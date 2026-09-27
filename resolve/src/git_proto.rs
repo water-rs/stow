@@ -1,15 +1,16 @@
 //! The slice of git's wire protocol the resolver speaks: pkt-line
-//! framing, the `info/refs` advertisement parse, and a protocol-v2
-//! `fetch` over smart HTTP that asks for one commit with
-//! `filter=blob:none` and `deepen 1` — GitHub answers with a pack of the
-//! commit plus every tree under it, no blobs, in one POST.
+//! framing, the `info/refs` advertisement parse, and `fetch` requests
+//! over smart HTTP — protocol v2 when the server negotiates it, v0
+//! otherwise — that ask for one commit shallowly (`deepen 1`).
 //!
-//! That fetch is how a tree's gitlink (submodule) commits are read
-//! without `api.github.com`: the REST trees API caps an unauthenticated
-//! caller at 60 requests per hour per egress IP — a quota shared Worker
-//! egress exhausts for the caller before the lane starts — while
-//! `git-upload-pack` is the same anonymous endpoint `git clone` itself
-//! uses.
+//! A `filter=blob:none` fetch is how a tree's gitlink (submodule) commits
+//! are read without `api.github.com`: the REST trees API caps an
+//! unauthenticated caller at 60 requests per hour per egress IP — a quota
+//! shared Worker egress exhausts for the caller before the lane starts —
+//! while `git-upload-pack` is the same anonymous endpoint `git clone`
+//! itself uses. The unfiltered fetch carries the dep lane on hosts with
+//! no tarball endpoint: one POST returns the commit's whole tree as a
+//! pack.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -106,6 +107,9 @@ pub struct TreeEntry {
     pub sha: String,
 }
 
+/// The `agent` capability every request advertises.
+const AGENT: &str = concat!("agent=stow-resolve/", env!("CARGO_PKG_VERSION"), "\n");
+
 /// `POST git-upload-pack` `command=fetch` for `commit` in `owner/repo`
 /// with `filter=blob:none` and `deepen 1`, returning the commit's whole
 /// recursive tree — every path's mode and object sha — from the pack
@@ -120,7 +124,7 @@ pub async fn fetch_commit_tree(
     let mut body = Vec::new();
     pkt_line(&mut body, "command=fetch\n");
     pkt_line(&mut body, "object-format=sha1\n");
-    pkt_line(&mut body, "agent=stow-resolve/0.5.0\n");
+    pkt_line(&mut body, AGENT);
     body.extend_from_slice(b"0001");
     pkt_line(&mut body, "thin-pack\n");
     pkt_line(&mut body, "no-progress\n");
@@ -130,30 +134,262 @@ pub async fn fetch_commit_tree(
     pkt_line(&mut body, &format!("want {commit}\n"));
     body.extend_from_slice(b"0000");
 
-    let url = format!("https://github.com/{owner}/{repo}.git/git-upload-pack");
-    let request = http::Request::post(&url)
-        .header("User-Agent", crate::github_tree::USER_AGENT)
-        .header("Content-Type", "application/x-git-upload-pack-request")
-        .header("Accept", "application/x-git-upload-pack-result")
-        .header("Git-Protocol", "version=2")
-        .body(body)?;
-    let response = client
-        .request(request)
+    let url = format!("https://github.com/{owner}/{repo}.git");
+    let response_body = upload_pack_post(client, &url, &body, true)
         .await
-        .with_context(|| format!("fetch tree of `{owner}/{repo}` failed"))?;
-    let (parts, response_body) = response.into_parts();
-    if !(200..300).contains(&parts.status.as_u16()) {
-        bail!(
-            "git fetch of `{owner}/{repo}` returned HTTP {}",
-            parts.status
-        );
-    }
-
+        .with_context(|| format!("fetch tree of `{owner}/{repo}`"))?;
     let pack = extract_pack(&response_body)
         .with_context(|| format!("decode git fetch response for `{owner}/{repo}`"))?;
     let objects =
         unpack_pack(&pack).with_context(|| format!("unpack git pack for `{owner}/{repo}`"))?;
     commit_tree(&objects, commit).with_context(|| format!("walk tree of `{owner}/{repo}`"))
+}
+
+/// What an `info/refs` advertisement carries: which fetch protocol the
+/// remote negotiated and — v0 only — the refs themselves.
+#[derive(Clone)]
+pub struct Advertisement {
+    /// The remote answered protocol v2 (`version 2` leads the response):
+    /// fetches use `command=` framing and refs come from a separate
+    /// `ls-refs` request — a v2 advertisement lists capabilities only.
+    pub v2: bool,
+    /// Advertised capabilities — v0 takes them from the first ref pkt's
+    /// NUL suffix (`shallow`, `side-band-64k`, …), v2 from the capability
+    /// lines themselves (`fetch=shallow` means `deepen` is accepted).
+    pub capabilities: Vec<String>,
+    /// The ref advertisement — populated for v0, always empty for v2.
+    pub refs: Vec<(String, String)>,
+}
+
+impl Advertisement {
+    /// `deepen` is only legal when the remote advertises shallow support
+    /// (`shallow` in v0, `fetch=shallow` in v2); without it the fetch
+    /// falls back to the commit's full history.
+    fn can_deepen(&self) -> bool {
+        self.capabilities.iter().any(|cap| {
+            cap == "shallow"
+                || cap
+                    .strip_prefix("fetch=")
+                    .is_some_and(|v| v.split(' ').any(|f| f == "shallow"))
+        })
+    }
+}
+
+/// `GET {url}/info/refs?service=git-upload-pack` asking for protocol v2:
+/// a v2 remote answers capability lines only (refs need [`ls_refs`]); a
+/// v0 remote ignores the header and answers the full advertisement, refs
+/// included. One request doubles as protocol detection and, for v0, ref
+/// resolution.
+pub async fn advertise(client: &Client, url: &str) -> CargoResult<Advertisement> {
+    let request = http::Request::get(format!("{url}/info/refs?service=git-upload-pack"))
+        .header("User-Agent", crate::github_tree::USER_AGENT)
+        .header("Accept", "application/x-git-upload-pack-advertisement")
+        .header("Git-Protocol", "version=2")
+        .body(Vec::new())?;
+    let response = client
+        .request(request)
+        .await
+        .with_context(|| format!("git advertisement of `{url}` failed"))?;
+    let (parts, body) = response.into_parts();
+    if !(200..300).contains(&parts.status.as_u16()) {
+        bail!(
+            "git advertisement of `{url}` returned HTTP {}",
+            parts.status
+        );
+    }
+    parse_advertisement(&body).with_context(|| format!("decode git advertisement of `{url}`"))
+}
+
+/// Parse an `info/refs` response into an [`Advertisement`]. The first
+/// content pkt decides the protocol: `version 2` leads the v2 capability
+/// list; `# service=` leads a v0 advertisement whose ref table follows
+/// after a flush pkt.
+fn parse_advertisement(body: &[u8]) -> CargoResult<Advertisement> {
+    let mut pkts = PktLines::new(body);
+    let mut capabilities = Vec::new();
+    let mut refs = Vec::new();
+    let mut v2 = None;
+    loop {
+        let Some(payload) = pkts.next()? else {
+            break;
+        };
+        let Some(payload) = payload else {
+            continue; // flush pkt — sections may follow
+        };
+        let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
+        if payload == b"# service=git-upload-pack" {
+            continue;
+        }
+        match v2 {
+            None => {
+                v2 = Some(payload == b"version 2");
+                continue;
+            }
+            Some(true) => {
+                let Ok(line) = str::from_utf8(payload) else {
+                    continue;
+                };
+                capabilities.push(line.to_owned());
+            }
+            Some(false) => {
+                // v0 ref line `<oid> SP <name>` — the first carries the
+                // capability list after a NUL.
+                let (head, suffix) = match payload.iter().position(|&b| b == 0) {
+                    Some(nul) => (&payload[..nul], Some(&payload[nul + 1..])),
+                    None => (payload, None),
+                };
+                if let Some(suffix) = suffix {
+                    let text = str::from_utf8(suffix).context("non-UTF-8 capabilities")?;
+                    capabilities.extend(text.split(' ').map(str::to_owned));
+                }
+                let Ok(line) = str::from_utf8(head) else {
+                    continue;
+                };
+                let mut parts = line.splitn(2, ' ');
+                if let (Some(oid), Some(name)) = (parts.next(), parts.next())
+                    && (name == "HEAD" || name.starts_with("refs/"))
+                {
+                    refs.push((oid.to_owned(), name.to_owned()));
+                }
+            }
+        }
+    }
+    Ok(Advertisement {
+        v2: v2.unwrap_or(false),
+        capabilities,
+        refs,
+    })
+}
+
+/// Protocol-v2 `ls-refs`: the ref table a v2 advertisement withholds.
+/// `peel` folds annotated tags into `^{}` pairs and `symrefs` keeps HEAD
+/// resolvable — the `(sha, refname)` shape `pick_ref` consumes.
+pub async fn ls_refs(client: &Client, url: &str) -> CargoResult<Vec<(String, String)>> {
+    let mut body = Vec::new();
+    pkt_line(&mut body, "command=ls-refs\n");
+    pkt_line(&mut body, "object-format=sha1\n");
+    pkt_line(&mut body, AGENT);
+    body.extend_from_slice(b"0001");
+    pkt_line(&mut body, "peel\n");
+    pkt_line(&mut body, "symrefs\n");
+    pkt_line(&mut body, "ref-prefix HEAD\n");
+    pkt_line(&mut body, "ref-prefix refs/\n");
+    body.extend_from_slice(b"0000");
+    let response = upload_pack_post(client, url, &body, true)
+        .await
+        .with_context(|| format!("list refs of `{url}`"))?;
+
+    let mut refs = Vec::new();
+    let mut pkts = PktLines::new(&response);
+    loop {
+        // A response pkt can be a flush/delimiter — `while let
+        // Some(Some(..))` would stop at it mid-stream.
+        let Some(payload) = pkts.next()? else { break };
+        let Some(payload) = payload else { continue };
+        let mut lines = payload.split(|&b| b == b'\n');
+        let Some(head) = lines.next() else { continue };
+        let Ok(head) = str::from_utf8(head) else {
+            continue;
+        };
+        let mut parts = head.splitn(2, ' ');
+        let (Some(oid), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        refs.push((oid.to_owned(), name.to_owned()));
+        for attr in lines {
+            if let Some(peeled) = attr.strip_prefix(b"peeled:") {
+                let peeled = str::from_utf8(peeled).context("non-UTF-8 peeled oid")?;
+                refs.push((peeled.to_owned(), format!("{name}^{{}}")));
+            }
+        }
+    }
+    Ok(refs)
+}
+
+/// Fetch `sha` from `url` — the repo URL `advertise` probed — requesting
+/// `deepen 1` (when the advertisement permits shallow), `no-progress` and
+/// `done`. Returns the pack bytes the response carries: protocol v2
+/// `command=fetch` when negotiated, v0 `want`/`done` otherwise.
+pub async fn fetch_pack(
+    client: &Client,
+    url: &str,
+    sha: &str,
+    adv: &Advertisement,
+) -> CargoResult<Vec<u8>> {
+    if adv.v2 {
+        let mut body = Vec::new();
+        pkt_line(&mut body, "command=fetch\n");
+        pkt_line(&mut body, "object-format=sha1\n");
+        pkt_line(&mut body, AGENT);
+        body.extend_from_slice(b"0001");
+        pkt_line(&mut body, "thin-pack\n");
+        pkt_line(&mut body, "no-progress\n");
+        pkt_line(&mut body, "ofs-delta\n");
+        if adv.can_deepen() {
+            pkt_line(&mut body, "deepen 1\n");
+        }
+        pkt_line(&mut body, &format!("want {sha}\n"));
+        pkt_line(&mut body, "done\n");
+        body.extend_from_slice(b"0000");
+        let response = upload_pack_post(client, url, &body, true).await?;
+        extract_pack(&response).with_context(|| format!("decode git fetch response for `{url}`"))
+    } else {
+        // v0: echo the capabilities the server actually advertised on the
+        // first `want` line; `deepen` rides after the flush, `done` ends
+        // the single negotiation round.
+        let caps = [
+            "multi_ack_detailed",
+            "no-done",
+            "side-band-64k",
+            "thin-pack",
+            "ofs-delta",
+            "no-progress",
+        ]
+        .into_iter()
+        .filter(|cap| adv.capabilities.iter().any(|c| c == cap))
+        .collect::<Vec<_>>();
+        let want = if caps.is_empty() {
+            format!("want {sha}\n")
+        } else {
+            format!("want {sha} {}\n", caps.join(" "))
+        };
+        let mut body = Vec::new();
+        pkt_line(&mut body, &want);
+        body.extend_from_slice(b"0000");
+        if adv.can_deepen() {
+            pkt_line(&mut body, "deepen 1\n");
+        }
+        pkt_line(&mut body, "done\n");
+        let response = upload_pack_post(client, url, &body, false).await?;
+        extract_pack_v0(&response).with_context(|| format!("decode git fetch response for `{url}`"))
+    }
+}
+
+/// `POST {url}/git-upload-pack` in the protocol version the advertisement
+/// negotiated, returning the response body.
+async fn upload_pack_post(
+    client: &Client,
+    url: &str,
+    body: &[u8],
+    v2: bool,
+) -> CargoResult<Vec<u8>> {
+    let mut request = http::Request::post(format!("{url}/git-upload-pack"))
+        .header("User-Agent", crate::github_tree::USER_AGENT)
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .header("Accept", "application/x-git-upload-pack-result");
+    if v2 {
+        request = request.header("Git-Protocol", "version=2");
+    }
+    let request = request.body(body.to_vec())?;
+    let response = client
+        .request(request)
+        .await
+        .with_context(|| format!("git upload-pack of `{url}` failed"))?;
+    let (parts, response_body) = response.into_parts();
+    if !(200..300).contains(&parts.status.as_u16()) {
+        bail!("git upload-pack of `{url}` returned HTTP {}", parts.status);
+    }
+    Ok(response_body)
 }
 
 /// Pull the pack bytes out of a `fetch` response's pkt-line sections:
@@ -195,6 +431,58 @@ fn extract_pack(response: &[u8]) -> CargoResult<Vec<u8>> {
     }
     if pack.is_empty() {
         bail!("response carried no packfile section");
+    }
+    Ok(pack)
+}
+
+/// Pull the pack bytes out of a v0 `fetch` response: `shallow`/`unshallow`
+/// and `NAK`/`ACK` control pkts lead — none of them banded — then the pack
+/// arrives sideband-framed when `side-band-64k` negotiated (channel 1 =
+/// pack, 2 = progress, 3 = fatal) or as raw `PACK` bytes when it did not.
+fn extract_pack_v0(response: &[u8]) -> CargoResult<Vec<u8>> {
+    let mut pkts = PktLines::new(response);
+    let mut pack = Vec::new();
+    loop {
+        let at = pkts.pos;
+        let payload = match pkts.next() {
+            Ok(Some(Some(payload))) => payload,
+            Ok(Some(None)) => continue, // flush pkt — more may follow
+            Ok(None) => break,
+            // Not a pkt at all: an unbanded `PACK` stream ran into the
+            // control block — everything from this offset is pack.
+            Err(_) if response[at..].starts_with(b"PACK") => {
+                pack.extend_from_slice(&response[at..]);
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let text = payload.strip_suffix(b"\n").unwrap_or(payload);
+        if text.starts_with(b"shallow ")
+            || text.starts_with(b"unshallow ")
+            || text.starts_with(b"ACK ")
+            || text == b"NAK"
+        {
+            continue;
+        }
+        if let Some(err) = text.strip_prefix(b"ERR ") {
+            bail!(
+                "server reported: {}",
+                String::from_utf8_lossy(err).trim_end()
+            );
+        }
+        match payload.first() {
+            Some(1) => pack.extend_from_slice(&payload[1..]),
+            Some(3) => bail!(
+                "server reported: {}",
+                String::from_utf8_lossy(&payload[1..]).trim_end()
+            ),
+            // 2 = progress — `no-progress` already suppresses most of it.
+            Some(2) => {}
+            _ => bail!("unexpected content in git fetch response"),
+        }
+    }
+    if pack.is_empty() {
+        bail!("response carried no pack data");
     }
     Ok(pack)
 }

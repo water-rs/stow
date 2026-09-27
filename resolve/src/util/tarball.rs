@@ -456,7 +456,7 @@ fn tar_path(name: &str) -> CargoResult<PathBuf> {
 
 /// Where a link's target resolves inside the unpacked tree, `None` when it
 /// lands outside (a dangling link — the file simply does not materialize).
-fn link_target(rel: &Path, target: &Path, symlink: bool) -> Option<PathBuf> {
+pub(crate) fn link_target(rel: &Path, target: &Path, symlink: bool) -> Option<PathBuf> {
     // A symlink resolves against its own directory; a hardlink against the
     // archive root.
     let base: Vec<String> = if symlink {
@@ -589,7 +589,10 @@ pub async fn collect_tar_gz(
 /// the target file's bytes, dir links copy every file beneath the target.
 /// Chained links resolve through the link map; cycles and dangling targets
 /// leave no entry — reading one fails the way reading it on disk would.
-fn materialize_links(files: &mut BTreeMap<PathBuf, Vec<u8>>, links: &[(PathBuf, PathBuf)]) {
+pub(crate) fn materialize_links(
+    files: &mut BTreeMap<PathBuf, Vec<u8>>,
+    links: &[(PathBuf, PathBuf)],
+) {
     let link_map: BTreeMap<PathBuf, PathBuf> = links.iter().cloned().collect();
     // Follow a link chain to its final non-link target, `None` on a cycle.
     let follow = |target: &Path| -> Option<PathBuf> {

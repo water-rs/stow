@@ -27,6 +27,14 @@ futures = { version = "0.3.32", default-features = false, features = [
     "async-await",
 ] }
 futures-util = { version = "0.3", default-features = false, features = ["io"] }
+# Pack decode for the smart-HTTP git lane (`sources::git::pack`): the gix
+# sub-crates the host-only `gix` dep already pulls, at default-features =
+# false so they compile for wasm32. `streaming-input` is off — it needs
+# `gix-tempfile`, which does not build on wasm32.
+gix-features = { version = "0.48.1", default-features = false, features = ["zlib"] }
+gix-hash = { version = "0.25.1", default-features = false, features = ["sha1"] }
+gix-object = { version = "0.62.0", default-features = false }
+gix-pack = { version = "0.72.0", default-features = false, features = ["sha1"] }
 glob = "0.3.3"
 hex = "0.4"
 http = "1"

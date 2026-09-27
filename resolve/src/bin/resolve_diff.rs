@@ -356,7 +356,7 @@ async fn write_vendored_itoa(client: &Client, root: &Path) -> anyhow::Result<()>
 
 /// A fixture workspace generated under `workdir/fixtures/<name>`; returns
 /// its root manifest. The git-dep fixture's `git = "..."` dependency is
-/// what exercises `CodeloadGitSource`.
+/// what exercises `GitTreeSource`.
 #[allow(clippy::future_not_send)]
 async fn prepare_fixture(client: &Client, workdir: &Path, name: &str) -> anyhow::Result<PathBuf> {
     let root = workdir.join("fixtures").join(name);
@@ -449,7 +449,7 @@ async fn prepare_fixture(client: &Client, workdir: &Path, name: &str) -> anyhow:
             )?;
             write_vendored_itoa(client, &root).await?;
         }
-        // A github.com git dependency: resolved through `CodeloadGitSource`
+        // A github.com git dependency: resolved through `GitTreeSource`
         // (ls-remote + tarball) so its crates.io deps become nodes.
         "git-dep" => write_fixture(
             &root,

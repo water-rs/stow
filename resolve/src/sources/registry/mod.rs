@@ -6,7 +6,7 @@
 //! discovered, and searched for. The purpose of a registry is to have a
 //! location that serves as permanent storage for versions of a crate over time.
 //!
-//! Compared to git sources (see [`GitSource`]), a registry provides many
+//! Compared to git sources (see [`GitTreeSource`]), a registry provides many
 //! packages as well as many versions simultaneously. Git sources can also
 //! have commits deleted through rebasings where registries cannot have their
 //! versions deleted.
@@ -23,7 +23,7 @@
 //! We'll cover each functionality later.
 //!
 //! [Registries]: https://doc.rust-lang.org/nightly/cargo/reference/registries.html
-//! [`GitSource`]: super::GitSource
+//! [`GitTreeSource`]: super::GitTreeSource
 //!
 //! # Different Kinds of Registries
 //!
@@ -1221,7 +1221,7 @@ fn verified_deflate_reader<'a>(
 /// always derives `prefix` from `unpack_dir`'s name because a `.crate` is
 /// named after its package directory. A codeload git tarball unpacks under
 /// a `{repo}-{sha}` prefix that names the source, not the destination, so
-/// [`git::codeload`] supplies both explicitly. Everything below is verbatim.
+/// [`git::tree`] supplies both explicitly. Everything below is verbatim.
 fn unpack(
     gctx: &GlobalContext,
     tarball: &mut File,
