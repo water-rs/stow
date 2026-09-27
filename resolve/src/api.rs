@@ -1508,6 +1508,9 @@ bisync = "^0.3.0"
         };
 
         let repo: &str = if cfg!(windows) { "C:/repo" } else { "/repo" };
+        // The git checkout lands under the home dir, and target paths must be
+        // absolute on the host: `/home/user` is not absolute on Windows.
+        let home: &str = if cfg!(windows) { "C:/home/user" } else { "/home/user" };
         let host = "x86_64-unknown-linux-gnu";
         let prepare = |dropped_lockfile: Option<String>,
                        responses: std::collections::HashMap<String, http::Response<Vec<u8>>>|
@@ -1530,7 +1533,7 @@ tool = { git = "https://github.com/o/tool", version = "^0.1" }
             vfs.insert(format!("{repo}/src/lib.rs"), b"pub fn f() {}".to_vec());
             let mut gctx = GlobalContext::new_for_resolve(
                 PathBuf::from(repo),
-                PathBuf::from("/home/user"),
+                PathBuf::from(home),
                 Shell::new(),
                 Env::new(),
                 false,
