@@ -16,7 +16,7 @@ pub use self::cargo_output_metadata::{ExportInfo, OutputMetadataOptions};
 pub use self::cargo_read_manifest::read_package;
 pub use self::cargo_update::print_lockfile_changes;
 pub use self::lockfile::{
-    LOCKFILE_NAME, load_pkg_lockfile, lockfile_package_ids, resolve_to_string, write_pkg_lockfile,
+    LOCKFILE_NAME, load_pkg_lockfile, parse_lockfile, resolve_to_string, write_pkg_lockfile,
 };
 pub use self::resolve::{
     ResolveSelection, SpecsAndResolvedFeatures, WorkspaceResolve, add_overrides,
