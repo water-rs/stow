@@ -41,7 +41,7 @@ pub async fn decide<B: FetchedResponse>(
         return FetchOutcome::Fatal(missing());
     }
     if !(200..300).contains(&status) {
-        let error = ResolverError::CratesIo(format!("crates.io {url} returned HTTP {status}"));
+        let error = ResolverError::Upstream(format!("crates.io {url} returned HTTP {status}"));
         if is_retryable_status(status) {
             return FetchOutcome::Retryable {
                 error,
@@ -53,7 +53,7 @@ pub async fn decide<B: FetchedResponse>(
     match response.into_inner().text().await {
         Ok(body) => FetchOutcome::Body(body),
         Err(error) => FetchOutcome::Retryable {
-            error: ResolverError::CratesIo(format!("read crates.io {url}: {error}")),
+            error: ResolverError::Upstream(format!("read crates.io {url}: {error}")),
             delay_ms: retry_delay(attempt, None),
         },
     }

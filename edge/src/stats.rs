@@ -304,7 +304,7 @@ mod worker {
         AnalyticsConsent, Hit, NO_ANALYTICS_HEADER, hit_blobs, hit_doubles, install_hash,
         user_agent_dimensions,
     };
-    use crate::api::GetArtifactError;
+    use crate::errors::GetArtifactError;
 
     /// Everything the stats writer needs from one request: consent, the
     /// connecting IP for the install hash, and the `stow-cli` user agent.
@@ -445,7 +445,7 @@ mod worker {
     async fn run_sql<T>(
         context: &StatsContext,
         sql: &str,
-    ) -> Result<Vec<T>, crate::api::GetArtifactError>
+    ) -> Result<Vec<T>, crate::errors::GetArtifactError>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
@@ -464,7 +464,7 @@ mod worker {
                 Some(sql.as_bytes()),
             )
             .map_err(|error| {
-                crate::api::GetArtifactError::InternalWithMessage(format!(
+                crate::errors::GetArtifactError::InternalWithMessage(format!(
                     "build stats query: {error}"
                 ))
             })?,
@@ -472,7 +472,7 @@ mod worker {
         let mut response =
             SendWrapper::new(skyzen_cloudflare::CfFetch.request(&request).await.map_err(
                 |error| {
-                    crate::api::GetArtifactError::InternalWithMessage(format!(
+                    crate::errors::GetArtifactError::InternalWithMessage(format!(
                         "stats query fetch: {error}"
                     ))
                 },
@@ -484,13 +484,13 @@ mod worker {
                 .into_send()
                 .await
                 .unwrap_or_else(|_| "<unreadable>".to_owned());
-            return Err(crate::api::GetArtifactError::InternalWithMessage(format!(
-                "stats query failed: {status} {body}"
-            )));
+            return Err(crate::errors::GetArtifactError::InternalWithMessage(
+                format!("stats query failed: {status} {body}"),
+            ));
         }
         let envelope: super::SqlEnvelope<T> =
             response.json().into_send().await.map_err(|error| {
-                crate::api::GetArtifactError::InternalWithMessage(format!(
+                crate::errors::GetArtifactError::InternalWithMessage(format!(
                     "decode stats query result: {error}"
                 ))
             })?;
@@ -501,14 +501,13 @@ mod worker {
     fn first_row<T>(
         mut rows: Vec<T>,
         query: &'static str,
-    ) -> Result<T, crate::api::GetArtifactError> {
+    ) -> Result<T, crate::errors::GetArtifactError> {
         if rows.len() == 1 {
             Ok(rows.remove(0))
         } else {
-            Err(crate::api::GetArtifactError::InternalWithMessage(format!(
-                "{query} returned {} rows",
-                rows.len()
-            )))
+            Err(crate::errors::GetArtifactError::InternalWithMessage(
+                format!("{query} returned {} rows", rows.len()),
+            ))
         }
     }
 
@@ -518,11 +517,10 @@ mod worker {
     pub async fn cached_usage_stats(
         context: &StatsContext,
         cache: &skyzen_cloudflare::CfCache,
-    ) -> Result<stow_types::api::UsageStats, crate::api::GetArtifactError> {
-        if let Some(bytes) = crate::cache::get_stats(cache)
-            .await
-            .map_err(|error| crate::api::GetArtifactError::InternalWithMessage(error.to_string()))?
-        {
+    ) -> Result<stow_types::api::UsageStats, crate::errors::GetArtifactError> {
+        if let Some(bytes) = crate::cache::get_stats(cache).await.map_err(|error| {
+            crate::errors::GetArtifactError::InternalWithMessage(error.to_string())
+        })? {
             match serde_json::from_slice(&bytes) {
                 Ok(stats) => return Ok(stats),
                 Err(error) => {
