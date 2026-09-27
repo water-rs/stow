@@ -75,6 +75,12 @@ pub struct StowResolveInput {
     /// treat units whose package is not crates.io-sourced as traversal,
     /// never nodes — but a `.crate` member *is* the published package.
     pub members_are_crates_io: bool,
+    /// `PackageId`s selection may admit even though the index marks them
+    /// yanked — the pins of the project's own `Cargo.lock`, which cargo
+    /// itself honors (`ops::lockfile_package_ids` parses it). Admission
+    /// only: the allowlist never makes a version preferred, and stow
+    /// keeps the lockfile out of version preference regardless.
+    pub yanked_allowlist: BTreeSet<PackageId>,
 }
 
 /// What a shared [`ResolveSession`] needs: the workspace plus everything
@@ -108,6 +114,8 @@ pub struct StowSessionInput {
     /// own `host_triple` `-vV` to report that host, and refuses a version
     /// different from the one selection saw.
     pub rustc_verbose_version: String,
+    /// As [`StowResolveInput::yanked_allowlist`].
+    pub yanked_allowlist: BTreeSet<PackageId>,
 }
 
 /// Stow's per-side unit graph under `units`/`roots`.
@@ -491,8 +499,15 @@ impl<'gctx> ResolveSession<'gctx> {
         // `cargo build` in a workspace builds the default members, and the
         // unit graph covers only what they pull in — the same spec set.
         let specs = Packages::Default.to_package_id_specs(&ws)?;
-        let selection =
-            ops::select_ws_with_opts(&ws, &cli_features, &specs, HasDevUnits::No, false).await?;
+        let selection = ops::select_ws_with_opts(
+            &ws,
+            &cli_features,
+            &specs,
+            HasDevUnits::No,
+            false,
+            &input.yanked_allowlist,
+        )
+        .await?;
         let has_binary = ws
             .members()
             .any(|member| member.targets().iter().any(|target| target.is_bin()));
@@ -595,6 +610,7 @@ pub async fn metadata(gctx: &GlobalContext, input: StowResolveInput) -> CargoRes
         no_deps: false,
         version: 1,
         filter_platforms: input.filter_platforms.clone(),
+        yanked_allowlist: input.yanked_allowlist.clone(),
     };
     let (metadata, _ws_resolve) = cargo_output_metadata::output_metadata_with(
         &setup.ws,
@@ -622,6 +638,7 @@ pub async fn resolve(
         rustc_verbose_version,
         cfg,
         members_are_crates_io,
+        yanked_allowlist,
     } = input;
     ResolveSession::prepare(
         gctx,
@@ -633,6 +650,7 @@ pub async fn resolve(
             cfg,
             members_are_crates_io,
             rustc_verbose_version: rustc_verbose_version.clone(),
+            yanked_allowlist,
         },
     )
     .await?
@@ -1272,6 +1290,7 @@ edition = "2024"
             cfg: BTreeMap::from([(host.to_string(), rustc_data::cfg("1.98.1", host).unwrap())]),
             members_are_crates_io: false,
             rustc_verbose_version: verbose.to_string(),
+            yanked_allowlist: BTreeSet::new(),
         };
         let session = futures::executor::block_on(ResolveSession::prepare(&gctx, &input))
             .expect("prepare installs the rustc selection needs");
@@ -1287,5 +1306,142 @@ edition = "2024"
             format!("{error:#}").contains("differs from the session's"),
             "{error:#}"
         );
+    }
+
+    /// A sparse index whose only semver-compatible releases are yanked:
+    /// without the project's own pins the resolve fails with the yanked
+    /// error; an allowlist naming `bisync 0.3.0` admits exactly that
+    /// version (the newer yanked `0.3.1` stays inadmissible); and a newer
+    /// non-yanked compatible release still wins — the allowlist admits,
+    /// it does not prefer.
+    #[test]
+    fn yanked_allowlist_admits_lockfile_pins() {
+        use crate::testing::RecordedHttp;
+        use crate::util::network::http_async::Client;
+
+        let repo: &str = if cfg!(windows) { "C:/repo" } else { "/repo" };
+        let fixture =
+            std::env::temp_dir().join(format!("stow-yanked-allowlist-{}", std::process::id()));
+        let index_dir = fixture.join("index.crates.io");
+        std::fs::create_dir_all(index_dir.join("bi/sy")).unwrap();
+        std::fs::write(
+            index_dir.join("config.json.body"),
+            r#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            index_dir.join("config.json.meta"),
+            r#"{"status":200,"headers":{}}"#,
+        )
+        .unwrap();
+        let write_index = |entries: &[(&str, bool)]| {
+            let body: String = entries
+                .iter()
+                .map(|(vers, yanked)| {
+                    format!(
+                        "{{\"name\":\"bisync\",\"vers\":\"{vers}\",\"deps\":[],\"cksum\":\"{}\",\"features\":{{}},\"yanked\":{yanked}}}\n",
+                        "0".repeat(64)
+                    )
+                })
+                .collect();
+            std::fs::write(index_dir.join("bi/sy/bisync.body"), body).unwrap();
+            std::fs::write(
+                index_dir.join("bi/sy/bisync.meta"),
+                r#"{"status":200,"headers":{}}"#,
+            )
+            .unwrap();
+        };
+        let host = "x86_64-unknown-linux-gnu";
+        let prepare = |yanked_allowlist: BTreeSet<PackageId>| -> CargoResult<String> {
+            let vfs = Rc::new(MemoryVfs::new());
+            set_vfs(vfs.clone());
+            vfs.insert(
+                format!("{repo}/Cargo.toml"),
+                br#"
+[package]
+name = "proj"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bisync = "^0.3.0"
+"#
+                .to_vec(),
+            );
+            vfs.insert(format!("{repo}/src/lib.rs"), b"pub fn f() {}".to_vec());
+            let mut gctx = GlobalContext::new_for_resolve(
+                PathBuf::from(repo),
+                PathBuf::from("/home/user"),
+                Shell::new(),
+                Env::new(),
+                false,
+            )
+            .expect("gctx");
+            gctx.set_http(Client::new(Rc::new(RecordedHttp::new(fixture.clone()))));
+            let session = futures::executor::block_on(ResolveSession::prepare(
+                &gctx,
+                &StowSessionInput {
+                    manifest_path: Path::new(repo).join("Cargo.toml"),
+                    features: Vec::new(),
+                    all_features: false,
+                    no_default_features: false,
+                    cfg: BTreeMap::from([(
+                        host.to_string(),
+                        rustc_data::cfg("1.98.1", host).unwrap(),
+                    )]),
+                    members_are_crates_io: false,
+                    rustc_verbose_version: rustc_data::verbose_version("1.98.1", host)
+                        .unwrap()
+                        .to_string(),
+                    yanked_allowlist,
+                },
+            ))?;
+            Ok(session
+                .selection
+                .targeted_resolve
+                .iter()
+                .find(|id| id.name().as_str() == "bisync")
+                .map(|id| id.version().to_string())
+                .expect("bisync resolved"))
+        };
+        let pin = |version: &str| {
+            BTreeSet::from([PackageId::try_new(
+                "bisync",
+                version,
+                crate::core::SourceId::from_url(
+                    "registry+https://github.com/rust-lang/crates.io-index",
+                )
+                .unwrap(),
+            )
+            .unwrap()])
+        };
+
+        // Two yanked releases compatible with `^0.3.0`: nothing is
+        // admissible without the project's pins.
+        write_index(&[("0.3.0", true), ("0.3.1", true)]);
+        let error = prepare(BTreeSet::new())
+            .err()
+            .expect("all compatible versions yanked must fail");
+        assert!(
+            format!("{error:#}").contains("version 0.3.1 is yanked"),
+            "{error:#}"
+        );
+
+        // The lockfile's pin admits exactly it — 0.3.1, also yanked but
+        // not pinned, stays inadmissible.
+        assert_eq!(
+            prepare(pin("0.3.0")).expect("the pinned yanked version resolves"),
+            "0.3.0"
+        );
+
+        // A newer compatible release that is not yanked still wins over
+        // the allowlisted pin — admission, not preference.
+        write_index(&[("0.3.0", true), ("0.3.1", true), ("0.3.2", false)]);
+        assert_eq!(
+            prepare(pin("0.3.0")).expect("the non-yanked release resolves"),
+            "0.3.2"
+        );
+
+        let _ = std::fs::remove_dir_all(&fixture);
     }
 }

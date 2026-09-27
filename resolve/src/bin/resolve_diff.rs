@@ -937,6 +937,10 @@ async fn run() -> anyhow::Result<()> {
                     .to_string(),
                 cfg: cfg.clone(),
                 members_are_crates_io: *members_are_crates_io,
+                // A lockfile the corpus dir carries is read for
+                // preference on both sides, which already admits the
+                // yanked versions it pins.
+                yanked_allowlist: BTreeSet::new(),
             };
             let mut gctx = GlobalContext::new_for_resolve(
                 manifest_dir.clone(),
