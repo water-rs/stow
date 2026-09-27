@@ -1,24 +1,23 @@
-//! Home of the [`GitSource`].
+//! Home of the git sources.
 //!
-//! Apparently, the most important type in this module is [`GitSource`].
-//! [`utils`] provides libgit2 utilities like fetch and checkout, whereas
-//! [`oxide`] is the counterpart for gitoxide integration. [`known_hosts`]
-//! is the mitigation of [CVE-2022-46176].
+//! [`GitTreeSource`] resolves every https git remote over plain HTTPS —
+//! codeload tarballs for github.com, a shallow smart-HTTP `fetch` for
+//! every other host — and runs on wasm32, so the worker and hosts share
+//! one code path. [`utils`] provides the libgit2/gitoxide fetch utilities
+//! the registry index still uses (host-only), whereas [`oxide`] is the
+//! counterpart for gitoxide integration. [`known_hosts`] is the
+//! mitigation of [CVE-2022-46176].
 //!
 //! [CVE-2022-46176]: https://blog.rust-lang.org/2023/01/10/cve-2022-46176.html
 
-pub use self::codeload::CodeloadGitSource;
+pub use self::tree::GitTreeSource;
 #[cfg(not(target_family = "wasm"))]
-pub use self::source::GitSource;
-#[cfg(not(target_family = "wasm"))]
-pub use self::utils::{GitCheckout, GitDatabase, GitRemote, fetch, resolve_ref};
-mod codeload;
+pub use self::utils::{fetch, resolve_ref};
 #[cfg(not(target_family = "wasm"))]
 mod known_hosts;
 #[cfg(not(target_family = "wasm"))]
 mod oxide;
-#[cfg(not(target_family = "wasm"))]
-mod source;
+mod tree;
 #[cfg(not(target_family = "wasm"))]
 mod utils;
 
