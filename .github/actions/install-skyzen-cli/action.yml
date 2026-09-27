@@ -8,10 +8,10 @@ runs:
   steps:
     - shell: bash
       env:
-        SKYZEN_CLI_VERSION: 0.4.3
+        SKYZEN_CLI_VERSION: 0.4.4
         # sha256 of skyzen-cli-x86_64-unknown-linux-gnu.tar.xz from the
-        # skyzen-cli-v0.4.3 release, recorded when the version was bumped.
-        SKYZEN_CLI_SHA256: 1ada0cea449332e3dd3cdc6a145a7b38d8402e67f151b2489d7a202fa139cca5
+        # skyzen-cli-v0.4.4 release, recorded when the version was bumped.
+        SKYZEN_CLI_SHA256: 93f3af44ce9becfc8637e570ec9b20eac02442616432eb8931ec4f3bb3df3f5f
       run: |
         set -euo pipefail
         if [ "$(uname -sm)" != "Linux x86_64" ]; then
