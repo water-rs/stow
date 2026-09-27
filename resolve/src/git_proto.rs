@@ -128,8 +128,8 @@ pub async fn fetch_commit_tree(
     body.extend_from_slice(b"0001");
     pkt_line(&mut body, "no-progress\n");
     pkt_line(&mut body, "ofs-delta\n");
-    pkt_line(&mut body, &format!("deepen 1\n"));
-    pkt_line(&mut body, &format!("filter blob:none\n"));
+    pkt_line(&mut body, "deepen 1\n");
+    pkt_line(&mut body, "filter blob:none\n");
     pkt_line(&mut body, &format!("want {commit}\n"));
     body.extend_from_slice(b"0000");
 
@@ -139,9 +139,9 @@ pub async fn fetch_commit_tree(
         .with_context(|| format!("fetch tree of `{owner}/{repo}`"))?;
     let pack = extract_pack(&response_body)
         .with_context(|| format!("decode git fetch response for `{owner}/{repo}`"))?;
-    let objects =
-        unpack_pack(&pack).with_context(|| format!("unpack git pack for `{owner}/{repo}`"))?;
-    commit_tree(&objects, commit).with_context(|| format!("walk tree of `{owner}/{repo}`"))
+    let index =
+        PackIndex::build(&pack).with_context(|| format!("unpack git pack for `{owner}/{repo}`"))?;
+    commit_tree(&index, commit).with_context(|| format!("walk tree of `{owner}/{repo}`"))
 }
 
 /// What an `info/refs` advertisement carries: which fetch protocol the
@@ -486,89 +486,12 @@ fn extract_pack_v0(response: &[u8]) -> CargoResult<Vec<u8>> {
     Ok(pack)
 }
 
-/// A pack object after delta resolution.
-struct Object {
-    ty: u8,
-    data: Vec<u8>,
-    sha: [u8; 20],
-}
-
 const OBJ_COMMIT: u8 = 1;
 const OBJ_TREE: u8 = 2;
 const OBJ_BLOB: u8 = 3;
 const OBJ_TAG: u8 = 4;
 const OBJ_OFS_DELTA: u8 = 6;
 const OBJ_REF_DELTA: u8 = 7;
-
-/// Decode a packfile: walk each object, inflate its zlib payload, and
-/// resolve deltas against their bases (offset or object-name).
-fn unpack_pack(pack: &[u8]) -> CargoResult<Vec<Object>> {
-    if pack.len() < 12 || &pack[..4] != b"PACK" {
-        bail!("not a packfile");
-    }
-    let count = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
-    let mut raw: Vec<(u64, u8, RawObj)> = Vec::with_capacity(count);
-    let mut sha_index: BTreeMap<[u8; 20], usize> = BTreeMap::new();
-    let mut pos = 12usize;
-    for _ in 0..count {
-        let offset = pos as u64;
-        let (ty, _size) = pack_obj_header(pack, &mut pos)?;
-        let raw_obj = match ty {
-            OBJ_OFS_DELTA => {
-                let base_offset = ofs_delta_base(pack, &mut pos, offset)?;
-                let (data, used) = inflate(&pack[pos..])?;
-                pos += used;
-                RawObj::OfsDelta {
-                    base_offset,
-                    delta: data,
-                }
-            }
-            OBJ_REF_DELTA => {
-                if pos + 20 > pack.len() {
-                    bail!("truncated ref-delta base");
-                }
-                let base_sha: [u8; 20] = pack[pos..pos + 20].try_into().unwrap();
-                pos += 20;
-                let (data, used) = inflate(&pack[pos..])?;
-                pos += used;
-                RawObj::RefDelta {
-                    base_sha,
-                    delta: data,
-                }
-            }
-            _ => {
-                let (data, used) = inflate(&pack[pos..])?;
-                pos += used;
-                RawObj::Plain(data)
-            }
-        };
-        raw.push((offset, ty, raw_obj));
-    }
-    // Index every non-delta object by name first: a ref-delta's base is
-    // named by sha and may sit anywhere in the pack. A delta-based
-    // ref-delta base still reports "not in pack" — `ofs-delta` was
-    // requested, so GitHub never emits that shape.
-    for (index, (_, ty, raw_obj)) in raw.iter().enumerate() {
-        if let RawObj::Plain(data) = raw_obj {
-            sha_index.insert(object_sha(*ty, data), index);
-        }
-    }
-    let mut resolved: Vec<Option<Object>> = (0..raw.len()).map(|_| None).collect();
-    for index in 0..raw.len() {
-        resolve_obj(&raw, &sha_index, &mut resolved, index)?;
-        if let Some(object) = &resolved[index] {
-            sha_index.insert(object.sha, index);
-        }
-    }
-    Ok(resolved.into_iter().flatten().collect())
-}
-
-/// A not-yet-resolved pack object payload.
-enum RawObj {
-    Plain(Vec<u8>),
-    OfsDelta { base_offset: u64, delta: Vec<u8> },
-    RefDelta { base_sha: [u8; 20], delta: Vec<u8> },
-}
 
 /// An object's varint `(type, size)` header at `pos`, advancing it.
 fn pack_obj_header(pack: &[u8], pos: &mut usize) -> CargoResult<(u8, u64)> {
@@ -643,44 +566,6 @@ fn inflate(input: &[u8]) -> CargoResult<(Vec<u8>, usize)> {
             }
         }
     }
-}
-
-/// Resolve object `index` — recursively through its base first when the
-/// object is a delta — into `resolved`.
-fn resolve_obj(
-    raw: &[(u64, u8, RawObj)],
-    sha_index: &BTreeMap<[u8; 20], usize>,
-    resolved: &mut [Option<Object>],
-    index: usize,
-) -> CargoResult<()> {
-    if resolved[index].is_some() {
-        return Ok(());
-    }
-    let (offset, ty, raw_obj) = &raw[index];
-    let (ty, data) = match raw_obj {
-        RawObj::Plain(data) => (*ty, data.clone()),
-        RawObj::OfsDelta { base_offset, delta } => {
-            let base_index = raw
-                .iter()
-                .position(|(o, _, _)| o == base_offset)
-                .ok_or_else(|| anyhow!("ofs-delta base at {base_offset} not in pack"))?;
-            resolve_obj(raw, sha_index, resolved, base_index)?;
-            let base = resolved[base_index].as_ref().unwrap();
-            (base.ty, apply_delta(&base.data, delta)?)
-        }
-        RawObj::RefDelta { base_sha, delta } => {
-            let base_index = *sha_index
-                .get(base_sha)
-                .ok_or_else(|| anyhow!("ref-delta base not in pack"))?;
-            resolve_obj(raw, sha_index, resolved, base_index)?;
-            let base = resolved[base_index].as_ref().unwrap();
-            (base.ty, apply_delta(&base.data, delta)?)
-        }
-    };
-    let sha = object_sha(ty, &data);
-    let _ = offset;
-    resolved[index] = Some(Object { ty, data, sha });
-    Ok(())
 }
 
 /// The object-name hash git computes: `sha1("{type} {len}\0" + data)`.
@@ -768,22 +653,38 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> CargoResult<Vec<u8>> {
     Ok(out)
 }
 
-/// Walk the resolved objects from `commit` into a recursive
-/// path → entry map. The commit's `tree` line names the root; every
-/// `0o40000` entry recurses.
-fn commit_tree(objects: &[Object], commit: &str) -> CargoResult<BTreeMap<PathBuf, TreeEntry>> {
-    let commit_sha: [u8; 20] = decode_sha(commit)?;
-    let commit_obj = objects
-        .iter()
-        .find(|o| o.ty == OBJ_COMMIT && o.sha == commit_sha)
-        .ok_or_else(|| anyhow!("pack lacks commit {commit}"))?;
+/// Walk `index`'s kept objects from `commit` into a recursive
+/// path → entry map — every non-directory entry (file, symlink,
+/// gitlink) with its mode and object name. The commit's `tree` line
+/// names the root; every `0o40000` entry recurses. A `blob:none` pack
+/// is commits and trees only — exactly what [`PackIndex`] keeps — so
+/// entries name objects the pack never carried.
+fn commit_tree(index: &PackIndex, commit: &str) -> CargoResult<BTreeMap<PathBuf, TreeEntry>> {
+    let commit_sha = decode_sha(commit)?;
+    let Some(&(OBJ_COMMIT, ref commit_data)) = index.kept.get(&commit_sha) else {
+        bail!("pack lacks commit {commit}");
+    };
     let mut entries = BTreeMap::new();
-    walk_tree(
-        objects,
-        commit_tree_sha(&commit_obj.data)?,
-        Path::new(""),
-        &mut entries,
-    )?;
+    let mut stack = vec![(commit_tree_sha(commit_data)?, PathBuf::new())];
+    while let Some((tree_sha, dir)) = stack.pop() {
+        let Some(&(OBJ_TREE, ref tree_data)) = index.kept.get(&tree_sha) else {
+            bail!("pack lacks tree {}", hex::encode(tree_sha));
+        };
+        for (name, mode, sha) in tree_entries(tree_data)? {
+            let path = dir.join(&name);
+            if mode == 0o40000 {
+                stack.push((sha, path));
+            } else {
+                entries.insert(
+                    path,
+                    TreeEntry {
+                        mode,
+                        sha: hex::encode(sha),
+                    },
+                );
+            }
+        }
+    }
     Ok(entries)
 }
 
@@ -829,35 +730,6 @@ fn decode_sha(hex: &str) -> CargoResult<[u8; 20]> {
         .try_into()
         .map_err(|_| anyhow!("sha must be 20 bytes"))?;
     Ok(bytes)
-}
-
-/// One tree object's entries recursively into `entries`, prefixing each
-/// name with `dir`.
-fn walk_tree(
-    objects: &[Object],
-    tree_sha: [u8; 20],
-    dir: &Path,
-    entries: &mut BTreeMap<PathBuf, TreeEntry>,
-) -> CargoResult<()> {
-    let tree = objects
-        .iter()
-        .find(|o| o.ty == OBJ_TREE && o.sha == tree_sha)
-        .ok_or_else(|| anyhow!("pack lacks tree {}", hex::encode(tree_sha)))?;
-    for (name, mode, sha) in tree_entries(&tree.data)? {
-        let path = dir.join(&name);
-        if mode == 0o40000 {
-            walk_tree(objects, sha, &path, entries)?;
-        } else {
-            entries.insert(
-                path,
-                TreeEntry {
-                    mode,
-                    sha: hex::encode(sha),
-                },
-            );
-        }
-    }
-    Ok(())
 }
 
 /// A pack entry's location: its raw type, its delta base when it is one,
@@ -1286,6 +1158,69 @@ mod tests {
         ));
         let files = tree_files(pack, "e2ac16b833e2ab69530a140a153a16c3bdc0095b").unwrap();
         assert_eq!(files[Path::new("big.bin")].as_slice(), b"");
+    }
+
+    /// `tests/fixtures/blob-none.pack` is what a `filter=blob:none` fetch
+    /// returns — commit `5cb6f174…` plus its three trees, no blobs — for
+    /// a repo whose root holds `.gitmodules`, `src/lib.rs`, and a
+    /// `vendor/sub` gitlink. The map `fill_submodules` reads keeps every
+    /// entry's mode and object name even though the blobs themselves
+    /// never left the server.
+    #[test]
+    fn fetch_commit_tree_reads_gitlinks_from_blob_none_pack() {
+        let pack = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/blob-none.pack"
+        ));
+        // The v2 fetch response: a `packfile` section pkt, the pack
+        // banded on channel 1, then the flush.
+        let mut response = format!("{:04x}packfile\n", "packfile\n".len() + 4).into_bytes();
+        let mut band = vec![1u8];
+        band.extend_from_slice(pack);
+        response.extend_from_slice(format!("{:04x}", band.len() + 4).as_bytes());
+        response.extend_from_slice(&band);
+        response.extend_from_slice(b"0000");
+
+        /// Answers every request with the fetch response.
+        struct FixedHttp(Vec<u8>);
+        impl crate::util::network::http_async::HttpClient for FixedHttp {
+            fn request<'a>(
+                &'a self,
+                request: http::Request<Vec<u8>>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = CargoResult<http::Response<Vec<u8>>>> + 'a>,
+            > {
+                let _ = request;
+                Box::pin(async move {
+                    Ok(http::Response::builder()
+                        .status(200)
+                        .body(self.0.clone())
+                        .unwrap())
+                })
+            }
+        }
+        let client = Client::new(std::rc::Rc::new(FixedHttp(response)));
+
+        let entries = futures::executor::block_on(fetch_commit_tree(
+            &client,
+            "dep-owner",
+            "dep-repo",
+            "5cb6f174f779e9ee26309a2c040a959808be4a2c",
+        ))
+        .unwrap();
+        // The gitlink names the submodule's commit; the file entries
+        // name blobs the pack never carried.
+        assert_eq!(
+            entries[Path::new("vendor/sub")],
+            TreeEntry {
+                mode: 0o160000,
+                sha: "1111111111111111111111111111111111111111".to_owned(),
+            }
+        );
+        assert_eq!(entries[Path::new(".gitmodules")].mode, 0o100644);
+        assert_eq!(entries[Path::new("src/lib.rs")].mode, 0o100644);
+        // Directories flatten — no `vendor` or `src` entries.
+        assert_eq!(entries.len(), 3);
     }
 
     /// `inflate` reports how many input bytes the stream consumed so the
