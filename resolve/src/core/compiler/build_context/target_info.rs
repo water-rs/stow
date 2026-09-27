@@ -419,6 +419,20 @@ impl<'gctx> RustcTargetData<'gctx> {
     ) -> CargoResult<RustcTargetData<'gctx>> {
         let gctx = ws.gctx();
         let rustc = gctx.load_global_rustc(Some(ws))?;
+        Self::new_injected_rustc(ws, rustc, requested_kinds, cfg_source)
+    }
+
+    /// [`Self::new_injected`] with an explicit `rustc` rather than the one
+    /// injected into `ws.gctx()` — for a caller projecting one prepared
+    /// resolve against more than one host triple, where the context's
+    /// single rustc slot cannot express the per-projection hosts.
+    pub fn new_injected_rustc(
+        ws: &Workspace<'gctx>,
+        rustc: Rustc,
+        requested_kinds: &[CompileKind],
+        cfg_source: Rc<dyn Fn(CompileKind) -> CargoResult<Vec<Cfg>> + 'gctx>,
+    ) -> CargoResult<RustcTargetData<'gctx>> {
+        let gctx = ws.gctx();
         let info_for = |kind: CompileKind, rustc: &Rustc| -> CargoResult<TargetInfo> {
             TargetInfo::new_injected(gctx, requested_kinds, rustc, kind, cfg_source(kind)?)
         };
