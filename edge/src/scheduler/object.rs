@@ -145,19 +145,35 @@ async fn submit(
         };
         to_error(error).set_status(status)
     })?;
-    dispatch_pending(env, db).await.map_err(|error| {
-        tracing::error!(%error, "scheduler submit dispatch_pending failed");
-        error
-    })?;
-    schedule_alarm(env, db, alarm).await.map_err(|error| {
-        tracing::error!(%error, "scheduler submit schedule_alarm failed");
-        error
-    })?;
+    // Dispatch is not this request's work: pointing the alarm at now lets
+    // `run_alarm`'s dispatch pass run it, so the submit answers once the
+    // queue write lands instead of holding the client — and burning the
+    // DO's per-request CPU budget — through claim plus a fan-out of
+    // GitHub calls.
+    arm_dispatch_alarm(alarm).await?;
     Ok(Json(InsertedResponse { inserted }))
 }
 
+/// Point the DO alarm at now: `run_alarm` then performs the dispatch
+/// pass (`dispatch_pending` plus `schedule_alarm`) that a mutating
+/// handler used to run inline. `setAlarm` overrides any existing
+/// scheduled alarm rather than keeping the earliest
+/// (<https://developers.cloudflare.com/durable-objects/api/alarms/#setalarm>),
+/// which is correct here: `run_alarm` re-arms via `schedule_alarm`, so
+/// moving an earlier wake-up up to now only dispatches sooner.
+async fn arm_dispatch_alarm(alarm: &Alarm) -> Result<()> {
+    // `Date::now()` returns whole milliseconds well below 2^53; the value
+    // is exactly representable and always fits i64.
+    #[allow(clippy::cast_possible_truncation)]
+    let now_ms = js_sys::Date::now() as i64;
+    alarm.set_alarm(now_ms).await.map_err(|error| {
+        let error = to_error(error);
+        tracing::error!(%error, "failed to arm scheduler dispatch alarm");
+        error
+    })
+}
+
 async fn complete(
-    env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(report): Json<stow_types::api::BuildCompleteReport>,
@@ -178,14 +194,10 @@ async fn complete(
         };
         to_error(error).set_status(status)
     })?;
-    dispatch_pending(&env, &db).await.map_err(|error| {
-        tracing::error!(%error, "scheduler complete dispatch_pending failed");
-        error
-    })?;
-    schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
-        tracing::error!(%error, "scheduler complete schedule_alarm failed");
-        error
-    })?;
+    // Same handoff as submit: the runner's report is acknowledged as soon
+    // as the queue row lands, and the alarm's dispatch pass — not this
+    // request — runs claim plus the GitHub fan-out.
+    arm_dispatch_alarm(&alarm).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
