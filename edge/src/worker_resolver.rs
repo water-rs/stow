@@ -905,7 +905,10 @@ fn enqueue_requests_inner(
 /// dependency graph failing, which the caller answers 422 — the same
 /// request resolves the same way.
 fn classify_resolve_failure(what: &str, error: &anyhow::Error) -> ResolverError {
-    if error.chain().any(<dyn std::error::Error + 'static>::is::<http_async::Error>) {
+    if error
+        .chain()
+        .any(<dyn std::error::Error + 'static>::is::<http_async::Error>)
+    {
         ResolverError::Upstream(format!("{what}: {error:#}"))
     } else {
         ResolverError::Unresolvable(format!("{what}: {error:#}"))
