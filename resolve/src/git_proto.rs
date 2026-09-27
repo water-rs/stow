@@ -126,7 +126,6 @@ pub async fn fetch_commit_tree(
     pkt_line(&mut body, "object-format=sha1\n");
     pkt_line(&mut body, AGENT);
     body.extend_from_slice(b"0001");
-    pkt_line(&mut body, "thin-pack\n");
     pkt_line(&mut body, "no-progress\n");
     pkt_line(&mut body, "ofs-delta\n");
     pkt_line(&mut body, &format!("deepen 1\n"));
@@ -322,7 +321,6 @@ pub async fn fetch_pack(
         pkt_line(&mut body, "object-format=sha1\n");
         pkt_line(&mut body, AGENT);
         body.extend_from_slice(b"0001");
-        pkt_line(&mut body, "thin-pack\n");
         pkt_line(&mut body, "no-progress\n");
         pkt_line(&mut body, "ofs-delta\n");
         if adv.can_deepen() {
@@ -337,11 +335,12 @@ pub async fn fetch_pack(
         // v0: echo the capabilities the server actually advertised on the
         // first `want` line; `deepen` rides after the flush, `done` ends
         // the single negotiation round.
+        // `thin-pack` is never requested: with no `have` lines the server
+        // has nothing to thin against, and the pack is self-contained.
         let caps = [
             "multi_ack_detailed",
             "no-done",
             "side-band-64k",
-            "thin-pack",
             "ofs-delta",
             "no-progress",
         ]
@@ -778,13 +777,48 @@ fn commit_tree(objects: &[Object], commit: &str) -> CargoResult<BTreeMap<PathBuf
         .iter()
         .find(|o| o.ty == OBJ_COMMIT && o.sha == commit_sha)
         .ok_or_else(|| anyhow!("pack lacks commit {commit}"))?;
-    let data = std::str::from_utf8(&commit_obj.data).context("commit is not UTF-8")?;
-    let root_sha = data
+    let mut entries = BTreeMap::new();
+    walk_tree(
+        objects,
+        commit_tree_sha(&commit_obj.data)?,
+        Path::new(""),
+        &mut entries,
+    )?;
+    Ok(entries)
+}
+
+/// The root tree a commit object names — its `tree` header's sha.
+fn commit_tree_sha(commit_data: &[u8]) -> CargoResult<[u8; 20]> {
+    let data = std::str::from_utf8(commit_data).context("commit is not UTF-8")?;
+    let root = data
         .lines()
         .find_map(|line| line.strip_prefix("tree "))
         .ok_or_else(|| anyhow!("commit has no tree"))?;
-    let mut entries = BTreeMap::new();
-    walk_tree(objects, decode_sha(root_sha)?, Path::new(""), &mut entries)?;
+    decode_sha(root)
+}
+
+/// Tree object bytes → `(name, mode, sha)` rows, verbatim git's
+/// `mode SP name NUL sha` layout.
+fn tree_entries(data: &[u8]) -> CargoResult<Vec<(String, u32, [u8; 20])>> {
+    let mut entries = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let Some(nul) = data[pos..].iter().position(|&b| b == 0) else {
+            bail!("truncated tree entry");
+        };
+        let header = std::str::from_utf8(&data[pos..pos + nul]).context("non-UTF-8 tree entry")?;
+        let (mode, name) = header
+            .split_once(' ')
+            .ok_or_else(|| anyhow!("malformed tree entry `{header}`"))?;
+        let mode = u32::from_str_radix(mode, 8).context("tree entry mode")?;
+        pos += nul + 1;
+        if pos + 20 > data.len() {
+            bail!("truncated tree entry sha");
+        }
+        let sha: [u8; 20] = data[pos..pos + 20].try_into().unwrap();
+        pos += 20;
+        entries.push((name.to_owned(), mode, sha));
+    }
     Ok(entries)
 }
 
@@ -809,24 +843,8 @@ fn walk_tree(
         .iter()
         .find(|o| o.ty == OBJ_TREE && o.sha == tree_sha)
         .ok_or_else(|| anyhow!("pack lacks tree {}", hex::encode(tree_sha)))?;
-    let mut pos = 0usize;
-    let data = &tree.data;
-    while pos < data.len() {
-        let Some(nul) = data[pos..].iter().position(|&b| b == 0) else {
-            bail!("truncated tree entry");
-        };
-        let header = std::str::from_utf8(&data[pos..pos + nul]).context("non-UTF-8 tree entry")?;
-        let (mode, name) = header
-            .split_once(' ')
-            .ok_or_else(|| anyhow!("malformed tree entry `{header}`"))?;
-        let mode = u32::from_str_radix(mode, 8).context("tree entry mode")?;
-        pos += nul + 1;
-        if pos + 20 > data.len() {
-            bail!("truncated tree entry sha");
-        }
-        let sha: [u8; 20] = data[pos..pos + 20].try_into().unwrap();
-        pos += 20;
-        let path = dir.join(name);
+    for (name, mode, sha) in tree_entries(&tree.data)? {
+        let path = dir.join(&name);
         if mode == 0o40000 {
             walk_tree(objects, sha, &path, entries)?;
         } else {
@@ -840,6 +858,325 @@ fn walk_tree(
         }
     }
     Ok(())
+}
+
+/// A pack entry's location: its raw type, its delta base when it is one,
+/// and where its zlib stream starts — enough to re-inflate the entry
+/// without rescanning the pack.
+struct EntryLoc {
+    offset: u64,
+    ty: u8,
+    base: Option<DeltaBase>,
+    data_offset: usize,
+}
+
+/// Where a delta entry's base lives.
+enum DeltaBase {
+    /// `ofs-delta`: the base entry's own offset in the pack.
+    Ofs(u64),
+    /// `ref-delta`: the base's object name.
+    Ref([u8; 20]),
+}
+
+/// A pack indexed for lazy blob decode: every entry's object id was
+/// computed in one pass — each entry inflated once — while only commits
+/// and trees were retained. Blobs re-inflate by offset on demand and
+/// delta chains resolve the same way, so peak residency is the pack, the
+/// index, the trees, and one in-flight decode — never every blob of the
+/// tree held at once.
+struct PackIndex<'a> {
+    pack: &'a [u8],
+    /// Entries in pack order.
+    locs: Vec<EntryLoc>,
+    /// Pack offset → entry index, for ofs-delta base lookups.
+    by_offset: BTreeMap<u64, usize>,
+    /// Object name → entry index, for ref-delta bases and the tree walk.
+    by_sha: BTreeMap<[u8; 20], usize>,
+    /// Decoded commits and trees keyed by name — the structure the tree
+    /// walk reads.
+    kept: BTreeMap<[u8; 20], (u8, std::rc::Rc<Vec<u8>>)>,
+}
+
+impl<'a> PackIndex<'a> {
+    /// Walk the pack once: locate every entry, inflate it, hash the
+    /// resolved object. Delta bases resolve from the pack by offset; a
+    /// `ref-delta` whose base's name is not yet indexed (its object may
+    /// sit later in the pack) waits for the fixpoint pass afterwards.
+    fn build(pack: &'a [u8]) -> CargoResult<Self> {
+        if pack.len() < 12 || &pack[..4] != b"PACK" {
+            bail!("not a packfile");
+        }
+        let count = u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize;
+        let mut index = PackIndex {
+            pack,
+            locs: Vec::with_capacity(count),
+            by_offset: BTreeMap::new(),
+            by_sha: BTreeMap::new(),
+            kept: BTreeMap::new(),
+        };
+        let mut pending = Vec::new();
+        let mut pos = 12usize;
+        for i in 0..count {
+            let offset = pos as u64;
+            let (ty, _size) = pack_obj_header(pack, &mut pos)?;
+            let base = match ty {
+                OBJ_OFS_DELTA => Some(DeltaBase::Ofs(ofs_delta_base(pack, &mut pos, offset)?)),
+                OBJ_REF_DELTA => {
+                    if pos + 20 > pack.len() {
+                        bail!("truncated ref-delta base");
+                    }
+                    let sha: [u8; 20] = pack[pos..pos + 20].try_into().unwrap();
+                    pos += 20;
+                    Some(DeltaBase::Ref(sha))
+                }
+                _ => None,
+            };
+            let data_offset = pos;
+            let (payload, used) = inflate(&pack[pos..])?;
+            pos += used;
+            index.by_offset.insert(offset, i);
+            index.locs.push(EntryLoc {
+                offset,
+                ty,
+                base,
+                data_offset,
+            });
+            let mut memo = BTreeMap::new();
+            match index.resolve(&index.locs[i], payload, &mut memo)? {
+                Some(object) => index.admit(i, object),
+                // A ref-delta base indexed later in the pack — retry once
+                // every entry's name is known.
+                None => pending.push(i),
+            }
+        }
+        loop {
+            let mut progressed = false;
+            let mut still = Vec::new();
+            for i in pending {
+                let mut memo = BTreeMap::new();
+                match index.decode(i, &mut memo)? {
+                    Some(object) => {
+                        index.admit(i, (*object).clone());
+                        progressed = true;
+                    }
+                    None => still.push(i),
+                }
+            }
+            if still.is_empty() {
+                break;
+            }
+            if !progressed {
+                bail!("pack delta bases could not be resolved");
+            }
+            pending = still;
+        }
+        Ok(index)
+    }
+
+    /// Record resolved `object` under its name; commit and tree objects
+    /// stay resident for the walk, everything else drops.
+    fn admit(&mut self, index: usize, object: (u8, Vec<u8>)) {
+        let (ty, data) = object;
+        let sha = object_sha(ty, &data);
+        self.by_sha.insert(sha, index);
+        if ty == OBJ_COMMIT || ty == OBJ_TREE {
+            self.kept.insert(sha, (ty, std::rc::Rc::new(data)));
+        }
+    }
+
+    /// Resolve an entry's already-inflated `payload` to `(type, data)`,
+    /// decoding delta bases recursively by offset. `None` means a
+    /// ref-delta base whose name is not indexed yet — the caller retries
+    /// after the walk.
+    fn resolve(
+        &self,
+        loc: &EntryLoc,
+        payload: Vec<u8>,
+        memo: &mut BTreeMap<usize, std::rc::Rc<(u8, Vec<u8>)>>,
+    ) -> CargoResult<Option<(u8, Vec<u8>)>> {
+        let resolved = match &loc.base {
+            None => (loc.ty, payload),
+            Some(DeltaBase::Ofs(offset)) => {
+                let Some(&base_index) = self.by_offset.get(offset) else {
+                    bail!("ofs-delta base at {offset} not in pack");
+                };
+                let Some(base) = self.decode(base_index, memo)? else {
+                    bail!("ofs-delta base at {offset} not in pack");
+                };
+                (base.0, apply_delta(&base.1, &payload)?)
+            }
+            Some(DeltaBase::Ref(sha)) => {
+                let Some(&base_index) = self.by_sha.get(sha) else {
+                    return Ok(None);
+                };
+                let Some(base) = self.decode(base_index, memo)? else {
+                    return Ok(None);
+                };
+                (base.0, apply_delta(&base.1, &payload)?)
+            }
+        };
+        // One object's decoded size is bounded the way the tarball lane
+        // bounds a member — a hostile pack errors instead of inflating
+        // without limit.
+        if resolved.1.len() as u64 > crate::util::tarball::MAX_RESOLVE_TREE_BYTES {
+            bail!(
+                "pack object exceeds the {}-byte object limit",
+                crate::util::tarball::MAX_RESOLVE_TREE_BYTES
+            );
+        }
+        Ok(Some(resolved))
+    }
+
+    /// Inflate entry `index` at its recorded offset and resolve it,
+    /// `memo` sharing the results the one decode's delta chain walks.
+    /// `None` only for a ref-delta base still unindexed.
+    fn decode(
+        &self,
+        index: usize,
+        memo: &mut BTreeMap<usize, std::rc::Rc<(u8, Vec<u8>)>>,
+    ) -> CargoResult<Option<std::rc::Rc<(u8, Vec<u8>)>>> {
+        if let Some(hit) = memo.get(&index) {
+            return Ok(Some(hit.clone()));
+        }
+        let loc = &self.locs[index];
+        let (payload, _) = inflate(&self.pack[loc.data_offset..])?;
+        let Some(resolved) = self.resolve(loc, payload, memo)? else {
+            return Ok(None);
+        };
+        let object = std::rc::Rc::new(resolved);
+        memo.insert(index, object.clone());
+        Ok(Some(object))
+    }
+
+    /// Decode the object named `sha` — a kept tree or commit, or a blob
+    /// re-inflated at its pack offset.
+    fn object(&self, sha: &[u8; 20]) -> CargoResult<(u8, std::rc::Rc<Vec<u8>>)> {
+        if let Some((ty, data)) = self.kept.get(sha) {
+            return Ok((*ty, data.clone()));
+        }
+        let Some(&index) = self.by_sha.get(sha) else {
+            bail!("pack lacks object {}", hex::encode(sha));
+        };
+        let mut memo = BTreeMap::new();
+        let object = self
+            .decode(index, &mut memo)?
+            .expect("indexed object resolves");
+        Ok((object.0, std::rc::Rc::new(object.1.clone())))
+    }
+}
+
+/// Decode `pack` — the un-band-framed payload of a `git-upload-pack`
+/// fetch response — into the same `path → contents` map
+/// [`crate::util::tarball::collect_tar_gz`] produces, restricted to the
+/// tree of `commit`.
+///
+/// Retention follows the tarball lane exactly: real bytes only where
+/// [`crate::util::tarball::resolve_reads_contents`] names the file (or a
+/// link resolves onto one), empty markers elsewhere, no directory
+/// entries, no `.cargo-ok`. The pack and the decoded objects die with
+/// this call — only the file map survives to be written into the
+/// checkout.
+pub fn tree_files(pack: &[u8], commit: &str) -> CargoResult<BTreeMap<PathBuf, Vec<u8>>> {
+    use crate::util::tarball;
+
+    let index = PackIndex::build(pack)?;
+    let commit_sha = decode_sha(commit)?;
+    let Some(&(OBJ_COMMIT, ref commit_data)) = index.kept.get(&commit_sha) else {
+        bail!("pack lacks commit {commit}");
+    };
+    let root = commit_tree_sha(commit_data)?;
+
+    // Walk the trees first, collecting files and links: which blobs to
+    // keep is decided once every link is known — a link walked before
+    // its target keeps the target's contents the same way.
+    let mut file_entries: Vec<(PathBuf, [u8; 20])> = Vec::new();
+    let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut stack = vec![(root, PathBuf::new())];
+    while let Some((tree_sha, dir)) = stack.pop() {
+        let Some(&(OBJ_TREE, ref tree_data)) = index.kept.get(&tree_sha) else {
+            bail!("pack lacks tree {}", hex::encode(tree_sha));
+        };
+        for (name, mode, sha) in tree_entries(tree_data)? {
+            // Tree names are single components, but a crafted pack could
+            // carry what a tar member would — reject escapes the way
+            // `unpack_in` does.
+            if name.is_empty() || name == ".." || name.contains('/') || name.contains('\\') {
+                bail!("tree entry `{name}` escapes the checkout root");
+            }
+            let rel = dir.join(&name);
+            if mode == 0o40000 {
+                stack.push((sha, rel));
+            } else if mode == 0o160000 {
+                // A gitlink is a submodule reference — like the codeload
+                // tarball, nothing is written beneath it.
+            } else if mode == 0o120000 {
+                let (ty, data) = index.object(&sha)?;
+                if ty != OBJ_BLOB {
+                    bail!("link `{}` is not a blob", rel.display());
+                }
+                let target = std::str::from_utf8(&data).context("non-UTF-8 link")?;
+                if let Some(target) = tarball::link_target(&rel, Path::new(target), true) {
+                    links.push((rel, target));
+                }
+            } else {
+                // cargo never extracts a `.cargo-ok` marker.
+                if name == ".cargo-ok" {
+                    continue;
+                }
+                file_entries.push((rel, sha));
+            }
+        }
+    }
+
+    // Targets a retained-name link resolves to keep their contents too —
+    // chased through the link map so a link to a link keeps the final
+    // file's bytes.
+    let link_map: BTreeMap<&Path, &Path> = links
+        .iter()
+        .map(|(rel, target)| (rel.as_path(), target.as_path()))
+        .collect();
+    let mut link_targets: std::collections::BTreeSet<PathBuf> = Default::default();
+    for (rel, target) in &links {
+        if !tarball::resolve_reads_contents(rel) {
+            continue;
+        }
+        let mut current = target.as_path();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(next) = link_map.get(current) {
+            if !seen.insert(current) {
+                break; // link cycle — the link leaves no entry
+            }
+            current = next;
+        }
+        link_targets.insert(current.to_path_buf());
+    }
+
+    // Only the retained blobs are re-inflated — everything else lands
+    // as an empty-but-present marker, matching the tarball lane.
+    let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+    let mut retained: u64 = 0;
+    for (rel, sha) in file_entries {
+        let keep = tarball::resolve_reads_contents(&rel) || link_targets.contains(rel.as_path());
+        let contents = if keep {
+            let (ty, data) = index.object(&sha)?;
+            if ty != OBJ_BLOB {
+                bail!("file `{}` is not a blob", rel.display());
+            }
+            if data.len() as u64 > tarball::MAX_RESOLVE_TREE_BYTES.saturating_sub(retained) {
+                bail!(
+                    "the pack's resolution inputs exceed the {}-byte retained-content limit",
+                    tarball::MAX_RESOLVE_TREE_BYTES
+                );
+            }
+            retained += data.len() as u64;
+            (*data).clone()
+        } else {
+            Vec::new()
+        };
+        files.insert(rel, contents);
+    }
+    tarball::materialize_links(&mut files, &links);
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -902,6 +1239,53 @@ mod tests {
         delta.push(0); // offset 0
         delta.push(5); // size 5
         assert_eq!(apply_delta(&base, &delta).unwrap(), b"hello");
+    }
+
+    /// `tests/fixtures/delta.pack` is a `git pack-objects
+    /// --delta-base-offset` capture of a one-commit repo (commit
+    /// `e2ac16b8…`) whose `Cargo.toml` blob is an ofs-delta against the
+    /// non-retained `zbase.txt` blob. Retaining `Cargo.toml` forces the
+    /// lazy decode-by-offset path to re-inflate the delta and resolve
+    /// its base straight from the pack.
+    #[test]
+    fn tree_files_decodes_retained_ofs_delta_blob() {
+        let pack = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/delta.pack"
+        ));
+        let files = tree_files(pack, "e2ac16b833e2ab69530a140a153a16c3bdc0095b").unwrap();
+
+        let names = [
+            "serde", "anyhow", "tokio", "regex", "clap", "tracing", "rand", "bytes", "futures",
+            "hyper",
+        ];
+        let deps = (0..300)
+            .map(|i| format!("{} = \"1.0.{i}\"\n", names[i % names.len()]))
+            .collect::<String>();
+        let manifest = format!(
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"
+        );
+        assert_eq!(
+            files[Path::new("Cargo.toml")].as_slice(),
+            manifest.as_bytes()
+        );
+        // The delta's base is a non-retained blob — present as an empty
+        // marker, its contents never leaving the pack except through the
+        // offset chase the delta resolution ran.
+        assert_eq!(files[Path::new("zbase.txt")].as_slice(), b"");
+    }
+
+    /// Same fixture: `big.bin` is a 64 KiB blob nothing retains, so the
+    /// map carries an empty marker for it — bounded residency means its
+    /// decoded bytes were never kept.
+    #[test]
+    fn tree_files_marks_non_retained_blob_empty() {
+        let pack = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/delta.pack"
+        ));
+        let files = tree_files(pack, "e2ac16b833e2ab69530a140a153a16c3bdc0095b").unwrap();
+        assert_eq!(files[Path::new("big.bin")].as_slice(), b"");
     }
 
     /// `inflate` reports how many input bytes the stream consumed so the

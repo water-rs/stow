@@ -17,7 +17,6 @@ pub use self::utils::{fetch, resolve_ref};
 mod known_hosts;
 #[cfg(not(target_family = "wasm"))]
 mod oxide;
-mod pack;
 mod tree;
 #[cfg(not(target_family = "wasm"))]
 mod utils;

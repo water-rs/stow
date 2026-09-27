@@ -558,7 +558,7 @@ impl<'gctx> GitTreeSource<'gctx> {
                 let adv = self.advertisement(url).await?;
                 let pack =
                     crate::git_proto::fetch_pack(self.gctx.http_async()?, url, sha, &adv).await?;
-                super::pack::tree_files(pack, sha)
+                crate::git_proto::tree_files(&pack, sha)
             }
         }
     }
