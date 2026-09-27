@@ -19,6 +19,9 @@ pub struct OutputMetadataOptions {
     pub no_deps: bool,
     pub version: u32,
     pub filter_platforms: Vec<String>,
+    /// As [`crate::ops::select_ws_with_opts`]'s `yanked_allowlist` — the
+    /// project's own lockfile pins, admissible even when yanked.
+    pub yanked_allowlist: std::collections::BTreeSet<PackageId>,
 }
 
 /// This is the structure that is serialized and displayed to the user.
@@ -165,6 +168,7 @@ pub async fn build_resolve_graph_with<'gctx>(
         HasDevUnits::Yes,
         force_all,
         dry_run,
+        &metadata_opts.yanked_allowlist,
     )
     .await?;
 

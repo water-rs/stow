@@ -107,6 +107,11 @@ pub struct PackageRegistry<'gctx> {
     /// This is constructed via [`PackageRegistry::register_lock`].
     /// See also [`LockedMap`].
     locked: LockedMap,
+    /// Packages whose index entry may be selected even though it is
+    /// yanked — the pins of the project's own lockfile, the admission rule
+    /// cargo applies to `Cargo.lock`. See
+    /// [`PackageRegistry::add_to_yanked_whitelist`].
+    yanked_whitelist: HashSet<PackageId>,
     source_config: SourceConfigMap<'gctx>,
 
     /// Patches registered during calls to [`PackageRegistry::patch`].
@@ -201,6 +206,7 @@ impl<'gctx> PackageRegistry<'gctx> {
             overrides: RefCell::new(Vec::new()),
             source_config,
             locked: HashMap::new(),
+            yanked_whitelist: HashSet::new(),
             patches: HashMap::new(),
             patches_locked: false,
             patches_available: HashMap::new(),
@@ -285,6 +291,18 @@ impl<'gctx> PackageRegistry<'gctx> {
     pub fn clear_lock(&mut self) {
         trace!("clear_lock");
         self.locked = HashMap::new();
+    }
+
+    /// Allows a group of packages to be available to query even if they
+    /// are yanked — the versions a project's own `Cargo.lock` pins.
+    ///
+    /// Upstream cargo hands the whitelist to each loaded `Source` so a
+    /// whitelisted version arrives as [`IndexSummary::Candidate`]. This
+    /// build's `Source` trait has no such hook, so [`Registry::query`]
+    /// rewrites `Yanked` to `Candidate` on the way out instead: admission
+    /// only, with no influence on version preference.
+    pub fn add_to_yanked_whitelist(&mut self, iter: impl Iterator<Item = PackageId>) {
+        self.yanked_whitelist.extend(iter);
     }
 
     /// Registers one "locked package" to the registry, for guiding the
@@ -758,6 +776,7 @@ impl<'gctx> Registry for PackageRegistry<'gctx> {
                 // then we skip this `summary`.
                 let locked = &self.locked;
                 let all_patches = &self.patches_available;
+                let yanked_whitelist = &self.yanked_whitelist;
                 let callback = &mut |summary: IndexSummary| {
                     for patch in patches.iter() {
                         let patch = patch.package_id().version();
@@ -766,7 +785,16 @@ impl<'gctx> Registry for PackageRegistry<'gctx> {
                         }
                     }
                     let summary = summary.map_summary(|summary| lock(locked, all_patches, summary));
-                    f(summary)
+                    match summary {
+                        // A whitelisted version — one the project's own
+                        // lockfile pins — is admissible even though yanked.
+                        IndexSummary::Yanked(summary)
+                            if yanked_whitelist.contains(&summary.package_id()) =>
+                        {
+                            f(IndexSummary::Candidate(summary))
+                        }
+                        summary => f(summary),
+                    }
                 };
                 return query_with_context(&*source, dep, kind, callback).await;
             }

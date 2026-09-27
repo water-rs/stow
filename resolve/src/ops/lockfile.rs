@@ -1,7 +1,8 @@
+use std::collections::BTreeSet;
 use std::io::prelude::*;
 
 use crate::core::resolver::encode::into_resolve;
-use crate::core::{Resolve, ResolveVersion, Workspace};
+use crate::core::{PackageId, Resolve, ResolveVersion, SourceId, Workspace};
 use crate::util::Filesystem;
 use crate::util::errors::CargoResult;
 
@@ -9,6 +10,28 @@ use anyhow::Context as _;
 use cargo_util_schemas::lockfile::TomlLockfile;
 
 pub const LOCKFILE_NAME: &str = "Cargo.lock";
+
+/// The `PackageId`s a lockfile's `[[package]]` `source` entries name —
+/// its registry and git pins. Member (path) entries carry no `source`
+/// and are skipped.
+///
+/// This is the yanked allowlist for a fresh resolve: a version the
+/// project's own lockfile pins stays admissible even when the index
+/// marks it yanked, which is cargo's own `Cargo.lock` rule.
+pub fn lockfile_package_ids(contents: &str) -> CargoResult<BTreeSet<PackageId>> {
+    let lockfile: TomlLockfile = toml::from_str(contents)?;
+    let mut packages = lockfile.package.unwrap_or_default();
+    if let Some(root) = lockfile.root {
+        packages.insert(0, root);
+    }
+    let mut ids = BTreeSet::new();
+    for pkg in &packages {
+        let Some(source) = &pkg.source else { continue };
+        let source = SourceId::from_url(source.source_str())?;
+        ids.insert(PackageId::try_new(&pkg.name, &pkg.version, source)?);
+    }
+    Ok(ids)
+}
 
 #[tracing::instrument(skip_all)]
 pub fn load_pkg_lockfile(ws: &Workspace<'_>) -> CargoResult<Option<Resolve>> {

@@ -86,7 +86,7 @@ use crate::util::report::Level;
 use anyhow::Context as _;
 use cargo_util_schemas::core::PartialVersion;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use tracing::{debug, trace};
 
@@ -331,8 +331,17 @@ pub async fn resolve_ws_with_opts<'gctx>(
     has_dev_units: HasDevUnits,
     force_all_targets: ForceAllTargets,
     dry_run: bool,
+    yanked_allowlist: &BTreeSet<PackageId>,
 ) -> CargoResult<WorkspaceResolve<'gctx>> {
-    let selection = select_ws_with_opts(ws, cli_features, specs, has_dev_units, dry_run).await?;
+    let selection = select_ws_with_opts(
+        ws,
+        cli_features,
+        specs,
+        has_dev_units,
+        dry_run,
+        yanked_allowlist,
+    )
+    .await?;
     let specs_and_features = selection
         .project(
             ws,
@@ -353,12 +362,19 @@ pub async fn resolve_ws_with_opts<'gctx>(
 /// The selection half of [`resolve_ws_with_opts`], split out so a caller
 /// can run it once and [`ResolveSelection::project`] per target.
 /// See [`resolve_ws_with_opts`] for the parameter contract.
+///
+/// `yanked_allowlist` is the set of [`PackageId`]s a resolve may select
+/// even though the index marks them yanked — the pins of the project's
+/// own `Cargo.lock`, which cargo itself admits. Admission only: the set
+/// is registered with [`PackageRegistry::add_to_yanked_whitelist`] and
+/// never enters `VersionPreferences`, so it does not pin anything.
 pub async fn select_ws_with_opts<'gctx>(
     ws: &Workspace<'gctx>,
     cli_features: &CliFeatures,
     specs: &[PackageIdSpec],
     has_dev_units: HasDevUnits,
     dry_run: bool,
+    yanked_allowlist: &BTreeSet<PackageId>,
 ) -> CargoResult<ResolveSelection<'gctx>> {
     let feature_unification = ws.resolve_feature_unification();
     let individual_specs = match feature_unification {
@@ -376,6 +392,7 @@ pub async fn select_ws_with_opts<'gctx>(
         .collect();
     let specs = &specs[..];
     let mut registry = ws.package_registry()?;
+    registry.add_to_yanked_whitelist(yanked_allowlist.iter().copied());
     let (resolve, resolved_with_overrides) = if ws.ignore_lock() {
         let add_patches = true;
         let resolve = None;

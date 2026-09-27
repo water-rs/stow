@@ -283,6 +283,10 @@ async fn resolve_at(
                     .to_string(),
                 cfg: cfg.clone(),
                 members_are_crates_io: false,
+                // The checkout keeps its own `Cargo.lock`, so yanked
+                // pins it names are already admitted by the previous-
+                // resolve path.
+                yanked_allowlist: std::collections::BTreeSet::new(),
             },
         )
         .await
