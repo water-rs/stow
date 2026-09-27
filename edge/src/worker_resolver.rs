@@ -1063,18 +1063,22 @@ async fn resolve_session_outputs(
         gctx.set_http(Client::new(http.clone()));
         gctx.share_index_caches(index_caches.clone());
         tracing::info!("resolve: session prepare begin");
+        // Selection runs against one rustc version; every family's `-vV`
+        // for the pinned toolchain reports it.
+        let session_rustc = verbose_by_host
+            .values()
+            .next()
+            .cloned()
+            .ok_or_else(|| ResolverError::BadRequest("resolve needs a target".to_string()))?;
         let session = api::ResolveSession::prepare(
             &gctx,
-            &StowResolveInput {
+            &api::StowSessionInput {
                 manifest_path: source.manifest_path.clone(),
-                // Per-projection fields; `project` takes them directly.
-                filter_platforms: Vec::new(),
-                host_triple: String::new(),
                 features: seed_features.iter().cloned().collect(),
                 all_features: false,
                 no_default_features,
                 members_are_crates_io: source.members_are_crates_io,
-                rustc_verbose_version: String::new(),
+                rustc_verbose_version: session_rustc,
                 cfg,
             },
         )

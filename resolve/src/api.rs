@@ -77,6 +77,39 @@ pub struct StowResolveInput {
     pub members_are_crates_io: bool,
 }
 
+/// What a shared [`ResolveSession`] needs: the workspace plus everything
+/// version selection consumes. The per-projection fields of a full
+/// [`StowResolveInput`] — `filter_platforms` and `host_triple` — are absent
+/// by construction; they belong to [`ResolveSession::project`].
+#[derive(Clone)]
+pub struct StowSessionInput {
+    /// Absolute path of the workspace root `Cargo.toml`, as
+    /// [`StowResolveInput::manifest_path`].
+    pub manifest_path: PathBuf,
+    /// `--features` values.
+    pub features: Vec<String>,
+    /// `--all-features`.
+    pub all_features: bool,
+    /// `--no-default-features` (inverted to `uses_default_features`).
+    pub no_default_features: bool,
+    /// `rustc --print cfg` output lines keyed by triple, as
+    /// [`StowResolveInput::cfg`]. Selection itself reads no cfg entries —
+    /// the map is stored for the projections.
+    pub cfg: BTreeMap<String, Vec<String>>,
+    /// Whether the workspace's own members are crates.io packages, as
+    /// [`StowResolveInput::members_are_crates_io`].
+    pub members_are_crates_io: bool,
+    /// `rustc -vV` stdout of the toolchain the resolve runs against —
+    /// installed on `gctx` via [`GlobalContext::set_rustc`] before the
+    /// workspace loads, because selection reads it through
+    /// [`GlobalContext::load_global_rustc`] whenever resolver v3 honours
+    /// `rust-version`. Any host's `-vV` for the pinned rustc version works
+    /// here; [`ResolveSession::project`] still requires each projection's
+    /// own `host_triple` `-vV` to report that host, and refuses a version
+    /// different from the one selection saw.
+    pub rustc_verbose_version: String,
+}
+
 /// Stow's per-side unit graph under `units`/`roots`.
 #[derive(Serialize)]
 pub struct StowResolveOutput {
@@ -401,6 +434,9 @@ pub struct ResolveSession<'gctx> {
     /// projection clones this and merges in that projection's kinds'
     /// rustflags cfgs.
     cfgs: HashMap<String, Vec<Cfg>>,
+    /// The version of the rustc selection ran against — every projection's
+    /// rustc must agree, since the package set was chosen under it.
+    rustc_version: semver::Version,
     specs: Vec<PackageIdSpec>,
     cli_features: CliFeatures,
     selection: ops::ResolveSelection<'gctx>,
@@ -409,13 +445,23 @@ pub struct ResolveSession<'gctx> {
 }
 
 impl<'gctx> ResolveSession<'gctx> {
-    /// Loads the workspace and runs version selection once. The input's
-    /// `filter_platforms`, `host_triple`, and `rustc_verbose_version` are
-    /// per-projection parameters — pass them to [`Self::project`].
+    /// Loads the workspace and runs version selection once. Selection
+    /// reads the gctx's rustc (`load_global_rustc`) whenever the workspace
+    /// honours `rust-version`, so the input's `rustc_verbose_version` is
+    /// installed here — before the workspace exists. `filter_platforms`,
+    /// `host_triple`, and each projection's own `-vV` stay per-projection
+    /// parameters of [`Self::project`].
     pub async fn prepare(
         gctx: &'gctx GlobalContext,
-        input: &StowResolveInput,
+        input: &StowSessionInput,
     ) -> CargoResult<ResolveSession<'gctx>> {
+        let rustc = Rustc::new_from_verbose_version(
+            PathBuf::from("rustc"),
+            input.rustc_verbose_version.clone(),
+        )?;
+        let rustc_version = rustc.version.clone();
+        gctx.set_rustc(rustc)?;
+
         // `.cargo/config.toml` in the fetched tree applies to everything
         // below — load it before any lazy config read can freeze `values`
         // empty.
@@ -455,6 +501,7 @@ impl<'gctx> ResolveSession<'gctx> {
             gctx,
             ws,
             cfgs,
+            rustc_version,
             specs,
             cli_features,
             selection,
@@ -483,6 +530,17 @@ impl<'gctx> ResolveSession<'gctx> {
                 "injected rustc host `{}` does not match host_triple `{}`",
                 rustc.host,
                 host_triple
+            );
+        }
+        // Selection ran under the session's rustc version; a projection on
+        // a different version would pair that package set with cfgs and
+        // rust-version gates it never asked about. A different host is the
+        // normal multi-target case and is fine.
+        if rustc.version != self.rustc_version {
+            anyhow::bail!(
+                "projection rustc version `{}` differs from the session's `{}`",
+                rustc.version,
+                self.rustc_version
             );
         }
 
@@ -554,14 +612,32 @@ pub async fn resolve(
     gctx: &GlobalContext,
     input: StowResolveInput,
 ) -> CargoResult<StowResolveOutput> {
-    ResolveSession::prepare(gctx, &input)
-        .await?
-        .project(
-            &input.filter_platforms,
-            &input.host_triple,
-            &input.rustc_verbose_version,
-        )
-        .await
+    let StowResolveInput {
+        manifest_path,
+        filter_platforms,
+        host_triple,
+        features,
+        all_features,
+        no_default_features,
+        rustc_verbose_version,
+        cfg,
+        members_are_crates_io,
+    } = input;
+    ResolveSession::prepare(
+        gctx,
+        &StowSessionInput {
+            manifest_path,
+            features,
+            all_features,
+            no_default_features,
+            cfg,
+            members_are_crates_io,
+            rustc_verbose_version: rustc_verbose_version.clone(),
+        },
+    )
+    .await?
+    .project(&filter_platforms, &host_triple, &rustc_verbose_version)
+    .await
 }
 
 /// Which cargo side a dep edge lands on: build deps and proc-macros live
@@ -1160,6 +1236,56 @@ serde = "1"
                 .dependencies
                 .as_ref()
                 .is_some_and(|deps| deps.contains_key("serde"))
+        );
+    }
+
+    /// A resolver-v3 workspace (edition 2024 without `rust-version`) makes
+    /// version selection consult the gctx's rustc, so `prepare` must have
+    /// installed one before the workspace loads — this is stow's
+    /// `admin/resolve` path, which failed with "no rustc injected" until it
+    /// did. A projection whose rustc reports a different *version* is
+    /// refused, since the package set was selected under the session's.
+    #[test]
+    fn session_prepare_installs_the_selection_rustc() {
+        let repo: &str = if cfg!(windows) { "C:/repo" } else { "/repo" };
+        let vfs = Rc::new(MemoryVfs::new());
+        set_vfs(vfs.clone());
+        vfs.insert(
+            format!("{repo}/Cargo.toml"),
+            br#"
+[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+"#
+            .to_vec(),
+        );
+        vfs.insert(format!("{repo}/src/lib.rs"), b"pub fn f() {}".to_vec());
+        let gctx = test_gctx(repo);
+        let host = "x86_64-unknown-linux-gnu";
+        let verbose = rustc_data::verbose_version("1.98.1", host).unwrap();
+        let input = StowSessionInput {
+            manifest_path: Path::new(repo).join("Cargo.toml"),
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+            cfg: BTreeMap::from([(host.to_string(), rustc_data::cfg("1.98.1", host).unwrap())]),
+            members_are_crates_io: false,
+            rustc_verbose_version: verbose.to_string(),
+        };
+        let session = futures::executor::block_on(ResolveSession::prepare(&gctx, &input))
+            .expect("prepare installs the rustc selection needs");
+        let output = futures::executor::block_on(session.project(&[], host, verbose))
+            .expect("project on the session's rustc");
+        assert_eq!(output.units.len(), 1);
+
+        let other_version = verbose.replace("release: 1.98.1", "release: 1.98.0");
+        let error = futures::executor::block_on(session.project(&[], host, &other_version))
+            .err()
+            .expect("a projection on another rustc version must fail");
+        assert!(
+            format!("{error:#}").contains("differs from the session's"),
+            "{error:#}"
         );
     }
 }
