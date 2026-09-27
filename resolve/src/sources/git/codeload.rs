@@ -196,7 +196,11 @@ pub struct CodeloadGitSource<'gctx> {
     repo: GitHubRepo,
     requested: RefCell<RequestedRev>,
     source_id: RefCell<SourceId>,
-    path_source: RefCell<Option<RecursivePathSource<'gctx>>>,
+    /// `Rc` so `query`/`download` can take the loaded source out of the
+    /// cell before awaiting — a `Ref`/`RefMut` held across an `.await`
+    /// deadlocks (panics on wasm) against a concurrent `update`'s
+    /// `replace`.
+    path_source: RefCell<Option<Rc<RecursivePathSource<'gctx>>>>,
     short_id: RefCell<Option<InternedString>>,
     /// The source identifier for Cargo's git checkout cache directories.
     ident: InternedString,
@@ -340,27 +344,31 @@ impl<'gctx> CodeloadGitSource<'gctx> {
     /// The commit the requested revision names, resolving named refs over
     /// ls-remote the way git does.
     async fn resolve_sha(&self) -> CargoResult<String> {
-        match &*self.requested.borrow() {
-            RequestedRev::Sha(sha) => Ok(sha.clone()),
-            RequestedRev::Reference(reference) => match reference {
-                GitReference::Rev(rev) if is_full_sha(rev) => Ok(rev.clone()),
-                GitReference::Rev(rev) if looks_like_commit_hash(rev) => {
-                    // git's revparse resolves a `rev` against refs before
-                    // trying it as a commit hash — a branch or tag literally
-                    // named `rev` still wins. A bare hash names a commit:
-                    // ls-remote never carries it, so when no ref matches,
-                    // GitHub's commits API expands it the same way cargo's
-                    // `github_fast_path` does.
-                    match self.ls_remote(reference).await {
-                        Ok(sha) => Ok(sha),
-                        Err(reference_err) => self
-                            .resolve_commit_sha(rev)
-                            .await
-                            .map_err(|_| reference_err),
-                    }
+        // The resolver polls queries on one source concurrently, so no
+        // borrow of `self`'s cells may live across an `.await` — copy the
+        // reference out before any fetch.
+        let reference = match &*self.requested.borrow() {
+            RequestedRev::Sha(sha) => return Ok(sha.clone()),
+            RequestedRev::Reference(reference) => reference.clone(),
+        };
+        match &reference {
+            GitReference::Rev(rev) if is_full_sha(rev) => Ok(rev.clone()),
+            GitReference::Rev(rev) if looks_like_commit_hash(rev) => {
+                // git's revparse resolves a `rev` against refs before
+                // trying it as a commit hash — a branch or tag literally
+                // named `rev` still wins. A bare hash names a commit:
+                // ls-remote never carries it, so when no ref matches,
+                // GitHub's commits API expands it the same way cargo's
+                // `github_fast_path` does.
+                match self.ls_remote(&reference).await {
+                    Ok(sha) => Ok(sha),
+                    Err(reference_err) => self
+                        .resolve_commit_sha(rev)
+                        .await
+                        .map_err(|_| reference_err),
                 }
-                reference => self.ls_remote(reference).await,
-            },
+            }
+            reference => self.ls_remote(reference).await,
         }
     }
 
@@ -499,7 +507,7 @@ impl<'gctx> CodeloadGitSource<'gctx> {
         let path_source = RecursivePathSource::new(&checkout_path, source_id, self.gctx);
         path_source.load()?;
 
-        self.path_source.replace(Some(path_source));
+        self.path_source.replace(Some(Rc::new(path_source)));
         self.short_id.replace(Some(short_sha(&sha).into()));
         self.requested.replace(RequestedRev::Sha(sha));
         self.mark_used()
@@ -529,16 +537,25 @@ impl<'gctx> Source for CodeloadGitSource<'gctx> {
         if self.path_source.borrow().is_none() {
             self.update().await?;
         }
-        let src = self.path_source.borrow();
-        let src = src.as_ref().unwrap();
+        // `src.query` awaits; clone the `Rc` out so the borrow of
+        // `path_source` cannot collide with a concurrent `update`'s
+        // `replace`.
+        let src = self
+            .path_source
+            .borrow()
+            .clone()
+            .expect("`update` leaves the path source loaded");
         src.query(dep, kind, f).await
     }
 
     async fn download(&self, id: PackageId) -> CargoResult<MaybePackage> {
         self.mark_used()?;
+        // Same shape as `query`: downloads of several packages in one git
+        // checkout run concurrently, so clone the `Rc` rather than holding
+        // a borrow across the await.
         self.path_source
-            .borrow_mut()
-            .as_mut()
+            .borrow()
+            .clone()
             .expect("BUG: `update()` must be called before `get()`")
             .download(id)
             .await
@@ -717,6 +734,116 @@ mod tests {
             .expect("github source");
         let sha = futures::executor::block_on(source.resolve_sha()).unwrap();
         assert_eq!(sha, full_sha);
+        fs::replace_vfs(None);
+    }
+
+    /// The resolver polls queries on one source concurrently, so
+    /// concurrent `update()`s interleave at every `.await`. While the
+    /// first is parked inside `resolve_sha`'s ls-remote, the second
+    /// completes and writes the results: a `RefCell` borrow held across
+    /// that await used to panic `RefCell already borrowed` in
+    /// `requested.replace` — a trap that on wasm left the request's
+    /// promise pending forever (the production "code had hung").
+    #[test]
+    fn concurrent_updates_on_one_source_do_not_deadlock() {
+        use futures::channel::oneshot;
+
+        fs::set_vfs(Rc::new(crate::util::fs::MemoryVfs::new()));
+        let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let pkt = |payload: &str| format!("{:04x}{payload}", payload.len() + 4);
+        let ls_remote = format!(
+            "{}{}{}{}{}",
+            pkt("# service=git-upload-pack\n"),
+            "0000",
+            pkt("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HEAD\0multi_ack thin-pack\n"),
+            pkt(&format!("{sha} refs/heads/main\n")),
+            "0000"
+        );
+
+        /// Answers ls-remote immediately except the first call, which
+        /// parks until the test opens `gate`.
+        struct GateHttp {
+            ls_remote: Vec<u8>,
+            gate: std::cell::Cell<Option<oneshot::Receiver<()>>>,
+        }
+        impl crate::util::network::http_async::HttpClient for GateHttp {
+            fn request<'a>(
+                &'a self,
+                request: http::Request<Vec<u8>>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = CargoResult<http::Response<Vec<u8>>>> + 'a>,
+            > {
+                let _ = request;
+                Box::pin(async move {
+                    if let Some(gate) = self.gate.take() {
+                        let _ = gate.await;
+                    }
+                    Ok(http::Response::builder()
+                        .status(200)
+                        .body(self.ls_remote.clone())
+                        .unwrap())
+                })
+            }
+        }
+
+        let (gate_send, gate_recv) = oneshot::channel();
+        let mut gctx = GlobalContext::default().unwrap();
+        gctx.set_http(crate::util::network::http_async::Client::new(Rc::new(
+            GateHttp {
+                ls_remote: ls_remote.into_bytes(),
+                gate: std::cell::Cell::new(Some(gate_recv)),
+            },
+        )));
+        let url = Url::parse("https://github.com/zed-industries/wprcontrol").unwrap();
+        let source_id = SourceId::for_git(&url, GitReference::Branch("main".to_string())).unwrap();
+        let source = Rc::new(
+            CodeloadGitSource::for_github(source_id, &gctx)
+                .unwrap()
+                .expect("github source"),
+        );
+
+        // The checkout already exists, so `update` skips the fetch loop —
+        // the collision being tested is the parked `resolve_sha` borrow
+        // versus the second update's `replace`, not the fetch gate.
+        let ident = ident_shallow(&source_id);
+        let checkout = gctx
+            .git_checkouts_path()
+            .join(&ident)
+            .into_path_unlocked()
+            .join(format!("wprcontrol-{sha}"));
+        fs::write(
+            checkout.join("Cargo.toml"),
+            b"[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(checkout.join("src/lib.rs"), b"pub fn f() {}").unwrap();
+
+        // Drive the two updates by hand, the interleave the resolver's
+        // poller produces: the first parks in `ls_remote` holding (before
+        // the fix) a borrow of `requested`; the second then runs `update`
+        // to completion in one poll — its `requested.replace` collided
+        // with the parked borrow.
+        let mut first = Box::pin(source.update());
+        let mut second = Box::pin(source.update());
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        match second.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(result) => result.expect("second update failed"),
+            std::task::Poll::Pending => {
+                panic!("second update blocked while the first was parked")
+            }
+        }
+        gate_send.send(()).unwrap();
+        loop {
+            match first.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(result) => {
+                    result.expect("first update failed");
+                    break;
+                }
+                std::task::Poll::Pending => {}
+            }
+        }
         fs::replace_vfs(None);
     }
 
