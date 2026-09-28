@@ -255,7 +255,7 @@ jobs:
           expected=$(sed -n 's/.*const SCHEMA_VERSION: i64 = \([0-9]\+\).*/\1/p' \
             edge/src/scheduler/queue.rs)
           if [ -z "$expected" ]; then
-            echo "::error::no SCHEMA_VERSION in the candidate source — land #437 before this workflow can deploy" >&2
+            echo "::error::no SCHEMA_VERSION in the candidate source" >&2
             exit 1
           fi
           if [ "$after" != "$expected" ]; then
