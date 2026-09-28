@@ -420,6 +420,49 @@ pub struct AdmissionRequest {
     pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
 }
 
+/// The pipeline step a failed attempt was running when it died.
+///
+/// A `BuildCompleteReport` carries it on `failure_step` so the
+/// scheduler's dispatch-freeze breaker can name the dominant failure
+/// classes without parsing free text — the step is the disambiguator an
+/// error prefix alone lacks (a register rejection is reported by the
+/// publish job, not by anything named `register`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureStep {
+    /// `stow-build build` — the untrusted compile stage.
+    Build,
+    /// `stow-build publish` short of artifact registration — the
+    /// validate/push/sign work the trusted job runs.
+    Publish,
+    /// The publish stage's `POST /api/v1/admin/artifacts/register` call
+    /// into the edge.
+    Register,
+}
+
+impl FailureStep {
+    /// The lowercase wire string the report serializes.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Publish => "publish",
+            Self::Register => "register",
+        }
+    }
+
+    /// Parse a stored `as_str()` value back.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "build" => Some(Self::Build),
+            "publish" => Some(Self::Publish),
+            "register" => Some(Self::Register),
+            _ => None,
+        }
+    }
+}
+
 /// CI reports job completion to the scheduler DO.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BuildCompleteReport {
@@ -436,6 +479,12 @@ pub struct BuildCompleteReport {
     pub success: bool,
     /// Failure description when `success` is false.
     pub error: Option<String>,
+    /// The pipeline step the failure happened in — set by senders that
+    /// know it so the scheduler's breaker classes the failure by
+    /// `step: error-prefix` instead of the prefix alone. Absent on
+    /// success and on reports from senders that predate the field.
+    #[serde(default)]
+    pub failure_step: Option<FailureStep>,
     /// Number of artifacts uploaded (including transitive deps).
     pub artifacts_uploaded: u32,
     /// GitHub Actions run id the report came from. CI leaves it `None`;
@@ -506,6 +555,229 @@ pub struct ResolvedDependencyGraphEntry {
 pub struct PanicSwitch {
     /// Whether anonymous traffic is being shed.
     pub enabled: bool,
+}
+
+/// The dispatch freeze — the scheduler's "builds are failing
+/// systematically" / "usage is over budget" circuit breaker.
+///
+/// Held by the scheduler Durable Object in its `settings` table under
+/// `dispatch_freeze`. Unlike [`PanicSwitch`], which sheds anonymous edge
+/// traffic to protect the worker, an engaged freeze stops the Durable
+/// Object from handing queue rows to CI runners so a systematic breakage
+/// cannot burn the org's Actions allowance; untrusted enqueues keep
+/// flowing. Wire shape of `GET`/`POST /api/v1/admin/dispatch-freeze`
+/// and of the scheduler object's `/dispatch-freeze` routes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreeze {
+    /// Whether dispatch is frozen.
+    pub enabled: bool,
+    /// The stored freeze record — present only while `enabled` holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<DispatchFreezeRecord>,
+}
+
+/// The record stored while a dispatch freeze is engaged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeRecord {
+    /// ISO 8601 timestamp the freeze engaged.
+    pub frozen_at: String,
+    /// What engaged the freeze.
+    pub trigger: DispatchFreezeTrigger,
+    /// What happened to the freeze alert email. Persisted so a freeze
+    /// nobody was told about is visible to whoever eventually reads it —
+    /// the exact failure this feature exists to prevent.
+    pub notify: DispatchFreezeNotify,
+}
+
+/// What engaged a dispatch freeze.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DispatchFreezeTrigger {
+    /// An operator froze dispatch by hand (`POST /dispatch-freeze`).
+    Manual,
+    /// The systematic-failure trip condition fired on a completion
+    /// report: enough outcomes inside the window *and* a failure ratio
+    /// over them, both required.
+    Tripped(DispatchFreezeTrip),
+    /// The scheduled usage check found a metered dimension over its
+    /// daily budget (`Cost` also flips the panic switch on).
+    Cost(DispatchFreezeCost),
+}
+
+/// The observed window that tripped a dispatch freeze — the numbers the
+/// freeze alert names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeTrip {
+    /// Configured window the outcomes were counted over.
+    pub window_minutes: u32,
+    /// Configured minimum sample: no stream trips below it however bad
+    /// its ratio.
+    pub min_outcomes: u32,
+    /// Configured failure ratio (percent) a sufficiently-sampled stream
+    /// must reach to trip.
+    pub fail_percent: u32,
+    /// Completed attempts observed across the fleet inside the window.
+    pub outcomes: u32,
+    /// Failed attempts across the fleet inside the window.
+    pub failures: u32,
+    /// `failures / outcomes` as a whole percent.
+    pub failure_percent: u32,
+    /// Whether the fleet-wide stream tripped on its own (the per-target
+    /// streams may trip independently of it — either is enough).
+    pub fleet_tripped: bool,
+    /// Per-target tallies for every target that recorded a failure in
+    /// the window; `tripped` marks the ones that individually met the
+    /// sample-and-ratio condition.
+    pub targets: Vec<DispatchFreezeTarget>,
+    /// The dominant failure classes of the window — `step: error-prefix`
+    /// with counts, descending.
+    #[serde(default)]
+    pub classes: Vec<DispatchFreezeClass>,
+    /// GitHub Actions URLs of recent runs that failed inside the window.
+    #[serde(default)]
+    pub example_run_urls: Vec<String>,
+}
+
+/// One target's contribution to a tripped freeze window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeTarget {
+    /// Compilation target.
+    pub target: TargetTriple,
+    /// Completed attempts observed for this target in the window.
+    pub outcomes: u32,
+    /// Failed attempts for this target in the window.
+    pub failures: u32,
+    /// Whether this target alone met the sample-and-ratio trip
+    /// condition.
+    pub tripped: bool,
+}
+
+/// One failure class's share of a tripped window — `register: POST
+/// /api/v1/admin/artifacts/register -> 500`-style labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeClass {
+    /// The `step: error-prefix` label the failed attempt was recorded
+    /// under (`unknown` when the report carried neither).
+    pub class: String,
+    /// Failed attempts in the window carrying this class.
+    pub count: u32,
+}
+
+/// The metered dimension a cost trip crossed — one per paid-allowance
+/// budget line the scheduled check reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CostMetric {
+    /// Scheduler Durable Object SQLite rows read.
+    DurableObjectRowsRead,
+    /// Scheduler Durable Object SQLite rows written.
+    DurableObjectRowsWritten,
+    /// Durable Object invocations (requests + alarms).
+    DurableObjectRequests,
+    /// Durable Object billed duration, GB-seconds.
+    DurableObjectDurationGbS,
+    /// Worker invocations of `stow-edge`.
+    WorkerRequests,
+    /// Worker CPU milliseconds consumed by `stow-edge`.
+    WorkerCpuMs,
+    /// D1 `stow-prod` rows read.
+    D1RowsRead,
+    /// D1 `stow-prod` rows written.
+    D1RowsWritten,
+}
+
+/// One route family's share of the day's Worker requests — the "top
+/// routes" the cost-trip email names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct TopRouteCount {
+    /// The dimension the count groups on — `scriptName` unless a path
+    /// dimension is available.
+    pub label: String,
+    /// Requests this group saw.
+    pub requests: f64,
+}
+
+/// The cost-trip evidence stored on the freeze record: which metered
+/// dimension crossed, today's usage, the daily budget it is checked
+/// against, and the day's top request groups.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeCost {
+    /// The first metric found over budget.
+    pub metric: CostMetric,
+    /// Usage since 00:00 UTC in the metric's unit.
+    pub used: f64,
+    /// The daily budget the usage is compared against — the monthly
+    /// Workers Paid allowance divided by 30, times
+    /// `STOW_COST_BUDGET_MULTIPLIER`.
+    pub budget: f64,
+    /// Every metric over budget (the trip names `metric`, this lists
+    /// all of them).
+    #[serde(default)]
+    pub over: Vec<DispatchFreezeCostEntry>,
+    /// Today's top request groups — `scriptName` from the Workers
+    /// dataset.
+    #[serde(default)]
+    pub top_routes: Vec<TopRouteCount>,
+}
+
+/// One over-budget metric line inside [`DispatchFreezeCost::over`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeCostEntry {
+    /// The metric.
+    pub metric: CostMetric,
+    /// Usage since 00:00 UTC.
+    pub used: f64,
+    /// Its daily budget.
+    pub budget: f64,
+}
+
+/// The edge scheduled handler's verdict of one usage check.
+///
+/// Posted to the scheduler object's `/usage-check` route, which trips
+/// the freeze when `over` is non-empty. `top_routes` rides along either
+/// way so a trip record carries the day's traffic shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct UsageCheck {
+    /// Every metered dimension over its daily budget today — empty
+    /// means the day is inside allowance and the check is a no-op.
+    #[serde(default)]
+    pub over: Vec<DispatchFreezeCostEntry>,
+    /// Today's top request groups (`scriptName` from the Workers
+    /// dataset) — the "top routes" the cost-trip email names.
+    #[serde(default)]
+    pub top_routes: Vec<TopRouteCount>,
+}
+
+/// What happened to the alert email a freeze state transition sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DispatchFreezeNotify {
+    /// The `send_email` binding accepted the message.
+    Sent {
+        /// Provider message id, when Cloudflare returned one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// `send()` rejected the message — the freeze still engaged; the
+    /// alert simply went nowhere.
+    Failed {
+        /// Cloudflare's structured error code (`E_*`), when the error
+        /// object carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// The error's message.
+        message: String,
+        /// Actionable hint for the known codes (e.g. which allowlist
+        /// setting `E_RECIPIENT_NOT_ALLOWED` refers to).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+    /// No send was attempted — the binding or an address was
+    /// unconfigured.
+    Disabled {
+        /// Why the path was off (names the missing binding/var).
+        reason: String,
+    },
 }
 
 /// Scheduler DO queue status for monitoring.
@@ -1026,6 +1298,9 @@ pub struct AdminStatus {
     pub targets: Vec<AdminTargetStats>,
     /// Whether the anonymous-traffic circuit breaker is engaged.
     pub panic_enabled: bool,
+    /// Whether the dispatch-freeze breaker is engaged — dispatch stopped,
+    /// enqueue still open.
+    pub dispatch_frozen: bool,
 }
 
 /// Response of `POST /api/v1/scheduler/tasks/submit` — what a request batch
