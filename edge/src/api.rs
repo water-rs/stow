@@ -1657,10 +1657,10 @@ pub async fn get_bundle(
 /// pointer stays short-lived while the blob it names is immutable.
 const INDEX_DIGEST_MAX_AGE: &str = "public, max-age=60";
 
-/// `Cache-Control` on the digest-addressed slice bytes: the digest pins
-/// the content, so the answer is immutable and the browser never
-/// revalidates it.
-const INDEX_SLICE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+/// `Cache-Control` on every digest-addressed answer — index slice bytes
+/// and bundles: the digest pins the content, so the answer is immutable
+/// and no cache in front of it ever revalidates.
+const DIGEST_ADDRESSED_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 /// The request's `Accept-Encoding` header value (empty when absent) —
 /// the slice route negotiates its `Content-Encoding` on it.
@@ -1916,7 +1916,7 @@ fn slice_response(
     );
     headers.insert(
         skyzen::header::CACHE_CONTROL,
-        HeaderValue::from_static(INDEX_SLICE_CACHE_CONTROL),
+        HeaderValue::from_static(DIGEST_ADDRESSED_CACHE_CONTROL),
     );
     // One URL serves both encodings — every cache between the worker and
     // the client must key on the request's Accept-Encoding.
@@ -2271,6 +2271,10 @@ fn bundle_response(body: Body, content_length: Option<u64>, cache_hit: bool) -> 
     headers.insert(
         skyzen::header::CONTENT_TYPE,
         HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
+    );
+    headers.insert(
+        skyzen::header::CACHE_CONTROL,
+        HeaderValue::from_static(DIGEST_ADDRESSED_CACHE_CONTROL),
     );
     if let Some(length) = content_length {
         headers.insert(skyzen::header::CONTENT_LENGTH, HeaderValue::from(length));
