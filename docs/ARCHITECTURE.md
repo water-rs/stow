@@ -465,9 +465,10 @@ attests — but it can neither interfere with other crates' compilations and
 sources nor edit or forge the evidence the scan and the publisher rely on.
 
 CI no longer holds a Cloudflare D1 credential. The edge worker owns the only
-write path to `artifacts` and authorizes it via GitHub identity on the
-`Authorization: Bearer` header — the `build-crate.yml` Actions OIDC token in
-CI (signature verified against GitHub's JWKS, with `iss`/`aud`/`repository`/
+write path to `artifacts` (`stow-admin index sync` behind
+`/api/v1/admin/artifacts/sync`) and authorizes it via GitHub identity on the
+`Authorization: Bearer` header — an Actions OIDC token minted inside the
+repo (signature verified against GitHub's JWKS, with `iss`/`aud`/`repository`/
 `job_workflow_ref`/`exp` pinned), or any credential GitHub would accept a
 push from on the repo (probed via the `git-receive-pack` ref
 advertisement — uniform across user tokens, fine-grained PATs, and
@@ -635,9 +636,9 @@ fields, retention, opt-out — is documented in
 
 All endpoints live on the edge worker. `?` paths use `Json<T>` extractors,
 which means the body is parsed *after* the per-handler extractor chain — and
-the bearer-credential extractor (`SchedulerCaller` / `ArtifactWriteCaller`)
-is declared first on authenticated handlers, so unauthorized POSTs
-short-circuit before deserialization.
+the bearer-credential extractor (`SchedulerCaller`) is declared first on
+authenticated handlers, so unauthorized POSTs short-circuit before
+deserialization.
 
 | Method + path | Auth | Body | Response | Purpose |
 |---|---|---|---|---|
@@ -666,7 +667,6 @@ short-circuit before deserialization.
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
 | POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
-| POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI completion reports (superseded by the `workflow_run` webhook) |
 | POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and completes the task only once that task's records artifact verifies in GHCR |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
 
@@ -708,7 +708,7 @@ flowing and the operator can always flip the rule back off.
 The zone's WAF maintenance rules protect the worker; the **dispatch freeze** protects the
 runner allowance and the Cloudflare bill. The object is event-driven —
 nothing polls, nothing wakes on a timer: two trips evaluate on the events
-that change their inputs. A completion report (`/complete`) upserts one
+that change their inputs. A completion report (`/tasks/complete-run`) upserts one
 five-minute bucket in `attempt_outcome_buckets` per target — retried
 attempts keep counting — and the object sums the trailing window's
 buckets (at most `window / 5min` per target whatever the traffic) and
@@ -728,7 +728,7 @@ flag, storage key, and purpose from the WAF maintenance rules — and `dispatch_
 gates on it, so the queue keeps accepting misses while nothing more is
 handed to runners. While frozen, the work-submitting routes
 (`tasks/submit/trusted`, `admin/preheat`, `admin/resolve/*`) answer 503
-naming the trigger; the `complete`/`register` reports stay open so
+naming the trigger; the `tasks/complete-run` webhook stays open so
 in-flight builds still land. Recovery is manual only:
 `POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
 --yes`) lifts the freeze and immediately resumes dispatch, while
@@ -738,7 +738,7 @@ transition log (engaged/cleared events with their triggers).
 Alerting is split by who owns the fact. The edge sends **email only** —
 one transition mail per change through the `send_email` binding
 (`alerts@stow.waterui.dev` → `me@lexo.cool`), naming the counts, window,
-dominant failure classes (`step: error-prefix`), and example Actions
+dominant failure classes (the failure's error first line), and example Actions
 run URLs. The `incident`-labelled issue record is the external
 watchdog's (#450): it runs in Actions with `issues: write`, reads the
 freeze state and transition log off the admin route every 15 minutes,

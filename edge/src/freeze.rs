@@ -927,11 +927,11 @@ mod tests {
             ],
             classes: vec![
                 DispatchFreezeClass {
-                    class: "register: POST /api/v1/admin/artifacts/register -> 500".to_owned(),
+                    class: "build-crate: GHCR records artifact missing".to_owned(),
                     count: 240,
                 },
                 DispatchFreezeClass {
-                    class: "build: cargo exited 101".to_owned(),
+                    class: "cargo exited 101".to_owned(),
                     count: 173,
                 },
             ],
@@ -957,7 +957,7 @@ mod tests {
             "60m",
             "x86_64-pc-windows-msvc",
             "aarch64-pc-windows-msvc",
-            "register: POST /api/v1/admin/artifacts/register -> 500",
+            "build-crate: GHCR records artifact missing",
             "https://github.com/water-rs/stow/actions/runs/123456",
             "https://github.com/water-rs/stow/actions/runs/123450",
             "stow-admin dispatch-freeze clear --yes",

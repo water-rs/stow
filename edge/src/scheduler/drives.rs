@@ -16,8 +16,8 @@ use std::pin::Pin;
 
 use skyzen_services::durable::DurableDb;
 use stow_types::api::{
-    BuildCompleteReport, EnqueueDependency, EnqueueRequest, EnqueueSource, PublishedSliceRow,
-    QueueSelector, QueueTaskStatus,
+    EnqueueDependency, EnqueueRequest, EnqueueSource, PublishedSliceRow, QueueSelector,
+    QueueTaskStatus,
 };
 use stow_types::identity::FeaturesJson;
 use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
@@ -266,28 +266,6 @@ pub const DRIVES: &[Drive] = &[
                         success: true,
                         error: None,
                         github_run_id: Some("12345".to_owned()),
-                    },
-                    crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            })
-        },
-    },
-    Drive {
-        name: "POST /builds/complete",
-        run: |db, shape, _settings| {
-            Box::pin(async move {
-                queue::complete(
-                    db,
-                    &BuildCompleteReport {
-                        task_id: hex_id(u64::from(shape.dispatched_row())),
-                        attempt: 1,
-                        success: true,
-                        error: None,
-                        failure_step: None,
-                        artifacts_uploaded: 0,
-                        github_run_id: None,
                     },
                     crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
                 )

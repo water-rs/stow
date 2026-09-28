@@ -19,9 +19,10 @@
 //!
 //! Costs (AGENTS.md "resources are spent deliberately"): one run is one
 //! GraphQL POST, one Analytics Engine SQL POST, ≤3 admin/endpoint calls,
-//! ≤ `1 + MAX_CLASSIFIED_RUNS*2` GitHub REST reads, and, only while an
-//! incident is open, ≤8 REST mutations plus one email — idle runs issue
-//! no mutations at all.
+//! one GHCR verified pull for the bundle probe (tag list + index
+//! manifest + signature + blob), ≤ `1 + MAX_CLASSIFIED_RUNS*2` GitHub
+//! REST reads, and, only while an incident is open, ≤8 REST mutations
+//! plus one email — idle runs issue no mutations at all.
 
 use std::fmt::Write as _;
 
@@ -317,7 +318,7 @@ const SIGNALS: &[Signal] = &[
     },
     Signal {
         id: "endpoint.artifact",
-        label: "HEAD of a real artifact byte path answers 200",
+        label: "GET of a real bundle byte path answers 200",
         window_secs: 0,
         min_sample: 1,
         threshold: 5000.0,
@@ -811,10 +812,10 @@ impl Watcher<'_> {
 
     // ----- public endpoints -----
 
-    /// `GET /api/v1/stats` and a `HEAD` of one real artifact byte path —
+    /// `GET /api/v1/stats` and a `GET` of one real bundle's byte path —
     /// the two anonymous answers a user depends on, checked as a user.
     /// Returns the readings plus an optional collector failure — the
-    /// admin catalog list failing blinds `endpoint.artifact` while
+    /// index pull failing blinds `endpoint.artifact` while
     /// `endpoint.stats` still gets its probe.
     async fn endpoint_readings(&self) -> (Vec<Reading>, Option<String>) {
         let mut readings = Vec::new();
@@ -823,15 +824,18 @@ impl Watcher<'_> {
                 .await,
         );
 
-        // Pick a real artifact so the HEAD exercises the byte path:
-        // catalog list (admin) → first record's `target/rustc/c_metadata`.
-        match self.pick_artifact().await {
-            Ok(Some((target, rustc, c_metadata))) => {
+        // Pick a real bundle so the GET exercises the byte path: the
+        // signed index slice on GHCR — the verified pull `index export`
+        // uses, not the D1 mirror — → a row's `bundle_digest`. GET, not
+        // HEAD: the route registers no HEAD handler, and the probe's job
+        // is the real user fetch anyway.
+        match self.pick_bundle_digest().await {
+            Ok(Some(digest)) => {
                 readings.push(
                     self.probe(
                         "endpoint.artifact",
-                        &format!("/api/v1/artifacts/{target}/{rustc}/{c_metadata}"),
-                        zenwave::Method::HEAD,
+                        &format!("/api/v1/bundles/{digest}"),
+                        zenwave::Method::GET,
                     )
                     .await,
                 );
@@ -840,10 +844,10 @@ impl Watcher<'_> {
                 signal: signal("endpoint.artifact"),
                 sample: 0,
                 value: 0.0,
-                evidence: vec!["no artifacts in the catalog".to_owned()],
+                evidence: vec!["no artifacts in the published index".to_owned()],
             }),
             Err(error) => {
-                return (readings, Some(format!("admin artifact list: {error}")));
+                return (readings, Some(format!("index pull: {error}")));
             }
         }
         (readings, None)
@@ -885,20 +889,44 @@ impl Watcher<'_> {
         }
     }
 
-    /// The newest catalog row's byte-path coordinates, or `None` when
-    /// the catalog is empty.
-    async fn pick_artifact(&self) -> stow_types::error::Result<Option<(String, String, String)>> {
-        let records: Vec<stow_types::api::ArtifactRecord> = self
-            .edge
-            .get_json("/api/v1/admin/artifacts?limit=1")
-            .await?;
-        Ok(records.first().map(|record| {
-            (
-                record.target.as_str().to_owned(),
-                record.rustc_version.as_str().to_owned(),
-                record.c_metadata.as_str().to_owned(),
+    /// One `bundle_digest` out of a published index slice, or `None`
+    /// when no slice carries rows. The slice is pulled and verified off
+    /// GHCR — the same signed source `index export` and `preheat manual`
+    /// pull — so the probe depends on the store the CLI itself reads,
+    /// not the D1 mirror.
+    async fn pick_bundle_digest(&self) -> stow_types::error::Result<Option<String>> {
+        let base = crate::index_cmd::registry_base()?;
+        let session = base.session();
+        let trust = crate::index_cmd::records_trust().await?;
+        let mut tags = session
+            .list_tags()
+            .await
+            .map_err(|error| stow_error!("list registry tags: {error}"))?;
+        // Sorted so the probed slice is deterministic run to run.
+        tags.sort();
+        for tag in tags {
+            let Some((target, rustc_version)) = crate::index_cmd::index_tag_parts(&tag) else {
+                continue;
+            };
+            let Some(pulled) = stow_oci::pull_index(&session, &base, target, rustc_version).await?
+            else {
+                continue;
+            };
+            let reference = base.reference(&tag)?;
+            crate::index_cmd::verify_artifact(
+                &session,
+                &trust,
+                &reference,
+                &format!("{}:{tag}", stow_types::registry::GHCR_BASE),
+                &pulled.manifest_digest,
+                crate::index_cmd::INDEX_CERT_URL,
             )
-        }))
+            .await?;
+            if let Some(row) = pulled.index.rows.first() {
+                return Ok(Some(row.bundle_digest.clone()));
+            }
+        }
+        Ok(None)
     }
 }
 

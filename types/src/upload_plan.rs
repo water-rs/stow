@@ -96,7 +96,7 @@ pub struct PublishedArtifact {
     pub bundle_size: u64,
 }
 
-/// Build the records the register endpoint stores, one per plan.
+/// Build the records a task's signed records artifact carries, one per plan.
 ///
 /// Coordinates come from each plan's published entry;
 /// `min_glibc_by_reference` carries the floor the publish stage measured
@@ -105,7 +105,7 @@ pub struct PublishedArtifact {
 ///
 /// # Errors
 /// Returns an error when a plan's `oci_reference` has no published entry
-/// or no measured floor — a record must never register as unmeasured.
+/// or no measured floor — a record must never be published unmeasured.
 pub fn build_artifact_records(
     plans: &[PlannedArtifact],
     published_by_reference: &BTreeMap<String, PublishedArtifact>,

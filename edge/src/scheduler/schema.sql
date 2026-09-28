@@ -326,18 +326,19 @@ CREATE TABLE IF NOT EXISTS attempt_outcome_buckets (
 -- Raw outcome rows are kept for failures only — the class and
 -- example-run evidence the trip alert prints is read once, when the
 -- check trips, so successes never land here and failures expire with
--- the window (the /complete insert deletes what aged out).
+-- the window (the completion insert deletes what aged out).
 CREATE TABLE IF NOT EXISTS attempt_outcomes (
     task_id TEXT NOT NULL,
     attempt INTEGER NOT NULL,
     -- Compilation target — the breaker's per-target trip streams group
     -- on it.
     target TEXT NOT NULL,
-    -- 'build' | 'publish' | 'register' — the BuildCompleteReport's
-    -- failure_step, NULL when the report did not carry one.
+    -- 'build' | 'publish' | 'register' — the pipeline step the old CI
+    -- completion report carried. Never written since the route's
+    -- removal; kept for the rows that predate it.
     failure_step TEXT,
-    -- `step: error-prefix` (or the bare step/prefix when only one is
-    -- known) — what the trip alert groups failures by.
+    -- The failure's error first line (or `unknown`) — what the trip
+    -- alert groups failures by.
     failure_class TEXT,
     github_run_id TEXT,
     finished_at TEXT NOT NULL DEFAULT (datetime('now')),

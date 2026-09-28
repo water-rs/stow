@@ -417,10 +417,10 @@ entry.
 ## Trusted-endpoint authentication
 
 Every authenticated endpoint — the whole `/api/v1/admin/*` surface
-(artifact registration, listing, inspection and prune, coverage, the
+(artifact sync, listing, inspection and prune, coverage, the
 queue transitions, the admin index export, preheat
-planning, operator status) plus `POST /api/v1/scheduler/tasks/submit`
-and `POST /api/v1/scheduler/complete` — takes
+planning, operator status) plus `POST /api/v1/scheduler/tasks/submit` —
+takes
 `Authorization: Bearer <credential>` and resolves the credential to a
 GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
 

@@ -174,7 +174,6 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
         "/api/v1/scheduler"
             .route((
                 "/tasks/submit".post(api::submit_scheduler_tasks),
-                "/complete".post(api::complete_build),
                 "/status".at(api::scheduler_status),
             ))
             .with(gate.clone()),

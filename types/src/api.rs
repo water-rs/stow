@@ -124,9 +124,10 @@ pub struct BuildTaskPayload {
     pub task_id: String,
     /// Which queue attempt this dispatch carries. The scheduler bumps a
     /// row's attempt every time a re-request resurrects it out of
-    /// failed/completed, and `complete` only applies a report whose attempt
-    /// matches the row's live one — a stale or duplicate report is a
-    /// conflict, never a silent overwrite of a newer attempt's state.
+    /// failed/completed, and the completion path only applies a report
+    /// whose attempt matches the row's live one — a stale or duplicate
+    /// report is a conflict, never a silent overwrite of a newer
+    /// attempt's state.
     /// Defaults to 0 so a payload serialized before the field existed still
     /// decodes; attempt 0 matches no row (attempts start at 1), so such a
     /// report is rejected rather than applied blindly.
@@ -188,12 +189,13 @@ pub struct BuildDepPin {
     pub host_side: bool,
 }
 
-/// Artifact record CI POSTs to the edge's register endpoint after a build.
+/// One artifact a trusted build published.
 ///
-/// Sent to `/api/v1/admin/artifacts/register` once the build, sign, and OCI
-/// push have all succeeded. The edge worker authenticates the caller's
-/// GitHub identity (Actions OIDC for CI, push-user token otherwise) and
-/// persists the row in D1.
+/// The element of the `Vec<ArtifactRecord>` the publish stage serializes
+/// into the signed `records-<rustc>-<task_id hash>` GHCR artifact once the
+/// build, re-hash, validation, sign, and push have all succeeded. Nothing
+/// POSTs it anywhere — `index sync` mirrors the verified records into the
+/// edge's D1 `artifacts` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactRecord {
     /// Stable hash of the trusted build's exact rustc invocation identity.
@@ -337,11 +339,10 @@ pub enum EnqueueSource {
 /// Admission ticket the edge mints for one canonical enqueue task when a
 /// public request misses the cache.
 ///
-/// Returned inside miss responses — as the 404 body of
-/// `POST /api/v1/artifacts/semantic` and in
-/// `DependencyGraphResponse::miss_admissions` — so the fetch path stays
-/// cheap. The client redeems the ticket by solving its proof-of-work and
-/// posting an [`EnqueueTicket`] to `POST /api/v1/enqueue`.
+/// Returned by `POST /api/v1/admissions` for each node the catalog does
+/// not cover — the fetch path stays cheap. The client redeems the
+/// ticket by solving its proof-of-work and posting an [`EnqueueTicket`]
+/// to `POST /api/v1/enqueue`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueAdmission {
     /// Canonical scheduler task id (blake3-derived identity string).
@@ -400,80 +401,6 @@ pub struct AdmissionRequest {
     /// The client's resolved transitive graph.
     #[serde(default)]
     pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
-}
-
-/// The pipeline step a failed attempt was running when it died.
-///
-/// A `BuildCompleteReport` carries it on `failure_step` so the
-/// scheduler's dispatch-freeze breaker can name the dominant failure
-/// classes without parsing free text — the step is the disambiguator an
-/// error prefix alone lacks (a register rejection is reported by the
-/// publish job, not by anything named `register`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum FailureStep {
-    /// `stow-build build` — the untrusted compile stage.
-    Build,
-    /// `stow-build publish` short of artifact registration — the
-    /// validate/push/sign work the trusted job runs.
-    Publish,
-    /// The publish stage's `POST /api/v1/admin/artifacts/register` call
-    /// into the edge.
-    Register,
-}
-
-impl FailureStep {
-    /// The lowercase wire string the report serializes.
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Build => "build",
-            Self::Publish => "publish",
-            Self::Register => "register",
-        }
-    }
-
-    /// Parse a stored `as_str()` value back.
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "build" => Some(Self::Build),
-            "publish" => Some(Self::Publish),
-            "register" => Some(Self::Register),
-            _ => None,
-        }
-    }
-}
-
-/// CI reports job completion to the scheduler DO.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BuildCompleteReport {
-    /// Scheduler task identifier, echoing `BuildTaskPayload::task_id`.
-    pub task_id: String,
-    /// Queue attempt this report belongs to, echoing
-    /// `BuildTaskPayload::attempt`. The scheduler applies the report only
-    /// when it matches the row's live attempt in a dispatched/running
-    /// state; anything else is a stale or duplicate report and conflicts.
-    /// Defaults to 0, which matches no row (attempts start at 1).
-    #[serde(default)]
-    pub attempt: u32,
-    /// Whether the build, sign, push, and registration all succeeded.
-    pub success: bool,
-    /// Failure description when `success` is false.
-    pub error: Option<String>,
-    /// The pipeline step the failure happened in — set by senders that
-    /// know it so the scheduler's breaker classes the failure by
-    /// `step: error-prefix` instead of the prefix alone. Absent on
-    /// success and on reports from senders that predate the field.
-    #[serde(default)]
-    pub failure_step: Option<FailureStep>,
-    /// Number of artifacts uploaded (including transitive deps).
-    pub artifacts_uploaded: u32,
-    /// GitHub Actions run id the report came from. CI leaves it `None`;
-    /// the edge overwrites it with the OIDC token's `run_id` claim before
-    /// forwarding, so the queue row carries the run that produced it.
-    #[serde(default)]
-    pub github_run_id: Option<String>,
 }
 
 /// Canonical scheduler task identity — the blake3-derived id `enqueue`
@@ -718,12 +645,12 @@ pub struct DispatchFreezeTarget {
     pub tripped: bool,
 }
 
-/// One failure class's share of a tripped window — `register: POST
-/// /api/v1/admin/artifacts/register -> 500`-style labels.
+/// One failure class's share of a tripped window — `build-crate 500`-
+/// style labels: the failure's error first line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DispatchFreezeClass {
-    /// The `step: error-prefix` label the failed attempt was recorded
-    /// under (`unknown` when the report carried neither).
+    /// The label the failed attempt was recorded under — its error's
+    /// first line (`unknown` when the report carried none).
     pub class: String,
     /// Failed attempts in the window carrying this class.
     pub count: u32,
@@ -1423,8 +1350,8 @@ pub struct QueueTask {
     pub dispatch_attempts: u32,
     /// Whether the row builds against its checked-in lockfile.
     pub preserve_lockfile: bool,
-    /// GitHub Actions run id the dispatched build reported back through
-    /// its OIDC-claimed register/complete calls.
+    /// GitHub Actions run id the `workflow_run` webhook completion
+    /// stamped onto the row.
     #[serde(default)]
     pub github_run_id: Option<String>,
     /// First request timestamp (`YYYY-MM-DD HH:MM:SS` UTC).
