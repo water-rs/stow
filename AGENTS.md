@@ -204,6 +204,16 @@ forwarding; it will not, because its entire content is one dependency declaratio
 construction. Designing for a need that does not exist is over-engineering even when
 the design it produces looks careful.
 
+## Resources are spent deliberately
+
+Everything stow runs on is metered or scarce: Durable Object rows, duration and requests, D1 rows, Worker CPU, R2 operations, runner slots, GitHub API quota. Stow is a service whose whole purpose is saving other people's compute, and wasting its own is the same failure.
+
+- **Per-event cost.** An operation costs what the event it handles touches, never what the stored data holds. A request that reads rows in proportion to a table is a defect even when the table is small today.
+- **Idle cost is zero.** Once its work is done, a Durable Object holds no timers, background promises, `waitUntil` tasks or open connections, so it hibernates at the platform minimum. An alarm is armed only while there is work pending.
+- **Independent outbound calls run concurrently** under a stated bound, so billed wall time is the slowest call rather than the sum.
+- **Runner slots are never held by waiting.** No job occupies a runner to poll, idle or stay resident.
+- **Every change states its cost.** A pull request that adds or changes a component on a request, alarm or scheduled path states its per-event and idle cost in its description, and the cost gate measures it.
+
 ## Measuring a performance claim
 
 Measure what the developer pays repeatedly, on a project large enough for the effect
