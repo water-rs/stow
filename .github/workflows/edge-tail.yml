@@ -22,12 +22,12 @@ jobs:
           wrangler tail stow-edge --format json > tail.jsonl 2> tail.err &
           tail_pid=$!
           echo TAIL_READY
-          sleep 1740
+          sleep 900
           kill "$tail_pid"
           cat tail.err
           wc -l tail.jsonl
           jq -r '.event.request.url // .event.cron // "other"' tail.jsonl | sort | uniq -c | sort -rn | head -20
-          jq -r 'select((.event.request.url // "") | test("resolve")) | "=== \(.eventTimestamp) \(.outcome) \([.exceptions[]?.message] | join(" | "))", (.logs[] | "\(.timestamp) \(.message | map(tostring) | join(" "))")' tail.jsonl | grep -E "ERROR|=== " | tail -800
+          jq -r 'select((.event.request.url // "") | test("artifacts/register")) | "=== \(.eventTimestamp) \(.outcome) \([.exceptions[]?.message] | join(" | "))", (.logs[] | "\(.timestamp) \(.message | map(tostring) | join(" "))")' tail.jsonl | grep -E "ERROR|=== " | tail -800
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
