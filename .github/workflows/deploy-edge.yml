@@ -1,33 +1,139 @@
 name: deploy-edge
 
+# The edge deploys a tested commit only: the trigger is a green `Test` run on
+# main, and a manual dispatch must name a commit that has one. The deploy is
+# four jobs — no runner is ever held waiting:
+#
+#   prepare          upload the new version (`wrangler versions upload` via
+#                    `skyzen deploy --upload-only`), add it to the deployment
+#                    at 0%, migrate the scheduler and run the synthetic suite
+#                    against it via the `Cloudflare-Workers-Version-Overrides`
+#                    header, then shift `canary_share`% of traffic onto it.
+#   canary-verdict   `environment: deploy-canary` — a GitHub environment whose
+#                    wait timer IS the observation window (operator setup in
+#                    docs/DEPLOYMENT.md); the job starts only after it elapses
+#                    and runs `stow-admin deploy verdict --phase canary`.
+#   promote          `wrangler versions deploy <id>@100%`.
+#   promoted-verdict `environment: deploy-promoted` (second wait timer), then
+#                    `--phase promoted`.
+#
+# The verdict binary is the `stow-admin` of the deployed commit's signed
+# toolchain image — `.github/actions/stow-toolchain` pulls
+# `ghcr.io/water-rs/stow-toolchain:<sha>-<platform>` and verifies the cosign
+# signature against the commit's own workflow sha, so no job compiles it.
+# A breach in either verdict job (or any post-upload failure) runs
+# `wrangler rollback` to the baseline version.
+#
+# Phase 1 compares per-`scriptVersion` metrics: worker error rate and
+# cpu/wall p50+p99 (`workersInvocationsAdaptive`), DO requests/errors/wall per
+# request (`durableObjectsInvocationsAdaptiveGroups`). Phase 2 compares the
+# metrics with no version dimension — `durableObjectsPeriodicGroups` and
+# `d1AnalyticsAdaptiveGroups` — post-promotion window against the equal-length
+# window ending at the deploy start.
+#
+# Durable Objects under a split deployment (per the Cloudflare "With Durable
+# Objects" doc): each object is *assigned* one version per deployment config —
+# the singleton Scheduler either stays on the baseline for the whole canary
+# (phase-1 DO rows report `skipped`) or is reassigned to the candidate, which
+# resets it once (in-memory state lost, SQLite storage survives). The
+# Scheduler's migration (`new_sqlite_classes`, tag v1) is already live, so a
+# version upload that changes no DO lifecycle is legal and a rollback never
+# crosses a migration boundary.
 on:
-  push:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
     branches: [main]
-    paths: [edge/**, resolve/**, types/**, shim/**, Cargo.toml, Cargo.lock]
   workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to deploy; must have a completed green `Test` run.
+        required: true
+        type: string
+      canary_share:
+        description: Percentage of traffic the canary version serves (1-99).
+        required: false
+        default: "5"
+        type: string
 
 permissions:
   contents: read
-  # Mints the run's OIDC token — the scheduler migrate step calls the
-  # admin route, which admits any workflow OIDC minted inside water-rs/stow.
+  # `gh run list` reads the Test run's conclusion for a dispatched sha.
+  actions: read
+  # `stow-admin scheduler migrate` mints an Actions OIDC JWT per request.
   id-token: write
+  # Pull the commit's signed stow toolchain from GHCR.
+  packages: read
 
 concurrency: deploy-edge
 
+env:
+  DEPLOY_SHA: ${{ inputs.sha || github.event.workflow_run.head_sha }}
+  CANARY_SHARE: ${{ inputs.canary_share || '5' }}
+  # zen-rs/skyzen commit that provides `deploy --upload-only` — the
+  # squash-merged commit of zen-rs/skyzen#98 on skyzen's dev.
+  SKYZEN_REV: 0271f693d253a9b32660affacbafaeffca455620
+  # The generated wrangler config, relative to edge/ (the manifest root).
+  WRANGLER_CONFIG: .skyzen/gen/wrangler.toml
+  # The synthetic suite's request count PER SIDE — also the verdict's
+  # --min-requests-per-version floor, so a low-traffic deploy still fails
+  # closed if the suite itself did not land.
+  SUITE_REQUESTS: "50"
+
 jobs:
-  deploy:
+  prepare:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    outputs:
+      baseline_version: ${{ steps.versions.outputs.baseline_version }}
+      candidate_version: ${{ steps.versions.outputs.candidate_version }}
+      deploy_start: ${{ steps.join.outputs.deploy_start }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      # A dispatch is only as tested as the commit it names — the deploy's
+      # justification is a green Test run, so verify one exists for the SHA.
+      - name: Resolve the green Test run for $DEPLOY_SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_run ]; then
+            run_id="${{ github.event.workflow_run.id }}"
+          else
+            run_id=$(gh run list --commit "$DEPLOY_SHA" --workflow Test --limit 50 \
+              --json databaseId,conclusion \
+              | jq -r '[.[] | select(.conclusion == "success")][0].databaseId // empty')
+          fi
+          if [ -z "$run_id" ]; then
+            echo "::error::no green Test run for $DEPLOY_SHA — refusing to deploy an untested commit" >&2
+            exit 1
+          fi
+          echo "Test run $run_id gates this deploy"
+
+      - name: Validate the canary input
+        run: |
+          case "$CANARY_SHARE" in ''|*[!0-9]*)
+            echo "::error::canary_share must be an integer 1-99, got '$CANARY_SHARE'" >&2
+            exit 1
+            ;;
+          esac
+          if [ "$CANARY_SHARE" -lt 1 ] || [ "$CANARY_SHARE" -gt 99 ]; then
+            echo "::error::canary_share must be 1-99, got $CANARY_SHARE" >&2
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # skyzen-cli ships cargo-dist binaries; install-action does not know
-      # the tool and its cargo-binstall fallback compiles it from source
-      # (about eight minutes), so the pinned, digest-checked archive is used.
       - uses: ./.github/actions/install-skyzen-cli
+        with:
+          rev: ${{ env.SKYZEN_REV }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install -g wrangler@4
       - run: skyzen doctor --provider cloudflare --manifest edge/Skyzen.toml
@@ -49,10 +155,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       # skyzen deploy resolves every declared [[secret]] from the environment
-      # and delivers them through `wrangler secret bulk`, so the Worker
-      # secrets ride the same channel on every deploy. An unset repository
-      # secret reaches the job as an empty string, which skyzen would deliver
-      # as a real (empty) secret, so every value is checked first.
+      # and, under --upload-only, folds them into the version upload itself
+      # (`--secrets-file`), so the candidate already carries them when
+      # traffic shifts. An unset repository secret reaches the job as an
+      # empty string, which skyzen would deliver as a real (empty) secret,
+      # so every value is checked first.
       - run: |
           for pair in \
             GITHUB_APP_PRIVATE_KEY:STOW_APP_PRIVATE_KEY \
@@ -67,7 +174,7 @@ jobs:
               exit 1
             fi
           done
-          skyzen deploy --provider cloudflare --manifest edge/Skyzen.toml
+          skyzen deploy --upload-only --provider cloudflare --manifest edge/Skyzen.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -76,17 +183,279 @@ jobs:
           TURNSTILE_SECRET_KEY: ${{ secrets.STOW_TURNSTILE_SECRET_KEY }}
           STOW_STATS_SALT_SECRET: ${{ secrets.STOW_STATS_SALT_SECRET }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
-      - name: Build stow-admin
-        run: cargo build --release -p stow-admin
-      # The scheduler Durable Object's database is not D1 — its migrations
-      # run through the operator route, never in request code, so the deploy
-      # drives it explicitly. `stow-admin` mints a fresh Actions OIDC JWT
-      # for the request (`id-token: write` above); the RepoWriter policy
-      # admits any workflow inside water-rs/stow. Migrations are additive —
-      # expand then contract — so the build just deployed keeps serving
-      # while they apply, and a non-2xx answer fails the deploy.
-      - name: Migrate the scheduler queue schema
+
+      - name: Read the baseline and candidate version ids
+        id: versions
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          # The baseline is whichever version currently holds the most
+          # traffic — 100% after a normal rollout, the majority half of a
+          # split deployment left behind by something else.
+          baseline=$(wrangler deployments status --config "$WRANGLER_CONFIG" --json \
+            | jq -r '.versions | max_by(.percentage).version_id')
+          candidate=$(wrangler versions list --config "$WRANGLER_CONFIG" --json \
+            | jq -r 'max_by(.metadata.created_on).id')
+          if [ -z "$baseline" ] || [ "$baseline" = "null" ]; then
+            echo "::error::could not read the deployed baseline version" >&2
+            exit 1
+          fi
+          if [ -z "$candidate" ] || [ "$candidate" = "null" ] || [ "$candidate" = "$baseline" ]; then
+            echo "::error::no new version to canary (candidate=$candidate, baseline=$baseline)" >&2
+            exit 1
+          fi
+          echo "baseline $baseline -> candidate $candidate"
+          echo "BASELINE_VERSION=$baseline" >> "$GITHUB_ENV"
+          echo "CANDIDATE_VERSION=$candidate" >> "$GITHUB_ENV"
+          echo "baseline_version=$baseline" >> "$GITHUB_OUTPUT"
+          echo "candidate_version=$candidate" >> "$GITHUB_OUTPUT"
+
+      # A version override only reaches a version in the current
+      # deployment, so the candidate joins at 0% first — the migrate call
+      # and synthetic suite below then address it directly. The
+      # observation window starts here: suite and canary traffic both land
+      # inside it.
+      - name: Add the candidate to the deployment at 0%
+        id: join
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          deploy_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "DEPLOY_START=$deploy_start" >> "$GITHUB_ENV"
+          echo "deploy_start=$deploy_start" >> "$GITHUB_OUTPUT"
+          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@0%"
+
+      # `stow-admin` comes from the commit's signed toolchain image.
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ env.DEPLOY_SHA }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The scheduler queue's schema is the DO's, not D1's: it migrates
+      # through the admin route, never in request code. The override header
+      # runs the call on the candidate build; migrations are additive, so
+      # the baseline keeps serving. The step fails if the stamped version
+      # is not the candidate's SCHEMA_VERSION.
+      - name: Migrate the scheduler schema on the candidate
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
-        run: ./target/release/stow-admin scheduler migrate
+        run: |
+          set -euo pipefail
+          export STOW_EDGE_VERSION_OVERRIDE="stow-edge=\"$CANDIDATE_VERSION\""
+          report=$(stow-admin --json scheduler migrate)
+          echo "$report"
+          after=$(jq -r '.after' <<<"$report")
+          expected=$(sed -n 's/.*const SCHEMA_VERSION: i64 = \([0-9]\+\).*/\1/p' \
+            edge/src/scheduler/queue.rs)
+          if [ -z "$expected" ]; then
+            echo "::error::no SCHEMA_VERSION in the candidate source — land #437 before this workflow can deploy" >&2
+            exit 1
+          fi
+          if [ "$after" != "$expected" ]; then
+            echo "::error::scheduler schema at $after, candidate expects $expected" >&2
+            exit 1
+          fi
+
+      # The suite is the verdict's guaranteed signal on BOTH sides:
+      # version overrides pin each probe to the candidate then the
+      # baseline, interleaved so both samples see the same edge conditions
+      # in the same window — organic traffic is never required. The
+      # artifact probe is keyed on this runner's own rustc (a well-formed
+      # miss, so 404 is fine — it is not an error).
+      - name: Synthetic suite against the candidate and baseline
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+        run: |
+          set -euo pipefail
+          host=$(rustc -vV | awk '/^host:/ {print $2}')
+          rustc=$(rustc --version | awk '{print $2}')
+          artifact_probe="/api/v1/artifacts/$host/$rustc/suite-probe"
+          cand="stow-edge=\"$CANDIDATE_VERSION\""
+          base="stow-edge=\"$BASELINE_VERSION\""
+          probes=$((SUITE_REQUESTS / 5))
+          for i in $(seq "$probes"); do
+            for url in "/" \
+              "/api/v1/crates/serde/versions" \
+              "$artifact_probe" \
+              "/api/v1/stats" \
+              "/api/v1/scheduler/status"; do
+              for override in "$cand" "$base"; do
+                code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
+                  -H "Cloudflare-Workers-Version-Overrides: $override" \
+                  "$STOW_EDGE_URL$url")
+                case "$code" in
+                  2*|404) ;;
+                  *) echo "::error::suite probe $url answered $code" >&2; exit 1 ;;
+                esac
+              done
+            done
+          done
+          echo "suite landed $SUITE_REQUESTS requests on each of $CANDIDATE_VERSION and $BASELINE_VERSION"
+
+      - name: Shift $CANARY_SHARE% of traffic onto the candidate
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@$CANARY_SHARE%"
+
+      # Any post-upload failure leaves the candidate in the deployment;
+      # roll back to the baseline. `CANDIDATE_VERSION` is only set once a
+      # version exists, so failures before the upload skip this.
+      - name: Roll back to the baseline
+        if: failure() && env.CANDIDATE_VERSION != ''
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler rollback "$BASELINE_VERSION" --config "$WRANGLER_CONFIG" \
+            --message "deploy-edge: prepare failure" --yes
+
+  canary-verdict:
+    needs: prepare
+    # The environment's wait timer is the observation window — the job
+    # starts after it elapses and no runner is held meanwhile.
+    environment: deploy-canary
+    runs-on: ubuntu-latest
+    env:
+      BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
+      CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
+      DEPLOY_START: ${{ needs.prepare.outputs.deploy_start }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ env.DEPLOY_SHA }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Both samples come from the SAME window [DEPLOY_START, now], split
+      # by `scriptVersion`: the suite pinned SUITE_REQUESTS requests to
+      # each version inside it, and organic traffic adds to both.
+      - name: Canary verdict (phase 1)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          stow-admin deploy verdict --phase canary \
+            --min-requests-per-version "$SUITE_REQUESTS" \
+            --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
+            --script stow-edge \
+            --baseline-version "$BASELINE_VERSION" \
+            --candidate-version "$CANDIDATE_VERSION" \
+            --baseline-from "$DEPLOY_START" \
+            --baseline-to "$now" \
+            --candidate-from "$DEPLOY_START" \
+            --candidate-to "$now"
+
+      - name: Roll back to the baseline
+        if: failure()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npm install -g wrangler@4
+          wrangler rollback "$BASELINE_VERSION" --name stow-edge \
+            --message "deploy-edge: canary verdict breach" --yes
+
+  promote:
+    needs: [prepare, canary-verdict]
+    runs-on: ubuntu-latest
+    env:
+      BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
+      CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
+    outputs:
+      promote_start: ${{ steps.promote.outputs.promote_start }}
+    steps:
+      # The post-promotion window starts where 100% traffic starts.
+      - name: Promote the candidate to 100%
+        id: promote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npm install -g wrangler@4
+          promote_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "promote_start=$promote_start" >> "$GITHUB_OUTPUT"
+          wrangler versions deploy --name stow-edge --yes "$CANDIDATE_VERSION@100%"
+
+      - name: Roll back to the baseline
+        if: failure()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npm install -g wrangler@4
+          wrangler rollback "$BASELINE_VERSION" --name stow-edge \
+            --message "deploy-edge: promote failure" --yes
+
+  promoted-verdict:
+    needs: [prepare, promote]
+    environment: deploy-promoted
+    runs-on: ubuntu-latest
+    env:
+      BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
+      CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
+      DEPLOY_START: ${{ needs.prepare.outputs.deploy_start }}
+      PROMOTE_START: ${{ needs.promote.outputs.promote_start }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ env.DEPLOY_SHA }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Phase 2's metrics carry no `scriptVersion` — account totals. The
+      # candidate window is [PROMOTE_START, now]; the baseline window is
+      # its equal-length mirror ending at the deploy start.
+      - name: Post-promotion verdict (phase 2)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          now_epoch=$(date -u +%s)
+          promote_epoch=$(date -u -d "$PROMOTE_START" +%s)
+          start_epoch=$(date -u -d "$DEPLOY_START" +%s)
+          baseline_from=$(date -u -d "@$((start_epoch - (now_epoch - promote_epoch)))" +%Y-%m-%dT%H:%M:%SZ)
+          now=$(date -u -d "@$now_epoch" +%Y-%m-%dT%H:%M:%SZ)
+          stow-admin deploy verdict --phase promoted \
+            --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
+            --script stow-edge \
+            --baseline-version "$BASELINE_VERSION" \
+            --candidate-version "$CANDIDATE_VERSION" \
+            --baseline-from "$baseline_from" \
+            --baseline-to "$DEPLOY_START" \
+            --candidate-from "$PROMOTE_START" \
+            --candidate-to "$now"
+
+      - name: Roll back to the baseline
+        if: failure()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npm install -g wrangler@4
+          wrangler rollback "$BASELINE_VERSION" --name stow-edge \
+            --message "deploy-edge: post-promotion verdict breach" --yes
