@@ -6215,7 +6215,7 @@ mod sqlite_tests {
     /// same path exactly once, through the operator route.
     #[tokio::test]
     async fn a_fresh_database_migrates_and_is_stamped() {
-        let db = memory_db_raw().await.expect("raw memory db");
+        let db = MeteredDb::new(memory_db_raw().await.expect("raw memory db"));
         let report = super::migrate(&db).await.expect("migrate");
         assert_eq!((report.before, report.after), (0, super::SCHEMA_VERSION));
         assert_eq!(
@@ -6234,6 +6234,7 @@ mod sqlite_tests {
     #[tokio::test]
     async fn a_request_path_issues_no_schema_statements() {
         let (db, log) = counting_memory_db().await.expect("counting db");
+        let db = MeteredDb::new(db);
         let base = log.lock().expect("log").len();
         super::panic_enabled(&db).await.expect("panic_enabled");
         let issued = log.lock().expect("log")[base..].to_vec();
@@ -6256,7 +6257,7 @@ mod sqlite_tests {
     async fn migrate_refuses_a_newer_schema() {
         // The migrate path's fixture: `migrate` runs only behind the
         // operator route, where schema probes are permitted.
-        let db = memory_db_raw().await.expect("raw memory db");
+        let db = MeteredDb::new(memory_db_raw().await.expect("raw memory db"));
         super::migrate(&db).await.expect("first migrate");
         db.query(&format!(
             "UPDATE scheduler_schema_version SET version = {}",

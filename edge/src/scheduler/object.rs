@@ -155,11 +155,9 @@ impl DurableObject for Scheduler {
             "/migrate".post(migrate_scheduler),
             // A nested Route under the root — the outer tuple caps at
             // 15 nodes.
-            Route::new((
-                "/dispatch-freeze"
-                    .at(read_dispatch_freeze)
-                    .post(write_dispatch_freeze),
-            )),
+            Route::new(("/dispatch-freeze"
+                .at(read_dispatch_freeze)
+                .post(write_dispatch_freeze),)),
         ))
         .on_alarm(run_alarm)
         .build()
