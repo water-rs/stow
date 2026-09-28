@@ -4,8 +4,8 @@
 //! Every request carries `User-Agent: stow-cli/<version> (<os>)` — the edge
 //! parses it into the anonymous `cli_version`/`os_family` usage-stat
 //! dimensions. When `STOW_NO_ANALYTICS=1` the client additionally sends
-//! `x-stow-no-analytics: 1`, which suppresses every analytics write and the
-//! install hash for that request.
+//! `x-stow-no-analytics: 1`, which suppresses every analytics write for that
+//! request.
 
 use std::convert::Infallible;
 

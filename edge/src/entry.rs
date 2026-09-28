@@ -1,7 +1,6 @@
 //! Cloudflare Workers bootstrap: binds D1, the scheduler Durable Object,
 //! the CF cache, and GHCR config, then mounts the public API routes.
 
-use skyzen::Method;
 use skyzen::routing::{CreateRouteNode, Route, RouteNode, Router};
 use skyzen::runtime::wasm;
 use skyzen::utils::State;
@@ -30,8 +29,6 @@ const TURNSTILE_SECRET_KEY_BINDING: &str = "TURNSTILE_SECRET_KEY";
 const TURNSTILE_HOSTNAME_BINDING: &str = "TURNSTILE_HOSTNAME";
 const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
 const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
-const STOW_STATS_BINDING: &str = "STOW_STATS";
-const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
 
@@ -61,8 +58,6 @@ fn worker(env: &wasm::Env) -> Router {
     let cache = CfCache::default();
     let analytics = env_binding::required_analytics_dataset(env, STOW_ANALYTICS_BINDING);
     let stats = StatsContext {
-        dataset: env_binding::required_analytics_dataset(env, STOW_STATS_BINDING),
-        salt_secret: env_binding::required_string(env, STOW_STATS_SALT_SECRET_BINDING),
         account_id: env_binding::required_string(env, CF_ACCOUNT_ID_BINDING),
         analytics_token: env_binding::required_string(env, CF_ANALYTICS_TOKEN_BINDING),
     };
@@ -194,13 +189,7 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
         "/install.ps1".at(site::install_ps1),
         "/stats".at(site::stats_page),
         "/requests/{task_id}".at(site::request_status),
-        "/api/v1/artifacts".route((
-            "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
-            "/{target}/{rustc_version}/{c_metadata}".endpoint(
-                Method::HEAD,
-                skyzen::handler::into_endpoint(api::check_artifact),
-            ),
-        )),
+        "/api/v1/bundles/{digest}".at(api::get_bundle),
         "/api/v1/crates".route((
             "/search".at(api::search_crates),
             "/{crate_name}/versions".at(api::crate_versions),

@@ -15,8 +15,8 @@
 //!
 //! Trust note: an attacker who can call register can pollute D1 with rows
 //! that point at digests they do not control. The CLI verifies cosign
-//! signatures on every fetch, so a polluted row causes a 404 on the
-//! client and a stale-row prune on the edge — it cannot be used to inject
+//! signatures on every fetch, so a polluted row causes a digest failure on
+//! the client — it cannot be used to inject
 //! malicious code. The edge additionally binds every OIDC write to the
 //! dispatched task's dependency closure, so a compromised run can only
 //! register the rows its own build could produce.

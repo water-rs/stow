@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_fs::{create_dir_all, read, write};
@@ -384,14 +384,13 @@ fn registry_app_with_probe(
         )
         .route("/token", get(issue_token))
         .route(
-            "/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}",
-            get(serve_edge_artifact).head(serve_edge_artifact),
+            "/api/v1/bundles/{digest}",
+            get(serve_edge_bundle).head(serve_edge_bundle),
         )
         .with_state(MockRegistryState {
             registry_root,
             token_realm: format!("http://{listen}/token"),
             tokens: Arc::new(Mutex::new(TokenState::default())),
-            index_slices: Arc::new(RwLock::new(HashMap::new())),
             requests: probe.as_ref().map(|probe| Arc::clone(&probe.requests)),
             rate_limits: probe.as_ref().map(|probe| Arc::clone(&probe.rate_limits)),
             toggles: probe.as_ref().map(|probe| Arc::clone(&probe.toggles)),
@@ -1181,11 +1180,6 @@ struct MockRegistryState {
     /// own `/token` endpoint.
     token_realm: String,
     tokens: Arc<Mutex<TokenState>>,
-    /// Decoded index slices behind the edge byte-path stand-in, keyed by
-    /// tag and revalidated against the published manifest's digest on
-    /// every request, so a republished slice is picked up without a
-    /// restart.
-    index_slices: Arc<RwLock<HashMap<String, CachedIndexSlice>>>,
     /// The probe's request log — `Some` only when a test attached one.
     requests: Option<Arc<Mutex<Vec<RequestRecord>>>>,
     /// The probe's scripted `429`s — `Some` only when a test attached one.
@@ -1193,13 +1187,6 @@ struct MockRegistryState {
     /// The probe's behavior toggles — `None` means the well-behaved
     /// registry: single `POST` uploads, digest headers, honest serving.
     toggles: Option<Arc<ProbeToggles>>,
-}
-
-/// One decoded slice plus the digest of the manifest it was decoded from.
-#[derive(Debug, Clone)]
-struct CachedIndexSlice {
-    manifest_digest: String,
-    index: Arc<ArtifactIndex>,
 }
 
 /// Issued bearer tokens and their expirations; `Instant` is enough
@@ -1507,28 +1494,22 @@ async fn store_manifest(
 }
 
 /// The edge byte path for hosts that run no worker (the bench lane):
-/// `GET|HEAD /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`
-/// resolves the key through the signed index slice published into this
-/// registry root and serves the bundle blob it pins — the same contract the
-/// real edge answers from D1 and GHCR, so `STOW_EDGE_URL` can point here.
-async fn serve_edge_artifact(
+/// `GET|HEAD /api/v1/bundles/{digest}` serves the blob the digest names —
+/// the same contract the real edge answers between its Cache API and the
+/// registry, so `STOW_EDGE_URL` can point here.
+async fn serve_edge_bundle(
     State(state): State<MockRegistryState>,
     method: Method,
-    AxumPath((target, rustc_version, c_metadata)): AxumPath<(String, String, String)>,
+    AxumPath(digest): AxumPath<String>,
 ) -> Result<Response<Body>, StatusCode> {
-    let index = state.index_slice(&target, &rustc_version).await?;
-    let Some(row) = index
-        .rows
-        .iter()
-        .find(|row| row.c_metadata.as_str() == c_metadata)
-    else {
-        tracing::warn!(%target, %rustc_version, %c_metadata, "byte path: no index row");
-        return Err(StatusCode::NOT_FOUND);
-    };
+    if !stow_types::registry::is_sha256_digest(&digest) {
+        tracing::warn!(%digest, "byte path: malformed bundle digest");
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let path = state
         .registry_root
         .join("blobs")
-        .join(row.bundle_digest.replace(':', "_"));
+        .join(digest.replace(':', "_"));
     let bytes = read(&path).await.map_err(|error| {
         tracing::warn!(path = %path.display(), %error, "byte path: bundle blob missing");
         StatusCode::NOT_FOUND
@@ -1555,73 +1536,6 @@ async fn serve_edge_artifact(
 }
 
 impl MockRegistryState {
-    /// The decoded slice for `(target, rustc_version)`: the cached copy
-    /// when the published manifest still hashes the same, otherwise the
-    /// slice re-read from the registry root. A missing or malformed
-    /// publication is a 404 — the byte path answers exactly what the index
-    /// pins, nothing else.
-    async fn index_slice(
-        &self,
-        target: &str,
-        rustc_version: &str,
-    ) -> Result<Arc<ArtifactIndex>, StatusCode> {
-        let tag = index_tag(target, rustc_version);
-        let manifest_path = self
-            .registry_root
-            .join("manifests")
-            .join(stow_types::registry::GHCR_REPOSITORY)
-            .join(&tag);
-        let manifest_bytes = read(&manifest_path).await.map_err(|error| {
-            tracing::warn!(path = %manifest_path.display(), %error, "byte path: index slice not published");
-            StatusCode::NOT_FOUND
-        })?;
-        let manifest_digest = sha256_digest(&manifest_bytes);
-        if let Some(cached) = self
-            .index_slices
-            .read()
-            .expect("index slice cache poisoned")
-            .get(&tag)
-            && cached.manifest_digest == manifest_digest
-        {
-            return Ok(Arc::clone(&cached.index));
-        }
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).map_err(|error| {
-            tracing::error!(path = %manifest_path.display(), %error, "byte path: malformed index manifest");
-            StatusCode::NOT_FOUND
-        })?;
-        let layer_digest = manifest
-            .pointer("/layers/0/digest")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                tracing::error!(path = %manifest_path.display(), "byte path: index manifest has no layer");
-                StatusCode::NOT_FOUND
-            })?;
-        let blob_path = self
-            .registry_root
-            .join("blobs")
-            .join(layer_digest.replace(':', "_"));
-        let index_bytes = read(&blob_path).await.map_err(|error| {
-            tracing::error!(path = %blob_path.display(), %error, "byte path: index blob missing");
-            StatusCode::NOT_FOUND
-        })?;
-        let index = stow_types::index::decode(&index_bytes).map_err(|error| {
-            tracing::error!(path = %blob_path.display(), %error, "byte path: index blob does not decode");
-            StatusCode::NOT_FOUND
-        })?;
-        let index = Arc::new(index);
-        self.index_slices
-            .write()
-            .expect("index slice cache poisoned")
-            .insert(
-                tag,
-                CachedIndexSlice {
-                    manifest_digest,
-                    index: Arc::clone(&index),
-                },
-            );
-        Ok(index)
-    }
-
     /// The digest the probe claims for a forged manifest file, if the
     /// test registered one — served in place of the bytes' real hash.
     fn forged_digest(&self, file_name: &str) -> Option<String> {
@@ -1978,16 +1892,18 @@ mod tests {
             .expect("index manifest");
     }
 
-    /// The edge byte-path stand-in answers the exact-key route from the
-    /// published slice: the pinned bundle for a listed key, 404 for an
-    /// unlisted one, and HEAD carries the length without the body.
+    /// The edge byte-path stand-in serves blobs by digest — the same
+    /// contract the worker answers in front of the registry: the blob for
+    /// a digest it holds, 404 for a well-formed digest that names none,
+    /// 400 for a malformed digest, and HEAD carries the length without the
+    /// body.
     #[tokio::test]
-    async fn byte_path_serves_the_bundle_the_index_pins() {
+    async fn byte_path_serves_bundles_by_digest() {
         let root = tempfile::tempdir().expect("registry root");
         let bundle = b"not really a tar, but the bytes the index pins".to_vec();
         publish_slice(root.path(), &bundle).await;
         let app = registry_app("127.0.0.1:40123", root.path().to_path_buf());
-        let uri = format!("/api/v1/artifacts/{TARGET}/{RUSTC}/{C_METADATA}?crate=serde");
+        let uri = format!("/api/v1/bundles/{}", sha256_digest(&bundle));
 
         let response = app
             .clone()
@@ -2030,18 +1946,37 @@ mod tests {
             .expect("head body");
         assert!(body.is_empty());
 
+        // A well-formed digest no blob is stored under is a registry miss.
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/api/v1/artifacts/{TARGET}/{RUSTC}/0011aabbccddeeff"
-                    ))
+                    .uri(format!("/api/v1/bundles/sha256:{}", "1".repeat(64)))
                     .body(Body::empty())
                     .expect("miss request builds"),
             )
             .await
             .expect("miss response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A malformed digest is rejected before any blob lookup.
+        for malformed in [
+            "sha256:zz",
+            "notadigest",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/bundles/{malformed}"))
+                        .body(Body::empty())
+                        .expect("malformed request builds"),
+                )
+                .await
+                .expect("malformed response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{malformed}");
+        }
     }
 
     /// Bind an ephemeral loopback port, serve the probe-instrumented

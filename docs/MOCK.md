@@ -78,7 +78,7 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 │                              │  POST /api/v1/scheduler/complete    │              │
 │                              │◄────────────────────────────────────│              │
 └──────────┬───────────────────┘                                     └─────┬────────┘
-           │ GET /api/v1/artifacts/… (bundle bytes), POST /api/v1/admissions │ bundles +
+           │ GET /api/v1/bundles/{digest} (bundle bytes), POST /api/v1/admissions │ bundles +
            ▲                                                               │ sigstore push
 ┌──────────┴───────────────────┐                                           ▼
 │ stow-cli (consumer machine)  │  OCI pulls: signed index.* slices ┌──────────────────┐

@@ -1117,7 +1117,8 @@ fn best_upgrade_for(
 /// The wrapper's exact lookup, resolved locally: the slice row whose
 /// `c_metadata` the invocation asks for. `c_metadata` is unique within a
 /// `(target, rustc_version)` slice and the slice is already scoped to the
-/// pair, so this is the edge's `get_artifact_reference` reduced to a scan.
+/// pair, so the lookup is a scan — the row's `bundle_digest` is then the
+/// byte-path address the edge serves.
 #[must_use]
 pub fn find_exact_artifact<'a>(
     rows: &'a [ArtifactIndexRow],

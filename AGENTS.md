@@ -42,7 +42,7 @@ identity. The build order is the edges. The unit rule is what may be a node.
 - Trust GitHub-hosted CI as the builder.
 - Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
 - Trusted CI registers artifact records via the edge worker's authenticated `/api/v1/admin/artifacts/register` endpoint (the caller proves a GitHub identity — Actions OIDC for CI, a push-user token otherwise). The edge owns the only write path to D1's `artifacts` table; CI does NOT hold a D1 credential.
-- Edge workers are untrusted-by-default serving infrastructure: every register write is gated by GitHub-identity auth (the `build-crate.yml` OIDC pin or a repo push user), and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the CLI sees a 404, edge prunes the stale row).
+- Edge workers are untrusted-by-default serving infrastructure: every register write is gated by GitHub-identity auth (the `build-crate.yml` OIDC pin or a repo push user), and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the CLI sees a 404 or a digest failure and compiles locally).
 - Future direction: replace bearer-credential register auth with a cosign-signed request body, so the register path itself becomes signature-rooted.
 
 ## Architecture map
@@ -54,8 +54,8 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `cache_policy.rs`: controls whether a rustc invocation is allowed to use public cache.
   - `inject.rs`: writes cached outputs back into Cargo target dirs.
   - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
-- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`, Cache API in front of GHCR) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
-  - `api.rs`: exact byte-path GET/HEAD, `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
+- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/bundles/{digest}`, Cache API in front of the GHCR blob — no catalog lookup) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
+  - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
   - `worker_resolver.rs`: the request lane, preheat lanes and admin enqueue resolve — cargo's resolver (`stow-resolve`) over fetched manifests.
   - `dependency_resolver.rs`: miss derivation for admissions and the shared crates.io record helpers.
   - `db.rs`: D1 schema helpers and artifact-catalog queries.

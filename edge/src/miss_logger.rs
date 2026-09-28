@@ -8,7 +8,6 @@
 //! an IP, a request id, a dependency graph, or a lockfile hash.
 
 use stow_types::api::EnqueueRequest;
-use stow_types::identity::CrateName;
 
 use crate::stats::AnalyticsConsent;
 
@@ -16,12 +15,11 @@ use crate::stats::AnalyticsConsent;
 /// dataset can grow other event kinds without changing its shape.
 const MISS_EVENT: &str = "miss";
 
-/// The lookup surface that observed the miss — the `path` blob.
+/// The lookup surface that observed the miss — the `path` blob. Every
+/// miss today is a graph miss: the byte path answers digest-addressed
+/// blobs and observes no crate identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissPath {
-    /// `GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`: no
-    /// row, or a row whose registry bundle turned out stale.
-    Exact,
     /// One uncovered node of `POST /api/v1/admissions`.
     Graph,
 }
@@ -30,7 +28,6 @@ impl MissPath {
     /// The blob value for this path.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Exact => "exact",
             Self::Graph => "graph",
         }
     }
@@ -59,22 +56,6 @@ pub struct Miss {
 }
 
 impl Miss {
-    /// An exact-key miss: the request identifies the artifact by
-    /// `c_metadata`, so the only demand fields it carries are the crate
-    /// name (from `?crate=`), the target, and the toolchain.
-    pub fn exact(crate_name: &CrateName, target: &str, rustc_version: &str) -> Self {
-        Self {
-            crate_name: crate_name.as_str().to_owned(),
-            version: String::new(),
-            features_json: String::new(),
-            target: target.to_owned(),
-            rustc_version: rustc_version.to_owned(),
-            kind: String::new(),
-            path: MissPath::Exact,
-            depends_on_json: String::new(),
-        }
-    }
-
     /// An uncovered node of a dependency-graph analysis.
     pub fn graph(request: &EnqueueRequest) -> Self {
         Self {
@@ -200,27 +181,6 @@ mod tests {
         }
     }
 
-    /// The exact surface knows only the crate name, target, and toolchain;
-    /// the slots it cannot observe stay empty in the fixed tuple.
-    #[test]
-    fn exact_miss_point_shape() {
-        let miss = Miss::exact(&CrateName::parse("serde").expect("name"), TARGET, RUSTC);
-        assert_eq!(
-            miss.blobs(),
-            [
-                "miss",
-                "serde",
-                "",
-                "",
-                "x86_64-unknown-linux-gnu",
-                "1.85.0",
-                "",
-                "exact",
-                ""
-            ]
-        );
-    }
-
     /// A graph miss names the uncovered package node; the enqueue
     /// request carries no artifact kind, so the slot stays empty.
     #[test]
@@ -266,15 +226,11 @@ mod tests {
     #[test]
     fn recording_stub_captures_rendered_points() {
         let log = RecordingMissLog::default();
-        log.write_miss(
-            AnalyticsConsent::ALLOWED,
-            &Miss::exact(&CrateName::parse("serde").expect("name"), TARGET, RUSTC),
-        );
+        log.write_miss(AnalyticsConsent::ALLOWED, &Miss::graph(&enqueue_request()));
         log.write_miss(AnalyticsConsent::ALLOWED, &Miss::graph(&enqueue_request()));
         let points = log.points.lock().expect("points").clone();
         assert_eq!(points.len(), 2);
-        assert_eq!(points[0][7], "exact");
-        assert_eq!(points[1][7], "graph");
+        assert!(points.iter().all(|point| point[7] == "graph"));
     }
 
     /// A request carrying `x-stow-no-analytics: 1` writes no point —
@@ -283,10 +239,7 @@ mod tests {
     #[test]
     fn denied_consent_writes_nothing() {
         let log = RecordingMissLog::default();
-        log.write_miss(
-            AnalyticsConsent::DENIED,
-            &Miss::exact(&CrateName::parse("serde").expect("name"), TARGET, RUSTC),
-        );
+        log.write_miss(AnalyticsConsent::DENIED, &Miss::graph(&enqueue_request()));
         assert!(log.points.lock().expect("points").is_empty());
     }
 }

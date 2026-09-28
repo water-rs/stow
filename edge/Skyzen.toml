@@ -87,9 +87,6 @@ name = "STOW_POW_CHALLENGE_SECRET"
 [[secret]]
 name = "TURNSTILE_SECRET_KEY"
 
-# Daily-salted install-hash key for the usage-statistics hit index.
-[[secret]]
-name = "STOW_STATS_SALT_SECRET"
 
 # API token with Analytics Engine read on the account — queried by
 # /api/v1/stats for the public usage page.
@@ -107,12 +104,6 @@ routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "wat
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
 
-# Usage statistics — served-hit and opt-in share events. Hit points are
-# sampled 1/10 and scaled by their stored weight at query time; the index
-# is a daily-salted install hash, never an IP.
-[[cloudflare.raw.analytics_engine_datasets]]
-binding = "STOW_STATS"
-dataset = "stow_events"
 
 # Paid plan defaults subrequests to 10k/invocation, which a cold-closure
 # analysis can exceed — every uncached entry costs a sparse-index fetch plus
