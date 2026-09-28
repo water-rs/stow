@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 
 use skyzen_cloudflare::CfD1;
 use skyzen_services::Db;
+use stow_types::api::SchemaMigrationReport;
 
 use crate::db;
 use crate::errors::QueueError;
@@ -77,25 +78,45 @@ impl DurableObject for Scheduler {
         #[cfg(target_arch = "wasm32")]
         crate::console_log::init();
         Route::new((
-            "/tasks/submit".post(submit_tasks),
-            "/tasks/submit/trusted".post(submit_tasks_trusted),
-            "/tasks/status".post(tasks_status),
-            "/tasks".at(list_tasks),
-            "/tasks/retry".post(queue_retry),
-            "/tasks/cancel".post(queue_cancel),
-            "/tasks/promote".post(queue_promote),
-            "/tasks/purge".post(queue_purge),
-            "/tasks/observe-run".post(observe_run),
+            // Grouped to stay under the router's route-tuple arity —
+            // the URLs are unchanged.
+            "/tasks".route((
+                "".at(list_tasks),
+                "/submit".post(submit_tasks),
+                "/submit/trusted".post(submit_tasks_trusted),
+                "/status".post(tasks_status),
+                "/retry".post(queue_retry),
+                "/cancel".post(queue_cancel),
+                "/promote".post(queue_promote),
+                "/purge".post(queue_purge),
+                "/observe-run".post(observe_run),
+            )),
             "/complete".post(complete),
             "/status".at(status),
             "/admin/status".at(admin_status),
             "/rustc/stable".at(stable_rustc),
             "/index/published".post(record_published_index),
             "/panic".at(read_panic).post(write_panic),
+            "/migrate".post(migrate_scheduler),
         ))
         .on_alarm(run_alarm)
         .build()
     }
+}
+
+/// `POST /migrate` — the only endpoint that may issue DDL on the queue
+/// database. Reached from `POST /api/v1/admin/scheduler/migrate`, which
+/// `deploy-edge.yml` calls right after `skyzen deploy` and `stow-admin
+/// scheduler migrate` calls manually. Runs the full migration pass and
+/// returns the schema version before and after.
+async fn migrate_scheduler(db: DurableDb) -> Result<Json<SchemaMigrationReport>> {
+    let report = queue::migrate(&db).await.map_err(to_error)?;
+    tracing::warn!(
+        before = report.before,
+        after = report.after,
+        "scheduler schema migrated"
+    );
+    Ok(Json(report))
 }
 
 /// `POST /tasks/submit` — the anonymous-lane submit. The pending-depth

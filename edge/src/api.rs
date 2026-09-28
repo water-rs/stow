@@ -694,6 +694,28 @@ pub async fn admin_status(
     Ok(Json(scheduler_client::admin_status(&scheduler).await?))
 }
 
+/// `POST /api/v1/admin/scheduler/migrate`
+///
+/// Run the scheduler Durable Object's schema migration — the only code
+/// path that may issue DDL on its database. `deploy-edge.yml` calls it
+/// right after `skyzen deploy` (migrations are additive, so the previous
+/// build keeps serving while they apply); `stow-admin scheduler
+/// migrate` is the manual path. Reports the schema version before and
+/// after.
+pub async fn admin_scheduler_migrate(
+    SchedulerCaller(caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::SchemaMigrationReport>, GetArtifactError> {
+    let report = scheduler_client::migrate_scheduler(&scheduler).await?;
+    tracing::warn!(
+        before = report.before,
+        after = report.after,
+        %caller,
+        "scheduler schema migrated via admin endpoint"
+    );
+    Ok(Json(report))
+}
+
 /// `GET /api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=`
 ///
 /// Queue rows matching the selector, newest transition first — the
