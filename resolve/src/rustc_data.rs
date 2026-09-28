@@ -22,15 +22,9 @@ use std::collections::BTreeMap;
 #[must_use]
 pub fn verbose_version(version: &str, host: &str) -> Option<&'static str> {
     match (version, host) {
-        ("1.98.1", "aarch64-apple-darwin") => Some(include_str!(
-            "../rustc-data/1.98.1/verbose/aarch64-apple-darwin.txt"
-        )),
-        ("1.98.1", "x86_64-pc-windows-msvc") => Some(include_str!(
-            "../rustc-data/1.98.1/verbose/x86_64-pc-windows-msvc.txt"
-        )),
-        ("1.98.1", "x86_64-unknown-linux-gnu") => Some(include_str!(
-            "../rustc-data/1.98.1/verbose/x86_64-unknown-linux-gnu.txt"
-        )),
+        ("1.98.1", "aarch64-apple-darwin") => Some(include_str!("../rustc-data/1.98.1/verbose/aarch64-apple-darwin.txt")),
+        ("1.98.1", "x86_64-pc-windows-msvc") => Some(include_str!("../rustc-data/1.98.1/verbose/x86_64-pc-windows-msvc.txt")),
+        ("1.98.1", "x86_64-unknown-linux-gnu") => Some(include_str!("../rustc-data/1.98.1/verbose/x86_64-unknown-linux-gnu.txt")),
         _ => None,
     }
 }
