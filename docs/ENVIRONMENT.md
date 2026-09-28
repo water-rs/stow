@@ -53,6 +53,7 @@ JSON) and sends nothing.
 | Variable | Default | Purpose |
 |---|---|---|
 | `STOW_EDGE_URL` | _required_ | Edge base URL the admin's trusted calls go to: scheduler task submits, `panic on\|off\|status` (the `/api/v1/admin/panic` circuit breaker) and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). |
+| `STOW_EDGE_VERSION_OVERRIDE` | _optional_ | Verbatim `Cloudflare-Workers-Version-Overrides` header value (e.g. `stow-edge="<version-id>"`) pinned onto every edge call — `deploy-edge.yml` sets it so `scheduler migrate` runs on the uploaded candidate before traffic shifts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints and the GitHub REST calls (`runs`, `cache`, `preheat projects generate`); the owner must have push access to `water-rs/stow`. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
 | `CF_ANALYTICS_TOKEN` | _required for `preheat missed`_ | Cloudflare API token with `Account Analytics: Read`, used to query the `stow_cache_misses` dataset. In CI it comes from the `CF_ANALYTICS_TOKEN` repository secret (see `DEPLOYMENT.md`). |

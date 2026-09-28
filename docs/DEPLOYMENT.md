@@ -190,33 +190,59 @@ for the alert type.
 green `Test` run of a `main` push (`workflow_run`), and on
 `workflow_dispatch`, which takes the commit `sha` (verified to have a
 completed green `Test` run via `gh run list --commit`) plus
-`canary_share` (default `5`) and `canary_window_minutes` (default `15`)
-inputs.
+`canary_share` (default `5`).
 
-The job uploads the new Worker version without deploying it —
+No job waits: the deploy is four jobs, and the observation windows are
+GitHub environment wait timers, which hold no runner. Operator setup
+(once per repository): under Settings → Environments create
+
+- `deploy-canary` — wait timer `15` minutes (the canary observation
+  window, the `canary-verdict` job's delay);
+- `deploy-promoted` — wait timer `15` minutes (the post-promotion
+  window, the `promoted-verdict` job's delay).
+
+Change a window by editing that environment's wait timer; the verdict
+reads the window's bounds from timestamps, so nothing else moves.
+
+The `prepare` job uploads the new Worker version without deploying it —
 `skyzen deploy --upload-only` plans `wrangler versions upload`, and the
 declared `[[secret]]` values travel in the same upload through
-`--secrets-file` — then shifts `canary_share`% of traffic onto it with
-`wrangler versions deploy`. Promotion is gated on two verdict phases of
+`--secrets-file` — then adds it to the deployment at `0%` so that
+version overrides reach it, runs `stow-admin scheduler migrate` against
+the candidate via the `Cloudflare-Workers-Version-Overrides` header
+(the scheduler schema version stamp must equal the candidate's own
+`SCHEMA_VERSION`, else the deploy fails before any traffic shifts),
+fires the synthetic suite at the candidate through the same override —
+50 requests across the site, crate lookup, artifact HEAD, stats and
+scheduler status paths, the floor the verdict's
+`--min-candidate-requests` expects — and finally shifts `canary_share`%
+of traffic onto it.
+
+Promotion is gated on two verdict phases of
 `stow-admin deploy verdict`, each printing every metric's baseline and
 candidate values and exiting non-zero on a breach — which runs
-`wrangler rollback` and fails the job:
+`wrangler rollback` and fails that job:
 
-- `--phase canary`, at the end of the observation window: worker error
-  rate and cpu/wall-time p50/p99 per `scriptVersion` from
-  `workersInvocationsAdaptive`, plus DO requests, errors and wall time
-  per request per `scriptVersion` from
+- `--phase canary`, run by `canary-verdict` after the `deploy-canary`
+  wait timer: worker error rate and cpu/wall-time p50/p99 per
+  `scriptVersion` from `workersInvocationsAdaptive`, plus DO requests,
+  errors and wall time per request per `scriptVersion` from
   `durableObjectsInvocationsAdaptiveGroups`. A canary that served
-  nothing fails closed; DO rows report `skipped` when the Scheduler
-  object stayed on the baseline (objects are assigned one version per
-  deployment config — a reassigned object is reset once, and SQLite
-  state survives).
-- `--phase promoted`, after promotion to 100% and a second window: the
-  metrics that carry no `scriptVersion` compare the post-promotion
-  window against the same baseline window — DO cpu and rows
+  nothing — or fewer than the suite's request count — fails closed; DO
+  rows report `skipped` when the Scheduler object stayed on the
+  baseline (objects are assigned one version per deployment config — a
+  reassigned object is reset once, and SQLite state survives).
+- `--phase promoted`, run by `promoted-verdict` after `promote` and the
+  `deploy-promoted` wait timer: the metrics that carry no
+  `scriptVersion` compare the post-promotion window against the
+  equal-length window ending at the deploy start — DO cpu and rows
   read/written per DO request from `durableObjectsPeriodicGroups`, and
   D1 rows read/written per worker request from
   `d1AnalyticsAdaptiveGroups`. A breach here rolls back too.
+
+The verdict jobs download the `stow-admin` artifact built by the Test
+run's `admin-binary` job for the deployed commit — nothing compiles it
+at deploy time.
 
 Required GitHub Actions secrets:
 

@@ -42,6 +42,13 @@ const STOW_OIDC_AUDIENCE_ENV: &str = "STOW_OIDC_AUDIENCE";
 /// per job when `id-token: write` is granted.
 const ACTIONS_ID_TOKEN_REQUEST_URL_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
+/// Pinned verbatim onto every edge call as the
+/// `Cloudflare-Workers-Version-Overrides` header when set — the deploy
+/// workflow uses it to aim `scheduler migrate` (and any other trusted
+/// call) at the uploaded candidate version before traffic shifts.
+const STOW_EDGE_VERSION_OVERRIDE_ENV: &str = "STOW_EDGE_VERSION_OVERRIDE";
+/// The header `STOW_EDGE_VERSION_OVERRIDE` fills.
+const VERSION_OVERRIDES_HEADER: &str = "Cloudflare-Workers-Version-Overrides";
 
 #[derive(Parser)]
 #[command(name = "stow-admin", about = "Operations CLI for the stow build fleet")]
@@ -204,6 +211,10 @@ pub(crate) struct Edge {
     /// caller apart, so a per-request mint is also what keeps the run
     /// under its own identity rather than a staged `GH_TOKEN`.
     token: Option<String>,
+    /// `STOW_EDGE_VERSION_OVERRIDE` verbatim — a Dictionary Structured
+    /// Header entry such as `stow-edge="<version-id>"`, pinned onto every
+    /// request so the call runs against that deployed version.
+    version_override: Option<String>,
 }
 
 impl Edge {
@@ -220,6 +231,9 @@ impl Edge {
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
             token,
+            version_override: std::env::var(STOW_EDGE_VERSION_OVERRIDE_ENV)
+                .ok()
+                .filter(|value| !value.is_empty()),
         })
     }
 
@@ -247,10 +261,15 @@ impl Edge {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
         let mut client = zenwave::client();
-        let response = client
+        let request = client
             .get(&url)
             .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
-            .map_err(|error| stow_error!("GET {url}: {error}"))?
+            .and_then(|request| match &self.version_override {
+                Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
+                None => Ok(request),
+            })
+            .map_err(|error| stow_error!("GET {url}: {error}"))?;
+        let response = request
             .await
             .map_err(|error| stow_error!("GET {url}: {error}"))?;
         response
@@ -271,11 +290,16 @@ impl Edge {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
         let mut client = zenwave::client();
-        let response = client
+        let request = client
             .post(&url)
             .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
+            .and_then(|request| match &self.version_override {
+                Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
+                None => Ok(request),
+            })
             .and_then(|request| request.json_body(body))
-            .map_err(|error| stow_error!("POST {url}: {error}"))?
+            .map_err(|error| stow_error!("POST {url}: {error}"))?;
+        let response = request
             .await
             .map_err(|error| stow_error!("POST {url}: {error}"))?;
         response

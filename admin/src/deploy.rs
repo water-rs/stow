@@ -120,6 +120,13 @@ pub struct VerdictArgs {
     /// See `--candidate-from`.
     #[arg(long, value_parser = parse_rfc3339)]
     candidate_to: OffsetDateTime,
+    /// Minimum worker requests the candidate must have served in its
+    /// window — the workflow's synthetic suite guarantees this floor via
+    /// version overrides, so organic traffic is never required for signal.
+    /// `0` disables the floor. Ignored by `--phase promoted` (its metrics
+    /// are account totals and skip on empty windows instead).
+    #[arg(long, default_value_t = 0)]
+    min_candidate_requests: u64,
 }
 
 fn parse_rfc3339(raw: &str) -> Result<OffsetDateTime, String> {
@@ -878,7 +885,15 @@ fn evaluate_canary(
     );
     let no_worker_signal = candidate.worker.is_none_or(|worker| worker.requests <= 0.0)
         || baseline.worker.is_none_or(|worker| worker.requests <= 0.0);
-    if no_worker_signal {
+    let min = f64::from(u32::try_from(args.min_candidate_requests).unwrap_or(u32::MAX));
+    let insufficient_sample =
+        !no_worker_signal && candidate.worker.is_some_and(|worker| worker.requests < min);
+    if no_worker_signal || insufficient_sample {
+        let verdict = if no_worker_signal {
+            "no signal"
+        } else {
+            "insufficient sample"
+        };
         report.metrics.insert(
             0,
             MetricVerdict {
@@ -886,13 +901,13 @@ fn evaluate_canary(
                 unit: "req",
                 baseline: baseline.worker.map_or(f64::NAN, |worker| worker.requests),
                 candidate: candidate.worker.map_or(f64::NAN, |worker| worker.requests),
-                ceiling: f64::NAN,
-                verdict: "no signal",
+                ceiling: min,
+                verdict,
             },
         );
         report
             .breaches
-            .insert(0, "worker signal (no signal)".to_owned());
+            .insert(0, format!("worker signal ({verdict})"));
         report.pass = false;
     }
     report
@@ -965,6 +980,7 @@ mod tests {
             baseline_to: parse_rfc3339("2026-09-28T00:15:00Z").expect("to"),
             candidate_from: parse_rfc3339("2026-09-28T00:15:00Z").expect("from"),
             candidate_to: parse_rfc3339("2026-09-28T00:30:00Z").expect("to"),
+            min_candidate_requests: 0,
         }
     }
 
@@ -1363,6 +1379,29 @@ mod tests {
         assert!(!report.pass);
         assert_eq!(report.metrics[0].verdict, "no signal");
         assert_eq!(report.breaches, ["worker signal (no signal)"]);
+    }
+
+    #[test]
+    fn a_candidate_below_the_minimum_sample_fails_closed() {
+        // The synthetic suite guarantees 50 requests on the candidate;
+        // one that served 3 breaches the floor even though it has signal.
+        let (baseline, _) = canary_samples();
+        let candidate = canary_sample(
+            &canary_data(
+                &json!([
+                    worker_group("old", 95_000.0, 40.0, 410.0, 2_100.0, 21_000.0, 82_000.0),
+                    worker_group("new", 3.0, 0.0, 420.0, 2_200.0, 22_000.0, 84_000.0),
+                ]),
+                &json!([do_invocation_group("old", 10_500.0, 6.0, 520_000_000.0)]),
+            ),
+            "new",
+        );
+        let mut min_args = args();
+        min_args.min_candidate_requests = 50;
+        let report = evaluate_canary(&min_args, &baseline, &candidate);
+        assert!(!report.pass);
+        assert_eq!(report.metrics[0].verdict, "insufficient sample");
+        assert_eq!(report.breaches, ["worker signal (insufficient sample)"]);
     }
 
     #[test]

@@ -1,32 +1,41 @@
 name: deploy-edge
 
 # The edge deploys a tested commit only: the trigger is a green `Test` run on
-# main, and a manual dispatch must name a commit that has one. The job uploads
-# the new Worker version without deploying it (`wrangler versions upload`,
-# via `skyzen deploy --upload-only`), shifts a slice of traffic onto it
-# (`wrangler versions deploy <id>@<share>%`), and gates promotion on two
-# verdict phases of `stow-admin deploy verdict`:
+# main, and a manual dispatch must name a commit that has one. The deploy is
+# four jobs — no runner is ever held waiting:
 #
-#   Phase 1, `canary` — per-`scriptVersion` worker metrics (error rate,
-#   cpu/wall p50+p99) plus DO requests/errors/wall-per-request from
-#   `durableObjectsInvocationsAdaptiveGroups`.
-#   Phase 2, `promoted` — after promotion to 100%, the metrics that carry
-#   no version dimension compare the post-promotion window against the
-#   equal-length window ending at the canary shift: DO cpu/rows per DO
-#   request (`durableObjectsPeriodicGroups`) and D1 rows per worker
-#   request (`d1AnalyticsAdaptiveGroups`).
+#   prepare          upload the new version (`wrangler versions upload` via
+#                    `skyzen deploy --upload-only`), add it to the deployment
+#                    at 0%, migrate the scheduler and run the synthetic suite
+#                    against it via the `Cloudflare-Workers-Version-Overrides`
+#                    header, then shift `canary_share`% of traffic onto it.
+#   canary-verdict   `environment: deploy-canary` — a GitHub environment whose
+#                    wait timer IS the observation window (operator setup in
+#                    docs/DEPLOYMENT.md); the job starts only after it elapses
+#                    and runs `stow-admin deploy verdict --phase canary`.
+#   promote          `wrangler versions deploy <id>@100%`.
+#   promoted-verdict `environment: deploy-promoted` (second wait timer), then
+#                    `--phase promoted`.
 #
-# A breach in either phase runs `wrangler rollback` and fails the job.
+# The verdict binary is the `stow-admin` artifact of the Test run that proved
+# the commit — no job compiles it. A breach in either verdict job (or any
+# post-upload failure) runs `wrangler rollback` to the baseline version.
 #
-# Durable Objects and gradual deployments (per the Cloudflare "With Durable
-# Objects" doc): each object is *assigned* one version per deployment config,
-# proportionally — the singleton Scheduler either stays on the baseline for
-# the whole canary (its DO rows then report `skipped`, not a breach) or is
-# reassigned to the candidate, which resets it once (in-memory state is lost,
-# SQLite storage survives; the API contract between the two versions must be
-# compatible either way). The Scheduler's migration (`new_sqlite_classes`,
-# tag v1) is already live, so a version upload that changes no DO lifecycle is
-# legal and a rollback to the baseline never crosses a migration boundary.
+# Phase 1 compares per-`scriptVersion` metrics: worker error rate and
+# cpu/wall p50+p99 (`workersInvocationsAdaptive`), DO requests/errors/wall per
+# request (`durableObjectsInvocationsAdaptiveGroups`). Phase 2 compares the
+# metrics with no version dimension — `durableObjectsPeriodicGroups` and
+# `d1AnalyticsAdaptiveGroups` — post-promotion window against the equal-length
+# window ending at the deploy start.
+#
+# Durable Objects under a split deployment (per the Cloudflare "With Durable
+# Objects" doc): each object is *assigned* one version per deployment config —
+# the singleton Scheduler either stays on the baseline for the whole canary
+# (phase-1 DO rows report `skipped`) or is reassigned to the candidate, which
+# resets it once (in-memory state lost, SQLite storage survives). The
+# Scheduler's migration (`new_sqlite_classes`, tag v1) is already live, so a
+# version upload that changes no DO lifecycle is legal and a rollback never
+# crosses a migration boundary.
 on:
   workflow_run:
     workflows: [Test]
@@ -43,33 +52,39 @@ on:
         required: false
         default: "5"
         type: string
-      canary_window_minutes:
-        description: Minutes the canary serves before the verdict runs.
-        required: false
-        default: "15"
-        type: string
 
 permissions:
   contents: read
-  # `gh run list` in the dispatch gate reads the Test run's conclusion.
+  # `gh run list`/`gh run download` read the Test run's conclusion and its
+  # stow-admin artifact.
   actions: read
+  # `stow-admin scheduler migrate` mints an Actions OIDC JWT per request.
+  id-token: write
 
 concurrency: deploy-edge
 
 env:
   DEPLOY_SHA: ${{ inputs.sha || github.event.workflow_run.head_sha }}
   CANARY_SHARE: ${{ inputs.canary_share || '5' }}
-  CANARY_WINDOW_MINUTES: ${{ inputs.canary_window_minutes || '15' }}
   # zen-rs/skyzen commit that provides `deploy --upload-only` — the
   # squash-merged commit of zen-rs/skyzen#98 on skyzen's dev.
   SKYZEN_REV: 0271f693d253a9b32660affacbafaeffca455620
   # The generated wrangler config, relative to edge/ (the manifest root).
   WRANGLER_CONFIG: .skyzen/gen/wrangler.toml
+  # The synthetic suite's request count — also the verdict's
+  # --min-candidate-requests floor, so a low-traffic deploy still fails
+  # closed if the suite itself did not land.
+  SUITE_REQUESTS: "50"
 
 jobs:
-  deploy:
+  prepare:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    outputs:
+      baseline_version: ${{ steps.versions.outputs.baseline_version }}
+      candidate_version: ${{ steps.versions.outputs.candidate_version }}
+      deploy_start: ${{ steps.join.outputs.deploy_start }}
+      test_run_id: ${{ steps.testrun.outputs.test_run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,20 +93,30 @@ jobs:
 
       # A dispatch is only as tested as the commit it names — the deploy's
       # justification is a green Test run, so verify one exists for the SHA.
-      - name: A dispatched SHA must have a green Test run
-        if: github.event_name == 'workflow_dispatch'
+      # The same lookup also finds the run whose `stow-admin` artifact the
+      # verdict jobs download.
+      - name: Resolve the green Test run for $DEPLOY_SHA
+        id: testrun
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          count=$(gh run list --commit "$DEPLOY_SHA" --workflow Test --limit 50 \
-            --json conclusion | jq '[.[] | select(.conclusion == "success")] | length')
-          if [ "$count" -lt 1 ]; then
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_run ]; then
+            run_id="${{ github.event.workflow_run.id }}"
+          else
+            run_id=$(gh run list --commit "$DEPLOY_SHA" --workflow Test --limit 50 \
+              --json databaseId,conclusion \
+              | jq -r '[.[] | select(.conclusion == "success")][0].databaseId // empty')
+          fi
+          if [ -z "$run_id" ]; then
             echo "::error::no green Test run for $DEPLOY_SHA — refusing to deploy an untested commit" >&2
             exit 1
           fi
-          echo "$count green Test run(s) for $DEPLOY_SHA"
+          echo "Test run $run_id gates this deploy"
+          echo "TEST_RUN_ID=$run_id" >> "$GITHUB_ENV"
+          echo "test_run_id=$run_id" >> "$GITHUB_OUTPUT"
 
-      - name: Validate the canary inputs
+      - name: Validate the canary input
         run: |
           case "$CANARY_SHARE" in ''|*[!0-9]*)
             echo "::error::canary_share must be an integer 1-99, got '$CANARY_SHARE'" >&2
@@ -100,15 +125,6 @@ jobs:
           esac
           if [ "$CANARY_SHARE" -lt 1 ] || [ "$CANARY_SHARE" -gt 99 ]; then
             echo "::error::canary_share must be 1-99, got $CANARY_SHARE" >&2
-            exit 1
-          fi
-          case "$CANARY_WINDOW_MINUTES" in ''|*[!0-9]*)
-            echo "::error::canary_window_minutes must be a positive integer, got '$CANARY_WINDOW_MINUTES'" >&2
-            exit 1
-            ;;
-          esac
-          if [ "$CANARY_WINDOW_MINUTES" -lt 1 ]; then
-            echo "::error::canary_window_minutes must be at least 1" >&2
             exit 1
           fi
 
@@ -142,7 +158,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       # skyzen deploy resolves every declared [[secret]] from the environment
       # and, under --upload-only, folds them into the version upload itself
-      # (`--secrets-file`), so the canary version already carries them when
+      # (`--secrets-file`), so the candidate already carries them when
       # traffic shifts. An unset repository secret reaches the job as an
       # empty string, which skyzen would deliver as a real (empty) secret,
       # so every value is checked first.
@@ -171,6 +187,7 @@ jobs:
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
 
       - name: Read the baseline and candidate version ids
+        id: versions
         working-directory: edge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -195,40 +212,145 @@ jobs:
           echo "baseline $baseline -> candidate $candidate"
           echo "BASELINE_VERSION=$baseline" >> "$GITHUB_ENV"
           echo "CANDIDATE_VERSION=$candidate" >> "$GITHUB_ENV"
+          echo "baseline_version=$baseline" >> "$GITHUB_OUTPUT"
+          echo "candidate_version=$candidate" >> "$GITHUB_OUTPUT"
 
-      # The baseline window ends where the candidate's begins — record it
-      # before traffic shifts.
-      - name: Shift $CANARY_SHARE% of traffic onto the candidate
+      # A version override only reaches a version in the current
+      # deployment, so the candidate joins at 0% first — the migrate call
+      # and synthetic suite below then address it directly. The
+      # observation window starts here: suite and canary traffic both land
+      # inside it.
+      - name: Add the candidate to the deployment at 0%
+        id: join
         working-directory: edge
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          echo "DEPLOY_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@$CANARY_SHARE%"
+          deploy_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "DEPLOY_START=$deploy_start" >> "$GITHUB_ENV"
+          echo "deploy_start=$deploy_start" >> "$GITHUB_OUTPUT"
+          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@0%"
 
-      # The build overlaps the observation window so the verdict binary is
-      # warm when the window ends; `wait` surfaces a build failure as a step
-      # failure, which the rollback step below also catches.
-      - name: Observe the canary window (building stow-admin meanwhile)
+      - name: Fetch the prebuilt stow-admin from the Test run
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cargo build -p stow-admin &
-          sleep "${CANARY_WINDOW_MINUTES}m"
-          wait
+          set -euo pipefail
+          gh run download "$TEST_RUN_ID" -n stow-admin -D /tmp/stow-admin-bin
+          chmod +x /tmp/stow-admin-bin/stow-admin
 
-      # `deploy verdict` prints every metric's baseline/candidate pair and
-      # exits non-zero on a breach or on no signal — a canary that served
-      # nothing proved nothing.
+      # The scheduler queue's schema is the DO's, not D1's: it migrates
+      # through the admin route, never in request code. The override header
+      # runs the call on the candidate build; migrations are additive, so
+      # the baseline keeps serving. Requires #437's
+      # `stow-admin scheduler migrate` — the step fails closed if the
+      # stamped version is not the candidate's SCHEMA_VERSION.
+      - name: Migrate the scheduler schema on the candidate
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          export STOW_EDGE_VERSION_OVERRIDE="stow-edge=\"$CANDIDATE_VERSION\""
+          report=$(/tmp/stow-admin-bin/stow-admin --json scheduler migrate)
+          echo "$report"
+          after=$(jq -r '.after' <<<"$report")
+          expected=$(sed -n 's/.*const SCHEMA_VERSION: i64 = \([0-9]\+\).*/\1/p' \
+            edge/src/scheduler/queue.rs)
+          if [ -z "$expected" ]; then
+            echo "::error::no SCHEMA_VERSION in the candidate source — land #437 before this workflow can deploy" >&2
+            exit 1
+          fi
+          if [ "$after" != "$expected" ]; then
+            echo "::error::scheduler schema at $after, candidate expects $expected" >&2
+            exit 1
+          fi
+
+      # The suite is the verdict's guaranteed signal: version overrides pin
+      # every request to the candidate, so organic traffic is never
+      # required — a 5% canary of a quiet site still produces a full
+      # sample. SUITE_REQUESTS requests total; the artifact probe accepts
+      # 404 (the key is a well-formed miss, not an error).
+      - name: Synthetic suite against the candidate
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+        run: |
+          set -euo pipefail
+          override="stow-edge=\"$CANDIDATE_VERSION\""
+          probes=$((SUITE_REQUESTS / 5))
+          for i in $(seq "$probes"); do
+            for url in "/" \
+              "/api/v1/crates/serde/versions" \
+              "/api/v1/artifacts/x86_64-unknown-linux-gnu/1.90.0/suite-probe" \
+              "/api/v1/stats" \
+              "/api/v1/scheduler/status"; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
+                -H "Cloudflare-Workers-Version-Overrides: $override" \
+                "$STOW_EDGE_URL$url")
+              case "$code" in
+                2*|404) ;;
+                *) echo "::error::suite probe $url answered $code" >&2; exit 1 ;;
+              esac
+            done
+          done
+          echo "suite landed $SUITE_REQUESTS requests on $CANDIDATE_VERSION"
+
+      - name: Shift $CANARY_SHARE% of traffic onto the candidate
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@$CANARY_SHARE%"
+
+      # Any post-upload failure leaves the candidate in the deployment;
+      # roll back to the baseline. `CANDIDATE_VERSION` is only set once a
+      # version exists, so failures before the upload skip this.
+      - name: Roll back to the baseline
+        if: failure() && env.CANDIDATE_VERSION != ''
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler rollback "$BASELINE_VERSION" --config "$WRANGLER_CONFIG" \
+            --message "deploy-edge: prepare failure" --yes
+
+  canary-verdict:
+    needs: prepare
+    # The environment's wait timer is the observation window — the job
+    # starts after it elapses and no runner is held meanwhile.
+    environment: deploy-canary
+    runs-on: ubuntu-latest
+    env:
+      BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
+      CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
+      DEPLOY_START: ${{ needs.prepare.outputs.deploy_start }}
+      TEST_RUN_ID: ${{ needs.prepare.outputs.test_run_id }}
+    steps:
+      - name: Fetch the prebuilt stow-admin from the Test run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$TEST_RUN_ID" -n stow-admin -D /tmp/stow-admin-bin
+          chmod +x /tmp/stow-admin-bin/stow-admin
+
+      # The candidate window is [DEPLOY_START, now] — it holds the suite's
+      # SUITE_REQUESTS requests plus organic canary traffic. The baseline
+      # window is its equal-length mirror ending at the deploy start.
       - name: Canary verdict (phase 1)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          now_epoch=$(date -u +%s)
           start_epoch=$(date -u -d "$DEPLOY_START" +%s)
-          baseline_from=$(date -u -d "@$((start_epoch - CANARY_WINDOW_MINUTES * 60))" +%Y-%m-%dT%H:%M:%SZ)
-          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          cargo run --quiet -p stow-admin -- deploy verdict --phase canary \
+          baseline_from=$(date -u -d "@$((start_epoch - (now_epoch - start_epoch)))" +%Y-%m-%dT%H:%M:%SZ)
+          now=$(date -u -d "@$now_epoch" +%Y-%m-%dT%H:%M:%SZ)
+          /tmp/stow-admin-bin/stow-admin deploy verdict --phase canary \
+            --min-candidate-requests "$SUITE_REQUESTS" \
             --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
             --script stow-edge \
             --baseline-version "$BASELINE_VERSION" \
@@ -238,34 +360,85 @@ jobs:
             --candidate-from "$DEPLOY_START" \
             --candidate-to "$now"
 
-      # The post-promotion window starts where 100% traffic starts — record
-      # it before the shift, the same way the canary window did.
-      - name: Promote the candidate to 100%
-        working-directory: edge
+      - name: Roll back to the baseline
+        if: failure()
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          echo "PROMOTE_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@100%"
+          set -euo pipefail
+          npm install -g wrangler@4
+          wrangler rollback "$BASELINE_VERSION" --name stow-edge \
+            --message "deploy-edge: canary verdict breach" --yes
 
-      - name: Observe the post-promotion window
-        run: sleep "${CANARY_WINDOW_MINUTES}m"
+  promote:
+    needs: [prepare, canary-verdict]
+    runs-on: ubuntu-latest
+    env:
+      BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
+      CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
+    outputs:
+      promote_start: ${{ steps.promote.outputs.promote_start }}
+    steps:
+      # The post-promotion window starts where 100% traffic starts.
+      - name: Promote the candidate to 100%
+        id: promote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npm install -g wrangler@4
+          promote_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "promote_start=$promote_start" >> "$GITHUB_OUTPUT"
+          wrangler versions deploy --name stow-edge --yes "$CANDIDATE_VERSION@100%"
 
-      # Phase 2: the metrics that carry no `scriptVersion` — DO periodic
-      # cpu/rows per DO request and D1 rows per worker request — compare
-      # the post-promotion window against the same baseline window. A
-      # breach here rolls back to the baseline too.
+      - name: Roll back to the baseline
+        if: failure()
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npm install -g wrangler@4
+          wrangler rollback "$BASELINE_VERSION" --name stow-edge \
+            --message "deploy-edge: promote failure" --yes
+
+  promoted-verdict:
+    needs: [prepare, promote]
+    environment: deploy-promoted
+    runs-on: ubuntu-latest
+    env:
+      BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
+      CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
+      DEPLOY_START: ${{ needs.prepare.outputs.deploy_start }}
+      PROMOTE_START: ${{ needs.promote.outputs.promote_start }}
+      TEST_RUN_ID: ${{ needs.prepare.outputs.test_run_id }}
+    steps:
+      - name: Fetch the prebuilt stow-admin from the Test run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$TEST_RUN_ID" -n stow-admin -D /tmp/stow-admin-bin
+          chmod +x /tmp/stow-admin-bin/stow-admin
+
+      # Phase 2's metrics carry no `scriptVersion` — account totals. The
+      # candidate window is [PROMOTE_START, now]; the baseline window is
+      # its equal-length mirror ending at the deploy start, the same
+      # pre-deploy window phase 1 measured.
       - name: Post-promotion verdict (phase 2)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
+          now_epoch=$(date -u +%s)
+          promote_epoch=$(date -u -d "$PROMOTE_START" +%s)
           start_epoch=$(date -u -d "$DEPLOY_START" +%s)
-          baseline_from=$(date -u -d "@$((start_epoch - CANARY_WINDOW_MINUTES * 60))" +%Y-%m-%dT%H:%M:%SZ)
-          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          cargo run --quiet -p stow-admin -- deploy verdict --phase promoted \
+          baseline_from=$(date -u -d "@$((start_epoch - (now_epoch - promote_epoch)))" +%Y-%m-%dT%H:%M:%SZ)
+          now=$(date -u -d "@$now_epoch" +%Y-%m-%dT%H:%M:%SZ)
+          /tmp/stow-admin-bin/stow-admin deploy verdict --phase promoted \
             --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
             --script stow-edge \
             --baseline-version "$BASELINE_VERSION" \
@@ -275,16 +448,13 @@ jobs:
             --candidate-from "$PROMOTE_START" \
             --candidate-to "$now"
 
-      # Anything after `versions deploy` failing — a verdict breach in
-      # either phase, the admin build, the runner — leaves the candidate
-      # serving traffic; roll it back. `CANDIDATE_VERSION` is only set
-      # once a version exists, so failures before the upload skip this.
       - name: Roll back to the baseline
-        if: failure() && env.CANDIDATE_VERSION != ''
-        working-directory: edge
+        if: failure()
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          wrangler rollback "$BASELINE_VERSION" --config "$WRANGLER_CONFIG" \
-            --message "deploy-edge: verdict breach or post-deploy failure" --yes
+          set -euo pipefail
+          npm install -g wrangler@4
+          wrangler rollback "$BASELINE_VERSION" --name stow-edge \
+            --message "deploy-edge: post-promotion verdict breach" --yes
