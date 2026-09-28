@@ -60,7 +60,7 @@ const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 const RECORDS_CERT_URL: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
 /// The `index.*`/`folded.*` pair is signed by the index workflow — the
 /// export verifies previous slices against it before folding on top.
-const INDEX_CERT_URL: &str = stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY;
+pub const INDEX_CERT_URL: &str = stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY;
 
 #[derive(Args)]
 pub struct IndexArgs {
@@ -278,7 +278,7 @@ pub async fn records_trust() -> stow_types::error::Result<stow_oci::verify::Trus
 /// `GHCR_BASE:tag` the publisher signed, so `identity_reference` is
 /// what verification compares — the same split the CLI's bundle and
 /// index verification makes.
-async fn verify_artifact(
+pub async fn verify_artifact(
     session: &stow_oci::RegistrySession,
     trust: &stow_oci::verify::Trust,
     reference: &oci_client::Reference,
@@ -444,7 +444,7 @@ type PullFut<'a, T> =
 
 /// The `(target, rustc)` an `index.*` tag names — the same suffix shape
 /// [`folded_tag_parts`] splits, under the other half of the tag pair.
-fn index_tag_parts(tag: &str) -> Option<(&str, &str)> {
+pub fn index_tag_parts(tag: &str) -> Option<(&str, &str)> {
     tag.strip_prefix("index.")?.split_once('.')
 }
 

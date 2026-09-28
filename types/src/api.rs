@@ -339,11 +339,10 @@ pub enum EnqueueSource {
 /// Admission ticket the edge mints for one canonical enqueue task when a
 /// public request misses the cache.
 ///
-/// Returned inside miss responses — as the 404 body of
-/// `POST /api/v1/artifacts/semantic` and in
-/// `DependencyGraphResponse::miss_admissions` — so the fetch path stays
-/// cheap. The client redeems the ticket by solving its proof-of-work and
-/// posting an [`EnqueueTicket`] to `POST /api/v1/enqueue`.
+/// Returned by `POST /api/v1/admissions` for each node the catalog does
+/// not cover — the fetch path stays cheap. The client redeems the
+/// ticket by solving its proof-of-work and posting an [`EnqueueTicket`]
+/// to `POST /api/v1/enqueue`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueAdmission {
     /// Canonical scheduler task id (blake3-derived identity string).
