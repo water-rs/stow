@@ -2316,7 +2316,52 @@ pub async fn record_published_slice(
     Ok(())
 }
 
+/// The scheduler schema version this build serves, stored in the
+/// database's `PRAGMA user_version`. Bump it whenever `schema.sql` or
+/// any step of [`migrate_schema`] changes: a queue stamped below it runs
+/// the migration pass once and is re-stamped, and a queue stamped above
+/// it fails fast rather than being served by code older than its schema.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Gate the migration pass on `PRAGMA user_version` so an up-to-date
+/// queue pays one pragma read and nothing else — the pass below costs
+/// ~1 s of DO CPU per call when it ran at the top of every queue
+/// operation (stow#432). The version is stamped only after every
+/// migration step has succeeded — the same per-statement commit
+/// discipline `migrate_queue_schema` and the column migrations already
+/// use — so a pass that dies midway leaves `user_version` behind and
+/// simply re-runs: every step is idempotent, exactly as it was when the
+/// pass ran per request.
 pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
+    let version = db
+        .query("PRAGMA user_version")
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("read scheduler schema version: {error}"))?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version > SCHEMA_VERSION {
+        return Err(QueueError::Invariant(format!(
+            "scheduler schema version {version} exceeds the {SCHEMA_VERSION} \
+             this build understands — the database was migrated by newer code"
+        )));
+    }
+    migrate_schema(db).await?;
+    db.query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+        .execute()
+        .await
+        .map_err(|error| format!("stamp scheduler schema version: {error}"))?;
+    Ok(())
+}
+
+/// The full schema migration pass [`ensure_schema`] gates behind
+/// `PRAGMA user_version`. Runs unchanged on any pre-versioned
+/// (`user_version = 0`) or older-versioned queue: production queues are
+/// modern and at 0, so they take the migration branch exactly once and
+/// are stamped. No transaction exists on `DurableDb`, so every step is
+/// written to be safe to re-run after a mid-pass failure.
+async fn migrate_schema(db: &DurableDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue)")
         .fetch_all::<QueueTableInfoRow>()
@@ -5632,6 +5677,75 @@ mod sqlite_tests {
             rows.iter()
                 .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0)
         );
+
+        let version = db
+            .query("PRAGMA user_version")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("schema version");
+        assert_eq!(
+            version,
+            super::SCHEMA_VERSION,
+            "a migrated queue is stamped at the current schema version"
+        );
+    }
+
+    /// A fresh database runs the migration pass and ends stamped at
+    /// `SCHEMA_VERSION` — production's `user_version = 0` queues take the
+    /// same path exactly once.
+    #[tokio::test]
+    async fn a_fresh_database_migrates_and_is_stamped() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        super::ensure_schema(&db).await.expect("ensure_schema");
+        let version = db
+            .query("PRAGMA user_version")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("schema version");
+        assert_eq!(version, super::SCHEMA_VERSION);
+    }
+
+    /// The whole point of the version gate (stow#432): once a queue is
+    /// stamped, `ensure_schema` issues exactly one statement — the
+    /// `PRAGMA user_version` read — instead of the full migration pass.
+    #[tokio::test]
+    async fn a_current_queue_pays_one_version_read() {
+        let (db, log) = counting_memory_db().await.expect("counting db");
+        let base = log.lock().expect("log").len();
+        super::ensure_schema(&db).await.expect("ensure_schema");
+        let issued = log.lock().expect("log")[base..].to_vec();
+        assert_eq!(
+            issued.len(),
+            1,
+            "a current queue's schema check is the version read alone: {issued:?}"
+        );
+        assert!(
+            issued[0].0.contains("user_version"),
+            "the one statement is `PRAGMA user_version`: {}",
+            issued[0].0
+        );
+    }
+
+    /// A queue stamped newer than this build's `SCHEMA_VERSION` was
+    /// migrated by newer code — `ensure_schema` fails fast rather than
+    /// letting old code read a schema it does not understand.
+    #[tokio::test]
+    async fn ensure_schema_refuses_a_newer_schema() {
+        let db = memory_db().await.expect("memory db");
+        db.query(&format!(
+            "PRAGMA user_version = {}",
+            super::SCHEMA_VERSION + 1
+        ))
+        .execute()
+        .await
+        .expect("stamp newer version");
+        let error = super::ensure_schema(&db)
+            .await
+            .expect_err("a newer schema version must fail fast");
+        assert!(
+            error.to_string().contains("newer"),
+            "the error names the version skew, got: {error}"
+        );
     }
 
     /// The side derivation each dev-era edge takes: a dep on the family
@@ -5952,10 +6066,10 @@ mod sqlite_tests {
     /// Issue #418 regression guard: a submit chunk must not issue one
     /// statement per request or per edge. A 1000-request chunk with
     /// three deps each — 1000 fresh rows, 3000 edges, 4000 probe ids —
-    /// runs 13 statements on the host backend: `ensure_schema`'s idempotent
-    /// round (7), the chunked existence probes (2), the batched task
-    /// insert (1), the edge-set delete (1), and the batched edge inserts
-    /// (2). A return to per-row statements issues thousands.
+    /// runs 7 statements on the host backend: `ensure_schema`'s
+    /// version read (1, stow#432), the chunked existence probes (2), the
+    /// batched task insert (1), the edge-set delete (1), and the batched
+    /// edge inserts (2). A return to per-row statements issues thousands.
     #[tokio::test]
     async fn a_submit_chunk_issues_a_constant_statement_count() {
         let (db, log) = counting_memory_db().await.expect("counting db");

@@ -44,10 +44,13 @@ trusted GitHub-Actions builder, `admin/` is the operator CLI,
   `edge/src/db.rs::ensure_artifact_table_columns`.
 - New scheduler queue columns go in
   `edge/src/scheduler/schema.sql`,
-  `edge/src/scheduler/queue.rs::ensure_schema` (forward migration
+  `edge/src/scheduler/queue.rs::migrate_schema` (forward migration
   branch), `edge/src/scheduler/queue.rs::migrate_queue_schema` (full
   rebuild branch), `TaskRow`, the SELECT column list in
   `claim_dispatchable_tasks`, and the INSERT in `enqueue`.
+- Any change to `edge/src/scheduler/schema.sql` or to a migration step
+  in `queue.rs` must bump `SCHEMA_VERSION` in `queue.rs` — deployed
+  queues re-run the pass once on the new version and are re-stamped.
 
 ## Testing changes locally
 
