@@ -1350,7 +1350,9 @@ mod sqlite_tests {
     /// failed-send drain pick it up.
     #[tokio::test]
     async fn admission_creates_the_row_the_drain_retries() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
         let mut request = enqueue_request("serde", "1.0.5", &["derive"]);
         // stow#317: the recorded miss keeps the edges the admitting
@@ -1413,7 +1415,9 @@ mod sqlite_tests {
     /// `seen_count` — and an already-queued row keeps its `queued_at`.
     #[tokio::test]
     async fn re_admission_upserts_the_same_row() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
         let request = enqueue_request("serde", "1.0.5", &["derive"]);
 
@@ -1454,7 +1458,9 @@ mod sqlite_tests {
     /// re-mint whichever lost the collision as `host_side: false`).
     #[tokio::test]
     async fn host_and_target_misses_at_one_identity_drain_as_both_sides() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
         let mut request = enqueue_request("heck", "0.5.0", &[]);
         let mut host_request = request.clone();
@@ -1504,7 +1510,9 @@ mod sqlite_tests {
     /// registered it so the bundle can be published and re-registered.
     #[tokio::test]
     async fn unbundled_rows_are_a_miss_until_backfilled() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
         let record = artifact_record(FIRST_DIGEST);
         insert_artifact_records(&db, std::slice::from_ref(&record))
@@ -1554,7 +1562,9 @@ mod sqlite_tests {
     /// a published bundle, which serving lookups treat as a miss too.
     #[tokio::test]
     async fn covered_identities_match_servable_rows_exactly() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
         let record = artifact_record(FIRST_DIGEST);
         // A target-side node is covered when both shapes its task
@@ -1621,7 +1631,9 @@ mod sqlite_tests {
     /// unserved.
     #[tokio::test]
     async fn covered_host_side_identity_needs_both_host_shapes() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
         let mut identity = SemanticTaskIdentity {
             crate_name: "heck".to_owned(),
@@ -1713,7 +1725,9 @@ mod sqlite_tests {
     /// floor distinguishes them.
     #[tokio::test]
     async fn over_floor_rows_do_not_cover_their_identity() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
         let floor = |minor: u32| {
             Some(stow_types::glibc::GlibcVersion {
@@ -1841,7 +1855,9 @@ mod sqlite_tests {
     /// on it (#170).
     #[tokio::test]
     async fn reregister_updates_row_but_preserves_created_at() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
 
         insert_artifact_records(&db, &[artifact_record(FIRST_DIGEST)])
@@ -1882,7 +1898,9 @@ mod sqlite_tests {
     /// off-by-one at the slice head would surface it — never appears.
     #[tokio::test]
     async fn index_pages_walk_every_servable_row_once() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         apply_migrations(&db).await;
 
         for c_metadata in ["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"] {

@@ -91,10 +91,9 @@ impl ResolvePool {
                         if index >= items.len() {
                             break;
                         }
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            work(&resolver, &items[index])
-                        }))
-                        .unwrap_or_else(|_panic| Err("resolve panicked".to_owned()));
+                        // A panic is a bug, not an item failure:
+                        // `thread::scope` re-raises it at the join.
+                        let result = work(&resolver, &items[index]);
                         if tx.send((index, result)).is_err() {
                             break;
                         }

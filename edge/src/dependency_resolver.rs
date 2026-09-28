@@ -2451,7 +2451,9 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn canonicalize_snaps_version_and_drops_bogus_features() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         let crates_io = StubCratesIo {
             versions: BTreeMap::from([(
@@ -2485,7 +2487,9 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn canonicalize_drops_requests_for_unpublished_versions() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         let crates_io = StubCratesIo {
             versions: BTreeMap::from([("serde".to_owned(), vec!["1.0.5".to_owned()])]),
@@ -2513,7 +2517,9 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn canonicalize_keeps_implicit_optional_dependency_features() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         // slab 0.4's real shape: `serde` is an optional dependency with no
         // `dep:` reference, so it is a valid implicit feature; `bogus` is not.
@@ -2556,7 +2562,9 @@ mod sqlite_tests {
     /// feature graph — and a second pass over warm caches fetches nothing.
     #[tokio::test]
     async fn canonicalize_batches_fetches_per_crate_and_reuses_caches() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         let crates_io = StubCratesIo {
             versions: BTreeMap::from([
@@ -2712,7 +2720,9 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn latest_published_version_picks_newest_stable() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         let crates_io = closure_stub();
 
@@ -2752,7 +2762,9 @@ mod sqlite_tests {
     /// answer 404 instead of 500.
     #[tokio::test]
     async fn unpublished_crate_yields_crate_not_published() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         let crates_io = closure_stub();
 
@@ -2787,7 +2799,9 @@ mod sqlite_tests {
     /// crates.io data is fetched (and cached) fresh.
     #[tokio::test]
     async fn old_format_graph_cache_row_is_not_served() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         // The v1 row shape: no `format_version`, dependency entries the
         // current schema would reject — but none of that is reached,
@@ -2900,7 +2914,9 @@ mod sqlite_tests {
     /// row — both become cold fetches upstream.
     #[tokio::test]
     async fn batched_version_graph_cache_read_splits_hits_misses_and_expired() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
 
         let graph_json = serde_json::to_string(&super::VersionGraph {
@@ -2957,7 +2973,9 @@ mod sqlite_tests {
         const DIRECT: usize = 130;
         const EXPANDED: usize = 830;
 
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         let entries = (0..DIRECT)
             .map(|index| stow_types::api::DependencyGraphEntry {
@@ -3042,7 +3060,9 @@ mod sqlite_tests {
     /// must be served uncached rather than erroring.
     #[tokio::test]
     async fn rejected_graph_cache_write_still_serves_the_graph() {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         db.query(
             "CREATE TRIGGER deny_graph_cache_write \

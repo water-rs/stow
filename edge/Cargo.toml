@@ -27,7 +27,6 @@ serde_html_form = "0.4"
 tracing.workspace = true
 semver.workspace = true
 blake3.workspace = true
-toml = "1"
 askama = "0.14"
 # The wasm-bindgen family is exact-coupled (`js-sys =0.3.x` requires
 # `wasm-bindgen =0.2.y` of the same release), and `skyzen dev`/`skyzen build`
@@ -74,11 +73,11 @@ tokio = { version = "1", features = ["macros", "rt"] }
 # Synthesized `.crate` tarballs for the sparse-unpack resolve test.
 tar.workspace = true
 
-# Host-only test dep: the sqlite test backend is `cfg(all(test, not(wasm32)))`,
-# so it must not enter the wasm32 dev-dep graph (rusqlite's bundled sqlite
-# cannot compile there).
+# Host-only test deps: the sqlite test backend is `cfg(all(test, not(wasm32)))`,
+# so sqlx-sqlite must not enter the wasm32 dev-dep graph.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-rusqlite = { version = "0.40", features = ["bundled"] }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
+skyzen-services = { version = "0.2.1", default-features = false, features = ["sqlite", "runtime-tokio"] }
 
 [lints]
 workspace = true

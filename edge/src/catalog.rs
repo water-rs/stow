@@ -162,7 +162,7 @@ fn default_closure(
     enabled
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -187,7 +187,7 @@ mod tests {
     }
 
     impl StubCratesIo {
-        const fn new(versions: BTreeMap<String, Vec<String>>) -> Self {
+        fn new(versions: BTreeMap<String, Vec<String>>) -> Self {
             Self {
                 versions,
                 features: BTreeMap::new(),
@@ -281,7 +281,9 @@ mod tests {
     }
 
     async fn memory_db() -> skyzen_services::Db {
-        let db = crate::scheduler::test_db::sql_memory_db().expect("memory db");
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
         crate::db::apply_migrations(&db).await;
         db
     }
