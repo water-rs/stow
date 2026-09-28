@@ -213,12 +213,16 @@ fn is_retryable_download_error(error: &zenwave::Error) -> bool {
         || matches!(error, zenwave::Error::BodyParse(_) | zenwave::Error::Io(_))
 }
 
+/// The sparse index's `dl` root (`index.crates.io/config.json`): the CDN
+/// cargo itself downloads from. The API's `/download` redirect lands on
+/// the same file but is rate-limited per IP under the crawler policy.
+const CRATE_DOWNLOAD_BASE: &str = "https://static.crates.io/crates";
+
 /// The `.crate` tarball bytes for the task crate.
 async fn download_crate_archive(task: &BuildTaskPayload) -> stow_types::error::Result<Vec<u8>> {
-    let url = format!(
-        "https://crates.io/api/v1/crates/{}/{}/download",
-        task.crate_name, task.version
-    );
+    let name = &task.crate_name;
+    let version = &task.version;
+    let url = format!("{CRATE_DOWNLOAD_BASE}/{name}/{name}-{version}.crate");
     retry_with_backoff(
         "crate download",
         DOWNLOAD_MAX_ATTEMPTS,

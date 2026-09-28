@@ -361,11 +361,12 @@ echo "[mock-e2e] started local-ci (pid $SERVICE_PID), log: $LOG_DIR/local-ci.log
 wait_for "local CI dispatch endpoint" 60 "$SERVICE_PID" \
     http_listening "http://${LOCAL_CI_ADDR}/dispatch"
 
-# Latest non-yanked 1.0.x on crates.io.
+# Latest non-yanked 1.0.x, read from the sparse index (one JSON line per
+# release) rather than the rate-limited crates.io API.
 TASK_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
-    'https://crates.io/api/v1/crates/itoa' \
-    | jq -r '[.versions[] | select(.yanked | not) | .num | select(startswith("1.0."))]
-             | sort_by(split(".") | map(tonumber)) | last // empty')"
+    'https://index.crates.io/it/oa/itoa' \
+    | jq -rs '[.[] | select(.yanked | not) | .vers | select(startswith("1.0."))]
+              | sort_by(split(".") | map(tonumber)) | last // empty')"
 [ -n "$TASK_VERSION" ] || die "no non-yanked itoa 1.0.x found on crates.io"
 echo "[mock-e2e] submitting $TASK_CRATE $TASK_VERSION features=$TASK_FEATURES target=$HOST_TARGET rustc=$RUSTC_VERSION"
 
