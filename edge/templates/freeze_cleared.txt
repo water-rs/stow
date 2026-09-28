@@ -12,4 +12,3 @@ will freeze dispatch again on the next failures. If the trip was a cost
 trip, also clear the panic switch the trip engaged:
   stow-admin panic off --yes
 
-(alert from {{ from }} to {{ to }})

@@ -583,10 +583,16 @@ pub struct DispatchFreezeRecord {
     pub frozen_at: String,
     /// What engaged the freeze.
     pub trigger: DispatchFreezeTrigger,
-    /// What happened to the freeze alert email. Persisted so a freeze
-    /// nobody was told about is visible to whoever eventually reads it —
-    /// the exact failure this feature exists to prevent.
-    pub notify: DispatchFreezeNotify,
+    /// What happened to the freeze alert — which incident issue carried
+    /// it, or why none did. Persisted so a freeze nobody was told about
+    /// is visible to whoever eventually reads it — the exact failure
+    /// this feature exists to prevent.
+    pub notify: AlertOutcome,
+    /// ISO 8601 timestamp of the last hourly digest send, set once a
+    /// digest lands. Absent means none has gone out — `frozen_at` then
+    /// marks the last notification (the open alert itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digested_at: Option<String>,
 }
 
 /// What engaged a dispatch freeze.
@@ -748,36 +754,63 @@ pub struct UsageCheck {
     pub top_routes: Vec<TopRouteCount>,
 }
 
-/// What happened to the alert email a freeze state transition sent.
+/// One alert channel's delivery result.
+///
+/// The freeze/fault alerts fan out to Email Sending (the notification)
+/// and a GitHub `incident` issue (the record); each channel reports
+/// independently so the other's failure never blocks it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum DispatchFreezeNotify {
-    /// The `send_email` binding accepted the message.
+pub enum ChannelOutcome {
+    /// Email Sending accepted the message.
     Sent {
-        /// Provider message id, when Cloudflare returned one.
+        /// Provider `message_id`, when Cloudflare returned one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
-    /// `send()` rejected the message — the freeze still engaged; the
-    /// alert simply went nowhere.
+    /// A new incident issue was created.
+    Opened {
+        /// The issue's `html_url`.
+        url: String,
+    },
+    /// A comment landed on an already-open incident issue (a re-opened
+    /// dedup or an hourly digest).
+    Commented {
+        /// The issue's `html_url`.
+        url: String,
+    },
+    /// The incident issue got its resolve comment and was closed.
+    Resolved {
+        /// The issue's `html_url`.
+        url: String,
+    },
+    /// The channel's call failed — the transition still landed; this
+    /// channel simply went nowhere.
     Failed {
-        /// Cloudflare's structured error code (`E_*`), when the error
-        /// object carried one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        code: Option<String>,
-        /// The error's message.
+        /// What the call returned or how it failed to decode.
         message: String,
-        /// Actionable hint for the known codes (e.g. which allowlist
-        /// setting `E_RECIPIENT_NOT_ALLOWED` refers to).
+        /// Actionable hint — a known `E_*` Email Sending code's fix, or
+        /// the `issues: write` grant a GitHub 403 points at.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
     },
-    /// No send was attempted — the binding or an address was
+    /// No call was attempted — the channel's binding/credentials are
     /// unconfigured.
     Disabled {
-        /// Why the path was off (names the missing binding/var).
+        /// Why the channel is off (names the missing binding/var).
         reason: String,
     },
+}
+
+/// What happened to one alert across both channels — recorded on the
+/// state row so a notification that went nowhere is visible to whoever
+/// reads `stow-admin` later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AlertOutcome {
+    /// The Email Sending notify.
+    pub email: ChannelOutcome,
+    /// The GitHub `incident` issue.
+    pub issue: ChannelOutcome,
 }
 
 /// Scheduler DO queue status for monitoring.

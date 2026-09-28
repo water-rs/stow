@@ -1739,6 +1739,29 @@ pub async fn freeze_record(
         .transpose()
 }
 
+/// Whether the live freeze's digest is due — the record's
+/// `digested_at` (falling back to `frozen_at`, since the open alert is
+/// itself a notification) compared in SQLite, where `strftime('%s')`
+/// reads the ISO strings without a Rust-side parser. `false` when the
+/// freeze isn't engaged or the stored timestamp won't parse.
+pub async fn freeze_digest_due(db: &DurableDb, minutes: u32) -> Result<bool, QueueError> {
+    let Some(record) = freeze_record(db).await? else {
+        return Ok(false);
+    };
+    let last_notified = record.digested_at.as_deref().unwrap_or(&record.frozen_at);
+    let due = db
+        .query(
+            "SELECT CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', ?) AS INTEGER) \
+             >= ? * 60 AS due",
+        )
+        .bind(last_notified)
+        .bind(i64::from(minutes))
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("compare digest timestamp: {error}"))?;
+    Ok(due != 0)
+}
+
 /// Whether dispatch is frozen — the `dispatch_freeze` row's presence is
 /// the flag.
 pub async fn freeze_enabled(db: &DurableDb) -> Result<bool, QueueError> {
@@ -6603,9 +6626,15 @@ mod sqlite_tests {
         stow_types::api::DispatchFreezeRecord {
             frozen_at: "2026-09-22T03:51:00Z".to_owned(),
             trigger: stow_types::api::DispatchFreezeTrigger::Manual,
-            notify: stow_types::api::DispatchFreezeNotify::Disabled {
-                reason: "test".to_owned(),
+            notify: stow_types::api::AlertOutcome {
+                email: stow_types::api::ChannelOutcome::Disabled {
+                    reason: "test".to_owned(),
+                },
+                issue: stow_types::api::ChannelOutcome::Disabled {
+                    reason: "test".to_owned(),
+                },
             },
+            digested_at: None,
         }
     }
 
@@ -6629,6 +6658,31 @@ mod sqlite_tests {
         super::delete_freeze(&db).await.expect("delete");
         assert!(!super::freeze_enabled(&db).await.expect("enabled"));
         assert!(super::freeze_record(&db).await.expect("read").is_none());
+    }
+
+    /// The digest-due comparison lives in SQLite `strftime`, which must
+    /// read the record's ISO strings: an old `frozen_at` is due, a
+    /// `digested_at` newer than the window resets it, and no record is
+    /// simply not due.
+    #[tokio::test]
+    async fn freeze_digest_due_reads_iso_timestamps() {
+        let db = memory_db().await.expect("memory db");
+        assert!(!super::freeze_digest_due(&db, 60).await.expect("due"));
+
+        let record = freeze_record_fixture(); // frozen_at is 2026 — past
+        super::set_freeze(&db, &record).await.expect("set");
+        assert!(
+            super::freeze_digest_due(&db, 60).await.expect("due"),
+            "a freeze days old is digest-due"
+        );
+
+        let mut stamped = record;
+        stamped.digested_at = Some("9999-01-01T00:00:00Z".to_owned());
+        super::set_freeze(&db, &stamped).await.expect("stamp");
+        assert!(
+            !super::freeze_digest_due(&db, 60).await.expect("due"),
+            "a future digested_at is not due"
+        );
     }
 
     /// While frozen, claim returns nothing and enqueue keeps accepting —

@@ -26,8 +26,8 @@ use std::fmt::Write as _;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use stow_types::api::{
-    AdminStatus, DispatchFreeze, DispatchFreezeNotify, DispatchFreezeTrigger, EnqueueRequest,
-    PanicSwitch, SchedulerSubmitResponse,
+    AdminStatus, AlertOutcome, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger,
+    EnqueueRequest, PanicSwitch, SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -593,25 +593,30 @@ fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
     }
 }
 
-/// One-line summary of a stored alert outcome — a failed send is
-/// shouted, not summarized away.
-fn summarize_notify(notify: &DispatchFreezeNotify) -> String {
-    match notify {
-        DispatchFreezeNotify::Sent { message_id } => message_id
+/// One-line summary of a stored alert outcome — both channels shown;
+/// a failure is shouted, not summarized away.
+fn summarize_notify(notify: &AlertOutcome) -> String {
+    format!(
+        "email: {} · issue: {}",
+        summarize_channel(&notify.email),
+        summarize_channel(&notify.issue),
+    )
+}
+
+/// One channel's outcome as one clause.
+fn summarize_channel(channel: &ChannelOutcome) -> String {
+    match channel {
+        ChannelOutcome::Sent { message_id } => message_id
             .as_ref()
             .map_or_else(|| "sent".to_owned(), |id| format!("sent (messageId {id})")),
-        DispatchFreezeNotify::Failed {
-            code,
-            message,
-            hint,
-        } => {
-            let code = code.as_deref().unwrap_or("E_UNKNOWN");
-            hint.as_ref().map_or_else(
-                || format!("FAILED {code}: {message}"),
-                |hint| format!("FAILED {code}: {message} — {hint}"),
-            )
-        }
-        DispatchFreezeNotify::Disabled { reason } => format!("disabled: {reason}"),
+        ChannelOutcome::Opened { url } => format!("opened {url}"),
+        ChannelOutcome::Commented { url } => format!("commented {url}"),
+        ChannelOutcome::Resolved { url } => format!("resolved {url}"),
+        ChannelOutcome::Failed { message, hint } => hint.as_ref().map_or_else(
+            || format!("FAILED: {message}"),
+            |hint| format!("FAILED: {message} — {hint}"),
+        ),
+        ChannelOutcome::Disabled { reason } => format!("disabled: {reason}"),
     }
 }
 

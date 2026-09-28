@@ -717,11 +717,18 @@ runners. While frozen, the work-submitting routes (`tasks/submit/trusted`,
 Recovery is manual only: `POST /api/v1/admin/dispatch-freeze`
 (`stow-admin dispatch-freeze clear --yes`) lifts the freeze and
 immediately resumes dispatch, while `dispatch-freeze status` shows the
-trigger and the alert outcome. Each state change sends exactly one email
-— freeze and clear — through the `send_email` binding, naming the counts,
-window, dominant failure classes (`step: error-prefix`), and example
-Actions run URLs; a failed send is recorded on the freeze record rather
-than breaking the freeze.
+trigger and the alert outcome. Each state change sends one alert —
+freeze and clear — fanned out to both channels: an email through the
+`send_email` binding, and a GitHub `incident`-labelled issue on
+`GITHUB_REPO` (opened by title prefix, commented at most hourly while
+open, commented and closed on resolve), naming the counts, window,
+dominant failure classes (`step: error-prefix`), and example Actions
+run URLs. While a freeze stays open, the scheduled run's
+`incident-digest` tick posts at most one digest an hour (`digested_at`
+on the record is the guard). Either channel's failure is recorded in
+the issue and on the freeze record rather than breaking the freeze —
+the issue path reuses the `stow-ci` App's installation token, so it
+needs **Issues: Read and write** on top of Actions.
 
 ## Tunables (Cloudflare bindings)
 

@@ -15,6 +15,7 @@ const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/pu
 const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_USAGE_CHECK_URL: &str = "https://scheduler.internal/usage-check";
+const SCHEDULER_INCIDENT_DIGEST_URL: &str = "https://scheduler.internal/incident-digest";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
@@ -166,7 +167,22 @@ pub async fn report_usage_check(
     send_json(namespace, SCHEDULER_USAGE_CHECK_URL, check).await
 }
 
->>>>>>> a10b666 (feat(edge): freeze dispatch on systematic failure and cost overrun, email per transition)
+/// The cron's digest tick: the object sends at most one digest an hour
+/// while a freeze is live (`digested_at` on the record is the guard),
+/// and no-ops otherwise. Fires every scheduled run — cheap no-op when
+/// nothing is frozen.
+pub async fn report_incident_digest(
+    namespace: &CfDurableNamespace,
+) -> Result<(), SchedulerClientError> {
+    send_json(
+        namespace,
+        SCHEDULER_INCIDENT_DIGEST_URL,
+        &serde_json::json!({}),
+    )
+    .await
+}
+
+
 /// The operator view behind `stow-admin status`.
 pub async fn admin_status(
     namespace: &CfDurableNamespace,

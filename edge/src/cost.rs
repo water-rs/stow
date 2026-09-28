@@ -156,13 +156,15 @@ pub fn cost_trigger(check: &UsageCheck) -> Option<DispatchFreezeTrigger> {
 /// the spec says is "logged and emailed", not skipped.
 pub const USAGE_CHECK_ERROR_SUBJECT: &str = "[stow] usage check failed";
 
-/// Askama context for `templates/usage_check_error.txt`.
+/// The incident-issue dedup key for usage-check failures.
+pub const USAGE_CHECK_INCIDENT_KEY: &str = "usage-check";
+
+/// Askama context for `templates/usage_check_error.txt` — the issue
+/// post and the email's `text` part.
 #[derive(askama::Template)]
 #[template(path = "usage_check_error.txt")]
 struct UsageCheckErrorTemplate<'a> {
     error: &'a str,
-    to: &'a str,
-    from: &'a str,
 }
 
 /// Askama context for `templates/usage_check_error.html`.
@@ -170,21 +172,22 @@ struct UsageCheckErrorTemplate<'a> {
 #[template(path = "usage_check_error.html")]
 struct UsageCheckErrorHtmlTemplate<'a> {
     error: &'a str,
-    to: &'a str,
-    from: &'a str,
 }
 
-/// Render the check-failure alert — the email the "logged and emailed"
-/// rule produces. Returns `(text, html)`.
+/// Render the check-failure alert — the draft the "logged and emailed"
+/// rule fans out to both channels.
 #[allow(clippy::missing_errors_doc)]
-pub fn render_usage_check_error(
-    error: &str,
-    to: &str,
-    from: &str,
-) -> Result<(String, String), askama::Error> {
-    let text = UsageCheckErrorTemplate { error, to, from }.render()?;
-    let html = UsageCheckErrorHtmlTemplate { error, to, from }.render()?;
-    Ok((text, html))
+pub fn render_usage_check_error(error: &str) -> Result<crate::freeze::AlertDraft, askama::Error> {
+    let body = UsageCheckErrorTemplate { error }.render()?;
+    let html = UsageCheckErrorHtmlTemplate { error }.render()?;
+    let title = crate::freeze::incident_title(USAGE_CHECK_INCIDENT_KEY, "analytics probe failed")?;
+    Ok(crate::freeze::AlertDraft {
+        key: USAGE_CHECK_INCIDENT_KEY,
+        subject: USAGE_CHECK_ERROR_SUBJECT.to_owned(),
+        title,
+        body,
+        html,
+    })
 }
 
 // ===== GraphQL wire shape =====

@@ -8,4 +8,3 @@ This is the failure the freeze is supposed to catch being unable to run.
 Check the Worker's logs (`stow-edge`) and the CF_ANALYTICS_TOKEN /
 CF_ACCOUNT_ID bindings.
 
-(alert from {{ from }} to {{ to }})

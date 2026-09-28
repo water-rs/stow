@@ -225,12 +225,17 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
     .collect()
 }
 
-/// The scheduled cost probe — `crons = ["*/10 * * * *"]` in
-/// `Skyzen.toml` lands here. Every run queries the GraphQL Analytics
-/// API for today's usage and posts the verdict to the scheduler Durable
-/// Object, which owns the freeze transition and the email. A broken
-/// check (GraphQL `errors`, transport, decode) is itself a fault worth
-/// an email — the trip it would have masked is invisible otherwise.
+/// The scheduled probe — `crons = ["*/10 * * * *"]` in `Skyzen.toml`
+/// lands here. Every run does two things against the scheduler Durable
+/// Object:
+/// - the cost check queries the GraphQL Analytics API for today's
+///   usage and posts the verdict, which owns the freeze transition and
+///   its alert;
+/// - the digest tick fans out a still-frozen note at most once an hour
+///   (`digested_at` on the record is the guard).
+/// A broken check (GraphQL `errors`, transport, decode) is itself a
+/// fault worth an alert — the trip it would have masked is invisible
+/// otherwise.
 #[skyzen::scheduled]
 async fn cost_check(
     _event: skyzen_cloudflare::CfScheduledEvent,
@@ -255,17 +260,21 @@ async fn cost_check(
         cost::run_usage_check(&account_id, &analytics_token, &scheduler, multiplier).await
     {
         tracing::error!(%error, "usage check failed");
-        if let Ok(config) = crate::email::alert_config(&env)
-            && let Ok((text, html)) =
-                cost::render_usage_check_error(&error, &config.to, &config.from)
-        {
-            let outcome =
-                crate::email::send_alert(&config, cost::USAGE_CHECK_ERROR_SUBJECT, &text, &html)
-                    .await;
-            if !matches!(outcome, stow_types::api::DispatchFreezeNotify::Sent { .. }) {
-                tracing::error!(?outcome, "usage-check failure alert send failed");
+        if let Ok(draft) = cost::render_usage_check_error(&error) {
+            let outcome = crate::freeze::AlertSink::opened(
+                &crate::incidents::EdgeAlerter::for_worker(&env).await,
+                &draft,
+            )
+            .await;
+            if !crate::freeze::notify_reached(&outcome) {
+                tracing::error!(?outcome, "usage-check failure alert reached nobody");
             }
         }
+    }
+    // The digest rides its own call so a usage-check failure never
+    // eats a due digest, and vice versa.
+    if let Err(error) = crate::scheduler_client::report_incident_digest(&scheduler).await {
+        tracing::error!(%error, "incident digest tick failed");
     }
     Ok(())
 }

@@ -8,7 +8,7 @@
 //! `Error` objects carrying a structured `code` (`E_*`) and `message`.
 //!
 //! A failed send is never an error to the caller: it is data. The
-//! returned [`DispatchFreezeNotify`] is written onto the freeze record,
+//! returned [`ChannelOutcome`] is written onto the freeze record,
 //! so the freeze engages and stays engaged even when the alert goes
 //! nowhere — the freeze is the load-bearing action, the email is
 //! notification, and a silent notification is something `stow-admin`
@@ -19,7 +19,7 @@ use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
-use stow_types::api::DispatchFreezeNotify;
+use stow_types::api::ChannelOutcome;
 
 use crate::{env_binding, freeze};
 
@@ -67,7 +67,11 @@ pub struct AlertConfig {
 /// Resolve the binding and addresses. `Err` carries the `Disabled`
 /// outcome naming the missing piece — for the mock/local deployments
 /// that is the binding itself, by design.
-pub fn alert_config(env: &JsValue) -> Result<AlertConfig, DispatchFreezeNotify> {
+///
+/// The `AlertConfig` this returns is one half of the alert pair —
+/// [`crate::incidents::EdgeAlerter`] fans every draft out to it and
+/// the `incident`-issue channel.
+pub fn alert_config(env: &JsValue) -> Result<AlertConfig, ChannelOutcome> {
     let value =
         Reflect::get(env, &JsValue::from_str(STOW_ALERT_EMAIL_BINDING)).map_err(|error| {
             freeze::notify_disabled(format!(
@@ -99,14 +103,14 @@ pub fn alert_config(env: &JsValue) -> Result<AlertConfig, DispatchFreezeNotify> 
 /// `send()` one alert carrying both a `text` and an `html` body — Email
 /// Sending multipart, no MIME construction on our side. Never returns
 /// `Err`: a synchronous throw, a rejected promise, and a serialization
-/// failure all become [`DispatchFreezeNotify::Failed`] with the
+/// failure all become [`ChannelOutcome::Failed`] with the
 /// structured code extracted when the error object carries one.
 pub async fn send_alert(
     config: &AlertConfig,
     subject: &str,
     text: &str,
     html: &str,
-) -> DispatchFreezeNotify {
+) -> ChannelOutcome {
     // The Email Sending message shape — `send()` takes
     // `{to, from, subject, text, html}`; `serde_wasm_bindgen` produces
     // exactly that object literal, which is far less code than a class
@@ -148,7 +152,7 @@ pub async fn send_alert(
 
 /// Extract `{code, message}` off a rejected `send()` error object and
 /// attach the known-code hint.
-fn send_error(error: &JsValue) -> DispatchFreezeNotify {
+fn send_error(error: &JsValue) -> ChannelOutcome {
     let code = Reflect::get(error, &JsValue::from_str("code"))
         .ok()
         .and_then(|value| value.as_string());

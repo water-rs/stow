@@ -39,4 +39,3 @@ Read or clear:
   {{ status_command }}
   {{ clear_command }}
 
-(alert from {{ from }} to {{ to }})

@@ -1,0 +1,10 @@
+stow dispatch freeze — still frozen at {{ now }}.
+
+Frozen at:  {{ frozen_at }}
+Set by:     {{ trigger_summary }}
+
+Dispatch stays halted until an operator clears it; enqueue keeps
+accepting work meanwhile. If the underlying breakage is fixed:
+
+  {{ clear_command }}
+  {{ status_command }}

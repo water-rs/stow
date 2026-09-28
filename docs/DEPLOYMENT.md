@@ -288,8 +288,12 @@ the `GITHUB_APP_PRIVATE_KEY` secret are used to sign an RS256 JWT
 (WebCrypto) and exchange it at the GitHub API. The `stow-ci` App is
 installed on `water-rs` (selected repositories: `water-rs/stow`) with
 **Actions: Read and write**, which is the permission the dispatch call
-requires. Minted tokens are cached in the Durable Object's SQL storage
-and reused while more than five minutes of validity remain.
+requires. The incident-issue alert channel reuses the same token and
+needs **Issues: Read and write** on the App — without it the issue
+half of an alert reports a 403 `Failed` outcome (the email half still
+sends, and the failure lands in the alert record). Minted tokens are
+cached in the Durable Object's SQL storage and reused while more than
+five minutes of validity remain.
 
 The crucial property: CI never holds a Cloudflare API token, and no
 shared secret exists anywhere on the edge write surface — every trusted
@@ -516,7 +520,8 @@ Required GitHub App configuration:
 
 The App is installed on `water-rs/stow` with **Contents: Read and
 write** and **Pull requests: Read and write** (plus **Actions: Read and
-write**, which the scheduler uses — see issue #33).
+write**, which the scheduler uses — see issue #33 — and **Issues: Read
+and write**, which the incident-issue alert channel needs).
 
 Both `release-plz.yml` jobs mint an installation token for the App and
 use it for checkout and release-plz rather than the default

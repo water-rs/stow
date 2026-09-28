@@ -18,7 +18,6 @@ use skyzen_services::Db;
 use stow_types::api::SchemaMigrationReport;
 
 use crate::db;
-use crate::email;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
@@ -111,50 +110,12 @@ impl freeze::FreezeStore for DbStore<'_> {
     }
 }
 
-/// `freeze::AlertSender` over the `send_email` binding. `alert_config`
-/// resolves binding + addresses once; a missing binding degrades to a
-/// `Disabled` outcome instead of erroring, so a transition always
-/// lands its record.
-struct EdgeAlertSender {
-    config: std::result::Result<email::AlertConfig, stow_types::api::DispatchFreezeNotify>,
-}
-
-impl EdgeAlertSender {
-    fn new(env: &WasmEnv) -> Self {
-        Self {
-            config: email::alert_config(env.as_js()),
-        }
-    }
-
-    /// The alert destination for rendering — the binding's when
-    /// present, the documented default otherwise so the body still
-    /// names the operator.
-    fn to(&self) -> &str {
-        self.config
-            .as_ref()
-            .map_or(freeze::DEFAULT_ALERT_TO, |config| config.to.as_str())
-    }
-
-    fn from(&self) -> &str {
-        self.config
-            .as_ref()
-            .map_or(freeze::DEFAULT_ALERT_FROM, |config| config.from.as_str())
-    }
-}
-
-impl freeze::AlertSender for EdgeAlertSender {
-    async fn send(
-        &self,
-        subject: &str,
-        text: &str,
-        html: &str,
-    ) -> stow_types::api::DispatchFreezeNotify {
-        match &self.config {
-            Ok(config) => email::send_alert(config, subject, text, html).await,
-            Err(disabled) => disabled.clone(),
-        }
-    }
-}
+/// `freeze::AlertSink` over both alert channels — the `send_email`
+/// notify and the GitHub `incident` issue record
+/// (`crate::incidents::EdgeAlerter`). Either channel's missing
+/// binding/credential degrades to a `Disabled` outcome instead of
+/// erroring, so a transition always lands its record.
+type EdgeAlerter = crate::incidents::EdgeAlerter;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
@@ -195,6 +156,7 @@ impl DurableObject for Scheduler {
                     .at(read_dispatch_freeze)
                     .post(write_dispatch_freeze),
                 "/usage-check".post(usage_check),
+                "/incident-digest".post(incident_digest),
             )),
         ))
         .on_alarm(run_alarm)
@@ -504,7 +466,7 @@ async fn write_dispatch_freeze(
     alarm: Alarm,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>> {
-    let sender = EdgeAlertSender::new(&env);
+    let sink = EdgeAlerter::for_object(&db, env.as_js()).await;
     let action = if switch.enabled {
         freeze::FreezeAction::Freeze
     } else {
@@ -512,12 +474,10 @@ async fn write_dispatch_freeze(
     };
     let transition = freeze::apply_transition(
         &DbStore(&db),
-        &sender,
+        &sink,
         action,
         stow_types::api::DispatchFreezeTrigger::Manual,
         &iso_now(),
-        sender.to(),
-        sender.from(),
     )
     .await
     .map_err(to_error)?;
@@ -581,15 +541,13 @@ async fn usage_check(
             "usage check over list non-empty but produced no cost trigger",
         ));
     };
-    let sender = EdgeAlertSender::new(&env);
+    let sink = EdgeAlerter::for_object(&db, env.as_js()).await;
     let transition = freeze::apply_transition(
         &DbStore(&db),
-        &sender,
+        &sink,
         freeze::FreezeAction::Freeze,
         trigger,
         &iso_now(),
-        sender.to(),
-        sender.from(),
     )
     .await
     .map_err(to_error)?;
@@ -603,21 +561,14 @@ async fn usage_check(
                 tracing::error!(%error, "scheduler cost-trip schedule_alarm failed");
                 error
             })?;
-            match &record.notify {
-                stow_types::api::DispatchFreezeNotify::Sent { .. } => {
-                    tracing::warn!(trigger = ?record.trigger, "dispatch freeze tripped on cost — alert sent");
-                }
-                stow_types::api::DispatchFreezeNotify::Failed { code, message, .. } => {
-                    tracing::error!(
-                        code = ?code,
-                        %message,
-                        trigger = ?record.trigger,
-                        "dispatch freeze tripped on cost — alert send failed"
-                    );
-                }
-                stow_types::api::DispatchFreezeNotify::Disabled { reason } => {
-                    tracing::warn!(%reason, "dispatch freeze tripped on cost — alert transport disabled");
-                }
+            if freeze::notify_reached(&record.notify) {
+                tracing::warn!(trigger = ?record.trigger, notify = %freeze::summarize_notify(&record.notify), "dispatch freeze tripped on cost");
+            } else {
+                tracing::error!(
+                    trigger = ?record.trigger,
+                    notify = %freeze::summarize_notify(&record.notify),
+                    "dispatch freeze tripped on cost — alert reached nobody"
+                );
             }
         }
         freeze::FreezeTransition::Unchanged => {
@@ -627,6 +578,28 @@ async fn usage_check(
             );
         }
         freeze::FreezeTransition::Cleared(_) => {}
+    }
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// `POST /incident-digest` — the cron's digest tick: when a freeze is
+/// live and its last notification is `FREEZE_DIGEST_MINUTES` old, one
+/// digest fans out and `digested_at` stamps now. The stamp guards the
+/// "at most one an hour" rule — the cron fires every ten minutes.
+async fn incident_digest(env: WasmEnv, db: DurableDb) -> Result<Json<OkResponse>> {
+    let due = queue::freeze_digest_due(&db, freeze::FREEZE_DIGEST_MINUTES)
+        .await
+        .map_err(to_error)?;
+    let sink = EdgeAlerter::for_object(&db, env.as_js()).await;
+    if let Some(outcome) = freeze::maybe_digest(&DbStore(&db), due, &sink, &iso_now())
+        .await
+        .map_err(to_error)?
+    {
+        if freeze::notify_reached(&outcome) {
+            tracing::info!(notify = %freeze::summarize_notify(&outcome), "dispatch freeze digest sent");
+        } else {
+            tracing::error!(notify = %freeze::summarize_notify(&outcome), "dispatch freeze digest reached nobody");
+        }
     }
     Ok(Json(OkResponse { ok: true }))
 }
@@ -641,10 +614,10 @@ fn iso_now() -> String {
 }
 
 /// After a failed completion, decide whether the trailing window trips
-/// the freeze. `apply_transition` owns the one-mail-per-transition
+/// the freeze. `apply_transition` owns the one-alert-per-transition
 /// rule: a live freeze answers `Unchanged` without rewriting the
 /// record or resending the alert. Storage and query errors propagate
-/// (loud); the alert send's outcome only ever lands on the record.
+/// (loud); the alert's outcome only ever lands on the record.
 async fn evaluate_dispatch_freeze(env: &WasmEnv, db: &DurableDb) -> Result<()> {
     // Cheap gate first — skip the window query entirely when frozen.
     if queue::freeze_enabled(db).await.map_err(to_error)? {
@@ -658,34 +631,25 @@ async fn evaluate_dispatch_freeze(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         return Ok(());
     };
     let trigger = trip_trigger(env, draft, &settings)?;
-    let sender = EdgeAlertSender::new(env);
+    let sink = EdgeAlerter::for_object(db, env.as_js()).await;
     if let freeze::FreezeTransition::Engaged(record) = freeze::apply_transition(
         &DbStore(db),
-        &sender,
+        &sink,
         freeze::FreezeAction::Freeze,
         trigger,
         &iso_now(),
-        sender.to(),
-        sender.from(),
     )
     .await
     .map_err(to_error)?
     {
-        match &record.notify {
-            stow_types::api::DispatchFreezeNotify::Sent { .. } => {
-                tracing::warn!(trigger = ?record.trigger, "dispatch freeze tripped — alert sent");
-            }
-            stow_types::api::DispatchFreezeNotify::Failed { code, message, .. } => {
-                tracing::error!(
-                    code = ?code,
-                    %message,
-                    trigger = ?record.trigger,
-                    "dispatch freeze tripped — alert send failed"
-                );
-            }
-            stow_types::api::DispatchFreezeNotify::Disabled { reason } => {
-                tracing::warn!(%reason, "dispatch freeze tripped — alert transport disabled");
-            }
+        if freeze::notify_reached(&record.notify) {
+            tracing::warn!(trigger = ?record.trigger, notify = %freeze::summarize_notify(&record.notify), "dispatch freeze tripped");
+        } else {
+            tracing::error!(
+                trigger = ?record.trigger,
+                notify = %freeze::summarize_notify(&record.notify),
+                "dispatch freeze tripped — alert reached nobody"
+            );
         }
     }
     Ok(())

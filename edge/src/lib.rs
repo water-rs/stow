@@ -82,6 +82,8 @@ mod env_binding;
 #[cfg(target_arch = "wasm32")]
 mod ghcr;
 #[cfg(target_arch = "wasm32")]
+mod incidents;
+#[cfg(target_arch = "wasm32")]
 mod runtime_settings;
 #[cfg(target_arch = "wasm32")]
 mod scheduler_client;
