@@ -20,6 +20,7 @@ mod queue;
 mod render;
 mod runs;
 mod scheduler;
+mod watchdog;
 
 use std::fmt::Write as _;
 
@@ -76,6 +77,10 @@ enum Command {
     Cache(cache::CacheArgs),
     /// Read or flip the edge's anonymous-traffic circuit breaker.
     Panic(PanicArgs),
+    /// External watchdog: evaluate the incident signals, trip the
+    /// breaker on a breach, keep the incident issue and the alert mail
+    /// current. `watchdog clear` is the manual recovery.
+    Watchdog(watchdog::WatchdogArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
     /// Submit one build task batch to the scheduler.
@@ -160,6 +165,9 @@ fn main() -> stow_types::error::Result<()> {
         }
         Command::Panic(args) => {
             with_edge(|edge| async move { panic_switch(&edge, args, output).await })
+        }
+        Command::Watchdog(args) => {
+            with_edge(|edge| async move { watchdog::run(&edge, args, output).await })
         }
         // The index commands pick their own executor: `publish` drives
         // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
@@ -562,7 +570,7 @@ pub(crate) async fn submit(
 /// The operator's GitHub credential for the edge's trusted endpoints and
 /// the GitHub REST calls (`runs`, `cache`): `GH_TOKEN`/`GITHUB_TOKEN`
 /// when set — the precedence `gh` itself follows — else `gh auth token`.
-async fn github_token() -> stow_types::error::Result<String> {
+pub(crate) async fn github_token() -> stow_types::error::Result<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)
             && !token.is_empty()

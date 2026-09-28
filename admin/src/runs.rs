@@ -64,7 +64,7 @@ pub enum FailureClass {
 
 impl FailureClass {
     /// Stable string form for the table view.
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ToolchainTargetMissing => "toolchain-target-missing",
             Self::CratesIoDownload => "crates-io-download",
@@ -217,8 +217,9 @@ fn is_error_line(line: &str) -> bool {
 /// Classify one job log. Scans error lines top-down for a known class;
 /// when none match, a run whose log never shows the `stow-build build`
 /// step starting died before the wrapper executed — the runner-loss and
-/// setup-failure bucket.
-fn classify_log(log: &str) -> (FailureClass, Option<String>) {
+/// setup-failure bucket. `watchdog` reuses it for the incident's
+/// failure-class breakdown.
+pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
     for line in log.lines() {
         let line = log_line_body(line);
         let line = line.as_str();
