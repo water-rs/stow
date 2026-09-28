@@ -13,6 +13,8 @@ const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_STABLE_RUSTC_URL: &str = "https://scheduler.internal/rustc/stable";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
+const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
+const SCHEDULER_USAGE_CHECK_URL: &str = "https://scheduler.internal/usage-check";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
@@ -129,6 +131,42 @@ pub async fn migrate_scheduler(
     post_json(namespace, SCHEDULER_MIGRATE_URL, &serde_json::json!({})).await
 }
 
+/// The dispatch freeze's current state — flag plus the stored record
+/// (trigger, notify outcome) when engaged.
+pub async fn get_dispatch_freeze(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::DispatchFreeze, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_FREEZE_URL).await
+}
+
+/// The manual transition that engages or lifts the dispatch freeze; the
+/// object answers the state it stored.
+pub async fn set_dispatch_freeze(
+    namespace: &CfDurableNamespace,
+    enabled: bool,
+) -> Result<stow_types::api::DispatchFreeze, SchedulerClientError> {
+    post_json(
+        namespace,
+        SCHEDULER_FREEZE_URL,
+        &stow_types::api::DispatchFreeze {
+            enabled,
+            record: None,
+        },
+    )
+    .await
+}
+
+/// The scheduled cost probe's verdict: the object trips the freeze (and
+/// the panic switch) when `over` is non-empty, and is a no-op otherwise.
+/// Used by the edge's `#[skyzen::scheduled]` handler — see `cost.rs`.
+pub async fn report_usage_check(
+    namespace: &CfDurableNamespace,
+    check: &stow_types::api::UsageCheck,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_USAGE_CHECK_URL, check).await
+}
+
+>>>>>>> a10b666 (feat(edge): freeze dispatch on systematic failure and cost overrun, email per transition)
 /// The operator view behind `stow-admin status`.
 pub async fn admin_status(
     namespace: &CfDurableNamespace,

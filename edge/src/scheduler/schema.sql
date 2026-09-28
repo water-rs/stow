@@ -149,12 +149,43 @@ CREATE TABLE IF NOT EXISTS scheduler_schema_version (
     version INTEGER NOT NULL
 );
 
--- Operator-flipped settings. Currently holds only `panic`, the
--- anonymous-traffic circuit breaker: 'true'/'false', absent means off.
+-- Operator-flipped and breaker-set flags. `panic` is the anonymous-
+-- traffic circuit breaker; `dispatch_frozen`/`dispatch_frozen_at` are the
+-- dispatch freeze the breaker trips and `dispatch-freeze clear` lifts —
+-- 'true'/'false' for flags, a datetime string for the timestamp; absent
+-- means off.
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- One row per completion report that landed on a live attempt — the
+-- sliding window the dispatch-freeze breaker evaluates. A queue row
+-- cannot carry this: a retried task flips back to 'pending' and its
+-- earlier failures would vanish from any row-keyed scan, so the outcome
+-- log is append-only and keyed on finished_at instead.
+CREATE TABLE IF NOT EXISTS attempt_outcomes (
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    -- Compilation target — the breaker's per-target trip streams group
+    -- on it.
+    target TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    -- 'build' | 'publish' | 'register' — the BuildCompleteReport's
+    -- failure_step, NULL when the report did not carry one.
+    failure_step TEXT,
+    -- `step: error-prefix` (or the bare step/prefix when only one is
+    -- known) — what the trip alert groups failures by.
+    failure_class TEXT,
+    github_run_id TEXT,
+    finished_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, attempt)
+);
+
+-- The breaker reads a trailing time window — the index keeps that scan
+-- off the row payload.
+CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_finished
+ON attempt_outcomes (finished_at);
 
 -- Stable rustc channel cache: a single row (id = 1) holding the version
 -- parsed out of channel-rust-stable.toml. The request API resolves the

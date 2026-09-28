@@ -414,6 +414,10 @@ pub enum GetArtifactError {
     /// surface the error as-is.
     #[error("{0}", status = TOO_MANY_REQUESTS)]
     SchedulerBusy(String),
+    /// Dispatch is frozen (systematic-failure or cost trip). The body's
+    /// `error` names the stored trigger so the operator sees why.
+    #[error("{0}", status = SERVICE_UNAVAILABLE)]
+    DispatchFrozen(String),
     #[error("internal server error")]
     Internal,
     #[error("internal server error: {0}")]
@@ -430,6 +434,12 @@ impl From<SchedulerClientError> for GetArtifactError {
             SchedulerClientError::Http {
                 status: 429, body, ..
             } => Self::SchedulerBusy(scheduler_error_message(&body).to_owned()),
+            // A 503 is the dispatch freeze's refusal — the trusted
+            // submit and admin enqueue paths answer it verbatim so the
+            // caller sees the freeze reason, not a bare 500.
+            SchedulerClientError::Http {
+                status: 503, body, ..
+            } => Self::DispatchFrozen(scheduler_error_message(&body).to_owned()),
             // A 4xx from the scheduler is a client problem — e.g. a
             // completion report naming a task the queue never held — and
             // the body is the scheduler's own client-safe message, so it

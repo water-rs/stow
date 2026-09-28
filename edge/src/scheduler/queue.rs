@@ -903,7 +903,77 @@ pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<()
         });
     }
 
+    // The row landed — append the attempt's outcome so the dispatch-freeze
+    // breaker's sliding window sees it even after a re-request flips the
+    // queue row back to pending.
+    record_attempt_outcome(db, report).await?;
+
     Ok(())
+}
+
+/// Write one row to `attempt_outcomes` for a completion report that
+/// applied — success or failure, since the breaker's sample is all
+/// completed attempts. `failure_class` is the label the trip alert
+/// groups by: the report's error prefix (first line, truncated)
+/// qualified by the step that failed.
+async fn record_attempt_outcome(
+    db: &DurableDb,
+    report: &BuildCompleteReport,
+) -> Result<(), QueueError> {
+    #[derive(skyzen::FromRow)]
+    struct TargetRow {
+        target: String,
+    }
+    let target = db
+        .query("SELECT target FROM queue WHERE task_id = ?")
+        .bind(report.task_id.clone())
+        .fetch_optional::<TargetRow>()
+        .await
+        .map_err(|error| format!("read completed task target: {error}"))?
+        .map(|row| row.target)
+        .unwrap_or_default();
+    db.query(
+        "INSERT INTO attempt_outcomes \
+             (task_id, attempt, target, success, failure_step, failure_class, \
+              github_run_id, finished_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) \
+         ON CONFLICT(task_id, attempt) DO NOTHING",
+    )
+    .bind(report.task_id.clone())
+    .bind(i64::from(report.attempt))
+    .bind(target)
+    .bind(i64::from(report.success))
+    .bind(report.failure_step.map(|step| step.as_str().to_owned()))
+    .bind(failure_class(report))
+    .bind(report.github_run_id.clone())
+    .execute()
+    .await
+    .map_err(|error| format!("record attempt outcome: {error}"))?;
+    Ok(())
+}
+
+/// The label a failed attempt is counted under — `step: prefix` when the
+/// report carries both, whichever one it carries when it does not, and
+/// `unknown` for a bare failure. The prefix is the error's first line,
+/// capped so a stack dump cannot explode the class list.
+fn failure_class(report: &BuildCompleteReport) -> Option<String> {
+    const MAX_PREFIX_CHARS: usize = 200;
+    if report.success {
+        return None;
+    }
+    let prefix = report
+        .error
+        .as_deref()
+        .and_then(|error| error.lines().next())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.chars().take(MAX_PREFIX_CHARS).collect::<String>());
+    match (report.failure_step, prefix) {
+        (Some(step), Some(prefix)) => Some(format!("{}: {prefix}", step.as_str())),
+        (Some(step), None) => Some(step.as_str().to_owned()),
+        (None, Some(prefix)) => Some(prefix),
+        (None, None) => Some("unknown".to_owned()),
+    }
 }
 
 pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
@@ -1243,6 +1313,13 @@ pub async fn claim_dispatchable_tasks(
     // so it rebuilds and republishes rather than gating dependents
     // forever. Repair, not dispatch: it runs paused or not.
     requeue_incomplete_shape_deps(db).await?;
+    // The dispatch freeze is the gate, and it lives here — the enqueue
+    // side of the queue never consults it, so misses keep arriving and
+    // stay pending for the first pass after a human lifts the freeze.
+    if freeze_enabled(db).await? {
+        tracing::info!("dispatch frozen — claiming nothing");
+        return Ok(Vec::new());
+    }
     let Dispatch::Limited(limit) = settings.dispatch else {
         tracing::info!("scheduler dispatch paused — claiming nothing");
         return Ok(Vec::new());
@@ -1630,7 +1707,197 @@ pub async fn set_panic(db: &DurableDb, enabled: bool) -> Result<(), QueueError> 
     Ok(())
 }
 
-// ===== Admin operations (`stow-admin` through the DO's `/tasks*` routes) =====
+// ===== Dispatch freeze (`settings` key `dispatch_freeze`) =====
+//
+// A separate flag from `panic` for a separate purpose: `panic` sheds
+// anonymous edge traffic to protect the worker; `dispatch_freeze` stops
+// the Durable Object from handing queue rows to CI runners while a
+// systematic breakage or an over-budget day is burning the org's
+// allowance. The row's presence is the flag — its value is the
+// serialized `DispatchFreezeRecord` (trigger, notify outcome) so
+// `GET /dispatch-freeze` answers the full picture from one read.
+
+/// Read the stored freeze record; `None` means dispatch is live. A value
+/// that fails to deserialize violates the key's contract and is an
+/// invariant error rather than a guess.
+pub async fn freeze_record(
+    db: &DurableDb,
+) -> Result<Option<stow_types::api::DispatchFreezeRecord>, QueueError> {
+    let value = db
+        .query("SELECT value FROM settings WHERE key = 'dispatch_freeze'")
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read dispatch freeze record: {error}"))?;
+    value
+        .map(|json| {
+            serde_json::from_str::<stow_types::api::DispatchFreezeRecord>(&json).map_err(|error| {
+                QueueError::Invariant(format!(
+                    "settings row `dispatch_freeze` holds an unparseable record: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Whether dispatch is frozen — the `dispatch_freeze` row's presence is
+/// the flag.
+pub async fn freeze_enabled(db: &DurableDb) -> Result<bool, QueueError> {
+    let count = db
+        .query("SELECT count(*) AS count FROM settings WHERE key = 'dispatch_freeze'")
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| format!("read dispatch freeze flag: {error}"))?;
+    Ok(count > 0)
+}
+
+/// Write the freeze record — `record.notify` is whatever the alert send
+/// already resolved to, so a failed send is persisted rather than
+/// propagated: the freeze is the load-bearing action.
+pub async fn set_freeze(
+    db: &DurableDb,
+    record: &stow_types::api::DispatchFreezeRecord,
+) -> Result<(), QueueError> {
+    let value = serde_json::to_string(record).map_err(|error| {
+        QueueError::Invariant(format!("serialize dispatch freeze record: {error}"))
+    })?;
+    db.query(
+        "INSERT INTO settings (key, value) VALUES ('dispatch_freeze', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(value)
+    .execute()
+    .await
+    .map_err(|error| format!("write dispatch freeze record: {error}"))?;
+    tracing::warn!("dispatch freeze engaged — dispatch stops, enqueue stays open");
+    Ok(())
+}
+
+/// Lift the freeze by deleting the record row — the caller already
+/// holds the record for the cleared-transition alert.
+pub async fn delete_freeze(db: &DurableDb) -> Result<(), QueueError> {
+    db.query("DELETE FROM settings WHERE key = 'dispatch_freeze'")
+        .execute()
+        .await
+        .map_err(|error| format!("clear dispatch freeze record: {error}"))?;
+    tracing::warn!("dispatch freeze cleared — dispatch resumes");
+    Ok(())
+}
+
+/// The evidence a failure-rate trip verdict becomes: the evaluated
+/// window plus the dominant failure classes and the freshest failing
+/// runs for the alert.
+#[derive(Debug)]
+pub struct FreezeTripDraft {
+    /// The pure trip verdict over the window tallies.
+    pub eval: crate::freeze::TripEval,
+    /// Failure classes by descending count (`step: error-prefix`) — the
+    /// lines the trip email leads with.
+    pub classes: Vec<stow_types::api::DispatchFreezeClass>,
+    /// `github_run_id`s of the most recent failures in the window.
+    pub example_run_ids: Vec<String>,
+}
+
+/// Example run ids the trip email names — enough to click through, not
+/// enough to bury the counts.
+const TRIP_EXAMPLE_RUNS: i64 = 3;
+
+/// Count recorded attempt outcomes per target over the trailing
+/// `settings.window_minutes` and run the pure trip decision. The sample
+/// is `attempt_outcomes`, not the queue rows: a retried task flips back
+/// to `pending` and would otherwise erase its earlier attempts from the
+/// window — exactly the retry-storm shape this breaker exists to catch.
+/// Dispatch failures never land there (no run was burned), so they are
+/// not the signal this watches.
+pub async fn evaluate_freeze_trip(
+    db: &DurableDb,
+    settings: &crate::freeze::FreezeSettings,
+) -> Result<Option<FreezeTripDraft>, QueueError> {
+    let window = format!("-{} minutes", settings.window_minutes);
+    let rows = db
+        .query(
+            "SELECT target, count(*) AS outcomes, \
+                 SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures \
+             FROM attempt_outcomes \
+             WHERE finished_at >= datetime('now', ?) \
+             GROUP BY target",
+        )
+        .bind(window.clone())
+        .fetch_all::<WindowOutcomeRow>()
+        .await
+        .map_err(|error| format!("count freeze-window outcomes by target: {error}"))?;
+    let mut tallies = Vec::with_capacity(rows.len());
+    for row in rows {
+        tallies.push(crate::freeze::OutcomeTally {
+            target: row.target,
+            outcomes: u64_to_u32(row.outcomes, "window outcomes")?,
+            failures: u64_to_u32(row.failures, "window failures")?,
+        });
+    }
+    let Some(eval) = crate::freeze::evaluate(&tallies, settings) else {
+        return Ok(None);
+    };
+    // The verdict is a trip — assemble its evidence. Failure classes
+    // rank `step: error-prefix` counts; example run ids name the
+    // freshest failing Actions runs the alert links.
+    let class_rows = db
+        .query(
+            "SELECT failure_class, count(*) AS count FROM attempt_outcomes \
+             WHERE success = 0 AND finished_at >= datetime('now', ?) \
+             GROUP BY failure_class ORDER BY count DESC, failure_class",
+        )
+        .bind(window.clone())
+        .fetch_all::<FailureClassRow>()
+        .await
+        .map_err(|error| format!("count freeze-window failure classes: {error}"))?;
+    let mut classes = Vec::with_capacity(class_rows.len());
+    for row in class_rows {
+        classes.push(stow_types::api::DispatchFreezeClass {
+            class: row.failure_class.unwrap_or_else(|| "unknown".to_owned()),
+            count: u64_to_u32(row.count, "window failure class count")?,
+        });
+    }
+    let example_run_ids = db
+        .query(
+            "SELECT github_run_id FROM attempt_outcomes \
+             WHERE success = 0 AND github_run_id IS NOT NULL \
+               AND finished_at >= datetime('now', ?) \
+             GROUP BY github_run_id ORDER BY MAX(finished_at) DESC LIMIT ?",
+        )
+        .bind(window)
+        .bind(TRIP_EXAMPLE_RUNS)
+        .fetch_all::<RunIdRow>()
+        .await
+        .map_err(|error| format!("load example failed run ids: {error}"))?
+        .into_iter()
+        .map(|row| row.github_run_id)
+        .collect();
+    Ok(Some(FreezeTripDraft {
+        eval,
+        classes,
+        example_run_ids,
+    }))
+}
+
+/// One `GROUP BY target` outcome row for [`evaluate_freeze_trip`].
+#[derive(Debug, skyzen::FromRow)]
+struct WindowOutcomeRow {
+    target: String,
+    outcomes: u64,
+    failures: u64,
+}
+
+/// One failure-class count for the trip evidence.
+#[derive(Debug, skyzen::FromRow)]
+struct FailureClassRow {
+    failure_class: Option<String>,
+    count: u64,
+}
+
+/// One run-id row for the trip evidence's example links.
+#[derive(Debug, skyzen::FromRow)]
+struct RunIdRow {
+    github_run_id: String,
+}
 
 /// Row cap for admin queue listings and the mutation preview the CLI
 /// renders — an unbounded scan on a hot queue would stall the Durable
@@ -1942,6 +2209,7 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
         in_flight,
         targets,
         panic_enabled: panic_enabled(db).await?,
+        dispatch_frozen: freeze_enabled(db).await?,
     })
 }
 
@@ -2101,11 +2369,18 @@ pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
 }
 
 /// Decide the next scheduler alarm from live queue state.
+///
+/// While the dispatch freeze is engaged there is nothing to wake for —
+/// dispatch is gated, so the alarm is deleted; the manual clear re-arms
+/// it through the `/dispatch-freeze` route's dispatch pass.
 pub async fn next_alarm(
     db: &DurableDb,
     now_ms: i64,
     settings: &SchedulerSettings,
 ) -> Result<AlarmPlan, QueueError> {
+    if freeze_enabled(db).await? {
+        return Ok(AlarmPlan::Delete);
+    }
     let active = count_active_by_family(db).await?;
     let capacity = match settings.dispatch {
         Dispatch::Paused => DispatchCapacity::Paused,
@@ -3931,6 +4206,7 @@ mod sqlite_tests {
                 attempt: claimed[0].attempt,
                 success: false,
                 error: Some("boom".to_owned()),
+                failure_step: None,
                 artifacts_uploaded: 0,
                 github_run_id: None,
             },
@@ -3988,6 +4264,7 @@ mod sqlite_tests {
                 attempt: claimed[0].attempt,
                 success: true,
                 error: None,
+                failure_step: None,
                 artifacts_uploaded: 1,
                 github_run_id: None,
             },
@@ -4483,6 +4760,7 @@ mod sqlite_tests {
                 attempt: claimed[0].attempt,
                 success: true,
                 error: None,
+                failure_step: None,
                 artifacts_uploaded: 3,
                 github_run_id: None,
             },
@@ -4506,6 +4784,7 @@ mod sqlite_tests {
                 attempt: 1,
                 success: true,
                 error: None,
+                failure_step: None,
                 artifacts_uploaded: 0,
                 github_run_id: None,
             },
@@ -5212,6 +5491,7 @@ mod sqlite_tests {
             attempt,
             success,
             error: None,
+            failure_step: None,
             artifacts_uploaded: 0,
             github_run_id: None,
         }
@@ -6270,6 +6550,253 @@ mod sqlite_tests {
             issued <= 6,
             "a 1000-request chunk must stay a constant statement count \
              (measured 6), got {issued}"
+        );
+    }
+
+    // ===== Dispatch freeze (issue #279) =====
+
+    /// Claim capacity large enough to seed whole windows of outcomes in
+    /// one pass.
+    const fn wide_claim_settings() -> SchedulerSettings {
+        SchedulerSettings {
+            dispatch: Dispatch::from_max_concurrent_jobs(500),
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        }
+    }
+
+    /// Enqueue then claim `count` tasks on `target`, then complete each
+    /// one — `Some((step, error, run_id))` fails it, `None` succeeds —
+    /// leaving exactly `count` rows in `attempt_outcomes`.
+    async fn seed_outcomes(
+        db: &DurableDb,
+        batch: u32,
+        count: usize,
+        target: &str,
+        failure: Option<(stow_types::api::FailureStep, &str, &str)>,
+    ) {
+        // Names carry the batch: a repeat name re-requests the failed
+        // task, which re-arms the not_before backoff and hides the row
+        // from the claim this seeding is about to run.
+        let requests: Vec<EnqueueRequest> = (0..count)
+            .map(|i| request_on(&format!("outcome-{batch}-{i}"), target, Vec::new()))
+            .collect();
+        super::enqueue_trusted(db, &requests, &wide_claim_settings())
+            .await
+            .expect("seed enqueue");
+        let claimed = super::claim_dispatchable_tasks(db, &wide_claim_settings(), &NoCoverage)
+            .await
+            .expect("seed claim");
+        assert_eq!(claimed.len(), count);
+        for task in claimed {
+            let mut report = report(&task.task_id, task.attempt, failure.is_none());
+            if let Some((step, error, run_id)) = failure {
+                report.failure_step = Some(step);
+                report.error = Some(error.to_owned());
+                report.github_run_id = Some(run_id.to_owned());
+            }
+            super::complete(db, &report).await.expect("seed complete");
+        }
+    }
+
+    fn freeze_record_fixture() -> stow_types::api::DispatchFreezeRecord {
+        stow_types::api::DispatchFreezeRecord {
+            frozen_at: "2026-09-22T03:51:00Z".to_owned(),
+            trigger: stow_types::api::DispatchFreezeTrigger::Manual,
+            notify: stow_types::api::DispatchFreezeNotify::Disabled {
+                reason: "test".to_owned(),
+            },
+        }
+    }
+
+    /// The record's presence is the flag: set reads back, enabled
+    /// reports true, delete clears both.
+    #[tokio::test]
+    async fn freeze_record_roundtrips_and_deletes() {
+        let db = memory_db().await.expect("memory db");
+        assert!(super::freeze_record(&db).await.expect("read").is_none());
+        assert!(!super::freeze_enabled(&db).await.expect("enabled"));
+
+        let record = freeze_record_fixture();
+        super::set_freeze(&db, &record).await.expect("set");
+        assert!(super::freeze_enabled(&db).await.expect("enabled"));
+        let stored = super::freeze_record(&db)
+            .await
+            .expect("read")
+            .expect("stored");
+        assert_eq!(stored, record);
+
+        super::delete_freeze(&db).await.expect("delete");
+        assert!(!super::freeze_enabled(&db).await.expect("enabled"));
+        assert!(super::freeze_record(&db).await.expect("read").is_none());
+    }
+
+    /// While frozen, claim returns nothing and enqueue keeps accepting —
+    /// and `next_alarm` plans `Delete` so no dispatch pass even wakes.
+    /// Clearing restores dispatch.
+    #[tokio::test]
+    async fn freeze_gates_dispatch_but_not_enqueue_and_clear_resumes() {
+        let db = memory_db().await.expect("memory db");
+        super::set_freeze(&db, &freeze_record_fixture())
+            .await
+            .expect("set freeze");
+
+        // Enqueue is unaffected — misses keep arriving.
+        enqueue(&db, &[request("frozen-miss", Vec::new())])
+            .await
+            .expect("enqueue while frozen");
+        // Dispatch is not: the claim gate answers empty no matter what
+        // is pending.
+        assert!(
+            super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+                .await
+                .expect("claim while frozen")
+                .is_empty()
+        );
+        let plan = super::next_alarm(&db, ROW_TS_MS, &settings())
+            .await
+            .expect("next alarm while frozen");
+        assert_eq!(plan, AlarmPlan::Delete);
+
+        super::delete_freeze(&db).await.expect("clear");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim after clear");
+        assert_eq!(claimed.len(), 1, "the freeze-queued miss dispatches");
+    }
+
+    /// The trip decision reads `attempt_outcomes`, not live queue rows —
+    /// a retried task keeps every failed attempt inside the window.
+    #[tokio::test]
+    async fn evaluate_freeze_trip_reads_attempt_outcomes() {
+        let db = memory_db().await.expect("memory db");
+        let freeze = crate::freeze::FreezeSettings {
+            window_minutes: 60,
+            min_outcomes: 10,
+            fail_percent: 50,
+        };
+
+        // Below the floor the ratio never trips, whatever it reads.
+        seed_outcomes(
+            &db,
+            0,
+            9,
+            TARGET,
+            Some((
+                stow_types::api::FailureStep::Register,
+                "register 500",
+                "run-1",
+            )),
+        )
+        .await;
+        assert!(
+            super::evaluate_freeze_trip(&db, &freeze)
+                .await
+                .expect("evaluate")
+                .is_none(),
+            "9/9 failures under a floor of 10 must not trip"
+        );
+
+        // Crossing the floor *and* the ratio trips; the draft carries
+        // the class tally and example run ids the alert prints.
+        seed_outcomes(&db, 1, 1, TARGET, None).await;
+        seed_outcomes(
+            &db,
+            2,
+            1,
+            TARGET,
+            Some((
+                stow_types::api::FailureStep::Register,
+                "register 500",
+                "run-2",
+            )),
+        )
+        .await;
+        let draft = super::evaluate_freeze_trip(&db, &freeze)
+            .await
+            .expect("evaluate")
+            .expect("10 failures of 11 outcomes trips (>= 10 sample, 91% >= 50%)");
+        assert!(draft.eval.fleet_tripped);
+        assert_eq!(draft.eval.outcomes, 11);
+        assert_eq!(draft.eval.failures, 10);
+        assert_eq!(
+            draft.classes.first().map(|class| class.class.as_str()),
+            Some("register: register 500"),
+            "the dominant class names step + error prefix"
+        );
+        assert_eq!(draft.classes.first().map(|class| class.count), Some(10));
+        assert_eq!(
+            draft.example_run_ids,
+            vec!["run-2".to_owned(), "run-1".to_owned()],
+            "freshest failing run ids first"
+        );
+    }
+
+    /// A failure wave concentrated on one target trips that target's
+    /// stream even when the fleet aggregate stays under the ratio.
+    #[tokio::test]
+    async fn evaluate_freeze_trip_trips_a_single_target_stream() {
+        let db = memory_db().await.expect("memory db");
+        let freeze = crate::freeze::FreezeSettings {
+            window_minutes: 60,
+            min_outcomes: 10,
+            fail_percent: 50,
+        };
+        // 10/10 on the Windows leg, all green on Linux: fleet 10/30 =
+        // 33% stays quiet; the target trips alone.
+        seed_outcomes(&db, 0, 20, TARGET, None).await;
+        seed_outcomes(
+            &db,
+            1,
+            10,
+            WINDOWS_TARGET,
+            Some((
+                stow_types::api::FailureStep::Build,
+                "linker exploded",
+                "run-9",
+            )),
+        )
+        .await;
+        let draft = super::evaluate_freeze_trip(&db, &freeze)
+            .await
+            .expect("evaluate")
+            .expect("the concentrated stream trips");
+        assert!(!draft.eval.fleet_tripped);
+        let tripped: Vec<&str> = draft
+            .eval
+            .targets
+            .iter()
+            .filter(|target| target.tripped)
+            .map(|target| target.target.as_str())
+            .collect();
+        assert_eq!(tripped, [WINDOWS_TARGET]);
+    }
+
+    /// The exact boundary is inclusive: `failures*100 >=
+    /// outcomes*fail_percent` at the sample floor.
+    #[tokio::test]
+    async fn freeze_trip_boundary_is_inclusive() {
+        let db = memory_db().await.expect("memory db");
+        let freeze = crate::freeze::FreezeSettings {
+            window_minutes: 60,
+            min_outcomes: 10,
+            fail_percent: 50,
+        };
+        seed_outcomes(&db, 0, 5, TARGET, None).await;
+        seed_outcomes(
+            &db,
+            1,
+            5,
+            TARGET,
+            Some((stow_types::api::FailureStep::Build, "boom", "run-1")),
+        )
+        .await;
+        assert!(
+            super::evaluate_freeze_trip(&db, &freeze)
+                .await
+                .expect("evaluate")
+                .is_some(),
+            "5/10 failures at a 50% threshold trips"
         );
     }
 }

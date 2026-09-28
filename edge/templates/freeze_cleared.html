@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<body style="font-family: system-ui, sans-serif; color: #1a1a1a; line-height: 1.5">
+<p><strong>stow dispatch freeze cleared</strong> — queued work is being
+dispatched to CI runners again.</p>
+<table style="border-collapse: collapse">
+  <tr><td style="padding: 2px 12px 2px 0; color: #555">Frozen at</td><td><code>{{ frozen_at }}</code></td></tr>
+  <tr><td style="padding: 2px 12px 2px 0; color: #555">Cleared at</td><td><code>{{ cleared_at }}</code></td></tr>
+  <tr><td style="padding: 2px 12px 2px 0; color: #555">Was set by</td><td>{{ trigger_summary }}</td></tr>
+  <tr><td style="padding: 2px 12px 2px 0; color: #555">Alert on freeze</td><td>{{ notify_summary }}</td></tr>
+</table>
+<p>Misses that arrived during the freeze stayed pending and now dispatch
+normally. If the underlying breakage is still live the trip condition
+will freeze dispatch again on the next failures. If the trip was a cost
+trip, also clear the panic switch the trip engaged:<br>
+<code>stow-admin panic off --yes</code></p>
+<p style="color: #777; font-size: 0.85em">(alert from {{ from }} to {{ to }})</p>
+</body>
+</html>

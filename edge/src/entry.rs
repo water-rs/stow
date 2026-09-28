@@ -11,7 +11,7 @@ use skyzen_services::Db;
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
 use crate::{
-    admission, api, env_binding, ghcr, github_auth, panic, runtime_settings, scheduler, site,
+    admission, api, cost, env_binding, ghcr, github_auth, panic, runtime_settings, scheduler, site,
 };
 
 const STOW_DB_BINDING: &str = "STOW_DB";
@@ -34,6 +34,7 @@ const STOW_STATS_BINDING: &str = "STOW_STATS";
 const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
+const STOW_COST_BUDGET_MULTIPLIER_BINDING: &str = "STOW_COST_BUDGET_MULTIPLIER";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -145,6 +146,9 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/panic"
                     .at(api::get_panic_switch)
                     .post(api::set_panic_switch),
+                "/dispatch-freeze"
+                    .at(api::get_dispatch_freeze)
+                    .post(api::set_dispatch_freeze),
                 "/preheat/plan".post(api::preheat_plan),
                 "/queue".at(api::admin_queue_list),
                 "/queue/retry".post(api::admin_queue_retry),
@@ -219,4 +223,49 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
     .into_iter()
     .map(|node| node.with(gate.clone()))
     .collect()
+}
+
+/// The scheduled cost probe — `crons = ["*/10 * * * *"]` in
+/// `Skyzen.toml` lands here. Every run queries the GraphQL Analytics
+/// API for today's usage and posts the verdict to the scheduler Durable
+/// Object, which owns the freeze transition and the email. A broken
+/// check (GraphQL `errors`, transport, decode) is itself a fault worth
+/// an email — the trip it would have masked is invisible otherwise.
+#[skyzen::scheduled]
+async fn cost_check(
+    _event: skyzen_cloudflare::CfScheduledEvent,
+    env: wasm::Env,
+    _ctx: skyzen_cloudflare::CfScheduleContext,
+) -> skyzen::Result<()> {
+    crate::console_log::init();
+    let account_id = env_binding::required_string(&env, CF_ACCOUNT_ID_BINDING);
+    let analytics_token = env_binding::required_string(&env, CF_ANALYTICS_TOKEN_BINDING);
+    let scheduler = CfDurableNamespace::from_env(&env, SCHEDULER_BINDING)
+        .map_err(|error| skyzen::Error::msg(format!("load scheduler binding: {error}")))?;
+    let multiplier = env_binding::optional_string(&env, STOW_COST_BUDGET_MULTIPLIER_BINDING)
+        .and_then(|raw| match raw.parse::<f64>() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(%raw, %error, "ignoring unparseable STOW_COST_BUDGET_MULTIPLIER");
+                None
+            }
+        })
+        .unwrap_or(cost::DEFAULT_COST_BUDGET_MULTIPLIER);
+    if let Err(error) =
+        cost::run_usage_check(&account_id, &analytics_token, &scheduler, multiplier).await
+    {
+        tracing::error!(%error, "usage check failed");
+        if let Ok(config) = crate::email::alert_config(&env)
+            && let Ok((text, html)) =
+                cost::render_usage_check_error(&error, &config.to, &config.from)
+        {
+            let outcome =
+                crate::email::send_alert(&config, cost::USAGE_CHECK_ERROR_SUBJECT, &text, &html)
+                    .await;
+            if !matches!(outcome, stow_types::api::DispatchFreezeNotify::Sent { .. }) {
+                tracing::error!(?outcome, "usage-check failure alert send failed");
+            }
+        }
+    }
+    Ok(())
 }

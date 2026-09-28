@@ -1,0 +1,11 @@
+stow usage check failed — the scheduled cost probe could not evaluate
+today's budgets, so an over-budget trip would be masked right now.
+
+Error:
+  {{ error }}
+
+This is the failure the freeze is supposed to catch being unable to run.
+Check the Worker's logs (`stow-edge`) and the CF_ANALYTICS_TOKEN /
+CF_ACCOUNT_ID bindings.
+
+(alert from {{ from }} to {{ to }})

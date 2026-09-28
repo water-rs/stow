@@ -559,6 +559,50 @@ pub async fn set_panic_switch(
     Ok(Json(stored))
 }
 
+/// GET /api/v1/admin/dispatch-freeze
+///
+/// The dispatch freeze's current state — flag plus the stored record
+/// (trigger, notify outcome) — read straight from the scheduler Durable
+/// Object. No cache entry rides this flag: unlike panic it only gates
+/// dispatch inside the object and the trusted lanes that talk to it.
+pub async fn get_dispatch_freeze(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DispatchFreeze>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::get_dispatch_freeze(&scheduler).await?,
+    ))
+}
+
+/// POST /api/v1/admin/dispatch-freeze
+///
+/// The manual transition that is also the freeze's only recovery path —
+/// clearing it resumes dispatch of everything that queued meanwhile.
+pub async fn set_dispatch_freeze(
+    SchedulerCaller(caller): SchedulerCaller,
+    Json(switch): Json<stow_types::api::DispatchFreeze>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DispatchFreeze>, GetArtifactError> {
+    let stored = scheduler_client::set_dispatch_freeze(&scheduler, switch.enabled).await?;
+    tracing::warn!(enabled = stored.enabled, %caller, "dispatch freeze flipped via admin endpoint");
+    Ok(Json(stored))
+}
+
+/// The 503 the admin work-submitting routes answer while the freeze is
+/// engaged — the reason names the stored trigger. Lanes that reach the
+/// object's submit get this refusal from the object itself; this check
+/// covers the routes whose work never crosses it (resolve, preheat).
+async fn refuse_if_dispatch_frozen(scheduler: &CfDurableNamespace) -> Result<(), GetArtifactError> {
+    let freeze = scheduler_client::get_dispatch_freeze(scheduler).await?;
+    if let Some(record) = freeze.record {
+        return Err(GetArtifactError::DispatchFrozen(format!(
+            "dispatch is frozen ({})",
+            crate::freeze::summarize_trigger(&record.trigger)
+        )));
+    }
+    Ok(())
+}
+
 /// Query for `GET /api/v1/admin/index/{target}/{rustc_version}`.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct IndexQuery {
@@ -874,6 +918,7 @@ pub async fn preheat_plan(
     State(scheduler): State<CfDurableNamespace>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
+    refuse_if_dispatch_frozen(&scheduler).await?;
     if let Some(target) = &request.target
         && !stow_types::api::is_ci_target(target.as_str())
     {
@@ -972,7 +1017,9 @@ pub async fn admin_resolve_crate(
     SchedulerCaller(_caller): SchedulerCaller,
     Json(request): Json<stow_types::api::AdminResolveCrateRequest>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
+    State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
+    refuse_if_dispatch_frozen(&scheduler).await?;
     let pool = OutboundPool::new();
     let resolved = worker_resolver::resolve_crate(
         &request.crate_name,
@@ -997,7 +1044,9 @@ pub async fn admin_resolve_project(
     SchedulerCaller(_caller): SchedulerCaller,
     Json(request): Json<stow_types::api::AdminResolveProjectRequest>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
+    State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
+    refuse_if_dispatch_frozen(&scheduler).await?;
     let pool = OutboundPool::new();
     let resolved = worker_resolver::resolve_github_project(
         &request.repo,

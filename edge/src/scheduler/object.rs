@@ -18,7 +18,9 @@ use skyzen_services::Db;
 use stow_types::api::SchemaMigrationReport;
 
 use crate::db;
+use crate::email;
 use crate::errors::QueueError;
+use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
@@ -35,6 +37,9 @@ const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
+const STOW_FREEZE_WINDOW_MINUTES_BINDING: &str = "STOW_FREEZE_WINDOW_MINUTES";
+const STOW_FREEZE_MIN_OUTCOMES_BINDING: &str = "STOW_FREEZE_MIN_OUTCOMES";
+const STOW_FREEZE_FAIL_PERCENT_BINDING: &str = "STOW_FREEZE_FAIL_PERCENT";
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     let defaults = SchedulerSettings::default();
@@ -64,6 +69,91 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
         )?
         .unwrap_or(defaults.human_daily_task_budget),
     })
+}
+
+/// The trip thresholds the failure-rate window and the cost budgets are
+/// evaluated with — same binding-with-default shape as the scheduler
+/// tunables.
+fn freeze_settings(env: &WasmEnv) -> Result<FreezeSettings> {
+    let defaults = FreezeSettings::default();
+    Ok(FreezeSettings {
+        window_minutes: read_optional_u32_binding(env, STOW_FREEZE_WINDOW_MINUTES_BINDING)?
+            .unwrap_or(defaults.window_minutes),
+        min_outcomes: read_optional_u32_binding(env, STOW_FREEZE_MIN_OUTCOMES_BINDING)?
+            .unwrap_or(defaults.min_outcomes),
+        fail_percent: read_optional_u32_binding(env, STOW_FREEZE_FAIL_PERCENT_BINDING)?
+            .unwrap_or(defaults.fail_percent),
+    })
+}
+
+/// `freeze::FreezeStore` over the object's own `settings` row — the
+/// storage seam the transition coordinator runs on.
+struct DbStore<'a>(&'a DurableDb);
+
+impl freeze::FreezeStore for DbStore<'_> {
+    fn record(
+        &self,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Option<stow_types::api::DispatchFreezeRecord>, QueueError>,
+    > + Send {
+        queue::freeze_record(self.0)
+    }
+    fn set(
+        &self,
+        record: &stow_types::api::DispatchFreezeRecord,
+    ) -> impl std::future::Future<Output = std::result::Result<(), QueueError>> + Send {
+        queue::set_freeze(self.0, record)
+    }
+    fn delete(
+        &self,
+    ) -> impl std::future::Future<Output = std::result::Result<(), QueueError>> + Send {
+        queue::delete_freeze(self.0)
+    }
+}
+
+/// `freeze::AlertSender` over the `send_email` binding. `alert_config`
+/// resolves binding + addresses once; a missing binding degrades to a
+/// `Disabled` outcome instead of erroring, so a transition always
+/// lands its record.
+struct EdgeAlertSender {
+    config: std::result::Result<email::AlertConfig, stow_types::api::DispatchFreezeNotify>,
+}
+
+impl EdgeAlertSender {
+    fn new(env: &WasmEnv) -> Self {
+        Self {
+            config: email::alert_config(env.as_js()),
+        }
+    }
+
+    /// The alert destination for rendering — the binding's when
+    /// present, the documented default otherwise so the body still
+    /// names the operator.
+    fn to(&self) -> &str {
+        self.config
+            .as_ref()
+            .map_or(freeze::DEFAULT_ALERT_TO, |config| config.to.as_str())
+    }
+
+    fn from(&self) -> &str {
+        self.config
+            .as_ref()
+            .map_or(freeze::DEFAULT_ALERT_FROM, |config| config.from.as_str())
+    }
+}
+
+impl freeze::AlertSender for EdgeAlertSender {
+    async fn send(
+        &self,
+        subject: &str,
+        text: &str,
+        html: &str,
+    ) -> stow_types::api::DispatchFreezeNotify {
+        match &self.config {
+            Ok(config) => email::send_alert(config, subject, text, html).await,
+            Err(disabled) => disabled.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -98,6 +188,14 @@ impl DurableObject for Scheduler {
             "/index/published".post(record_published_index),
             "/panic".at(read_panic).post(write_panic),
             "/migrate".post(migrate_scheduler),
+            // A nested Route under the root — the outer tuple caps at
+            // 15 nodes.
+            Route::new((
+                "/dispatch-freeze"
+                    .at(read_dispatch_freeze)
+                    .post(write_dispatch_freeze),
+                "/usage-check".post(usage_check),
+            )),
         ))
         .on_alarm(run_alarm)
         .build()
@@ -151,6 +249,9 @@ async fn submit(
     enforce_pending_cap: bool,
 ) -> Result<Json<InsertedResponse>> {
     let settings = scheduler_settings(env)?;
+    if !enforce_pending_cap {
+        refuse_if_frozen(db).await?;
+    }
     let result = if enforce_pending_cap {
         queue::enqueue(db, requests, &settings).await
     } else {
@@ -175,6 +276,22 @@ async fn submit(
     Ok(Json(InsertedResponse { inserted }))
 }
 
+/// The trusted submit lane refuses while the freeze is engaged — a
+/// cost trip means the account is over budget, so even enqueues that
+/// would merely wait are declined with the freeze reason. Anonymous
+/// submits stay open: a miss costs nothing until it dispatches, and
+/// dropping it would just blind the queue.
+async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
+    if let Some(record) = queue::freeze_record(db).await.map_err(to_error)? {
+        let reason = format!(
+            "dispatch is frozen ({})",
+            freeze::summarize_trigger(&record.trigger)
+        );
+        return Err(Error::msg(reason).set_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+    Ok(())
+}
+
 /// Point the DO alarm at now: `run_alarm` then performs the dispatch
 /// pass (`dispatch_pending` plus `schedule_alarm`) that a mutating
 /// handler used to run inline. `setAlarm` overrides any existing
@@ -195,6 +312,7 @@ async fn arm_dispatch_alarm(alarm: &Alarm) -> Result<()> {
 }
 
 async fn complete(
+    env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(report): Json<stow_types::api::BuildCompleteReport>,
@@ -215,6 +333,13 @@ async fn complete(
         };
         to_error(error).set_status(status)
     })?;
+    // A failed attempt may have closed the window's trip condition —
+    // evaluate while this request still holds the outcome row's write
+    // context. The freeze then eats the dispatch the alarm was about
+    // to run.
+    if !report.success {
+        evaluate_dispatch_freeze(&env, &db).await?;
+    }
     // Same handoff as submit: the runner's report is acknowledged as soon
     // as the queue row lands, and the alarm's dispatch pass — not this
     // request — runs claim plus the GitHub fan-out.
@@ -359,6 +484,236 @@ async fn write_panic(
     Ok(Json(switch))
 }
 
+/// `GET /dispatch-freeze` — the dispatch freeze's current state: the
+/// flag plus the stored record (trigger and notify outcome) when
+/// engaged.
+async fn read_dispatch_freeze(db: DurableDb) -> Result<Json<stow_types::api::DispatchFreeze>> {
+    let record = queue::freeze_record(&db).await.map_err(to_error)?;
+    Ok(Json(stow_types::api::DispatchFreeze {
+        enabled: record.is_some(),
+        record,
+    }))
+}
+
+/// `POST /dispatch-freeze` — the manual transition that is also the
+/// only recovery path. Each direction sends exactly one alert, and
+/// writing the state already held is a no-op so alerts never repeat.
+async fn write_dispatch_freeze(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(switch): Json<stow_types::api::DispatchFreeze>,
+) -> Result<Json<stow_types::api::DispatchFreeze>> {
+    let sender = EdgeAlertSender::new(&env);
+    let action = if switch.enabled {
+        freeze::FreezeAction::Freeze
+    } else {
+        freeze::FreezeAction::Clear
+    };
+    let transition = freeze::apply_transition(
+        &DbStore(&db),
+        &sender,
+        action,
+        stow_types::api::DispatchFreezeTrigger::Manual,
+        &iso_now(),
+        sender.to(),
+        sender.from(),
+    )
+    .await
+    .map_err(to_error)?;
+    match transition {
+        freeze::FreezeTransition::Engaged(record) => {
+            // While frozen `next_alarm` plans a delete — a live alarm
+            // would only spin dispatch passes the gate would eat.
+            schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+                tracing::error!(%error, "scheduler freeze schedule_alarm failed");
+                error
+            })?;
+            tracing::warn!(?record.notify, "dispatch freeze engaged manually");
+            Ok(Json(stow_types::api::DispatchFreeze {
+                enabled: true,
+                record: Some(record),
+            }))
+        }
+        freeze::FreezeTransition::Cleared(_) => {
+            // Misses that queued during the freeze dispatch first now.
+            dispatch_pending(&env, &db).await.map_err(|error| {
+                tracing::error!(%error, "scheduler unfreeze dispatch_pending failed");
+                error
+            })?;
+            schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+                tracing::error!(%error, "scheduler unfreeze schedule_alarm failed");
+                error
+            })?;
+            tracing::warn!("dispatch freeze cleared manually");
+            Ok(Json(stow_types::api::DispatchFreeze {
+                enabled: false,
+                record: None,
+            }))
+        }
+        freeze::FreezeTransition::Unchanged => {
+            let record = queue::freeze_record(&db).await.map_err(to_error)?;
+            Ok(Json(stow_types::api::DispatchFreeze {
+                enabled: record.is_some(),
+                record,
+            }))
+        }
+    }
+}
+
+/// `POST /usage-check` — the edge's scheduled cost probe posts its
+/// verdict here; a non-empty `over` list trips the same freeze the
+/// failure-rate breaker engages, and flips the panic switch because a
+/// cost wave can arrive on trusted traffic the panic gate never sees.
+/// The check's verdict while already frozen is logged and dropped —
+/// state transitions are exactly one email.
+async fn usage_check(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(check): Json<stow_types::api::UsageCheck>,
+) -> Result<Json<OkResponse>> {
+    if check.over.is_empty() {
+        return Ok(Json(OkResponse { ok: true }));
+    }
+    let Some(trigger) = crate::cost::cost_trigger(&check) else {
+        return Err(Error::msg(
+            "usage check over list non-empty but produced no cost trigger",
+        ));
+    };
+    let sender = EdgeAlertSender::new(&env);
+    let transition = freeze::apply_transition(
+        &DbStore(&db),
+        &sender,
+        freeze::FreezeAction::Freeze,
+        trigger,
+        &iso_now(),
+        sender.to(),
+        sender.from(),
+    )
+    .await
+    .map_err(to_error)?;
+    match transition {
+        freeze::FreezeTransition::Engaged(record) => {
+            // The panic switch sheds anonymous traffic too: an
+            // over-budget day is not the moment to keep paying miss
+            // lookups for it.
+            queue::set_panic(&db, true).await.map_err(to_error)?;
+            schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+                tracing::error!(%error, "scheduler cost-trip schedule_alarm failed");
+                error
+            })?;
+            match &record.notify {
+                stow_types::api::DispatchFreezeNotify::Sent { .. } => {
+                    tracing::warn!(trigger = ?record.trigger, "dispatch freeze tripped on cost — alert sent");
+                }
+                stow_types::api::DispatchFreezeNotify::Failed { code, message, .. } => {
+                    tracing::error!(
+                        code = ?code,
+                        %message,
+                        trigger = ?record.trigger,
+                        "dispatch freeze tripped on cost — alert send failed"
+                    );
+                }
+                stow_types::api::DispatchFreezeNotify::Disabled { reason } => {
+                    tracing::warn!(%reason, "dispatch freeze tripped on cost — alert transport disabled");
+                }
+            }
+        }
+        freeze::FreezeTransition::Unchanged => {
+            tracing::info!(
+                over = check.over.len(),
+                "usage check over budget — dispatch already frozen"
+            );
+        }
+        freeze::FreezeTransition::Cleared(_) => {}
+    }
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// `Date#toISOString` — the timestamp format the record and alert
+/// bodies carry.
+fn iso_now() -> String {
+    js_sys::Date::new_0()
+        .to_iso_string()
+        .as_string()
+        .expect("Date#toISOString returns a string")
+}
+
+/// After a failed completion, decide whether the trailing window trips
+/// the freeze. `apply_transition` owns the one-mail-per-transition
+/// rule: a live freeze answers `Unchanged` without rewriting the
+/// record or resending the alert. Storage and query errors propagate
+/// (loud); the alert send's outcome only ever lands on the record.
+async fn evaluate_dispatch_freeze(env: &WasmEnv, db: &DurableDb) -> Result<()> {
+    // Cheap gate first — skip the window query entirely when frozen.
+    if queue::freeze_enabled(db).await.map_err(to_error)? {
+        return Ok(());
+    }
+    let settings = freeze_settings(env)?;
+    let Some(draft) = queue::evaluate_freeze_trip(db, &settings)
+        .await
+        .map_err(to_error)?
+    else {
+        return Ok(());
+    };
+    let trigger = trip_trigger(env, draft, &settings)?;
+    let sender = EdgeAlertSender::new(env);
+    if let freeze::FreezeTransition::Engaged(record) = freeze::apply_transition(
+        &DbStore(db),
+        &sender,
+        freeze::FreezeAction::Freeze,
+        trigger,
+        &iso_now(),
+        sender.to(),
+        sender.from(),
+    )
+    .await
+    .map_err(to_error)?
+    {
+        match &record.notify {
+            stow_types::api::DispatchFreezeNotify::Sent { .. } => {
+                tracing::warn!(trigger = ?record.trigger, "dispatch freeze tripped — alert sent");
+            }
+            stow_types::api::DispatchFreezeNotify::Failed { code, message, .. } => {
+                tracing::error!(
+                    code = ?code,
+                    %message,
+                    trigger = ?record.trigger,
+                    "dispatch freeze tripped — alert send failed"
+                );
+            }
+            stow_types::api::DispatchFreezeNotify::Disabled { reason } => {
+                tracing::warn!(%reason, "dispatch freeze tripped — alert transport disabled");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Turn a trip verdict into the wire `Tripped` trigger — the example
+/// run URLs only materialize for failing run ids plus the repo binding.
+fn trip_trigger(
+    env: &WasmEnv,
+    draft: queue::FreezeTripDraft,
+    settings: &FreezeSettings,
+) -> Result<stow_types::api::DispatchFreezeTrigger> {
+    let example_run_urls = read_optional_string_binding(env, GITHUB_REPO_BINDING)
+        .map(|repo| {
+            draft
+                .example_run_ids
+                .iter()
+                .map(|run_id| format!("https://github.com/{repo}/actions/runs/{run_id}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    draft
+        .eval
+        .into_wire(settings, draft.classes, example_run_urls)
+        .map(stow_types::api::DispatchFreezeTrigger::Tripped)
+        .map_err(|invariant| Error::msg(format!("freeze trip evidence invariant: {invariant}")))
+}
+
 /// `POST /index/published` — the index-publish path's report that a slice
 /// went live, carrying the semantic identities it serves. Recording it
 /// before the dispatch pass lets a dependent the report just released
@@ -446,6 +801,15 @@ impl queue::CoverageOracle for CatalogCoverage {
 }
 
 async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
+    // The dispatch freeze gates here and inside `claim_dispatchable_tasks`
+    // — the enqueue side never consults it, so misses keep arriving and
+    // stay pending for the first pass after a human lifts the freeze. It
+    // precedes binding resolution on purpose: while frozen there is no
+    // dispatch pass at all, not even its failures.
+    if queue::freeze_enabled(db).await.map_err(to_error)? {
+        tracing::info!("dispatch frozen — skipping dispatch pass");
+        return Ok(());
+    }
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let settings = scheduler_settings(env)?;
     // Binding resolution precedes claiming: a misconfigured binding fails

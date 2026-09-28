@@ -47,8 +47,38 @@ TURNSTILE_HOSTNAME = "stow.waterui.dev"
 # token; the edge rejects OIDC credentials carrying any other `aud`.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 # Account id the Analytics Engine SQL API is queried under — powers
-# GET /api/v1/stats.
+# GET /api/v1/stats and the scheduled cost trip's GraphQL read.
 CF_ACCOUNT_ID = "76e9b86d5be8efabd346f9b2c4da0d41"
+# Dispatch-freeze trip condition: a stream (the fleet aggregate, or any
+# single target) must record at least STOW_FREEZE_MIN_OUTCOMES terminal
+# outcomes inside the trailing STOW_FREEZE_WINDOW_MINUTES AND reach
+# STOW_FREEZE_FAIL_PERCENT percent failures — both, never either alone.
+# The motivating incident (#431) failed ~120 outcomes/hour on each
+# Windows leg, so 50 outcomes at 50% inside an hour trips it well
+# before the runner allowance is gone; a queue too quiet to reach the
+# sample cannot be burning the allowance either.
+STOW_FREEZE_WINDOW_MINUTES = "60"
+STOW_FREEZE_MIN_OUTCOMES = "50"
+STOW_FREEZE_FAIL_PERCENT = "50"
+# Freeze-transition alert email: the sender must live on a domain
+# onboarded under Compute → Email Service → Email Sending
+# (E_SENDER_NOT_VERIFIED otherwise); the recipient is whoever owns
+# runner-allowance incidents. The send_email binding itself is declared
+# under cloudflare.raw below — mock/local manifests deliberately omit
+# it so they can never reach Cloudflare's sending API.
+STOW_ALERT_FROM = "alerts@stow.waterui.dev"
+STOW_ALERT_TO = "me@lexo.cool"
+# Multiplies every cost budget the scheduled check evaluates — 1.0
+# checks the Workers Paid included allowances (each /30 for the daily
+# budget); lower it to trip earlier on a shared account.
+STOW_COST_BUDGET_MULTIPLIER = "1.0"
+
+# The scheduled cost probe: every ten minutes the edge reads today's
+# account usage off the GraphQL Analytics API and POSTs the verdict to
+# the scheduler Durable Object, which trips the dispatch freeze over
+# budget.
+[cloudflare.triggers]
+crons = ["*/10 * * * *"]
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"
@@ -124,3 +154,32 @@ dataset = "stow_events"
 [cloudflare.raw.limits]
 subrequests = 100000
 cpu_ms = 15000
+
+# Freeze-transition alert transport — Email Service Email Sending (public
+# beta). `remote = true` makes the binding callable over the Email Service
+# API. Declared only here: the mock/local manifests deliberately omit it
+# so they can never reach Cloudflare's sending API — their alert path
+# resolves to `Disabled`. `allowed_destination_addresses` pins sends to
+# the one operator even though the onboarded sender domain would let the
+# binding mail anyone — an alerting path able to mail arbitrary addresses
+# is a worse bug than a missed alert.
+[[cloudflare.raw.send_email]]
+name = "STOW_ALERT_EMAIL"
+remote = true
+allowed_destination_addresses = ["me@lexo.cool"]
+
+# Workers Logs — a systematic failure that 500s must leave a searchable
+# record, not exist only on a live tail. The wrangler keys are
+# `[observability] enabled`/`head_sampling_rate` plus
+# `[observability.logs] enabled`/`head_sampling_rate`/`invocation_logs`
+# (all sampled at 1 — the failure signal must not thin out under load).
+# Workers Paid includes 20M log events/month at 7-day retention, then
+# $0.60 per additional million (developers.cloudflare.com/workers/
+# observability/logs/workers-logs + /workers/platform/pricing).
+[cloudflare.raw.observability]
+enabled = true
+head_sampling_rate = 1
+[cloudflare.raw.observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
