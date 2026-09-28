@@ -5777,7 +5777,10 @@ mod sqlite_tests {
     /// old code read a schema it does not understand.
     #[tokio::test]
     async fn migrate_refuses_a_newer_schema() {
-        let db = memory_db().await.expect("memory db");
+        // The migrate path's fixture: `migrate` runs only behind the
+        // operator route, where schema probes are permitted.
+        let db = memory_db_raw().await.expect("raw memory db");
+        super::migrate(&db).await.expect("first migrate");
         db.query(&format!(
             "UPDATE scheduler_schema_version SET version = {}",
             super::SCHEMA_VERSION + 1
