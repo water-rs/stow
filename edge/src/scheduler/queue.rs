@@ -7,8 +7,8 @@ use skyzen_services::durable::DbValue;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueRequest,
     EnqueueSource, FaultObservation, FaultOffender, FaultSignal, PublishedSliceRow, QueueSelector,
-    QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus, SchemaMigrationReport,
-    TaskLane, runner_family,
+    QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus,
+    SchemaMigrationReport, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -1898,7 +1898,6 @@ pub async fn freeze_transitions(
 pub async fn fault_signals(
     db: &MeteredDb,
 ) -> Result<Vec<(FaultSignal, crate::faults::SignalState)>, QueueError> {
-    ensure_schema(db).await?;
     let rows = db
         .query("SELECT signal, opened_at, last_digest_at, observation FROM fault_signals")
         .fetch_all::<FaultSignalRow>()
@@ -1956,7 +1955,6 @@ pub async fn set_fault_signal(
     signal: FaultSignal,
     state: &crate::faults::SignalState,
 ) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
     let observation = serde_json::to_string(&state.observation)
         .map_err(|error| QueueError::Invariant(format!("serialize fault observation: {error}")))?;
     db.query(
@@ -1977,7 +1975,6 @@ pub async fn set_fault_signal(
 
 /// Drop a resolved signal's row.
 pub async fn delete_fault_signal(db: &MeteredDb, signal: FaultSignal) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
     db.query("DELETE FROM fault_signals WHERE signal = ?")
         .bind(signal_name(signal)?)
         .execute()
@@ -2007,7 +2004,6 @@ pub async fn build_failure_observation(
         BUILD_FAILURE_ATTEMPT_THRESHOLD, BUILD_FAILURE_MIN_OUTCOMES, BUILD_FAILURE_PERCENT,
         MAX_OFFENDERS,
     };
-    ensure_schema(db).await?;
     let window = format!("-{window_minutes} minutes");
     let (total, failures) = {
         let row = db
@@ -2114,7 +2110,6 @@ pub async fn queue_health_observation(
     window_minutes: u32,
 ) -> Result<FaultObservation, QueueError> {
     use crate::faults::{MAX_OFFENDERS, QUEUE_AGE_MINUTES, QUEUE_STALL_MIN_PENDING};
-    ensure_schema(db).await?;
     // Only rows dispatch may claim right now count — a `not_before`
     // delay is deliberate back-off, not a stall.
     let health = db
@@ -3107,7 +3102,7 @@ pub async fn record_published_slice(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Run the scheduler schema migration — the only code that may issue
 /// DDL or a backfill against the queue database. Migrations are
