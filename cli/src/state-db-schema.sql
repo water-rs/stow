@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS artifact_cache_entries (
     verified_marker_version INTEGER,
     verified_marker_policy TEXT,
     provenance TEXT NOT NULL DEFAULT 'remote',
+    native_original_out_dir TEXT,
     PRIMARY KEY (rustc_version, cache_key)
 );
 

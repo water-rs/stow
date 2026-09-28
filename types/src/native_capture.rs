@@ -60,6 +60,7 @@ pub fn capture_native_artifacts(
         cargo_directives,
         dep_env_vars: BTreeMap::new(),
         out_dir_files,
+        original_out_dir: out_dir.to_path_buf(),
     }))
 }
 

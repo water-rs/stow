@@ -147,7 +147,14 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
     let task = load_task_payload()?;
     match publish(&task, input_dir).await {
         Ok(report) => {
-            notify::report_completion(&report).await?;
+            // A 409 means a newer attempt owns the task: the run's report
+            // cannot apply, so it is a warn, not a failure (stow#431).
+            if !notify::report_completion(&report).await? {
+                tracing::warn!(
+                    task_id = %task.task_id,
+                    "completion report rejected — a newer attempt owns the task"
+                );
+            }
             Ok(())
         }
         Err(error) => {
@@ -160,10 +167,19 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
                 artifacts_uploaded: 0,
                 github_run_id: None,
             };
-            if let Err(notify_error) = notify::report_completion(&report).await {
-                return Err(stow_types::stow_error!(
-                    "{error}; reporting the failure to the scheduler also failed: {notify_error}"
-                ));
+            match notify::report_completion(&report).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        task_id = %task.task_id,
+                        "failure report rejected — a newer attempt owns the task"
+                    );
+                }
+                Err(notify_error) => {
+                    return Err(stow_types::stow_error!(
+                        "{error}; reporting the failure to the scheduler also failed: {notify_error}"
+                    ));
+                }
             }
             Err(error)
         }
@@ -208,7 +224,16 @@ async fn publish(
         &upload_outcome.published_by_reference,
         &measure_glibc_floors(&output.plan)?,
     )?;
-    register::register_artifacts(Some(&task.task_id), &artifact_records).await?;
+    // A 409 here means the scheduler reclaimed the task while this build
+    // ran and a newer attempt owns it — the records can never land, so the
+    // publish stops and reports; the report itself conflicts the same way
+    // and the job exits quietly (stow#431).
+    if !register::register_artifacts(Some(&task.task_id), &artifact_records).await? {
+        tracing::warn!(
+            task_id = %task.task_id,
+            "register rejected the records — a newer attempt owns the task"
+        );
+    }
 
     tracing::info!(
         task_id = %task.task_id,

@@ -3736,6 +3736,7 @@ mod tests {
                         ],
                         dep_env_vars: BTreeMap::default(),
                         out_dir_files: Vec::new(),
+                        original_out_dir: std::path::PathBuf::from("/original/build/out"),
                     }),
                     sigstore_signatures: Vec::new(),
                     entry_dir: PathBuf::new(),
@@ -3760,6 +3761,7 @@ mod tests {
             cargo_directives: vec!["cargo:rustc-link-lib=static=ring-core".to_owned()],
             dep_env_vars: BTreeMap::default(),
             out_dir_files: Vec::new(),
+            original_out_dir: std::path::PathBuf::from("/original/build/out"),
         };
 
         assert!(native_requires_link_replay(&native));

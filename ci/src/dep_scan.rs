@@ -253,8 +253,16 @@ fn select_captured_artifacts(
     package_index: &PackageIndex,
     captured_artifacts: &[CapturedRustcArtifact],
 ) -> stow_types::error::Result<SelectedCaptures> {
-    let mut selected =
-        BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
+    let mut selected = BTreeMap::<
+        (
+            String,
+            String,
+            String,
+            String,
+            Option<stow_types::public_cache::UnitInvocation>,
+        ),
+        SelectedCapturedArtifact,
+    >::new();
     let mut absorbed_duplicates = 0usize;
     for captured in captured_artifacts {
         // Observed units (build-script compiles, binaries, probes) exist so a
@@ -287,6 +295,7 @@ fn select_captured_artifacts(
             artifact_kind.as_str().to_owned(),
             serde_json::to_string(&captured.emit)
                 .expect("captured emit serialization must succeed"),
+            captured.invocation,
         );
         let candidate = SelectedCapturedArtifact {
             package: package.clone(),
@@ -317,22 +326,38 @@ struct SelectedCaptures {
 /// there when the two are provably captures of the same rustc unit.
 /// Returns `true` when the candidate was merged rather than inserted.
 fn select_captured_artifact(
-    selected: &mut BTreeMap<(String, String, String, String), SelectedCapturedArtifact>,
-    key: (String, String, String, String),
+    selected: &mut BTreeMap<
+        (
+            String,
+            String,
+            String,
+            String,
+            Option<stow_types::public_cache::UnitInvocation>,
+        ),
+        SelectedCapturedArtifact,
+    >,
+    key: (
+        String,
+        String,
+        String,
+        String,
+        Option<stow_types::public_cache::UnitInvocation>,
+    ),
     candidate: SelectedCapturedArtifact,
 ) -> stow_types::error::Result<bool> {
     let Some(existing) = selected.get_mut(&key) else {
         selected.insert(key, candidate);
         return Ok(false);
     };
-    // Two restorable records under one selection key are a duplicate: the key
-    // already carries every identity dimension (crate, stable metadata, kind,
-    // emit), so a second record claiming it is either the same rustc unit
-    // seen twice — a unit that links in every cargo phase, like a build
-    // dependency or a proc macro, is captured once per phase into that
-    // phase's own `CARGO_TARGET_DIR`, and a split unit graph captures the
-    // host and requested-target halves into sibling `deps` dirs — or a
-    // forged replay. `same_captured_unit` is the proof of "same unit";
+    // Two restorable records under one selection key are a duplicate: the
+    // key already carries every identity dimension (crate, stable
+    // metadata, kind, emit, invocation), so a second record claiming it
+    // is either the same rustc unit seen twice — a unit that links in
+    // every cargo phase, like a build dependency or a proc macro, is
+    // captured once per phase into that phase's own `CARGO_TARGET_DIR`,
+    // and a split unit graph captures the host and requested-target
+    // halves into sibling `deps` dirs — or a forged replay.
+    // `same_captured_unit` is the proof of "same unit";
     // anything else is a collision and aborts the scan.
     if !same_captured_unit(&existing.captured, &candidate.captured) {
         return Err(stow_types::stow_error!(
@@ -1316,6 +1341,7 @@ mod tests {
     use stow_types::api::BuildTaskPayload;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::platform::{PanicStrategy, Profile};
+    use stow_types::public_cache::UnitInvocation;
 
     use super::{
         IndexedPackage, ResolvedArtifact, SelectedCapturedArtifact, output_owner_index,
@@ -1339,6 +1365,7 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
+            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -1404,6 +1431,7 @@ mod tests {
             "0c5856ca18b3a9e0".to_owned(),
             ArtifactKind::ProcMacro.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
+            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -1489,6 +1517,7 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
+            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -1533,6 +1562,7 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
+            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -1570,6 +1600,43 @@ mod tests {
         let error = select_captured_artifact(&mut selected, key, second)
             .expect_err("a different compile key under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
+    }
+
+    /// A host-side task runs every phase under both invocation spellings
+    /// and each produces its own unit — same crate, same metadata, same
+    /// emit, different compile key. Selection must keep both: collapsing
+    /// them under one key aborted every host-side build as a duplicate
+    /// identity (stow#431).
+    #[test]
+    fn native_and_target_spelling_of_one_unit_select_separately() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("aho_corasick".to_owned())
+            .or_default()
+            .insert("1.1.4".to_owned(), indexed("aho_corasick", "1.1.4"));
+
+        let mut native = captured(
+            "aho_corasick",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target-native/debug/deps",
+        );
+        native.crate_version = Some("1.1.4".to_owned());
+        native.compile_key = "aa".repeat(32);
+        native.invocation = Some(stow_types::public_cache::UnitInvocation::Native);
+
+        let mut explicit = captured(
+            "aho_corasick",
+            "ef4a079a8dc04c32",
+            "/tmp/workspace/target-target/debug/deps",
+        );
+        explicit.crate_version = Some("1.1.4".to_owned());
+        explicit.compile_key = "bb".repeat(32);
+        explicit.invocation = Some(stow_types::public_cache::UnitInvocation::Target);
+
+        let selected = select_captured_artifacts(&index, &[native, explicit])
+            .expect("the two invocation spellings are two selected artifacts");
+        assert_eq!(selected.artifacts.len(), 2);
+        assert_eq!(selected.absorbed_duplicates, 0);
     }
 
     #[test]
@@ -1918,6 +1985,7 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
+            dep_pins: Vec::new(),
         }
     }
 
@@ -2037,6 +2105,7 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
+            dep_pins: Vec::new(),
         };
         let task_features = ["default", "derive", "serde_derive", "std"]
             .into_iter()
@@ -2094,6 +2163,7 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
+            dep_pins: Vec::new(),
         };
         let task_features = BTreeSet::from(["default".to_owned()]);
 

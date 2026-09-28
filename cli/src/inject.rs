@@ -422,14 +422,29 @@ async fn materialize_bundle_output_paths(
     Ok(())
 }
 
+/// Write the native artifacts the bundle carries for a crate whose build
+/// script produced native outputs — `-sys` crates and any crate with `links`.
+///
+/// Cargo exports `OUT_DIR` to the rustc invocation of a crate with a build
+/// script, and the wrapper records it on `parsed.build_script_out_dir`: that
+/// is where the build script's outputs belong — the `static_libs` from the
+/// archive and the `out_dir_files` snapshot — while the `output` file belongs
+/// one level up, in the build dir. No `-L native=` path is ever a usable
+/// substitute for the recorded `OUT_DIR`: a build script may publish a search
+/// path outside it (`cargo:rustc-link-search=native=<manifest>/lib`), which
+/// made a read-only registry source dir the write target (stow#431).
 async fn write_native_artifacts(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
     native: &NativeArtifacts,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
-    let Some(native_dir) = parsed.native_search_paths.first() else {
-        return Ok(());
+    let Some(native_dir) = parsed.build_script_out_dir.as_deref() else {
+        return Err(stow_types::stow_error!(
+            "a bundle for {} carries native artifacts but the rustc invocation \
+             has no OUT_DIR to restore them into",
+            parsed.crate_name
+        ));
     };
     async_fs::create_dir_all(native_dir)
         .await
@@ -741,59 +756,33 @@ fn rewrite_native_directives(
     let native_dir_str = native_dir.to_str().ok_or_else(|| {
         stow_types::stow_error!("native output dir {} is not UTF-8", native_dir.display())
     })?;
-    let original_out_dir = detect_original_native_out_dir(&native.cargo_directives)?;
+    let original_out_dir = native.original_out_dir.to_str().ok_or_else(|| {
+        stow_types::stow_error!(
+            "recorded OUT_DIR {} is not UTF-8",
+            native.original_out_dir.display()
+        )
+    })?;
+    // The bundle records the producing build's OUT_DIR; a directive naming
+    // anything else — a search path under the package's own source tree,
+    // for instance — passes through untouched.
     let mut lines = Vec::with_capacity(native.cargo_directives.len());
     for directive in &native.cargo_directives {
         if directive.starts_with("cargo:rustc-link-search=native=") {
-            if let Some(original_out_dir) = original_out_dir.as_deref() {
-                let current = directive
-                    .strip_prefix("cargo:rustc-link-search=native=")
-                    .ok_or_else(|| {
-                        stow_types::stow_error!("invalid native link-search directive")
-                    })?;
-                if current == original_out_dir {
-                    lines.push(format!("cargo:rustc-link-search=native={native_dir_str}"));
-                    continue;
-                }
+            let current = directive
+                .strip_prefix("cargo:rustc-link-search=native=")
+                .ok_or_else(|| stow_types::stow_error!("invalid native link-search directive"))?;
+            if current == original_out_dir {
+                lines.push(format!("cargo:rustc-link-search=native={native_dir_str}"));
+            } else {
+                lines.push(directive.clone());
             }
-            lines.push(directive.clone());
+        } else if directive.contains(original_out_dir) {
+            lines.push(directive.replace(original_out_dir, native_dir_str));
         } else {
-            let rewritten = match original_out_dir.as_deref() {
-                Some(original_out_dir) if directive.contains(original_out_dir) => {
-                    directive.replace(original_out_dir, native_dir_str)
-                }
-                _ => directive.clone(),
-            };
-            lines.push(rewritten);
+            lines.push(directive.clone());
         }
     }
     Ok(format!("{}\n", lines.join("\n")))
-}
-
-fn detect_original_native_out_dir(
-    directives: &[String],
-) -> stow_types::error::Result<Option<String>> {
-    let mut candidates = directives
-        .iter()
-        .filter_map(|directive| directive.strip_prefix("cargo:rustc-link-search=native="))
-        .filter_map(|path| {
-            std::path::Path::new(path)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value == "out")
-                .then_some(path.to_owned())
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    if candidates.len() > 1 {
-        return Err(stow_types::stow_error!(
-            "native build directives contain multiple output directories"
-        ));
-    }
-    Ok(candidates.pop_first())
 }
 
 #[cfg(test)]
@@ -838,6 +827,7 @@ mod tests {
             overflow_checks: None,
             strip: None,
             native_search_paths: Vec::new(),
+            build_script_out_dir: None,
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
@@ -978,6 +968,7 @@ mod tests {
             ],
             dep_env_vars: std::collections::BTreeMap::new(),
             out_dir_files: Vec::new(),
+            original_out_dir: PathBuf::from("/tmp/original/build/out"),
         };
         let rewritten = rewrite_native_directives(&native, std::path::Path::new("/tmp/new/out"))
             .expect("rewrite directives");
@@ -985,6 +976,124 @@ mod tests {
         assert!(rewritten.contains("cargo:root=/tmp/new/out"));
         assert!(rewritten.contains("cargo:include=/tmp/new/out/include"));
         assert!(rewritten.contains("cargo:rustc-link-search=native=/usr/lib"));
+    }
+
+    /// The bundle's recorded `OUT_DIR` is the only path rewritten; a
+    /// link-search path outside it — another build's `out`, a library dir
+    /// under the package source — passes through untouched.
+    #[test]
+    fn rewrite_native_directives_passes_through_paths_outside_the_recorded_out_dir() {
+        let native = NativeArtifacts {
+            static_libs: Vec::new(),
+            cargo_directives: vec![
+                "cargo:rustc-link-search=native=/original/build/out".to_owned(),
+                "cargo:rustc-link-search=native=/other/build/out".to_owned(),
+                "cargo:root=/original/build/out".to_owned(),
+            ],
+            dep_env_vars: std::collections::BTreeMap::new(),
+            out_dir_files: Vec::new(),
+            original_out_dir: PathBuf::from("/original/build/out"),
+        };
+        let rewritten = rewrite_native_directives(&native, std::path::Path::new("/tmp/new/out"))
+            .expect("rewrite directives");
+        assert!(rewritten.contains("cargo:rustc-link-search=native=/tmp/new/out"));
+        assert!(rewritten.contains("cargo:root=/tmp/new/out"));
+        assert!(rewritten.contains("cargo:rustc-link-search=native=/other/build/out"));
+    }
+
+    /// stow#431: `windows_x86_64_msvc`'s build script emits
+    /// `cargo:rustc-link-search=native=<CARGO_MANIFEST_DIR>/lib`, so the only
+    /// `-L native=` path on the invocation is the read-only registry source
+    /// dir. Native artifacts must restore under the invocation's own `OUT_DIR`
+    /// (cargo exports it on the rustc invocation) and the package source
+    /// tree must never be written.
+    #[test]
+    fn write_native_artifacts_uses_invocation_out_dir_not_search_paths() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            let manifest_dir = tempdir
+                .path()
+                .join("registry/src/windows_x86_64_msvc-0.52.6");
+            let manifest_lib = manifest_dir.join("lib");
+            std::fs::create_dir_all(&manifest_lib).expect("manifest lib dir");
+            let new_out_dir = tempdir
+                .path()
+                .join("build/windows_x86_64_msvc-bbbb2222/out");
+
+            let mut parsed = semantic_test_parsed_args(&out_dir);
+            parsed.native_search_paths = vec![manifest_lib.clone()];
+            parsed.build_script_out_dir = Some(new_out_dir.clone());
+
+            let cache_dir = tempdir.path().join("cache-entry");
+            std::fs::create_dir_all(cache_dir.join("files")).expect("cache files dir");
+            std::fs::write(cache_dir.join("files").join("libitoa-other.rmeta"), b"test")
+                .expect("write cached test artifact");
+            let mut bundle = semantic_test_bundle(cache_dir, tempdir.path(), "libitoa-other.rmeta");
+            bundle.native = Some(NativeArtifacts {
+                static_libs: Vec::new(),
+                cargo_directives: vec![
+                    format!("cargo:rustc-link-search=native={}", manifest_lib.display()),
+                    "cargo:rustc-link-lib=static=windows.0.52.0".to_owned(),
+                ],
+                dep_env_vars: std::collections::BTreeMap::new(),
+                out_dir_files: Vec::new(),
+                original_out_dir: tempdir.path().join("original/build/out"),
+            });
+
+            write_artifacts(&parsed, &bundle, OutputDirWriters::StowOnly)
+                .await
+                .expect("restore bundle");
+
+            let output =
+                std::fs::read_to_string(new_out_dir.parent().expect("build dir").join("output"))
+                    .expect("read rewritten build script output");
+            // The search path outside OUT_DIR passes through untouched.
+            assert!(output.contains(&format!(
+                "cargo:rustc-link-search=native={}",
+                manifest_lib.display()
+            )));
+            assert!(output.contains("cargo:rustc-link-lib=static=windows.0.52.0"));
+
+            // The registry source tree is read-only: nothing may be written
+            // into or under it.
+            assert!(!manifest_dir.join("output").exists());
+            assert_eq!(
+                std::fs::read_dir(&manifest_lib)
+                    .expect("read manifest lib dir")
+                    .count(),
+                0
+            );
+        });
+    }
+
+    /// An invocation carrying no `OUT_DIR` cannot restore native artifacts —
+    /// writing them under a `-L` path was the stow#431 defect.
+    #[test]
+    fn write_native_artifacts_errors_without_invocation_out_dir() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            let cache_dir = tempdir.path().join("cache-entry");
+            std::fs::create_dir_all(cache_dir.join("files")).expect("cache files dir");
+            std::fs::write(cache_dir.join("files").join("libitoa-other.rmeta"), b"test")
+                .expect("write cached test artifact");
+            let mut parsed = semantic_test_parsed_args(&out_dir);
+            parsed.native_search_paths = vec![tempdir.path().join("anywhere")];
+            let mut bundle = semantic_test_bundle(cache_dir, tempdir.path(), "libitoa-other.rmeta");
+            bundle.native = Some(NativeArtifacts {
+                static_libs: Vec::new(),
+                cargo_directives: Vec::new(),
+                dep_env_vars: std::collections::BTreeMap::new(),
+                out_dir_files: Vec::new(),
+                original_out_dir: PathBuf::from("/original/build/out"),
+            });
+
+            let error = write_artifacts(&parsed, &bundle, OutputDirWriters::StowOnly)
+                .await
+                .expect_err("native bundle without OUT_DIR must error");
+            assert!(error.to_string().contains("no OUT_DIR"), "{error}");
+        });
     }
 
     #[test]

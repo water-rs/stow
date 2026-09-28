@@ -259,6 +259,7 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
+            dep_pins: Vec::new(),
         }
     }
 

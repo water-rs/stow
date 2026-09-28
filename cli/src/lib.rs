@@ -536,7 +536,13 @@ fn classify_invocation(
     args: &[OsString],
 ) -> Result<rustc_args::ParsedRustcArgs, UnparseableInvocation> {
     match rustc_args::ParsedRustcArgs::parse(args) {
-        Ok(parsed) => Ok(parsed),
+        Ok(mut parsed) => {
+            // Cargo exports OUT_DIR on the rustc invocation of a crate with a
+            // build script; native artifact restore writes the script's
+            // outputs exactly there (inject.rs).
+            parsed.build_script_out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
+            Ok(parsed)
+        }
         Err(error) if error.contains("missing --crate-name") => {
             Err(UnparseableInvocation::Probe(error))
         }
