@@ -59,7 +59,9 @@ impl Connection {
         Ok(Self { stream, token })
     }
 
-    /// Ask what to do with one rustc invocation.
+    /// Ask what to do with one rustc invocation. `build_script_out_dir` is
+    /// the `OUT_DIR` this invocation's environment carried — per-invocation
+    /// env facts exist only in this process, so they ride the request.
     ///
     /// # Errors
     ///
@@ -69,8 +71,9 @@ impl Connection {
         &mut self,
         executable: &std::ffi::OsStr,
         args: &[OsString],
+        build_script_out_dir: Option<&std::ffi::OsStr>,
     ) -> Result<Decision, String> {
-        let plan = Plan::new(self.token.clone(), executable, args);
+        let plan = Plan::new(self.token.clone(), executable, args, build_script_out_dir);
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served => Ok(Decision::Served),
             Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
