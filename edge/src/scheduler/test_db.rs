@@ -1,21 +1,31 @@
 //! Host-only [`DurableDb`] backend over an in-memory `SQLite` database, so the
 //! scheduler's SQL (queue schema, eligibility predicates, lease arithmetic)
 //! is exercised by unit tests instead of only the pure `plan_alarm` policy.
+//!
+//! `rusqlite` is the driver rather than `sqlx`: `sqlx`'s sqlite crate pins a
+//! `libsqlite3-sys` range that can no longer share one `links` owner with the
+//! `cargo` crate's `rusqlite`, so the test database is built on the `rusqlite`
+//! side instead of carrying a second `sqlite3` linkage.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use rusqlite::types::Value;
 use skyzen_services::durable::{
     DbExecResult, DbValue, DurableDb, DurableDbBackend, DurableDbError,
 };
-use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _, sqlite::SqliteRow};
+use skyzen_services::{BatchStatement, Db, DbBackend, DbDialect, DbError};
 
 use crate::errors::QueueError;
 use crate::scheduler::queue;
 
-/// `DurableDbBackend` backed by a `sqlx` `SQLite` pool.
+/// `DurableDbBackend` backed by a single `rusqlite` connection — `Clone`
+/// hands every holder the same in-memory database, matching the
+/// one-connection pool this replaces.
 #[derive(Debug, Clone)]
-struct SqliteBackend {
-    pool: sqlx::SqlitePool,
+pub struct SqliteBackend {
+    conn: Arc<Mutex<rusqlite::Connection>>,
     /// Whether DDL and PRAGMA statements pass [`check_do_statements`].
     /// Migrations are operations work — only the migrate path may issue
     /// them — so the flag is on while a migration-capable database is
@@ -24,29 +34,84 @@ struct SqliteBackend {
     /// creates, alters, drops or probes the schema from request code
     /// fails the test instead of slipping to production, where the DO
     /// would accept the DDL but the ops rule forbids it.
-    ddl_permitted: std::sync::Arc<AtomicBool>,
+    ddl_permitted: Arc<AtomicBool>,
 }
 
 impl SqliteBackend {
+    fn open() -> Result<Self, rusqlite::Error> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            ddl_permitted: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
     /// Revert the backend to request-path mode — every constructor that
     /// runs the migration calls this once it has applied the schema.
     fn close_migration(&self) {
         self.ddl_permitted.store(false, Ordering::Relaxed);
     }
+
+    fn run_query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, String> {
+        check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))
+            .map_err(|e| e.to_string())?;
+        let rows = {
+            let conn = self.conn.lock().expect("sqlite connection");
+            let mut statement = conn.prepare(query).map_err(|e| e.to_string())?;
+            let columns = statement
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let rows = statement
+                .query(rusqlite::params_from_iter(db_values(params)))
+                .map_err(|e| e.to_string())?
+                .mapped(|row| row_to_json(row, &columns))
+                .collect::<Result<Vec<_>, rusqlite::Error>>()
+                .map_err(|e| e.to_string())?;
+            drop(statement);
+            drop(conn);
+            rows
+        };
+        Ok(DbExecResult {
+            rows_read: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            rows,
+            rows_written: 0,
+        })
+    }
+
+    fn run_execute(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, String> {
+        check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))
+            .map_err(|e| e.to_string())?;
+        let rows_written = {
+            let conn = self.conn.lock().expect("sqlite connection");
+            if params.is_empty() {
+                // Unbound statements are DDL or multi-statement SQL
+                // (schema.sql); rusqlite's `execute` stops after the first
+                // statement, `execute_batch` runs them all.
+                conn.execute_batch(query).map_err(|e| e.to_string())?;
+                0
+            } else {
+                conn.execute(query, rusqlite::params_from_iter(db_values(params)))
+                    .map_err(|e| e.to_string())?
+            }
+        };
+        Ok(DbExecResult {
+            rows: Vec::new(),
+            rows_read: 0,
+            rows_written: u64::try_from(rows_written).unwrap_or(u64::MAX),
+        })
+    }
 }
 
 /// Open a fresh in-memory queue database with the scheduler schema applied.
 ///
-/// `max_connections(1)` is required: `sqlite::memory:` databases are scoped to
-/// a single connection, so a wider pool would hand out independent empty
-/// databases.
-///
 /// # Errors
 ///
-/// Returns `QueueError::Sql` if the pool cannot be opened or `migrate`
+/// Returns `QueueError::Sql` if the database cannot be opened or `migrate`
 /// fails.
 pub async fn memory_db() -> Result<DurableDb, QueueError> {
-    let backend = memory_backend().await?;
+    let backend = memory_backend()?;
     let db = DurableDb::new(backend.clone());
     queue::migrate(&db).await?;
     backend.close_migration();
@@ -60,9 +125,25 @@ pub async fn memory_db() -> Result<DurableDb, QueueError> {
 ///
 /// # Errors
 ///
-/// Returns `QueueError::Sql` if the pool cannot be opened.
+/// Returns `QueueError::Sql` if the database cannot be opened.
 pub async fn memory_db_raw() -> Result<DurableDb, QueueError> {
-    Ok(DurableDb::new(memory_backend().await?))
+    Ok(DurableDb::new(memory_backend()?))
+}
+
+/// A fresh in-memory `sqlite` [`Db`] for the artifact-catalog tests in
+/// `crate::db`, replacing `Db::connect_sqlite_memory` which lives behind the
+/// `sqlite` feature this crate no longer enables.
+///
+/// # Errors
+///
+/// Returns `DbError::Backend` if the database cannot be opened.
+pub fn sql_memory_db() -> Result<Db, DbError> {
+    Ok(Db::new(SqliteBackend::open().map_err(|error| {
+        DbError::Backend {
+            message: format!("open in-memory sqlite: {error}"),
+            source: None,
+        }
+    })?))
 }
 
 /// Every statement the wrapped backend ran, in order — `(sql, elapsed)`.
@@ -76,11 +157,11 @@ pub type StatementLog =
 ///
 /// # Errors
 ///
-/// Returns `QueueError::Sql` if the pool cannot be opened or `migrate`
+/// Returns `QueueError::Sql` if the database cannot be opened or `migrate`
 /// fails.
 pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueError> {
     let log = StatementLog::default();
-    let inner = memory_backend().await?;
+    let inner = memory_backend()?;
     let db = DurableDb::new(CountingBackend {
         inner: inner.clone(),
         log: log.clone(),
@@ -90,16 +171,9 @@ pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueErro
     Ok((db, log))
 }
 
-async fn memory_backend() -> Result<SqliteBackend, QueueError> {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .map_err(|error| QueueError::Sql(format!("open in-memory sqlite: {error}")))?;
-    Ok(SqliteBackend {
-        pool,
-        ddl_permitted: std::sync::Arc::new(AtomicBool::new(true)),
-    })
+fn memory_backend() -> Result<SqliteBackend, QueueError> {
+    SqliteBackend::open()
+        .map_err(|error| QueueError::Sql(format!("open in-memory sqlite: {error}")))
 }
 
 /// A `SqliteBackend` wrapper that appends every statement and its wall
@@ -122,7 +196,7 @@ impl CountingBackend {
 impl DurableDbBackend for CountingBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         let start = std::time::Instant::now();
-        let result = self.inner.query(query, params).await;
+        let result = DurableDbBackend::query(&self.inner, query, params).await;
         self.record(query, start.elapsed());
         result
     }
@@ -133,13 +207,13 @@ impl DurableDbBackend for CountingBackend {
         params: &[DbValue],
     ) -> Result<DbExecResult, DurableDbError> {
         let start = std::time::Instant::now();
-        let result = self.inner.execute(query, params).await;
+        let result = DurableDbBackend::execute(&self.inner, query, params).await;
         self.record(query, start.elapsed());
         result
     }
 
-    async fn database_size(&self) -> Result<u64, DurableDbError> {
-        self.inner.database_size().await
+    fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
+        self.inner.database_size()
     }
 }
 
@@ -265,46 +339,97 @@ fn check_do_statements(sql: &str, ddl_permitted: bool) -> Result<(), DurableDbEr
 }
 
 impl DurableDbBackend for SqliteBackend {
-    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
-        check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
-        let rows = bind_params(sqlx::query(query), params)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(backend_error)?;
-        let rows = rows
-            .iter()
-            .map(row_to_json)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(DbExecResult {
-            rows_read: u64::try_from(rows.len()).map_err(backend_error)?,
-            rows,
-            rows_written: 0,
-        })
-    }
-
-    async fn execute(
+    fn query(
         &self,
         query: &str,
         params: &[DbValue],
-    ) -> Result<DbExecResult, DurableDbError> {
-        check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
-        let result = bind_params(sqlx::query(query), params)
-            .execute(&self.pool)
-            .await
-            .map_err(backend_error)?;
-        Ok(DbExecResult {
-            rows: Vec::new(),
-            rows_read: 0,
-            rows_written: result.rows_affected(),
-        })
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+        std::future::ready(self.run_query(query, params).map_err(durable_error))
     }
 
-    async fn database_size(&self) -> Result<u64, DurableDbError> {
-        let page_count = pragma_i64(&self.pool, "PRAGMA page_count").await?;
-        let page_size = pragma_i64(&self.pool, "PRAGMA page_size").await?;
-        page_count
-            .checked_mul(page_size)
-            .ok_or_else(|| backend_error("sqlite database size overflow"))
+    fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, DurableDbError>> + Send {
+        std::future::ready(self.run_execute(query, params).map_err(durable_error))
+    }
+
+    fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
+        std::future::ready(
+            pragma_i64(self, "PRAGMA page_count")
+                .and_then(|page_count| {
+                    pragma_i64(self, "PRAGMA page_size")
+                        .map(|page_size| page_count.checked_mul(page_size))
+                })
+                .and_then(|size| size.ok_or(rusqlite::Error::IntegralValueOutOfRange(0, -1)))
+                .map_err(durable_error),
+        )
+    }
+}
+
+impl DbBackend for SqliteBackend {
+    fn dialect(&self) -> DbDialect {
+        DbDialect::Sqlite
+    }
+
+    fn query(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + Send {
+        std::future::ready(self.run_query(query, params).map_err(sql_error))
+    }
+
+    fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + Send {
+        std::future::ready(self.run_execute(query, params).map_err(sql_error))
+    }
+
+    fn execute_batch(
+        &self,
+        statements: Vec<BatchStatement>,
+    ) -> impl Future<Output = Result<Vec<DbExecResult>, DbError>> + Send {
+        std::future::ready(self.run_batch(&statements))
+    }
+}
+
+impl SqliteBackend {
+    /// `Db::execute_batch` promises all-or-nothing: wrap the run in a
+    /// transaction and roll back on the first failure.
+    fn run_batch(&self, statements: &[BatchStatement]) -> Result<Vec<DbExecResult>, DbError> {
+        let conn = self.conn.lock().expect("sqlite connection");
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_error)?;
+        let mut results = Vec::with_capacity(statements.len());
+        let outcome = statements.iter().try_for_each(|statement| {
+            conn.prepare(&statement.sql)
+                .and_then(|mut prepared| {
+                    prepared.execute(rusqlite::params_from_iter(db_values(&statement.params)))
+                })
+                .map(|rows_written| {
+                    results.push(DbExecResult {
+                        rows: Vec::new(),
+                        rows_read: 0,
+                        rows_written: u64::try_from(rows_written).unwrap_or(u64::MAX),
+                    });
+                })
+                .map_err(sql_error)
+        });
+        let result = match outcome {
+            Ok(()) => conn
+                .execute_batch("COMMIT")
+                .map(|()| results)
+                .map_err(sql_error),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        };
+        drop(conn);
+        result
     }
 }
 
@@ -315,43 +440,52 @@ fn backend_error(error: impl std::fmt::Display) -> DurableDbError {
     }
 }
 
-async fn pragma_i64(pool: &sqlx::SqlitePool, sql: &str) -> Result<u64, DurableDbError> {
-    let value: i64 = sqlx::query_scalar(sql)
-        .fetch_one(pool)
-        .await
-        .map_err(backend_error)?;
-    u64::try_from(value).map_err(backend_error)
+fn durable_error(error: impl std::fmt::Display) -> DurableDbError {
+    backend_error(error)
 }
 
-fn bind_params<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    params: &[DbValue],
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
-    let mut query = query;
-    for param in params {
-        query = match param {
-            DbValue::Null => query.bind(Option::<String>::None),
-            DbValue::Boolean(value) => query.bind(*value),
-            DbValue::Integer(value) => query.bind(*value),
-            DbValue::Real(value) => query.bind(*value),
-            DbValue::Text(value) => query.bind(value.clone()),
-            DbValue::Blob(value) => query.bind(value.clone()),
-            // The richer DbValue variants bind as the text renderings the
-            // Durable Object SQL backend this harness stands in for uses, so a
-            // test writes the same bytes production would.
-            DbValue::Timestamp(value) => query.bind(value.to_rfc3339()),
-            DbValue::Uuid(value) => query.bind(value.to_string()),
-            DbValue::Decimal(value) => query.bind(value.to_string()),
-            DbValue::Json(value) => query.bind(value.to_string()),
-        };
+fn sql_error(error: impl std::fmt::Display) -> DbError {
+    DbError::Backend {
+        message: error.to_string(),
+        source: None,
     }
-    query
 }
 
-fn row_to_json(row: &SqliteRow) -> Result<serde_json::Value, DurableDbError> {
-    let mut object = serde_json::Map::with_capacity(row.len());
-    for (index, column) in row.columns().iter().enumerate() {
-        object.insert(column.name().to_owned(), value_to_json(row, index)?);
+fn pragma_i64(backend: &SqliteBackend, sql: &str) -> Result<u64, rusqlite::Error> {
+    let conn = backend.conn.lock().expect("sqlite connection");
+    let value: i64 = conn.query_row(sql, [], |row| row.get(0))?;
+    drop(conn);
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+}
+
+/// Bind as rusqlite's `types::Value`; the richer `DbValue` variants bind as
+/// the text renderings the Durable Object SQL backend this harness stands in
+/// for uses, so a test writes the same bytes production would.
+fn db_values(params: &[DbValue]) -> Vec<Value> {
+    params
+        .iter()
+        .map(|param| match param {
+            DbValue::Null => Value::Null,
+            DbValue::Boolean(value) => Value::Integer(i64::from(*value)),
+            DbValue::Integer(value) => Value::Integer(*value),
+            DbValue::Real(value) => Value::Real(*value),
+            DbValue::Text(value) => Value::Text(value.clone()),
+            DbValue::Blob(value) => Value::Blob(value.clone()),
+            DbValue::Timestamp(value) => Value::Text(value.to_rfc3339()),
+            DbValue::Uuid(value) => Value::Text(value.to_string()),
+            DbValue::Decimal(value) => Value::Text(value.to_string()),
+            DbValue::Json(value) => Value::Text(value.to_string()),
+        })
+        .collect()
+}
+
+fn row_to_json(
+    row: &rusqlite::Row<'_>,
+    columns: &[String],
+) -> Result<serde_json::Value, rusqlite::Error> {
+    let mut object = serde_json::Map::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        object.insert(column.clone(), value_to_json(row, index)?);
     }
     Ok(serde_json::Value::Object(object))
 }
@@ -359,28 +493,18 @@ fn row_to_json(row: &SqliteRow) -> Result<serde_json::Value, DurableDbError> {
 /// Convert by the value's runtime storage class, not the column's declared
 /// type: expression columns (`count(*)`, `CAST`, `datetime()`) declare none,
 /// and `SQLite` stores whatever class the expression produced.
-fn value_to_json(row: &SqliteRow, index: usize) -> Result<serde_json::Value, DurableDbError> {
-    let raw = row.try_get_raw(index).map_err(backend_error)?;
-    if raw.is_null() {
-        return Ok(serde_json::Value::Null);
-    }
-    let storage_class = raw.type_info().name().to_owned();
-    match storage_class.as_str() {
-        "BOOLEAN" => decode_json::<bool>(row, index),
-        "INTEGER" => decode_json::<i64>(row, index),
-        "REAL" => decode_json::<f64>(row, index),
-        "TEXT" => decode_json::<String>(row, index),
-        "BLOB" => decode_json::<Vec<u8>>(row, index),
-        other => Err(backend_error(format!(
-            "unsupported sqlite storage class {other} in column {index}"
-        ))),
-    }
-}
-
-fn decode_json<'r, T>(row: &'r SqliteRow, index: usize) -> Result<serde_json::Value, DurableDbError>
-where
-    T: sqlx::Decode<'r, sqlx::Sqlite> + sqlx::Type<sqlx::Sqlite> + serde::Serialize,
-{
-    let value: T = row.try_get(index).map_err(backend_error)?;
-    Ok(serde_json::json!(value))
+fn value_to_json(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> Result<serde_json::Value, rusqlite::Error> {
+    use rusqlite::types::ValueRef;
+    Ok(match row.get_ref(index)? {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Integer(value) => serde_json::json!(value),
+        ValueRef::Real(value) => serde_json::json!(value),
+        ValueRef::Text(value) => {
+            serde_json::json!(std::str::from_utf8(value).unwrap_or_default())
+        }
+        ValueRef::Blob(value) => serde_json::json!(value),
+    })
 }

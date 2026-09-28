@@ -18,7 +18,9 @@ mod preheat;
 mod projects;
 mod queue;
 mod render;
+mod resolve;
 mod runs;
+mod rust_channel;
 mod scheduler;
 mod watchdog;
 

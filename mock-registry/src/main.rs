@@ -886,6 +886,9 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
             let crate_types_json = serde_json::to_string(&record.crate_types)?;
             let profile_json = serde_json::to_string(&record.profile)?;
             let emit_json = serde_json::to_string(&record.emit)?;
+            // SQLite integers are i64; rusqlite no longer binds u64
+            // directly.
+            let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
             statement
                 .execute(rusqlite::params![
                     record.compile_key,
@@ -904,10 +907,10 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
                     crate_types_json,
                     profile_json,
                     emit_json,
-                    record.artifact_size,
+                    to_i64(record.artifact_size),
                     record.bundle_digest,
-                    record.bundle_size,
-                    record.compile_millis,
+                    to_i64(record.bundle_size),
+                    to_i64(record.compile_millis),
                 ])
                 .map_err(|error| stow_types::stow_error!("upsert sqlite artifact {} {} {}: {error}", record.crate_name, record.target, record.c_metadata))?;
         }

@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 skyzen = { version = "0.3.0", default-features = false, features = ["json", "query"] }
 skyzen-cloudflare = "0.3.0"
-skyzen-services = "0.2.1"
+skyzen-services = { version = "0.2.1", default-features = false }
 stow-types.workspace = true
 stow-shim.workspace = true
 stow-resolve.workspace = true
@@ -70,10 +70,15 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
-sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }
 tokio = { version = "1", features = ["macros", "rt"] }
 # Synthesized `.crate` tarballs for the sparse-unpack resolve test.
 tar.workspace = true
+
+# Host-only test dep: the sqlite test backend is `cfg(all(test, not(wasm32)))`,
+# so it must not enter the wasm32 dev-dep graph (rusqlite's bundled sqlite
+# cannot compile there).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [lints]
 workspace = true

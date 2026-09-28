@@ -961,7 +961,7 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
 /// Point-in-time view of one queue row. `None` when the task id is not in
 /// the queue; the request API batches through [`tasks_status`], so the
 /// single-id form exists for tests.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub async fn task_status(
     db: &DurableDb,
     task_id: &str,
