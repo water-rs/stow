@@ -82,9 +82,9 @@ async fn ensure_declared_columns(
     for column in declared {
         if column.table != current_table {
             current_table = column.table;
-            existing = sqlx::query_scalar::<_, String>(&format!(
+            existing = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
                 "SELECT name FROM pragma_table_info('{current_table}')"
-            ))
+            )))
             .fetch_all(pool)
             .await
             .wrap_err_with(|| {
@@ -101,7 +101,7 @@ async fn ensure_declared_columns(
             "ALTER TABLE {} ADD COLUMN {}",
             column.table, column.definition
         );
-        sqlx::query(&statement)
+        sqlx::query(sqlx::AssertSqlSafe(statement))
             .execute(pool)
             .await
             .wrap_err_with(|| {

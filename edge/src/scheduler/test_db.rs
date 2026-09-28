@@ -267,7 +267,7 @@ fn check_do_statements(sql: &str, ddl_permitted: bool) -> Result<(), DurableDbEr
 impl DurableDbBackend for SqliteBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
-        let rows = bind_params(sqlx::query(query), params)
+        let rows = bind_params(sqlx::query(sqlx::AssertSqlSafe(query)), params)
             .fetch_all(&self.pool)
             .await
             .map_err(backend_error)?;
@@ -288,7 +288,7 @@ impl DurableDbBackend for SqliteBackend {
         params: &[DbValue],
     ) -> Result<DbExecResult, DurableDbError> {
         check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
-        let result = bind_params(sqlx::query(query), params)
+        let result = bind_params(sqlx::query(sqlx::AssertSqlSafe(query)), params)
             .execute(&self.pool)
             .await
             .map_err(backend_error)?;
@@ -316,7 +316,7 @@ fn backend_error(error: impl std::fmt::Display) -> DurableDbError {
 }
 
 async fn pragma_i64(pool: &sqlx::SqlitePool, sql: &str) -> Result<u64, DurableDbError> {
-    let value: i64 = sqlx::query_scalar(sql)
+    let value: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .fetch_one(pool)
         .await
         .map_err(backend_error)?;
@@ -324,9 +324,9 @@ async fn pragma_i64(pool: &sqlx::SqlitePool, sql: &str) -> Result<u64, DurableDb
 }
 
 fn bind_params<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     params: &[DbValue],
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
     let mut query = query;
     for param in params {
         query = match param {

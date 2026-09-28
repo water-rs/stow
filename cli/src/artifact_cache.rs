@@ -1075,7 +1075,8 @@ pub async fn load_artifact_dep_identities(
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND c_metadata IN ({placeholders})"
     );
-    let mut rows = sqlx::query_as::<_, ObservedDepIdentityRow>(&sql).bind(rustc_version);
+    let mut rows =
+        sqlx::query_as::<_, ObservedDepIdentityRow>(sqlx::AssertSqlSafe(sql)).bind(rustc_version);
     for c_metadata in c_metadatas {
         rows = rows.bind(c_metadata);
     }
@@ -1139,7 +1140,7 @@ pub async fn resolve_dependency_c_metadata_json(
         "SELECT output_path, c_metadata FROM materialized_outputs \
          WHERE output_path IN ({placeholders})"
     );
-    let mut rows = sqlx::query_as::<_, (String, String)>(&sql);
+    let mut rows = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
     for output_path in identities.iter().map(|(_, output_path)| output_path) {
         rows = rows.bind(output_path);
     }
@@ -2750,9 +2751,9 @@ async fn delete_artifact_cache_children(
         "artifact_cache_native_dep_env_vars",
         "artifact_cache_native_out_dir_files",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE rustc_version = ? AND cache_key = ?"
-        ))
+        )))
         .bind(rustc_version)
         .bind(cache_key)
         .execute(connection)
@@ -2919,7 +2920,8 @@ pub async fn filter_locally_cached_keys(
             "SELECT cache_key, relative_dir FROM artifact_cache_entries \
              WHERE rustc_version = ? AND cache_key IN ({placeholders})"
         );
-        let mut query = sqlx::query_as::<_, (String, String)>(&sql).bind(rustc_version);
+        let mut query =
+            sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql)).bind(rustc_version);
         for cache_key in chunk {
             query = query.bind(cache_key);
         }
@@ -2944,7 +2946,9 @@ pub async fn filter_locally_cached_keys(
                 "UPDATE artifact_cache_entries SET last_accessed_ms = ? \
                  WHERE rustc_version = ? AND cache_key IN ({placeholders})"
             );
-            let mut query = sqlx::query(&sql).bind(last_accessed_ms).bind(rustc_version);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(last_accessed_ms)
+                .bind(rustc_version);
             for cache_key in chunk {
                 query = query.bind(cache_key);
             }

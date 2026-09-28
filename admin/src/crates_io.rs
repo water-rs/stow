@@ -236,9 +236,6 @@ struct CratesResponse {
 pub struct CrateVersion {
     /// The `vers` string.
     pub num: String,
-    /// The feature table the release declares.
-    #[serde(default)]
-    pub features: std::collections::BTreeMap<String, Vec<String>>,
     /// Whether crates.io yanked the release.
     pub yanked: bool,
     /// All-time downloads of this exact version, which is how a version

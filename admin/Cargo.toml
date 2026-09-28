@@ -14,6 +14,7 @@ path = "src/main.rs"
 strip-ansi-escapes = "0.2"
 stow-types.workspace = true
 stow-oci.workspace = true
+stow-resolver.workspace = true
 rustls.workspace = true
 zenwave.workspace = true
 serde.workspace = true

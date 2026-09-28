@@ -38,36 +38,6 @@ pub trait ChannelCache: Sync {
     fn put(&self, version: &str) -> impl Future<Output = Result<(), RustChannelError>> + Send;
 }
 
-/// Parse `[pkg.rustc].version` out of `channel-rust-stable.toml`, reducing
-/// the decorated string (`"1.98.1 (hash date)"`) to the semantic numeric
-/// portion the queue's `rustc_version` identity column uses.
-///
-/// # Errors
-/// [`RustChannelError::Parse`] when the manifest is not TOML, lacks
-/// `pkg.rustc.version`, or the version fails wire validation.
-pub fn parse_channel_rustc_version(manifest: &str) -> Result<WireRustcVersion, RustChannelError> {
-    let document: toml::Table = toml::from_str(manifest)
-        .map_err(|error| RustChannelError::Parse(format!("invalid channel TOML: {error}")))?;
-    let raw = document
-        .get("pkg")
-        .and_then(|pkg| pkg.get("rustc"))
-        .and_then(|rustc| rustc.get("version"))
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| RustChannelError::Parse("missing pkg.rustc.version".to_owned()))?;
-    // The manifest decorates the version with build metadata:
-    // `"1.98.1 (04b871bb4 2026-01-01)"` — only the leading semver matters.
-    let numeric = raw
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| RustChannelError::Parse(format!("empty pkg.rustc.version `{raw}`")))?;
-    let version = semver::Version::parse(numeric).map_err(|error| {
-        RustChannelError::Parse(format!("invalid rustc semver `{numeric}`: {error}"))
-    })?;
-    WireRustcVersion::parse(version.to_string()).map_err(|error| {
-        RustChannelError::Parse(format!("invalid rustc version `{numeric}`: {error}"))
-    })
-}
-
 /// Resolve the current stable rustc: serve the version string the cache
 /// holds while it is fresh, otherwise fetch the manifest, parse it, and
 /// store the version. The fetched manifest parses before it stores, so a
@@ -96,7 +66,8 @@ pub async fn stable_rustc_version(
         });
     }
     let manifest = source.fetch_manifest().await?;
-    let version = parse_channel_rustc_version(&manifest)?;
+    let version = stow_types::identity::parse_channel_rustc_version(&manifest)
+        .map_err(|error| RustChannelError::Parse(error.to_string()))?;
     cache.put(version.as_str()).await?;
     Ok(version)
 }
@@ -163,33 +134,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{
-        ChannelCache, RustChannelError, RustChannelSource, parse_channel_rustc_version,
-        stable_rustc_version,
-    };
+    use super::{ChannelCache, RustChannelError, RustChannelSource, stable_rustc_version};
 
     const MANIFEST: &str = include_str!("../tests/fixtures/channel-rust-stable.toml");
-
-    #[test]
-    fn parses_rustc_version_from_channel_manifest() {
-        let version = parse_channel_rustc_version(MANIFEST).expect("parse manifest");
-        assert_eq!(version.as_str(), "1.98.1");
-    }
-
-    #[test]
-    fn rejects_manifest_without_rustc_version() {
-        assert!(parse_channel_rustc_version("[pkg.cargo]\nversion = \"0.99.0\"\n").is_err());
-        assert!(parse_channel_rustc_version("not toml = [").is_err());
-        assert!(parse_channel_rustc_version("[pkg.rustc]\nversion = \"bad version!!\"\n").is_err());
-    }
-
-    #[test]
-    fn rejects_empty_version_string() {
-        assert!(
-            parse_channel_rustc_version("[pkg.rustc]\nversion = \"\"\n").is_err(),
-            "empty version must fail, not produce an empty rustc identity"
-        );
-    }
 
     /// The version-string cache stub: `get` serves `stored`, `put`
     /// records every store, and the `fail_*` flags inject a failure so

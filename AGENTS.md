@@ -67,7 +67,8 @@ identity. The build order is the edges. The unit rule is what may be a node.
 - `oci/`: shared OCI push/sign/pull machinery (`stow-oci`) — bundle publish for `stow-build`, index publish for `stow-admin`, digest pulls for the CLI.
 - `mock-registry/`: local mock OCI registry for simulation and tests (`populate`, `publish-index`, `index-from-records`, `serve`; speaks GHCR's anonymous bearer exchange).
 - `types/`: shared API and artifact key types (`index.rs` carries the signed `ArtifactIndex` wire format).
-- `admin/`: operations CLI for preheating the cache via the scheduler and publishing index slices (`index export|publish`).
+- `resolver/`: native graph resolver (`stow-resolver`) on the published `cargo` crate — materializes a fetched source (project tree or `.crate`), runs cargo's own `resolve_ws_with_opts`/`FeatureResolver` per CI target with the toolchain's real rustc facts, and emits the per-target unit set (package, feature set, dependency edges, host/target side) plus the `EnqueueRequest` conversion the lanes share.
+- `admin/`: operations CLI for preheating the cache via the scheduler and publishing index slices (`index export|publish`); every lane resolves in-process with `stow-resolver` (`resolve::RESOLVE_CONCURRENCY` worker threads).
 
 ## Important repo assumptions
 - water-rs Actions capacity is 60 concurrent runners (20 on macOS) — a full `CI_TARGET_TRIPLES` request wave dispatches in one window; wall clock is set by the slowest (Windows) leg.

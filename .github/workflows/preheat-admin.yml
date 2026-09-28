@@ -20,10 +20,10 @@ on:
         required: true
       top_binaries:
         description: >-
-          Also seed the top-N binary crates' resolves: the edge
-          fetches each `.crate` tarball and runs cargo's resolver per
-          target — every crates.io node an ordinary crate task
-          carrying its crates.io edges as `depends_on`.
+          Also seed the top-N binary crates' resolves: stow-admin
+          fetches each `.crate` tarball and runs cargo's resolver
+          in-process per target — every crates.io node an ordinary
+          crate task carrying its crates.io edges as `depends_on`.
         type: boolean
         required: false
         default: true
@@ -42,9 +42,9 @@ on:
       projects:
         description: >-
           Also submit the projects lane: for every repository the
-          reviewed `preheat/projects.toml` lists, the edge fetches the
-          codeload tarball, drops the committed Cargo.lock so cargo
-          re-resolves the latest semver-compatible versions, and
+          reviewed `preheat/projects.toml` lists, stow-admin fetches
+          the codeload tarball, drops the committed Cargo.lock so
+          cargo re-resolves the latest semver-compatible versions, and
           enqueues its crates.io graph — ordinary crate tasks carrying
           their crates.io edges as `depends_on`.
         type: boolean
@@ -65,9 +65,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Resolution runs in-process now: stow-resolver probes `rustc -vV`
+      # and `--print cfg`, so the toolchain must be the same version the
+      # tasks target, not floating `stable`.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: stable
+          toolchain: ${{ inputs.rustc_version }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
@@ -121,7 +124,7 @@ jobs:
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           TARGETS: ${{ inputs.targets }}
-        # One codeload tarball per repository resolved in the edge, and
+        # One codeload tarball per repository resolved in-process, and
         # each repository's tasks post right after it resolves — a token
         # or network failure mid-lane keeps everything before it.
         run: |

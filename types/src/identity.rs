@@ -320,6 +320,39 @@ string_newtype!(
     InvalidRustcVersion
 );
 
+/// Parse `[pkg.rustc].version` out of `channel-rust-stable.toml`, reducing
+/// the decorated string (`"1.98.1 (hash date)"`) to the semantic numeric
+/// portion.
+///
+/// Shared by the edge's channel cache and `stow-admin`'s lane setup so both
+/// read the version the same way.
+///
+/// # Errors
+/// Returns an [`crate::error::Error`] when the manifest is not TOML, lacks
+/// `pkg.rustc.version`, or the version is not valid semver.
+pub fn parse_channel_rustc_version(manifest: &str) -> crate::error::Result<WireRustcVersion> {
+    use crate::error::Context as _;
+
+    let document: toml::Table =
+        toml::from_str(manifest).wrap_err("channel-rust-stable.toml is not TOML")?;
+    let raw = document
+        .get("pkg")
+        .and_then(|pkg| pkg.get("rustc"))
+        .and_then(|rustc| rustc.get("version"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| crate::error::Error::msg("channel manifest has no pkg.rustc.version"))?;
+    // The manifest decorates the version with build metadata:
+    // `"1.98.1 (04b871bb4 2026-01-01)"` — only the leading semver matters.
+    let numeric = raw
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| crate::error::Error::msg("channel manifest rustc version is empty"))?;
+    let version = semver::Version::parse(numeric)
+        .wrap_err_with(|| format!("channel manifest rustc version `{numeric}`"))?;
+    WireRustcVersion::parse(version.to_string())
+        .wrap_err_with(|| format!("channel manifest rustc version `{numeric}`"))
+}
+
 /// A semver crate version (no shape constraints beyond what semver requires).
 ///
 /// We delegate validation to the `semver` crate but still expose this newtype
@@ -590,6 +623,28 @@ impl<'de> Deserialize<'de> for DependencyCMetadataJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_manifest_yields_the_numeric_rustc_version() {
+        let manifest = "[pkg.rustc]\nversion = \"1.98.1 (04b871bb4 2026-01-01)\"\n";
+        let version = super::parse_channel_rustc_version(manifest).expect("parse manifest");
+        assert_eq!(version.as_str(), "1.98.1");
+    }
+
+    #[test]
+    fn channel_manifest_without_a_valid_rustc_version_is_an_error() {
+        for manifest in [
+            "[pkg.cargo]\nversion = \"0.99.0\"\n",
+            "not toml = [",
+            "[pkg.rustc]\nversion = \"bad version!!\"\n",
+            "[pkg.rustc]\nversion = \"\"\n",
+        ] {
+            assert!(
+                super::parse_channel_rustc_version(manifest).is_err(),
+                "`{manifest}` must not produce a rustc identity"
+            );
+        }
+    }
 
     #[test]
     fn crate_name_accepts_typical() {
