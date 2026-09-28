@@ -93,7 +93,7 @@ pub struct Resolver {
     /// shared across this session's resolves so index caches live
     /// across projects.
     cargo_home: PathBuf,
-    /// Real rustc binary this machine's toolchain resolves to.
+    /// Real rustc binary of the toolchain the session pins.
     rustc: PathBuf,
     /// The executable copied per family host as `rustc-shim-<host>` —
     /// `stow-admin`'s own binary in production, `stow-rustc-shim` in
@@ -118,17 +118,19 @@ pub struct Resolver {
 impl Resolver {
     /// A session with a fresh, session-owned `CARGO_HOME` — the default
     /// isolation the issue states ("an isolated `CARGO_HOME` per run that
-    /// the process owns"). `shim_source` is the executable copied per
-    /// family host as `rustc-shim-<host>` — it must dispatch a
-    /// `rustc-shim-*` `argv[0]` to [`crate::shim::run`].
+    /// the process owns"). `rustc_version` names the rustup toolchain the
+    /// session probes — the rustc every task the session emits pins —
+    /// and `shim_source` is the executable copied per family host as
+    /// `rustc-shim-<host>`: it must dispatch a `rustc-shim-*` `argv[0]`
+    /// to [`crate::shim::run`].
     ///
     /// # Errors
-    /// No rustc on PATH, or toolchain probing failed.
-    pub fn new(shim_source: PathBuf) -> CargoResult<Self> {
+    /// `rustc_version`'s toolchain is not installed, or probing failed.
+    pub fn new(rustc_version: &WireRustcVersion, shim_source: PathBuf) -> CargoResult<Self> {
         let dir = tempfile::tempdir().context("resolver scratch dir")?;
         let cargo_home = dir.path().join("cargo-home");
         std::fs::create_dir_all(&cargo_home).context("cargo home")?;
-        Self::setup(dir, cargo_home, shim_source)
+        Self::setup(dir, cargo_home, rustc_version, shim_source)
     }
 
     /// A session whose `CARGO_HOME` is a caller-owned directory — still
@@ -137,33 +139,49 @@ impl Resolver {
     /// resolves. The directory is created if absent; the caller owns
     /// its lifecycle (concurrent writers must serialize themselves —
     /// cargo's own file locks arbitrate within the directory).
-    /// `shim_source` is as [`Resolver::new`]'s.
+    /// `rustc_version` and `shim_source` are as [`Resolver::new`]'s.
     ///
     /// # Errors
     /// Directory creation or toolchain probing failures.
-    pub fn with_cargo_home(cargo_home: PathBuf, shim_source: PathBuf) -> CargoResult<Self> {
+    pub fn with_cargo_home(
+        cargo_home: PathBuf,
+        rustc_version: &WireRustcVersion,
+        shim_source: PathBuf,
+    ) -> CargoResult<Self> {
         std::fs::create_dir_all(&cargo_home).context("cargo home")?;
         let dir = tempfile::tempdir().context("resolver scratch dir")?;
-        Self::setup(dir, cargo_home, shim_source)
+        Self::setup(dir, cargo_home, rustc_version, shim_source)
     }
 
     fn setup(
         dir: tempfile::TempDir,
         cargo_home: PathBuf,
+        rustc_version: &WireRustcVersion,
         shim_source: PathBuf,
     ) -> CargoResult<Self> {
-        // `rustup which rustc` resolves the active toolchain's real
-        // binary — the `rustc` on PATH may itself be a rustup proxy,
-        // and `rustc -vV` through the proxy resolves a *default*
-        // toolchain that is not necessarily what `cargo` would see.
-        let rustc = std::process::Command::new("rustup")
-            .args(["which", "rustc"])
+        // The session probes the toolchain its tasks pin, never
+        // whichever rustc happens to be active: `rustup which
+        // --toolchain` resolves that toolchain's real binary, and
+        // `RUSTUP_AUTO_INSTALL=0` keeps an absent toolchain a failure
+        // instead of a download.
+        let requested = rustc_version.as_str();
+        let output = std::process::Command::new("rustup")
+            .args(["which", "--toolchain", requested, "rustc"])
+            .env("RUSTUP_AUTO_INSTALL", "0")
             .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
-            .filter(|path| path.exists())
-            .unwrap_or_else(|| PathBuf::from("rustc"));
+            .with_context(|| format!("run rustup which --toolchain {requested} rustc"))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "rustup has no toolchain for `{requested}` — install it with \
+             `rustup toolchain install {requested}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let rustc = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        anyhow::ensure!(
+            rustc.is_file(),
+            "rustup resolved `{requested}`'s rustc to {}, which is not a file",
+            rustc.display()
+        );
         let output = std::process::Command::new(&rustc)
             .arg("-vV")
             .output()
@@ -185,6 +203,15 @@ impl Resolver {
             .find_map(|line| line.strip_prefix("release: "))
             .map(str::trim)
             .context("rustc -vV reports no release")?;
+        // The toolchain that answered must *be* the pinned release — a
+        // custom-linked toolchain or a stale rustup dir that reports
+        // anything else gives the tasks facts from a different compiler.
+        anyhow::ensure!(
+            release == requested,
+            "rustc `{requested}` resolves to {} reporting release {release} — \
+             the toolchain's release must equal the pinned version",
+            rustc.display()
+        );
         let version = semver::Version::parse(release)
             .with_context(|| format!("rustc release `{release}` is not semver"))?;
         info!(?rustc, %host_triple, %version, ?cargo_home, "resolver session");
@@ -215,8 +242,8 @@ impl Resolver {
         Ok(session)
     }
 
-    /// The toolchain's release version — the `rustc_version` callers
-    /// stamp on tasks.
+    /// The pinned toolchain's release — verified to equal the
+    /// `rustc_version` the session was constructed for.
     #[must_use]
     pub const fn version(&self) -> &semver::Version {
         &self.version

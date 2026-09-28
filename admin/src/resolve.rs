@@ -35,15 +35,16 @@ pub struct ResolvePool {
 }
 
 impl ResolvePool {
-    /// Build the session: resolve the real toolchain (`rustup which
-    /// rustc`, `-vV`) and write the per-runner-family rustc shims.
+    /// Build the session pinned to `rustc_version`'s rustup toolchain —
+    /// `rustup which --toolchain` for its real rustc and `-vV` to prove
+    /// the release — then write the per-runner-family rustc shims.
     ///
     /// # Errors
-    /// Toolchain probing failures.
-    pub(crate) fn new() -> stow_types::error::Result<Self> {
+    /// `rustc_version` is not an installed toolchain, or probing failed.
+    pub(crate) fn new(rustc_version: &WireRustcVersion) -> stow_types::error::Result<Self> {
         let shim = std::env::current_exe().wrap_err("current executable path")?;
-        let resolver = stow_resolver::Resolver::new(shim)
-            .wrap_err("resolver session (rustc on PATH must be the lane's toolchain)")?;
+        let resolver = stow_resolver::Resolver::new(rustc_version, shim)
+            .wrap_err(format!("resolver session for rustc {rustc_version}"))?;
         Ok(Self {
             resolver: Arc::new(resolver),
         })

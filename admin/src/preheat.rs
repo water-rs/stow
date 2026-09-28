@@ -342,7 +342,7 @@ async fn top(
     // Every job resolves in-process on the pool's workers; results
     // drain back in submission order so the batch reads exactly like
     // today's sequential loop.
-    let pool = crate::resolve::ResolvePool::new()?;
+    let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let mut slots: Vec<Option<Result<stow_resolver::SourceResolve, String>>> =
         jobs.iter().map(|_| None).collect();
     pool.run(
@@ -443,7 +443,7 @@ async fn binary(
         None => crate::rust_channel::stable_rustc_version().await?,
     };
 
-    let pool = crate::resolve::ResolvePool::new()?;
+    let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let resolved = resolve_binary_crate(
         pool.resolver(),
         crate_name.as_str(),
@@ -702,7 +702,7 @@ fn resolve_binaries(
             bin_only: false,
         });
     }
-    let pool = crate::resolve::ResolvePool::new()?;
+    let pool = crate::resolve::ResolvePool::new(rustc_version)?;
     let mut slots: Vec<Option<Result<BinaryResolve, String>>> = jobs.iter().map(|_| None).collect();
     pool.run(
         &jobs,
@@ -990,7 +990,7 @@ async fn plan(
         None => CI_TARGET_TRIPLES.iter().map(|t| (*t).to_owned()).collect(),
     };
     let seed = features_json.features().to_vec();
-    let pool = crate::resolve::ResolvePool::new()?;
+    let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let resolver = pool.shared();
     let version = release.version.as_semver().clone();
     let crate_name_string = crate_name.to_string();

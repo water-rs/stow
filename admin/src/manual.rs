@@ -413,7 +413,7 @@ async fn resolve_sources(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<Vec<EnqueueRequest>> {
-    let pool = crate::resolve::ResolvePool::new()?;
+    let pool = crate::resolve::ResolvePool::new(rustc_version)?;
     let mut requests = Vec::new();
     let mut failures = Vec::new();
     if let Some(path) = &args.crates {
