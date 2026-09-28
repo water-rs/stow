@@ -108,5 +108,9 @@ pub fn cfg_map<'a>(
 }
 CFG_TAIL
 } > resolve/src/rustc_data.rs
+# The arms above are emitted one per line; rustfmt gives the table the
+# layout the committed file has, so an unchanged channel regenerates a
+# byte-identical file and the refresh job opens no pull request.
+rustfmt --edition 2024 resolve/src/rustc_data.rs
 
 echo "vendored rustc data for ${version} host ${host} under ${dest}; resolve/src/rustc_data.rs regenerated"
