@@ -4,6 +4,10 @@ on:
   push:
     branches: [dev]
   pull_request:
+  # `installable release` is a required check on dev, so the merge queue
+  # waits for it on the merge_group ref; without this trigger the queue
+  # would wait forever.
+  merge_group:
 
 # A branch pushed several times in a row only needs its newest run: the older
 # ones test a tree nobody will merge. Pushes to main and dev keep theirs,
