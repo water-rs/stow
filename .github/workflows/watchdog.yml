@@ -3,7 +3,8 @@ name: Watchdog
 # The external incident watchdog (stow#450): every 15 minutes it reads
 # the Cloudflare usage/health signals, the build-pipeline failure rate,
 # the scheduler queue and the public endpoints. On a breach it trips the
-# breaker itself — panic gate on, dispatching workflows disabled — then
+# breaker itself — the `stow maintenance: anonymous` WAF rule on,
+# dispatching workflows disabled — then
 # keeps the `incident` issue and the alert mail current. It runs outside
 # the edge, so a broken edge cannot silence it.
 #
@@ -67,6 +68,7 @@ jobs:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ vars.CF_ZONE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

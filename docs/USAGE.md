@@ -291,8 +291,9 @@ acting unless `--yes` is given.
   catalog rows (GHCR tags are not deleted).
 - `stow-admin cache stats` / `cache clear --prefix <p> --yes` — the
   repository's GitHub Actions cache quota and prefix eviction.
-- `stow-admin panic on|off|status` — the anonymous-traffic circuit
-  breaker (`on`/`off` are mutations).
+- `stow-admin maintenance ensure|on|off|status [--scope anonymous|lanes|all]`
+  — the zone WAF maintenance rules; `ensure` creates the entrypoint and
+  any missing rule disabled (`ensure`/`on`/`off` are mutations).
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
 - `stow-admin preheat top --target ... --rustc-version ... [--limit 100] --yes`

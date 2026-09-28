@@ -149,8 +149,7 @@ CREATE TABLE IF NOT EXISTS scheduler_schema_version (
     version INTEGER NOT NULL
 );
 
--- Operator-flipped settings. Currently holds only `panic`, the
--- anonymous-traffic circuit breaker: 'true'/'false', absent means off.
+-- Operator-flipped settings, a key/value table.
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

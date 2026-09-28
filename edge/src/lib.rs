@@ -40,8 +40,6 @@ mod index_slice;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod miss_logger;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod panic;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod register;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod registry_auth;
