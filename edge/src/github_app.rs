@@ -221,9 +221,13 @@ pub async fn installation_token(
 }
 
 /// Build the JWT from the App key and exchange it for an installation
-/// token.
+/// token — uncached; callers with a `DurableDb` should use
+/// [`installation_token`], which caches. The Worker's scheduled
+/// handler uses this directly (the token cache lives in DO storage).
 #[cfg(target_arch = "wasm32")]
-async fn mint_installation_token(config: &AppConfig) -> Result<InstallationToken, GitHubAppError> {
+pub async fn mint_installation_token(
+    config: &AppConfig,
+) -> Result<InstallationToken, GitHubAppError> {
     let pkcs8_der = pkcs8_der_from_pem(&config.private_key_pem)?;
     // `Date::now()` returns whole milliseconds well below 2^53, so the
     // value is exactly representable and always fits i64.

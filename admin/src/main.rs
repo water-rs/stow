@@ -27,8 +27,11 @@ mod watchdog;
 
 use std::fmt::Write as _;
 
-use clap::{Args, Parser, Subcommand};
-use stow_types::api::{AdminStatus, EnqueueRequest, SchedulerSubmitResponse};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use stow_types::api::{
+    AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, EnqueueRequest,
+    FreezeTransitionEvent, SchedulerSubmitResponse,
+};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
@@ -92,12 +95,34 @@ enum Command {
     /// breaker on a breach, keep the incident issue and the alert mail
     /// current. `watchdog clear` is the manual recovery.
     Watchdog(watchdog::WatchdogArgs),
+    /// Read or clear the scheduler's dispatch freeze — the manual
+    /// recovery path after a systematic-failure or cost trip.
+    DispatchFreeze(DispatchFreezeArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
     Deploy(deploy::DeployArgs),
+}
+
+#[derive(Args)]
+struct DispatchFreezeArgs {
+    /// `status` reads the freeze; `clear` lifts it, resuming dispatch of
+    /// everything that queued during it. Engagement is automatic — a
+    /// systematic-failure or cost trip — or the dispatch-freeze POST.
+    #[arg(value_enum)]
+    action: DispatchFreezeAction,
+    /// Apply the clear. `status` never mutates; `clear` without `--yes`
+    /// prints the plan and exits 0.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DispatchFreezeAction {
+    Status,
+    Clear,
 }
 
 #[derive(Args)]
@@ -161,6 +186,9 @@ fn main() -> stow_types::error::Result<()> {
         Command::Maintenance(args) => smol::block_on(maintenance::run(args, output)),
         Command::Watchdog(args) => {
             with_edge(|edge| async move { watchdog::run(&edge, args, output).await })
+        }
+        Command::DispatchFreeze(args) => {
+            with_edge(|edge| async move { dispatch_freeze_switch(&edge, args, output).await })
         }
         // The index commands pick their own executor: `publish` drives
         // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
@@ -381,6 +409,11 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         let mut out = String::new();
         let _ = writeln!(
             out,
+            "freeze       {}",
+            if status.dispatch_frozen { "on" } else { "off" }
+        );
+        let _ = writeln!(
+            out,
             "pending      {} miss, {} human",
             status.pending_miss, status.pending_human
         );
@@ -441,6 +474,123 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         }
         out.trim_end().to_owned()
     })
+}
+
+/// `stow-admin dispatch-freeze status|clear` — read the dispatch
+/// freeze or drive the manual transition that is its only recovery
+/// path. `status` shows the whole record — the trigger, and the alert
+/// outcome so a freeze nobody was emailed about is visible. `clear` is
+/// a mutation: it prints the plan and only applies under `--yes`.
+async fn dispatch_freeze_switch(
+    edge: &Edge,
+    args: DispatchFreezeArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    if args.action == DispatchFreezeAction::Status {
+        let switch: DispatchFreeze = edge.get_json("/api/v1/admin/dispatch-freeze").await?;
+        return render::emit(output, &switch, render_freeze);
+    }
+    let plan = DispatchFreeze {
+        enabled: false,
+        record: None,
+        transitions: Vec::new(),
+    };
+    render::mutation(
+        output,
+        args.yes,
+        plan,
+        |envelope: &render::Planned<DispatchFreeze, DispatchFreeze>| {
+            let mut out = "clear dispatch freeze\n".to_owned();
+            if let Some(result) = &envelope.result {
+                let _ = writeln!(out, "{}", render_freeze(result));
+            }
+            let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+            out
+        },
+        async move |plan: &DispatchFreeze| {
+            edge.post_json("/api/v1/admin/dispatch-freeze", plan).await
+        },
+    )
+    .await
+}
+
+/// Human rendering of the freeze state — the flag line, the stored
+/// record's trigger and alert outcome, and the transition log the
+/// incident record is written from.
+fn render_freeze(switch: &DispatchFreeze) -> String {
+    let mut out = format!("freeze {}", if switch.enabled { "on" } else { "off" });
+    if let Some(record) = &switch.record {
+        let _ = write!(out, "\n  frozen at  {}", record.frozen_at);
+        let _ = write!(out, "\n  trigger    {}", summarize_trigger(&record.trigger));
+        let _ = write!(out, "\n  alert      {}", summarize_notify(&record.notify));
+    }
+    if !switch.transitions.is_empty() {
+        out.push_str("\n  transitions (newest first):");
+        for transition in &switch.transitions {
+            let event = match transition.event {
+                FreezeTransitionEvent::Engaged => "engaged",
+                FreezeTransitionEvent::Cleared => "cleared",
+            };
+            let _ = write!(out, "\n    {} {}", transition.at, event);
+            if let Some(trigger) = &transition.trigger {
+                let _ = write!(out, " — {}", summarize_trigger(trigger));
+            }
+        }
+    }
+    out
+}
+
+/// One-line summary of a stored trigger — the same wording the
+/// cleared-transition email carries.
+fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
+    match trigger {
+        DispatchFreezeTrigger::Manual => "manual (dispatch-freeze POST)".to_owned(),
+        DispatchFreezeTrigger::Tripped(trip) => {
+            let tripped: Vec<&str> = trip
+                .targets
+                .iter()
+                .filter(|target| target.tripped)
+                .map(|target| target.target.as_str())
+                .collect();
+            let streams = if trip.fleet_tripped {
+                if tripped.is_empty() {
+                    "fleet".to_owned()
+                } else {
+                    format!("fleet + {}", tripped.join(", "))
+                }
+            } else {
+                tripped.join(", ")
+            };
+            format!(
+                "tripped: {}/{} outcomes failed ({}%) over {}m — {}",
+                trip.failures, trip.outcomes, trip.failure_percent, trip.window_minutes, streams
+            )
+        }
+        DispatchFreezeTrigger::Cost(cost) => {
+            format!(
+                "cost trip: {:?} used {:.0} of a {:.0} daily budget",
+                cost.metric, cost.used, cost.budget
+            )
+        }
+    }
+}
+
+/// One-line summary of the stored alert outcome — a failure is
+/// shouted, not summarized away.
+fn summarize_notify(notify: &ChannelOutcome) -> String {
+    match notify {
+        ChannelOutcome::Sent { message_id } => message_id
+            .as_ref()
+            .map_or_else(|| "sent".to_owned(), |id| format!("sent (messageId {id})")),
+        ChannelOutcome::Opened { url } => format!("opened {url}"),
+        ChannelOutcome::Commented { url } => format!("commented {url}"),
+        ChannelOutcome::Resolved { url } => format!("resolved {url}"),
+        ChannelOutcome::Failed { message, hint } => hint.as_ref().map_or_else(
+            || format!("FAILED: {message}"),
+            |hint| format!("FAILED: {message} — {hint}"),
+        ),
+        ChannelOutcome::Disabled { reason } => format!("disabled: {reason}"),
+    }
 }
 
 /// `stow-admin submit` — one `EnqueueRequest` batch, one POST. The

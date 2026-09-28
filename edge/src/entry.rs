@@ -129,6 +129,9 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/index/{target}/{rustc_version}"
                     .at(api::list_artifact_index)
                     .post(api::record_published_index),
+                "/dispatch-freeze"
+                    .at(api::get_dispatch_freeze)
+                    .post(api::set_dispatch_freeze),
                 "/preheat/plan".post(api::preheat_plan),
                 "/queue".at(api::admin_queue_list),
                 "/queue/retry".post(api::admin_queue_retry),

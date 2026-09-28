@@ -149,9 +149,76 @@ CREATE TABLE IF NOT EXISTS scheduler_schema_version (
     version INTEGER NOT NULL
 );
 
--- Operator-flipped settings, a key/value table.
+-- Operator-flipped settings and the breaker-set freeze record.
+-- `dispatch_freeze` holds the serialized `DispatchFreezeRecord` the
+-- breaker writes on a trip and `dispatch-freeze clear` removes; absent
+-- means dispatch is live.
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
+-- The sliding window the dispatch-freeze breaker evaluates. A queue row
+-- cannot carry this: a retried task flips back to 'pending' and its
+-- earlier failures would vanish from any row-keyed scan, so the outcome
+-- tally is kept aside, in per-target time buckets.
+-- The breaker's sliding window lives in counters, not rows: every
+-- completion upserts one 5-minute bucket per target, so the trip check
+-- sums at most (window / 5min) rows per target whatever the traffic.
+-- `bucket` is unixepoch floored to the bucket size.
+CREATE TABLE IF NOT EXISTS attempt_outcome_buckets (
+    target TEXT NOT NULL,
+    bucket INTEGER NOT NULL,
+    outcomes INTEGER NOT NULL,
+    failures INTEGER NOT NULL,
+    PRIMARY KEY (target, bucket)
+);
+
+-- Raw outcome rows are kept for failures only — the class and
+-- example-run evidence the trip alert prints is read once, when the
+-- check trips, so successes never land here and failures expire with
+-- the window (the /complete insert deletes what aged out).
+CREATE TABLE IF NOT EXISTS attempt_outcomes (
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    -- Compilation target — the breaker's per-target trip streams group
+    -- on it.
+    target TEXT NOT NULL,
+    -- 'build' | 'publish' | 'register' — the BuildCompleteReport's
+    -- failure_step, NULL when the report did not carry one.
+    failure_step TEXT,
+    -- `step: error-prefix` (or the bare step/prefix when only one is
+    -- known) — what the trip alert groups failures by.
+    failure_class TEXT,
+    github_run_id TEXT,
+    finished_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, attempt)
+);
+
+-- The trip evidence reads and the expiry delete both bound on
+-- finished_at — the index keeps those scans off the row payload.
+CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_finished
+ON attempt_outcomes (finished_at);
+
+
+-- The dispatch-freeze transition log the watchdog (#450) turns into the
+-- `incident` issue record: one append-only row per engage/clear so a
+-- recorder that missed a transition still sees it. `trigger` is the
+-- serialized DispatchFreezeTrigger — set on engage and echoed on clear
+-- (the cleared record's trigger).
+CREATE TABLE IF NOT EXISTS dispatch_freeze_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    event TEXT NOT NULL, -- 'engaged' | 'cleared'
+    trigger TEXT         -- serialized DispatchFreezeTrigger, NULL when unknown
+);
+
+-- The DO's own billed SQL work, per UTC day — the self-meter the
+-- event-driven cost trip reads (GraphQL analytics used to do this on a
+-- cron; the DO sees its own cursor rowsRead/rowsWritten immediately and
+-- for free). Two statements per request max: one upsert, one read.
+CREATE TABLE IF NOT EXISTS do_meter (
+    day TEXT PRIMARY KEY,
+    rows_read INTEGER NOT NULL,
+    rows_written INTEGER NOT NULL
+);

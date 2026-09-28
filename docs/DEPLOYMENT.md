@@ -373,8 +373,11 @@ the `GITHUB_APP_PRIVATE_KEY` secret are used to sign an RS256 JWT
 (WebCrypto) and exchange it at the GitHub API. The `stow-ci` App is
 installed on `water-rs` (selected repositories: `water-rs/stow`) with
 **Actions: Read and write**, which is the permission the dispatch call
-requires. Minted tokens are cached in the Durable Object's SQL storage
-and reused while more than five minutes of validity remain.
+requires. The `incident` issue record is the external watchdog's (#450)
+— the App deliberately carries no `issues` grant, because the edge is
+untrusted serving infrastructure. Minted tokens are
+cached in the Durable Object's SQL storage and reused while more than
+five minutes of validity remain.
 
 The crucial property: CI never holds a Cloudflare API token, and no
 shared secret exists anywhere on the edge write surface — every trusted

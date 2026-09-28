@@ -27,7 +27,7 @@ use std::fmt::Write as _;
 
 use askama::Template;
 use clap::{Args, Subcommand};
-use stow_types::api::AdminStatus;
+use stow_types::api::{AdminStatus, DispatchFreeze};
 use stow_types::stow_error;
 
 use crate::maintenance::{self, MaintenanceScope};
@@ -108,12 +108,12 @@ struct Signal {
 
 /// Hours in the monthly allowance window — the hourly budget each usage
 /// signal compares last-hour consumption against is `monthly / 720`.
-/// Thirty days is the convention `edge/src/cost.rs` (#451) uses for its
-/// daily budgets, so both layers share the allowance model.
+/// Thirty days is the convention `edge/src/scheduler/meter.rs` (#451)
+/// uses for its daily budgets, so both layers share the allowance model.
 const HOURS_PER_MONTH: f64 = 720.0;
 
 // Monthly included allowances, per Cloudflare's published pricing
-// (verified against the docs 2026-09-28; `edge/src/cost.rs` carries the
+// (verified against the docs 2026-09-28;  carries the
 // same table for the in-edge daily budgets):
 // - Workers Paid — 10M requests/mo, 30M CPU ms/mo. Per the Workers
 //   pricing footnote, subrequests are not billed, so `subrequests` is
@@ -245,6 +245,18 @@ const SIGNALS: &[Signal] = &[
         min_sample: 0,
         threshold: 1.0,
         unit: "errors",
+        effect: Effect::Alert,
+    },
+    // The DO's own breaker — the freeze itself already cut dispatch,
+    // so the watchdog records the incident and never re-trips: no
+    // maintenance rule, no workflow disable.
+    Signal {
+        id: "edge.dispatch_frozen",
+        label: "scheduler dispatch freeze engaged (the DO's own breaker fired)",
+        window_secs: 0,
+        min_sample: 1,
+        threshold: 1.0,
+        unit: "frozen",
         effect: Effect::Alert,
     },
     Signal {
@@ -475,6 +487,7 @@ impl Watcher<'_> {
         gather!("overloaded-events", self.overloaded_reading());
         gather!("pipeline", self.pipeline_readings());
         gather!("queue", self.queue_readings());
+        gather!("dispatch-freeze", self.freeze_reading());
         let (endpoint_readings, endpoint_failure) = self.endpoint_readings().await;
         readings.extend(endpoint_readings);
         if let Some(error) = endpoint_failure {
@@ -754,6 +767,46 @@ impl Watcher<'_> {
                 evidence: stall_evidence,
             },
         ])
+    }
+
+    // ----- the DO's own breaker -----
+
+    /// `GET /api/v1/admin/dispatch-freeze` — the freeze flag, its
+    /// record and the transition log. A `1.0` reading breaches the
+    /// signal, which is `Alert`: the freeze is the breaker's cut
+    /// itself, so the watchdog's job is the `incident` issue — reason,
+    /// since, and the last transitions land in the body.
+    async fn freeze_reading(&self) -> Result<Vec<Reading>, String> {
+        let freeze: DispatchFreeze = self
+            .edge
+            .get_json("/api/v1/admin/dispatch-freeze")
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut evidence = Vec::new();
+        if let Some(record) = &freeze.record {
+            evidence.push(format!(
+                "reason: {}",
+                crate::summarize_trigger(&record.trigger)
+            ));
+            evidence.push(format!("since: {}", record.frozen_at));
+        }
+        for transition in freeze.transitions.iter().take(3) {
+            let trigger = transition
+                .trigger
+                .as_ref()
+                .map(|trigger| format!(" — {}", crate::summarize_trigger(trigger)))
+                .unwrap_or_default();
+            evidence.push(format!(
+                "{:?} at {}{}",
+                transition.event, transition.at, trigger
+            ));
+        }
+        Ok(vec![Reading {
+            signal: signal("edge.dispatch_frozen"),
+            sample: 1,
+            value: f64::from(u8::from(freeze.enabled)),
+            evidence,
+        }])
     }
 
     // ----- public endpoints -----
@@ -2520,6 +2573,21 @@ mod tests {
         assert!(decision.incident);
         assert!(decision.tripped.is_empty());
         assert_eq!(decision.alerting.len(), 2);
+    }
+
+    /// A frozen dispatch status is an incident the watchdog records —
+    /// alert, never a re-trip: the freeze already cut dispatch, so no
+    /// maintenance rule or workflow disable.
+    #[test]
+    fn a_frozen_status_yields_an_incident() {
+        let readings = vec![reading("edge.dispatch_frozen", 1, 1.0)];
+        let decision = decide(&readings, &[]);
+        assert!(decision.incident);
+        assert!(decision.tripped.is_empty());
+        assert_eq!(decision.alerting.len(), 1);
+        // And cleared dispatch stays clear.
+        let cleared = decide(&[reading("edge.dispatch_frozen", 1, 0.0)], &[]);
+        assert!(!cleared.incident);
     }
 
     /// A collector failure alone is an incident — the watchdog is blind.

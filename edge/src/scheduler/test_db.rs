@@ -65,11 +65,13 @@ pub async fn memory_db_raw() -> Result<DurableDb, QueueError> {
     Ok(DurableDb::new(memory_backend().await?))
 }
 
-/// Every statement the wrapped backend ran, in order — `(sql, elapsed)`.
-/// The submit-path measurements for issue #418 read this after a run to
-/// report statement counts per request and per dependency edge.
+/// Every statement the wrapped backend ran, in order —
+/// `(sql, elapsed, rows_read)`. `rows_read` is the result-row count the
+/// host backend reports; queries written so the result set is the scan
+/// set (e.g. reading bucket rows rather than a server-side aggregate)
+/// make it equal the Durable Object's billed `rowsRead`.
 pub type StatementLog =
-    std::sync::Arc<std::sync::Mutex<Vec<(std::string::String, std::time::Duration)>>>;
+    std::sync::Arc<std::sync::Mutex<Vec<(std::string::String, std::time::Duration, u64)>>>;
 
 /// Open a fresh in-memory queue database (schema applied) whose backend
 /// records every statement it executes, returning the log alongside.
@@ -111,11 +113,11 @@ struct CountingBackend {
 }
 
 impl CountingBackend {
-    fn record(&self, sql: &str, elapsed: std::time::Duration) {
+    fn record(&self, sql: &str, elapsed: std::time::Duration, rows_read: u64) {
         self.log
             .lock()
             .expect("statement log")
-            .push((sql.to_owned(), elapsed));
+            .push((sql.to_owned(), elapsed, rows_read));
     }
 }
 
@@ -123,7 +125,8 @@ impl DurableDbBackend for CountingBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         let start = std::time::Instant::now();
         let result = self.inner.query(query, params).await;
-        self.record(query, start.elapsed());
+        let rows_read = result.as_ref().map_or(0, |result| result.rows_read);
+        self.record(query, start.elapsed(), rows_read);
         result
     }
 
@@ -134,7 +137,8 @@ impl DurableDbBackend for CountingBackend {
     ) -> Result<DbExecResult, DurableDbError> {
         let start = std::time::Instant::now();
         let result = self.inner.execute(query, params).await;
-        self.record(query, start.elapsed());
+        let rows_read = result.as_ref().map_or(0, |result| result.rows_read);
+        self.record(query, start.elapsed(), rows_read);
         result
     }
 
