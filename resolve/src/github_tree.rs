@@ -80,8 +80,12 @@ pub async fn fetch_github_tree(
 ) -> CargoResult<GithubTree> {
     let root = GithubRepo::from_repo(repo)
         .with_context(|| format!("`{repo}` is not a github.com owner/repo"))?;
-    let commit = resolve_ref(client, &root, git_ref).await?;
-    let mut files = fetch_codeload(client, &root, &commit).await?;
+    let commit = resolve_ref(client, &root, git_ref)
+        .await
+        .map_err(|error| classify_root_fetch(error, &root, git_ref))?;
+    let mut files = fetch_codeload(client, &root, &commit)
+        .await
+        .map_err(|error| classify_root_fetch(error, &root, git_ref))?;
     let mut notes = Vec::new();
     let mut trees = BTreeMap::new();
     fill_submodules(
@@ -165,6 +169,75 @@ impl GithubRepo {
     }
 }
 
+/// A `GET` answered a non-2xx status — typed so the tree fetch can tell
+/// a missing repository or ref (404) from an upstream fault without
+/// reading message text.
+#[derive(Debug)]
+struct StatusFailure {
+    /// What the fetch was after (`git refs of `o/r``, `tree of `o/r``).
+    what: String,
+    /// The URL the status came from.
+    url: String,
+    /// The HTTP status code.
+    status: http::StatusCode,
+}
+
+impl std::fmt::Display for StatusFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to get {} from `{}`: HTTP {}",
+            self.what, self.url, self.status
+        )
+    }
+}
+
+impl std::error::Error for StatusFailure {}
+
+/// The repository or ref a tree fetch named does not exist on
+/// github.com — the ls-remote or codeload tarball answered 404, or the
+/// advertised refs did not contain the ref. Raised as a typed error so
+/// the caller can answer "not found" rather than an upstream fault; only
+/// the fetch's own root lookups produce it — a submodule's 404 lands in
+/// [`GithubTree::notes`].
+#[derive(Debug)]
+pub struct RepoNotFound {
+    /// The `owner/repo` the fetch was asked for.
+    pub repo: String,
+    /// The ref (`HEAD`, branch, tag, sha) asked for.
+    pub git_ref: String,
+}
+
+impl std::fmt::Display for RepoNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` at `{}` was not found on github.com",
+            self.repo, self.git_ref
+        )
+    }
+}
+
+impl std::error::Error for RepoNotFound {}
+
+/// Map a root-lookup failure to [`RepoNotFound`] when a 404 caused it;
+/// any other failure passes through unchanged.
+fn classify_root_fetch(error: anyhow::Error, repo: &GithubRepo, git_ref: &str) -> anyhow::Error {
+    let missing = error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<StatusFailure>())
+        .any(|failure| failure.status == http::StatusCode::NOT_FOUND);
+    if missing {
+        RepoNotFound {
+            repo: format!("{}/{}", repo.owner, repo.repo),
+            git_ref: git_ref.to_owned(),
+        }
+        .into()
+    } else {
+        error
+    }
+}
+
 /// `GET` `url` through the resolve client into bytes; a non-2xx status is
 /// an error naming the fetched thing. Transport failures retry — a
 /// codeload stream dropping mid-body is the ordinary case, and the lane
@@ -181,7 +254,12 @@ async fn get(client: &Client, url: &str, what: &str) -> CargoResult<Vec<u8>> {
             Ok(response) => {
                 let (parts, body) = response.into_parts();
                 if !(200..300).contains(&parts.status.as_u16()) {
-                    bail!("failed to get {what} from `{url}`: HTTP {}", parts.status);
+                    return Err(StatusFailure {
+                        what: what.to_owned(),
+                        url: url.to_owned(),
+                        status: parts.status,
+                    }
+                    .into());
                 }
                 return Ok(body);
             }
@@ -216,7 +294,12 @@ async fn get_stream(
             Ok(response) => {
                 let (parts, body) = response.into_parts();
                 if !(200..300).contains(&parts.status.as_u16()) {
-                    bail!("failed to get {what} from `{url}`: HTTP {}", parts.status);
+                    return Err(StatusFailure {
+                        what: what.to_owned(),
+                        url: url.to_owned(),
+                        status: parts.status,
+                    }
+                    .into());
                 }
                 let len = parts
                     .headers
@@ -269,11 +352,11 @@ async fn resolve_ref(client: &Client, repo: &GithubRepo, git_ref: &str) -> Cargo
             .or_else(|| git_ref.strip_prefix("refs/").and_then(find))
     };
     sha.ok_or_else(|| {
-        anyhow!(
-            "reference `{git_ref}` not found in `{}/{}`",
-            repo.owner,
-            repo.repo
-        )
+        RepoNotFound {
+            repo: format!("{}/{}", repo.owner, repo.repo),
+            git_ref: git_ref.to_owned(),
+        }
+        .into()
     })
 }
 
@@ -518,7 +601,95 @@ fn is_full_sha(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
+    use crate::util::network::http_async::{Client, HttpClient};
+
+    /// An [`HttpClient`] answering from an in-memory URL → response map;
+    /// any URL outside the map errors, which is what proves a fetch that
+    /// misses in the advertisement never asks codeload for a tree.
+    struct MapHttp(std::collections::HashMap<String, http::Response<Vec<u8>>>);
+
+    impl HttpClient for MapHttp {
+        fn request<'a>(
+            &'a self,
+            request: http::Request<Vec<u8>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = CargoResult<http::Response<Vec<u8>>>> + 'a>,
+        > {
+            let url = request.uri().to_string();
+            Box::pin(async move {
+                self.0
+                    .get(&url)
+                    .cloned()
+                    .ok_or_else(|| anyhow::format_err!("no recorded response for `{url}`"))
+            })
+        }
+    }
+
+    fn response(status: u16, body: &str) -> http::Response<Vec<u8>> {
+        http::Response::builder()
+            .status(status)
+            .body(body.as_bytes().to_vec())
+            .unwrap()
+    }
+
+    /// A v0 `info/refs` advertisement carrying `HEAD` and
+    /// `refs/heads/main` only.
+    fn advertisement() -> String {
+        let sha = "1111111111111111111111111111111111111111";
+        let pkt = |payload: &str| format!("{:04x}{payload}", payload.len() + 4);
+        format!(
+            "{}{}{}{}{}",
+            pkt("# service=git-upload-pack\n"),
+            "0000",
+            pkt(&format!("{sha} HEAD\0multi_ack thin-pack\n")),
+            pkt(&format!("{sha} refs/heads/main\n")),
+            "0000"
+        )
+    }
+
+    /// A repo github.com does not serve — `info/refs` answers 404 —
+    /// makes `fetch_github_tree` raise [`RepoNotFound`] so the edge can
+    /// answer 404 rather than a redacted upstream fault.
+    #[test]
+    fn missing_repo_is_repo_not_found() {
+        let client = Client::new(Rc::new(MapHttp(std::collections::HashMap::from([(
+            "https://github.com/o/missing/info/refs?service=git-upload-pack".to_owned(),
+            response(404, "not found"),
+        )]))));
+        let error = futures::executor::block_on(fetch_github_tree(&client, "o/missing", "HEAD"))
+            .err()
+            .expect("a missing repository fails");
+        assert!(
+            error
+                .chain()
+                .any(<dyn std::error::Error + 'static>::is::<RepoNotFound>),
+            "expected RepoNotFound in the chain, got {error:#}"
+        );
+    }
+
+    /// A repo that exists but advertises no such branch/tag — the
+    /// advertisement answers 200, `resolve_ref` finds no `dev` — makes
+    /// `fetch_github_tree` raise the same [`RepoNotFound`]: the ref's
+    /// absence is decided at the advertisement, not by a 404 on the wire.
+    #[test]
+    fn missing_ref_is_repo_not_found() {
+        let client = Client::new(Rc::new(MapHttp(std::collections::HashMap::from([(
+            "https://github.com/o/repo/info/refs?service=git-upload-pack".to_owned(),
+            response(200, &advertisement()),
+        )]))));
+        let error = futures::executor::block_on(fetch_github_tree(&client, "o/repo", "dev"))
+            .err()
+            .expect("a missing ref fails");
+        assert!(
+            error
+                .chain()
+                .any(<dyn std::error::Error + 'static>::is::<RepoNotFound>),
+            "expected RepoNotFound in the chain, got {error:#}"
+        );
+    }
 
     #[test]
     fn gitmodules_parse() {

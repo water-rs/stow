@@ -91,16 +91,32 @@ impl Client {
     }
 
     /// Perform the request, returning the full response (headers + body).
+    ///
+    /// A transport failure surfaces as [`Error`] in the returned error's
+    /// chain — an [`Error`] the transport produced itself passes through,
+    /// anything else is wrapped in [`Error::Other`] — so a caller classifying
+    /// a resolver error can tell an upstream fetch failure from an
+    /// application-level one by downcasting for [`Error`]. A non-2xx status
+    /// is not an error here; the caller reads `parts.status`.
     pub async fn request(&self, request: http::Request<Vec<u8>>) -> CargoResult<Response<Vec<u8>>> {
-        self.inner.request(request).await
+        self.inner
+            .request(request)
+            .await
+            .map_err(classify_transport)
     }
 
-    /// Perform the request, returning headers + a streaming body.
+    /// Perform the request, returning headers + a streaming body. Transport
+    /// failures carry [`Error`] the same way [`Client::request`] marks them;
+    /// errors the returned body stream yields later are the transport's own
+    /// and pass through unmarked.
     pub async fn request_stream(
         &self,
         request: http::Request<Vec<u8>>,
     ) -> CargoResult<Response<BodyStream>> {
-        self.inner.request_stream(request).await
+        self.inner
+            .request_stream(request)
+            .await
+            .map_err(classify_transport)
     }
 
     /// Perform a blocking request.
@@ -115,7 +131,7 @@ impl Client {
         let blocking = self.blocking.as_ref().ok_or_else(|| {
             anyhow::format_err!("no blocking HTTP transport configured for this client")
         })?;
-        blocking.request(request)
+        blocking.request(request).map_err(classify_transport)
     }
 
     /// Approximate bytes still in flight across this client (progress only).
@@ -124,8 +140,20 @@ impl Client {
     }
 }
 
+/// Mark a failure an [`HttpClient`] returned with the transport's own
+/// [`Error`] type — an already-typed [`Error`] passes through, anything
+/// else becomes [`Error::Other`].
+fn classify_transport(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<Error>() {
+        Ok(marked) => marked.into(),
+        Err(error) => Error::Other(error).into(),
+    }
+}
+
 /// Error type returned by [`HttpClient`] implementations, carrying the
-/// spurious-vs-fatal classification the retry layer applies.
+/// spurious-vs-fatal classification the retry layer applies. [`Client`]
+/// wraps every transport failure in it, so an error chain containing one
+/// is a fetch failure rather than an application-level error.
 #[derive(Debug)]
 pub enum Error {
     /// A transient transport failure — retried by `retry::Retry`.

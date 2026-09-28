@@ -55,7 +55,7 @@ use stow_resolve::rustc_data;
 use stow_resolve::sources::registry::IndexCachesRoot;
 use stow_resolve::util::context::{Env, GlobalContext};
 use stow_resolve::util::fs::{MemoryVfs, Vfs, poll_scoped};
-use stow_resolve::util::network::http_async::{BodyStream, Client, HttpClient};
+use stow_resolve::util::network::http_async::{self, BodyStream, Client, HttpClient};
 use stow_resolve::util::shell::Shell;
 use stow_resolve::util::tarball::{self, TarPrefix};
 use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource, runner_family};
@@ -457,7 +457,7 @@ async fn crate_workspace(
     )
     .await
     .map_err(|error| {
-        ResolverError::CratesIo(format!("unpack {crate_name}-{version}.crate: {error}"))
+        ResolverError::Upstream(format!("unpack {crate_name}-{version}.crate: {error}"))
     })?;
     tracing::info!(crate = %crate_name, %version, files = files.len(), "resolve: source workspace built");
     build_workspace(files, keep_lockfile, true)
@@ -476,7 +476,17 @@ async fn github_workspace(
     let tree = github_tree::fetch_github_tree(&Client::new(http.clone()), repo, git_ref)
         .await
         .map_err(|error| {
-            ResolverError::CratesIo(format!("fetch {repo}@{git_ref} tree: {error:#}"))
+            if error
+                .chain()
+                .any(<dyn std::error::Error + 'static>::is::<github_tree::RepoNotFound>)
+            {
+                ResolverError::RepoNotFound {
+                    repo: repo.to_owned(),
+                    git_ref: git_ref.to_owned(),
+                }
+            } else {
+                ResolverError::Upstream(format!("fetch {repo}@{git_ref} tree: {error:#}"))
+            }
         })?;
     tracing::info!(
         repo,
@@ -886,20 +896,37 @@ fn enqueue_requests_inner(
     (requests, uncovered)
 }
 
+/// Classify a resolver-machinery failure by what produced it: an error
+/// chain containing the transport's [`http_async::Error`] — every fetch
+/// [`Client`] makes marks its failures that way — is an upstream problem
+/// (5xx, retryable). Anything else is the project's own manifest or
+/// dependency graph failing, which the caller answers 422 — the same
+/// request resolves the same way.
+fn classify_resolve_failure(what: &str, error: &anyhow::Error) -> ResolverError {
+    if error
+        .chain()
+        .any(<dyn std::error::Error + 'static>::is::<http_async::Error>)
+    {
+        ResolverError::Upstream(format!("{what}: {error:#}"))
+    } else {
+        ResolverError::Unresolvable(format!("{what}: {error:#}"))
+    }
+}
+
 /// `GET` the URL body — one fetch, no retry: the index machinery retries
 /// on its own machinery's `Retry` policy; tarballs and one-shot GETs pass
 /// through the same transport.
 async fn get_bytes(client: &ResolveHttp, url: &str) -> Result<Vec<u8>, ResolverError> {
     let request = http::Request::get(url)
         .body(Vec::new())
-        .map_err(|error| ResolverError::CratesIo(format!("build request {url}: {error}")))?;
+        .map_err(|error| ResolverError::Upstream(format!("build request {url}: {error}")))?;
     let response = client
         .request(request)
         .await
-        .map_err(|error| ResolverError::CratesIo(format!("fetch {url}: {error}")))?;
+        .map_err(|error| ResolverError::Upstream(format!("fetch {url}: {error}")))?;
     let (parts, body) = response.into_parts();
     if !(200..300).contains(&parts.status.as_u16()) {
-        return Err(ResolverError::CratesIo(format!(
+        return Err(ResolverError::Upstream(format!(
             "{url} returned HTTP {}",
             parts.status
         )));
@@ -917,14 +944,14 @@ async fn get_stream(
 ) -> Result<(BodyStream, Option<u64>), ResolverError> {
     let request = http::Request::get(url)
         .body(Vec::new())
-        .map_err(|error| ResolverError::CratesIo(format!("build request {url}: {error}")))?;
+        .map_err(|error| ResolverError::Upstream(format!("build request {url}: {error}")))?;
     let response = client
         .request_stream(request)
         .await
-        .map_err(|error| ResolverError::CratesIo(format!("fetch {url}: {error}")))?;
+        .map_err(|error| ResolverError::Upstream(format!("fetch {url}: {error}")))?;
     let (parts, body) = response.into_parts();
     if !(200..300).contains(&parts.status.as_u16()) {
-        return Err(ResolverError::CratesIo(format!(
+        return Err(ResolverError::Upstream(format!(
             "{url} returned HTTP {}",
             parts.status
         )));
@@ -953,7 +980,7 @@ async fn fetch_rustc_data(
     let url = format!("{}/{path}", base.trim_end_matches('/'));
     let bytes = get_bytes(http, &url).await?;
     String::from_utf8(bytes)
-        .map_err(|error| ResolverError::CratesIo(format!("{url} is not UTF-8: {error}")))
+        .map_err(|error| ResolverError::Upstream(format!("{url} is not UTF-8: {error}")))
 }
 
 /// The `rustc -vV`/`--print cfg` inputs one resolve needs — vendored
@@ -1086,7 +1113,7 @@ async fn resolve_session_outputs(
             Env::new(),
             false,
         )
-        .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
+        .map_err(|error| classify_resolve_failure("resolver context", &error))?;
         gctx.set_http(Client::new(http.clone()));
         gctx.share_index_caches(index_caches.clone());
         tracing::info!("resolve: session prepare begin");
@@ -1111,7 +1138,7 @@ async fn resolve_session_outputs(
             },
         )
         .await
-        .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+        .map_err(|error| classify_resolve_failure("resolve failed", &error))?;
         let mut outputs = Vec::with_capacity(targets.len());
         for (target, host_triple) in targets.iter().zip(hosts.iter()) {
             tracing::info!(target = %target, "resolve: projection begin");
@@ -1122,7 +1149,7 @@ async fn resolve_session_outputs(
                     &verbose_by_host[host_triple],
                 )
                 .await
-                .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+                .map_err(|error| classify_resolve_failure("resolve failed", &error))?;
             // Wasm linear memory never shrinks, so the size at resolve end
             // is the request's high-water mark against the isolate's
             // 128 MiB cap.
@@ -1188,7 +1215,7 @@ async fn resolve_workspace(
             Env::new(),
             false,
         )
-        .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
+        .map_err(|error| classify_resolve_failure("resolver context", &error))?;
         gctx.set_http(Client::new(http.clone()));
         gctx.share_index_caches(index_caches.clone());
         tracing::info!(target = %target, "resolve: api::resolve begin");
@@ -1208,7 +1235,7 @@ async fn resolve_workspace(
             },
         )
         .await
-        .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+        .map_err(|error| classify_resolve_failure("resolve failed", &error))?;
         // Wasm linear memory never shrinks, so the size at resolve end is
         // the request's high-water mark against the isolate's 128 MiB cap.
         tracing::info!(
@@ -1523,6 +1550,74 @@ mod tests {
         let kept = build_workspace(files, true, false).unwrap();
         assert!(kept.dropped_lockfile.is_none());
         assert!(kept.vfs.exists(&lockfile_path));
+    }
+
+    /// `classify_resolve_failure` splits a resolve error on whether its
+    /// chain carries the transport's own [`http_async::Error`]: a manifest
+    /// whose requirement no recorded index version satisfies is the
+    /// project's problem (`Unresolvable` → 422), while a crate the index
+    /// fetch cannot even serve fails on the wire (`Upstream` → 5xx).
+    #[tokio::test]
+    async fn resolve_failure_classifies_graph_vs_transport() {
+        let http: ResolveHttp = Rc::new(RecordedHttp::new(PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../resolve/tests/resolve-diff-fixture/http"
+        ))));
+        let rustc_version = WireRustcVersion::parse("1.98.1").unwrap();
+        let targets = vec![TargetTriple::parse("wasm32-unknown-unknown").unwrap()];
+        let resolve = |manifest: &'static str| {
+            let http = http.clone();
+            let rustc_version = rustc_version.clone();
+            let targets = targets.clone();
+            async move {
+                let files: BTreeMap<PathBuf, Vec<u8>> =
+                    [("Cargo.toml", manifest), ("src/lib.rs", "")]
+                        .into_iter()
+                        .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
+                        .collect();
+                let source = build_workspace(files, false, false).expect("workspace");
+                source_resolve(&http, &source, &targets, &rustc_version, 0, None).await
+            }
+        };
+
+        // `unicode-ident` is in the recorded index but not at 999: the
+        // index answers, cargo's resolver rejects — the project's graph.
+        let error = resolve(concat!(
+            "[package]\n",
+            "name = \"app\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+            "\n",
+            "[dependencies]\n",
+            "unicode-ident = \"=999.0.0\"\n",
+        ))
+        .await
+        .err()
+        .expect("an unsatisfiable requirement fails");
+        assert!(
+            matches!(error, ResolverError::Unresolvable(_)),
+            "expected Unresolvable, got {error:?}"
+        );
+        assert!(error.to_string().contains("unicode-ident"));
+
+        // `nope-not-in-recording` has no recorded index response: the
+        // fetch itself fails — upstream transport, not the project's.
+        let error = resolve(concat!(
+            "[package]\n",
+            "name = \"app\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+            "\n",
+            "[dependencies]\n",
+            "nope-not-in-recording = \"1\"\n",
+        ))
+        .await
+        .err()
+        .expect("an unservable index fetch fails");
+        assert!(
+            matches!(error, ResolverError::Upstream(_)),
+            "expected Upstream, got {error:?}"
+        );
     }
 
     fn unit(

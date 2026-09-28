@@ -182,12 +182,12 @@ impl RequestStatusPage {
 pub async fn request_status(
     params: skyzen::routing::Params,
     skyzen::utils::State(scheduler): skyzen::utils::State<skyzen_cloudflare::CfDurableNamespace>,
-) -> Result<skyzen::Response, crate::api::GetArtifactError> {
+) -> Result<skyzen::Response, crate::errors::GetArtifactError> {
     use skyzen::{Body, Response, StatusCode};
 
     let task_id = params
         .get("task_id")
-        .map_err(|_| crate::api::GetArtifactError::BadRequest)?
+        .map_err(|_| crate::errors::GetArtifactError::BadRequest)?
         .to_owned();
     let task =
         crate::scheduler_client::get_tasks_status(&scheduler, std::slice::from_ref(&task_id))
@@ -197,7 +197,7 @@ pub async fn request_status(
     let found = task.is_some();
     let html = RequestStatusPage::new(task_id, task)
         .render()
-        .map_err(|error| crate::api::GetArtifactError::InternalWithMessage(error.to_string()))?;
+        .map_err(|error| crate::errors::GetArtifactError::InternalWithMessage(error.to_string()))?;
 
     let mut response = Response::new(Body::from(html));
     if !found {
@@ -238,11 +238,11 @@ fn script_response(body: &'static str) -> skyzen::Response {
 #[cfg(target_arch = "wasm32")]
 pub async fn index(
     skyzen::utils::State(site): skyzen::utils::State<SiteConfig>,
-) -> Result<skyzen::utils::Html<String>, crate::api::GetArtifactError> {
+) -> Result<skyzen::utils::Html<String>, crate::errors::GetArtifactError> {
     IndexPage::new(&site)
         .render()
         .map(skyzen::utils::Html)
-        .map_err(|error| crate::api::GetArtifactError::InternalWithMessage(error.to_string()))
+        .map_err(|error| crate::errors::GetArtifactError::InternalWithMessage(error.to_string()))
 }
 
 /// One rendered leaderboard row — the name plus its formatted count.
@@ -332,12 +332,12 @@ impl StatsPage {
 pub async fn stats_page(
     skyzen::utils::State(stats_ctx): skyzen::utils::State<crate::stats::StatsContext>,
     skyzen::utils::State(cache): skyzen::utils::State<skyzen_cloudflare::CfCache>,
-) -> Result<skyzen::utils::Html<String>, crate::api::GetArtifactError> {
+) -> Result<skyzen::utils::Html<String>, crate::errors::GetArtifactError> {
     let usage = crate::stats::cached_usage_stats(&stats_ctx, &cache).await?;
     StatsPage::new(&usage)
         .render()
         .map(skyzen::utils::Html)
-        .map_err(|error| crate::api::GetArtifactError::InternalWithMessage(error.to_string()))
+        .map_err(|error| crate::errors::GetArtifactError::InternalWithMessage(error.to_string()))
 }
 
 #[cfg(test)]

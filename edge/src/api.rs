@@ -21,6 +21,7 @@ use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 
 use crate::db;
+use crate::errors::GetArtifactError;
 use crate::fetch_guard::OutboundPool;
 use crate::github_auth;
 use crate::lookup_key::{bundle_cache_key, exact_lookup_key, row_matches_digest};
@@ -221,17 +222,6 @@ pub struct PowAdmission {
 /// The scheduler dispatches at CI speed, so a short fixed hold-off is
 /// more honest than a computed estimate of queue-clearing time.
 const QUEUE_FULL_RETRY_AFTER_SECS: u64 = 600;
-
-/// Unwrap the scheduler's `{"error": "..."}` JSON envelope so a refusal's
-/// message reaches the client once, not nested inside a second object;
-/// an unexpected body passes through verbatim.
-fn scheduler_error_message(body: &str) -> &str {
-    #[derive(serde::Deserialize)]
-    struct ErrorBody<'a> {
-        error: &'a str,
-    }
-    serde_json::from_str::<ErrorBody<'_>>(body).map_or(body, |parsed| parsed.error)
-}
 
 /// `429 Too Many Requests` with a `Retry-After` header — the shared
 /// `{"error": ...}` renderer cannot attach headers, so the rate-limited
@@ -735,7 +725,9 @@ async fn queue_mutation(
             // in the generic report wording.
             crate::errors::SchedulerClientError::Http {
                 status: 400, body, ..
-            } => GetArtifactError::BadRequestWithMessage(scheduler_error_message(&body).to_owned()),
+            } => GetArtifactError::BadRequestWithMessage(
+                crate::errors::scheduler_error_message(&body).to_owned(),
+            ),
             other => other.into(),
         })
 }
@@ -2691,125 +2683,6 @@ pub async fn usage_stats(
         .map(Json)
 }
 
-#[skyzen::error]
-pub enum GetArtifactError {
-    #[error("bad request", status = BAD_REQUEST)]
-    BadRequest,
-    /// A rejected request whose reason is safe to show the caller — the
-    /// request page renders the body's `error` verbatim.
-    #[error("{0}", status = BAD_REQUEST)]
-    BadRequestWithMessage(String),
-    #[error("unauthorized", status = UNAUTHORIZED)]
-    Unauthorized,
-    /// Turnstile rejected the request. The request-API contract renders
-    /// this as `{"error":"turnstile rejected","error-codes":[...]}` — a
-    /// shape the shared `{"error": ...}` renderer cannot express — so
-    /// handlers return [`Self::rejection_response`] instead of `Err`.
-    /// `status = FORBIDDEN` keeps even that fallback path correct.
-    #[error("turnstile rejected", status = FORBIDDEN)]
-    TurnstileRejected {
-        /// Codes surfaced to the client verbatim (`siteverify-unavailable`,
-        /// `hostname-mismatch`, or siteverify's own `error-codes`).
-        error_codes: Vec<String>,
-    },
-    #[error("artifact not found", status = NOT_FOUND)]
-    NotFound,
-    /// The caller asked to build a target trusted CI has no runner for.
-    /// Refused here so it can never become a dispatch: `build-crate.yml`
-    /// resolves an unknown target to an empty `runs-on`, and the run then
-    /// dies before any job starts, spending a queue slot and reporting
-    /// nothing.
-    #[error(
-        "`{target}` is not a target this cache builds; supported: {supported}",
-        status = BAD_REQUEST
-    )]
-    UnsupportedTarget {
-        /// The target the caller asked for.
-        target: String,
-        /// The targets trusted CI can build, comma-separated.
-        supported: String,
-    },
-    /// A request named a crate (or an exact version) crates.io does not
-    /// publish; the message names it because the request page shows the
-    /// body's `error` verbatim.
-    #[error("crate `{crate_name}` is not published on crates.io", status = NOT_FOUND)]
-    CrateNotPublished {
-        /// The crate the caller asked for.
-        crate_name: String,
-    },
-    /// The crate exists but the requested version does not (or every
-    /// candidate is yanked or a prerelease).
-    #[error("`{crate_name}` has no published {requested}", status = NOT_FOUND)]
-    VersionNotPublished {
-        /// The crate the caller asked for.
-        crate_name: String,
-        /// `version X.Y.Z` when one was asked for, else `stable release`.
-        requested: String,
-    },
-    /// `GET /api/v1/requests/{task_id}` for a task the scheduler does not
-    /// know: never enqueued, or already reaped.
-    #[error("unknown request task id `{task_id}`", status = NOT_FOUND)]
-    UnknownTask {
-        /// The id from the request path.
-        task_id: String,
-    },
-    /// The scheduler refused a completion report because its attempt no
-    /// longer matches the queue row's live state — a stale report for a
-    /// superseded attempt or a duplicate. The body is the scheduler's own
-    /// message, which already names the task and both attempts.
-    #[error("{0}", status = CONFLICT)]
-    CompletionConflict(String),
-    /// A register request's record set escapes the authority of the task
-    /// the caller named — a record whose target or rustc version differs
-    /// from the task's, or a `(crate, version)` outside the task's
-    /// dependency closure. The message names the offending record.
-    #[error("{0}", status = FORBIDDEN)]
-    RegisterForbidden(String),
-    /// A register request named a task that cannot accept records —
-    /// unknown to the scheduler queue, or not in an in-flight
-    /// (`dispatched`/`running`) state. A conflict, not a credential
-    /// failure: the caller authenticated, the named work is just not the
-    /// live row it claims.
-    #[error("{0}", status = CONFLICT)]
-    RegisterConflict(String),
-    #[error("GHCR unavailable", status = BAD_GATEWAY)]
-    GhcrUnavailable,
-    /// GitHub (OIDC JWKS or the repo-permission API) could not be consulted
-    /// — a 502 so CI retries instead of recording a permanent auth failure.
-    /// The upstream reason stays in the worker log.
-    #[error("github trust upstream unavailable", status = BAD_GATEWAY)]
-    TrustUpstreamUnavailable,
-    /// GitHub rate-limited the trust check itself — a 503 so CI backs
-    /// off rather than hammering the probe that triggered the limit.
-    /// The `TrustRateLimitGate` middleware turns this into a 503 with the
-    /// `Retry-After` GitHub asked for; this variant is the bare-status
-    /// fallback when it surfaces through the shared error envelope.
-    #[error("github trust upstream rate limited", status = SERVICE_UNAVAILABLE)]
-    TrustUpstreamRateLimited,
-    /// A request exceeded a documented edge limit. The message names the
-    /// observed count and the limit — a client error (413 renders its
-    /// message, 5xx does not), because retrying the same request can
-    /// never help.
-    #[error("{0}", status = PAYLOAD_TOO_LARGE)]
-    TooLarge(String),
-    /// The request is well-formed but the edge declines to process it —
-    /// e.g. a `POST /api/v1/requests` dependency closure over
-    /// `STOW_HUMAN_MAX_CLOSURE`. Retrying unchanged can never help.
-    #[error("{0}", status = UNPROCESSABLE_ENTITY)]
-    UnprocessableEntity(String),
-    /// The scheduler refused a submit with 429 — on the human lane the
-    /// daily task budget, on the miss lane the pending-depth cap.
-    /// Handlers that know the retry semantics answer a `Retry-After`
-    /// response instead; this status is the fallback for paths that
-    /// surface the error as-is.
-    #[error("{0}", status = TOO_MANY_REQUESTS)]
-    SchedulerBusy(String),
-    #[error("internal server error")]
-    Internal,
-    #[error("internal server error: {0}")]
-    InternalWithMessage(String),
-}
-
 impl GetArtifactError {
     /// Render a [`Self::TurnstileRejected`] with the contract's
     /// `error-codes` body; every other variant passes through as `Err`
@@ -2820,58 +2693,6 @@ impl GetArtifactError {
                 Ok(crate::turnstile::rejected_response(&error_codes))
             }
             other => Err(other),
-        }
-    }
-}
-
-impl From<crate::errors::SchedulerClientError> for GetArtifactError {
-    fn from(error: crate::errors::SchedulerClientError) -> Self {
-        match error {
-            // A 429 is a capacity refusal — the queue-depth cap or the
-            // human-lane daily budget — not a malformed request. The body
-            // is the scheduler's own `{"error": ...}` JSON; unwrap it so
-            // the message is not nested inside a second envelope.
-            crate::errors::SchedulerClientError::Http {
-                status: 429, body, ..
-            } => Self::SchedulerBusy(scheduler_error_message(&body).to_owned()),
-            // A 4xx from the scheduler is a client problem — e.g. a
-            // completion report naming a task the queue never held — and
-            // the body is the scheduler's own client-safe message, so it
-            // reaches the reporter verbatim instead of as a bare 500.
-            crate::errors::SchedulerClientError::Http { status, body, .. }
-                if (400..500).contains(&status) =>
-            {
-                Self::BadRequestWithMessage(format!("scheduler rejected the report: {body}"))
-            }
-            other => Self::InternalWithMessage(other.to_string()),
-        }
-    }
-}
-
-impl From<crate::errors::DbError> for GetArtifactError {
-    fn from(error: crate::errors::DbError) -> Self {
-        Self::InternalWithMessage(error.to_string())
-    }
-}
-
-impl From<crate::errors::ResolverError> for GetArtifactError {
-    fn from(error: crate::errors::ResolverError) -> Self {
-        match error {
-            crate::errors::ResolverError::CrateNotPublished { crate_name } => {
-                Self::CrateNotPublished { crate_name }
-            }
-            crate::errors::ResolverError::LimitExceeded { .. } => Self::TooLarge(error.to_string()),
-            crate::errors::ResolverError::VersionNotPublished {
-                crate_name,
-                version,
-            } => Self::VersionNotPublished {
-                crate_name,
-                requested: format!("version {version}"),
-            },
-            crate::errors::ResolverError::BadRequest(message) => {
-                Self::BadRequestWithMessage(message)
-            }
-            other => Self::InternalWithMessage(other.to_string()),
         }
     }
 }

@@ -82,7 +82,7 @@ impl CratesIo for CfCratesIo {
         // crates.io has no 404 for a search that matches nothing, so this
         // arm only fires if the endpoint itself disappears.
         let response: CratesIoSearchResponse = fetch_json(&url, false, &self.pool, &|| {
-            ResolverError::CratesIo(format!(
+            ResolverError::Upstream(format!(
                 "crates.io {CRATES_IO_API_BASE} search returned 404"
             ))
         })
@@ -109,7 +109,7 @@ async fn fetch_index_file(crate_name: &str, pool: &OutboundPool) -> Result<Strin
 /// check a missing crate surfaced as a decode error — and a 500.
 /// `missing` says what a 404 on *this* URL means, because only the caller
 /// knows what it asked for. Other non-2xx statuses stay
-/// [`ResolverError::CratesIo`]; the error body is never read, since
+/// [`ResolverError::Upstream`]; the error body is never read, since
 /// upstream diagnostics must not reach clients.
 async fn fetch_json<T: serde::de::DeserializeOwned>(
     url: &str,
@@ -179,7 +179,7 @@ async fn fetch_once(
         Ok(response) => GuardedResponse::new(SendWrapper::new(response)),
         Err(error) => {
             return FetchOutcome::Retryable {
-                error: ResolverError::CratesIo(format!("fetch {url}: {error}")),
+                error: ResolverError::Upstream(format!("fetch {url}: {error}")),
                 delay_ms: retry_delay(attempt, None),
             };
         }
@@ -191,7 +191,7 @@ fn build_get_request(url: &str, cacheable: bool) -> Result<worker::Request, Reso
     let headers = worker::Headers::new();
     headers
         .set("User-Agent", CRATES_IO_USER_AGENT)
-        .map_err(|error| ResolverError::CratesIo(error.to_string()))?;
+        .map_err(|error| ResolverError::Upstream(error.to_string()))?;
 
     let mut init = worker::RequestInit::new();
     init.with_method(worker::Method::Get);
@@ -208,5 +208,5 @@ fn build_get_request(url: &str, cacheable: bool) -> Result<worker::Request, Reso
     }
 
     worker::Request::new_with_init(url, &init)
-        .map_err(|error| ResolverError::CratesIo(error.to_string()))
+        .map_err(|error| ResolverError::Upstream(error.to_string()))
 }
