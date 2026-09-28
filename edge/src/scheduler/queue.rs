@@ -2508,6 +2508,24 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
         .await
         .map_err(|error| format!("add queue_dependencies.dep_side_known column: {error}"))?;
     }
+    // Both dev-era passes select on a marker value almost no edge still
+    // carries; without these partial indexes each select scanned every
+    // edge in the queue (stow#432). They are created here rather than in
+    // schema.sql because a dev-era table only gains the columns above.
+    db.query(
+        "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_side_unknown \
+         ON queue_dependencies(task_id) WHERE dep_side_known = 0",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("index edges with an unknown side: {error}"))?;
+    db.query(
+        "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_unmasked \
+         ON queue_dependencies(task_id) WHERE dep_invocations = 0",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("index edges without a shape mask: {error}"))?;
     derive_dev_era_edge_sides(db).await?;
     backfill_dev_era_edge_masks(db).await
 }
@@ -5952,8 +5970,8 @@ mod sqlite_tests {
     /// Issue #418 regression guard: a submit chunk must not issue one
     /// statement per request or per edge. A 1000-request chunk with
     /// three deps each — 1000 fresh rows, 3000 edges, 4000 probe ids —
-    /// runs 13 statements on the host backend: `ensure_schema`'s idempotent
-    /// round (7), the chunked existence probes (2), the batched task
+    /// runs 15 statements on the host backend: `ensure_schema`'s idempotent
+    /// round (9), the chunked existence probes (2), the batched task
     /// insert (1), the edge-set delete (1), and the batched edge inserts
     /// (2). A return to per-row statements issues thousands.
     #[tokio::test]
@@ -5979,7 +5997,7 @@ mod sqlite_tests {
         assert!(
             issued <= 15,
             "a 1000-request chunk must stay a constant statement count \
-             (measured 13), got {issued}"
+             (measured 15), got {issued}"
         );
     }
 }
