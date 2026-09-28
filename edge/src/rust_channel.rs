@@ -63,7 +63,6 @@ pub fn parse_channel_rustc_version(manifest: &str) -> Result<WireRustcVersion, R
 pub async fn cached_stable_version(
     db: &DurableDb,
 ) -> Result<Option<WireRustcVersion>, RustChannelError> {
-    crate::scheduler::queue::ensure_schema(db).await?;
     let version = db
         .query(
             "SELECT version FROM rust_stable_channel \
@@ -88,7 +87,6 @@ pub async fn store_stable_version(
     db: &DurableDb,
     version: &WireRustcVersion,
 ) -> Result<(), RustChannelError> {
-    crate::scheduler::queue::ensure_schema(db).await?;
     db.query(
         "INSERT INTO rust_stable_channel (id, version, fetched_at) \
          VALUES (1, ?, datetime('now')) \

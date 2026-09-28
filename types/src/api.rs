@@ -902,6 +902,20 @@ pub struct QueueMutationResult {
     pub affected: u32,
 }
 
+/// What `POST /api/v1/admin/scheduler/migrate` reports — the stored
+/// scheduler schema version before and after the migration pass ran.
+/// `before == after` means the queue was already current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchemaMigrationReport {
+    /// Schema version the queue carried coming in — `0` on a
+    /// pre-versioned queue whose `scheduler_schema_version` row did not
+    /// exist yet.
+    pub before: i64,
+    /// Schema version the queue carries now — the build's own
+    /// `SCHEMA_VERSION`, since a successful pass always ends stamped.
+    pub after: i64,
+}
+
 /// One queue row as `GET /api/v1/admin/queue` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueueTask {

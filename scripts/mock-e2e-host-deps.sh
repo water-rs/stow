@@ -340,6 +340,23 @@ SERVICE_PID=$!
 CHILD_PIDS+=("$SERVICE_PID")
 CHILD_NAMES+=(edge)
 echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
+# The scheduler Durable Object applies its schema through the operator
+# migrate route — deployment work, never request work — so the mock
+# plays the deploy pipeline: wait only for the listener, then run the
+# same `stow-admin scheduler migrate` deploy-edge.yml runs, before any
+# scheduler traffic. A status read before the migration is a 500; the
+# listener probe takes the route's response code as its ready signal.
+wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
+    http_listening "$SCHEDULER_URL/status"
+migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler migrate 2>&1)" \
+    || die "stow-admin scheduler migrate failed: $migrate_out"
+echo "[mock-e2e] $migrate_out"
+current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
+    "$REPO_ROOT/edge/src/scheduler/queue.rs")"
+[ -n "$current_schema" ] || die "could not read SCHEMA_VERSION from queue.rs"
+[ "${migrate_out##* }" = "$current_schema" ] \
+    || die "scheduler migrate reported '$migrate_out', expected schema $current_schema"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 
@@ -596,17 +613,15 @@ snafu_id="$(sched "SELECT task_id FROM queue WHERE crate_name = 'snafu' AND host
 sched "UPDATE queue_dependencies SET dep_host_side = 0, dep_side_known = 0 \
     WHERE task_id = '$snafu_id'"
 
-# `ensure_schema` runs on every scheduler touch — poll until the edge's
-# stored side reads -1: owner and dep both sit on the family host
-# triple, so the derivation cannot prove which side the edge meant.
-edge_side=""
-for _ in $(seq 1 30); do
-    curl -fsS --max-time 10 "$SCHEDULER_URL/status" >/dev/null 2>&1 || true
-    edge_side="$(sched "SELECT dep_host_side FROM queue_dependencies \
-        WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'")"
-    [ "$edge_side" = "-1" ] && break
-    sleep 2
-done
+# The side derivation is part of the migration pass, which runs only
+# through the operator route — rerun it the way a deploy would. The
+# edge's stored side must read -1: owner and dep both sit on the family
+# host triple, so the derivation cannot prove which side the edge meant.
+migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler migrate 2>&1)" \
+    || die "stow-admin scheduler migrate failed: $migrate_out"
+edge_side="$(sched "SELECT dep_host_side FROM queue_dependencies \
+    WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'")"
 [ "$edge_side" = "-1" ] \
     || die "the migration left snafu->snafu-derive at dep_host_side $edge_side — expected -1 (unestablished)"
 

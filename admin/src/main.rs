@@ -19,6 +19,7 @@ mod projects;
 mod queue;
 mod render;
 mod runs;
+mod scheduler;
 
 use std::fmt::Write as _;
 
@@ -60,6 +61,9 @@ enum Command {
     Status,
     /// Inspect and mutate scheduler queue rows.
     Queue(queue::QueueArgs),
+    /// Scheduler operations — the schema migration route and anything
+    /// else that runs on operator cadence, not per request.
+    Scheduler(scheduler::SchedulerArgs),
     /// Per-target servable identities for one crate.
     Coverage(coverage::CoverageArgs),
     /// Enqueue cache-warming task batches.
@@ -134,6 +138,9 @@ fn main() -> stow_types::error::Result<()> {
         Command::Status => with_edge(|edge| async move { status(&edge, output).await }),
         Command::Queue(args) => {
             with_edge(|edge| async move { queue::run(&edge, args, output).await })
+        }
+        Command::Scheduler(args) => {
+            with_edge(|edge| async move { scheduler::run(&edge, args, output).await })
         }
         Command::Coverage(args) => {
             with_edge(|edge| async move { coverage::run(&edge, args, output).await })

@@ -6,7 +6,7 @@ use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueRequest,
     EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
-    RunnerFamily, SchedulerStatus, TaskLane, runner_family,
+    RunnerFamily, SchedulerStatus, SchemaMigrationReport, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -530,7 +530,6 @@ async fn enqueue_inner(
     settings: &SchedulerSettings,
     enforce_pending_cap: bool,
 ) -> Result<u32, QueueError> {
-    ensure_schema(db).await?;
     // Both gates run before any insert so a refused submit leaves no
     // trace: the depth cap turns away miss-lane batches once the queue is
     // full, and the human lane spends from a per-UTC-day budget.
@@ -844,7 +843,6 @@ fn plan_enqueue(
 }
 
 pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
     let status = if report.success {
         "completed"
     } else {
@@ -909,7 +907,6 @@ pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<()
 }
 
 pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
-    ensure_schema(db).await?;
     // One pass over the queue's (status, lane) groups — six sequential
     // count(*) scans would read ~6x the rows for the same answer, and every
     // graph analysis and enqueue redemption calls this.
@@ -969,7 +966,6 @@ pub async fn task_status(
     db: &DurableDb,
     task_id: &str,
 ) -> Result<Option<RequestStatus>, QueueError> {
-    ensure_schema(db).await?;
     let row = db
         .query(&format!(
             "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, \
@@ -995,12 +991,11 @@ pub async fn tasks_status(
     db: &DurableDb,
     task_ids: &[String],
 ) -> Result<Vec<RequestStatus>, QueueError> {
-    ensure_schema(db).await?;
     if task_ids.is_empty() {
         return Ok(Vec::new());
     }
-    // One IN-clause select per batch: the per-id loop re-ran ensure_schema
-    // and a point select for every id — an N+1 on a hot request path.
+    // One IN-clause select per batch: a per-id loop issued a point
+    // select for every id — an N+1 on a hot request path.
     let mut by_id =
         std::collections::HashMap::<String, RequestStatusRow>::with_capacity(task_ids.len());
     for chunk in task_ids.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
@@ -1240,7 +1235,6 @@ pub async fn claim_dispatchable_tasks(
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
 ) -> Result<Vec<QueuedTask>, QueueError> {
-    ensure_schema(db).await?;
     // Stale recovery runs ahead of the pause check: a paused scheduler
     // owes its in-flight builds the same lease-expiry reclaim.
     recover_stale_active_tasks(db, settings).await?;
@@ -1518,7 +1512,6 @@ pub async fn mark_dispatch_failed(
     task_id: &str,
     error: &str,
 ) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
     // Exponential backoff keyed on dispatch_attempts (incremented at claim
     // time): a persistent dispatch failure (GitHub outage, bad token) must
     // not spin the alarm in a zero-delay retry loop.
@@ -1569,7 +1562,6 @@ const GITHUB_APP_TOKEN_MIN_REMAINING_SECS: i64 = 300;
 pub async fn github_app_token(
     db: &DurableDb,
 ) -> Result<Option<crate::github_app::InstallationToken>, QueueError> {
-    ensure_schema(db).await?;
     let row = db
         .query(
             "SELECT token, expires_at FROM github_app_token \
@@ -1592,7 +1584,6 @@ pub async fn store_github_app_token(
     db: &DurableDb,
     token: &crate::github_app::InstallationToken,
 ) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
     db.query(
         "INSERT INTO github_app_token (id, token, expires_at) VALUES (1, ?, ?) \
          ON CONFLICT(id) DO UPDATE \
@@ -1611,7 +1602,6 @@ pub async fn store_github_app_token(
 /// violates the schema's contract and is an invariant error rather than a
 /// guess.
 pub async fn panic_enabled(db: &DurableDb) -> Result<bool, QueueError> {
-    ensure_schema(db).await?;
     let value = db
         .query("SELECT value FROM settings WHERE key = 'panic'")
         .fetch_scalar_optional::<String>()
@@ -1629,7 +1619,6 @@ pub async fn panic_enabled(db: &DurableDb) -> Result<bool, QueueError> {
 
 /// Write the anonymous-traffic circuit breaker into the `settings` table.
 pub async fn set_panic(db: &DurableDb, enabled: bool) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
     db.query(
         "INSERT INTO settings (key, value) VALUES ('panic', ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1777,7 +1766,6 @@ pub async fn list_tasks(
     db: &DurableDb,
     selector: &QueueSelector,
 ) -> Result<Vec<QueueTask>, QueueError> {
-    ensure_schema(db).await?;
     // A listing accepts a fully empty selector — it means "everything" —
     // so the EmptySelector refusal a mutation gets cannot apply here.
     let (predicate, values) = match selector_predicate(selector) {
@@ -1840,7 +1828,6 @@ pub async fn apply_mutation(
     mutation: QueueMutation,
     selector: &QueueSelector,
 ) -> Result<u32, QueueError> {
-    ensure_schema(db).await?;
     let (predicate, values) = selector_predicate(selector)?;
     let sql = match mutation {
         QueueMutation::Retry => format!(
@@ -1885,7 +1872,6 @@ pub async fn apply_mutation(
 /// the oldest pending row's age, the in-flight set, per-target outcome
 /// tallies over the trailing 24 hours, and the panic flag.
 pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
-    ensure_schema(db).await?;
     let queue_status = status(db).await?;
     let oldest_pending_seconds = db
         .query(
@@ -1972,7 +1958,6 @@ pub async fn observe_run(
     task_id: &str,
     github_run_id: &str,
 ) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
     db.query(
         "UPDATE queue SET github_run_id = ? \
          WHERE task_id = ? AND status IN ('dispatched', 'running')",
@@ -2121,7 +2106,6 @@ pub async fn next_alarm(
     now_ms: i64,
     settings: &SchedulerSettings,
 ) -> Result<AlarmPlan, QueueError> {
-    ensure_schema(db).await?;
     let active = count_active_by_family(db).await?;
     let capacity = match settings.dispatch {
         Dispatch::Paused => DispatchCapacity::Paused,
@@ -2314,7 +2298,6 @@ pub async fn record_published_slice(
     rustc_version: &str,
     rows: &[PublishedSliceRow],
 ) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
     let generation = db
         .query(
             "SELECT MAX(generation) AS generation FROM ( \
@@ -2393,7 +2376,90 @@ pub async fn record_published_slice(
     Ok(())
 }
 
-pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
+/// The scheduler schema version this build serves, recorded in the
+/// `scheduler_schema_version` singleton row once [`migrate`] has applied
+/// it — `PRAGMA user_version` is the usual carrier but the Durable
+/// Object SQL authorizer refuses it
+/// (<https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/>),
+/// so the version lives in a table. Bump it whenever `schema.sql` or
+/// any step of [`migrate_schema`] changes — and keep every change
+/// additive (expand, then contract): `deploy-edge.yml` runs the
+/// migration right after `skyzen deploy`, while the previous build may
+/// still be serving requests, so nothing the running code reads may
+/// stop existing while the pass applies.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Run the scheduler schema migration — the only code that may issue
+/// DDL or a backfill against the queue database. Migrations are
+/// operations work: no request handler, and not the alarm, calls this.
+/// The deploy pipeline drives it through
+/// `POST /api/v1/admin/scheduler/migrate` (→ the Durable Object's
+/// `/migrate` handler) right after `skyzen deploy`; `stow-admin
+/// scheduler migrate` is the manual path. Request code assumes the
+/// schema exists — when it does not, its own SQL fails loudly, which is
+/// the fail-fast.
+///
+/// A stored version newer than `SCHEMA_VERSION` means the database was
+/// migrated by newer code — fail fast rather than silently serve it.
+/// The stamp is written only after every migration step has succeeded
+/// — the same per-statement commit discipline `migrate_queue_schema`
+/// and the column migrations already use — so a pass that dies midway
+/// leaves the version behind and re-runs: every step is idempotent, and
+/// a queue already at `SCHEMA_VERSION` reports `before == after`.
+pub async fn migrate(db: &DurableDb) -> Result<SchemaMigrationReport, QueueError> {
+    let before = stored_schema_version(db).await?;
+    if before > SCHEMA_VERSION {
+        return Err(QueueError::Invariant(format!(
+            "scheduler schema version {before} exceeds the {SCHEMA_VERSION} \
+             this build understands — the database was migrated by newer code"
+        )));
+    }
+    migrate_schema(db).await?;
+    db.query(
+        "INSERT INTO scheduler_schema_version (id, version) VALUES (1, ?) \
+         ON CONFLICT(id) DO UPDATE SET version = excluded.version",
+    )
+    .bind(SCHEMA_VERSION)
+    .execute()
+    .await
+    .map_err(|error| format!("stamp scheduler schema version: {error}"))?;
+    Ok(SchemaMigrationReport {
+        before,
+        after: SCHEMA_VERSION,
+    })
+}
+
+/// The stored schema version, or 0 on a queue that predates the marker
+/// table or was never stamped. Both mean the migration pass has not run
+/// under this versioning scheme — the pass is idempotent and is what
+/// creates the table (via `schema.sql`) and the row in the first place.
+/// Whether the table exists is asked of `PRAGMA table_info`, which the
+/// Durable Object authorizer admits and which answers an empty set for a
+/// missing table, rather than read off a failed query's message.
+async fn stored_schema_version(db: &DurableDb) -> Result<i64, QueueError> {
+    let marker_columns = db
+        .query("PRAGMA table_info(scheduler_schema_version)")
+        .fetch_all::<QueueTableInfoRow>()
+        .await
+        .map_err(|error| format!("load scheduler_schema_version table_info: {error}"))?;
+    if marker_columns.is_empty() {
+        return Ok(0);
+    }
+    let version = db
+        .query("SELECT version FROM scheduler_schema_version WHERE id = 1")
+        .fetch_scalar_optional::<i64>()
+        .await
+        .map_err(|error| format!("read scheduler schema version: {error}"))?;
+    Ok(version.unwrap_or(0))
+}
+
+/// The full schema migration pass [`migrate`] runs. Re-running it is a
+/// no-op on a current queue — every step is idempotent — so the operator
+/// route is safe to call from a deploy retry. No transaction exists on
+/// `DurableDb`, so every step is written to be safe to re-run after a
+/// mid-pass failure. Every statement may run while the previous build
+/// still serves requests: additive only, expand then contract.
+async fn migrate_schema(db: &DurableDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue)")
         .fetch_all::<QueueTableInfoRow>()
@@ -5652,13 +5718,13 @@ mod sqlite_tests {
         PRIMARY KEY (task_id, depends_on_task_id)
     )";
 
-    /// `ensure_schema` must migrate a dev-era schema in any column order
+    /// `migrate` must migrate a dev-era schema in any column order
     /// and still backfill every pre-existing edge's mask: the backfill
     /// joins `queue.host_side`, so it must run after the host-side
     /// rebuild and must not depend on whether the ALTER columns it fills
     /// were just added (stow#367).
     #[tokio::test]
-    async fn ensure_schema_migrates_a_dev_era_queue_and_backfills_edge_masks() {
+    async fn migrate_migrates_a_dev_era_queue_and_backfills_edge_masks() {
         #[derive(skyzen::FromRow)]
         struct EdgeRow {
             side: i64,
@@ -5701,11 +5767,18 @@ mod sqlite_tests {
         .await
         .expect("dev-era edge row");
 
-        super::ensure_schema(&db).await.expect("ensure_schema");
+        let report = super::migrate(&db).await.expect("migrate");
+        assert_eq!(
+            (report.before, report.after),
+            (0, super::SCHEMA_VERSION),
+            "a pre-versioned queue reports 0 → SCHEMA_VERSION"
+        );
         // A second pass must be a no-op, not a failure — deploy retries.
-        super::ensure_schema(&db)
-            .await
-            .expect("ensure_schema retry");
+        let retry = super::migrate(&db).await.expect("migrate retry");
+        assert_eq!(
+            (retry.before, retry.after),
+            (super::SCHEMA_VERSION, super::SCHEMA_VERSION)
+        );
 
         let edge = db
             .query(
@@ -5737,6 +5810,119 @@ mod sqlite_tests {
             rows.iter()
                 .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0)
         );
+
+        assert_eq!(
+            super::stored_schema_version(&db)
+                .await
+                .expect("schema version"),
+            super::SCHEMA_VERSION,
+            "a migrated queue is stamped at the current schema version"
+        );
+    }
+
+    /// A fresh database runs the migration pass and ends stamped at
+    /// `SCHEMA_VERSION` — production's pre-versioned queues take the
+    /// same path exactly once, through the operator route.
+    #[tokio::test]
+    async fn a_fresh_database_migrates_and_is_stamped() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        let report = super::migrate(&db).await.expect("migrate");
+        assert_eq!((report.before, report.after), (0, super::SCHEMA_VERSION));
+        assert_eq!(
+            super::stored_schema_version(&db)
+                .await
+                .expect("schema version"),
+            super::SCHEMA_VERSION
+        );
+    }
+
+    /// The ops rule's cost bound (stow#432): request code runs no
+    /// schema work at all — no version read, no `PRAGMA`, no DDL — so
+    /// the cheapest request path issues exactly its own statement. The
+    /// backend's migration permit already refuses anything else; this
+    /// names what the permit is for.
+    #[tokio::test]
+    async fn a_request_path_issues_no_schema_statements() {
+        let (db, log) = counting_memory_db().await.expect("counting db");
+        let base = log.lock().expect("log").len();
+        super::panic_enabled(&db).await.expect("panic_enabled");
+        let issued = log.lock().expect("log")[base..].to_vec();
+        assert_eq!(
+            issued.len(),
+            1,
+            "the panic-flag read is one statement and nothing else: {issued:?}"
+        );
+        assert!(
+            issued[0].0.starts_with("SELECT"),
+            "the one statement is the settings read: {}",
+            issued[0].0
+        );
+    }
+
+    /// A queue stamped newer than this build's `SCHEMA_VERSION` was
+    /// migrated by newer code — `migrate` fails fast rather than letting
+    /// old code read a schema it does not understand.
+    #[tokio::test]
+    async fn migrate_refuses_a_newer_schema() {
+        // The migrate path's fixture: `migrate` runs only behind the
+        // operator route, where schema probes are permitted.
+        let db = memory_db_raw().await.expect("raw memory db");
+        super::migrate(&db).await.expect("first migrate");
+        db.query(&format!(
+            "UPDATE scheduler_schema_version SET version = {}",
+            super::SCHEMA_VERSION + 1
+        ))
+        .execute()
+        .await
+        .expect("stamp newer version");
+        let error = super::migrate(&db)
+            .await
+            .expect_err("a newer schema version must fail fast");
+        assert!(
+            error.to_string().contains("newer"),
+            "the error names the version skew, got: {error}"
+        );
+    }
+
+    /// The host backend enforces both halves of the ops rule (stow#432):
+    /// a request-path database refuses every `PRAGMA` — including the
+    /// documented ones, since request code must never probe the schema —
+    /// and every DDL head, while the migrate path's fixture still applies
+    /// the Durable Object authorizer's pragma allowlist (`user_version`
+    /// refused, `table_info` allowed) on top of permitting the DDL.
+    #[tokio::test]
+    async fn the_test_backend_refuses_schema_work_outside_migrate() {
+        let db = memory_db().await.expect("memory db");
+        for sql in [
+            "PRAGMA user_version",
+            "PRAGMA table_info(queue)",
+            "CREATE TABLE extra (id INTEGER)",
+            "ALTER TABLE queue ADD COLUMN extra INTEGER",
+            "DROP TABLE queue",
+        ] {
+            assert!(
+                db.query(sql).execute().await.is_err(),
+                "{sql} must fail on a request-path database"
+            );
+        }
+        let db = memory_db_raw().await.expect("raw memory db");
+        db.query("PRAGMA table_info(queue)")
+            .fetch_all::<super::QueueTableInfoRow>()
+            .await
+            .expect("the documented pragma the migrations rely on");
+        db.query("CREATE TABLE tmp_marker (id INTEGER)")
+            .execute()
+            .await
+            .expect("DDL on the migrate path's database");
+        let error = db
+            .query("PRAGMA user_version")
+            .execute()
+            .await
+            .expect_err("the DO authorizer refuses it even under migrate");
+        assert!(
+            error.to_string().contains("user_version"),
+            "the rejection names the pragma, got: {error}"
+        );
     }
 
     /// The side derivation each dev-era edge takes: a dep on the family
@@ -5745,7 +5931,7 @@ mod sqlite_tests {
     /// dep on the host triple under an owner on the same triple — or on
     /// neither — stays unestablished (-1).
     #[tokio::test]
-    async fn ensure_schema_derives_dev_era_edge_sides_from_triples() {
+    async fn migrate_derives_dev_era_edge_sides_from_triples() {
         #[derive(skyzen::FromRow)]
         struct EdgeRow {
             side: i64,
@@ -5795,10 +5981,8 @@ mod sqlite_tests {
             .expect("dev-era edge row");
         }
 
-        super::ensure_schema(&db).await.expect("ensure_schema");
-        super::ensure_schema(&db)
-            .await
-            .expect("ensure_schema retry is a no-op");
+        super::migrate(&db).await.expect("migrate");
+        super::migrate(&db).await.expect("migrate retry is a no-op");
 
         let rows = db
             .query(
@@ -6057,10 +6241,11 @@ mod sqlite_tests {
     /// Issue #418 regression guard: a submit chunk must not issue one
     /// statement per request or per edge. A 1000-request chunk with
     /// three deps each — 1000 fresh rows, 3000 edges, 4000 probe ids —
-    /// runs 15 statements on the host backend: `ensure_schema`'s idempotent
-    /// round (9), the chunked existence probes (2), the batched task
-    /// insert (1), the edge-set delete (1), and the batched edge inserts
-    /// (2). A return to per-row statements issues thousands.
+    /// runs 6 statements on the host backend: the chunked existence
+    /// probes (2), the batched task insert (1), the edge-set delete (1),
+    /// and the batched edge inserts (2). The schema check that topped
+    /// them up is gone entirely (stow#432): request code runs none. A
+    /// return to per-row statements issues thousands.
     #[tokio::test]
     async fn a_submit_chunk_issues_a_constant_statement_count() {
         let (db, log) = counting_memory_db().await.expect("counting db");
@@ -6082,9 +6267,9 @@ mod sqlite_tests {
 
         let issued = log.lock().expect("log").len() - base;
         assert!(
-            issued <= 15,
+            issued <= 6,
             "a 1000-request chunk must stay a constant statement count \
-             (measured 15), got {issued}"
+             (measured 6), got {issued}"
         );
     }
 }
