@@ -316,21 +316,7 @@ pub async fn load_cached_bundle(
             return Ok(None);
         }
     };
-    let profile = serde_json::from_str::<Profile>(&entry.profile_json).wrap_err_with(|| {
-        format!("parse artifact cache profile_json for rustc {rustc_version} cache key {cache_key}")
-    })?;
-    let emit = serde_json::from_str::<Vec<String>>(&entry.emit_json).wrap_err_with(|| {
-        format!("parse artifact cache emit_json for rustc {rustc_version} cache key {cache_key}")
-    })?;
-    let kind = serde_json::from_str::<ArtifactKind>(&entry.kind_json).wrap_err_with(|| {
-        format!("parse artifact cache kind_json for rustc {rustc_version} cache key {cache_key}")
-    })?;
-    let crate_types = serde_json::from_str::<Vec<RustCrateType>>(&entry.crate_types_json)
-        .wrap_err_with(|| {
-            format!(
-                "parse artifact cache crate_types_json for rustc {rustc_version} cache key {cache_key}"
-            )
-        })?;
+    let shape = EntryShape::parse(&entry, &rustc_version, &cache_key)?;
     Ok(Some(CachedArtifactBundle {
         provenance: ArtifactProvenance::from_column(&entry.provenance)?,
         oci_reference: entry.oci_reference,
@@ -344,10 +330,10 @@ pub async fn load_cached_bundle(
         dependency_compile_keys_json: entry.dependency_compile_keys_json,
         compile_millis: db_int(entry.compile_millis, "artifact cache entry compile_millis")?,
         size_bytes: db_int(entry.size_bytes, "artifact cache entry size_bytes")?,
-        profile,
-        emit,
-        kind,
-        crate_types,
+        profile: shape.profile,
+        emit: shape.emit,
+        kind: shape.kind,
+        crate_types: shape.crate_types,
         outputs,
         native,
         sigstore_signatures,
@@ -360,6 +346,50 @@ pub async fn load_cached_bundle(
         verified_marker_policy: entry.verified_marker_policy,
         _lease_lock: lease_lock,
     }))
+}
+
+/// The JSON-encoded unit shape columns of one artifact cache entry.
+struct EntryShape {
+    profile: Profile,
+    emit: Vec<String>,
+    kind: ArtifactKind,
+    crate_types: Vec<RustCrateType>,
+}
+
+impl EntryShape {
+    fn parse(
+        entry: &ArtifactCacheEntryRow,
+        rustc_version: &str,
+        cache_key: &str,
+    ) -> stow_types::error::Result<Self> {
+        let profile = serde_json::from_str::<Profile>(&entry.profile_json).wrap_err_with(|| {
+            format!(
+                "parse artifact cache profile_json for rustc {rustc_version} cache key {cache_key}"
+            )
+        })?;
+        let emit = serde_json::from_str::<Vec<String>>(&entry.emit_json).wrap_err_with(|| {
+            format!(
+                "parse artifact cache emit_json for rustc {rustc_version} cache key {cache_key}"
+            )
+        })?;
+        let kind = serde_json::from_str::<ArtifactKind>(&entry.kind_json).wrap_err_with(|| {
+            format!(
+                "parse artifact cache kind_json for rustc {rustc_version} cache key {cache_key}"
+            )
+        })?;
+        let crate_types = serde_json::from_str::<Vec<RustCrateType>>(&entry.crate_types_json)
+            .wrap_err_with(|| {
+                format!(
+                    "parse artifact cache crate_types_json for rustc {rustc_version} cache key {cache_key}"
+                )
+            })?;
+        Ok(Self {
+            profile,
+            emit,
+            kind,
+            crate_types,
+        })
+    }
 }
 
 #[derive(Debug, Clone, FromRow)]
