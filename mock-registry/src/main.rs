@@ -1399,7 +1399,7 @@ struct IndexFromRecordsArgs {
 struct ServeArgs {
     #[arg(long)]
     registry_root: PathBuf,
-    #[arg(long, default_value = "127.0.0.1:40123")]
+    #[arg(long, default_value = "127.0.0.1:28123")]
     listen: String,
 }
 
@@ -2057,7 +2057,7 @@ mod tests {
             b"{\"schemaVersion\":2}",
         )
         .expect("manifest file");
-        let app = registry_app("127.0.0.1:40123", root.path().to_path_buf());
+        let app = registry_app("127.0.0.1:28123", root.path().to_path_buf());
 
         // 1. Unauthenticated asset request → 401 + Bearer challenge. The
         // version ping carries the same challenge — that is how the
@@ -2080,7 +2080,7 @@ mod tests {
                 .to_owned();
             assert_eq!(
                 challenge,
-                "Bearer realm=\"http://127.0.0.1:40123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache:pull\""
+                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache:pull\""
             );
         }
 
@@ -2204,7 +2204,7 @@ mod tests {
         let root = tempfile::tempdir().expect("registry root");
         let bundle = b"not really a tar, but the bytes the index pins".to_vec();
         publish_slice(root.path(), &bundle).await;
-        let app = registry_app("127.0.0.1:40123", root.path().to_path_buf());
+        let app = registry_app("127.0.0.1:28123", root.path().to_path_buf());
         let uri = format!("/api/v1/bundles/{}", sha256_digest(&bundle));
 
         let response = app
