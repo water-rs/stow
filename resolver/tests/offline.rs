@@ -4,9 +4,9 @@
 //! never preferred over a newer non-yanked release) and the host/target
 //! unit split.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stow_resolver::{ResolveOptions, Resolver, StowSide, StowUnit};
 
@@ -23,43 +23,32 @@ struct Fixture {
     proc_macro: bool,
 }
 
+/// `value` serialized as a TOML document.
+fn toml_document(value: &Value) -> String {
+    toml::to_string(value).unwrap()
+}
+
 /// Pack `fixture` into `{reg}/{name}-{version}.crate` and append its
 /// index line, returning the sha256 the index records.
-#[allow(clippy::too_many_lines)] // manifest, tarball and index line in one builder
 fn publish(reg: &Path, fixture: &Fixture) -> String {
-    let mut manifest = format!(
-        "[package]\nname = \"{}\"\nversion = \"{}\"\nedition = \"2021\"\n",
-        fixture.name, fixture.version
-    );
+    let features: serde_json::Map<String, Value> = fixture
+        .features
+        .iter()
+        .map(|(name, members)| ((*name).to_owned(), json!(members)))
+        .collect();
+    let mut manifest = json!({
+        "package": { "name": fixture.name, "version": fixture.version, "edition": "2021" },
+        "features": features,
+        "dependencies": fixture
+            .deps
+            .iter()
+            .map(|(name, req, features)| {
+                ((*name).to_owned(), json!({ "version": req, "features": features }))
+            })
+            .collect::<serde_json::Map<_, _>>(),
+    });
     if fixture.proc_macro {
-        manifest.push_str("\n[lib]\nproc-macro = true\n");
-    }
-    if !fixture.features.is_empty() {
-        manifest.push_str("\n[features]\n");
-        for (name, members) in fixture.features {
-            writeln!(
-                manifest,
-                "{name} = [{}]",
-                members
-                    .iter()
-                    .map(|member| format!("\"{member}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-            .unwrap();
-        }
-    }
-    for (name, req, features) in &fixture.deps {
-        write!(
-            manifest,
-            "\n[dependencies.{name}]\nversion = \"{req}\"\nfeatures = [{}]",
-            features
-                .iter()
-                .map(|feature| format!("\"{feature}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .unwrap();
+        manifest["lib"] = json!({ "proc-macro": true });
     }
     let lib = if fixture.proc_macro {
         "extern crate proc_macro;\n"
@@ -76,7 +65,7 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     for (path, contents) in [
         (
             format!("{}-{}/Cargo.toml", fixture.name, fixture.version),
-            manifest,
+            toml_document(&manifest),
         ),
         (
             format!("{}-{}/src/lib.rs", fixture.name, fixture.version),
@@ -93,32 +82,31 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     tar.into_inner().unwrap().finish().unwrap();
     let cksum = format!("{:x}", Sha256::digest(std::fs::read(&tarball).unwrap()));
 
-    let mut deps_json = String::new();
-    for (name, req, features) in &fixture.deps {
-        write!(
-            deps_json,
-            "{{\"name\":\"{name}\",\"req\":\"^{req}\",\"features\":{},\"optional\":false,\"default_features\":true,\"target\":null,\"kind\":\"normal\"}},",
-            serde_json::to_string(&features).unwrap(),
-        )
-        .unwrap();
-    }
-    let line = format!(
-        "{{\"name\":\"{}\",\"vers\":\"{}\",\"deps\":[{}],\"cksum\":\"{}\",\"features\":{},\"yanked\":{}}}\n",
-        fixture.name,
-        fixture.version,
-        deps_json.trim_end_matches(','),
-        cksum,
-        serde_json::Value::Object(
-            fixture
-                .features
-                .iter()
-                .map(|(name, members)| {
-                    ((*name).to_owned(), serde_json::to_value(members).unwrap())
-                })
-                .collect(),
-        ),
-        fixture.yanked,
-    );
+    let deps: Vec<Value> = fixture
+        .deps
+        .iter()
+        .map(|(name, req, features)| {
+            json!({
+                "name": name,
+                "req": format!("^{req}"),
+                "features": features,
+                "optional": false,
+                "default_features": true,
+                "target": null,
+                "kind": "normal",
+            })
+        })
+        .collect();
+    let mut line = serde_json::to_string(&json!({
+        "name": fixture.name,
+        "vers": fixture.version,
+        "deps": deps,
+        "cksum": cksum,
+        "features": features,
+        "yanked": fixture.yanked,
+    }))
+    .unwrap();
+    line.push('\n');
     // Sparse-index shard layout: 1 → `1/n`, 2 → `2/na`,
     // 3 → `3/a/abc`, else `ab/cd/name` — all lowercase.
     let lower = fixture.name.to_lowercase();
@@ -144,10 +132,12 @@ fn resolver_at(reg: &Path) -> (tempfile::TempDir, Resolver) {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("config.toml"),
-        format!(
-            "[source.crates-io]\nreplace-with = \"local\"\n\n[source.local]\nlocal-registry = \"{}\"\n",
-            reg.display()
-        ),
+        toml_document(&json!({
+            "source": {
+                "crates-io": { "replace-with": "local" },
+                "local": { "local-registry": reg },
+            },
+        })),
     )
     .unwrap();
     let resolver = Resolver::with_cargo_home(
@@ -159,33 +149,31 @@ fn resolver_at(reg: &Path) -> (tempfile::TempDir, Resolver) {
 }
 
 /// A single-member project tree on disk; returns its manifest path.
-fn project(dir: &Path, dependencies: &str) -> PathBuf {
+fn project(dir: &Path, dependencies: &Value) -> PathBuf {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/lib.rs"), "").unwrap();
     let manifest = dir.join("Cargo.toml");
     std::fs::write(
         &manifest,
-        format!(
-            "[package]\nname = \"root\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n{dependencies}"
-        ),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dependencies": dependencies,
+        })),
     )
     .unwrap();
     manifest
 }
 
-fn lock_entry(name: &str, version: &str, source: &str) -> String {
-    format!("[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"{source}\"\n")
+fn lock_entry(name: &str, version: &str, source: &str) -> Value {
+    json!({ "name": name, "version": version, "source": source })
 }
 
-fn dropped_lockfile(entries: &[String], deps: &[&str]) -> String {
-    format!(
-        "version = 4\n\n[[package]]\nname = \"root\"\nversion = \"0.0.0\"\ndependencies = [{}]\n\n{}",
-        deps.iter()
-            .map(|dep| format!("\"{dep}\""))
-            .collect::<Vec<_>>()
-            .join(", "),
-        entries.join("\n"),
-    )
+fn dropped_lockfile(entries: Vec<Value>, deps: &[&str]) -> String {
+    let root = json!({ "name": "root", "version": "0.0.0", "dependencies": deps });
+    toml_document(&json!({
+        "version": 4,
+        "package": std::iter::once(root).chain(entries).collect::<Vec<_>>(),
+    }))
 }
 
 /// Every `name` unit in the one requested target's output.
@@ -218,10 +206,10 @@ fn yanked_pin_is_admitted() {
             proc_macro: false,
         },
     );
-    let manifest = project(&work.path().join("root"), "[dependencies]\ndep = \"1\"\n");
+    let manifest = project(&work.path().join("root"), &json!({ "dep": "1" }));
     let (_home, resolver) = resolver_at(&reg);
     let lock = dropped_lockfile(
-        &[lock_entry("dep", "1.0.0", CRATES_IO)],
+        vec![lock_entry("dep", "1.0.0", CRATES_IO)],
         &["dep 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"],
     );
     let out = resolver
@@ -257,10 +245,10 @@ fn newer_release_beats_the_pin() {
             },
         );
     }
-    let manifest = project(&work.path().join("root"), "[dependencies]\ndep = \"1\"\n");
+    let manifest = project(&work.path().join("root"), &json!({ "dep": "1" }));
     let (_home, resolver) = resolver_at(&reg);
     let lock = dropped_lockfile(
-        &[lock_entry("dep", "1.0.0", CRATES_IO)],
+        vec![lock_entry("dep", "1.0.0", CRATES_IO)],
         &["dep 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"],
     );
     let out = resolver
@@ -305,7 +293,9 @@ fn git_pin_locks_the_sha() {
     let write_manifest = |version: &str| {
         std::fs::write(
             repo.join("Cargo.toml"),
-            format!("[package]\nname = \"gitdep\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+            toml_document(&json!({
+                "package": { "name": "gitdep", "version": version, "edition": "2021" },
+            })),
         )
         .unwrap();
         std::fs::write(repo.join("src/lib.rs"), "").unwrap();
@@ -316,24 +306,16 @@ fn git_pin_locks_the_sha() {
     let pinned = sha_of("HEAD");
     write_manifest("0.2.0");
 
+    let url = url::Url::from_file_path(&repo).unwrap();
     let manifest = project(
         &work.path().join("root"),
-        &format!(
-            "[dependencies]\ngitdep = {{ git = \"file://{}\" }}\n",
-            repo.display()
-        ),
+        &json!({ "gitdep": { "git": url.as_str() } }),
     );
     let (_home, resolver) = resolver_at(&work.path().join("registry"));
+    let source = format!("git+{url}#{pinned}");
     let lock = dropped_lockfile(
-        &[lock_entry(
-            "gitdep",
-            "0.1.0",
-            &format!("git+file://{}#{pinned}", repo.display()),
-        )],
-        &[&format!(
-            "gitdep 0.1.0 (git+file://{}#{pinned})",
-            repo.display()
-        )],
+        vec![lock_entry("gitdep", "0.1.0", &source)],
+        &[&format!("gitdep 0.1.0 ({source})")],
     );
     let out = resolver
         .resolve(
@@ -380,7 +362,7 @@ fn normal_and_proc_macro_sides_split() {
     );
     let manifest = project(
         &work.path().join("root"),
-        "[dependencies]\nshared = { version = \"1\", features = [\"a\"] }\npm = \"1\"\n",
+        &json!({ "shared": { "version": "1", "features": ["a"] }, "pm": "1" }),
     );
     let (_home, resolver) = resolver_at(&reg);
     let out = resolver
