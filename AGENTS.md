@@ -206,7 +206,13 @@ the design it produces looks careful.
 
 ## Operator notifications
 
-Every email stow sends goes through Cloudflare Email Service **Email Sending**, whether it is an alert, an incident, a breaker trip or a watchdog report. The sending domain `stow.waterui.dev` is onboarded, the sender is `alerts@stow.waterui.dev`, and mail goes to the operator. Inside the Worker it uses the `send_email` binding; everywhere else (Actions, `stow-admin`) it uses the REST API, `POST /accounts/{account_id}/email/sending/send`, with a token scoped to email sending. GitHub notifications and Email Routing are not alert channels. A GitHub issue may record an incident, but it never notifies anyone.
+Every alert, incident, breaker trip and watchdog report is a GitHub issue in this repository labelled `incident`:
+- one issue per incident, opened when it starts;
+- updated at most hourly while it stays open;
+- closed when it is cleared;
+- deduplicated by label and title prefix.
+
+GitHub's notifications reach the operator. Actions jobs use their `GITHUB_TOKEN` with `issues: write`. The edge uses the GitHub App installation token it already mints.
 
 ## Resources are spent deliberately
 
