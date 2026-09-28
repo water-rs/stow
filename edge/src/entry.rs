@@ -105,6 +105,17 @@ fn worker(env: &wasm::Env) -> Router {
 
     let mut nodes = anonymous_nodes(&panic_gate);
     nodes.extend(trusted_nodes(&trust_gate));
+    // Outermost wrapper: every response passing a route is observed for
+    // the #438 error-rate signal — a 5xx writes one Analytics Engine
+    // fault event keyed by route family (panic sheds count too: a shed
+    // is still a 503 the caller received). The dataset also lands in a
+    // thread-local so `scheduler_client`'s DO `overloaded` catches can
+    // record from inside `fetch`, where no env handle exists.
+    crate::faults::install_dataset(analytics.clone());
+    let nodes: Vec<RouteNode> = nodes
+        .into_iter()
+        .map(|node| node.with(crate::faults::FaultWatch))
+        .collect();
 
     Route::new(nodes)
         .with(db)

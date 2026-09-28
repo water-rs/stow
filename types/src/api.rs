@@ -772,6 +772,97 @@ pub struct DispatchFreezeCostEntry {
     pub budget: f64,
 }
 
+/// One production-fault signal — #438.
+///
+/// Runs every ten minutes over a sliding window. Each opens and
+/// resolves independently; an open signal mails once, a resolved
+/// signal mails once, and a still-open signal is summarised in a
+/// digest at most hourly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultSignal {
+    /// Worker 5xx rate over the window.
+    ErrorRate,
+    /// `exceededCpu`/`exceededMemory`/`fatalInternalErrors` on the DO,
+    /// plus DO `overloaded` errors the edge records itself.
+    ResourceFailures,
+    /// Failed attempts inside the window, by class and target, plus
+    /// tasks sitting at or above the attempt threshold.
+    BuildFailures,
+    /// Oldest pending task's age, and dispatch stalls (pending work,
+    /// free capacity, nothing dispatched in the window).
+    QueueHealth,
+    /// Any metered dimension past half its daily budget.
+    UsageWarn,
+    /// Any metered dimension past 80% of its daily budget — the last
+    /// warning before the #279 cost trip at 100%.
+    UsageHigh,
+}
+
+impl FaultSignal {
+    /// The label alert subjects and digests print.
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::ErrorRate => "error rate",
+            Self::ResourceFailures => "resource failures",
+            Self::BuildFailures => "build failures",
+            Self::QueueHealth => "queue health",
+            Self::UsageWarn => "usage at 50% of daily budget",
+            Self::UsageHigh => "usage at 80% of daily budget",
+        }
+    }
+}
+
+/// One offending row an open signal names — a route family, a failure
+/// class, or a task — with a link where one exists (a run URL).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct FaultOffender {
+    /// What is offending (`register: POST ... -> 500`, a route family,
+    /// a task id + crate).
+    pub label: String,
+    /// The count or measure this offender carries (requests, failures,
+    /// attempt number) rendered for the alert.
+    pub count: f64,
+    /// A link for the offender — an Actions run URL — when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// One signal's evaluated state for the window.
+///
+/// The scheduler object produces the object-side signals
+/// (`BuildFailures`, `QueueHealth`) on the events that change them —
+/// completion, enqueue, dispatch — and stores them in its
+/// `fault_signals` table. The edge-side signals (`ErrorRate`,
+/// `ResourceFailures`, `UsageWarn`, `UsageHigh`) are evaluated by the
+/// external watchdog from Analytics Engine events the edge writes per
+/// request, so the vocabulary here is shared by both evaluators.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct FaultObservation {
+    /// The signal this answers for.
+    pub signal: FaultSignal,
+    /// Whether the signal's min-sample + threshold condition held over
+    /// the window.
+    pub open: bool,
+    /// What was measured, in `unit`.
+    pub observed: f64,
+    /// The threshold `observed` is read against (a rate percent, an
+    /// event count, minutes, or a budget ratio).
+    pub threshold: f64,
+    /// The unit `observed`/`threshold` are in — `%`, `events`,
+    /// `minutes`, `x daily budget`.
+    pub unit: String,
+    /// The window's sample (requests, attempts, pending rows).
+    pub sample: f64,
+    /// The minimum sample the signal required — below it `open` is
+    /// always false however bad the ratio.
+    pub min_sample: f64,
+    /// Top offenders for an open signal (already bounded).
+    #[serde(default)]
+    pub offenders: Vec<FaultOffender>,
+}
+
 /// One alert channel's delivery result.
 ///
 /// The edge alerts by email only (Email Sending) — its App token has

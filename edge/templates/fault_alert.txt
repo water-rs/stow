@@ -1,0 +1,18 @@
+stow fault {{ kind }} — evaluated over the trailing 10 minutes.
+
+{% for line in lines -%}
+== {{ line.title }} ==
+  observed:  {{ line.observed }} {{ line.unit }} (threshold {{ line.threshold }})
+  sample:    {{ line.sample }} over {{ line.window_minutes }}m
+{%- if !line.offenders.is_empty() %}
+  top offenders:
+{%- for offender in line.offenders %}
+    - {{ offender.label }} ({{ offender.count }}){% if let Some(url) = offender.url %} — {{ url }}{% endif %}
+{%- endfor %}
+{%- endif %}
+
+{% endfor -%}
+These signals evaluate every ten minutes and digest at most hourly
+while open. Dispatch freeze state and queue detail:
+  stow-admin dispatch-freeze status
+  stow-admin queue list

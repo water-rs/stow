@@ -121,6 +121,34 @@ impl freeze::FreezeStore for DbStore<'_> {
 /// has no `issues` grant and will not get one.
 type EdgeAlerter = crate::email::EdgeAlerter;
 
+/// `faults::SignalStore` over the object's `fault_signals` table — the
+/// #438 state seam `apply_fault_transitions` runs on.
+impl crate::faults::SignalStore for DbStore<'_> {
+    fn open_signals(
+        &self,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<
+            Vec<(stow_types::api::FaultSignal, crate::faults::SignalState)>,
+            QueueError,
+        >,
+    > + Send {
+        queue::fault_signals(self.0)
+    }
+    fn open(
+        &self,
+        signal: stow_types::api::FaultSignal,
+        state: &crate::faults::SignalState,
+    ) -> impl std::future::Future<Output = std::result::Result<(), QueueError>> + Send {
+        queue::set_fault_signal(self.0, signal, state)
+    }
+    fn resolve(
+        &self,
+        signal: stow_types::api::FaultSignal,
+    ) -> impl std::future::Future<Output = std::result::Result<(), QueueError>> + Send {
+        queue::delete_fault_signal(self.0, signal)
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
 pub struct Scheduler;
@@ -230,6 +258,8 @@ async fn submit(
         };
         to_error(error).set_status(status)
     })?;
+    // Enqueue moved queue health — evaluate that signal on this event.
+    queue_health_evaluation(db, env).await;
     // Dispatch is not this request's work: pointing the alarm at now lets
     // `run_alarm`'s dispatch pass run it, so the submit answers once the
     // queue write lands instead of holding the client — and burning the
@@ -303,11 +333,77 @@ async fn complete(
     if !report.success {
         evaluate_dispatch_freeze(&env, &db).await?;
     }
+    // Every completion moves the build-failures window — successes
+    // drain it the same as failures fill it.
+    build_failures_evaluation(&db, &env).await;
     // Same handoff as submit: the runner's report is acknowledged as soon
     // as the queue row lands, and the alarm's dispatch pass — not this
     // request — runs claim plus the GitHub fan-out.
     arm_dispatch_alarm(&alarm).await?;
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// The #438 object-side evaluation one event runs: `observation` is the
+/// signal whose fact the event changed — build failures on completion,
+/// queue health on enqueue and on each dispatch pass. A transition mails
+/// once; a still-open signal digests at most hourly. The evaluation is
+/// deliberately non-fatal: it observes the event, it never fails it.
+async fn evaluate_fault_signals(
+    db: &MeteredDb,
+    env: &WasmEnv,
+    observation: stow_types::api::FaultObservation,
+) {
+    let sink = EdgeAlerter::new(env.as_js());
+    match crate::faults::apply_fault_transitions(
+        &DbStore(db),
+        &sink,
+        vec![observation],
+        &iso_now(),
+        &iso_minutes_ago(crate::faults::DIGEST_INTERVAL_MINUTES),
+    )
+    .await
+    {
+        Ok(report)
+            if !report.opened.is_empty() || !report.resolved.is_empty() || report.digested =>
+        {
+            tracing::warn!(
+                opened = ?report.opened,
+                resolved = ?report.resolved,
+                digested = report.digested,
+                "fault-signal transitions"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, "fault-signal evaluation failed");
+        }
+    }
+}
+
+/// The build-failures signal's run links come from `GITHUB_REPO`; an
+/// unset binding leaves offenders unlinked rather than failing the
+/// evaluation.
+async fn build_failures_evaluation(db: &MeteredDb, env: &WasmEnv) {
+    let run_url_prefix = read_optional_string_binding(env, GITHUB_REPO_BINDING)
+        .map(|repo| format!("https://github.com/{repo}/actions/runs/"));
+    match queue::build_failure_observation(
+        db,
+        crate::faults::FAULT_WINDOW_MINUTES,
+        run_url_prefix.as_deref(),
+    )
+    .await
+    {
+        Ok(observation) => evaluate_fault_signals(db, env, observation).await,
+        Err(error) => tracing::error!(%error, "build-failures observation failed"),
+    }
+}
+
+/// Queue health on the enqueue and dispatch events that move it.
+async fn queue_health_evaluation(db: &MeteredDb, env: &WasmEnv) {
+    match queue::queue_health_observation(db, crate::faults::FAULT_WINDOW_MINUTES).await {
+        Ok(observation) => evaluate_fault_signals(db, env, observation).await,
+        Err(error) => tracing::error!(%error, "queue-health observation failed"),
+    }
 }
 
 async fn status(db: MeteredDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
@@ -537,6 +633,19 @@ fn iso_now() -> String {
         .expect("Date#toISOString returns a string")
 }
 
+/// `iso_now` shifted back `minutes` — the digest-due comparison point.
+fn iso_minutes_ago(minutes: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a minutes delta is far below 2^53"
+    )]
+    let offset_ms = (minutes as f64).mul_add(-60_000.0, js_sys::Date::new_0().get_time());
+    js_sys::Date::new(&js_sys::wasm_bindgen::JsValue::from_f64(offset_ms))
+        .to_iso_string()
+        .as_string()
+        .expect("Date#toISOString returns a string")
+}
+
 /// After a failed completion, decide whether the trailing window trips
 /// the freeze. `apply_transition` owns the one-alert-per-transition
 /// rule: a live freeze answers `Unchanged` without rewriting the
@@ -738,6 +847,7 @@ impl queue::CoverageOracle for CatalogCoverage {
 }
 
 async fn dispatch_pending(env: &WasmEnv, db: &MeteredDb) -> Result<()> {
+    queue_health_evaluation(db, env).await;
     // The dispatch freeze gates here and inside `claim_dispatchable_tasks`
     // — the enqueue side never consults it, so misses keep arriving and
     // stay pending for the first pass after a human lifts the freeze. It

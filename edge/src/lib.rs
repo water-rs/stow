@@ -25,6 +25,8 @@ pub(crate) mod dependency_resolver;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod errors;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod faults;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod fetch_guard;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod freeze;

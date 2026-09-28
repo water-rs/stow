@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<body>
+<p><strong>stow fault {{ kind }}</strong> — evaluated over the trailing
+10 minutes.</p>
+{% for line in lines %}
+<h3>{{ line.title }}</h3>
+<table>
+  <tr><td>observed</td><td><code>{{ line.observed }} {{ line.unit }}</code>
+      (threshold {{ line.threshold }})</td></tr>
+  <tr><td>sample</td><td>{{ line.sample }} over {{ line.window_minutes }}m</td></tr>
+</table>
+{%- if !line.offenders.is_empty() %}
+<ul>
+{%- for offender in line.offenders %}
+  <li>{{ offender.label }} ({{ offender.count }}){% if let Some(url) = offender.url %} —
+      <a href="{{ url }}">{{ url }}</a>{% endif %}</li>
+{%- endfor %}
+</ul>
+{%- endif %}
+{% endfor %}
+<p>These signals evaluate every ten minutes and digest at most hourly
+while open. Dispatch freeze state and queue detail:
+<code>stow-admin dispatch-freeze status</code>,
+<code>stow-admin queue list</code>.</p>
+</body>
+</html>

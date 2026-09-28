@@ -187,6 +187,20 @@ CREATE TABLE IF NOT EXISTS attempt_outcomes (
 CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_finished
 ON attempt_outcomes (finished_at);
 
+-- #438 fault signals: one row per currently-open signal. The row's
+-- presence means the signal is open; `observation` is the JSON
+-- FaultObservation stored at open time and refreshed every tick while
+-- the signal stays open (the resolve alert names what it recorded, and
+-- the digest reads current numbers). `last_digest_at` caps digest
+-- alerts at one per signal per hour.
+CREATE TABLE IF NOT EXISTS fault_signals (
+    -- FaultSignal snake_case — 'error_rate', 'queue_health', ...
+    signal TEXT PRIMARY KEY,
+    opened_at TEXT NOT NULL,
+    last_digest_at TEXT NOT NULL,
+    observation TEXT NOT NULL
+);
+
 -- Stable rustc channel cache: a single row (id = 1) holding the version
 -- parsed out of channel-rust-stable.toml. The request API resolves the
 -- current stable rustc through this table so repeated human requests do

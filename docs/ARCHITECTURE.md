@@ -739,6 +739,27 @@ edge-health signals (request error rate, exceeded CPU/memory, usage
 percentages) are the watchdog's too — the GraphQL Analytics API is only
 read from Actions, never from the edge.
 
+The **fault signals** (#438) split by where the fact lives, and none of
+them poll. The scheduler object evaluates its own signals on the events
+that change them — **build failures** on every completion report (the
+`attempt_outcomes` window, offenders being attempt-threshold tasks and
+dominant classes) and **queue health** on enqueue and on each dispatch
+pass (oldest eligible pending age, and pending-without-claims stalls,
+suppressed while dispatch is frozen). A transition mails once through
+the same `send_email` sink, keyed `fault-{signal}`; open state lives in
+the object's `fault_signals` table, a resolved signal mails once and
+drops its row, and a still-open signal digests at most hourly — only
+when an evaluation actually runs.
+
+The edge-side signals are the #450 watchdog's: **error rate** (Worker
+5xx share of requests), **resource failures** (the DO's `exceededCpu`/
+`exceededMemory`/`fatalInternalErrors` sums plus `overloaded` errors),
+and **usage** at 50%/80% of each daily budget ahead of the 100% cost
+trip. The edge only *writes* their inputs — a `FaultWatch` middleware
+records each 5xx into `STOW_ANALYTICS` fault events and
+`scheduler_client` records each DO `overloaded` catch, both per event —
+and the watchdog reads them back in Actions at no Cloudflare cost.
+
 ## Tunables (Cloudflare bindings)
 
 The edge worker reads runtime knobs from `vars` bindings via

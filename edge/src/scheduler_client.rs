@@ -283,19 +283,28 @@ async fn fetch(
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
-    let response = stub
-        .fetch(request)
-        .await
-        .map_err(|error| SchedulerClientError::Fetch {
+    let response = stub.fetch(request).await.map_err(|error| {
+        let message = error.to_string();
+        // A "Durable Object is overloaded" rejection is a #438
+        // resource-failure signal — record it so the scheduled
+        // check sees it, then keep returning the real error.
+        if message.contains("overloaded") {
+            crate::faults::record_do_overloaded(url);
+        }
+        SchedulerClientError::Fetch {
             url: url.to_owned(),
-            message: error.to_string(),
-        })?;
+            message,
+        }
+    })?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let body = response.into_body().into_string().await.map_or_else(
             |error| format!("read scheduler error body: {error}"),
             |body| body.to_string(),
         );
+        if body.contains("overloaded") {
+            crate::faults::record_do_overloaded(url);
+        }
         return Err(SchedulerClientError::Http {
             url: url.to_owned(),
             status,

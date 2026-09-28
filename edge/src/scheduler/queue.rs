@@ -6,8 +6,9 @@ use super::meter::MeteredDb;
 use skyzen_services::durable::DbValue;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueRequest,
-    EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
-    RunnerFamily, SchedulerStatus, SchemaMigrationReport, TaskLane, runner_family,
+    EnqueueSource, FaultObservation, FaultOffender, FaultSignal, PublishedSliceRow, QueueSelector,
+    QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus, SchemaMigrationReport,
+    TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -1885,6 +1886,346 @@ pub async fn freeze_transitions(
             })
         })
         .collect()
+}
+
+// ===== Fault signals (`fault_signals` table, #438) =====
+//
+// One row per open signal — `signal` is the `FaultSignal` serde key
+// (`error_rate`, `queue_health`, …) and `observation` the serialized
+// `FaultObservation` the resolve alert names after the window drains.
+
+/// Every open signal's stored state.
+pub async fn fault_signals(
+    db: &MeteredDb,
+) -> Result<Vec<(FaultSignal, crate::faults::SignalState)>, QueueError> {
+    ensure_schema(db).await?;
+    let rows = db
+        .query("SELECT signal, opened_at, last_digest_at, observation FROM fault_signals")
+        .fetch_all::<FaultSignalRow>()
+        .await
+        .map_err(|error| format!("read fault signals: {error}"))?;
+    rows.into_iter()
+        .map(|row| {
+            let signal = serde_json::from_value::<FaultSignal>(serde_json::Value::String(
+                row.signal.clone(),
+            ))
+            .map_err(|error| {
+                QueueError::Invariant(format!(
+                    "fault_signals row holds unknown signal `{}`: {error}",
+                    row.signal
+                ))
+            })?;
+            let observation = serde_json::from_str(&row.observation).map_err(|error| {
+                QueueError::Invariant(format!(
+                    "fault_signals row {signal:?} holds unparseable observation: {error}"
+                ))
+            })?;
+            Ok((
+                signal,
+                crate::faults::SignalState {
+                    opened_at: row.opened_at,
+                    last_digest_at: row.last_digest_at,
+                    observation,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// One `fault_signals` row.
+#[derive(Debug, skyzen::FromRow)]
+struct FaultSignalRow {
+    signal: String,
+    opened_at: String,
+    last_digest_at: String,
+    observation: String,
+}
+
+/// The serde key a `FaultSignal` stores/queries under.
+fn signal_name(signal: FaultSignal) -> Result<String, QueueError> {
+    serde_json::to_value(signal)
+        .map_err(|error| QueueError::Invariant(format!("serialize fault signal: {error}")))?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| QueueError::Invariant("fault signal is not a string".to_owned()))
+}
+
+/// Insert or refresh one open signal's state.
+pub async fn set_fault_signal(
+    db: &MeteredDb,
+    signal: FaultSignal,
+    state: &crate::faults::SignalState,
+) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    let observation = serde_json::to_string(&state.observation)
+        .map_err(|error| QueueError::Invariant(format!("serialize fault observation: {error}")))?;
+    db.query(
+        "INSERT INTO fault_signals (signal, opened_at, last_digest_at, observation) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT(signal) DO UPDATE SET \
+             last_digest_at = excluded.last_digest_at, observation = excluded.observation",
+    )
+    .bind(signal_name(signal)?)
+    .bind(state.opened_at.as_str())
+    .bind(state.last_digest_at.as_str())
+    .bind(observation)
+    .execute()
+    .await
+    .map_err(|error| format!("write fault signal: {error}"))?;
+    Ok(())
+}
+
+/// Drop a resolved signal's row.
+pub async fn delete_fault_signal(db: &MeteredDb, signal: FaultSignal) -> Result<(), QueueError> {
+    ensure_schema(db).await?;
+    db.query("DELETE FROM fault_signals WHERE signal = ?")
+        .bind(signal_name(signal)?)
+        .execute()
+        .await
+        .map_err(|error| format!("delete fault signal: {error}"))?;
+    Ok(())
+}
+
+/// The build-failures signal's observation over the trailing window —
+/// a min-sample + failure-rate verdict on `attempt_outcomes` (the same
+/// append-only log the freeze breaker reads), with two offender kinds:
+/// tasks sitting at or above the attempt threshold, and the window's
+/// dominant failure classes. `run_url_prefix` is the repo's Actions
+/// runs URL (`https://github.com/{repo}/actions/runs/`); without it
+/// offenders go out unlinked.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    reason = "queue and outcome counts sit far below 2^53; MAX_OFFENDERS is a small const"
+)]
+pub async fn build_failure_observation(
+    db: &MeteredDb,
+    window_minutes: u32,
+    run_url_prefix: Option<&str>,
+) -> Result<FaultObservation, QueueError> {
+    use crate::faults::{
+        BUILD_FAILURE_ATTEMPT_THRESHOLD, BUILD_FAILURE_MIN_OUTCOMES, BUILD_FAILURE_PERCENT,
+        MAX_OFFENDERS,
+    };
+    ensure_schema(db).await?;
+    let window = format!("-{window_minutes} minutes");
+    let (total, failures) = {
+        let row = db
+            .query(
+                "SELECT count(*) AS outcomes, \
+                     COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failures \
+                 FROM attempt_outcomes \
+                 WHERE finished_at >= datetime('now', ?)",
+            )
+            .bind(window.clone())
+            .fetch_one::<WindowTotalsRow>()
+            .await
+            .map_err(|error| format!("count fault-window outcomes: {error}"))?;
+        (row.outcomes as f64, row.failures as f64)
+    };
+    let run_url = |run_id: Option<&str>| {
+        run_id.and_then(|id| run_url_prefix.map(|prefix| format!("{prefix}{id}")))
+    };
+    // Retry-storm offenders first — a task at attempt ≥4 is the shape
+    // the motivating incident took (tasks retried to attempt 12).
+    let storm_rows = db
+        .query(
+            "SELECT task_id, crate_name, attempt, github_run_id FROM queue \
+             WHERE attempt >= ? AND status != 'completed' \
+             ORDER BY attempt DESC, updated_at DESC LIMIT ?",
+        )
+        .bind(i64::from(BUILD_FAILURE_ATTEMPT_THRESHOLD))
+        .bind(MAX_OFFENDERS as i64)
+        .fetch_all::<StormTaskRow>()
+        .await
+        .map_err(|error| format!("list attempt-threshold tasks: {error}"))?;
+    let mut offenders: Vec<FaultOffender> = Vec::with_capacity(MAX_OFFENDERS);
+    for row in storm_rows {
+        offenders.push(FaultOffender {
+            label: format!(
+                "{} attempt {} ({})",
+                row.crate_name,
+                row.attempt,
+                &row.task_id[..12.min(row.task_id.len())]
+            ),
+            count: f64::from(row.attempt),
+            url: run_url(row.github_run_id.as_deref()),
+        });
+    }
+    // Then the window's dominant failure classes, each linked to its
+    // freshest failing run when one reported a run id.
+    let remaining = MAX_OFFENDERS.saturating_sub(offenders.len()) as i64;
+    if remaining > 0 {
+        let class_rows = db
+            .query(
+                "SELECT failure_class, count(*) AS count, \
+                     MAX(github_run_id) AS run_id \
+                 FROM attempt_outcomes \
+                 WHERE success = 0 AND finished_at >= datetime('now', ?) \
+                 GROUP BY failure_class ORDER BY count DESC, failure_class LIMIT ?",
+            )
+            .bind(window)
+            .bind(remaining)
+            .fetch_all::<ClassOffenderRow>()
+            .await
+            .map_err(|error| format!("list window failure classes: {error}"))?;
+        for row in class_rows {
+            offenders.push(FaultOffender {
+                label: row.failure_class.unwrap_or_else(|| "unknown".to_owned()),
+                count: row.count as f64,
+                url: run_url(row.run_id.as_deref()),
+            });
+        }
+    }
+    let percent = if total > 0.0 {
+        failures / total * 100.0
+    } else {
+        0.0
+    };
+    Ok(FaultObservation {
+        signal: FaultSignal::BuildFailures,
+        open: crate::faults::opens(
+            total,
+            BUILD_FAILURE_MIN_OUTCOMES,
+            percent,
+            BUILD_FAILURE_PERCENT,
+        ),
+        observed: percent,
+        threshold: BUILD_FAILURE_PERCENT,
+        unit: "% failed".to_owned(),
+        sample: total,
+        min_sample: BUILD_FAILURE_MIN_OUTCOMES,
+        offenders,
+    })
+}
+
+/// The queue-health signal — the oldest dispatchable pending row's age
+/// in minutes, and the dispatch stall: pending work with zero claims
+/// inside the window while dispatch is not frozen. `created_at` is the
+/// age base — a re-requested row resurrects through `pending` with its
+/// original timestamp, which is the age a consumer waits on anyway.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    reason = "queue depths and second deltas sit far below 2^53; MAX_OFFENDERS is a small const"
+)]
+pub async fn queue_health_observation(
+    db: &MeteredDb,
+    window_minutes: u32,
+) -> Result<FaultObservation, QueueError> {
+    use crate::faults::{MAX_OFFENDERS, QUEUE_AGE_MINUTES, QUEUE_STALL_MIN_PENDING};
+    ensure_schema(db).await?;
+    // Only rows dispatch may claim right now count — a `not_before`
+    // delay is deliberate back-off, not a stall.
+    let health = db
+        .query(
+            "SELECT count(*) AS pending, \
+                 CAST(strftime('%s','now') AS INTEGER) \
+                     - CAST(strftime('%s', MIN(created_at)) AS INTEGER) AS oldest_seconds \
+             FROM queue WHERE status = 'pending' AND not_before <= datetime('now')",
+        )
+        .fetch_one::<QueueHealthRow>()
+        .await
+        .map_err(|error| format!("read queue health: {error}"))?;
+    let claimed = db
+        .query(
+            "SELECT count(*) AS count FROM queue \
+             WHERE status IN ('dispatched', 'running') \
+               AND updated_at >= datetime('now', ?)",
+        )
+        .bind(format!("-{window_minutes} minutes"))
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("count in-window claims: {error}"))?;
+    let pending = health.pending as f64;
+    let oldest_minutes = health.oldest_seconds.unwrap_or(0) as f64 / 60.0;
+    let stalled = pending >= QUEUE_STALL_MIN_PENDING && claimed == 0 && !freeze_enabled(db).await?;
+    let mut offenders: Vec<FaultOffender> = Vec::new();
+    if stalled || oldest_minutes > QUEUE_AGE_MINUTES {
+        let rows = db
+            .query(
+                "SELECT task_id, crate_name, \
+                     CAST(strftime('%s','now') AS INTEGER) \
+                         - CAST(strftime('%s', created_at) AS INTEGER) AS age_seconds \
+                 FROM queue \
+                 WHERE status = 'pending' AND not_before <= datetime('now') \
+                 ORDER BY created_at ASC LIMIT ?",
+            )
+            .bind(MAX_OFFENDERS as i64)
+            .fetch_all::<AgedPendingRow>()
+            .await
+            .map_err(|error| format!("list aged pending tasks: {error}"))?;
+        for row in rows {
+            offenders.push(FaultOffender {
+                label: format!(
+                    "{} ({})",
+                    row.crate_name,
+                    &row.task_id[..12.min(row.task_id.len())]
+                ),
+                count: row.age_seconds as f64 / 60.0,
+                url: None,
+            });
+        }
+    }
+    if stalled {
+        offenders.insert(
+            0,
+            FaultOffender {
+                label: format!("dispatch stalled: {claimed} claims in {window_minutes}m"),
+                count: claimed as f64,
+                url: None,
+            },
+        );
+    }
+    Ok(FaultObservation {
+        signal: FaultSignal::QueueHealth,
+        open: crate::faults::opens(
+            pending,
+            QUEUE_STALL_MIN_PENDING,
+            oldest_minutes,
+            QUEUE_AGE_MINUTES,
+        ) || stalled,
+        observed: oldest_minutes,
+        threshold: QUEUE_AGE_MINUTES,
+        unit: "minutes".to_owned(),
+        sample: pending,
+        min_sample: QUEUE_STALL_MIN_PENDING,
+        offenders,
+    })
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct WindowTotalsRow {
+    outcomes: u64,
+    failures: u64,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct StormTaskRow {
+    task_id: String,
+    crate_name: String,
+    attempt: u32,
+    github_run_id: Option<String>,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct ClassOffenderRow {
+    failure_class: Option<String>,
+    count: u64,
+    run_id: Option<String>,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct QueueHealthRow {
+    pending: u64,
+    oldest_seconds: Option<i64>,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct AgedPendingRow {
+    task_id: String,
+    crate_name: String,
+    age_seconds: i64,
 }
 
 /// The evidence a failure-rate trip verdict becomes: the evaluated
@@ -6910,5 +7251,171 @@ mod sqlite_tests {
                 .is_some(),
             "5/10 failures at a 50% threshold trips"
         );
+    }
+
+    // ===== Fault-signal state + observations (#438) =====
+
+    fn fault_state_fixture(signal: stow_types::api::FaultSignal) -> crate::faults::SignalState {
+        crate::faults::SignalState {
+            opened_at: "2026-09-28T00:00:00Z".to_owned(),
+            last_digest_at: "2026-09-28T00:00:00Z".to_owned(),
+            observation: stow_types::api::FaultObservation {
+                signal,
+                open: true,
+                observed: 3.0,
+                threshold: 1.0,
+                unit: "events".to_owned(),
+                sample: 3.0,
+                min_sample: 1.0,
+                offenders: Vec::new(),
+            },
+        }
+    }
+
+    /// One row per open signal — set inserts, a repeat set refreshes
+    /// `last_digest_at`/`observation` but keeps `opened_at`, and delete
+    /// resolves the row away.
+    #[tokio::test]
+    async fn fault_signal_state_round_trips() {
+        let db = metered_db().await.expect("memory db");
+        assert!(super::fault_signals(&db).await.expect("read").is_empty());
+
+        let state = fault_state_fixture(stow_types::api::FaultSignal::QueueHealth);
+        super::set_fault_signal(&db, stow_types::api::FaultSignal::QueueHealth, &state)
+            .await
+            .expect("set");
+        let stored = super::fault_signals(&db).await.expect("read");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].1.opened_at, "2026-09-28T00:00:00Z");
+
+        let mut digested = state.clone();
+        digested.last_digest_at = "2026-09-28T01:00:00Z".to_owned();
+        super::set_fault_signal(&db, stow_types::api::FaultSignal::QueueHealth, &digested)
+            .await
+            .expect("refresh");
+        let stored = super::fault_signals(&db).await.expect("read");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].1.opened_at, "2026-09-28T00:00:00Z",
+            "a refresh keeps the original opened_at"
+        );
+        assert_eq!(stored[0].1.last_digest_at, "2026-09-28T01:00:00Z");
+
+        super::delete_fault_signal(&db, stow_types::api::FaultSignal::QueueHealth)
+            .await
+            .expect("delete");
+        assert!(super::fault_signals(&db).await.expect("read").is_empty());
+    }
+
+    /// The build-failures observation applies the same min-sample +
+    /// ratio gate the freeze breaker does, and names both offender
+    /// kinds: attempt-threshold tasks and the window's failure classes.
+    #[tokio::test]
+    async fn build_failure_observation_gates_on_sample_and_names_offenders() {
+        let db = metered_db().await.expect("memory db");
+        // 3/3 failed is 100% but below the 10-outcome floor — closed.
+        seed_outcomes(
+            &db,
+            0,
+            3,
+            TARGET,
+            Some((
+                stow_types::api::FailureStep::Register,
+                "POST -> 500",
+                "run-1",
+            )),
+        )
+        .await;
+        let obs = super::build_failure_observation(&db, 10, None)
+            .await
+            .expect("observe");
+        assert!(!obs.open, "min-sample gates a small but all-failed window");
+
+        // 8 more failures: 11/11 = 100% over the floor — open, and the
+        // failure class is an offender.
+        seed_outcomes(
+            &db,
+            1,
+            8,
+            TARGET,
+            Some((
+                stow_types::api::FailureStep::Register,
+                "POST -> 500",
+                "run-2",
+            )),
+        )
+        .await;
+        // A task stuck at the attempt threshold is the other offender
+        // kind.
+        seed_failed(&db, "retry-storm", 6, 3).await;
+        let obs = super::build_failure_observation(&db, 10, None)
+            .await
+            .expect("observe");
+        assert!(obs.open, "11/11 failed opens the signal");
+        assert!((obs.observed - 100.0).abs() < f64::EPSILON);
+        assert!(
+            obs.offenders
+                .iter()
+                .any(|offender| offender.label.contains("retry-storm")),
+            "attempt-threshold task named: {:?}",
+            obs.offenders
+        );
+        assert!(
+            obs.offenders
+                .iter()
+                .any(|offender| offender.label.contains("register")),
+            "failure class named: {:?}",
+            obs.offenders
+        );
+    }
+
+    /// Queue health opens on an aged pending row and on a dispatch
+    /// stall — pending work, free capacity, zero in-window claims —
+    /// but a freeze suppresses the stall half (dispatch is meant to be
+    /// stopped).
+    #[tokio::test]
+    async fn queue_health_observation_ages_stalls_and_bows_to_freeze() {
+        let db = metered_db().await.expect("memory db");
+        let obs = super::queue_health_observation(&db, 10)
+            .await
+            .expect("observe");
+        assert!(!obs.open, "an empty queue is healthy");
+
+        // A pending row the claim loop just left alone is a stall.
+        enqueue(&db, &[request("stuck", Vec::new())])
+            .await
+            .expect("enqueue");
+        let obs = super::queue_health_observation(&db, 10)
+            .await
+            .expect("observe");
+        assert!(obs.open, "pending + no claims + not frozen = stalled");
+        assert!(
+            obs.offenders
+                .iter()
+                .any(|offender| offender.label.contains("dispatch stalled")),
+            "stall offender line: {:?}",
+            obs.offenders
+        );
+
+        // Frozen dispatch is deliberate — the stall half stands down.
+        super::set_freeze(&db, &freeze_record_fixture())
+            .await
+            .expect("freeze");
+        let obs = super::queue_health_observation(&db, 10)
+            .await
+            .expect("observe");
+        assert!(!obs.open, "a frozen queue does not report a stall");
+
+        super::delete_freeze(&db).await.expect("clear freeze");
+        // An aged row opens on age alone even while claims happen.
+        db.query("UPDATE queue SET created_at = datetime('now', '-2 hours')")
+            .execute()
+            .await
+            .expect("age the row");
+        let obs = super::queue_health_observation(&db, 10)
+            .await
+            .expect("observe");
+        assert!(obs.open, "a 2-hour-old pending row opens on age");
+        assert!(obs.observed > 60.0);
     }
 }
