@@ -323,12 +323,18 @@ async fn read_panic(db: DurableDb) -> Result<Json<stow_types::api::PanicSwitch>>
 /// `POST /panic` — write the flag, then answer what was stored.
 async fn write_panic(
     db: DurableDb,
+    alarm: Alarm,
     Json(switch): Json<stow_types::api::PanicSwitch>,
 ) -> Result<Json<stow_types::api::PanicSwitch>> {
     queue::set_panic(&db, switch.enabled)
         .await
         .map_err(to_error)?;
     tracing::warn!(enabled = switch.enabled, "panic switch flipped");
+    // The alarm stopped re-arming itself while the switch was on (see
+    // `run_alarm`); turning it off restarts the dispatch loop.
+    if !switch.enabled {
+        arm_dispatch_alarm(&alarm).await?;
+    }
     Ok(Json(switch))
 }
 
@@ -372,6 +378,14 @@ async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {
 }
 
 async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
+    // The panic switch freezes the scheduler as well as anonymous traffic:
+    // a dispatch pass reads the whole pending queue, so while the switch is
+    // on the alarm neither dispatches nor re-arms itself, and nothing runs
+    // until `write_panic` turns the switch off and re-arms it.
+    if queue::panic_enabled(&db).await.map_err(to_error)? {
+        tracing::warn!("scheduler alarm stopped: the panic switch is on");
+        return Ok("frozen");
+    }
     dispatch_pending(&env, &db).await.map_err(|error| {
         tracing::error!(%error, "scheduler alarm dispatch_pending failed");
         error
