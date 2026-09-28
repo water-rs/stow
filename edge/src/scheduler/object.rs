@@ -94,7 +94,6 @@ impl DurableObject for Scheduler {
             "/complete".post(complete),
             "/status".at(status),
             "/admin/status".at(admin_status),
-            "/rustc/stable".at(stable_rustc),
             "/index/published".post(record_published_index),
             "/panic".at(read_panic).post(write_panic),
             "/migrate".post(migrate_scheduler),
@@ -388,16 +387,6 @@ async fn record_published_index(
     Ok(Json(OkResponse { ok: true }))
 }
 
-async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {
-    let version =
-        crate::rust_channel::stable_rustc_version(&db, &crate::rust_channel::CfRustChannel)
-            .await
-            .map_err(to_error)?;
-    Ok(Json(StableRustcResponse {
-        version: version.as_str().to_owned(),
-    }))
-}
-
 async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
     // The panic switch freezes the scheduler as well as anonymous traffic:
     // a dispatch pass reads the whole pending queue, so while the switch is
@@ -592,9 +581,4 @@ struct InsertedResponse {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct OkResponse {
     ok: bool,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-struct StableRustcResponse {
-    version: String,
 }

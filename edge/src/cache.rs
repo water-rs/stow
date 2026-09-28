@@ -199,6 +199,33 @@ pub async fn delete_panic_flag(cache: &CfCache) -> Result<(), CacheError> {
         .map_err(|error| CacheError::from_cf(&error))
 }
 
+/// How long the resolved stable rustc version is cached — releases ship
+/// roughly every six weeks, so an hour is ample.
+const STABLE_RUSTC_TTL_SECONDS: u32 = 60 * 60;
+
+/// Fetch the cached stable rustc version string — a single fixed key;
+/// one release channel, one entry.
+pub async fn get_stable_rustc(cache: &CfCache) -> Result<Option<Vec<u8>>, CacheError> {
+    cache
+        .get_url_bytes(stable_rustc_url(), false)
+        .await
+        .map_err(|error| CacheError::from_cf(&error))
+}
+
+/// Cache a resolved stable rustc version for [`STABLE_RUSTC_TTL_SECONDS`].
+/// The stored body is the version string alone, so a hit reparses a
+/// dozen bytes rather than the ~900 KB channel manifest it came from.
+pub async fn put_stable_rustc(cache: &CfCache, version: &str) -> Result<(), CacheError> {
+    put_response(
+        cache,
+        stable_rustc_url(),
+        version.as_bytes(),
+        "text/plain",
+        &format!("public, s-maxage={STABLE_RUSTC_TTL_SECONDS}"),
+    )
+    .await
+}
+
 /// Fetch the cached public-stats JSON body — a single fixed key; the
 /// `UsageStats` aggregates are global, never per-request.
 pub async fn get_stats(cache: &CfCache) -> Result<Option<Vec<u8>>, CacheError> {
@@ -271,6 +298,11 @@ fn stats_url() -> String {
     format!("{CACHE_DOMAIN}/stats")
 }
 
+/// The fixed key the stable channel's resolved rustc version lives under.
+fn stable_rustc_url() -> String {
+    format!("{CACHE_DOMAIN}/rustc/stable")
+}
+
 #[derive(Debug)]
 pub enum CacheError {
     Cloudflare(String),
@@ -286,6 +318,8 @@ impl CacheError {
         Self::Worker(error.to_string())
     }
 }
+
+impl std::error::Error for CacheError {}
 
 impl std::fmt::Display for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

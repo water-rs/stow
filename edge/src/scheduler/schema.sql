@@ -156,13 +156,3 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
--- Stable rustc channel cache: a single row (id = 1) holding the version
--- parsed out of channel-rust-stable.toml. The request API resolves the
--- current stable rustc through this table so repeated human requests do
--- not re-fetch the Rust release manifest; entries older than the TTL are
--- refreshed on the next request.
-CREATE TABLE IF NOT EXISTS rust_stable_channel (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    version TEXT NOT NULL,
-    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
