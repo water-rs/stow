@@ -204,6 +204,10 @@ forwarding; it will not, because its entire content is one dependency declaratio
 construction. Designing for a need that does not exist is over-engineering even when
 the design it produces looks careful.
 
+## Operator notifications
+
+Every email stow sends goes through Cloudflare Email Service **Email Sending**, whether it is an alert, an incident, a breaker trip or a watchdog report. The sending domain `stow.waterui.dev` is onboarded, the sender is `alerts@stow.waterui.dev`, and mail goes to the operator. Inside the Worker it uses the `send_email` binding; everywhere else (Actions, `stow-admin`) it uses the REST API, `POST /accounts/{account_id}/email/sending/send`, with a token scoped to email sending. GitHub notifications and Email Routing are not alert channels. A GitHub issue may record an incident, but it never notifies anyone.
+
 ## Resources are spent deliberately
 
 Everything stow runs on is metered or scarce: Durable Object rows, duration and requests, D1 rows, Worker CPU, R2 operations, runner slots, GitHub API quota. Stow is a service whose whole purpose is saving other people's compute, and wasting its own is the same failure.
