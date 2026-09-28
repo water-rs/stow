@@ -174,17 +174,35 @@ struct IndexPublishSummary {
 /// scheduler learns what the published index actually serves. The
 /// file's header is authoritative — the slice key comes from it, so the
 /// command takes only `--file`.
+///
+/// The default report is a delta: `index export` saves the previously
+/// published index beside `--out` as `<file>.prev`, and the report
+/// sends `base_generation` plus only the rows that moved. `--full`
+/// (or a file with no `.prev` — a slice's first publish) sends the
+/// explicit full report the scheduler diffs itself.
 #[derive(Args)]
 pub struct IndexReportArgs {
     /// The encoded index file (`index export --out`).
     #[arg(long)]
     file: std::path::PathBuf,
+    /// Send the explicit full report (`base_generation` unset) — the
+    /// resync path for a slice whose optimistic-lock check failed, and
+    /// the automatic shape of a first publish.
+    #[arg(long)]
+    full: bool,
 }
 
 /// The JSON line `index report` prints on stdout.
 #[derive(Debug, serde::Serialize)]
 struct IndexReportSummary {
-    rows: usize,
+    /// Rows the report added to the slice — the whole membership on a
+    /// full report.
+    added: usize,
+    /// Rows the report retired — `0` on a full report.
+    retired: usize,
+    /// `true` when the report took the explicit full path (`--full` or
+    /// no `.prev` sidecar).
+    full: bool,
     tag: String,
 }
 
@@ -279,6 +297,13 @@ async fn index_export(edge: &Edge, args: IndexExportArgs) -> stow_types::error::
     }
     tracing::info!(%target, %rustc_version, rows = rows.len(), "exported artifact index slice");
 
+    // The previous published index fixes the generation stamp and gives
+    // `index report` its delta base — pull it now, while the tag still
+    // resolves to it (the report runs after `index publish` moved the
+    // tag to this index). Saved beside `--out` as `<file>.prev`.
+    let prev = prev_published_index(target.as_str(), rustc_version.as_str()).await?;
+    let generation = prev.as_ref().map_or(1, |index| index.header.generation + 1);
+
     let index = ArtifactIndex {
         header: ArtifactIndexHeader {
             format_version: ARTIFACT_INDEX_FORMAT_VERSION,
@@ -287,6 +312,7 @@ async fn index_export(edge: &Edge, args: IndexExportArgs) -> stow_types::error::
             generated_at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .map_err(|error| stow_error!("format generated_at: {error}"))?,
+            generation,
             row_count: u64::try_from(rows.len())
                 .map_err(|_| stow_error!("row count {} exceeds u64", rows.len()))?,
         },
@@ -304,10 +330,132 @@ async fn index_export(edge: &Edge, args: IndexExportArgs) -> stow_types::error::
     smol::fs::write(&args.out, &bytes)
         .await
         .map_err(|error| stow_error!("write index {}: {error}", args.out.display()))?;
+    if let Some(prev) = prev {
+        let prev_bytes =
+            encode(&prev).map_err(|error| stow_error!("encode previous index: {error}"))?;
+        smol::fs::write(prev_path(&args.out), &prev_bytes)
+            .await
+            .map_err(|error| stow_error!("write previous-index sidecar: {error}"))?;
+    }
     let line = serde_json::to_string(&summary)
         .map_err(|error| stow_error!("serialize index summary: {error}"))?;
     render::emit_line(&line);
     Ok(())
+}
+
+/// The sidecar `index export` leaves beside `--out`: the encoded index
+/// the slice's tag resolved to before this export ran — `index report`'s
+/// delta base. A report on a file with no sidecar (a slice's first
+/// publish, or an export predating this feature) falls back to the
+/// explicit full report.
+fn prev_path(out: &std::path::Path) -> std::path::PathBuf {
+    let mut prev = out.as_os_str().to_os_string();
+    prev.push(".prev");
+    std::path::PathBuf::from(prev)
+}
+
+/// The previously published index for `(target, rustc_version)` — the
+/// artifact the slice's tag resolves to *right now*, pulled while it is
+/// still the tag's target. `None` when no index exists yet.
+///
+/// Mock mode reads `STOW_MOCK_REGISTRY_ROOT` directly, exactly where
+/// `stow-mock-registry publish-index` wrote the tagged manifest and its
+/// blob; the production path pulls through `stow-oci` under the same
+/// `GHCR_USERNAME`/`GHCR_TOKEN` credentials `index publish` uses. No
+/// credential means no registry is reachable at all — an offline export
+/// is treated as a first publish rather than a failure.
+async fn prev_published_index(
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<ArtifactIndex>> {
+    let tag = index_tag(target, rustc_version);
+    if let Ok(registry_root) = std::env::var(STOW_MOCK_REGISTRY_ROOT_ENV) {
+        let root = std::path::Path::new(&registry_root);
+        let manifest_path = root
+            .join("manifests")
+            .join(stow_types::registry::GHCR_REPOSITORY)
+            .join(&tag);
+        let Ok(manifest_bytes) = smol::fs::read(&manifest_path).await else {
+            return Ok(None);
+        };
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| stow_error!("parse mock index manifest: {error}"))?;
+        let digest = manifest
+            .pointer("/layers/0/digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| stow_error!("mock index manifest carries no layer digest"))?;
+        let blob = smol::fs::read(root.join("blobs").join(digest.replace(':', "_")))
+            .await
+            .map_err(|error| stow_error!("read mock index blob: {error}"))?;
+        return decode(&blob)
+            .map(Some)
+            .map_err(|error| stow_error!("decode mock index: {error}"));
+    }
+    let Ok(credentials) = stow_oci::RegistryCredentials::from_env() else {
+        return Ok(None);
+    };
+    let session = credentials
+        .session()
+        .map_err(|error| stow_error!("build registry session: {error}"))?;
+    stow_oci::pull_published_index(&session, target, rustc_version)
+        .await?
+        .map(|bytes| decode(&bytes).map_err(|error| stow_error!("decode index: {error}")))
+        .transpose()
+}
+
+/// The index file's semantic rows as [`PublishedSliceRow`]s — the
+/// scheduler's slice membership. Artifact rows collapse onto semantic
+/// identity + unit shape — several `c_metadata`/`compile_key` rows can name
+/// one `(crate, version, features, shape)` — so the report
+/// deduplicates. Two rows of the same identity at different unit shapes
+/// stay separate: the gate compares each shape an edge requires against
+/// its own row. A catalog row carrying no shape (registered before the
+/// column existed) reports as shapeless and covers nothing. A measured
+/// row above the sysroot's glibc floor publishes in the index but a
+/// baseline host cannot load it, so it releases no dependent — the same
+/// rule the catalog's coverage oracle applies (stow#336).
+fn semantic_rows(index: &ArtifactIndex) -> Vec<PublishedSliceRow> {
+    let mut seen = std::collections::BTreeSet::new();
+    index
+        .rows
+        .iter()
+        .filter(|row| {
+            row.min_glibc
+                .is_none_or(|floor| floor <= stow_types::glibc::GLIBC_BASELINE)
+        })
+        .map(|row| PublishedSliceRow {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+            unit_shape: row.unit_shape,
+        })
+        .filter(|row| {
+            seen.insert((
+                row.crate_name.as_str().to_owned(),
+                row.version.to_string(),
+                row.features_json.raw(),
+                row.unit_shape,
+            ))
+        })
+        .collect()
+}
+
+/// The identity a publish delta diffs on — the slice's semantic row
+/// key, matching `published_slice_rows`' primary key.
+fn row_key(
+    row: &PublishedSliceRow,
+) -> (
+    String,
+    String,
+    String,
+    Option<stow_types::public_cache::UnitShape>,
+) {
+    (
+        row.crate_name.as_str().to_owned(),
+        row.version.to_string(),
+        row.features_json.raw(),
+        row.unit_shape,
+    )
 }
 
 /// `stow-admin index publish` — the second half of the index pipeline.
@@ -387,48 +535,69 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
         .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
     let index = decode(&bytes)
         .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
-    let target = index.header.target;
-    let rustc_version = index.header.rustc_version;
-    // Artifact rows collapse onto semantic identity + unit shape —
-    // several c_metadata/compile_key rows can name one `(crate, version,
-    // features, shape)` — so the report deduplicates. Two rows of the
-    // same identity at different unit shapes stay separate: the gate
-    // compares each shape an edge requires against its own row. A
-    // catalog row carrying no shape (registered before the column
-    // existed) reports as shapeless and covers nothing.
-    let mut seen = std::collections::BTreeSet::new();
-    let rows: Vec<PublishedSliceRow> = index
-        .rows
-        .iter()
-        .filter(|row| {
-            row.min_glibc
-                .is_none_or(|floor| floor <= stow_types::glibc::GLIBC_BASELINE)
-        })
-        .map(|row| PublishedSliceRow {
-            crate_name: row.crate_name.clone(),
-            version: row.version.clone(),
-            features_json: row.features_json.clone(),
-            unit_shape: row.unit_shape,
-        })
-        .filter(|row| {
-            seen.insert((
-                row.crate_name.as_str().to_owned(),
-                row.version.to_string(),
-                row.features_json.raw(),
-                row.unit_shape,
-            ))
-        })
-        .collect();
-    let report = PublishedSliceReport { rows };
+    let target = index.header.target.clone();
+    let rustc_version = index.header.rustc_version.clone();
+    let rows = semantic_rows(&index);
+
+    // The delta base is the `.prev` sidecar `index export` captured
+    // while the tag still named the previous index. `--full`, or a file
+    // with no sidecar (first publish, older export), takes the explicit
+    // full path — the caller never retries it silently and neither does
+    // the DO: a `base_generation` mismatch answers 409 instead.
+    let prev = match smol::fs::read(prev_path(&args.file)).await {
+        Ok(bytes) => Some(decode(&bytes).map_err(|error| {
+            stow_error!(
+                "decode previous index {}: {error}",
+                prev_path(&args.file).display()
+            )
+        })?),
+        Err(_) => None,
+    };
+    let (base_generation, added, retired) = if args.full {
+        (None, rows, Vec::new())
+    } else if let Some(prev) = prev {
+        let prev_rows = semantic_rows(&prev);
+        let current: std::collections::BTreeSet<_> = rows.iter().map(row_key).collect();
+        let previous: std::collections::BTreeSet<_> = prev_rows.iter().map(row_key).collect();
+        let added: Vec<PublishedSliceRow> = rows
+            .iter()
+            .filter(|row| !previous.contains(&row_key(row)))
+            .cloned()
+            .collect();
+        let retired: Vec<PublishedSliceRow> = prev_rows
+            .into_iter()
+            .filter(|row| !current.contains(&row_key(row)))
+            .collect();
+        (Some(prev.header.generation), added, retired)
+    } else {
+        (None, rows, Vec::new())
+    };
+    let report = PublishedSliceReport {
+        base_generation,
+        generation: Some(index.header.generation),
+        added,
+        retired,
+    };
     edge.post_json::<_, serde_json::Value>(
         &format!("/api/v1/admin/index/{target}/{rustc_version}"),
         &report,
     )
     .await?;
     let tag = index_tag(target.as_str(), rustc_version.as_str());
-    let rows = report.rows.len();
-    tracing::info!(%tag, rows, "reported published index slice to the edge");
-    let line = serde_json::to_string(&IndexReportSummary { rows, tag })
+    let summary = IndexReportSummary {
+        added: report.added.len(),
+        retired: report.retired.len(),
+        full: report.base_generation.is_none(),
+        tag: tag.clone(),
+    };
+    tracing::info!(
+        %tag,
+        added = summary.added,
+        retired = summary.retired,
+        full = summary.full,
+        "reported published index slice to the edge"
+    );
+    let line = serde_json::to_string(&summary)
         .map_err(|error| stow_error!("serialize index report summary: {error}"))?;
     render::emit_line(&line);
     Ok(())

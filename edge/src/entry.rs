@@ -139,6 +139,8 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/queue/promote".post(api::admin_queue_promote),
                 "/queue/purge".post(api::admin_queue_purge),
                 "/scheduler/migrate".post(api::admin_scheduler_migrate),
+                "/scheduler/budget".post(api::admin_scheduler_budget),
+                "/scheduler/budget/seed".post(api::admin_scheduler_budget_seed),
                 "/status".at(api::admin_status),
             ))
             .with(gate.clone()),

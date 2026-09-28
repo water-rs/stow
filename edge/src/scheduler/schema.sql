@@ -37,6 +37,40 @@ CREATE TABLE IF NOT EXISTS queue (
     -- re-queue is at most once — the rebuild republishes real shapes, so
     -- the missing-shape condition cannot recur.
     shape_requeue INTEGER NOT NULL DEFAULT 0,
+    -- The dependency gate's answer, persisted: 1 while every edge of this
+    -- row resolves to units the published slice serves. Written at edge
+    -- sync, recomputed by every transition into `pending`, and refreshed
+    -- on pending rows only where an edge or slice write can change the
+    -- answer — the claim reads the flag only on pending rows, so a
+    -- dispatch pass never re-evaluates the dependency EXISTS.
+    deps_met INTEGER NOT NULL DEFAULT 0,
+    -- The dependency gate's terminal answer, persisted: 1 while a
+    -- pending row owns an edge whose dep failed or was never resolved
+    -- and whose required units the published slice does not serve —
+    -- the set `effective_status` used to recompute per row on every
+    -- read. Maintained wherever `deps_met` is, plus on the dependents
+    -- of a task whose status flips into or out of `failed` — those are
+    -- the only transitions that move the flag. Only meaningful on
+    -- pending rows; a stale value on another status is never observed.
+    blocked INTEGER NOT NULL DEFAULT 0,
+    -- The earliest instant the row is dispatchable: the later of
+    -- `first_requested_at + dispatch_min_age` and the `not_before`
+    -- backoff gate, rendered as the row is written (the human lane
+    -- pays no minimum age, so its wake is just `not_before`). Read by
+    -- the alarm's wake probes — the claim re-checks eligibility from
+    -- the live columns, so a stale value costs at most a cheap
+    -- pass, never a wrong dispatch.
+    wake_at TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
+    -- The row's runner family ('linux'/'macos'/'windows'), set once at
+    -- enqueue — target never changes. Lets the wake-time probes prefix
+    -- equality-filter by family instead of scanning.
+    dispatch_family TEXT NOT NULL DEFAULT '',
+    -- The claim ORDER BY tuple encoded as one sortable string:
+    -- lane rank | family rank (Windows first) | first_requested_at |
+    -- inverted priority | created_at | task_id. The claim walk orders by
+    -- it under an index and pages by keyset, so a dispatch pass reads
+    -- rows proportional to the slots it fills, not the queue size.
+    dispatch_key TEXT NOT NULL DEFAULT '',
     UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
 );
 
@@ -84,6 +118,115 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     PRIMARY KEY (task_id, depends_on_task_id)
 );
 
+-- The claim walk: pending + deps-met rows in dispatch order. The alarm's
+-- dispatch pass reads the first page of this index, never the queue.
+-- `dispatch_key` is unique within a status group, so the trailing
+-- residual-filter columns (`dispatch_family`, `lane`,
+-- `first_requested_at`, `not_before`) do not disturb the ORDER BY — they
+-- let a skipped index entry answer the family/lane/age checks without
+-- fetching the row.
+CREATE INDEX IF NOT EXISTS idx_queue_dispatch
+ON queue (status, deps_met, dispatch_key, dispatch_family, lane, first_requested_at, not_before);
+
+-- The alarm's wake probes: `SELECT 1 … wake_at <= now LIMIT 1` (already
+-- dispatchable) and `MIN(wake_at) … wake_at > now` (earliest deferred
+-- wake) — both bounded by the `wake_at` ordering, with
+-- `dispatch_family` before it so a saturated family's deferred rows do
+-- not stand ahead of another family's earliest wake in the same walk.
+CREATE INDEX IF NOT EXISTS idx_queue_wake_eligible
+ON queue (status, deps_met, dispatch_family, wake_at);
+
+-- Admin's oldest-pending MIN and the 24h outcome window.
+CREATE INDEX IF NOT EXISTS idx_queue_status_first
+ON queue (status, first_requested_at);
+
+CREATE INDEX IF NOT EXISTS idx_queue_status_updated
+ON queue (status, updated_at);
+
+-- `list_tasks`'s newest-first tail read: the ORDER BY walks this index
+-- and stops at the page's LIMIT.
+CREATE INDEX IF NOT EXISTS idx_queue_updated_at
+ON queue (updated_at);
+
+-- The pending/blocked selectors' page: pending rows ordered newest
+-- first within each `blocked` arm, so a `?status=pending` or
+-- `?status=blocked` listing stops at its LIMIT instead of walking the
+-- pending set until enough unfiltered rows accumulate.
+CREATE INDEX IF NOT EXISTS idx_queue_pending_live
+ON queue (blocked, updated_at) WHERE status = 'pending';
+
+-- `list_tasks` selector bounds: a `target` or `crate_name` filtered
+-- listing walks the matching group of its own index under the same
+-- newest-first ordering instead of scanning `idx_queue_updated_at` for
+-- matches.
+CREATE INDEX IF NOT EXISTS idx_queue_target_updated
+ON queue (target, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_queue_crate_updated
+ON queue (crate_name, updated_at);
+
+-- The exact (status, lane) counts `status()` reports, maintained by
+-- trigger instead of a whole-queue GROUP BY on every request. The
+-- triggers fire on every write path — request handlers, operator
+-- mutations, fixtures and the migration's own row moves — so no code
+-- path maintains the table by hand; `migrate` rebuilds it wholesale
+-- once, in case it ever drifted.
+CREATE TABLE IF NOT EXISTS queue_status_counts (
+    status TEXT NOT NULL,
+    lane TEXT NOT NULL,
+    -- `blocked` is part of the key so `status()` reads the blocked
+    -- count off the counter rows too — the (pending, *, 1) rows —
+    -- instead of evaluating the fatal-edge EXISTS across the graph on
+    -- every request.
+    blocked INTEGER NOT NULL DEFAULT 0,
+    n INTEGER NOT NULL,
+    PRIMARY KEY (status, lane, blocked)
+);
+
+CREATE TRIGGER IF NOT EXISTS queue_counts_on_insert AFTER INSERT ON queue
+BEGIN
+    INSERT INTO queue_status_counts (status, lane, blocked, n)
+        VALUES (NEW.status, NEW.lane, NEW.blocked, 1)
+    ON CONFLICT (status, lane, blocked) DO UPDATE SET n = n + 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS queue_counts_on_delete AFTER DELETE ON queue
+BEGIN
+    INSERT INTO queue_status_counts (status, lane, blocked, n)
+        VALUES (OLD.status, OLD.lane, OLD.blocked, -1)
+    ON CONFLICT (status, lane, blocked) DO UPDATE SET n = n - 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS queue_counts_on_move
+    AFTER UPDATE OF status, lane, blocked ON queue
+    WHEN OLD.status != NEW.status OR OLD.lane != NEW.lane
+       OR OLD.blocked != NEW.blocked
+BEGIN
+    INSERT INTO queue_status_counts (status, lane, blocked, n)
+        VALUES (OLD.status, OLD.lane, OLD.blocked, -1)
+    ON CONFLICT (status, lane, blocked) DO UPDATE SET n = n - 1;
+    INSERT INTO queue_status_counts (status, lane, blocked, n)
+        VALUES (NEW.status, NEW.lane, NEW.blocked, 1)
+    ON CONFLICT (status, lane, blocked) DO UPDATE SET n = n + 1;
+END;
+
+-- The repair pass's candidate set: only completed rows that have not been
+-- shape-checked. Once the backlog drains the index is empty and the alarm
+-- pays one index probe for it.
+CREATE INDEX IF NOT EXISTS idx_queue_shape_requeue
+ON queue (task_id) WHERE status = 'completed' AND shape_requeue = 0;
+
+CREATE INDEX IF NOT EXISTS idx_queue_dependencies_dep
+ON queue_dependencies (depends_on_task_id);
+
+-- Edges whose dep identity was never resolved can never be met — the
+-- blocked-count query reads exactly the `idx_queue_dependencies_unresolved`
+-- set. That index, `idx_queue_dependencies_slice` and
+-- `idx_queue_dependencies_dep_match` live in
+-- `migrate_queue_dependencies_columns` instead of here: a dev-era edges
+-- table only gains `dep_crate_name`/`dep_host_side`/`dep_target` there,
+-- so an index on them cannot build during this include.
+
 -- What each published index slice serves, reported by the index-publish
 -- path itself after a slice goes live. A report writes its rows under a
 -- fresh generation, then flips published_slices.generation in one
@@ -99,6 +242,11 @@ CREATE TABLE IF NOT EXISTS published_slices (
     rustc_version TEXT NOT NULL,
     generation INTEGER NOT NULL DEFAULT 0,
     published_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- The index generation the last applied report declared its base+1:
+    -- the optimistic token a delta report's `base_generation` is checked
+    -- against (a mismatch is a 409 and the reporter resyncs with a full
+    -- report). 0 until the first report applies.
+    applied_generation INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (target, rustc_version)
 );
 
@@ -142,8 +290,9 @@ CREATE TABLE IF NOT EXISTS github_app_token (
 
 -- The schema version this queue was migrated to, kept as a singleton
 -- row. `PRAGMA user_version` would be the conventional carrier but the
--- Durable Object SQL authorizer refuses it, so `migrate` reads and
--- stamps this row instead (see SCHEMA_VERSION in queue.rs).
+-- Durable Object SQL authorizer refuses it, so the operator migrate
+-- route reads and stamps this row instead (see SCHEMA_VERSION in
+-- queue.rs).
 CREATE TABLE IF NOT EXISTS scheduler_schema_version (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL

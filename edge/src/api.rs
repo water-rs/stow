@@ -664,13 +664,16 @@ pub async fn record_published_index(
         .map_err(|_| GetArtifactError::BadRequest)?
         .parse::<WireRustcVersion>()
         .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let rows = report.rows.len();
+    let rows = report.added.len() + report.retired.len();
     scheduler_client::record_published_index(
         &scheduler,
         &stow_types::api::PublishedSlice {
             target: target.clone(),
             rustc_version: rustc_version.clone(),
-            rows: report.rows,
+            base_generation: report.base_generation,
+            generation: report.generation,
+            added: report.added,
+            retired: report.retired,
         },
     )
     .await?;
@@ -718,6 +721,35 @@ pub async fn admin_scheduler_migrate(
         "scheduler schema migrated via admin endpoint"
     );
     Ok(Json(report))
+}
+
+/// `POST /api/v1/admin/scheduler/budget/seed`
+///
+/// Seed the production-shaped fixture into the scheduler Durable Object —
+/// the workerd cost harness's load step (stow#433). The object 404s
+/// unless the deploy carries `STOW_SCHEDULER_BUDGET=1`, which only the
+/// mock stack does.
+pub async fn admin_scheduler_budget_seed(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::SchedulerSeedRequest>,
+) -> Result<Json<stow_types::api::SchedulerSeedReport>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::seed_budget_fixture(&scheduler, &request).await?,
+    ))
+}
+
+/// `POST /api/v1/admin/scheduler/budget`
+///
+/// Measure every scheduler route and the alarm pass with the Durable
+/// Object's real `rowsRead`/`rowsWritten` cursor counters — the numbers
+/// Cloudflare bills on, and the budget the merge gate enforces
+/// (stow#433). Same deploy-var guard as the seed route.
+pub async fn admin_scheduler_budget(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::SchedulerBudgetReport>, GetArtifactError> {
+    Ok(Json(scheduler_client::scheduler_budget(&scheduler).await?))
 }
 
 /// `GET /api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=`

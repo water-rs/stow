@@ -442,6 +442,7 @@ mod tests {
                 target: TargetTriple::parse(TARGET).expect("target"),
                 rustc_version: WireRustcVersion::parse(RUSTC).expect("rustc"),
                 generated_at: "2026-09-24T12:00:00Z".to_owned(),
+                generation: 1,
                 row_count: rows.len() as u64,
             },
             rows,

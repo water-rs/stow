@@ -304,6 +304,10 @@ claims to list every variable stow reads, so that claim is checkable and has to 
   - scheduler forward path
   - local Wrangler/runtime
 
+## Per-request cost on the edge
+
+A Worker route, a Durable Object handler and the scheduler alarm run on every request, so their cost is multiplied by traffic and by table size. Each scheduler route and the alarm pass is a drive in `edge/src/scheduler/drives.rs`, measured by `scripts/scheduler-budget.sh` with workerd's billed `rowsRead`/`rowsWritten` at two fixture sizes: a drive fails when its cost grows with the stored bulk (more than 10% + 50 rows between the sizes) or exceeds its absolute budget, and a route without a drive fails the gate. A cost legitimately bounded by something other than the event (human-lane depth, the dispatch cap, a day's completions) names that bound beside its drive. Schema changes are operations work: request code and the alarm never create, alter, index or backfill anything, and never check the schema. Migrations run only through the operator migrate route, which the deploy pipeline calls right after the new version goes live, and they are additive so the running code keeps working while they apply. When a fix names a defect class, the same PR searches for every other instance of that class and lists them.
+
 ## What to avoid
 - Do not replace crates.io as the production dependency graph source.
 - Do not weaken the GitHub-trusted CI model.

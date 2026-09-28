@@ -30,7 +30,11 @@ use crate::platform::Profile;
 /// rows — a catalog row whose floor is still unknown is excluded until
 /// `index backfill-min-glibc` measures it — so `None` on a v2 row always
 /// means "measured, no glibc requirement", never "unmeasured".
-pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 2;
+///
+/// v3 makes `ArtifactIndexHeader::generation` required — a defaulted `0`
+/// would silently accept an index that predates the field and claim a
+/// delta base the report path cannot honor.
+pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 3;
 
 /// Media type of the index's single OCI layer — the zstd-compressed
 /// [`ArtifactIndex`] JSON.
@@ -62,6 +66,11 @@ pub struct ArtifactIndexHeader {
     /// makes every export's bytes unique, so publish-side change
     /// detection digests the rows, never the blob.
     pub generated_at: String,
+    /// The index's generation in the publish sequence — `1` on a slice's
+    /// first index, the previous index's `+ 1` after. The report path
+    /// sends the previous generation as its delta base so the scheduler
+    /// can optimistic-lock slice reports.
+    pub generation: i64,
     /// Number of rows the body carries; [`decode`] rejects a mismatch.
     pub row_count: u64,
 }
@@ -268,6 +277,7 @@ mod tests {
                 target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target"),
                 rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc"),
                 generated_at: "2026-09-20T12:00:00Z".to_owned(),
+                generation: 1,
                 row_count: rows.len() as u64,
             },
             rows,

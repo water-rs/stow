@@ -110,6 +110,53 @@ pub async fn published_index_content_sha256(
     }
 }
 
+/// Pull the index blob the slice's tag currently resolves to.
+///
+/// The previous index `stow-admin index export` bases its generation
+/// stamp and `index report` bases its delta on. `None` when the tag
+/// does not exist yet (first publish).
+///
+/// # Errors
+///
+/// Returns an error when the reference does not parse, the pull fails,
+/// the tag resolves to an image index, or the manifest has no layer.
+pub async fn pull_published_index(
+    session: &RegistrySession,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<Option<Vec<u8>>> {
+    let reference = format!("{GHCR_BASE}:{}", index_tag(target, rustc_version));
+    let parsed_reference: Reference = reference
+        .parse()
+        .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
+    let (manifest_bytes, _) = match session.pull_manifest(&parsed_reference).await {
+        Ok(pulled) => pulled,
+        Err(error) if error.is_not_found() => return Ok(None),
+        Err(error) => {
+            return Err(stow_types::stow_error!(
+                "pull index manifest {reference}: {error}"
+            ));
+        }
+    };
+    match serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| stow_types::stow_error!("parse index manifest {reference}: {error}"))?
+    {
+        OciManifest::Image(manifest) => {
+            let layer = manifest.layers.first().ok_or_else(|| {
+                stow_types::stow_error!("index manifest {reference} carries no layer")
+            })?;
+            session
+                .pull_blob(&layer.digest)
+                .await
+                .map(Some)
+                .map_err(|error| stow_types::stow_error!("pull index blob {reference}: {error}"))
+        }
+        OciManifest::ImageIndex(_) => Err(stow_types::stow_error!(
+            "index reference {reference} resolves to an image index, not an image manifest"
+        )),
+    }
+}
+
 /// Push `index_bytes` as the single-layer index artifact under the slice's
 /// tag and sign it with cosign.
 ///
