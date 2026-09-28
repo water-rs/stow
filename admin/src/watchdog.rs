@@ -922,7 +922,14 @@ impl Watcher<'_> {
                 crate::index_cmd::INDEX_CERT_URL,
             )
             .await?;
-            if let Some(row) = pulled.index.rows.first() {
+            let rustc_version = stow_types::identity::WireRustcVersion::parse(rustc_version)
+                .map_err(|error| stow_error!("index tag {tag}: {error}"))?;
+            let index = crate::index_cmd::decode_published_slice(
+                &reference,
+                &rustc_version,
+                &pulled.bytes,
+            )?;
+            if let Some(row) = index.rows.first() {
                 return Ok(Some(row.bundle_digest.clone()));
             }
         }
