@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+  merge_group:
   workflow_call:
 
 # A branch pushed several times in a row only needs its newest run: the older
@@ -282,3 +283,46 @@ jobs:
           shared-key: resolve-diff-windows
           save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --replay resolve/tests/resolve-diff-fixture --family windows
+
+  # One check to require. Rulesets and the merge queue name this job instead
+  # of every leg: it needs all of them, `if: always()` runs it past a failed
+  # or cancelled need, and the verdict reads `needs.*.result` so such a leg
+  # turns the gate red. `skipped` passes — a leg skipped by the paths
+  # contract above reported success, which is what the ruleset sees too.
+  gate:
+    needs:
+      - changes
+      - test
+      - lint
+      - edge-wasm
+      - publish-dry-run
+      - mock-e2e
+      - resolve-diff
+      - resolve-diff-macos
+      - resolve-diff-windows
+    if: always()
+    name: CI gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The gate covers every job only because it needs every job; a new job
+      # that forgets to join `needs:` would ship ungated. Read the workflow
+      # itself and fail if any job other than this one is absent from the
+      # list.
+      - name: Needs covers every job
+        run: |
+          needed=$(yq '.jobs.gate.needs.[]' .github/workflows/test.yml | sort)
+          declared=$(yq '.jobs | keys.[]' .github/workflows/test.yml | sort | grep -vx gate)
+          if [ "$needed" != "$declared" ]; then
+            diff <(echo "$declared") <(echo "$needed") || true
+            echo "CI gate needs: must name every other job in test.yml" >&2
+            exit 1
+          fi
+      - name: Every leg succeeded or skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e '[.[].result] | all(. == "success" or . == "skipped")' > /dev/null
