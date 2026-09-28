@@ -57,6 +57,12 @@ jobs:
         run: |
           echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" \
             >> "$GITHUB_OUTPUT"
+      # A local action resolves from the workspace, so its directory has
+      # to be checked out; nothing else in the tree is needed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
       - name: stow-admin from the signed toolchain
         uses: ./.github/actions/stow-toolchain
         with:
