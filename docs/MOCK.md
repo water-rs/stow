@@ -75,14 +75,14 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 ┌──────────────────────────────┐  POST {STOW_LOCAL_CI_URL}/dispatch  ┌──────────────┐
 │ wrangler dev (port 8788)     │────────────────────────────────────►│ stow-build   │
 │ stow-edge wasm + miniflare   │  POST /api/v1/github/workflow-run   │ local CI     │
-│ D1, Durable Object           │◄────────────────────────────────────│ port 40124   │
+│ D1, Durable Object           │◄────────────────────────────────────│ port 28124   │
 └──────────┬───────────────────┘                                     └─────┬────────┘
            │ GET /api/v1/bundles/{digest} (bundle bytes), POST /api/v1/admissions │ bundles + records
            ▲                                                               │ sigstore push
 ┌──────────┴───────────────────┐                                           ▼
 │ stow-cli (consumer machine)  │  OCI pulls: signed index.* slices ┌──────────────────┐
 │ index slice cached locally   │◄──────────────────────────────────│ stow-mock-registry│
-└──────────────────────────────┘                                   │ port 40123 (serve)│
+└──────────────────────────────┘                                   │ port 28123 (serve)│
                                                                    └──────────────────┘
 ```
 
@@ -107,14 +107,14 @@ mkdir -p /tmp/stow-bench/mock-registry
 target/debug/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-registry
 ```
 
-Verify: `curl -i http://127.0.0.1:40123/v2/` returns `401 Unauthorized`
+Verify: `curl -i http://127.0.0.1:28123/v2/` returns `401 Unauthorized`
 with a `WWW-Authenticate` Bearer challenge — that is how the version ping
 behaves on GHCR, and how `oci-client` discovers the token realm.
 
 The mock speaks GHCR's anonymous token exchange, so the pull path is
 exercised end to end: `/v2/…` requests without a bearer get `401` plus a
 `WWW-Authenticate` challenge pointing at
-`http://127.0.0.1:40123/token`, `GET /token?service=…&scope=…` mints a
+`http://127.0.0.1:28123/token`, `GET /token?service=…&scope=…` mints a
 bearer (kept in server memory with a 300 s expiry), and only requests
 carrying a registry-issued token are served.
 
@@ -168,10 +168,10 @@ STOW_GITHUB_WEBHOOK_SECRET=mock-github-webhook-secret \
 STOW_MOCK_PUBLIC_KEY_PATH=/tmp/stow-bench/keys/public.pem \
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-target/debug/stow-build serve --listen 127.0.0.1:40124
+target/debug/stow-build serve --listen 127.0.0.1:28124
 ```
 
-Verify: the log prints `local CI server listening listen=127.0.0.1:40124`.
+Verify: the log prints `local CI server listening listen=127.0.0.1:28124`.
 
 ## Configure the CLI
 
@@ -179,7 +179,7 @@ Verify: the log prints `local CI server listening listen=127.0.0.1:40124`.
 mkdir -p ~/Library/Application\ Support/stow  # macOS path; ~/.config/stow on Linux
 cat > ~/Library/Application\ Support/stow/config.toml <<EOF
 edge_url = "http://127.0.0.1:8788"
-registry_base_url = "http://127.0.0.1:40123/v2/water-rs/stow-cache"
+registry_base_url = "http://127.0.0.1:28123/v2/water-rs/stow-cache"
 verify_mode = "mock-key"   # needs a stow-cli built with --features mock-verify
 mock_public_key_path = "/tmp/stow-bench/keys/public.pem"
 EOF

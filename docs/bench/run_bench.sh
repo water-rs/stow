@@ -13,8 +13,8 @@ mkdir -p "$OUT"
 # the registry port. The
 # /admissions call on a miss lands there too and surfaces as a 404 in its
 # log instead of a silent connection-refused.
-export STOW_EDGE_URL=http://127.0.0.1:40123
-export STOW_REGISTRY_BASE_URL=http://127.0.0.1:40123/v2/water-rs/stow-cache
+export STOW_EDGE_URL=http://127.0.0.1:28123
+export STOW_REGISTRY_BASE_URL=http://127.0.0.1:28123/v2/water-rs/stow-cache
 export STOW_VERIFY_MODE=mock-key
 export STOW_MOCK_PUBLIC_KEY_PATH=/home/user/bench/keys/mock.pub
 export STOW_CACHE_DIR=/home/user/bench/work/cache
