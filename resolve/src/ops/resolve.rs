@@ -86,7 +86,7 @@ use crate::util::report::Level;
 use anyhow::Context as _;
 use cargo_util_schemas::core::PartialVersion;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use tracing::{debug, trace};
 
@@ -331,7 +331,7 @@ pub async fn resolve_ws_with_opts<'gctx>(
     has_dev_units: HasDevUnits,
     force_all_targets: ForceAllTargets,
     dry_run: bool,
-    yanked_allowlist: &BTreeSet<PackageId>,
+    dropped_lockfile: Option<&str>,
 ) -> CargoResult<WorkspaceResolve<'gctx>> {
     let selection = select_ws_with_opts(
         ws,
@@ -339,7 +339,7 @@ pub async fn resolve_ws_with_opts<'gctx>(
         specs,
         has_dev_units,
         dry_run,
-        yanked_allowlist,
+        dropped_lockfile,
     )
     .await?;
     let specs_and_features = selection
@@ -363,18 +363,22 @@ pub async fn resolve_ws_with_opts<'gctx>(
 /// can run it once and [`ResolveSelection::project`] per target.
 /// See [`resolve_ws_with_opts`] for the parameter contract.
 ///
-/// `yanked_allowlist` is the set of [`PackageId`]s a resolve may select
-/// even though the index marks them yanked — the pins of the project's
-/// own `Cargo.lock`, which cargo itself admits. Admission only: the set
-/// is registered with [`PackageRegistry::add_to_yanked_whitelist`] and
-/// never enters `VersionPreferences`, so it does not pin anything.
+/// `dropped_lockfile` is the contents of the project's own `Cargo.lock`
+/// when the caller drops it from the tree before resolving — the edge's
+/// projects lane. Its registry pins become the yanked allowlist:
+/// admissible even when the index marks them yanked, never preferred —
+/// so registry versions still float. Each git pin registers as a lock,
+/// which makes [`PackageRegistry::lock`] rewrite deps on it to the
+/// precise `#sha` source before that source loads, so the git dep
+/// resolves at the sha the lockfile names rather than whatever its ref
+/// points at today — cargo's own `Cargo.lock` rule for git deps.
 pub async fn select_ws_with_opts<'gctx>(
     ws: &Workspace<'gctx>,
     cli_features: &CliFeatures,
     specs: &[PackageIdSpec],
     has_dev_units: HasDevUnits,
     dry_run: bool,
-    yanked_allowlist: &BTreeSet<PackageId>,
+    dropped_lockfile: Option<&str>,
 ) -> CargoResult<ResolveSelection<'gctx>> {
     let feature_unification = ws.resolve_feature_unification();
     let individual_specs = match feature_unification {
@@ -392,7 +396,28 @@ pub async fn select_ws_with_opts<'gctx>(
         .collect();
     let specs = &specs[..];
     let mut registry = ws.package_registry()?;
-    registry.add_to_yanked_whitelist(yanked_allowlist.iter().copied());
+    let dropped_resolve = dropped_lockfile
+        .map(|contents| ops::parse_lockfile(ws, contents))
+        .transpose()
+        .context("failed to parse the workspace's dropped Cargo.lock")?;
+    if let Some(dropped) = &dropped_resolve {
+        // Registry pins keep admission-only semantics: selectable while
+        // yanked, never preferred. Git pins carry the locked sha in the
+        // source's precise fragment, so they register as locks instead —
+        // the only entries that may constrain selection. Registering
+        // anything else would be wrong: `lock()` rewrites a registered
+        // node's deps to the lockfile's versions too, which would pin
+        // registry versions for workspace members and git packages.
+        registry.add_to_yanked_whitelist(dropped.iter().filter(|id| id.source_id().is_registry()));
+        for node in dropped.iter().filter(|id| id.source_id().is_git()) {
+            let deps = dropped
+                .deps_not_replaced(node)
+                .map(|(id, _)| id)
+                .filter(|id| id.source_id().is_git())
+                .collect();
+            registry.register_lock(node, deps);
+        }
+    }
     let (resolve, resolved_with_overrides) = if ws.ignore_lock() {
         let add_patches = true;
         let resolve = None;

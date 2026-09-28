@@ -15,8 +15,10 @@
 //!   --locked` reproduces — the projects lane drops the committed
 //!   lockfile so its resolve lands on the latest semver-compatible
 //!   versions, as it did when the admin CLI ran `cargo metadata` locally;
-//!   the dropped lockfile's pins still admit the yanked versions they
-//!   name, cargo's own rule ([`stow_resolve::ops::lockfile_package_ids`]);
+//!   the dropped lockfile travels into the session, where its registry
+//!   pins still admit the yanked versions they name and its git pins
+//!   lock each git dep to the sha they name — cargo's own lockfile
+//!   rules;
 //! - the registry: cargo's sparse-index machinery over a [`worker::Fetch`]
 //!   transport, with the index `.cache` files persisting under the shared
 //!   in-memory cargo home for the whole request;
@@ -48,9 +50,7 @@ use crate::fetch_guard::OutboundPool;
 use semver::Version;
 use skyzen_services::Db;
 use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitKind};
-use stow_resolve::core::PackageId;
 use stow_resolve::github_tree;
-use stow_resolve::ops::lockfile_package_ids;
 use stow_resolve::rustc_data;
 use stow_resolve::sources::registry::IndexCachesRoot;
 use stow_resolve::util::context::{Env, GlobalContext};
@@ -182,11 +182,12 @@ struct SourceWorkspace {
     members_are_crates_io: bool,
     /// Whether the tree carried a `Cargo.lock` into the resolve.
     ships_lockfile: bool,
-    /// The crates.io and git pins of the dropped workspace lockfiles,
-    /// admissible to version selection even when yanked — cargo's own
-    /// rule for the versions a project's `Cargo.lock` names. Empty for
-    /// lanes that keep their lockfile or never had one.
-    yanked_allowlist: BTreeSet<PackageId>,
+    /// Contents of the workspace root's `Cargo.lock`, dropped from the
+    /// tree but carried into the resolve — its registry pins stay
+    /// admissible while yanked and each git pin locks that dep's sha,
+    /// cargo's own lockfile rules. `None` for lanes that keep their
+    /// lockfile or never had one.
+    dropped_lockfile: Option<String>,
 }
 
 /// The in-memory tree every resolve in this request shares. The
@@ -509,23 +510,20 @@ fn build_workspace(
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let ships_lockfile = keep_lockfile && files.contains_key(&ws_root.join("Cargo.lock"));
-    // The workspace root's `Cargo.lock` leaves its pins in
-    // `yanked_allowlist` before it goes: a version the project locked
-    // stays selectable even though the index yanked it, which is what
-    // cargo itself does with a lockfile in hand. The set is admission,
-    // not preference — nothing else about selection changes.
-    let yanked_allowlist = match files.get(&ws_root.join("Cargo.lock")) {
-        Some(data) if !keep_lockfile => {
-            // A lockfile cargo could not read fails cargo's own build of
-            // the project, so it fails this resolve too.
-            let contents = std::str::from_utf8(data).map_err(|error| {
-                ResolverError::BadRequest(format!("workspace Cargo.lock is not UTF-8: {error}"))
-            })?;
-            lockfile_package_ids(contents).map_err(|error| {
-                ResolverError::BadRequest(format!("workspace Cargo.lock: {error:#}"))
-            })?
-        }
-        _ => BTreeSet::new(),
+    // The workspace root's `Cargo.lock` travels into the resolve as
+    // `dropped_lockfile` before it goes: the versions it pins stay
+    // admissible even when the index yanked them, and each git dep
+    // locks to the sha it names — which is what cargo itself does
+    // with a lockfile in hand.
+    let dropped_lockfile = match files.get(&ws_root.join("Cargo.lock")) {
+        Some(data) if !keep_lockfile => Some(
+            std::str::from_utf8(data)
+                .map_err(|error| {
+                    ResolverError::BadRequest(format!("workspace Cargo.lock is not UTF-8: {error}"))
+                })?
+                .to_owned(),
+        ),
+        _ => None,
     };
     for (path, data) in files {
         // Every `Cargo.lock` under the selected workspace is dropped
@@ -544,7 +542,7 @@ fn build_workspace(
         cargo_home: PathBuf::from(CARGO_HOME_DIR),
         members_are_crates_io,
         ships_lockfile,
-        yanked_allowlist,
+        dropped_lockfile,
     })
 }
 
@@ -1109,7 +1107,7 @@ async fn resolve_session_outputs(
                 members_are_crates_io: source.members_are_crates_io,
                 rustc_verbose_version: session_rustc,
                 cfg,
-                yanked_allowlist: source.yanked_allowlist.clone(),
+                dropped_lockfile: source.dropped_lockfile.clone(),
             },
         )
         .await
@@ -1206,7 +1204,7 @@ async fn resolve_workspace(
                 members_are_crates_io: source.members_are_crates_io,
                 rustc_verbose_version: verbose.clone(),
                 cfg,
-                yanked_allowlist: source.yanked_allowlist.clone(),
+                dropped_lockfile: source.dropped_lockfile.clone(),
             },
         )
         .await
@@ -1491,12 +1489,13 @@ mod tests {
         );
     }
 
-    /// The dropped workspace-root `Cargo.lock` leaves its sourced pins in
-    /// the `yanked_allowlist` — source-less member entries contribute
-    /// nothing, and a lane that keeps the lockfile admits them through
-    /// the previous-resolve path instead.
+    /// The dropped workspace-root `Cargo.lock` travels into the resolve
+    /// as `dropped_lockfile` contents; a lane that keeps the lockfile
+    /// leaves it in the tree for the previous-resolve path instead, and
+    /// a lockfile nested under a member dir is dropped without being
+    /// carried.
     #[test]
-    fn build_workspace_feeds_lockfile_pins_to_allowlist() {
+    fn build_workspace_carries_dropped_lockfile() {
         let lockfile = concat!(
             "version = 4\n\n",
             "[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\n\n",
@@ -1517,21 +1516,13 @@ mod tests {
         .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
         .collect();
         let ws = build_workspace(files.clone(), false, false).unwrap();
-        let names: BTreeSet<_> = ws
-            .yanked_allowlist
-            .iter()
-            .map(|id| (id.name().as_str().to_string(), id.version().to_string()))
-            .collect();
-        assert_eq!(
-            names,
-            BTreeSet::from([
-                ("bisync".to_string(), "0.3.0".to_string()),
-                ("tool".to_string(), "1.2.3".to_string()),
-            ])
-        );
+        let lockfile_path = Path::new(WORKSPACE_DIR).join("Cargo.lock");
+        assert_eq!(ws.dropped_lockfile.as_deref(), Some(lockfile));
+        assert!(!ws.vfs.exists(&lockfile_path));
 
         let kept = build_workspace(files, true, false).unwrap();
-        assert!(kept.yanked_allowlist.is_empty());
+        assert!(kept.dropped_lockfile.is_none());
+        assert!(kept.vfs.exists(&lockfile_path));
     }
 
     fn unit(

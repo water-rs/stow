@@ -938,9 +938,10 @@ async fn run() -> anyhow::Result<()> {
                 cfg: cfg.clone(),
                 members_are_crates_io: *members_are_crates_io,
                 // A lockfile the corpus dir carries is read for
-                // preference on both sides, which already admits the
-                // yanked versions it pins.
-                yanked_allowlist: BTreeSet::new(),
+                // preference on both sides — it already admits its
+                // yanked pins and locks its git deps, so the lane's
+                // dropped-lockfile input is not replayed here.
+                dropped_lockfile: None,
             };
             let mut gctx = GlobalContext::new_for_resolve(
                 manifest_dir.clone(),
