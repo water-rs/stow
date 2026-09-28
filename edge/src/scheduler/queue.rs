@@ -1370,14 +1370,14 @@ async fn load_claimed_dep_pins(
                     row.task_id
                 ))
             })?,
-            version: CrateVersion::new(
-                semver::Version::parse(&row.dep_version).map_err(|error| {
+            version: CrateVersion::new(semver::Version::parse(&row.dep_version).map_err(
+                |error| {
                     QueueError::Invariant(format!(
                         "dep pin for {}: invalid version: {error}",
                         row.task_id
                     ))
-                })?,
-            ),
+                },
+            )?),
             features_json: FeaturesJson::from_sorted(
                 serde_json::from_str(&row.dep_features_json).map_err(|error| {
                     QueueError::Invariant(format!(
