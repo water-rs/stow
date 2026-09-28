@@ -123,7 +123,18 @@ async fn report_failed_task(
     task: &BuildTaskPayload,
     error: String,
 ) -> stow_types::error::Result<()> {
-    report_completion(state, &task.task_id, task.attempt, false, Some(error), 0).await
+    report_completion(
+        state,
+        &task.task_id,
+        task.attempt,
+        false,
+        Some(error),
+        // The serve path's post-build work is the publish stage's
+        // local stand-in.
+        Some(stow_types::api::FailureStep::Publish),
+        0,
+    )
+    .await
 }
 
 /// The task id names a directory under the dispatch root, so it must be a
@@ -194,6 +205,7 @@ async fn run_dispatched_task(
             task.attempt,
             false,
             Some(format!("stow-build exited with status {status}")),
+            Some(stow_types::api::FailureStep::Build),
             0,
         )
         .await?;
@@ -206,16 +218,33 @@ async fn run_dispatched_task(
     // outcome is binary now: a live process reached this line means the
     // build ran to completion and whatever it plans is the whole closure.
     if upload_plan_len(&layout.upload_plan_path).await? == 0 {
-        return report_completion(&state, &task.task_id, task.attempt, true, None, 0).await;
+        return report_completion(&state, &task.task_id, task.attempt, true, None, None, 0).await;
     }
 
     populate_mock_registry(&exe, &state, &task, &layout).await?;
-    let artifacts_uploaded = register_records(&state, &task.task_id, &layout.records_path).await?;
+    let artifacts_uploaded =
+        match register_records(&state, &task.task_id, &layout.records_path).await {
+            Ok(count) => count,
+            Err(error) => {
+                report_completion(
+                    &state,
+                    &task.task_id,
+                    task.attempt,
+                    false,
+                    Some(error.to_string()),
+                    Some(stow_types::api::FailureStep::Register),
+                    0,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
     report_completion(
         &state,
         &task.task_id,
         task.attempt,
         true,
+        None,
         None,
         artifacts_uploaded,
     )
@@ -309,6 +338,7 @@ async fn populate_mock_registry(
         Some(format!(
             "mock registry populate exited with status {populate_status}"
         )),
+        Some(stow_types::api::FailureStep::Publish),
         0,
     )
     .await?;
@@ -357,6 +387,7 @@ async fn report_completion(
     attempt: u32,
     success: bool,
     error: Option<String>,
+    failure_step: Option<stow_types::api::FailureStep>,
     artifacts_uploaded: u32,
 ) -> stow_types::error::Result<()> {
     let report = BuildCompleteReport {
@@ -364,6 +395,7 @@ async fn report_completion(
         attempt,
         success,
         error,
+        failure_step,
         artifacts_uploaded,
         github_run_id: None,
     };

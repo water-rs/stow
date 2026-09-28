@@ -157,13 +157,15 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
             }
             Ok(())
         }
-        Err(error) => {
-            tracing::error!(task_id = %task.task_id, %error, "publish stage failed");
+        Err(failure) => {
+            let (step, error) = (failure.step(), failure.into_error());
+            tracing::error!(task_id = %task.task_id, %error, step = %step.as_str(), "publish stage failed");
             let report = BuildCompleteReport {
                 task_id: task.task_id.clone(),
                 attempt: task.attempt,
                 success: false,
                 error: Some(error.to_string()),
+                failure_step: Some(step),
                 artifacts_uploaded: 0,
                 github_run_id: None,
             };
@@ -186,10 +188,41 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
     }
 }
 
+/// `publish()`'s error split on the pipeline step that produced it —
+/// the report carries the step so the scheduler's failure classes can
+/// name `register` what a bare publish-job error text cannot.
+enum PublishFailure {
+    /// Validate/push/sign work the trusted job owns.
+    Stage(stow_types::error::Error),
+    /// The `artifacts/register` POST into the edge.
+    Register(stow_types::error::Error),
+}
+
+impl PublishFailure {
+    const fn step(&self) -> stow_types::api::FailureStep {
+        match self {
+            Self::Stage(_) => stow_types::api::FailureStep::Publish,
+            Self::Register(_) => stow_types::api::FailureStep::Register,
+        }
+    }
+
+    fn into_error(self) -> stow_types::error::Error {
+        match self {
+            Self::Stage(error) | Self::Register(error) => error,
+        }
+    }
+}
+
+impl From<stow_types::error::Error> for PublishFailure {
+    fn from(error: stow_types::error::Error) -> Self {
+        Self::Stage(error)
+    }
+}
+
 async fn publish(
     task: &BuildTaskPayload,
     input_dir: &std::path::Path,
-) -> stow_types::error::Result<BuildCompleteReport> {
+) -> Result<BuildCompleteReport, PublishFailure> {
     let output = stage::read_build_output(input_dir).await?;
     let closure = closure::resolve(task).await?;
     // Every cache-consumption claim is only as good as the signed index
@@ -227,8 +260,12 @@ async fn publish(
     // A 409 here means the scheduler reclaimed the task while this build
     // ran and a newer attempt owns it — the records can never land, so the
     // publish stops and reports; the report itself conflicts the same way
-    // and the job exits quietly (stow#431).
-    if !register::register_artifacts(Some(&task.task_id), &artifact_records).await? {
+    // and the job exits quietly (stow#431). A real register failure (5xx,
+    // transport) reports with `failure_step: register`.
+    if !register::register_artifacts(Some(&task.task_id), &artifact_records)
+        .await
+        .map_err(PublishFailure::Register)?
+    {
         tracing::warn!(
             task_id = %task.task_id,
             "register rejected the records — a newer attempt owns the task"
@@ -248,6 +285,7 @@ async fn publish(
         attempt: task.attempt,
         success: true,
         error: None,
+        failure_step: None,
         artifacts_uploaded: upload_outcome.newly_pushed,
         github_run_id: None,
     })
