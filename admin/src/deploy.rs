@@ -120,13 +120,14 @@ pub struct VerdictArgs {
     /// See `--candidate-from`.
     #[arg(long, value_parser = parse_rfc3339)]
     candidate_to: OffsetDateTime,
-    /// Minimum worker requests the candidate must have served in its
-    /// window — the workflow's synthetic suite guarantees this floor via
-    /// version overrides, so organic traffic is never required for signal.
-    /// `0` disables the floor. Ignored by `--phase promoted` (its metrics
-    /// are account totals and skip on empty windows instead).
+    /// Minimum worker requests EACH version must have served in its
+    /// window — the workflow's synthetic suite pins this many requests to
+    /// both sides via version overrides, so organic traffic is never
+    /// required for signal. `0` disables the floor. Ignored by
+    /// `--phase promoted` (its metrics are account totals and skip on
+    /// empty windows instead).
     #[arg(long, default_value_t = 0)]
-    min_candidate_requests: u64,
+    min_requests_per_version: u64,
 }
 
 fn parse_rfc3339(raw: &str) -> Result<OffsetDateTime, String> {
@@ -885,9 +886,10 @@ fn evaluate_canary(
     );
     let no_worker_signal = candidate.worker.is_none_or(|worker| worker.requests <= 0.0)
         || baseline.worker.is_none_or(|worker| worker.requests <= 0.0);
-    let min = f64::from(u32::try_from(args.min_candidate_requests).unwrap_or(u32::MAX));
-    let insufficient_sample =
-        !no_worker_signal && candidate.worker.is_some_and(|worker| worker.requests < min);
+    let min = f64::from(u32::try_from(args.min_requests_per_version).unwrap_or(u32::MAX));
+    let insufficient_sample = !no_worker_signal
+        && (candidate.worker.is_some_and(|worker| worker.requests < min)
+            || baseline.worker.is_some_and(|worker| worker.requests < min));
     if no_worker_signal || insufficient_sample {
         let verdict = if no_worker_signal {
             "no signal"
@@ -980,7 +982,7 @@ mod tests {
             baseline_to: parse_rfc3339("2026-09-28T00:15:00Z").expect("to"),
             candidate_from: parse_rfc3339("2026-09-28T00:15:00Z").expect("from"),
             candidate_to: parse_rfc3339("2026-09-28T00:30:00Z").expect("to"),
-            min_candidate_requests: 0,
+            min_requests_per_version: 0,
         }
     }
 
@@ -1382,11 +1384,14 @@ mod tests {
     }
 
     #[test]
-    fn a_candidate_below_the_minimum_sample_fails_closed() {
-        // The synthetic suite guarantees 50 requests on the candidate;
-        // one that served 3 breaches the floor even though it has signal.
+    fn a_side_below_the_minimum_sample_fails_closed() {
+        // The suite guarantees 50 requests PER VERSION; a side that served
+        // 3 breaches the floor even though it has signal, whichever side
+        // it is.
+        let mut min_args = args();
+        min_args.min_requests_per_version = 50;
         let (baseline, _) = canary_samples();
-        let candidate = canary_sample(
+        let thin_candidate = canary_sample(
             &canary_data(
                 &json!([
                     worker_group("old", 95_000.0, 40.0, 410.0, 2_100.0, 21_000.0, 82_000.0),
@@ -1396,12 +1401,25 @@ mod tests {
             ),
             "new",
         );
-        let mut min_args = args();
-        min_args.min_candidate_requests = 50;
-        let report = evaluate_canary(&min_args, &baseline, &candidate);
+        let report = evaluate_canary(&min_args, &baseline, &thin_candidate);
         assert!(!report.pass);
         assert_eq!(report.metrics[0].verdict, "insufficient sample");
         assert_eq!(report.breaches, ["worker signal (insufficient sample)"]);
+
+        let thin_baseline = canary_sample(
+            &canary_data(
+                &json!([
+                    worker_group("old", 4.0, 0.0, 410.0, 2_100.0, 21_000.0, 82_000.0),
+                    worker_group("new", 500.0, 1.0, 420.0, 2_200.0, 22_000.0, 84_000.0),
+                ]),
+                &json!([do_invocation_group("new", 100.0, 0.0, 5_000_000.0)]),
+            ),
+            "old",
+        );
+        let (_, candidate) = canary_samples();
+        let report = evaluate_canary(&min_args, &thin_baseline, &candidate);
+        assert!(!report.pass);
+        assert_eq!(report.metrics[0].verdict, "insufficient sample");
     }
 
     #[test]

@@ -17,9 +17,13 @@ name: deploy-edge
 #   promoted-verdict `environment: deploy-promoted` (second wait timer), then
 #                    `--phase promoted`.
 #
-# The verdict binary is the `stow-admin` artifact of the Test run that proved
-# the commit — no job compiles it. A breach in either verdict job (or any
-# post-upload failure) runs `wrangler rollback` to the baseline version.
+# The verdict binary is the `stow-admin` of the deployed commit's signed
+# toolchain image — `.github/actions/stow-toolchain` pulls
+# `ghcr.io/water-rs/stow-toolchain:<sha>-<platform>` and verifies the cosign
+# signature against the commit's own workflow sha, so no job compiles it.
+# The action lands with #431; until then the jobs that use it fail closed.
+# A breach in either verdict job (or any post-upload failure) runs
+# `wrangler rollback` to the baseline version.
 #
 # Phase 1 compares per-`scriptVersion` metrics: worker error rate and
 # cpu/wall p50+p99 (`workersInvocationsAdaptive`), DO requests/errors/wall per
@@ -55,8 +59,7 @@ on:
 
 permissions:
   contents: read
-  # `gh run list`/`gh run download` read the Test run's conclusion and its
-  # stow-admin artifact.
+  # `gh run list` reads the Test run's conclusion for a dispatched sha.
   actions: read
   # `stow-admin scheduler migrate` mints an Actions OIDC JWT per request.
   id-token: write
@@ -71,8 +74,8 @@ env:
   SKYZEN_REV: 0271f693d253a9b32660affacbafaeffca455620
   # The generated wrangler config, relative to edge/ (the manifest root).
   WRANGLER_CONFIG: .skyzen/gen/wrangler.toml
-  # The synthetic suite's request count — also the verdict's
-  # --min-candidate-requests floor, so a low-traffic deploy still fails
+  # The synthetic suite's request count PER SIDE — also the verdict's
+  # --min-requests-per-version floor, so a low-traffic deploy still fails
   # closed if the suite itself did not land.
   SUITE_REQUESTS: "50"
 
@@ -84,7 +87,6 @@ jobs:
       baseline_version: ${{ steps.versions.outputs.baseline_version }}
       candidate_version: ${{ steps.versions.outputs.candidate_version }}
       deploy_start: ${{ steps.join.outputs.deploy_start }}
-      test_run_id: ${{ steps.testrun.outputs.test_run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,10 +95,7 @@ jobs:
 
       # A dispatch is only as tested as the commit it names — the deploy's
       # justification is a green Test run, so verify one exists for the SHA.
-      # The same lookup also finds the run whose `stow-admin` artifact the
-      # verdict jobs download.
       - name: Resolve the green Test run for $DEPLOY_SHA
-        id: testrun
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -113,8 +112,6 @@ jobs:
             exit 1
           fi
           echo "Test run $run_id gates this deploy"
-          echo "TEST_RUN_ID=$run_id" >> "$GITHUB_ENV"
-          echo "test_run_id=$run_id" >> "$GITHUB_OUTPUT"
 
       - name: Validate the canary input
         run: |
@@ -232,13 +229,13 @@ jobs:
           echo "deploy_start=$deploy_start" >> "$GITHUB_OUTPUT"
           wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@0%"
 
-      - name: Fetch the prebuilt stow-admin from the Test run
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh run download "$TEST_RUN_ID" -n stow-admin -D /tmp/stow-admin-bin
-          chmod +x /tmp/stow-admin-bin/stow-admin
+      # `stow-admin` comes from the commit's signed toolchain image (#431's
+      # `.github/actions/stow-toolchain` — the input names track that
+      # action's contract and the workflow fails closed until it lands).
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ env.DEPLOY_SHA }}
+          binaries: stow-admin
 
       # The scheduler queue's schema is the DO's, not D1's: it migrates
       # through the admin route, never in request code. The override header
@@ -253,7 +250,7 @@ jobs:
         run: |
           set -euo pipefail
           export STOW_EDGE_VERSION_OVERRIDE="stow-edge=\"$CANDIDATE_VERSION\""
-          report=$(/tmp/stow-admin-bin/stow-admin --json scheduler migrate)
+          report=$(stow-admin --json scheduler migrate)
           echo "$report"
           after=$(jq -r '.after' <<<"$report")
           expected=$(sed -n 's/.*const SCHEMA_VERSION: i64 = \([0-9]\+\).*/\1/p' \
@@ -267,34 +264,41 @@ jobs:
             exit 1
           fi
 
-      # The suite is the verdict's guaranteed signal: version overrides pin
-      # every request to the candidate, so organic traffic is never
-      # required — a 5% canary of a quiet site still produces a full
-      # sample. SUITE_REQUESTS requests total; the artifact probe accepts
-      # 404 (the key is a well-formed miss, not an error).
-      - name: Synthetic suite against the candidate
+      # The suite is the verdict's guaranteed signal on BOTH sides:
+      # version overrides pin each probe to the candidate then the
+      # baseline, interleaved so both samples see the same edge conditions
+      # in the same window — organic traffic is never required. The
+      # artifact probe is keyed on this runner's own rustc (a well-formed
+      # miss, so 404 is fine — it is not an error).
+      - name: Synthetic suite against the candidate and baseline
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
         run: |
           set -euo pipefail
-          override="stow-edge=\"$CANDIDATE_VERSION\""
+          host=$(rustc -vV | awk '/^host:/ {print $2}')
+          rustc=$(rustc --version | awk '{print $2}')
+          artifact_probe="/api/v1/artifacts/$host/$rustc/suite-probe"
+          cand="stow-edge=\"$CANDIDATE_VERSION\""
+          base="stow-edge=\"$BASELINE_VERSION\""
           probes=$((SUITE_REQUESTS / 5))
           for i in $(seq "$probes"); do
             for url in "/" \
               "/api/v1/crates/serde/versions" \
-              "/api/v1/artifacts/x86_64-unknown-linux-gnu/1.90.0/suite-probe" \
+              "$artifact_probe" \
               "/api/v1/stats" \
               "/api/v1/scheduler/status"; do
-              code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
-                -H "Cloudflare-Workers-Version-Overrides: $override" \
-                "$STOW_EDGE_URL$url")
-              case "$code" in
-                2*|404) ;;
-                *) echo "::error::suite probe $url answered $code" >&2; exit 1 ;;
-              esac
+              for override in "$cand" "$base"; do
+                code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
+                  -H "Cloudflare-Workers-Version-Overrides: $override" \
+                  "$STOW_EDGE_URL$url")
+                case "$code" in
+                  2*|404) ;;
+                  *) echo "::error::suite probe $url answered $code" >&2; exit 1 ;;
+                esac
+              done
             done
           done
-          echo "suite landed $SUITE_REQUESTS requests on $CANDIDATE_VERSION"
+          echo "suite landed $SUITE_REQUESTS requests on each of $CANDIDATE_VERSION and $BASELINE_VERSION"
 
       - name: Shift $CANARY_SHARE% of traffic onto the candidate
         working-directory: edge
@@ -326,37 +330,34 @@ jobs:
       BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
       CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
       DEPLOY_START: ${{ needs.prepare.outputs.deploy_start }}
-      TEST_RUN_ID: ${{ needs.prepare.outputs.test_run_id }}
     steps:
-      - name: Fetch the prebuilt stow-admin from the Test run
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh run download "$TEST_RUN_ID" -n stow-admin -D /tmp/stow-admin-bin
-          chmod +x /tmp/stow-admin-bin/stow-admin
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ env.DEPLOY_SHA }}
+          binaries: stow-admin
 
-      # The candidate window is [DEPLOY_START, now] — it holds the suite's
-      # SUITE_REQUESTS requests plus organic canary traffic. The baseline
-      # window is its equal-length mirror ending at the deploy start.
+      # Both samples come from the SAME window [DEPLOY_START, now], split
+      # by `scriptVersion`: the suite pinned SUITE_REQUESTS requests to
+      # each version inside it, and organic traffic adds to both.
       - name: Canary verdict (phase 1)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          now_epoch=$(date -u +%s)
-          start_epoch=$(date -u -d "$DEPLOY_START" +%s)
-          baseline_from=$(date -u -d "@$((start_epoch - (now_epoch - start_epoch)))" +%Y-%m-%dT%H:%M:%SZ)
-          now=$(date -u -d "@$now_epoch" +%Y-%m-%dT%H:%M:%SZ)
-          /tmp/stow-admin-bin/stow-admin deploy verdict --phase canary \
-            --min-candidate-requests "$SUITE_REQUESTS" \
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          stow-admin deploy verdict --phase canary \
+            --min-requests-per-version "$SUITE_REQUESTS" \
             --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
             --script stow-edge \
             --baseline-version "$BASELINE_VERSION" \
             --candidate-version "$CANDIDATE_VERSION" \
-            --baseline-from "$baseline_from" \
-            --baseline-to "$DEPLOY_START" \
+            --baseline-from "$DEPLOY_START" \
+            --baseline-to "$now" \
             --candidate-from "$DEPLOY_START" \
             --candidate-to "$now"
 
@@ -413,20 +414,19 @@ jobs:
       CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
       DEPLOY_START: ${{ needs.prepare.outputs.deploy_start }}
       PROMOTE_START: ${{ needs.promote.outputs.promote_start }}
-      TEST_RUN_ID: ${{ needs.prepare.outputs.test_run_id }}
     steps:
-      - name: Fetch the prebuilt stow-admin from the Test run
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh run download "$TEST_RUN_ID" -n stow-admin -D /tmp/stow-admin-bin
-          chmod +x /tmp/stow-admin-bin/stow-admin
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ env.DEPLOY_SHA }}
+          binaries: stow-admin
 
       # Phase 2's metrics carry no `scriptVersion` — account totals. The
       # candidate window is [PROMOTE_START, now]; the baseline window is
-      # its equal-length mirror ending at the deploy start, the same
-      # pre-deploy window phase 1 measured.
+      # its equal-length mirror ending at the deploy start.
       - name: Post-promotion verdict (phase 2)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -438,7 +438,7 @@ jobs:
           start_epoch=$(date -u -d "$DEPLOY_START" +%s)
           baseline_from=$(date -u -d "@$((start_epoch - (now_epoch - promote_epoch)))" +%Y-%m-%dT%H:%M:%SZ)
           now=$(date -u -d "@$now_epoch" +%Y-%m-%dT%H:%M:%SZ)
-          /tmp/stow-admin-bin/stow-admin deploy verdict --phase promoted \
+          stow-admin deploy verdict --phase promoted \
             --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
             --script stow-edge \
             --baseline-version "$BASELINE_VERSION" \

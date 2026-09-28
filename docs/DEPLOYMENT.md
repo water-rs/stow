@@ -212,11 +212,11 @@ version overrides reach it, runs `stow-admin scheduler migrate` against
 the candidate via the `Cloudflare-Workers-Version-Overrides` header
 (the scheduler schema version stamp must equal the candidate's own
 `SCHEMA_VERSION`, else the deploy fails before any traffic shifts),
-fires the synthetic suite at the candidate through the same override —
-50 requests across the site, crate lookup, artifact HEAD, stats and
-scheduler status paths, the floor the verdict's
-`--min-candidate-requests` expects — and finally shifts `canary_share`%
-of traffic onto it.
+fires the synthetic suite through the same override — 50 requests on the
+candidate interleaved with 50 on the baseline across the site, crate
+lookup, artifact HEAD, stats and scheduler status paths, the floor the
+verdict's `--min-requests-per-version` expects on each side — and
+finally shifts `canary_share`% of traffic onto it.
 
 Promotion is gated on two verdict phases of
 `stow-admin deploy verdict`, each printing every metric's baseline and
@@ -227,11 +227,12 @@ candidate values and exiting non-zero on a breach — which runs
   wait timer: worker error rate and cpu/wall-time p50/p99 per
   `scriptVersion` from `workersInvocationsAdaptive`, plus DO requests,
   errors and wall time per request per `scriptVersion` from
-  `durableObjectsInvocationsAdaptiveGroups`. A canary that served
-  nothing — or fewer than the suite's request count — fails closed; DO
-  rows report `skipped` when the Scheduler object stayed on the
-  baseline (objects are assigned one version per deployment config — a
-  reassigned object is reset once, and SQLite state survives).
+  `durableObjectsInvocationsAdaptiveGroups`. Both sides are measured in
+  the same window — the suite pinned its requests to each version, so
+  either side serving nothing or fewer than the suite's count fails
+  closed; DO rows report `skipped` when the Scheduler object stayed on
+  the baseline (objects are assigned one version per deployment config —
+  a reassigned object is reset once, and SQLite state survives).
 - `--phase promoted`, run by `promoted-verdict` after `promote` and the
   `deploy-promoted` wait timer: the metrics that carry no
   `scriptVersion` compare the post-promotion window against the
@@ -240,9 +241,12 @@ candidate values and exiting non-zero on a breach — which runs
   D1 rows read/written per worker request from
   `d1AnalyticsAdaptiveGroups`. A breach here rolls back too.
 
-The verdict jobs download the `stow-admin` artifact built by the Test
-run's `admin-binary` job for the deployed commit — nothing compiles it
-at deploy time.
+`stow-admin` comes from the deployed commit's signed toolchain image —
+`.github/actions/stow-toolchain` pulls
+`ghcr.io/water-rs/stow-toolchain:<sha>-<platform>` and verifies the
+cosign signature against the commit's own workflow sha, so nothing
+compiles it at deploy time. The action lands with #431; this workflow
+fails closed until then.
 
 Required GitHub Actions secrets:
 
