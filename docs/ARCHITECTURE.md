@@ -77,14 +77,13 @@ Every observed miss is logged as one data point in the
 `STOW_ANALYTICS`), never as a D1 row: anonymous traffic cannot spend
 billed row writes. A point's blobs are `(event, crate_name, version,
 features_json, target, rustc_version, kind, path)` with `event = "miss"`,
-its doubles are `[1]`, and the crate name is the index. Two miss shapes
-exist: each uncovered node the admissions handler enqueues writes a
-`graph` point carrying the full request identity, and a 404 on the
-artifact byte path with a `?crate=` query writes an `exact` point
-carrying only crate name, target, and rustc (the `kind` slot is always
-empty today). A point carries artifact identity only — no IP, no request
-id, no dependency graph, no lockfile hash. Semantic misses never reach
-the edge: the CLI resolves them locally against the index slice.
+its doubles are `[1]`, and the crate name is the index. Every miss is a
+`graph` point carrying the full request identity, written by the
+admissions handler once per uncovered node (the `kind` slot is always
+empty today); the digest-addressed byte path observes no crate identity
+and writes nothing. A point carries artifact identity only — no IP, no
+request id, no dependency graph, no lockfile hash. Semantic misses never
+reach the edge: the CLI resolves them locally against the index slice.
 
 A D1 row exists only for a miss whose admission was redeemed: when
 `POST /api/v1/enqueue` verifies the challenge and proof-of-work it
@@ -267,11 +266,11 @@ The bundle needs no signature of its own: it embeds the signed manifest and
 config, the signature materials, and the layers byte-for-byte, and the CLI
 verifies that material after download. The record registered with the
 edge carries the bundle layer's digest and size (`bundle_digest`,
-`bundle_size`), republished verbatim into the index row; the edge streams
-that blob by digest from GHCR through `GET /api/v1/artifacts/…`, teeing
-it into the Cache API, and the CLI requires the bytes to hash to the
-index row's `bundle_digest` — no intermediary ever assembles, buffers or
-inspects it. The publish stage validated the tar
+`bundle_size`), republished verbatim into the index row; the CLI asks the
+edge for `GET /api/v1/bundles/{bundle_digest}`, which serves the blob
+Cache-API-first and tees a GHCR miss into the cache, and the CLI requires
+the bytes to hash to the index row's `bundle_digest` — no intermediary
+ever assembles, buffers or inspects it. The publish stage validated the tar
 (`stow_types::bundle_schema`) before pushing it.
 
 | Path | Content |
@@ -283,8 +282,8 @@ inspects it. The publish stage validated the tar
 | `files/<name>` | One entry per layer in manifest order: `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, the native archive |
 
 Rows registered before bundles were published carry an empty
-`bundle_digest`; the index export omits them (no pullable digest means
-no coverage), and the serving lookup treats such a row as a miss. `stow-build backfill-bundles` lists them through
+`bundle_digest`; the index export omits them — a row with no pullable
+digest is not coverage. `stow-build backfill-bundles` lists them through
 `GET /api/v1/admin/artifacts/unbundled`, republishes each bundle from the
 signed image already in GHCR, and re-registers the record.
 
@@ -381,8 +380,8 @@ What each hop is allowed to do:
 
 | Hop | Reads | Writes |
 |---|---|---|
-| stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/artifacts/…`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
-| edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users, and bound to the dispatched task's dependency closure — an OIDC write must name an in-flight task and every record's `(crate, version)` must be the task crate or a closure member); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss); `stow_events` Analytics Engine points (sampled hits) |
+| stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
+| edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users, and bound to the dispatched task's dependency closure — an OIDC write must name an in-flight task and every record's `(crate, version)` must be the task crate or a closure member); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
@@ -458,8 +457,9 @@ push from on the repo (probed via the `git-receive-pack` ref
 advertisement — uniform across user tokens, fine-grained PATs, and
 installation tokens). The CLI verifies cosign signatures on every cache hit
 (`cli/src/verify.rs`) before injecting bytes into Cargo's target directory,
-so a polluted record (e.g. from a stolen credential) produces a 404 +
-stale-row prune on the client, not malicious code.
+and the digest-addressed fetch requires the bytes to hash to the index's
+`bundle_digest`, so a polluted record (e.g. from a stolen credential)
+produces a verification failure and a local compile, not malicious code.
 
 What "verifies cosign signatures" means in `github-ci` mode: the signature
 material must carry a Rekor bundle; the bundle's signed entry timestamp is
@@ -596,35 +596,25 @@ Four workflows keep it warm:
 
 ## Usage statistics
 
-Anonymous usage events go to the `stow_events` Analytics Engine dataset
-(binding `STOW_STATS`), never to D1 — exactly like misses, anonymous
-traffic cannot spend billed row writes. Two event shapes exist; both are
-gated on the `x-stow-no-analytics: 1` request header, which the CLI sends
-on every request when `STOW_NO_ANALYTICS=1` is set (`edge/src/stats.rs`'s
+Anonymous usage events go to the `stow_cache_misses` Analytics Engine
+dataset (binding `STOW_ANALYTICS`), never to D1 — anonymous traffic
+cannot spend billed row writes. The one live shape is the `graph` miss
+the admissions handler writes per uncovered node. Every write is gated
+on the `x-stow-no-analytics: 1` request header, which the CLI sends on
+every request when `STOW_NO_ANALYTICS=1` is set (`edge/src/stats.rs`'s
 `AnalyticsConsent` extractor — every write takes the consent as an
 argument, so the opt-out is honoured by construction).
-
-- `hit` — written by the exact byte path (`GET /api/v1/artifacts/…`,
-  the only artifact-serving route) with probability 1/10; the stored sample
-  weight (`double1 = 10`) scales counts back up at query time. Blobs are
-  `(event, target, rustc_version, crate_name, version, size_bucket,
-  cli_version, os_family, surface)`; doubles are `(sample_weight,
-  compile_millis, bundle_size)`. The point's sole index is a
-  daily-salted install hash —
-  `hex(HMAC-SHA256(HMAC-SHA256(STOW_STATS_SALT_SECRET, YYYY-MM-DD), ip))[..16]` —
-  which counts distinct installs per day and cannot be joined across
-  days; the client IP is hashed inside the worker and never written.
 
 `GET /api/v1/stats` answers `UsageStats` by running the
 `edge/src/sql/stats_*.sql` queries against the Analytics Engine SQL API
 (`POST …/accounts/{CF_ACCOUNT_ID}/analytics_engine/sql`, authorized by
 the `CF_ANALYTICS_TOKEN` secret) and caches the response in the Cache
-API for one hour per colo. `daily_active_installs_7d` averages the
-per-day distinct install hashes over 7 days (the daily salt makes a
-weekly unique count impossible by design) and is suppressed below 20 —
-stow publishes no small counts. `GET /stats`
+API for one hour per colo. The hit-side queries read `stow_events`, the
+retired hit dataset: the digest-addressed byte path carries no artifact
+identity and writes nothing, so its points drain under the 90-day
+retention and the derived figures decay to zero. `GET /stats`
 renders the same numbers as a public page. The full data contract —
-fields, retention, sampling, opt-out — is documented in
+fields, retention, opt-out — is documented in
 [`PRIVACY.md`](../PRIVACY.md).
 
 ## Wire-protocol surface (HTTP)
@@ -640,8 +630,7 @@ short-circuit before deserialization.
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
 | GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Cache-API-cached for one hour |
-| GET `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=<name>` | none | — | the `<tag>.bundle` blob, streamed | Exact-key byte fetch — the only artifact-serving route; the CLI resolves which key to fetch from its local index |
-| HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` (the bundle's size) | Existence probe |
+| GET `/api/v1/bundles/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Digest-addressed byte fetch — the only artifact-serving route; the `sha256:<64 hex>` path segment is the index row's `bundle_digest`, served Cache-API-first over GHCR |
 | POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `RegisterArtifactsRequest` | `OkResponse` | Trusted CI registers built artifacts; the OIDC caller's `task_id` binds the write to the dispatched task's target/rustc and dependency closure |
 | GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
 | GET `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | — | `PanicSwitch` | Read the anonymous-traffic circuit breaker |
@@ -653,7 +642,7 @@ short-circuit before deserialization.
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
-| POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows and invalidate their lookup cache entries; GHCR tags are not deleted — `artifacts prune` |
+| POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows; GHCR tags are not deleted — `artifacts prune` |
 | POST `/api/v1/admin/preheat/plan` | Bearer: repo-workflow OIDC or push user | `PreheatPlanRequest` | `PreheatPlanResponse` | Dry-run closure expansion for a crate request — `preheat plan` |
 | POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for the posted graph's uncovered nodes — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
@@ -672,7 +661,7 @@ Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub i
 Every `/api/v1/` path sits behind the zone rate-limit rule documented in
 [`DEPLOYMENT.md`](DEPLOYMENT.md#one-time-cloudflare-setup) — 60 requests
 per 10 seconds per source IP over the API prefix, not per route. The
-`/api/v1/artifacts/` byte path is carved out of it: a warm build streams
+`/api/v1/bundles/` byte path is carved out of it: a warm build streams
 its closure at the CLI's prefetch concurrency and the per-`rustc` wrapper
 fetches on demand under cargo's job parallelism, so one address
 legitimately sends tens of bundle requests a second, and a Cache API hit

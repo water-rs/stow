@@ -138,6 +138,21 @@ pub struct OciDigestMismatch {
     pub actual: String,
 }
 
+/// Whether `digest` is `sha256:` plus exactly 64 lowercase hex digits.
+///
+/// The only shape a digest-addressed request path may carry, and the
+/// shape [`sha256_digest`] produces. Checked before the value is ever
+/// interpolated into a registry URL.
+#[must_use]
+pub fn is_sha256_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// Verify that `bytes` hash to the `sha256:<hex>` `expected` digest.
 ///
 /// A digest reference is only as trustworthy as the content behind it —
@@ -535,6 +550,26 @@ mod tests {
                 None,
                 "reference should fail: {reference}"
             );
+        }
+    }
+
+    #[test]
+    fn sha256_digest_shape() {
+        let valid = sha256_digest(b"bytes");
+        assert!(is_sha256_digest(&valid));
+        let over_long = format!("{valid}0");
+        let upper_hex = format!("sha256:{}", "A".repeat(64));
+        for digest in [
+            "",
+            "sha256:",
+            "sha256:zzzz",
+            "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &valid[..valid.len() - 1],
+            over_long.as_str(),
+            upper_hex.as_str(),
+            "SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!is_sha256_digest(digest), "{digest}");
         }
     }
 

@@ -1265,7 +1265,7 @@ pub struct ArtifactListQuery {
 /// Request body for `POST /api/v1/admin/artifacts/prune`.
 ///
 /// Deletes every catalog row built by `rustc_version` — the retired
-/// toolchain — and invalidates its lookup-cache entries. GHCR image tags
+/// toolchain. GHCR image tags
 /// are not deleted; they age out under the package's own retention.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactPruneRequest {

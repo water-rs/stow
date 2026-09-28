@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use futures_util::StreamExt as _;
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
@@ -20,12 +19,11 @@ use stow_types::api::{
 use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 
+use crate::cache_key::bundle_cache_key;
 use crate::db;
 use crate::errors::GetArtifactError;
 use crate::fetch_guard::OutboundPool;
 use crate::github_auth;
-use crate::lookup_key::{bundle_cache_key, exact_lookup_key, row_matches_digest};
-use crate::miss_logger::{Miss, MissLog};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
@@ -323,7 +321,6 @@ pub async fn register_artifacts(
     ArtifactWriteCaller(caller): ArtifactWriteCaller,
     Json(request): Json<RegisterArtifactsRequest>,
     db: Db,
-    State(cache): State<CfCache>,
     State(scheduler): State<CfDurableNamespace>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
@@ -384,14 +381,8 @@ pub async fn register_artifacts(
     // One atomic D1 batch writes every record: a failed statement rolls
     // the request's rows back, and a thousand-record request is one
     // round trip rather than a serial loop the worker timeout eats
-    // mid-flight. Cache invalidations are best-effort and independent
-    // per row, so they fan out bounded after the write lands.
+    // mid-flight.
     db::insert_artifact_records(&db, &request.records).await?;
-    futures_util::stream::iter(request.records.iter())
-        .for_each_concurrent(REGISTER_CACHE_INVALIDATE_CONCURRENCY, |record| {
-            invalidate_lookup_entries(&cache, record)
-        })
-        .await;
     tracing::info!(
         registered = count,
         %caller,
@@ -1031,11 +1022,6 @@ fn resolve_response(
 
 /// Row bound for the admin artifacts listing.
 const MAX_ADMIN_ARTIFACTS_LIST: u32 = 1000;
-/// Lookup-cache deletes in flight after a register batch lands —
-/// invalidation is best-effort per row, so the bound only limits how
-/// many Cache API calls a single request holds open at once.
-const REGISTER_CACHE_INVALIDATE_CONCURRENCY: usize = 16;
-
 /// `GET /api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=`
 ///
 /// Bounded catalog listing — the prune preview's data source and an
@@ -1140,19 +1126,13 @@ pub async fn inspect_artifact(
 
 /// POST /api/v1/admin/artifacts/prune
 ///
-/// Delete every catalog row built by the retired toolchain and invalidate
-/// each row's lookup-cache entries. GHCR image tags are not deleted —
-/// they age out under the package's own retention.
+/// Delete every catalog row built by the retired toolchain. GHCR image
+/// tags are not deleted — they age out under the package's own retention.
 pub async fn prune_artifacts(
     SchedulerCaller(caller): SchedulerCaller,
     Json(request): Json<stow_types::api::ArtifactPruneRequest>,
     db: Db,
-    State(cache): State<CfCache>,
 ) -> Result<Json<stow_types::api::ArtifactPruneResponse>, GetArtifactError> {
-    let records = db::artifact_records_for_rustc(&db, request.rustc_version.as_str()).await?;
-    for record in &records {
-        invalidate_lookup_entries(&cache, record).await;
-    }
     let deleted = db::delete_artifacts_for_rustc(&db, request.rustc_version.as_str()).await?;
     tracing::warn!(
         %caller,
@@ -1161,20 +1141,6 @@ pub async fn prune_artifacts(
         "pruned artifact rows for a retired toolchain"
     );
     Ok(Json(stow_types::api::ArtifactPruneResponse { deleted }))
-}
-
-/// Registration is an upsert — a rebuilt artifact overwrites the row for
-/// its identity, so the cached exact lookup that could still resolve to
-/// the old row is deleted with it.
-async fn invalidate_lookup_entries(cache: &CfCache, record: &ArtifactRecord) {
-    let key = exact_lookup_key(
-        record.target.as_str(),
-        record.rustc_version.as_str(),
-        record.c_metadata.as_str(),
-    );
-    if let Err(error) = cache::delete_lookup(cache, &key).await {
-        tracing::warn!(%error, key = %key, "failed to invalidate artifact lookup cache entry");
-    }
 }
 
 /// POST /api/v1/scheduler/tasks/submit
@@ -1649,182 +1615,39 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
     cacheable_json(&response, CATALOG_VERSIONS_MAX_AGE)
 }
 
-/// Query parameters for artifact requests.
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-pub struct ArtifactQuery {
-    /// Crate name (for miss logging and validation).
-    #[serde(rename = "crate")]
-    pub crate_name: Option<String>,
-    /// The `sha256:…` bundle digest the caller's signed index pins for
-    /// this key, when the caller sends one.
-    pub digest: Option<String>,
-}
-
-/// GET /`api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=serde&digest=sha256:…`
+/// GET /`api/v1/bundles/{digest}`
 ///
-/// Returns the complete artifact bundle for one crate compilation unit.
-///
-/// Flow:
-/// 1. Lookup-cache check for the artifact row (free, per-datacenter) — a
-///    hit skips D1 entirely, unless `digest` says the cached row names a
-///    bundle the caller was not promised
-/// 2. Lookup miss → schema-ensured D1 read, row written back to the
-///    lookup cache; a real miss is never cached
-/// 3. Catalog row disagreeing with `digest` → treated as a miss, since
-///    the caller verifies the bytes against its signed index
-/// 4. Bundle bytes: CF Cache hit → return; miss → fetch from GHCR, tee
-///    into CF Cache
-/// 5. Stale GHCR fetch → prune the D1 row and the lookup entry, then 404
-/// 6. D1 miss → validate `crate_name`, log miss, return 404
-pub async fn get_artifact(
+/// The byte path: this worker is the Cache API in front of the
+/// `<tag>.bundle` blobs under `ghcr.io/water-rs/stow-cache`. The
+/// `sha256:<64 lowercase hex>` path segment is the whole address — it is
+/// validated before any fetch; a cache hit returns; a miss opens the GHCR
+/// blob and tees it into the cache while it streams; a GHCR 404 is a 404.
+/// No catalog row is consulted: the CLI's signed index named these bytes,
+/// and the CLI verifies them against the index before they are used.
+pub async fn get_bundle(
     params: Params,
-    Query(query): Query<ArtifactQuery>,
-    db: Db,
     streams: BundleStreams,
-    State(analytics): State<AnalyticsEngineDataset>,
-    sink: stats::StatsSink,
 ) -> Result<Response, GetArtifactError> {
     let BundleStreams {
         context,
         cache,
         ghcr,
     } = streams;
-    let target = params
-        .get("target")
+    let digest = params
+        .get("digest")
         .map_err(|_| GetArtifactError::BadRequest)?;
-    let rustc_version = params
-        .get("rustc_version")
-        .map_err(|_| GetArtifactError::BadRequest)?;
-    let c_metadata = params
-        .get("c_metadata")
-        .map_err(|_| GetArtifactError::BadRequest)?;
-
-    let expected_digest = query.digest.as_deref().filter(|digest| !digest.is_empty());
-    let artifact_row = resolve_exact_row(
-        &db,
-        &cache,
-        c_metadata,
-        target,
-        rustc_version,
-        expected_digest,
-    )
-    .await?;
-
-    let artifact_row = artifact_row.filter(|row| {
-        catalog_row_is_the_one_requested(row, expected_digest, c_metadata, target, rustc_version)
-    });
-
-    let Some(row) = artifact_row else {
-        // 404 IS the miss event. Log it server-side.
-        log_exact_miss(
-            &analytics,
-            sink.telemetry.consent,
-            &query,
-            target,
-            rustc_version,
-        );
-        return Err(GetArtifactError::NotFound);
-    };
-    let cache_key = bundle_cache_key(target, rustc_version, &row.bundle_digest);
-
-    match open_bundle_stream(&context, &cache, &ghcr, &cache_key, &row).await {
-        Ok((body, cache_hit)) => {
-            stats::record_hit(
-                &sink,
-                &stats::Hit {
-                    target,
-                    rustc_version,
-                    crate_name: &row.crate_name,
-                    version: &row.version,
-                    bundle_size: row.bundle_size,
-                    compile_millis: row.compile_millis,
-                },
-            );
-            Ok(bundle_response(body, row.bundle_size, cache_hit))
-        }
-        Err(error) if error.indicates_stale_artifact() => {
-            tracing::warn!(
-                %error,
-                oci_reference = %row.oci_reference,
-                oci_digest = %row.oci_digest,
-                c_metadata,
-                target,
-                rustc_version,
-                "pruning stale artifact row from D1 due to GHCR fetch error"
-            );
-            prune_stale_artifact_row(&db, &cache, c_metadata, target, rustc_version).await?;
-            log_exact_miss(
-                &analytics,
-                sink.telemetry.consent,
-                &query,
-                target,
-                rustc_version,
-            );
-            Err(GetArtifactError::NotFound)
-        }
-        Err(ghcr::FetchError::Unauthorized { status, .. }) => {
-            tracing::error!(
-                status,
-                oci_reference = %row.oci_reference,
-                "GHCR authentication failed — NOT pruning D1 row"
-            );
-            Err(GetArtifactError::InternalWithMessage(format!(
-                "GHCR authentication failed (HTTP {status})"
-            )))
-        }
-        // A retryable upstream outage surfaces as 502 and the CLI compiles
-        // locally rather than waiting on the registry.
-        Err(ghcr::FetchError::Unavailable) => {
-            tracing::warn!(key = %cache_key, "GHCR unavailable (rate limit or 5xx)");
-            Err(GetArtifactError::GhcrUnavailable)
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "GHCR fetch failed");
-            Err(GetArtifactError::InternalWithMessage(error.to_string()))
-        }
+    if !stow_types::registry::is_sha256_digest(digest) {
+        return Err(GetArtifactError::BadRequestWithMessage(format!(
+            "malformed bundle digest `{digest}` — expected sha256:<64 lowercase hex>"
+        )));
     }
-}
+    let cache_key = bundle_cache_key(digest);
 
-/// HEAD /`api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`
-///
-/// Check if an artifact exists without downloading it.
-pub async fn check_artifact(
-    params: Params,
-    db: Db,
-    State(cache): State<CfCache>,
-) -> Result<Response, GetArtifactError> {
-    let target = params
-        .get("target")
-        .map_err(|_| GetArtifactError::BadRequest)?;
-    let rustc_version = params
-        .get("rustc_version")
-        .map_err(|_| GetArtifactError::BadRequest)?;
-    let c_metadata = params
-        .get("c_metadata")
-        .map_err(|_| GetArtifactError::BadRequest)?;
-
-    let artifact_row =
-        resolve_exact_row(&db, &cache, c_metadata, target, rustc_version, None).await?;
-
-    match artifact_row {
-        Some(row) => {
-            let mut response = Response::new(Body::empty());
-            // GET on this URL streams the published bundle blob, so its
-            // length is the response length; the raw artifact bytes (the
-            // uncompressed outputs) stay under a stow header.
-            response.headers_mut().insert(
-                skyzen::header::CONTENT_LENGTH,
-                HeaderValue::from(row.bundle_size),
-            );
-            if let Some(size) = row.artifact_size {
-                response
-                    .headers_mut()
-                    .insert("x-stow-artifact-size", HeaderValue::from(size));
-            }
-            Ok(response)
-        }
-        None => Err(GetArtifactError::NotFound),
-    }
+    let (body, content_length, cache_hit) =
+        open_bundle_stream(&context, &cache, &ghcr, &cache_key, digest)
+            .await
+            .map_err(registry_fetch_error)?;
+    Ok(bundle_response(body, content_length, cache_hit))
 }
 
 /* ---- index slices ---- */
@@ -1902,19 +1725,21 @@ async fn index_rustc_version(
         .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))
 }
 
-/// The fixed repository every index slice lives in — slice tags are
-/// built by `index_tag` under `GHCR_BASE`, never from caller input.
-fn index_repository() -> Result<stow_types::registry::RepositoryPath<'static>, GetArtifactError> {
-    stow_types::registry::repository_path(stow_types::registry::GHCR_BASE).ok_or_else(|| {
-        GetArtifactError::InternalWithMessage("GHCR_BASE has no repository path".to_owned())
-    })
+/// The fixed repository every cached blob lives in —
+/// `water-rs/stow-cache`, the repository the pull scope names. Slice tags
+/// are built by `index_tag` under `GHCR_BASE` and bundle digests are
+/// caller-supplied but validated to `sha256:<64 hex>` — neither ever names
+/// another repository.
+fn cache_repository() -> stow_types::registry::RepositoryPath<'static> {
+    stow_types::registry::repository_path(stow_types::registry::GHCR_BASE)
+        .expect("GHCR_BASE is a fixed canonical reference with a repository path")
 }
 
-/// Map a registry failure on the index paths onto the public error
-/// surface: a missing slice is a 404, a rate-limited or 5xx registry is
+/// Map a registry failure on the byte paths onto the public error
+/// surface: a missing blob is a 404, a rate-limited or 5xx registry is
 /// a 502, and anything else is an internal error — never a silent empty
 /// answer.
-fn index_fetch_error(error: ghcr::FetchError) -> GetArtifactError {
+fn registry_fetch_error(error: ghcr::FetchError) -> GetArtifactError {
     match error {
         ghcr::FetchError::NotFound => GetArtifactError::NotFound,
         ghcr::FetchError::Unavailable => GetArtifactError::GhcrUnavailable,
@@ -1935,15 +1760,10 @@ async fn index_slice_layer(
     pool: &OutboundPool,
 ) -> Result<stow_types::api::OciDescriptor, GetArtifactError> {
     let tag = stow_types::index::index_tag(target.as_str(), rustc_version.as_str());
-    let mut response = ghcr::open_manifest(
-        &ghcr.base_url,
-        index_repository()?,
-        &tag,
-        &ghcr.tokens,
-        pool,
-    )
-    .await
-    .map_err(index_fetch_error)?;
+    let mut response =
+        ghcr::open_manifest(&ghcr.base_url, cache_repository(), &tag, &ghcr.tokens, pool)
+            .await
+            .map_err(registry_fetch_error)?;
     let body = response
         .text()
         .into_send()
@@ -2005,13 +1825,13 @@ async fn fetch_index_slice_upstream(
     }
     let upstream = ghcr::open_blob(
         &ghcr.base_url,
-        index_repository()?,
+        cache_repository(),
         digest,
         &ghcr.tokens,
         pool,
     )
     .await
-    .map_err(index_fetch_error)?;
+    .map_err(registry_fetch_error)?;
     if let Some(length) = worker_content_length(&upstream).filter(|length| *length > layer.size) {
         return Err(GetArtifactError::InternalWithMessage(format!(
             "slice blob reports {length} bytes, over the {} its manifest declares",
@@ -2152,7 +1972,7 @@ pub async fn get_index_slice(
         Ok(Some(cached)) => {
             let content_length = worker_content_length(&cached);
             return Ok(slice_response(
-                body_from_worker_response(cached).map_err(index_fetch_error)?,
+                body_from_worker_response(cached).map_err(registry_fetch_error)?,
                 encoding,
                 content_length,
                 true,
@@ -2196,7 +2016,7 @@ pub async fn get_index_slice(
                 }
             }
             Ok(slice_response(
-                body_from_worker_response(upstream).map_err(index_fetch_error)?,
+                body_from_worker_response(upstream).map_err(registry_fetch_error)?,
                 encoding,
                 content_length,
                 false,
@@ -2442,123 +2262,41 @@ pub async fn enqueue_admitted_task(
     Ok(response)
 }
 
-/// Resolve the artifact row for an exact `(c_metadata, target,
-/// rustc_version)` identity, CF-cache-first so warm hits never touch D1.
-/// A lookup miss falls through to a schema-ensured D1 read whose result
-/// is written back to the lookup cache; a real `None` (404) is never
-/// cached — misses drive admission and must stay fresh.
-/// Whether the catalog's own row names the bundle the caller pinned.
-///
-/// A row that does not is a real miss rather than a body worth sending:
-/// the caller checks the bytes against its signed index and would reject
-/// them, and a miss makes it fall back to rustc and enqueue the rebuild.
-fn catalog_row_is_the_one_requested(
-    row: &db::ArtifactRow,
-    expected_digest: Option<&str>,
-    c_metadata: &str,
-    target: &str,
-    rustc_version: &str,
-) -> bool {
-    if row_matches_digest(&row.bundle_digest, expected_digest) {
-        return true;
-    }
-    tracing::info!(
-        c_metadata,
-        target,
-        rustc_version,
-        catalog_digest = %row.bundle_digest,
-        expected_digest = expected_digest.unwrap_or_default(),
-        "catalog bundle differs from the digest the caller's index pins"
-    );
-    false
-}
-
-async fn resolve_exact_row(
-    db: &Db,
-    cache: &CfCache,
-    c_metadata: &str,
-    target: &str,
-    rustc_version: &str,
-    expected_digest: Option<&str>,
-) -> Result<Option<db::ArtifactRow>, GetArtifactError> {
-    let lookup_key = exact_lookup_key(target, rustc_version, c_metadata);
-    match cache::get_lookup(cache, &lookup_key).await {
-        // A cached row that names the bundle the caller was promised is
-        // the row the catalog holds. One that names a different bundle is
-        // a leftover of a re-registration: `invalidate_lookup_entries`
-        // only reaches the datacenter that served the register call, so
-        // every other colo keeps the previous row until its TTL expires,
-        // and serving from it hands the caller bytes its signed index
-        // will reject. Drop it and read the catalog.
-        Ok(Some(row)) if row_matches_digest(&row.bundle_digest, expected_digest) => {
-            return Ok(Some(row));
-        }
-        Ok(Some(row)) => {
-            tracing::info!(
-                key = %lookup_key,
-                cached_digest = %row.bundle_digest,
-                expected_digest = expected_digest.unwrap_or_default(),
-                "cached artifact row names a different bundle than the caller expects; \
-                 re-reading the catalog"
-            );
-            if let Err(error) = cache::delete_lookup(cache, &lookup_key).await {
-                tracing::warn!(%error, key = %lookup_key, "failed to drop stale lookup entry");
-            }
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, key = %lookup_key, "cf lookup cache read failed; falling back to D1");
-        }
-    }
-    let row = db::get_artifact_reference(db, c_metadata, target, rustc_version)
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, "D1 query failed");
-            GetArtifactError::Internal
-        })?;
-    if let Some(row) = &row
-        && let Err(error) = cache::put_lookup(cache, &lookup_key, row).await
-    {
-        tracing::warn!(%error, key = %lookup_key, "cf lookup cache write failed");
-    }
-    Ok(row)
-}
-
 /// The streamed bundle response: the body is the published bundle blob
-/// byte-for-byte, so its length is the row's `bundle_size`.
-fn bundle_response(body: Body, bundle_size: u64, cache_hit: bool) -> Response {
+/// byte-for-byte, so its length is the upstream `content-length` when the
+/// registry or the cache reported one.
+fn bundle_response(body: Body, content_length: Option<u64>, cache_hit: bool) -> Response {
     let mut response = Response::new(body);
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         skyzen::header::CONTENT_TYPE,
         HeaderValue::from_static(STOW_BUNDLE_MEDIA_TYPE),
     );
-    response.headers_mut().insert(
-        skyzen::header::CONTENT_LENGTH,
-        HeaderValue::from(bundle_size),
-    );
-    response
-        .headers_mut()
-        .insert("x-stow-cache", cache_status_header(cache_hit));
+    if let Some(length) = content_length {
+        headers.insert(skyzen::header::CONTENT_LENGTH, HeaderValue::from(length));
+    }
+    headers.insert("x-stow-cache", cache_status_header(cache_hit));
     response
 }
 
-/// Open the bundle for `row` as a stream: the Cache API copy when there is
-/// one, otherwise the registry blob by digest, teed into the Cache API
-/// while the client reads it. Nothing on this path buffers the bundle or
-/// inspects it — the publish stage validated the tar before pushing it,
-/// GHCR addresses it by content, and the CLI verifies the cosign material
-/// inside it.
+/// Open the bundle for `digest` as a stream: the Cache API copy when there
+/// is one, otherwise the registry blob, teed into the Cache API while the
+/// client reads it. Nothing on this path buffers the bundle or inspects
+/// it — the publish stage validated the tar before pushing it, GHCR
+/// addresses it by content, and the CLI verifies the digest and the cosign
+/// material inside it.
 async fn open_bundle_stream(
     context: &WorkerContext,
     cache: &CfCache,
     ghcr: &GhcrConfig,
     cache_key: &str,
-    row: &db::ArtifactRow,
-) -> Result<(Body, bool), ghcr::FetchError> {
+    digest: &str,
+) -> Result<(Body, Option<u64>, bool), ghcr::FetchError> {
     match cache::get_stream(cache, cache_key).await {
         Ok(Some(cached)) => {
             tracing::debug!(key = %cache_key, "cf cache hit");
-            return Ok((body_from_worker_response(cached)?, true));
+            let content_length = worker_content_length(&cached);
+            return Ok((body_from_worker_response(cached)?, content_length, true));
         }
         Ok(None) => {
             tracing::debug!(key = %cache_key, "cf cache miss");
@@ -2568,14 +2306,10 @@ async fn open_bundle_stream(
         }
     }
 
-    let repository = oci_repository(&row.oci_reference).map_err(|error| {
-        tracing::error!(%error, "refusing GHCR fetch for malformed OCI reference");
-        ghcr::FetchError::InvalidRequest(error.to_string())
-    })?;
     let mut upstream = ghcr::open_blob(
         &ghcr.base_url,
-        repository,
-        &row.bundle_digest,
+        cache_repository(),
+        digest,
         &ghcr.tokens,
         &OutboundPool::new(),
     )
@@ -2583,15 +2317,15 @@ async fn open_bundle_stream(
     .map_err(|error| {
         tracing::error!(
             cache_key = %cache_key,
-            oci_reference = %row.oci_reference,
-            bundle_digest = %row.bundle_digest,
+            bundle_digest = %digest,
             error = %error,
             "edge failed to open bundle blob from registry"
         );
         error
     })?;
 
-    if cache::fits_cache(row.bundle_size) {
+    let content_length = worker_content_length(&upstream);
+    if content_length.is_none_or(cache::fits_cache) {
         // `cloned` tees the JS stream: one branch feeds the Cache API
         // under `waitUntil`, the other is the response body. The put
         // consumes its branch at the client's pace, so no branch buffers
@@ -2615,7 +2349,7 @@ async fn open_bundle_stream(
         }
     }
 
-    Ok((body_from_worker_response(upstream)?, false))
+    Ok((body_from_worker_response(upstream)?, content_length, false))
 }
 
 /// Hand a `worker::Response` body to Skyzen without reading it.
@@ -2626,70 +2360,12 @@ fn body_from_worker_response(response: worker::Response) -> Result<Body, ghcr::F
         .map_err(|error| ghcr::FetchError::Network(format!("wrap registry response: {error:?}")))
 }
 
-fn oci_repository(
-    reference: &str,
-) -> Result<stow_types::registry::RepositoryPath<'_>, GetArtifactError> {
-    // `oci_reference_name` enforces the canonical single-package shape;
-    // `repository_path` then yields `water-rs/stow-cache`, the repository
-    // the pull scope names.
-    stow_types::registry::oci_reference_name(reference)
-        .and_then(|_| stow_types::registry::repository_path(reference))
-        .ok_or_else(|| {
-            GetArtifactError::InternalWithMessage(format!(
-                "malformed OCI reference `{reference}` — expected ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}}"
-            ))
-        })
-}
-
 /// OCI registry configuration for artifact fetching, stored via `State<GhcrConfig>`.
 #[derive(Debug, Clone)]
 pub struct GhcrConfig {
     pub base_url: String,
     /// Per-isolate bearer cache for the anonymous registry token exchange.
     pub tokens: RegistryTokens,
-}
-
-async fn prune_stale_artifact_row(
-    db: &Db,
-    cache: &CfCache,
-    c_metadata: &str,
-    target: &str,
-    rustc_version: &str,
-) -> Result<(), GetArtifactError> {
-    tracing::warn!(
-        c_metadata = %c_metadata,
-        target = %target,
-        rustc_version = %rustc_version,
-        "pruning stale artifact row after registry miss"
-    );
-    db::delete_artifact_reference(db, c_metadata, target, rustc_version)
-        .await
-        .map_err(GetArtifactError::from)?;
-    // The row is gone — any cached lookup pointing at it must die with
-    // it, or the pruned artifact would keep resolving.
-    if let Err(error) =
-        cache::delete_lookup(cache, &exact_lookup_key(target, rustc_version, c_metadata)).await
-    {
-        tracing::warn!(%error, "failed to delete lookup entry for pruned artifact row");
-    }
-    Ok(())
-}
-
-/// Write the exact-path miss point when the client named the crate via
-/// `?crate=` — a value that cannot parse as a crates.io name is not
-/// demand data, so it is skipped.
-fn log_exact_miss(
-    analytics: &AnalyticsEngineDataset,
-    consent: stats::AnalyticsConsent,
-    query: &ArtifactQuery,
-    target: &str,
-    rustc_version: &str,
-) {
-    if let Some(ref crate_name) = query.crate_name
-        && let Ok(crate_name) = crate_name.parse::<CrateName>()
-    {
-        analytics.write_miss(consent, &Miss::exact(&crate_name, target, rustc_version));
-    }
 }
 
 /// GET /api/v1/stats — the public aggregate usage statistics. Anonymous:

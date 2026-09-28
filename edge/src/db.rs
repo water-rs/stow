@@ -11,35 +11,6 @@ use crate::errors::DbError;
 use crate::scheduler::queue::SemanticTaskIdentity;
 use crate::sql_batch;
 
-/// Result of looking up an artifact by composite key.
-#[derive(Debug, Clone, skyzen::FromRow, serde::Serialize, serde::Deserialize)]
-pub struct ArtifactRow {
-    pub c_metadata: String,
-    pub oci_reference: String,
-    pub oci_digest: String,
-    pub created_at: String,
-    pub artifact_size: Option<u64>,
-    /// Digest of the `<tag>.bundle` blob the edge streams; empty on rows
-    /// registered before bundles were published, which the serve path
-    /// prunes.
-    pub bundle_digest: String,
-    /// Byte length of that blob — the response `content-length`.
-    pub bundle_size: u64,
-    /// Crate name — the hit-event dimension for top-crates statistics.
-    /// Defaults keep lookup entries cached before the field existed
-    /// parseable.
-    #[serde(default)]
-    pub crate_name: String,
-    /// Crate version — the hit-event dimension for version-leaderboard
-    /// statistics.
-    #[serde(default)]
-    pub version: String,
-    /// Wall-clock milliseconds the captured rustc invocation took — the
-    /// CPU time a served hit is credited as saving.
-    #[serde(default)]
-    pub compile_millis: u64,
-}
-
 #[derive(Debug, skyzen::FromRow)]
 struct QueuedDependencyGraphMissRow {
     crate_name: String,
@@ -785,28 +756,8 @@ pub async fn list_artifact_records(
     rows.into_iter().map(FullArtifactRow::into_record).collect()
 }
 
-/// Every catalog row built by `rustc_version` — the prune set whose
-/// lookup-cache entries the caller invalidates before the delete lands.
-pub async fn artifact_records_for_rustc(
-    db: &Db,
-    rustc_version: &str,
-) -> Result<Vec<ArtifactRecord>, DbError> {
-    validate_rustc_version(rustc_version)?;
-    let rows = db
-        .query(&format!(
-            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
-             WHERE rustc_version = ? ORDER BY created_at, c_metadata"
-        ))
-        .bind(rustc_version)
-        .fetch_all::<FullArtifactRow>()
-        .await
-        .map_err(|error| DbError::Query(format!("artifacts for rustc query: {error}")))?;
-    rows.into_iter().map(FullArtifactRow::into_record).collect()
-}
-
-/// Delete every catalog row built by `rustc_version` — the second half of
-/// `artifacts prune`, after the caller has invalidated each row's lookup
-/// cache entries. Returns the deleted row count.
+/// Delete every catalog row built by `rustc_version` — the mutation half
+/// of `artifacts prune`. Returns the deleted row count.
 pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<u32, DbError> {
     validate_rustc_version(rustc_version)?;
     let result = db
@@ -821,34 +772,6 @@ pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<
             result.rows_written
         ))
     })
-}
-
-/// The servable row for an exact identity. Rows without a published
-/// bundle (registered before bundles existed, see
-/// [`unbundled_artifact_records`]) are a miss on every serving lookup —
-/// there is no blob to stream until a backfill or rebuild re-registers
-/// them.
-pub async fn get_artifact_reference(
-    db: &Db,
-    c_metadata: &str,
-    target: &str,
-    rustc_version: &str,
-) -> Result<Option<ArtifactRow>, DbError> {
-    validate_c_metadata(c_metadata)?;
-    validate_target(target)?;
-    validate_rustc_version(rustc_version)?;
-
-    db.query(
-        "SELECT c_metadata, crate_name, version, oci_reference, oci_digest, created_at, artifact_size, bundle_digest, bundle_size, compile_millis \
-         FROM artifacts \
-         WHERE c_metadata = ? AND target = ? AND rustc_version = ? AND bundle_digest != ''",
-    )
-    .bind(c_metadata)
-    .bind(target)
-    .bind(rustc_version)
-    .fetch_optional::<ArtifactRow>()
-    .await
-    .map_err(|error| DbError::Query(format!("db query: {error}")))
 }
 
 /// The subset of `identities` the catalog serves: servable rows (each
@@ -1019,29 +942,6 @@ struct ShapelessKeyRow {
     c_metadata: String,
     target: String,
     rustc_version: String,
-}
-
-pub async fn delete_artifact_reference(
-    db: &Db,
-    c_metadata: &str,
-    target: &str,
-    rustc_version: &str,
-) -> Result<(), DbError> {
-    validate_c_metadata(c_metadata)?;
-    validate_target(target)?;
-    validate_rustc_version(rustc_version)?;
-
-    db.query("DELETE FROM artifacts WHERE c_metadata = ? AND target = ? AND rustc_version = ?")
-        .bind(c_metadata)
-        .bind(target)
-        .bind(rustc_version)
-        .execute()
-        .await
-        .map_err(|error| {
-            format!("delete stale artifact {c_metadata} {target} {rustc_version}: {error}")
-        })?;
-
-    Ok(())
 }
 
 pub async fn take_dependency_graph_misses(
@@ -1259,9 +1159,10 @@ mod sqlite_tests {
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        apply_migrations, artifact_index_page, covered_semantic_identities, get_artifact_reference,
-        insert_artifact_records, record_admitted_miss, set_dependency_graph_misses_queued,
-        take_dependency_graph_misses, unbundled_artifact_records,
+        apply_migrations, artifact_index_page, artifact_record as fetch_artifact_record,
+        covered_semantic_identities, insert_artifact_records, record_admitted_miss,
+        set_dependency_graph_misses_queued, take_dependency_graph_misses,
+        unbundled_artifact_records,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1505,11 +1406,18 @@ mod sqlite_tests {
         );
     }
 
-    /// A row registered before bundles existed is invisible to serving
-    /// lookups, and the backfill listing hands back the record that
-    /// registered it so the bundle can be published and re-registered.
+    /// A row registered before bundles existed is not servable — the
+    /// index page's `bundle_digest != ''` predicate excludes it — and the
+    /// backfill listing hands back the record that registered it so the
+    /// bundle can be published and re-registered.
     #[tokio::test]
     async fn unbundled_rows_are_a_miss_until_backfilled() {
+        async fn servable(db: &skyzen_services::Db) -> u64 {
+            db.query("SELECT COUNT(*) FROM artifacts WHERE bundle_digest != ''")
+                .fetch_scalar::<u64>()
+                .await
+                .expect("servable count")
+        }
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
@@ -1523,12 +1431,7 @@ mod sqlite_tests {
             .await
             .expect("age the row to the pre-bundle schema");
 
-        assert!(
-            get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
-                .await
-                .expect("lookup")
-                .is_none()
-        );
+        assert_eq!(servable(&db).await, 0);
         let unbundled = unbundled_artifact_records(&db, 10)
             .await
             .expect("unbundled listing");
@@ -1550,12 +1453,7 @@ mod sqlite_tests {
                 .expect("unbundled listing"),
             Vec::new()
         );
-        assert!(
-            get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
-                .await
-                .expect("lookup")
-                .is_some()
-        );
+        assert_eq!(servable(&db).await, 1);
     }
 
     /// Coverage is exact on every identity column and ignores rows without
@@ -1882,14 +1780,20 @@ mod sqlite_tests {
             .expect("row count");
         assert_eq!(rows, 1);
 
-        let row = get_artifact_reference(&db, C_METADATA, TARGET, RUSTC)
+        let created_at = db
+            .query("SELECT created_at FROM artifacts")
+            .fetch_scalar::<String>()
+            .await
+            .expect("created_at");
+        assert_eq!(created_at, "2001-02-03 04:05:06");
+
+        let row = fetch_artifact_record(&db, TARGET, RUSTC, C_METADATA)
             .await
             .expect("lookup")
             .expect("row present");
-        assert_eq!(row.created_at, "2001-02-03 04:05:06");
         assert_eq!(row.oci_digest, SECOND_DIGEST);
-        assert_eq!(row.crate_name, "serde");
-        assert_eq!(row.version, "1.0.0");
+        assert_eq!(row.crate_name.as_str(), "serde");
+        assert_eq!(row.version.to_string(), "1.0.0");
         assert_eq!(row.compile_millis, 1_234);
     }
 

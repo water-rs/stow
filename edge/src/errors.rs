@@ -414,8 +414,6 @@ pub enum GetArtifactError {
     /// surface the error as-is.
     #[error("{0}", status = TOO_MANY_REQUESTS)]
     SchedulerBusy(String),
-    #[error("internal server error")]
-    Internal,
     #[error("internal server error: {0}")]
     InternalWithMessage(String),
 }

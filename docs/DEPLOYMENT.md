@@ -37,7 +37,6 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen secret set GITHUB_APP_PRIVATE_KEY  # stow-ci GitHub App PEM; same key as the STOW_APP_PRIVATE_KEY repository secret
    skyzen secret set STOW_POW_CHALLENGE_SECRET  # HMAC key for enqueue-admission challenges
    skyzen secret set TURNSTILE_SECRET_KEY       # Turnstile secret key paired with the TURNSTILE_SITE_KEY var
-   skyzen secret set STOW_STATS_SALT_SECRET     # HMAC key for the daily-salted install hash (any strong random string)
    skyzen secret set CF_ANALYTICS_TOKEN         # API token with Analytics Engine read, used by GET /api/v1/stats
    ```
 
@@ -70,7 +69,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    catalog — but enumerating paths would leave the other anonymous
    routes (request and scheduler status, routes added later) unlimited,
    so the rule matches the `/api/v1/` path prefix and carves out only
-   `/api/v1/artifacts/`. The byte path is excluded on purpose: a warm
+   `/api/v1/bundles/`. The byte path is excluded on purpose: a warm
    build streams its closure at the CLI's prefetch concurrency and the
    per-`rustc` wrapper fetches on demand under cargo's own job
    parallelism, so one address legitimately sends tens of bundle
@@ -121,7 +120,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      --data @- <<'JSON'
    {
      "description": "stow: per-IP limit on /api/v1/",
-     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/bundles/\")",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src"],
@@ -144,7 +143,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      --data @- <<'JSON'
    {
      "description": "stow: per-IP limit on /api/v1/",
-     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/bundles/\")",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src"],
@@ -170,7 +169,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    The same rule in the dashboard: *Security → Security rules → Create
    rule → Rate limiting rules*, match `URI Path` `starts with`
    `/api/v1/` **and** `URI Path` `does not start with`
-   `/api/v1/artifacts/`, 60 requests per 10 seconds per IP, block for
+   `/api/v1/bundles/`, 60 requests per 10 seconds per IP, block for
    10 seconds.
 
 ### Billing notifications
@@ -212,9 +211,6 @@ Required GitHub Actions secrets:
   `0x4AAAAAAE8LjhnMsqdVhiSp`, invisible mode, hostname
   `stow.waterui.dev`); `POST /api/v1/requests` verifies every submitted
   token against it.
-- `STOW_STATS_SALT_SECRET` → Worker `STOW_STATS_SALT_SECRET` — HMAC key
-  the daily-salted install hash is derived from (any strong random
-  string; rotating it only re-baselines the active-installs estimate).
 - `CF_ANALYTICS_TOKEN` → Worker `CF_ANALYTICS_TOKEN` — the
   Analytics-Engine-read API token `GET /api/v1/stats` queries with.
 

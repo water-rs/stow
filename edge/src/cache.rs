@@ -1,18 +1,11 @@
 use skyzen_cloudflare::worker;
 use skyzen_cloudflare::{CfCache, CfCacheError};
 
-use crate::db::ArtifactRow;
-
 /// Internal domain for CF Cache API keys.
 const CACHE_DOMAIN: &str = "https://cache.stow.internal";
 
 /// CF Cache 512MB limit (Free/Pro/Biz tiers).
 const MAX_CACHE_SIZE: u64 = 512 * 1024 * 1024;
-
-/// Lookup entries can go stale when a row is re-registered or pruned;
-/// every mutation path deletes them explicitly, and this TTL bounds the
-/// window when a delete itself fails.
-const LOOKUP_TTL_SECONDS: u32 = 24 * 60 * 60;
 
 /// How long the public `UsageStats` body is cached — the published page
 /// tolerates hourly staleness and the SQL API is billed per query.
@@ -109,52 +102,6 @@ pub async fn put_index_slice_bytes(
     .await
 }
 
-/// Fetch a cached artifact-row lookup. A hit carries everything a serve
-/// needs — OCI reference, digest, size — so the caller skips D1 entirely.
-/// A corrupt entry is treated as a miss: the D1 read it falls back to
-/// overwrites the entry with fresh data.
-pub async fn get_lookup(cache: &CfCache, key: &str) -> Result<Option<ArtifactRow>, CacheError> {
-    let Some(bytes) = cache
-        .get_url_bytes(lookup_url(key), false)
-        .await
-        .map_err(|error| CacheError::from_cf(&error))?
-    else {
-        return Ok(None);
-    };
-    match serde_json::from_slice::<ArtifactRow>(&bytes) {
-        Ok(row) => Ok(Some(row)),
-        Err(error) => {
-            tracing::warn!(key = %key, %error, "cf cache lookup entry failed to parse; treating as miss");
-            Ok(None)
-        }
-    }
-}
-
-/// Cache the artifact row a D1 read just resolved. Best-effort: callers
-/// log and continue on failure.
-pub async fn put_lookup(cache: &CfCache, key: &str, row: &ArtifactRow) -> Result<(), CacheError> {
-    let body = serde_json::to_vec(row)
-        .map_err(|error| CacheError::Worker(format!("serialize lookup entry: {error}")))?;
-    put_response(
-        cache,
-        lookup_url(key),
-        &body,
-        "application/json",
-        &format!("public, s-maxage={LOOKUP_TTL_SECONDS}"),
-    )
-    .await
-}
-
-/// Drop a lookup entry after the row it names was re-registered or
-/// pruned. `ResponseNotFound` is success — the entry is gone either way.
-pub async fn delete_lookup(cache: &CfCache, key: &str) -> Result<(), CacheError> {
-    cache
-        .delete_url(lookup_url(key), false)
-        .await
-        .map(|_| ())
-        .map_err(|error| CacheError::from_cf(&error))
-}
-
 /// Seconds a cached panic-flag answer may be reused per colo. The flag is
 /// the attack backstop, so the TTL trades propagation delay against the
 /// Durable Object read every entry expiry would otherwise cost.
@@ -245,19 +192,13 @@ async fn put_response(
 }
 
 fn bundle_url(cache_key: &str) -> String {
-    format!("{CACHE_DOMAIN}/artifacts/{cache_key}")
+    format!("{CACHE_DOMAIN}/bundles/{cache_key}")
 }
 
 /// Index slices get their own URL namespace so a slice key can never
-/// alias a bundle or lookup key.
+/// alias a bundle key.
 fn index_slice_url(cache_key: &str) -> String {
     format!("{CACHE_DOMAIN}/index-slices/{cache_key}")
-}
-
-/// Lookup entries get their own URL namespace so a metadata key can never
-/// alias a bundle key.
-fn lookup_url(key: &str) -> String {
-    format!("{CACHE_DOMAIN}/lookups/{key}")
 }
 
 /// The fixed key the panic flag lives under — one flag, one entry.

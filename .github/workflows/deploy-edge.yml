@@ -58,7 +58,6 @@ jobs:
             GITHUB_APP_PRIVATE_KEY:STOW_APP_PRIVATE_KEY \
             STOW_POW_CHALLENGE_SECRET:STOW_POW_CHALLENGE_SECRET \
             TURNSTILE_SECRET_KEY:STOW_TURNSTILE_SECRET_KEY \
-            STOW_STATS_SALT_SECRET:STOW_STATS_SALT_SECRET \
             CF_ANALYTICS_TOKEN:CF_ANALYTICS_TOKEN; do
             name=${pair%%:*}
             repo_secret=${pair##*:}
@@ -74,7 +73,6 @@ jobs:
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.STOW_APP_PRIVATE_KEY }}
           STOW_POW_CHALLENGE_SECRET: ${{ secrets.STOW_POW_CHALLENGE_SECRET }}
           TURNSTILE_SECRET_KEY: ${{ secrets.STOW_TURNSTILE_SECRET_KEY }}
-          STOW_STATS_SALT_SECRET: ${{ secrets.STOW_STATS_SALT_SECRET }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
       - name: Build stow-admin
         run: cargo build --release -p stow-admin
