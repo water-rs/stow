@@ -214,6 +214,10 @@ Every alert, incident, breaker trip and watchdog report is a GitHub issue in thi
 
 GitHub's notifications reach the operator. Actions jobs use their `GITHUB_TOKEN` with `issues: write`. The edge uses the GitHub App installation token it already mints.
 
+## Platform-native first
+
+Before building any infrastructure mechanism, search Cloudflare's and GitHub's documentation for a native feature and use it when it fits. Examples: a kill switch, rate limiting, alerting, a canary, logging, queues, scheduling, merge gating. Cloudflare offers WAF custom and rate-limiting rules, the Workers rate-limiting binding, usage and budget notifications, Workers Logs, gradual deployments, Queues, Workflows, cron triggers and Analytics Engine. GitHub offers rulesets, merge queues, concurrency groups and environments. The panic switch reimplemented WAF custom rules inside the Worker and cost a Worker invocation and a Durable Object read on every request it shed. The issue or pull request that builds such a mechanism names the native options it checked and why none fits.
+
 ## Resources are spent deliberately
 
 Everything stow runs on is metered or scarce: Durable Object rows, duration and requests, D1 rows, Worker CPU, R2 operations, runner slots, GitHub API quota. Stow is a service whose whole purpose is saving other people's compute, and wasting its own is the same failure.
