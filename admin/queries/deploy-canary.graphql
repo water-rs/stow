@@ -1,0 +1,21 @@
+query DeployVerdict($account: String!, $script: String!, $from: Time!, $to: Time!) {
+  viewer {
+    accounts(filter: { accountTag: $account }) {
+      workersInvocationsAdaptive(
+        filter: { scriptName: $script, datetime_geq: $from, datetime_leq: $to }
+        limit: 500
+      ) {
+        dimensions { scriptVersion }
+        sum { requests errors }
+        quantiles { cpuTimeP50 cpuTimeP99 wallTimeP50 wallTimeP99 }
+      }
+      durableObjectsInvocationsAdaptiveGroups(
+        filter: { datetime_geq: $from, datetime_leq: $to }
+        limit: 500
+      ) {
+        dimensions { scriptVersion }
+        sum { requests errors wallTime }
+      }
+    }
+  }
+}

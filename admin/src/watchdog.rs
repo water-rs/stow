@@ -32,6 +32,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use zenwave::{Client, ResponseExt};
 
+use crate::cloudflare::{self, API_BASE};
 use crate::render::{self, Output, Table};
 use crate::runs;
 use crate::{Edge, github};
@@ -404,11 +405,6 @@ fn decide(readings: &[Reading], collect_failures: &[CollectFailure]) -> Decision
 
 /// Cloudflare credentials/env the analytics calls need.
 const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
-/// The operator's existing Cloudflare API token — the watchdog uses it
-/// for GraphQL analytics, Analytics Engine SQL and Email Sending; it
-/// needs `Account Analytics:Read` plus `Email Sending`.
-const CLOUDFLARE_API_TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
-const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 /// The Worker script name the Workers metrics filter on — must match
 /// `cloudflare.name` in `edge/Skyzen.toml`.
 const WORKER_SCRIPT_NAME: &str = "stow-edge";
@@ -517,48 +513,15 @@ impl Watcher<'_> {
         since_quarter: &str,
         now: &str,
     ) -> Result<CfSnapshot, String> {
-        let body = GraphqlRequest {
-            query: WATCHDOG_QUERY,
-            variables: QueryVars {
-                account_tag: self.account.to_owned(),
-                script_name: WORKER_SCRIPT_NAME.to_owned(),
-                since_hour: since_hour.to_owned(),
-                since_quarter: since_quarter.to_owned(),
-                now: now.to_owned(),
-            },
+        let variables = QueryVars {
+            account_tag: self.account.to_owned(),
+            script_name: WORKER_SCRIPT_NAME.to_owned(),
+            since_hour: since_hour.to_owned(),
+            since_quarter: since_quarter.to_owned(),
+            now: now.to_owned(),
         };
-        let url = format!("{CLOUDFLARE_API_BASE}/graphql");
-        let mut client = zenwave::client().timeout(std::time::Duration::from_secs(45));
-        let response = client
-            .post(&url)
-            .and_then(|request| {
-                request.header("Authorization", format!("Bearer {}", self.cf_token))
-            })
-            .and_then(|request| request.json_body(&body))
-            .map_err(|error| format!("POST {url}: {error}"))?
-            .await
-            .map_err(|error| format!("POST {url}: {error}"))?
-            .error_for_status()
-            .await
-            .map_err(|error| format!("POST {url}: {error}"))?;
-        let envelope: GraphqlResponse = response
-            .into_json()
-            .await
-            .map_err(|error| format!("decode {url}: {error}"))?;
-        if let Some(errors) = envelope.errors
-            && !errors.is_empty()
-        {
-            let messages = errors
-                .iter()
-                .map(|error| error.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(format!("GraphQL errors: {messages}"));
-        }
-        let account = envelope
-            .data
-            .and_then(|data| data.viewer.accounts.into_iter().next())
-            .ok_or_else(|| "GraphQL response carried no account data".to_owned())?;
+        let account: AccountGroups =
+            cloudflare::query_account(self.cf_token, WATCHDOG_QUERY, &variables).await?;
         Ok(CfSnapshot::from(account))
     }
 
@@ -572,10 +535,7 @@ impl Watcher<'_> {
                      WHERE blob1 = 'overloaded' \
                      AND timestamp >= NOW() - INTERVAL '1' HOUR \
                      FORMAT JSON";
-        let url = format!(
-            "{CLOUDFLARE_API_BASE}/accounts/{}/analytics_engine/sql",
-            self.account
-        );
+        let url = format!("{API_BASE}/accounts/{}/analytics_engine/sql", self.account);
         let mut client = zenwave::client().timeout(std::time::Duration::from_secs(45));
         let response = client
             .post(&url)
@@ -923,35 +883,7 @@ fn classify_one(log: &str) -> &'static str {
 /// dataset: DO periodic sums (usage + resource failures), DO invocations
 /// (requests), Worker invocations over the hour (usage) and grouped by
 /// invocation status over the last 15 minutes (health), and D1 rows.
-const WATCHDOG_QUERY: &str = r"query StowWatchdog($accountTag: String!, $scriptName: String!, $sinceHour: Time!, $sinceQuarter: Time!, $now: Time!) {
-  viewer {
-    accounts(filter: {accountTag: $accountTag}) {
-      doPeriodic: durableObjectsPeriodicGroups(filter: {datetime_geq: $sinceHour, datetime_leq: $now}, limit: 100) {
-        sum { activeTime cpuTime duration exceededCpuErrors exceededMemoryErrors fatalInternalErrors rowsRead rowsWritten storageDeletes storageReadUnits storageWriteUnits subrequests }
-      }
-      doInvoke: durableObjectsInvocationsAdaptiveGroups(filter: {datetime_geq: $sinceHour, datetime_leq: $now}, limit: 100) {
-        sum { requests wallTime errors }
-      }
-      worker: workersInvocationsAdaptive(filter: {datetime_geq: $sinceHour, datetime_leq: $now, scriptName: $scriptName}, limit: 100) {
-        sum { clientDisconnects cpuTimeUs duration errors requestDuration requests responseBodySize subrequests wallTime }
-      }
-      workerStatus: workersInvocationsAdaptive(filter: {datetime_geq: $sinceQuarter, datetime_leq: $now, scriptName: $scriptName}, limit: 100) {
-        dimensions { status }
-        sum { requests }
-      }
-      d1: d1AnalyticsAdaptiveGroups(filter: {datetime_geq: $sinceHour, datetime_leq: $now}, limit: 100) {
-        sum { rowsRead rowsWritten }
-      }
-    }
-  }
-}";
-
-/// The POST body.
-#[derive(Debug, serde::Serialize)]
-struct GraphqlRequest {
-    query: &'static str,
-    variables: QueryVars,
-}
+const WATCHDOG_QUERY: &str = include_str!("../queries/watchdog.graphql");
 
 /// Query variables — account tag, Worker script name, and the two
 /// window cutoffs (hour for usage, quarter-hour for health).
@@ -966,27 +898,6 @@ struct QueryVars {
     #[serde(rename = "sinceQuarter")]
     since_quarter: String,
     now: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GraphqlResponse {
-    data: Option<GraphqlData>,
-    errors: Option<Vec<GraphqlError>>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GraphqlError {
-    message: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GraphqlData {
-    viewer: GraphqlViewer,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GraphqlViewer {
-    accounts: Vec<AccountGroups>,
 }
 
 /// The aliased groups of [`WATCHDOG_QUERY`].
@@ -1806,7 +1717,7 @@ async fn send_mail(
     text: &str,
     html: &str,
 ) -> Result<Option<String>, String> {
-    let url = format!("{CLOUDFLARE_API_BASE}/accounts/{account}/email/sending/send");
+    let url = format!("{API_BASE}/accounts/{account}/email/sending/send");
     let body = MailBody {
         to: ALERT_TO,
         from: ALERT_FROM,
@@ -1908,8 +1819,7 @@ fn signal_report(reading: &Reading) -> SignalReport {
 #[allow(clippy::too_many_lines)]
 async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error::Result<()> {
     let gh_token = crate::github_token().await?;
-    let cf_token = std::env::var(CLOUDFLARE_API_TOKEN_ENV)
-        .map_err(|_| stow_error!("missing {CLOUDFLARE_API_TOKEN_ENV}"))?;
+    let cf_token = cloudflare::api_token()?;
     let account =
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let watcher = Watcher {
@@ -2178,8 +2088,7 @@ fn finish(output: Output, report: &WatchdogReport) -> stow_types::error::Result<
 #[allow(clippy::too_many_lines)]
 async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error::Result<()> {
     let gh_token = crate::github_token().await?;
-    let cf_token = std::env::var(CLOUDFLARE_API_TOKEN_ENV)
-        .map_err(|_| stow_error!("missing {CLOUDFLARE_API_TOKEN_ENV}"))?;
+    let cf_token = cloudflare::api_token()?;
     let account =
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let watcher = Watcher {
@@ -2600,15 +2509,8 @@ mod tests {
             "workerStatus":[{"dimensions":{"status":"success"},"sum":{"requests":100}},{"dimensions":{"status":"scriptThrewException"},"sum":{"requests":4}}],
             "d1":[{"sum":{"rowsRead":10,"rowsWritten":5}}]
         }]}}}"#;
-        let envelope: GraphqlResponse = serde_json::from_str(json).unwrap();
-        let account = envelope
-            .data
-            .unwrap()
-            .viewer
-            .accounts
-            .into_iter()
-            .next()
-            .unwrap();
+        let envelope: cloudflare::Envelope<AccountGroups> = serde_json::from_str(json).unwrap();
+        let account = envelope.into_account().unwrap();
         let snapshot = CfSnapshot::from(account);
         let readings = snapshot.readings();
         let decision = decide(&readings, &[]);
@@ -2630,8 +2532,11 @@ mod tests {
     #[test]
     fn graphql_errors_array_is_a_hard_error() {
         let json = r#"{"data":null,"errors":[{"message":"bad field"}]}"#;
-        let envelope: GraphqlResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(envelope.errors.unwrap().len(), 1);
+        let envelope: cloudflare::Envelope<AccountGroups> = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            envelope.into_account().unwrap_err(),
+            "Cloudflare GraphQL errors: bad field"
+        );
     }
 
     /// Digest cadence — at most one comment an hour.

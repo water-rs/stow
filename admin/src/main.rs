@@ -10,6 +10,7 @@
 
 mod artifacts;
 mod cache;
+mod cloudflare;
 mod coverage;
 mod crates_io;
 mod deploy;

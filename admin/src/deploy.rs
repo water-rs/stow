@@ -46,12 +46,9 @@ use serde::de::DeserializeOwned;
 use stow_types::stow_error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use zenwave::{Client, ResponseExt};
 
+use crate::cloudflare;
 use crate::render::{self, Output, Table};
-
-const GRAPHQL_ENDPOINT: &str = "https://api.cloudflare.com/client/v4/graphql";
-const CLOUDFLARE_API_TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
 
 #[derive(Args)]
 pub struct DeployArgs {
@@ -406,35 +403,6 @@ struct PromotedSample {
 
 // ---- GraphQL wire shapes -------------------------------------------------
 
-/// A `{"data": …, "errors": …}` envelope.
-#[derive(Debug, Deserialize)]
-struct GraphQlEnvelope<T> {
-    /// Present on success.
-    data: Option<T>,
-    /// Present on failure — Cloudflare reports field errors here, sometimes
-    /// alongside partial `data`.
-    errors: Option<Vec<GraphQlError>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GraphQlError {
-    /// The API's message.
-    message: String,
-}
-
-/// `viewer { accounts(...) { <T> } }` — the shape every analytics query shares.
-#[derive(Debug, Deserialize)]
-struct Viewer<T> {
-    /// The viewer root.
-    viewer: ViewerAccounts<T>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ViewerAccounts<T> {
-    /// One entry per account the filter matched — the tag names exactly one.
-    accounts: Vec<T>,
-}
-
 /// What the canary query returns.
 #[derive(Debug, Deserialize)]
 struct CanaryData {
@@ -575,13 +543,13 @@ struct RequestsSum {
     requests: f64,
 }
 
-/// One GraphQL request body.
+/// The variables both verdict queries take.
 #[derive(Debug, serde::Serialize)]
-struct GraphQlRequest {
-    /// The query document.
-    query: &'static str,
-    /// The variables it references.
-    variables: serde_json::Value,
+struct WindowVars<'a> {
+    account: &'a str,
+    script: &'a str,
+    from: String,
+    to: String,
 }
 
 /// The canary query: both versioned datasets, both bounds, one round trip.
@@ -589,62 +557,13 @@ struct GraphQlRequest {
 /// one row per deployed version. The DO dataset is filtered by datetime
 /// alone — `scriptName` is not among its confirmed dimensions — so it is
 /// an account total like every other DO/D1 dataset (see module docs).
-const CANARY_QUERY: &str = r"query DeployVerdict($account: String!, $script: String!, $from: Time!, $to: Time!) {
-  viewer {
-    accounts(filter: { accountTag: $account }) {
-      workersInvocationsAdaptive(
-        filter: { scriptName: $script, datetime_geq: $from, datetime_leq: $to }
-        limit: 500
-      ) {
-        dimensions { scriptVersion }
-        sum { requests errors }
-        quantiles { cpuTimeP50 cpuTimeP99 wallTimeP50 wallTimeP99 }
-      }
-      durableObjectsInvocationsAdaptiveGroups(
-        filter: { datetime_geq: $from, datetime_leq: $to }
-        limit: 500
-      ) {
-        dimensions { scriptVersion }
-        sum { requests errors wallTime }
-      }
-    }
-  }
-}";
+const CANARY_QUERY: &str = include_str!("../queries/deploy-canary.graphql");
 
 /// The promoted query: the unversioned datasets, account totals, one round
 /// trip — `durableObjectsPeriodicGroups` and `d1AnalyticsAdaptiveGroups`
 /// for the numerators, the invocation datasets for the request
 /// denominators.
-const PROMOTED_QUERY: &str = r"query DeployVerdict($account: String!, $script: String!, $from: Time!, $to: Time!) {
-  viewer {
-    accounts(filter: { accountTag: $account }) {
-      durableObjectsPeriodicGroups(
-        filter: { datetime_geq: $from, datetime_leq: $to }
-        limit: 500
-      ) {
-        sum { cpuTime rowsRead rowsWritten }
-      }
-      durableObjectsInvocationsAdaptiveGroups(
-        filter: { datetime_geq: $from, datetime_leq: $to }
-        limit: 500
-      ) {
-        sum { requests }
-      }
-      d1AnalyticsAdaptiveGroups(
-        filter: { datetime_geq: $from, datetime_leq: $to }
-        limit: 500
-      ) {
-        sum { rowsRead rowsWritten }
-      }
-      workersInvocationsAdaptive(
-        filter: { scriptName: $script, datetime_geq: $from, datetime_leq: $to }
-        limit: 500
-      ) {
-        sum { requests }
-      }
-    }
-  }
-}";
+const PROMOTED_QUERY: &str = include_str!("../queries/deploy-promoted.graphql");
 
 pub async fn run(args: DeployArgs, output: Output) -> stow_types::error::Result<()> {
     match args.command {
@@ -658,18 +577,21 @@ async fn verdict(args: VerdictArgs, output: Output) -> stow_types::error::Result
             "each window's --*-from must precede its --*-to"
         ));
     }
-    let token = std::env::var(CLOUDFLARE_API_TOKEN_ENV)
-        .map_err(|_| stow_error!("missing {CLOUDFLARE_API_TOKEN_ENV}"))?;
+    let token = cloudflare::api_token()?;
 
     let report = match args.phase {
         VerdictPhase::Canary => {
-            let baseline = canary_sample(&token, &args, true).await?;
-            let candidate = canary_sample(&token, &args, false).await?;
+            let (baseline, candidate) = futures_util::try_join!(
+                canary_sample(&token, &args, true),
+                canary_sample(&token, &args, false),
+            )?;
             evaluate_canary(&args, &baseline, &candidate)
         }
         VerdictPhase::Promoted => {
-            let baseline = promoted_sample(&token, &args, true).await?;
-            let candidate = promoted_sample(&token, &args, false).await?;
+            let (baseline, candidate) = futures_util::try_join!(
+                promoted_sample(&token, &args, true),
+                promoted_sample(&token, &args, false),
+            )?;
             evaluate_promoted(&args, &baseline, &candidate)
         }
     };
@@ -696,42 +618,19 @@ async fn fetch_window<D: DeserializeOwned>(
     } else {
         (args.candidate_from, args.candidate_to)
     };
-    let body = GraphQlRequest {
-        query,
-        variables: serde_json::json!({
-            "account": args.account_tag,
-            "script": args.script,
-            "from": from.format(&Rfc3339).map_err(|error| stow_error!("format window start: {error}"))?,
-            "to": to.format(&Rfc3339).map_err(|error| stow_error!("format window end: {error}"))?,
-        }),
+    let variables = WindowVars {
+        account: &args.account_tag,
+        script: &args.script,
+        from: from
+            .format(&Rfc3339)
+            .map_err(|error| stow_error!("format window start: {error}"))?,
+        to: to
+            .format(&Rfc3339)
+            .map_err(|error| stow_error!("format window end: {error}"))?,
     };
-    let mut client = zenwave::client();
-    let response = client
-        .post(GRAPHQL_ENDPOINT)
-        .and_then(|request| request.header("Authorization", format!("Bearer {token}")))
-        .and_then(|request| request.json_body(&body))
-        .map_err(|error| stow_error!("POST {GRAPHQL_ENDPOINT}: {error}"))?
+    cloudflare::query_account(token, query, &variables)
         .await
-        .map_err(|error| stow_error!("POST {GRAPHQL_ENDPOINT}: {error}"))?;
-    let envelope: GraphQlEnvelope<Viewer<D>> = response
-        .error_for_status()
-        .await
-        .map_err(|error| stow_error!("POST {GRAPHQL_ENDPOINT}: {error}"))?
-        .into_json()
-        .await
-        .map_err(|error| stow_error!("decode GraphQL response: {error}"))?;
-    if let Some(errors) = envelope.errors.filter(|errors| !errors.is_empty()) {
-        let messages = errors
-            .iter()
-            .map(|error| error.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(stow_error!("Cloudflare GraphQL errors: {messages}"));
-    }
-    envelope
-        .data
-        .and_then(|data| data.viewer.accounts.into_iter().next())
-        .ok_or_else(|| stow_error!("GraphQL answer carried no account data"))
+        .map_err(|error| stow_error!("{error}"))
 }
 
 /// Run `CANARY_QUERY` for one window and pull the asked-for version's rows
