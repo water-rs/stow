@@ -78,7 +78,7 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 │                              │  POST /api/v1/scheduler/complete    │              │
 │                              │◄────────────────────────────────────│              │
 └──────────┬───────────────────┘                                     └─────┬────────┘
-           │ GET /api/v1/artifacts/… (bundle bytes), POST /api/v1/admissions │ bundles +
+           │ GET /api/v1/bundles/{digest} (bundle bytes), POST /api/v1/admissions │ bundles +
            ▲                                                               │ sigstore push
 ┌──────────┴───────────────────┐                                           ▼
 │ stow-cli (consumer machine)  │  OCI pulls: signed index.* slices ┌──────────────────┐
@@ -139,8 +139,23 @@ wrangler --config /path/to/edge/.skyzen/gen/wrangler.toml dev --local --port 878
     --persist-to /tmp/stow-bench/edge-state
 ```
 
+The D1 schema above is only half the story: the scheduler Durable Object
+keeps its own SQLite store, and request code never creates it —
+migrations are operations work. Run the same operator migration the
+deploy pipeline runs after `skyzen deploy`, in a fourth shell once
+Wrangler is listening (any HTTP response is enough — the scheduler
+routes are 500s until the schema exists):
+
+```sh
+# Prints `scheduler schema <before> → <after>`; <after> is the build's
+# SCHEMA_VERSION. Safe to repeat — a current queue is a no-op.
+STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
+    target/debug/stow-admin scheduler migrate
+```
+
 Verify: `curl http://127.0.0.1:8788/api/v1/scheduler/status` returns
-`{"pending":0,"dispatched":0,"running":0,"completed":0,"failed":0}`.
+`{"pending":0,"dispatched":0,"running":0,"completed":0,"failed":0}` —
+a 500 `no such table: queue` means the migrate step did not run.
 
 **Terminal 3 — local CI dispatch endpoint:**
 

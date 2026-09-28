@@ -1,0 +1,211 @@
+//! The `send_email` binding the dispatch freeze alerts through.
+//!
+//! The binding is resolved as a plain object off `env` and its `send`
+//! method invoked over `wasm_bindgen`. `send()` takes the Email Sending
+//! message shape `{to, from, subject, text, html}` — a plain object
+//! literal built by `serde_wasm_bindgen` rather than a hand-written
+//! class binding — and answers `Promise<{ messageId }>`; rejections are
+//! `Error` objects carrying a structured `code` (`E_*`) and `message`.
+//!
+//! A failed send is never an error to the caller: it is data. The
+//! returned [`ChannelOutcome`] is written onto the freeze record,
+//! so the freeze engages and stays engaged even when the alert goes
+//! nowhere — the freeze is the load-bearing action, the email is
+//! notification, and a silent notification is something `stow-admin`
+//! must be able to see.
+
+use js_sys::Reflect;
+use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+
+use stow_types::api::ChannelOutcome;
+
+use crate::{env_binding, freeze};
+
+/// `[[send_email]]` binding name, declared in `Skyzen.toml` through
+/// `cloudflare.raw` with `remote = true` (the binding is a remote Email
+/// Sending service, not something workerd emulates). Deliberately absent
+/// from the mock/local manifests so those deployments resolve to
+/// `Disabled` and can never reach Cloudflare's sending API.
+const STOW_ALERT_EMAIL_BINDING: &str = "STOW_ALERT_EMAIL";
+/// Sender-address var; [`freeze::DEFAULT_ALERT_FROM`] when unset.
+const STOW_ALERT_FROM_BINDING: &str = "STOW_ALERT_FROM";
+/// Recipient-address var; [`freeze::DEFAULT_ALERT_TO`] when unset.
+const STOW_ALERT_TO_BINDING: &str = "STOW_ALERT_TO";
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    /// The `send_email` binding object — a service-binding-style handle
+    /// whose `send` method takes the Email Sending message
+    /// `{to, from, subject, text, html}` and returns
+    /// `Promise<{ messageId }>`.
+    #[wasm_bindgen(extends = js_sys::Object)]
+    type SendEmailBinding;
+
+    /// `binding.send(message)`. A synchronous throw surfaces through
+    /// `catch`; a rejection surfaces when the promise resolves.
+    #[wasm_bindgen(method, catch)]
+    fn send(this: &SendEmailBinding, message: &JsValue) -> Result<js_sys::Promise, JsValue>;
+}
+
+/// The resolved alert transport: the binding handle plus the addresses
+/// the message is addressed with (shown to the renderer so the body
+/// footer can name them). `SendWrapper` marks the JS handle Send-safe
+/// (workers are single-threaded) so the config can live across `.await`
+/// in the `Send` futures Skyzen requires of handlers.
+pub struct AlertConfig {
+    binding: SendWrapper<SendEmailBinding>,
+    /// Sender — must sit on a domain onboarded under Compute → Email
+    /// Service → Email Sending or `send` answers `E_SENDER_NOT_VERIFIED`.
+    pub from: String,
+    /// Recipient — additionally pinned by the binding's
+    /// `allowed_destination_addresses` in `Skyzen.toml`.
+    pub to: String,
+}
+
+/// Resolve the binding and addresses. `Err` carries the `Disabled`
+/// outcome naming the missing piece — for the mock/local deployments
+/// that is the binding itself, by design.
+///
+/// The `AlertConfig` this returns backs the edge's only alert channel
+/// — [`EdgeAlerter`] sends every draft through it. The `incident`
+/// issue record is the #450 watchdog's job: the edge's App token has
+/// no `issues` grant by design.
+pub fn alert_config(env: &JsValue) -> Result<AlertConfig, ChannelOutcome> {
+    let value =
+        Reflect::get(env, &JsValue::from_str(STOW_ALERT_EMAIL_BINDING)).map_err(|error| {
+            freeze::notify_disabled(format!(
+                "reading binding '{STOW_ALERT_EMAIL_BINDING}': {error:?}"
+            ))
+        })?;
+    if value.is_undefined() || value.is_null() {
+        return Err(freeze::notify_disabled(format!(
+            "'{STOW_ALERT_EMAIL_BINDING}' send_email binding is not declared"
+        )));
+    }
+    let send = Reflect::get(&value, &JsValue::from_str("send"))
+        .ok()
+        .filter(JsValue::is_function);
+    if send.is_none() {
+        return Err(freeze::notify_disabled(format!(
+            "'{STOW_ALERT_EMAIL_BINDING}' is not a send_email binding (no send method)"
+        )));
+    }
+    Ok(AlertConfig {
+        binding: SendWrapper::new(value.unchecked_into()),
+        from: env_binding::optional_string(env, STOW_ALERT_FROM_BINDING)
+            .unwrap_or_else(|| freeze::DEFAULT_ALERT_FROM.to_owned()),
+        to: env_binding::optional_string(env, STOW_ALERT_TO_BINDING)
+            .unwrap_or_else(|| freeze::DEFAULT_ALERT_TO.to_owned()),
+    })
+}
+
+/// `send()` one alert carrying both a `text` and an `html` body — Email
+/// Sending multipart, no MIME construction on our side. Never returns
+/// `Err`: a synchronous throw, a rejected promise, and a serialization
+/// failure all become [`ChannelOutcome::Failed`] with the
+/// structured code extracted when the error object carries one.
+pub async fn send_alert(
+    config: &AlertConfig,
+    subject: &str,
+    text: &str,
+    html: &str,
+) -> ChannelOutcome {
+    // The Email Sending message shape — `send()` takes
+    // `{to, from, subject, text, html}`; `serde_wasm_bindgen` produces
+    // exactly that object literal, which is far less code than a class
+    // binding.
+    #[derive(serde::Serialize)]
+    struct EmailMessage<'a> {
+        to: &'a str,
+        from: &'a str,
+        subject: &'a str,
+        text: &'a str,
+        html: &'a str,
+    }
+    let message = match serde_wasm_bindgen::to_value(&EmailMessage {
+        to: &config.to,
+        from: &config.from,
+        subject,
+        text,
+        html,
+    }) {
+        Ok(message) => message,
+        Err(error) => {
+            return freeze::notify_failed(None, format!("serialize alert email: {error}"));
+        }
+    };
+    let promise = match config.binding.send(&message) {
+        Ok(promise) => promise,
+        Err(error) => return send_error(&error),
+    };
+    match JsFuture::from(promise).into_send().await {
+        Ok(result) => {
+            let message_id = Reflect::get(&result, &JsValue::from_str("messageId"))
+                .ok()
+                .and_then(|value| value.as_string());
+            freeze::notify_sent(message_id)
+        }
+        Err(error) => send_error(&error),
+    }
+}
+
+/// Extract `{code, message}` off a rejected `send()` error object and
+/// attach the known-code hint.
+fn send_error(error: &JsValue) -> ChannelOutcome {
+    let code = Reflect::get(error, &JsValue::from_str("code"))
+        .ok()
+        .and_then(|value| value.as_string());
+    let message = Reflect::get(error, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .unwrap_or_else(|| format!("{error:?}"));
+    freeze::notify_failed(code, message)
+}
+
+/// The email alert sink the object and the scheduled handler use —
+/// every draft (freeze transition, digest, fault signal, usage-check
+/// failure) goes out through the one `send_email` binding.
+pub struct EdgeAlerter {
+    config: Result<AlertConfig, ChannelOutcome>,
+}
+
+impl EdgeAlerter {
+    /// Resolve the binding once — the same constructor serves the
+    /// object context and the Worker's scheduled context (no
+    /// per-callsite credential is needed: `send_email` is a binding).
+    pub fn new(env: &JsValue) -> Self {
+        Self {
+            config: alert_config(env),
+        }
+    }
+
+    async fn send(&self, draft: &crate::freeze::AlertDraft) -> ChannelOutcome {
+        match &self.config {
+            Ok(config) => send_alert(config, &draft.subject, &draft.body, &draft.html).await,
+            Err(outcome) => outcome.clone(),
+        }
+    }
+}
+
+impl crate::freeze::AlertSink for EdgeAlerter {
+    fn opened(
+        &self,
+        draft: &crate::freeze::AlertDraft,
+    ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+        self.send(draft)
+    }
+    fn updated(
+        &self,
+        draft: &crate::freeze::AlertDraft,
+    ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+        self.send(draft)
+    }
+    fn resolved(
+        &self,
+        draft: &crate::freeze::AlertDraft,
+    ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+        self.send(draft)
+    }
+}

@@ -1,0 +1,42 @@
+[package]
+name = "stow-resolver"
+description = "Native graph resolution for stow: the vendored cargo resolver's unit graph, reimplemented on the published `cargo` crate"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/water-rs/stow"
+publish = false
+
+[dependencies]
+# The cargo crate matching the stable toolchain stow builds with —
+# cargo 0.(N+1) ships with Rust 1.N. The resolver runs cargo's own
+# `resolver::resolve` + `FeatureResolver` on a real workspace directory
+# with an isolated CARGO_HOME.
+cargo = "=0.99.0"
+cargo-platform = "0.3.3"
+cargo-util = "0.2.31"
+cargo-util-schemas = "0.14.2"
+cargo-util-terminal = "0.1.1"
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+semver = { workspace = true }
+tracing = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+stow-types = { workspace = true }
+zenwave = { workspace = true }
+toml = { workspace = true }
+url = "2"
+tempfile = { workspace = true }
+
+[dev-dependencies]
+http = "1"
+flate2 = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[lints]
+workspace = true

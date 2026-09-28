@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<body style="font-family: system-ui, sans-serif; color: #1a1a1a; max-width: 640px;">
+<h2 style="margin-bottom: 4px;">stow watchdog — {{ kind }}</h2>
+<p style="margin-top: 0; color: #666;">{{ now }} UTC</p>
+{% if !breaches.is_empty() %}
+<table style="border-collapse: collapse; margin: 12px 0;">
+  <tr>
+    <th style="border: 1px solid #ccc; padding: 4px 8px; text-align: left;">signal</th>
+    <th style="border: 1px solid #ccc; padding: 4px 8px; text-align: left;">window</th>
+    <th style="border: 1px solid #ccc; padding: 4px 8px; text-align: left;">observed</th>
+    <th style="border: 1px solid #ccc; padding: 4px 8px; text-align: left;">threshold</th>
+    <th style="border: 1px solid #ccc; padding: 4px 8px; text-align: left;">effect</th>
+  </tr>
+  {% for breach in breaches %}
+  <tr>
+    <td style="border: 1px solid #ccc; padding: 4px 8px;"><code>{{ breach.id }}</code></td>
+    <td style="border: 1px solid #ccc; padding: 4px 8px;">{{ breach.window }}</td>
+    <td style="border: 1px solid #ccc; padding: 4px 8px;">{{ breach.observed }}</td>
+    <td style="border: 1px solid #ccc; padding: 4px 8px;">{{ breach.threshold }}</td>
+    <td style="border: 1px solid #ccc; padding: 4px 8px;">{{ breach.effect }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% for breach in breaches %}
+{% if !breach.evidence.is_empty() %}
+<p><code>{{ breach.id }}</code></p>
+<ul>
+  {% for line in breach.evidence %}<li style="font-family: monospace; font-size: 12px;">{{ line }}</li>{% endfor %}
+</ul>
+{% endif %}
+{% endfor %}
+{% if !actions.is_empty() %}
+<p><strong>Breaker actions</strong></p>
+<ul>{% for action in actions %}<li>{{ action }}</li>{% endfor %}</ul>
+{% endif %}
+{% if !failures.is_empty() %}
+<p><strong>Watchdog partial failures</strong></p>
+<ul>{% for failure in failures %}<li>{{ failure }}</li>{% endfor %}</ul>
+{% endif %}
+{% if let Some(url) = issue_url %}<p><a href="{{ url }}">Incident issue</a></p>{% endif %}
+<p style="color: #666; font-size: 12px;">Recovery is manual: <code>stow-admin watchdog clear</code></p>
+</body>
+</html>

@@ -534,9 +534,18 @@ enum UnparseableInvocation {
 
 fn classify_invocation(
     args: &[OsString],
+    build_script_out_dir: Option<PathBuf>,
 ) -> Result<rustc_args::ParsedRustcArgs, UnparseableInvocation> {
     match rustc_args::ParsedRustcArgs::parse(args) {
-        Ok(parsed) => Ok(parsed),
+        Ok(mut parsed) => {
+            // Cargo exports OUT_DIR on the rustc invocation of a crate with a
+            // build script; native artifact restore writes the script's
+            // outputs exactly there (inject.rs). It arrives as a parameter —
+            // under a supervisor the deciding process never sees the
+            // invocation's environment.
+            parsed.build_script_out_dir = build_script_out_dir;
+            Ok(parsed)
+        }
         Err(error) if error.contains("missing --crate-name") => {
             Err(UnparseableInvocation::Probe(error))
         }
@@ -602,8 +611,16 @@ impl supervisor::server::Handler for BuildSupervisor {
         self: &std::sync::Arc<Self>,
         executable: OsString,
         args: Vec<OsString>,
+        build_script_out_dir: Option<OsString>,
     ) -> supervisor::server::Decision<Self::Pending> {
-        match decide_rustc_invocation(&executable, &args, &self.env_cache).await {
+        match decide_rustc_invocation(
+            &executable,
+            &args,
+            &self.env_cache,
+            build_script_out_dir.map(PathBuf::from),
+        )
+        .await
+        {
             Outcome::Served => supervisor::server::Decision::Served,
             Outcome::Compile(post) => supervisor::server::Decision::Compile(post),
         }
@@ -667,7 +684,11 @@ async fn delegate_to_supervisor(
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     let decision = connection
-        .plan(&command.executable, &command.wrapped_args)
+        .plan(
+            &command.executable,
+            &command.wrapped_args,
+            std::env::var_os("OUT_DIR").as_deref(),
+        )
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     tracing::debug!(
@@ -699,7 +720,14 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
         miss_journal::drain_finished_builds(out_dir);
     }
     let env_cache = WrapperEnvCache::default();
-    match decide_rustc_invocation(&command.executable, &command.wrapped_args, &env_cache).await {
+    match decide_rustc_invocation(
+        &command.executable,
+        &command.wrapped_args,
+        &env_cache,
+        std::env::var_os("OUT_DIR").map(PathBuf::from),
+    )
+    .await
+    {
         Outcome::Served => std::process::exit(0),
         Outcome::Compile(post) => {
             let status =
@@ -731,8 +759,9 @@ async fn decide_rustc_invocation(
     rustc: &OsString,
     wrapped_args: &[std::ffi::OsString],
     env_cache: &WrapperEnvCache,
+    build_script_out_dir: Option<PathBuf>,
 ) -> Outcome {
-    let parsed = match classify_invocation(wrapped_args) {
+    let parsed = match classify_invocation(wrapped_args, build_script_out_dir) {
         Ok(parsed) => parsed,
         Err(UnparseableInvocation::Probe(error)) => {
             tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
@@ -2824,7 +2853,7 @@ async fn resolve_local_build_artifact(
         identity,
         features_json,
         dependency_c_metadata_json,
-        build_script_out_dir: std::env::var_os("OUT_DIR").map(PathBuf::from),
+        build_script_out_dir: parsed.build_script_out_dir.clone(),
     }))
 }
 
@@ -3384,12 +3413,10 @@ mod tests {
     fn unparseable_rustc_invocation_passes_through_instead_of_failing() {
         // A flag stow does not model must never fail the unit: the
         // invocation goes to the real rustc verbatim.
-        let invocation = classify_invocation(&args(&[
-            "--crate-name",
-            "itoa",
-            "-Z",
-            "embed-metadata=banana",
-        ]));
+        let invocation = classify_invocation(
+            &args(&["--crate-name", "itoa", "-Z", "embed-metadata=banana"]),
+            None,
+        );
 
         assert!(
             matches!(invocation, Err(UnparseableInvocation::Passthrough(_))),
@@ -3400,9 +3427,48 @@ mod tests {
     #[test]
     fn crate_name_less_probe_stays_a_quiet_passthrough() {
         assert!(matches!(
-            classify_invocation(&args(&["-vV"])),
+            classify_invocation(&args(&["-vV"]), None),
             Err(UnparseableInvocation::Probe(_))
         ));
+    }
+
+    /// cargo exports `OUT_DIR` on the rustc call of a crate with a build
+    /// script, and it belongs to the invocation, not the process that
+    /// decides. The supervisor's own environment carries no `OUT_DIR`
+    /// (this process's does not either), so the parsed invocation must
+    /// hold exactly the value the plan carried.
+    #[tokio::test]
+    async fn the_plan_carries_the_invocations_out_dir() {
+        let handler = std::sync::Arc::new(super::BuildSupervisor::default());
+        let decision = crate::supervisor::server::Handler::plan(
+            &handler,
+            OsString::from("rustc"),
+            args(&[
+                "--crate-name",
+                "demo",
+                "--crate-type",
+                "lib",
+                "--out-dir",
+                "/tmp/out",
+                "--emit",
+                "dep-info,metadata,link",
+                "-C",
+                "metadata=abc123",
+            ]),
+            Some(OsString::from("/tmp/build/demo-aaa/out")),
+        )
+        .await;
+
+        let crate::supervisor::server::Decision::Compile(post) = decision else {
+            panic!("an unserved cacheable invocation decides to compile");
+        };
+        assert_eq!(
+            post.parsed
+                .expect("parsed invocation")
+                .build_script_out_dir
+                .as_deref(),
+            Some(std::path::Path::new("/tmp/build/demo-aaa/out")),
+        );
     }
 
     #[test]

@@ -1,8 +1,7 @@
-use std::collections::BTreeSet;
 use std::io::prelude::*;
 
 use crate::core::resolver::encode::into_resolve;
-use crate::core::{PackageId, Resolve, ResolveVersion, SourceId, Workspace};
+use crate::core::{Resolve, ResolveVersion, Workspace};
 use crate::util::Filesystem;
 use crate::util::errors::CargoResult;
 
@@ -11,26 +10,14 @@ use cargo_util_schemas::lockfile::TomlLockfile;
 
 pub const LOCKFILE_NAME: &str = "Cargo.lock";
 
-/// The `PackageId`s a lockfile's `[[package]]` `source` entries name —
-/// its registry and git pins. Member (path) entries carry no `source`
-/// and are skipped.
-///
-/// This is the yanked allowlist for a fresh resolve: a version the
-/// project's own lockfile pins stays admissible even when the index
-/// marks it yanked, which is cargo's own `Cargo.lock` rule.
-pub fn lockfile_package_ids(contents: &str) -> CargoResult<BTreeSet<PackageId>> {
+/// Parse lockfile `contents` into a [`Resolve`] against `ws` — the same
+/// decode [`load_pkg_lockfile`] performs on a `Cargo.lock` it finds on
+/// disk, for a lockfile the caller carried in from elsewhere. The edge's
+/// projects lane drops each workspace's `Cargo.lock` out of the fetched
+/// tree before resolving and carries its contents here instead.
+pub fn parse_lockfile(ws: &Workspace<'_>, contents: &str) -> CargoResult<Resolve> {
     let lockfile: TomlLockfile = toml::from_str(contents)?;
-    let mut packages = lockfile.package.unwrap_or_default();
-    if let Some(root) = lockfile.root {
-        packages.insert(0, root);
-    }
-    let mut ids = BTreeSet::new();
-    for pkg in &packages {
-        let Some(source) = &pkg.source else { continue };
-        let source = SourceId::from_url(source.source_str())?;
-        ids.insert(PackageId::try_new(&pkg.name, &pkg.version, source)?);
-    }
-    Ok(ids)
+    into_resolve(lockfile, contents, ws)
 }
 
 #[tracing::instrument(skip_all)]
@@ -46,11 +33,9 @@ pub fn load_pkg_lockfile(ws: &Workspace<'_>) -> CargoResult<Option<Resolve>> {
     f.read_to_string(&mut s)
         .with_context(|| format!("failed to read file: {}", f.path().display()))?;
 
-    let resolve = (|| -> CargoResult<Option<Resolve>> {
-        let v: TomlLockfile = toml::from_str(&s)?;
-        Ok(Some(into_resolve(v, &s, ws)?))
-    })()
-    .with_context(|| format!("failed to parse lock file at: {}", f.path().display()))?;
+    let resolve = parse_lockfile(ws, &s)
+        .map(Some)
+        .with_context(|| format!("failed to parse lock file at: {}", f.path().display()))?;
     Ok(resolve)
 }
 

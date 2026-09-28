@@ -51,8 +51,10 @@ invocation without them keeps the key it produced before they were modeled:
 
 ### `artifacts`
 
-The edge worker upserts rows here from the trusted CI register endpoint
-(`edge/src/db.rs::insert_artifact_record`). The SQL template lives at
+The edge worker upserts rows here from the `POST /api/v1/admin/artifacts/sync`
+endpoint (`edge/src/db.rs::insert_artifact_record`) — the D1 table is a
+mirror of GHCR's signed records artifacts, populated by
+`stow-admin index sync` inside `index-publish.yml`. The SQL template lives at
 `edge/src/sql/insert_artifact.sql`; adding a column requires editing that
 file plus the matching `bind` calls in `insert_artifact_record`. Column list
 (in INSERT order):
@@ -77,14 +79,13 @@ Every observed miss is logged as one data point in the
 `STOW_ANALYTICS`), never as a D1 row: anonymous traffic cannot spend
 billed row writes. A point's blobs are `(event, crate_name, version,
 features_json, target, rustc_version, kind, path)` with `event = "miss"`,
-its doubles are `[1]`, and the crate name is the index. Two miss shapes
-exist: each uncovered node the admissions handler enqueues writes a
-`graph` point carrying the full request identity, and a 404 on the
-artifact byte path with a `?crate=` query writes an `exact` point
-carrying only crate name, target, and rustc (the `kind` slot is always
-empty today). A point carries artifact identity only — no IP, no request
-id, no dependency graph, no lockfile hash. Semantic misses never reach
-the edge: the CLI resolves them locally against the index slice.
+its doubles are `[1]`, and the crate name is the index. Every miss is a
+`graph` point carrying the full request identity, written by the
+admissions handler once per uncovered node (the `kind` slot is always
+empty today); the digest-addressed byte path observes no crate identity
+and writes nothing. A point carries artifact identity only — no IP, no
+request id, no dependency graph, no lockfile hash. Semantic misses never
+reach the edge: the CLI resolves them locally against the index slice.
 
 A D1 row exists only for a miss whose admission was redeemed: when
 `POST /api/v1/enqueue` verifies the challenge and proof-of-work it
@@ -185,8 +186,9 @@ optional-dependency feature activation, `cfg(...)` target restrictions —
 and submits every uncovered node as an `EnqueueSource::HumanRequest`
 task for each of `stow_types::api::CI_TARGET_TRIPLES`. `rustc_version`
 is the current stable channel release, parsed from
-`channel-rust-stable.toml` and cached in the Durable Object's
-`rust_stable_channel` table for 60 minutes. `GET
+`channel-rust-stable.toml` and cached in the Worker's Cache API for 60
+minutes (`edge/src/rust_channel.rs`), so the lane never wakes the
+scheduler Durable Object to resolve it. `GET
 /api/v1/requests/{task_id}` returns the task's `RequestStatus` — lane,
 queue status, and its 1-based `human_lane_position` while it is still
 pending in the human lane.
@@ -265,13 +267,13 @@ trusted publish stage pushes `<tag>.bundle`, a single-layer image whose
 layer is the bundle tar a CLI consumes (`stow_types::bundle::assemble_bundle`).
 The bundle needs no signature of its own: it embeds the signed manifest and
 config, the signature materials, and the layers byte-for-byte, and the CLI
-verifies that material after download. The record registered with the
-edge carries the bundle layer's digest and size (`bundle_digest`,
-`bundle_size`), republished verbatim into the index row; the edge streams
-that blob by digest from GHCR through `GET /api/v1/artifacts/…`, teeing
-it into the Cache API, and the CLI requires the bytes to hash to the
-index row's `bundle_digest` — no intermediary ever assembles, buffers or
-inspects it. The publish stage validated the tar
+verifies that material after download. The task's records artifact
+carries the bundle layer's digest and size (`bundle_digest`,
+`bundle_size`), republished verbatim into the index row; the CLI asks the
+edge for `GET /api/v1/bundles/{bundle_digest}`, which serves the blob
+Cache-API-first and tees a GHCR miss into the cache, and the CLI requires
+the bytes to hash to the index row's `bundle_digest` — no intermediary
+ever assembles, buffers or inspects it. The publish stage validated the tar
 (`stow_types::bundle_schema`) before pushing it.
 
 | Path | Content |
@@ -282,11 +284,9 @@ inspects it. The publish stage validated the tar
 | `sigstore/payload-<n>.json` | Cosign simple-signing payloads, one per signature layer |
 | `files/<name>` | One entry per layer in manifest order: `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, the native archive |
 
-Rows registered before bundles were published carry an empty
-`bundle_digest`; the index export omits them (no pullable digest means
-no coverage), and the serving lookup treats such a row as a miss. `stow-build backfill-bundles` lists them through
-`GET /api/v1/admin/artifacts/unbundled`, republishes each bundle from the
-signed image already in GHCR, and re-registers the record.
+A record whose artifact predates bundle publishing carries an empty
+`bundle_digest`; the index export omits it — a row with no pullable
+digest is not coverage.
 
 Constants (media types, paths) are defined in `types/src/bundle.rs`.
 
@@ -308,12 +308,17 @@ foreign version — and a `row_count` checked against the decoded body.
 identity the CLI rejects, so `index-publish-cron.yml` dispatches it on
 `main` after every completed `build-crate` run (a ten-minute schedule is
 the backstop; GitHub delivers those ticks hours apart), and its first
-step refuses any other ref. A run
-resolves the current stable rustc from the
-channel manifest, exports each `CI_TARGET_TRIPLES` slice through
-`GET /api/v1/admin/index/{target}/{rustc_version}` (keyset-paginated by
-`c_metadata`, `SchedulerCaller`-gated) via `stow-admin index export`, and
-pushes it with `stow-admin index publish`. Because the header's
+step refuses any other ref. A run does one `stow-admin index export
+--out-dir --rustc-version` pass scoped to one rustc — the completed
+run's `<rustc>-<task_id>` title names it, and the pass pulls and
+verifies the published `index`/`folded` pair per `(target, rustc)`
+slice of that rustc and then only the `records-<rustc>-*` artifacts no
+folded set covers, all from GHCR with no edge round-trip — and emits an
+empty generation-1 slice for every `CI_TARGET_TRIPLES` member that got
+no rows and has no published pair, so a `--target` consumer always
+finds the tag —
+then loops the pass's `slices.json` for `stow-admin index publish`,
+which pushes the `index` plus `folded` pair and signs both. Because the header's
 `generated_at` makes every
 export byte-unique, the run does not compare blob digests: the export
 reports a `content_sha256` over everything but the timestamp, the
@@ -350,7 +355,7 @@ Four layers, and one of them is deliberately outside this repository:
    declare. A client cannot mint identities from arbitrary strings, so
    every task it can create is a legitimate one that will serve real
    users.
-4. **The anonymous-traffic circuit breaker** (`stow-admin panic`).
+4. **The zone maintenance rules** (`stow-admin maintenance`).
 
 Proof-of-work is a cost speed bump on top of these, not one of them. It
 cannot be sized to stop abuse: the legitimate client and the attacker pay
@@ -365,29 +370,39 @@ charges whoever arrives next for a backlog everyone built — which is why
    │ build job (untrusted)        │ upload │ publish job (trusted)        │
    │ contents: read, no secrets   │──────► │ packages: write, id-token    │
    │ stow-build build             │ artifact│ stow-build publish           │
-   │ runs third-party build.rs    │        │ validates, pushes, signs,    │
-   └──────────────────────────────┘        │ registers, reports           │
+   │ runs third-party build.rs    │        │ validates, pushes bundles +  │
+   └──────────────────────────────┘        │ records, cosign-signs        │
                                            └─┬────────────────────────────┘
-                                             │ POST /api/v1/admin/artifacts/register
-                                             │ (Bearer: github-oidc)
+                                             │
                                              ▼
-  client (cli)  ──── zenwave ──►  edge worker (skyzen) ──► CF D1 (authoritative)
+  GitHub ──workflow_run webhook──►  edge worker (skyzen) ──► CF D1 (catalog mirror)
         ▲                              │ CfFetch
-        │ inject                       ▼
-   cargo target/                  GHCR (OCI)
+        │                              ▼
+  client (cli)  ──── zenwave ──►  GHCR (OCI): bundles, records, index slices
+        │
+        │ inject
+        ▼
+   cargo target/
 ```
+
+The build job never calls the edge: records live only in GHCR, and the
+scheduler learns the outcome from GitHub's `workflow_run` webhook — the
+edge verifies `X-Hub-Signature-256`, parses `display_title`
+(`<rustc>-<task_id>`) into its rustc and task id, and completes the
+task only after the task's records artifact verifies in GHCR. `stow-admin index export` rebuilds each index slice
+from those signed records, and the `artifacts` D1 table is a mirror
+populated by `index sync`, not the write target.
 
 What each hop is allowed to do:
 
 | Hop | Reads | Writes |
 |---|---|---|
-| stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/artifacts/…`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
-| edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users, and bound to the dispatched task's dependency closure — an OIDC write must name an in-flight task and every record's `(crate, version)` must be the task crate or a closure member); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss); `stow_events` Analytics Engine points (sampled hits) |
+| stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
+| edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/sync`, gated by repo push users and bound to records already published in GHCR); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
-| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
-| `report-failure` job (`build-crate.yml`) | the dispatch task input; OIDC (`id-token: write`) | scheduler `/complete` failure reports |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | D1 `artifacts` via the edge admin index endpoint; GHCR manifests; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache` |
+| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>` artifacts); sigstore signatures |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
 
 The build and publish jobs never share a process or an environment. The build job's
 `GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a
@@ -458,8 +473,9 @@ push from on the repo (probed via the `git-receive-pack` ref
 advertisement — uniform across user tokens, fine-grained PATs, and
 installation tokens). The CLI verifies cosign signatures on every cache hit
 (`cli/src/verify.rs`) before injecting bytes into Cargo's target directory,
-so a polluted record (e.g. from a stolen credential) produces a 404 +
-stale-row prune on the client, not malicious code.
+and the digest-addressed fetch requires the bytes to hash to the index's
+`bundle_digest`, so a polluted record (e.g. from a stolen credential)
+produces a verification failure and a local compile, not malicious code.
 
 What "verifies cosign signatures" means in `github-ci` mode: the signature
 material must carry a Rekor bundle; the bundle's signed entry timestamp is
@@ -472,23 +488,21 @@ match the trusted builder's workflow URL and OIDC issuer; and only then is the E
 signature over the payload checked. A key leaked from a short-lived Fulcio
 certificate therefore cannot sign anything after that certificate expires.
 
-> **Register binding.** The endpoint is authenticated by GitHub identity,
-> and an OIDC write must additionally name the scheduler task the run was
-> dispatched for (`RegisterArtifactsRequest.task_id`). The edge requires
-> the task to be in flight and every record to carry the task's target and
-> rustc version, and it expands the task's crates.io dependency closure
-> with the same resolver `POST /api/v1/requests` uses: a record for a
-> `(crate, version)` outside that closure rejects the whole request before
-> any row is written. A compromised publish job for crate X can therefore
-> only register rows crate X's own build could produce. Tasks that resolve
-> a lockfile the edge cannot reproduce (`preserve_lockfile` overlays)
-> skip the crates.io expansion — their
-> binding narrows to the task's target/rustc identity — and push-user
-> callers may omit `task_id` for the operator backfill path.
+> **Records binding.** CI never calls the edge to record builds — each
+> task's records land in GHCR as a cosign-signed `records-<rustc>-<task_id hash>`
+> artifact under the pinned `build-crate.yml` identity, and every reader
+> (`index export`, the webhook completion check) verifies that signature
+> before trusting the rows. The D1 `artifacts` table is a mirror: the
+> `sync` endpoint only accepts rows identical to what the registry's
+> verified records carry, so the catalog can lag or be rebuilt wholesale
+> without ever becoming the source of truth.
 >
-> **Future direction.** Requiring the request body itself to be
-> cosign-signed by the same identity that signs OCI bundles would make
-> register signature-rooted end to end.
+> **Completion binding.** GitHub's `workflow_run` webhook is HMAC-signed
+> with `STOW_GITHUB_WEBHOOK_SECRET`, which only GitHub and the edge hold;
+> the edge accepts a completion only for a `build-crate.yml` run on `main`
+> whose `display_title` parses as `<rustc>-<task_id>`, and only after
+> the task's records
+> artifact verifies in GHCR — a forged "success" cannot mint catalog rows.
 
 ## Local artifact cache
 
@@ -596,35 +610,25 @@ Four workflows keep it warm:
 
 ## Usage statistics
 
-Anonymous usage events go to the `stow_events` Analytics Engine dataset
-(binding `STOW_STATS`), never to D1 — exactly like misses, anonymous
-traffic cannot spend billed row writes. Two event shapes exist; both are
-gated on the `x-stow-no-analytics: 1` request header, which the CLI sends
-on every request when `STOW_NO_ANALYTICS=1` is set (`edge/src/stats.rs`'s
+Anonymous usage events go to the `stow_cache_misses` Analytics Engine
+dataset (binding `STOW_ANALYTICS`), never to D1 — anonymous traffic
+cannot spend billed row writes. The one live shape is the `graph` miss
+the admissions handler writes per uncovered node. Every write is gated
+on the `x-stow-no-analytics: 1` request header, which the CLI sends on
+every request when `STOW_NO_ANALYTICS=1` is set (`edge/src/stats.rs`'s
 `AnalyticsConsent` extractor — every write takes the consent as an
 argument, so the opt-out is honoured by construction).
-
-- `hit` — written by the exact byte path (`GET /api/v1/artifacts/…`,
-  the only artifact-serving route) with probability 1/10; the stored sample
-  weight (`double1 = 10`) scales counts back up at query time. Blobs are
-  `(event, target, rustc_version, crate_name, version, size_bucket,
-  cli_version, os_family, surface)`; doubles are `(sample_weight,
-  compile_millis, bundle_size)`. The point's sole index is a
-  daily-salted install hash —
-  `hex(HMAC-SHA256(HMAC-SHA256(STOW_STATS_SALT_SECRET, YYYY-MM-DD), ip))[..16]` —
-  which counts distinct installs per day and cannot be joined across
-  days; the client IP is hashed inside the worker and never written.
 
 `GET /api/v1/stats` answers `UsageStats` by running the
 `edge/src/sql/stats_*.sql` queries against the Analytics Engine SQL API
 (`POST …/accounts/{CF_ACCOUNT_ID}/analytics_engine/sql`, authorized by
 the `CF_ANALYTICS_TOKEN` secret) and caches the response in the Cache
-API for one hour per colo. `daily_active_installs_7d` averages the
-per-day distinct install hashes over 7 days (the daily salt makes a
-weekly unique count impossible by design) and is suppressed below 20 —
-stow publishes no small counts. `GET /stats`
+API for one hour per colo. The hit-side queries read `stow_events`, the
+retired hit dataset: the digest-addressed byte path carries no artifact
+identity and writes nothing, so its points drain under the 90-day
+retention and the derived figures decay to zero. `GET /stats`
 renders the same numbers as a public page. The full data contract —
-fields, retention, sampling, opt-out — is documented in
+fields, retention, opt-out — is documented in
 [`PRIVACY.md`](../PRIVACY.md).
 
 ## Wire-protocol surface (HTTP)
@@ -640,20 +644,18 @@ short-circuit before deserialization.
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
 | GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Cache-API-cached for one hour |
-| GET `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}?crate=<name>` | none | — | the `<tag>.bundle` blob, streamed | Exact-key byte fetch — the only artifact-serving route; the CLI resolves which key to fetch from its local index |
-| HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` (the bundle's size) | Existence probe |
-| POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `RegisterArtifactsRequest` | `OkResponse` | Trusted CI registers built artifacts; the OIDC caller's `task_id` binds the write to the dispatched task's target/rustc and dependency closure |
-| GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
-| GET `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | — | `PanicSwitch` | Read the anonymous-traffic circuit breaker |
-| POST `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | `PanicSwitch` | `PanicSwitch` | Flip the circuit breaker — anonymous routes shed with 503 + `Retry-After` |
+| GET `/api/v1/bundles/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Digest-addressed byte fetch — the only artifact-serving route; the `sha256:<64 hex>` path segment is the index row's `bundle_digest`, served Cache-API-first over GHCR |
+| POST `/api/v1/admin/artifacts/sync` | Bearer: repo push user | `Vec<ArtifactRecord>` chunk | `OkResponse` | Mirror the GHCR records into the D1 catalog — `stow-admin index sync` inside `index-publish.yml` |
+| GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
+| POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|clear`) |
 | GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
-| GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes, panic flag — `stow-admin status` |
+| GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: repo-workflow OIDC or push user | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
-| POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows and invalidate their lookup cache entries; GHCR tags are not deleted — `artifacts prune` |
+| POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows; GHCR tags are not deleted — `artifacts prune` |
 | POST `/api/v1/admin/preheat/plan` | Bearer: repo-workflow OIDC or push user | `PreheatPlanRequest` | `PreheatPlanResponse` | Dry-run closure expansion for a crate request — `preheat plan` |
 | POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for the posted graph's uncovered nodes — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
@@ -664,7 +666,8 @@ short-circuit before deserialization.
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
 | POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
-| POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI reports completion |
+| POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI completion reports (superseded by the `workflow_run` webhook) |
+| POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and completes the task only once that task's records artifact verifies in GHCR |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
 
 Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
@@ -672,27 +675,79 @@ Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub i
 Every `/api/v1/` path sits behind the zone rate-limit rule documented in
 [`DEPLOYMENT.md`](DEPLOYMENT.md#one-time-cloudflare-setup) — 60 requests
 per 10 seconds per source IP over the API prefix, not per route. The
-`/api/v1/artifacts/` byte path is carved out of it: a warm build streams
+`/api/v1/bundles/` byte path is carved out of it: a warm build streams
 its closure at the CLI's prefetch concurrency and the per-`rustc` wrapper
 fetches on demand under cargo's job parallelism, so one address
 legitimately sends tens of bundle requests a second, and a Cache API hit
 there costs one Worker request and no D1 or Durable Object work. The trusted
-write endpoints (`admin/artifacts/register`, `scheduler/tasks/submit`,
-`scheduler/complete`) are inside the limited prefix, which is fine at
-CI's request rate: a build makes one register call per task chunk.
+write endpoints (`admin/artifacts/sync`, `scheduler/tasks/submit`,
+`github/workflow-run`) are inside the limited prefix, which is fine at
+their request rate: a wave makes one sync batch per slice and GitHub
+delivers one webhook per run.
 
-When even that is too much — Cloudflare has no spend cap — the panic
-switch sheds anonymous traffic outright. `POST /api/v1/admin/panic`
-(`stow-admin panic on`) writes a flag into the scheduler Durable Object's
-`settings` table, and a middleware on the anonymous route group answers
-every such request `503 Service Unavailable` with `Retry-After: 300`
-before its handler runs. The flag is read through the Cache API under a
-fixed key (`s-maxage=60`), so a per-request read costs one local cache
-probe and a flip propagates within 60 s — immediately in the colo
-that wrote it, whose cache entry is deleted. The trusted
-`/api/v1/admin/*` and `/api/v1/scheduler/*` routes are never gated, so CI
-keeps registering and completing builds and the operator can always flip
-the switch back off.
+When even that is too much — Cloudflare has no spend cap — the zone's
+maintenance rules stop traffic outright. Three WAF custom rules live on
+the `waterui.dev` zone's `http_request_firewall_custom` phase (created
+disabled by `stow-admin maintenance ensure` in `deploy-edge.yml`,
+matched by description, so a redeploy never stomps a live toggle):
+`stow maintenance: anonymous` blocks every route on the edge host
+except the trusted `/api/v1/admin/*` and `/api/v1/scheduler/*`
+prefixes; `stow maintenance: scheduler lanes` blocks exactly the public
+routes whose handlers reach the scheduler Durable Object
+(`scheduler_lanes` in `types/src/api.rs`) — the partial reopening where
+bundle bytes keep serving; and `stow maintenance: all` blocks the
+whole hostname. `stow-admin maintenance on --scope anonymous` flips the
+rule's `enabled` flag through the Rulesets API; the watchdog (#450)
+trips by enabling `anonymous`. Blocked requests are answered in the
+security phase — they never invoke the Worker and never reach the
+Durable Object, so the shed costs nothing and a broken edge cannot
+silence the breaker. The trusted prefixes and the GitHub webhook route
+stay up under `anonymous`, so record syncs and completion webhooks keep
+flowing and the operator can always flip the rule back off.
+
+The zone's WAF maintenance rules protect the worker; the **dispatch freeze** protects the
+runner allowance and the Cloudflare bill. The object is event-driven —
+nothing polls, nothing wakes on a timer: two trips evaluate on the events
+that change their inputs. A completion report (`/complete`) upserts one
+five-minute bucket in `attempt_outcome_buckets` per target — retried
+attempts keep counting — and the object sums the trailing window's
+buckets (at most `window / 5min` per target whatever the traffic) and
+trips when a
+stream (the fleet aggregate, or any single target) reaches both the
+minimum sample and the failure ratio (never either alone: a bare ratio
+false-positives on tiny samples, a bare count trips constantly at high
+volume). The cost trip is self-metered: `MeteringBackend`, a `DurableDbBackend`
+wrapper the middleware installs in place of the request's `DurableDb`,
+reads `rowsRead`/`rowsWritten` off every statement's cursor — the exact
+counters Cloudflare bills on — and a per-request settle folds them into
+the `do_meter` day row; the moment a UTC day's totals pass (the monthly
+included allowance / 30 × `STOW_COST_BUDGET_MULTIPLIER`), dispatch
+freezes on the operation that crossed it. On a trip the
+object writes a `dispatch_freeze` record into `settings` — a different
+flag, storage key, and purpose from the WAF maintenance rules — and `dispatch_pending`
+gates on it, so the queue keeps accepting misses while nothing more is
+handed to runners. While frozen, the work-submitting routes
+(`tasks/submit/trusted`, `admin/preheat`, `admin/resolve/*`) answer 503
+naming the trigger; the `complete`/`register` reports stay open so
+in-flight builds still land. Recovery is manual only:
+`POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
+--yes`) lifts the freeze and immediately resumes dispatch, while
+`dispatch-freeze status` shows the trigger, the alert outcome, and the
+transition log (engaged/cleared events with their triggers).
+
+Alerting is split by who owns the fact. The edge sends **email only** —
+one transition mail per change through the `send_email` binding
+(`alerts@stow.waterui.dev` → `me@lexo.cool`), naming the counts, window,
+dominant failure classes (`step: error-prefix`), and example Actions
+run URLs. The `incident`-labelled issue record is the external
+watchdog's (#450): it runs in Actions with `issues: write`, reads the
+freeze state and transition log off the admin route every 15 minutes,
+writes and closes the issue, and posts the hourly still-frozen digest —
+the edge's `stow-ci` App token carries no `issues` grant by design (the
+edge is untrusted serving infrastructure). Account-wide cost and
+edge-health signals (request error rate, exceeded CPU/memory, usage
+percentages) are the watchdog's too — the GraphQL Analytics API is only
+read from Actions, never from the edge.
 
 ## Tunables (Cloudflare bindings)
 
@@ -715,6 +770,13 @@ is unset or malformed.
 | `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks accepted per UTC day, counted in the scheduler object's `human_daily_task_budget` table; overspending submits get 429 + `Retry-After` to 00:00 UTC |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request page's invisible Turnstile widget |
 | `TURNSTILE_SECRET_KEY` | required (secret) | Turnstile secret `POST /api/v1/requests` verifies tokens against |
+| `STOW_FREEZE_WINDOW_MINUTES` | `60` | Trailing window the dispatch-freeze trip counts terminal outcomes over; long enough to see the measured failure-wave rate decisively, short enough that a stale burst cannot haunt the next day |
+| `STOW_FREEZE_MIN_OUTCOMES` | `50` | Sample floor for the trip condition: a stream (fleet aggregate or one target) must record this many terminal outcomes in the window before its failure ratio is read — below it nothing trips however bad the ratio |
+| `STOW_FREEZE_FAIL_PERCENT` | `50` | Failure ratio (percent) a sufficiently-sampled stream must reach to freeze dispatch; the trip needs both the sample floor and this ratio, never either alone |
+| `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Scales the scheduler object's self-metered daily SQL budget (Workers Paid monthly allowances / 30) — the trip fires on the operation that crosses it |
+| `STOW_ALERT_FROM` | `alerts@stow.waterui.dev` | Sender address of freeze-transition alert emails; must live on a domain onboarded and Enabled under Compute → Email Service → Email Sending (`E_SENDER_NOT_VERIFIED` otherwise) |
+| `STOW_ALERT_TO` | `me@lexo.cool` | Recipient of the freeze + clear transition emails |
+| `STOW_ALERT_EMAIL` (`send_email` binding) | declared in `Skyzen.toml` only | Email Service send binding the transition alerts go through; the mock/local manifests deliberately omit it so their alert path resolves to `Disabled` and can never reach Cloudflare's sending API |
 
 ## Local development
 

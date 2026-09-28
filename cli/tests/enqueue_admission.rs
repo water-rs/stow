@@ -53,6 +53,7 @@ fn seed_empty_index_slice(cache_dir: &Path) {
             rustc_version: stow_types::identity::WireRustcVersion::parse(RUSTC_VERSION)
                 .expect("rustc version"),
             generated_at: "2026-09-24T12:00:00Z".to_owned(),
+            generation: 1,
             row_count: 0,
         },
         rows: Vec::new(),

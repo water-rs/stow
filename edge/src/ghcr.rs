@@ -269,20 +269,3 @@ pub enum FetchError {
     #[error("GHCR returned unexpected HTTP status {0}")]
     UnexpectedStatus(u16),
 }
-
-impl FetchError {
-    /// Whether the failure means the registry no longer holds what the D1
-    /// row promises, so the row is pruned rather than retried.
-    pub const fn indicates_stale_artifact(&self) -> bool {
-        match self {
-            Self::NotFound => true,
-            Self::InvalidRequest(_)
-            | Self::Network(_)
-            | Self::Unavailable
-            | Self::InvalidChallenge(_)
-            | Self::TokenExchange { .. }
-            | Self::Unauthorized { .. }
-            | Self::UnexpectedStatus(_) => false,
-        }
-    }
-}

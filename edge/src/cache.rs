@@ -1,18 +1,11 @@
 use skyzen_cloudflare::worker;
 use skyzen_cloudflare::{CfCache, CfCacheError};
 
-use crate::db::ArtifactRow;
-
 /// Internal domain for CF Cache API keys.
 const CACHE_DOMAIN: &str = "https://cache.stow.internal";
 
 /// CF Cache 512MB limit (Free/Pro/Biz tiers).
 const MAX_CACHE_SIZE: u64 = 512 * 1024 * 1024;
-
-/// Lookup entries can go stale when a row is re-registered or pruned;
-/// every mutation path deletes them explicitly, and this TTL bounds the
-/// window when a delete itself fails.
-const LOOKUP_TTL_SECONDS: u32 = 24 * 60 * 60;
 
 /// How long the public `UsageStats` body is cached — the published page
 /// tolerates hourly staleness and the SQL API is billed per query.
@@ -109,94 +102,31 @@ pub async fn put_index_slice_bytes(
     .await
 }
 
-/// Fetch a cached artifact-row lookup. A hit carries everything a serve
-/// needs — OCI reference, digest, size — so the caller skips D1 entirely.
-/// A corrupt entry is treated as a miss: the D1 read it falls back to
-/// overwrites the entry with fresh data.
-pub async fn get_lookup(cache: &CfCache, key: &str) -> Result<Option<ArtifactRow>, CacheError> {
-    let Some(bytes) = cache
-        .get_url_bytes(lookup_url(key), false)
-        .await
-        .map_err(|error| CacheError::from_cf(&error))?
-    else {
-        return Ok(None);
-    };
-    match serde_json::from_slice::<ArtifactRow>(&bytes) {
-        Ok(row) => Ok(Some(row)),
-        Err(error) => {
-            tracing::warn!(key = %key, %error, "cf cache lookup entry failed to parse; treating as miss");
-            Ok(None)
-        }
-    }
-}
+/// How long the resolved stable rustc version is cached — releases ship
+/// roughly every six weeks, so an hour is ample.
+const STABLE_RUSTC_TTL_SECONDS: u32 = 60 * 60;
 
-/// Cache the artifact row a D1 read just resolved. Best-effort: callers
-/// log and continue on failure.
-pub async fn put_lookup(cache: &CfCache, key: &str, row: &ArtifactRow) -> Result<(), CacheError> {
-    let body = serde_json::to_vec(row)
-        .map_err(|error| CacheError::Worker(format!("serialize lookup entry: {error}")))?;
-    put_response(
-        cache,
-        lookup_url(key),
-        &body,
-        "application/json",
-        &format!("public, s-maxage={LOOKUP_TTL_SECONDS}"),
-    )
-    .await
-}
-
-/// Drop a lookup entry after the row it names was re-registered or
-/// pruned. `ResponseNotFound` is success — the entry is gone either way.
-pub async fn delete_lookup(cache: &CfCache, key: &str) -> Result<(), CacheError> {
+/// Fetch the cached stable rustc version string — a single fixed key;
+/// one release channel, one entry.
+pub async fn get_stable_rustc(cache: &CfCache) -> Result<Option<Vec<u8>>, CacheError> {
     cache
-        .delete_url(lookup_url(key), false)
+        .get_url_bytes(stable_rustc_url(), false)
         .await
-        .map(|_| ())
         .map_err(|error| CacheError::from_cf(&error))
 }
 
-/// Seconds a cached panic-flag answer may be reused per colo. The flag is
-/// the attack backstop, so the TTL trades propagation delay against the
-/// Durable Object read every entry expiry would otherwise cost.
-const PANIC_TTL_SECONDS: u32 = 60;
-
-/// The cached panic flag, or `None` on a miss. A corrupt entry is a miss:
-/// the Durable Object read it falls back to rewrites the entry.
-pub async fn get_panic_flag(cache: &CfCache) -> Result<Option<bool>, CacheError> {
-    let Some(bytes) = cache
-        .get_url_bytes(panic_url(), false)
-        .await
-        .map_err(|error| CacheError::from_cf(&error))?
-    else {
-        return Ok(None);
-    };
-    if let Some(enabled) = crate::panic::parse_flag(&bytes) {
-        return Ok(Some(enabled));
-    }
-    tracing::warn!("cf cache panic entry failed to parse; treating as miss");
-    Ok(None)
-}
-
-/// Re-populate the panic-flag entry after a Durable Object read.
-pub async fn put_panic_flag(cache: &CfCache, enabled: bool) -> Result<(), CacheError> {
+/// Cache a resolved stable rustc version for [`STABLE_RUSTC_TTL_SECONDS`].
+/// The stored body is the version string alone, so a hit reparses a
+/// dozen bytes rather than the ~900 KB channel manifest it came from.
+pub async fn put_stable_rustc(cache: &CfCache, version: &str) -> Result<(), CacheError> {
     put_response(
         cache,
-        panic_url(),
-        &crate::panic::flag_body(enabled),
-        "application/json",
-        &format!("public, s-maxage={PANIC_TTL_SECONDS}"),
+        stable_rustc_url(),
+        version.as_bytes(),
+        "text/plain",
+        &format!("public, s-maxage={STABLE_RUSTC_TTL_SECONDS}"),
     )
     .await
-}
-
-/// Drop the panic-flag entry so the colo that flipped the switch sees the
-/// new value on the next request instead of up to a TTL later.
-pub async fn delete_panic_flag(cache: &CfCache) -> Result<(), CacheError> {
-    cache
-        .delete_url(panic_url(), false)
-        .await
-        .map(|_| ())
-        .map_err(|error| CacheError::from_cf(&error))
 }
 
 /// Fetch the cached public-stats JSON body — a single fixed key; the
@@ -245,30 +175,24 @@ async fn put_response(
 }
 
 fn bundle_url(cache_key: &str) -> String {
-    format!("{CACHE_DOMAIN}/artifacts/{cache_key}")
+    format!("{CACHE_DOMAIN}/bundles/{cache_key}")
 }
 
 /// Index slices get their own URL namespace so a slice key can never
-/// alias a bundle or lookup key.
+/// alias a bundle key.
 fn index_slice_url(cache_key: &str) -> String {
     format!("{CACHE_DOMAIN}/index-slices/{cache_key}")
-}
-
-/// Lookup entries get their own URL namespace so a metadata key can never
-/// alias a bundle key.
-fn lookup_url(key: &str) -> String {
-    format!("{CACHE_DOMAIN}/lookups/{key}")
-}
-
-/// The fixed key the panic flag lives under — one flag, one entry.
-fn panic_url() -> String {
-    format!("{CACHE_DOMAIN}/settings/panic")
 }
 
 /// The stats body lives under its own fixed key — there is exactly one
 /// public aggregate.
 fn stats_url() -> String {
     format!("{CACHE_DOMAIN}/stats")
+}
+
+/// The fixed key the stable channel's resolved rustc version lives under.
+fn stable_rustc_url() -> String {
+    format!("{CACHE_DOMAIN}/rustc/stable")
 }
 
 #[derive(Debug)]
@@ -286,6 +210,8 @@ impl CacheError {
         Self::Worker(error.to_string())
     }
 }
+
+impl std::error::Error for CacheError {}
 
 impl std::fmt::Display for CacheError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

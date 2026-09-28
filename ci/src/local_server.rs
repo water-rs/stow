@@ -2,48 +2,129 @@
 //!
 //! Activated via `stow-build serve`. Implements `POST /dispatch` so a
 //! locally-running edge worker can dispatch a `BuildTaskPayload` for an
-//! end-to-end test run without touching real GitHub Actions.
+//! end-to-end test run without touching real GitHub Actions — and
+//! `GET /tasks`, the run-state list `stow-admin preheat manual` polls in
+//! its `--dispatch-url` mode.
+//!
+//! The run mirrors the production shape exactly: build in one process,
+//! then the records artifact lands in the mock registry and completion
+//! reaches the edge as a `workflow_run` webhook POST — the same
+//! `X-Hub-Signature-256` HMAC GitHub signs with — never a scheduler call.
 //!
 //! Uses skyzen + skyzen-hyper for routing so the same DSL is shared with the
 //! edge worker and there is exactly one HTTP server framework in the
 //! workspace. async-net provides a futures-compatible TCP listener so we
 //! avoid the tokio-IO / futures-IO bridging dance.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use async_net::TcpListener;
 use executor_core::tokio::TokioGlobal;
 use futures_lite::stream;
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use skyzen::Server;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
-use stow_types::api::{
-    ArtifactRecord, BuildCompleteReport, BuildTaskPayload, RegisterArtifactsRequest,
-};
+use stow_types::api::BuildTaskPayload;
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
 
+type HmacSha256 = Hmac<Sha256>;
+
+/// One dispatched run's state, as `GET /tasks` reports it — the local
+/// stand-in for a GitHub Actions workflow run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MockTaskRun {
+    /// The run's name — `<rustc>-<task_id>`, the same shape
+    /// `build-crate.yml`'s `run-name` stamps on the real API.
+    pub display_title: String,
+    /// `queued`, `in_progress`, or `completed` — the GitHub Actions
+    /// `status` field's spelling.
+    pub status: &'static str,
+    /// `success` or `failure` once `status` is `completed`; `null`
+    /// before, exactly like the API.
+    pub conclusion: Option<&'static str>,
+    /// Where a human would look — the failure list prints it.
+    pub html_url: String,
+}
+
 /// Per-process state injected into every `/dispatch` invocation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LocalServerState {
-    /// Scheduler `/complete` URL prefix (no trailing slash).
-    pub scheduler_url: String,
-    /// Edge URL prefix (no trailing slash). The local CI server appends
-    /// `/api/v1/admin/artifacts/register` for trusted-CI registration —
-    /// the same endpoint production CI uses.
+    /// Edge URL prefix (no trailing slash) — the `workflow_run` webhook
+    /// posts to `{edge_url}/api/v1/github/workflow-run`.
     pub edge_url: String,
+    /// Shared secret the webhook signature is computed with — the
+    /// `STOW_GITHUB_WEBHOOK_SECRET` binding's local value.
+    pub webhook_secret: String,
     /// Filesystem path to the mock cosign public key.
     pub mock_public_key_path: String,
     /// Filesystem path to the mock cosign private key.
     pub mock_private_key_path: String,
     /// Root directory the mock OCI registry serves out of.
     pub mock_registry_root: String,
-    /// Bearer credential for the edge's trusted endpoints — the
-    /// developer's GitHub token (or an OIDC JWT when `serve` itself runs
-    /// inside Actions), resolved once by `auth::edge_bearer`.
-    pub edge_bearer: String,
+    /// Every dispatched task's run state, served by `GET /tasks`.
+    pub runs: Arc<Mutex<BTreeMap<String, MockTaskRun>>>,
+    /// The bound listen address, filled by `serve` — the `html_url` a
+    /// mock run reports.
+    pub listen: SocketAddr,
+}
+
+impl std::fmt::Debug for LocalServerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalServerState")
+            .field("edge_url", &self.edge_url)
+            .field("mock_registry_root", &self.mock_registry_root)
+            .field("listen", &self.listen)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalServerState {
+    /// Assemble the state `serve` runs with; `listen` is overwritten by
+    /// the bound address once the socket opens.
+    pub fn new(
+        edge_url: String,
+        webhook_secret: String,
+        mock_public_key_path: String,
+        mock_private_key_path: String,
+        mock_registry_root: String,
+    ) -> Self {
+        Self {
+            edge_url,
+            webhook_secret,
+            mock_public_key_path,
+            mock_private_key_path,
+            mock_registry_root,
+            runs: Arc::new(Mutex::new(BTreeMap::new())),
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        }
+    }
+
+    fn mark_run(
+        &self,
+        task: &BuildTaskPayload,
+        status: &'static str,
+        conclusion: Option<&'static str>,
+    ) {
+        let display_title =
+            stow_types::records::run_title(task.rustc_version.as_str(), &task.task_id);
+        let entry = MockTaskRun {
+            display_title: display_title.clone(),
+            status,
+            conclusion,
+            html_url: format!("http://{}/tasks/{display_title}", self.listen),
+        };
+        self.runs
+            .lock()
+            .expect("runs mutex poisoned")
+            .insert(task.task_id.clone(), entry);
+    }
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -56,13 +137,24 @@ struct DispatchResponse {
     ok: bool,
 }
 
-/// Bind and serve the dev dispatch endpoint.
-pub async fn serve(listen: SocketAddr, state: LocalServerState) -> stow_types::error::Result<()> {
-    let router = build_router(state);
+#[derive(Debug, serde::Serialize)]
+struct TasksResponse {
+    tasks: Vec<MockTaskRun>,
+}
 
+/// Bind and serve the dev dispatch endpoint.
+pub async fn serve(
+    listen: SocketAddr,
+    mut state: LocalServerState,
+) -> stow_types::error::Result<()> {
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|error| stow_types::stow_error!("bind local ci server {}: {error}", listen))?;
+    state.listen = listener
+        .local_addr()
+        .map_err(|error| stow_types::stow_error!("read bound address: {error}"))?;
+    let router = build_router(state);
+
     tracing::info!(%listen, "local CI server listening");
     let connections = Box::pin(stream::unfold(listener, |listener| async move {
         let result = listener.accept().await;
@@ -81,9 +173,23 @@ pub async fn serve(listen: SocketAddr, state: LocalServerState) -> stow_types::e
 }
 
 fn build_router(state: LocalServerState) -> Router {
-    Route::new(("/dispatch".post(dispatch),))
+    Route::new(("/dispatch".post(dispatch), "/tasks".at(list_tasks)))
         .with(State(state))
         .build()
+}
+
+/// `GET /tasks` — the run list `stow-admin preheat manual` polls when it
+/// drives the local runner, answering the same shape the GitHub runs API
+/// does (`status`/`conclusion`/`display_title` semantics).
+async fn list_tasks(State(state): State<LocalServerState>) -> Response {
+    let tasks = state
+        .runs
+        .lock()
+        .expect("runs mutex poisoned")
+        .values()
+        .cloned()
+        .collect();
+    json_response(&TasksResponse { tasks }, StatusCode::OK)
 }
 
 async fn dispatch(
@@ -91,26 +197,34 @@ async fn dispatch(
     Json(event): Json<RepositoryDispatchEvent>,
 ) -> Response {
     let task = event.client_payload;
-    let state_for_task = state.clone();
+    state.mark_run(&task, "in_progress", None);
     tokio::spawn(async move {
-        if let Err(error) = run_dispatched_task(state_for_task, task.clone()).await {
+        let state_for_task = state.clone();
+        if let Err(error) = run_dispatched_task(state_for_task.clone(), task.clone()).await {
             tracing::error!(task_id = %task.task_id, %error, "local CI dispatched task failed");
-            if let Err(report_error) =
-                report_failed_task(&state, &task, format!("local CI dispatch failed: {error}"))
-                    .await
+            state_for_task.mark_run(&task, "completed", Some("failure"));
+            if let Err(report_error) = report_failed_task(
+                &state_for_task,
+                &task,
+                format!("local CI dispatch failed: {error}"),
+            )
+            .await
             {
                 tracing::error!(
                     task_id = %task.task_id,
                     %report_error,
-                    "failed to report local CI task failure to scheduler"
+                    "failed to report local CI task failure via webhook"
                 );
             }
         }
     });
-    let body = serde_json::to_vec(&DispatchResponse { ok: true })
-        .expect("DispatchResponse always serializes");
+    json_response(&DispatchResponse { ok: true }, StatusCode::ACCEPTED)
+}
+
+fn json_response(payload: &impl serde::Serialize, status: StatusCode) -> Response {
+    let body = serde_json::to_vec(payload).expect("response always serializes");
     let mut response = Response::new(Body::from(body));
-    *response.status_mut() = StatusCode::ACCEPTED;
+    *response.status_mut() = status;
     response.headers_mut().insert(
         "content-type",
         skyzen::header::HeaderValue::from_static("application/json"),
@@ -123,7 +237,7 @@ async fn report_failed_task(
     task: &BuildTaskPayload,
     error: String,
 ) -> stow_types::error::Result<()> {
-    report_completion(state, &task.task_id, task.attempt, false, Some(error), 0).await
+    post_workflow_run(state, task, "failure", Some(error)).await
 }
 
 /// The task id names a directory under the dispatch root, so it must be a
@@ -149,7 +263,7 @@ struct DispatchLayout {
     output_dir: PathBuf,
     /// Upload plan the build stage writes and `populate` consumes.
     upload_plan_path: PathBuf,
-    /// Artifact records `populate` writes for the register step.
+    /// Artifact records `populate` writes for the records-artifact step.
     records_path: PathBuf,
 }
 
@@ -188,38 +302,27 @@ async fn run_dispatched_task(
     // else, exactly as the production build job does.
     let status = run_build_stage(&exe, &task_json, &layout).await?;
     if !status.success() {
-        report_completion(
-            &state,
-            &task.task_id,
-            task.attempt,
-            false,
-            Some(format!("stow-build exited with status {status}")),
-            0,
-        )
-        .await?;
-        return Err(stow_types::stow_error!(
-            "stow-build failed with status {status}"
-        ));
+        let error = format!("stow-build exited with status {status}");
+        state.mark_run(&task, "completed", Some("failure"));
+        post_workflow_run(&state, &task, "failure", Some(error.clone())).await?;
+        return Err(stow_types::stow_error!("{error}"));
     }
 
     // `stow-build build` exits non-zero when any cargo phase failed — the
     // outcome is binary now: a live process reached this line means the
     // build ran to completion and whatever it plans is the whole closure.
     if upload_plan_len(&layout.upload_plan_path).await? == 0 {
-        return report_completion(&state, &task.task_id, task.attempt, true, None, 0).await;
+        // Even an artifact-less task publishes its (empty) records
+        // artifact — the webhook's existence check must find it.
+        push_records(&state, &task, &layout.records_path, exe.as_path()).await?;
+        state.mark_run(&task, "completed", Some("success"));
+        return post_workflow_run(&state, &task, "success", None).await;
     }
 
     populate_mock_registry(&exe, &state, &task, &layout).await?;
-    let artifacts_uploaded = register_records(&state, &task.task_id, &layout.records_path).await?;
-    report_completion(
-        &state,
-        &task.task_id,
-        task.attempt,
-        true,
-        None,
-        artifacts_uploaded,
-    )
-    .await
+    push_records(&state, &task, &layout.records_path, exe.as_path()).await?;
+    state.mark_run(&task, "completed", Some("success"));
+    post_workflow_run(&state, &task, "success", None).await
 }
 
 /// Spawn the untrusted `stow-build build` stage. It receives only the task
@@ -235,6 +338,8 @@ async fn run_build_stage(
         .arg("--output-dir")
         .arg(&layout.output_dir)
         .env_remove("SCHEDULER_URL")
+        .env_remove("STOW_EDGE_URL")
+        .env_remove("STOW_GITHUB_WEBHOOK_SECRET")
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
@@ -258,8 +363,8 @@ async fn upload_plan_len(upload_plan_path: &Path) -> stow_types::error::Result<u
 }
 
 /// Populate the mock OCI registry from the upload plan and sign with the
-/// mock keys, writing the artifact records the register step posts. A
-/// failed populate is reported to the scheduler before the error returns.
+/// mock keys, writing the artifact records the records-artifact step then
+/// pushes.
 async fn populate_mock_registry(
     exe: &Path,
     state: &LocalServerState,
@@ -301,113 +406,129 @@ async fn populate_mock_registry(
     if populate_status.success() {
         return Ok(());
     }
-    report_completion(
-        state,
-        &task.task_id,
-        task.attempt,
-        false,
-        Some(format!(
-            "mock registry populate exited with status {populate_status}"
-        )),
-        0,
-    )
-    .await?;
+    let error = format!("mock registry populate exited with status {populate_status}");
+    state.mark_run(task, "completed", Some("failure"));
+    post_workflow_run(state, task, "failure", Some(error.clone())).await?;
+    Err(stow_types::stow_error!("{error}"))
+}
+
+/// Write the task's records artifact into the mock registry — the same
+/// object the production publish stage pushes to GHCR under
+/// `records-<rustc>-<task_id hash>`, signed by the mock key instead of cosign.
+async fn push_records(
+    state: &LocalServerState,
+    task: &BuildTaskPayload,
+    records_path: &Path,
+    exe: &Path,
+) -> stow_types::error::Result<()> {
+    let mock_registry_exe = exe
+        .parent()
+        .ok_or_else(|| {
+            stow_types::stow_error!("cannot determine parent directory of stow-build binary")
+        })?
+        .join(format!(
+            "stow-mock-registry{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+    // An empty plan leaves no records.json — the records artifact carries
+    // the empty set, exactly like production's `push_records(&[])`.
+    if !records_path.exists() {
+        async_fs::write(records_path, "[]").await?;
+    }
+    let status = async_process::Command::new(&mock_registry_exe)
+        .arg("push-records")
+        .arg("--records")
+        .arg(records_path)
+        .arg("--task-id")
+        .arg(&task.task_id)
+        .arg("--rustc-version")
+        .arg(&task.rustc_version)
+        .arg("--registry-root")
+        .arg(PathBuf::from(&state.mock_registry_root))
+        .arg("--private-key")
+        .arg(PathBuf::from(&state.mock_private_key_path))
+        .status()
+        .await?;
+    if status.success() {
+        return Ok(());
+    }
     Err(stow_types::stow_error!(
-        "mock registry populate failed with status {populate_status}"
+        "mock registry push-records failed with status {status}"
     ))
 }
 
-/// POST every record `populate` wrote to the edge register endpoint,
-/// bound to the dispatched task exactly as the production publish stage
-/// is, and return how many artifacts were uploaded.
-async fn register_records(
+/// POST a synthetic `workflow_run` `completed` webhook to the edge — the
+/// exact event shape and signature header GitHub delivers, so the mock
+/// edge verifies the same HMAC the production one does.
+async fn post_workflow_run(
     state: &LocalServerState,
-    task_id: &str,
-    records_path: &Path,
-) -> stow_types::error::Result<u32> {
-    let records_bytes = async_fs::read(records_path).await?;
-    let records: Vec<ArtifactRecord> = serde_json::from_slice(&records_bytes)?;
-    let artifact_count = records.len();
-    // Match the production register path: each record costs the edge one D1
-    // subrequest, so chunk within Workers' per-invocation budget.
-    for chunk in records.chunks(32) {
-        let body = RegisterArtifactsRequest {
-            task_id: Some(task_id.to_owned()),
-            records: chunk.to_vec(),
-        };
-        post_json(
-            &format!(
-                "{}/api/v1/admin/artifacts/register",
-                state.edge_url.trim_end_matches('/')
-            ),
-            &body,
-            Some(state.edge_bearer.as_str()),
-        )
-        .await?;
-    }
-    u32::try_from(artifact_count)
-        .map_err(|_| stow_types::stow_error!("artifact count {artifact_count} exceeds u32"))
-}
-
-/// POST a `BuildCompleteReport` for `task_id` to the scheduler `/complete`
-/// endpoint.
-async fn report_completion(
-    state: &LocalServerState,
-    task_id: &str,
-    attempt: u32,
-    success: bool,
+    task: &BuildTaskPayload,
+    conclusion: &str,
     error: Option<String>,
-    artifacts_uploaded: u32,
-) -> stow_types::error::Result<()> {
-    let report = BuildCompleteReport {
-        task_id: task_id.to_owned(),
-        attempt,
-        success,
-        error,
-        artifacts_uploaded,
-        github_run_id: None,
-    };
-    post_json(
-        &format!("{}/complete", state.scheduler_url.trim_end_matches('/')),
-        &report,
-        Some(state.edge_bearer.as_str()),
-    )
-    .await
-}
-
-async fn post_json(
-    url: &str,
-    payload: &(impl serde::Serialize + Sync),
-    bearer: Option<&str>,
 ) -> stow_types::error::Result<()> {
     const MAX_ATTEMPTS: u32 = 5;
+    let task_id = task.task_id.as_str();
+    if let Some(error) = &error {
+        tracing::warn!(task_id, %error, "workflow_run reports {conclusion}");
+    }
+    // The production pin: same path/branch/event/repository fields the
+    // webhook requires, with the run title `build-crate.yml` would stamp.
+    let payload = serde_json::json!({
+        "action": "completed",
+        "repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
+        "workflow_run": {
+            "id": blake3::hash(task_id.as_bytes()).as_bytes()[..8]
+                .iter()
+                .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte)),
+            "name": "build-crate.yml",
+            "path": format!(".github/workflows/{}", stow_types::trusted_builder::WORKFLOW_FILE),
+            "event": "workflow_dispatch",
+            "display_title": stow_types::records::run_title(task.rustc_version.as_str(), task_id),
+            "head_branch": stow_types::trusted_builder::BRANCH,
+            "conclusion": conclusion,
+            "html_url": format!("http://{}/tasks/{task_id}", state.listen),
+            "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
+        },
+    });
+    let body = serde_json::to_vec(&payload)?;
+    let signature = {
+        let mut mac = HmacSha256::new_from_slice(state.webhook_secret.as_bytes())
+            .map_err(|error| stow_types::stow_error!("init webhook HMAC: {error}"))?;
+        mac.update(&body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    };
+    let url = format!(
+        "{}/api/v1/github/workflow-run",
+        state.edge_url.trim_end_matches('/')
+    );
     let mut last_error: Option<stow_types::error::Error> = None;
-
     for attempt in 0..MAX_ATTEMPTS {
-        let mut client = zenwave::client();
-        let builder = client.post(url)?;
-        let builder = if let Some(token) = bearer {
-            builder.header("Authorization", format!("Bearer {token}"))?
-        } else {
-            builder
-        };
-        let attempt_result = match builder.json_body(payload)?.await {
-            Ok(response) => response.error_for_status().await.map(|_| ()),
-            Err(error) => Err(error),
-        };
+        let attempt_result = async {
+            let mut client = zenwave::client();
+            client
+                .post(&url)?
+                .header("X-GitHub-Event", "workflow_run")?
+                .header("X-Hub-Signature-256", &signature)?
+                .header("Content-Type", "application/json")?
+                .bytes_body(body.clone())
+                .await?
+                .error_for_status()
+                .await?;
+            Ok::<(), zenwave::Error>(())
+        }
+        .await;
         match attempt_result {
             Ok(()) => return Ok(()),
             Err(error) => {
-                last_error = Some(error.into());
+                last_error = Some(stow_types::stow_error!("POST {url}: {error}"));
                 if attempt + 1 < MAX_ATTEMPTS {
                     sleep(Duration::from_millis(250)).await;
                 }
             }
         }
     }
-
     Err(last_error.unwrap_or_else(|| {
-        stow_types::stow_error!("post_json: all {MAX_ATTEMPTS} attempts failed")
+        stow_types::stow_error!("post_workflow_run: all {MAX_ATTEMPTS} attempts failed")
     }))
 }
 

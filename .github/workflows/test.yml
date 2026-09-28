@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+  merge_group:
   workflow_call:
 
 # A branch pushed several times in a row only needs its newest run: the older
@@ -199,6 +200,20 @@ jobs:
       # link with mold too.
       - uses: ./.github/actions/link-with-mold
       - uses: ./.github/actions/install-skyzen-cli
+      # The mock's dispatched builds link the buster glibc-2.28 sysroot
+      # the way production builds do (stow#336) — same manifest hash key
+      # as the build-crate job's cache; the extracted tree is large
+      # enough to keep between runs.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: glibc-sysroot
+        with:
+          path: ~/.cache/stow
+          key: glibc-sysroot-${{ hashFiles('ci/glibc-sysroot-debs.txt') }}
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.glibc-sysroot.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/stow
+          key: ${{ steps.glibc-sysroot.outputs.cache-primary-key }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       # The mock manifest runs on the Cloudflare provider, so `skyzen dev`
       # supervises `wrangler dev --local` (workerd).
@@ -216,6 +231,50 @@ jobs:
         with:
           name: mock-e2e-logs
           path: ${{ runner.temp }}/stow-mock-e2e/logs
+          if-no-files-found: ignore
+
+  # The merge gate for scheduler cost (stow#433): the host test is the
+  # fast pre-check, but the numbers Cloudflare bills — the cursor's
+  # `rowsRead`/`rowsWritten` — only exist under workerd. This job seeds
+  # the production-shaped fixture through the Durable Object's probe
+  # route and fails when any route or the alarm pass exceeds its
+  # in-code budget.
+  scheduler-budget:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Scheduler budget (workerd)
+    runs-on: ubuntu-latest
+    permissions:
+      # Same operator auth as mock-e2e: the budget probe rides the
+      # trusted admin endpoints, which authenticate the credential's own
+      # repo permissions — GITHUB_TOKEN needs push (`contents: write`).
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: scheduler-budget
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: cargo build -p stow-admin
+      - run: scripts/scheduler-budget.sh
+        env:
+          STOW_BUDGET_WORK_DIR: ${{ runner.temp }}/stow-budget
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: scheduler-budget-logs
+          path: |
+            ${{ runner.temp }}/stow-budget/logs
+            ${{ runner.temp }}/stow-budget/budget-report.json
           if-no-files-found: ignore
 
   # The resolver is cargo's own code carried into `stow-resolve`; this job
@@ -282,3 +341,47 @@ jobs:
           shared-key: resolve-diff-windows
           save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --replay resolve/tests/resolve-diff-fixture --family windows
+
+  # One check to require. Rulesets and the merge queue name this job instead
+  # of every leg: it needs all of them, `if: always()` runs it past a failed
+  # or cancelled need, and the verdict reads `needs.*.result` so such a leg
+  # turns the gate red. `skipped` passes — a leg skipped by the paths
+  # contract above reported success, which is what the ruleset sees too.
+  gate:
+    needs:
+      - changes
+      - test
+      - lint
+      - edge-wasm
+      - publish-dry-run
+      - mock-e2e
+      - scheduler-budget
+      - resolve-diff
+      - resolve-diff-macos
+      - resolve-diff-windows
+    if: always()
+    name: CI gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The gate covers every job only because it needs every job; a new job
+      # that forgets to join `needs:` would ship ungated. Read the workflow
+      # itself and fail if any job other than this one is absent from the
+      # list.
+      - name: Needs covers every job
+        run: |
+          needed=$(yq '.jobs.gate.needs.[]' .github/workflows/test.yml | sort)
+          declared=$(yq '.jobs | keys.[]' .github/workflows/test.yml | sort | grep -vx gate)
+          if [ "$needed" != "$declared" ]; then
+            diff <(echo "$declared") <(echo "$needed") || true
+            echo "CI gate needs: must name every other job in test.yml" >&2
+            exit 1
+          fi
+      - name: Every leg succeeded or skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e '[.[].result] | all(. == "success" or . == "skipped")' > /dev/null

@@ -267,7 +267,6 @@ async fn process_prefetched_artifact(
     let bundle_ref = BundleRef {
         target: &target,
         rustc_version: &rustc_version,
-        crate_name: &request.crate_name,
         c_metadata: &request.c_metadata,
         bundle_digest: &request.bundle_digest,
     };

@@ -1,0 +1,122 @@
+name: toolchain-publish
+
+# Every build-crate dispatch used to compile stow-build and stow-cli on
+# the runner that also builds the task's crate — up to ~17 minutes per
+# run, once per target leg of the wave. This workflow compiles them once
+# per main commit per host platform and publishes the toolchain (stow-build,
+# stow-cli, stow-admin) to GHCR as a digest-addressed, cosign-signed OCI
+# artifact; build-crate and the deploy/watchdog jobs pull it by `github.sha`
+# instead of compiling or hunting Test-run artifacts (stow#431).
+#
+# It runs on `merge_group`, not `push`: GitHub fast-forwards `main` to the
+# merge-group head it tested, so `github.sha` here is exactly the future
+# main sha — the tag `<sha>-<platform>` is what a build-crate dispatch
+# looks up, and the artifact exists before `main` moves. The signing
+# identity is `…/toolchain-publish.yml@refs/heads/gh-readonly-queue/main/…`,
+# a ref only GitHub's merge queue can create, and consumers additionally
+# pin the signature's workflow-sha extension to their own `github.sha` —
+# provenance at least as strong as the source build it replaces.
+#
+# GHCR/OCI rather than release assets: the manifest digest makes the pull
+# itself the digest verification (a release asset would need a sidecar
+# served from the same trust domain it claims to check), cosign already
+# signs this registry's artifacts with the keyless identity the trust
+# model is built on, and no per-commit tags or releases accrete on the
+# repo. The pull runs before any stow binary exists on the runner, so
+# both directions go through the oras CLI — stow-oci is a library whose
+# own host is the artifact being fetched.
+#
+# `toolchain gate` is the required status check for `main`. It must
+# report on both events a required check sees: `merge_group` (the commit
+# the queue tests) and `pull_request` (a PR cannot enter the queue until
+# its required checks are green). The matrix legs only run on
+# `merge_group` — nothing is published for a PR — and the gate treats a
+# skipped leg as success, so the same check name reports green on the PR
+# and green on the queued commit.
+
+on:
+  merge_group:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  toolchain:
+    name: publish stow toolchain (${{ matrix.key }})
+    # Only the merge queue publishes: its head sha is the future main sha
+    # consumers look up; a pull_request run exists only so the required
+    # `toolchain gate` check reports on PRs.
+    if: github.event_name == 'merge_group'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, key: linux-x64 }
+          - { os: windows-latest, key: windows-x64 }
+          - { os: macos-14, key: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write # push ghcr.io/water-rs/stow-toolchain
+      id-token: write # cosign keyless
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - name: Build stow-build, stow-cli and stow-admin
+        run: cargo build --release -p stow-build -p stow-cli -p stow-admin
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Publish the toolchain artifact
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PLATFORM_KEY: ${{ matrix.key }}
+        run: |
+          set -euo pipefail
+          bins=(stow-build stow-cli stow-admin)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bins=(stow-build.exe stow-cli.exe stow-admin.exe)
+          fi
+          tar -C target/release -czf stow-toolchain.tar.gz "${bins[@]}"
+
+          ref="ghcr.io/water-rs/stow-toolchain:${GITHUB_SHA}-${PLATFORM_KEY}"
+          echo "$GHCR_TOKEN" | oras login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+          oras push "$ref" \
+            "stow-toolchain.tar.gz:application/vnd.oci.image.layer.v1.tar+gzip"
+          digest="$(oras manifest fetch --descriptor "$ref" | jq -r .digest)"
+          # Sign by digest: the signature attests these exact bytes came
+          # from this workflow under the merge queue — the identity the
+          # consumer pins.
+          cosign sign --yes "ghcr.io/water-rs/stow-toolchain@${digest}"
+          echo "published ${ref} digest ${digest}"
+
+  # One aggregate check so the merge queue can require every platform leg
+  # with a single rule — the legs fan out into three check names.
+  gate:
+    name: toolchain gate
+    needs: toolchain
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Every leg succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # On pull_request the legs are skipped by design; on
+          # merge_group every leg must have published.
+          if [ "$EVENT" = merge_group ]; then
+            echo "$NEEDS" | jq -e '[.[].result] | all(. == "success")' > /dev/null
+          else
+            echo "$NEEDS" | jq -e '[.[].result] | all(. == "skipped")' > /dev/null
+          fi

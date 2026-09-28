@@ -26,11 +26,14 @@ use crate::platform::Profile;
 /// The `format_version` this crate writes and the only one [`decode`]
 /// accepts.
 ///
-/// v2 adds `ArtifactIndexRow::min_glibc`. The edge exports only measured
-/// rows — a catalog row whose floor is still unknown is excluded until
-/// `index backfill-min-glibc` measures it — so `None` on a v2 row always
-/// means "measured, no glibc requirement", never "unmeasured".
-pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 2;
+/// v2 adds `ArtifactIndexRow::min_glibc`. Every records artifact writes
+/// a floor, so `None` on a v2 row always means "measured, no glibc
+/// requirement", never "unmeasured".
+///
+/// v3 makes `ArtifactIndexHeader::generation` required — a defaulted `0`
+/// would silently accept an index that predates the field and claim a
+/// delta base the report path cannot honor.
+pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 3;
 
 /// Media type of the index's single OCI layer — the zstd-compressed
 /// [`ArtifactIndex`] JSON.
@@ -38,6 +41,13 @@ pub const STOW_INDEX_MEDIA_TYPE: &str = "application/vnd.stow.index.v1+zstd";
 
 /// Media type of the OCI config the index artifact carries.
 pub const STOW_INDEX_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.index.config.v1+json";
+
+/// Media type of the folded set's single OCI layer — the JSON array of
+/// records tags already folded into the sibling `index` slice.
+pub const STOW_FOLDED_MEDIA_TYPE: &str = "application/vnd.stow.folded.v1+json";
+
+/// Media type of the OCI config the folded artifact carries.
+pub const STOW_FOLDED_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.folded.config.v1+json";
 
 /// The published artifact index: a versioned header plus the slice's rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +72,11 @@ pub struct ArtifactIndexHeader {
     /// makes every export's bytes unique, so publish-side change
     /// detection digests the rows, never the blob.
     pub generated_at: String,
+    /// The index's generation in the publish sequence — `1` on a slice's
+    /// first index, the previous index's `+ 1` after. The report path
+    /// sends the previous generation as its delta base so the scheduler
+    /// can optimistic-lock slice reports.
+    pub generation: i64,
     /// Number of rows the body carries; [`decode`] rejects a mismatch.
     pub row_count: u64,
 }
@@ -136,6 +151,28 @@ pub fn index_tag(target: &str, rustc_version: &str) -> String {
         "index.{target}.{}",
         crate::registry::sanitize_oci_tag_component(rustc_version)
     )
+}
+
+/// The tag of the folded set companion to `index_tag`.
+///
+/// The folded artifact holds the sorted list of records tags already
+/// folded into that slice, pushed and signed under the index workflow's
+/// identity next to it. The CLI never reads it; `index export` uses it
+/// to pull only new records.
+#[must_use]
+pub fn folded_tag(target: &str, rustc_version: &str) -> String {
+    format!(
+        "folded.{target}.{}",
+        crate::registry::sanitize_oci_tag_component(rustc_version)
+    )
+}
+
+/// The `(target, rustc_version)` a `folded.*` tag names — the inverse of
+/// [`folded_tag`]. The first `.` after the prefix splits target from
+/// rustc: targets carry no `.` while the sanitized rustc does.
+#[must_use]
+pub fn folded_tag_parts(tag: &str) -> Option<(&str, &str)> {
+    tag.strip_prefix("folded.")?.split_once('.')
 }
 
 /// The publish-side content digest: `sha256` over the canonical JSON of
@@ -229,6 +266,18 @@ pub fn decode(bytes: &[u8]) -> Result<ArtifactIndex, IndexError> {
     /// any plausible pool size.
     const MAX_INDEX_JSON_LEN: u64 = 256 * 1024 * 1024;
 
+    /// The header's version alone, read before the full shape: an index
+    /// of another format answers with its version, not with whichever
+    /// field that format happens to lack.
+    #[derive(serde::Deserialize)]
+    struct VersionProbe {
+        header: HeaderVersion,
+    }
+    #[derive(serde::Deserialize)]
+    struct HeaderVersion {
+        format_version: u32,
+    }
+
     let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(bytes))
         .map_err(IndexError::Decompress)?;
     let mut json = Vec::new();
@@ -236,12 +285,13 @@ pub fn decode(bytes: &[u8]) -> Result<ArtifactIndex, IndexError> {
         .take(MAX_INDEX_JSON_LEN)
         .read_to_end(&mut json)
         .map_err(IndexError::Decompress)?;
-    let index: ArtifactIndex = serde_json::from_slice(&json).map_err(IndexError::Deserialize)?;
-    if index.header.format_version != ARTIFACT_INDEX_FORMAT_VERSION {
+    let probe: VersionProbe = serde_json::from_slice(&json).map_err(IndexError::Deserialize)?;
+    if probe.header.format_version != ARTIFACT_INDEX_FORMAT_VERSION {
         return Err(IndexError::UnsupportedFormatVersion {
-            found: index.header.format_version,
+            found: probe.header.format_version,
         });
     }
+    let index: ArtifactIndex = serde_json::from_slice(&json).map_err(IndexError::Deserialize)?;
     let actual = index.rows.len() as u64;
     if index.header.row_count != actual {
         return Err(IndexError::RowCountMismatch {
@@ -256,6 +306,28 @@ pub fn decode(bytes: &[u8]) -> Result<ArtifactIndex, IndexError> {
 mod tests {
     use semver::Version;
 
+    /// An index of an older format is rejected by its version, even when
+    /// it lacks a field the current format requires.
+    #[test]
+    fn an_older_format_is_rejected_by_its_version() {
+        let json = serde_json::json!({
+            "header": {
+                "format_version": 2,
+                "target": "x86_64-unknown-linux-gnu",
+                "rustc_version": "1.98.1",
+                "generated_at": "2026-09-28T00:00:00Z",
+                "row_count": 0,
+            },
+            "rows": [],
+        });
+        let bytes =
+            zstd::encode_all(serde_json::to_vec(&json).expect("json").as_slice(), 3).expect("zstd");
+        assert!(matches!(
+            decode(&bytes),
+            Err(IndexError::UnsupportedFormatVersion { found: 2 })
+        ));
+    }
+
     use super::*;
     use crate::api::CI_TARGET_TRIPLES;
     use crate::platform::{PanicStrategy, StripLevel};
@@ -268,6 +340,7 @@ mod tests {
                 target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target"),
                 rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc"),
                 generated_at: "2026-09-20T12:00:00Z".to_owned(),
+                generation: 1,
                 row_count: rows.len() as u64,
             },
             rows,

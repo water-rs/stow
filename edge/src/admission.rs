@@ -29,7 +29,9 @@
 //!    dropping feature names the crate does not declare. A client cannot
 //!    mint novel identities out of arbitrary strings, so the tasks an
 //!    attacker can create are legitimate ones that serve real users.
-//! 4. **The anonymous-traffic circuit breaker** (`crate::panic`).
+//! 4. **The zone maintenance rules** (`stow-admin maintenance`, stow#453) —
+//!    WAF custom rules on the `waterui.dev` zone that block traffic in the
+//!    security phase before the Worker runs.
 //!
 //! Difficulty was once scaled by the scheduler's pending depth, one bit
 //! per fifty tasks up to a 24-bit cap. That duplicated layer 2 while

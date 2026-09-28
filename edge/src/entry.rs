@@ -1,7 +1,6 @@
 //! Cloudflare Workers bootstrap: binds D1, the scheduler Durable Object,
 //! the CF cache, and GHCR config, then mounts the public API routes.
 
-use skyzen::Method;
 use skyzen::routing::{CreateRouteNode, Route, RouteNode, Router};
 use skyzen::runtime::wasm;
 use skyzen::utils::State;
@@ -11,7 +10,7 @@ use skyzen_services::Db;
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
 use crate::{
-    admission, api, env_binding, ghcr, github_auth, panic, runtime_settings, scheduler, site,
+    admission, api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook,
 };
 
 const STOW_DB_BINDING: &str = "STOW_DB";
@@ -30,10 +29,9 @@ const TURNSTILE_SECRET_KEY_BINDING: &str = "TURNSTILE_SECRET_KEY";
 const TURNSTILE_HOSTNAME_BINDING: &str = "TURNSTILE_HOSTNAME";
 const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
 const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
-const STOW_STATS_BINDING: &str = "STOW_STATS";
-const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
+const STOW_GITHUB_WEBHOOK_SECRET_BINDING: &str = "STOW_GITHUB_WEBHOOK_SECRET";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -61,8 +59,6 @@ fn worker(env: &wasm::Env) -> Router {
     let cache = CfCache::default();
     let analytics = env_binding::required_analytics_dataset(env, STOW_ANALYTICS_BINDING);
     let stats = StatsContext {
-        dataset: env_binding::required_analytics_dataset(env, STOW_STATS_BINDING),
-        salt_secret: env_binding::required_string(env, STOW_STATS_SALT_SECRET_BINDING),
         account_id: env_binding::required_string(env, CF_ACCOUNT_ID_BINDING),
         analytics_token: env_binding::required_string(env, CF_ANALYTICS_TOKEN_BINDING),
     };
@@ -93,18 +89,17 @@ fn worker(env: &wasm::Env) -> Router {
         turnstile_site_key: env_binding::required_string(env, TURNSTILE_SITE_KEY_BINDING),
     };
 
-    // One gate shared by every anonymous node: while the scheduler-held
-    // panic flag is on, each of these sheds with 503 + Retry-After before
-    // its handler runs. The trusted `/api/v1/admin/*` and
-    // `/api/v1/scheduler/*` nodes never carry it.
-    let panic_gate = panic::PanicGate::new(scheduler.clone(), cache.clone());
-    // The trusted nodes' counterpart: when the GitHub trust check
-    // upstream is rate-limited, this renders the 503 with the
-    // `Retry-After` GitHub asked for.
+    // When the GitHub trust check upstream is rate-limited, this renders
+    // the 503 with the `Retry-After` GitHub asked for.
     let trust_gate = github_auth::TrustRateLimitGate;
 
-    let mut nodes = anonymous_nodes(&panic_gate);
+    let mut nodes = anonymous_nodes();
     nodes.extend(trusted_nodes(&trust_gate));
+    // The GitHub `workflow_run` webhook's authentication is its
+    // `X-Hub-Signature-256` HMAC — it carries neither the trust gate's
+    // caller credential nor the zone WAF rules' shedding (completions
+    // must drain during a partial reopen).
+    nodes.push("/api/v1/github/workflow-run".post(webhook::github_workflow_run));
 
     Route::new(nodes)
         .with(db)
@@ -126,6 +121,10 @@ fn worker(env: &wasm::Env) -> Router {
         }))
         .with(State(github_auth::Jwks::default()))
         .with(State(github_auth::PushVerdicts::default()))
+        .with(State(webhook::WebhookSecret(env_binding::required_string(
+            env,
+            STOW_GITHUB_WEBHOOK_SECRET_BINDING,
+        ))))
         .build()
 }
 
@@ -142,15 +141,18 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/index/{target}/{rustc_version}"
                     .at(api::list_artifact_index)
                     .post(api::record_published_index),
-                "/panic"
-                    .at(api::get_panic_switch)
-                    .post(api::set_panic_switch),
+                "/dispatch-freeze"
+                    .at(api::get_dispatch_freeze)
+                    .post(api::set_dispatch_freeze),
                 "/preheat/plan".post(api::preheat_plan),
                 "/queue".at(api::admin_queue_list),
                 "/queue/retry".post(api::admin_queue_retry),
                 "/queue/cancel".post(api::admin_queue_cancel),
                 "/queue/promote".post(api::admin_queue_promote),
                 "/queue/purge".post(api::admin_queue_purge),
+                "/scheduler/migrate".post(api::admin_scheduler_migrate),
+                "/scheduler/budget".post(api::admin_scheduler_budget),
+                "/scheduler/budget/seed".post(api::admin_scheduler_budget_seed),
                 "/status".at(api::admin_status),
             ))
             .with(gate.clone()),
@@ -158,9 +160,7 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
         // route-tuple arity — the URLs are unchanged.
         "/api/v1/admin/artifacts"
             .route((
-                "/register".post(api::register_artifacts),
-                "/unbundled".at(api::list_unbundled_artifacts),
-                "/unmeasured-glibc".at(api::list_unmeasured_glibc_artifacts),
+                "/sync".post(api::sync_artifacts),
                 "/prune".post(api::prune_artifacts),
                 "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
             ))
@@ -183,23 +183,21 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
 
 /// Every route an unauthenticated caller can reach — artifact byte reads,
 /// catalog search, miss-admission minting and enqueue redemption, the
-/// human request lane,
-/// and the site pages — each wrapped in `gate` so the panic switch sheds
-/// them all from one place.
-fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
+/// human request lane, and the site pages. The anonymous-traffic breaker
+/// is the zone's `stow maintenance: anonymous` WAF rule (`stow-admin
+/// maintenance`), not a gate here — blocked requests never invoke the
+/// Worker. The `scheduler_lanes` mounts share their path constants with
+/// that rule's `scheduler lanes` scope, so the rule and the router can
+/// never disagree on which lanes reach the Durable Object.
+fn anonymous_nodes() -> Vec<RouteNode> {
+    use stow_types::api::scheduler_lanes as lanes;
     vec![
         "/".at(site::index),
         "/install.sh".at(site::install_sh),
         "/install.ps1".at(site::install_ps1),
         "/stats".at(site::stats_page),
-        "/requests/{task_id}".at(site::request_status),
-        "/api/v1/artifacts".route((
-            "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
-            "/{target}/{rustc_version}/{c_metadata}".endpoint(
-                Method::HEAD,
-                skyzen::handler::into_endpoint(api::check_artifact),
-            ),
-        )),
+        lanes::REQUEST_PAGE.at(site::request_status),
+        "/api/v1/bundles/{digest}".at(api::get_bundle),
         "/api/v1/crates".route((
             "/search".at(api::search_crates),
             "/{crate_name}/versions".at(api::crate_versions),
@@ -209,13 +207,10 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
             "/{target}/{rustc_version}".at(api::get_index_slice_digest),
             "/{target}/{rustc_version}/{digest}".at(api::get_index_slice),
         )),
-        "/api/v1/admissions".post(api::mint_miss_admissions),
+        lanes::ADMISSIONS.post(api::mint_miss_admissions),
         "/api/v1/stats".at(api::usage_stats),
-        "/api/v1/enqueue".post(api::enqueue_admitted_task),
-        "/api/v1/requests".post(api::submit_crate_request),
-        "/api/v1/requests/{task_id}".at(api::crate_request_status),
+        lanes::ENQUEUE.post(api::enqueue_admitted_task),
+        lanes::REQUESTS.post(api::submit_crate_request),
+        lanes::REQUEST.at(api::crate_request_status),
     ]
-    .into_iter()
-    .map(|node| node.with(gate.clone()))
-    .collect()
 }

@@ -75,12 +75,15 @@ pub struct StowResolveInput {
     /// treat units whose package is not crates.io-sourced as traversal,
     /// never nodes — but a `.crate` member *is* the published package.
     pub members_are_crates_io: bool,
-    /// `PackageId`s selection may admit even though the index marks them
-    /// yanked — the pins of the project's own `Cargo.lock`, which cargo
-    /// itself honors (`ops::lockfile_package_ids` parses it). Admission
-    /// only: the allowlist never makes a version preferred, and stow
-    /// keeps the lockfile out of version preference regardless.
-    pub yanked_allowlist: BTreeSet<PackageId>,
+    /// Contents of the project's own `Cargo.lock` when the caller drops
+    /// it from the tree before resolving — the edge's projects lane.
+    /// Selection parses it with cargo's own lockfile decode
+    /// (`ops::parse_lockfile`): its registry pins stay admissible even
+    /// when the index marks them yanked (admission only, never
+    /// preference), and each git pin locks that dep to the sha the
+    /// lockfile names. `None` for lanes that keep the lockfile (it
+    /// applies through the previous-resolve path) or never had one.
+    pub dropped_lockfile: Option<String>,
 }
 
 /// What a shared [`ResolveSession`] needs: the workspace plus everything
@@ -114,8 +117,8 @@ pub struct StowSessionInput {
     /// own `host_triple` `-vV` to report that host, and refuses a version
     /// different from the one selection saw.
     pub rustc_verbose_version: String,
-    /// As [`StowResolveInput::yanked_allowlist`].
-    pub yanked_allowlist: BTreeSet<PackageId>,
+    /// As [`StowResolveInput::dropped_lockfile`].
+    pub dropped_lockfile: Option<String>,
 }
 
 /// Stow's per-side unit graph under `units`/`roots`.
@@ -505,7 +508,7 @@ impl<'gctx> ResolveSession<'gctx> {
             &specs,
             HasDevUnits::No,
             false,
-            &input.yanked_allowlist,
+            input.dropped_lockfile.as_deref(),
         )
         .await?;
         let has_binary = ws
@@ -610,7 +613,7 @@ pub async fn metadata(gctx: &GlobalContext, input: StowResolveInput) -> CargoRes
         no_deps: false,
         version: 1,
         filter_platforms: input.filter_platforms.clone(),
-        yanked_allowlist: input.yanked_allowlist.clone(),
+        dropped_lockfile: input.dropped_lockfile.clone(),
     };
     let (metadata, _ws_resolve) = cargo_output_metadata::output_metadata_with(
         &setup.ws,
@@ -638,7 +641,7 @@ pub async fn resolve(
         rustc_verbose_version,
         cfg,
         members_are_crates_io,
-        yanked_allowlist,
+        dropped_lockfile,
     } = input;
     ResolveSession::prepare(
         gctx,
@@ -650,7 +653,7 @@ pub async fn resolve(
             cfg,
             members_are_crates_io,
             rustc_verbose_version: rustc_verbose_version.clone(),
-            yanked_allowlist,
+            dropped_lockfile,
         },
     )
     .await?
@@ -1290,7 +1293,7 @@ edition = "2024"
             cfg: BTreeMap::from([(host.to_string(), rustc_data::cfg("1.98.1", host).unwrap())]),
             members_are_crates_io: false,
             rustc_verbose_version: verbose.to_string(),
-            yanked_allowlist: BTreeSet::new(),
+            dropped_lockfile: None,
         };
         let session = futures::executor::block_on(ResolveSession::prepare(&gctx, &input))
             .expect("prepare installs the rustc selection needs");
@@ -1309,11 +1312,11 @@ edition = "2024"
     }
 
     /// A sparse index whose only semver-compatible releases are yanked:
-    /// without the project's own pins the resolve fails with the yanked
-    /// error; an allowlist naming `bisync 0.3.0` admits exactly that
-    /// version (the newer yanked `0.3.1` stays inadmissible); and a newer
-    /// non-yanked compatible release still wins — the allowlist admits,
-    /// it does not prefer.
+    /// without the project's own lockfile the resolve fails with the
+    /// yanked error; a dropped lockfile pinning `bisync 0.3.0` admits
+    /// exactly that version (the newer yanked `0.3.1` stays
+    /// inadmissible); and a newer non-yanked compatible release still
+    /// wins — the dropped lockfile admits, it does not prefer.
     #[test]
     fn yanked_allowlist_admits_lockfile_pins() {
         use crate::testing::RecordedHttp;
@@ -1352,7 +1355,7 @@ edition = "2024"
             .unwrap();
         };
         let host = "x86_64-unknown-linux-gnu";
-        let prepare = |yanked_allowlist: BTreeSet<PackageId>| -> CargoResult<String> {
+        let prepare = |dropped_lockfile: Option<String>| -> CargoResult<String> {
             let vfs = Rc::new(MemoryVfs::new());
             set_vfs(vfs.clone());
             vfs.insert(
@@ -1393,7 +1396,7 @@ bisync = "^0.3.0"
                     rustc_verbose_version: rustc_data::verbose_version("1.98.1", host)
                         .unwrap()
                         .to_string(),
-                    yanked_allowlist,
+                    dropped_lockfile,
                 },
             ))?;
             Ok(session
@@ -1405,21 +1408,19 @@ bisync = "^0.3.0"
                 .expect("bisync resolved"))
         };
         let pin = |version: &str| {
-            BTreeSet::from([PackageId::try_new(
-                "bisync",
-                version,
-                crate::core::SourceId::from_url(
-                    "registry+https://github.com/rust-lang/crates.io-index",
-                )
-                .unwrap(),
-            )
-            .unwrap()])
+            Some(format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"proj\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"bisync\"]\n\n\
+                 [[package]]\nname = \"bisync\"\nversion = \"{version}\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+            ))
         };
 
         // Two yanked releases compatible with `^0.3.0`: nothing is
         // admissible without the project's pins.
         write_index(&[("0.3.0", true), ("0.3.1", true)]);
-        let error = prepare(BTreeSet::new())
+        let error = prepare(None)
             .err()
             .expect("all compatible versions yanked must fail");
         assert!(
@@ -1443,5 +1444,180 @@ bisync = "^0.3.0"
         );
 
         let _ = std::fs::remove_dir_all(&fixture);
+    }
+
+    /// A git dep whose branch HEAD moved to an incompatible version:
+    /// the dropped lockfile's `git+...#sha` pin makes the dep's source
+    /// load with that sha as its precise rev, so `GitTreeSource`
+    /// never consults ls-remote — the pinned run serves no ref
+    /// advertisement at all — and the resolve lands on the pinned
+    /// commit. Without the lockfile the dep follows today's HEAD, whose
+    /// manifest version fails the `version` requirement, so the resolve
+    /// errors.
+    #[test]
+    fn dropped_lockfile_pins_git_sha() {
+        use crate::util::network::http_async::{Client, HttpClient};
+
+        /// An [`HttpClient`] answering from an in-memory URL → response
+        /// map; any URL outside the map errors, which is what proves a
+        /// pinned git dep never asks for ls-remote.
+        struct MapHttp(std::collections::HashMap<String, http::Response<Vec<u8>>>);
+
+        impl HttpClient for MapHttp {
+            fn request<'a>(
+                &'a self,
+                request: http::Request<Vec<u8>>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = CargoResult<http::Response<Vec<u8>>>> + 'a>,
+            > {
+                let url = request.uri().to_string();
+                Box::pin(async move {
+                    self.0
+                        .get(&url)
+                        .cloned()
+                        .ok_or_else(|| anyhow::format_err!("no recorded response for `{url}`"))
+                })
+            }
+        }
+
+        const PIN_SHA: &str = "1111111111111111111111111111111111111111";
+        const HEAD_SHA: &str = "2222222222222222222222222222222222222222";
+
+        // A codeload tarball body: one-component prefix, a `tool`
+        // package at `version`.
+        let tarball = |version: &str| -> Vec<u8> {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            {
+                let manifest = format!(
+                    "[package]\nname = \"tool\"\nversion = \"{version}\"\nedition = \"2021\"\n"
+                );
+                let mut builder = tar::Builder::new(&mut enc);
+                for (path, data) in [
+                    ("tool-x/Cargo.toml", manifest.as_bytes()),
+                    ("tool-x/src/lib.rs", &b"pub fn f() {}\n"[..]),
+                ] {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(data.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_cksum();
+                    builder.append_data(&mut header, path, data).unwrap();
+                }
+                builder.finish().unwrap();
+            }
+            enc.finish().unwrap()
+        };
+
+        let repo: &str = if cfg!(windows) { "C:/repo" } else { "/repo" };
+        // The git checkout lands under the home dir, and target paths must be
+        // absolute on the host: `/home/user` is not absolute on Windows.
+        let home: &str = if cfg!(windows) {
+            "C:/home/user"
+        } else {
+            "/home/user"
+        };
+        let host = "x86_64-unknown-linux-gnu";
+        let prepare = |dropped_lockfile: Option<String>,
+                       responses: std::collections::HashMap<String, http::Response<Vec<u8>>>|
+         -> CargoResult<(String, Option<String>)> {
+            let vfs = Rc::new(MemoryVfs::new());
+            set_vfs(vfs.clone());
+            vfs.insert(
+                format!("{repo}/Cargo.toml"),
+                br#"
+[package]
+name = "proj"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tool = { git = "https://github.com/o/tool", version = "^0.1" }
+"#
+                .to_vec(),
+            );
+            vfs.insert(format!("{repo}/src/lib.rs"), b"pub fn f() {}".to_vec());
+            let mut gctx = GlobalContext::new_for_resolve(
+                PathBuf::from(repo),
+                PathBuf::from(home),
+                Shell::new(),
+                Env::new(),
+                false,
+            )
+            .expect("gctx");
+            gctx.set_http(Client::new(Rc::new(MapHttp(responses))));
+            let session = futures::executor::block_on(ResolveSession::prepare(
+                &gctx,
+                &StowSessionInput {
+                    manifest_path: Path::new(repo).join("Cargo.toml"),
+                    features: Vec::new(),
+                    all_features: false,
+                    no_default_features: false,
+                    cfg: BTreeMap::from([(
+                        host.to_string(),
+                        rustc_data::cfg("1.98.1", host).unwrap(),
+                    )]),
+                    members_are_crates_io: false,
+                    rustc_verbose_version: rustc_data::verbose_version("1.98.1", host)
+                        .unwrap()
+                        .to_string(),
+                    dropped_lockfile,
+                },
+            ))?;
+            let id = session
+                .selection
+                .targeted_resolve
+                .iter()
+                .find(|id| id.name().as_str() == "tool")
+                .expect("tool resolved");
+            Ok((
+                id.version().to_string(),
+                id.source_id().precise_git_fragment().map(str::to_owned),
+            ))
+        };
+
+        let response = |body: Vec<u8>| http::Response::builder().status(200).body(body).unwrap();
+        let codeload = |sha: &str| format!("https://codeload.github.com/o/tool/tar.gz/{sha}");
+
+        // Today's HEAD carries `tool` 2.0.0, outside `^0.1` — without
+        // the lockfile the dep follows the branch and fails.
+        let pkt = |payload: &str| format!("{:04x}{payload}", payload.len() + 4);
+        let ls_remote = format!(
+            "{}{}{}{}{}",
+            pkt("# service=git-upload-pack\n"),
+            "0000",
+            pkt(&format!("{HEAD_SHA} HEAD\0multi_ack thin-pack\n")),
+            pkt(&format!("{HEAD_SHA} refs/heads/main\n")),
+            "0000"
+        );
+        let error = prepare(
+            None,
+            std::collections::HashMap::from([
+                (
+                    "https://github.com/o/tool/info/refs?service=git-upload-pack".to_string(),
+                    response(ls_remote.into_bytes()),
+                ),
+                (codeload(HEAD_SHA), response(tarball("2.0.0"))),
+            ]),
+        )
+        .err()
+        .expect("HEAD's incompatible version must fail the resolve");
+        assert!(format!("{error:#}").contains("tool"), "{error:#}");
+
+        // The lockfile's `git+...#sha` pin lands as the dep source's
+        // precise rev: no ls-remote is served, and the resolve yields
+        // the pinned sha's `0.1.0`.
+        let lockfile = format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"proj\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"tool\"]\n\n\
+             [[package]]\nname = \"tool\"\nversion = \"0.1.0\"\n\
+             source = \"git+https://github.com/o/tool#{PIN_SHA}\"\n"
+        );
+        let (version, precise) = prepare(
+            Some(lockfile),
+            std::collections::HashMap::from([(codeload(PIN_SHA), response(tarball("0.1.0")))]),
+        )
+        .expect("the pinned sha resolves");
+        assert_eq!(version, "0.1.0");
+        assert_eq!(precise.as_deref(), Some(PIN_SHA));
     }
 }

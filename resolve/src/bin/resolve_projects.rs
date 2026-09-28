@@ -1,7 +1,9 @@
 //! `resolve-projects`: run the projects lane's resolve natively over a
 //! `projects.toml` — the same `fetch_github_tree` + `select_manifest` +
 //! `api::resolve` chain the worker's `resolve_github_project` runs, at the
-//! vendored rustc identity the lane's tasks carry.
+//! vendored rustc identity the lane's tasks carry. `Cargo.lock` files are
+//! dropped from the written tree and the root one carried into the
+//! resolve as `dropped_lockfile`, matching `build_workspace`.
 //!
 //! Each repo is fetched (codeload tarball plus submodule trees at the
 //! pinned gitlink commits), written to a workdir, and resolved once per
@@ -234,12 +236,37 @@ async fn resolve_repo(
 
     let dir = workdir.join(repo.replace('/', "-"));
     let _ = fs::remove_dir_all(&dir);
+    // `build_workspace` parity: the workspace root's `Cargo.lock` leaves
+    // the tree and travels into the resolve instead, and every
+    // `Cargo.lock` under the root is dropped.
+    let ws_root = manifest_rel
+        .parent()
+        .map_or_else(PathBuf::new, Path::to_path_buf);
+    let dropped_lockfile = match tree.files.get(&ws_root.join("Cargo.lock")) {
+        Some(data) => {
+            Some(String::from_utf8(data.clone()).context("workspace Cargo.lock is not UTF-8")?)
+        }
+        None => None,
+    };
     for (rel, data) in &tree.files {
+        if rel.file_name().and_then(|n| n.to_str()) == Some("Cargo.lock")
+            && rel.starts_with(&ws_root)
+        {
+            continue;
+        }
         let path = dir.join(rel);
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(path, data)?;
     }
-    let result = resolve_at(client, cargo_home, cfg, &dir.join(&manifest_rel), targets).await;
+    let result = resolve_at(
+        client,
+        cargo_home,
+        cfg,
+        &dir.join(&manifest_rel),
+        targets,
+        dropped_lockfile,
+    )
+    .await;
     let _ = fs::remove_dir_all(&dir);
     result
 }
@@ -254,6 +281,7 @@ async fn resolve_at(
     cfg: &BTreeMap<String, Vec<String>>,
     manifest_path: &Path,
     targets: &[String],
+    dropped_lockfile: Option<String>,
 ) -> anyhow::Result<usize> {
     let manifest_dir = manifest_path.parent().unwrap().to_path_buf();
     let mut units = 0;
@@ -283,10 +311,9 @@ async fn resolve_at(
                     .to_string(),
                 cfg: cfg.clone(),
                 members_are_crates_io: false,
-                // The checkout keeps its own `Cargo.lock`, so yanked
-                // pins it names are already admitted by the previous-
-                // resolve path.
-                yanked_allowlist: std::collections::BTreeSet::new(),
+                // The checkout's `Cargo.lock` was dropped before this
+                // resolve; its pins travel in through the input instead.
+                dropped_lockfile: dropped_lockfile.clone(),
             },
         )
         .await

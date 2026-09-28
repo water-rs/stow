@@ -9,13 +9,15 @@ const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/status";
 const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
+const SCHEDULER_RUN_COMPLETE_URL: &str = "https://scheduler.internal/tasks/complete-run";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
-const SCHEDULER_STABLE_RUSTC_URL: &str = "https://scheduler.internal/rustc/stable";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
-const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
+const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
-const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
+const SCHEDULER_MIGRATE_URL: &str = "https://scheduler.internal/migrate";
+const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
+const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -53,6 +55,16 @@ pub async fn send_complete(
     send_json(namespace, SCHEDULER_COMPLETE_URL, report).await
 }
 
+/// The GitHub `workflow_run` webhook's completion channel (stow#455):
+/// the event names the task and its conclusion, never an attempt — the
+/// object resolves the live attempt.
+pub async fn send_run_complete(
+    namespace: &CfDurableNamespace,
+    report: &stow_types::api::WorkflowRunComplete,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_RUN_COMPLETE_URL, report).await
+}
+
 pub async fn get_status(
     namespace: &CfDurableNamespace,
 ) -> Result<stow_types::api::SchedulerStatus, SchedulerClientError> {
@@ -69,25 +81,6 @@ pub async fn get_tasks_status(
     post_json(namespace, SCHEDULER_TASKS_STATUS_URL, task_ids).await
 }
 
-/// The stable rustc version the human lane builds against, resolved (and
-/// cached) inside the scheduler Durable Object.
-pub async fn get_stable_rustc(
-    namespace: &CfDurableNamespace,
-) -> Result<stow_types::identity::WireRustcVersion, SchedulerClientError> {
-    #[derive(serde::Deserialize)]
-    struct StableRustcResponse {
-        version: String,
-    }
-
-    let parsed = get_json::<StableRustcResponse>(namespace, SCHEDULER_STABLE_RUSTC_URL).await?;
-    stow_types::identity::WireRustcVersion::parse(&parsed.version).map_err(|error| {
-        SchedulerClientError::Decode(format!(
-            "scheduler reported invalid rustc version `{}`: {error}",
-            parsed.version
-        ))
-    })
-}
-
 /// The index-publish path's report that a `(target, rustc_version)`
 /// slice went live — the semantic identities it serves, which become the
 /// membership the scheduler's dependency gate checks.
@@ -98,22 +91,38 @@ pub async fn record_published_index(
     send_json(namespace, SCHEDULER_PUBLISHED_INDEX_URL, slice).await
 }
 
-/// The anonymous-traffic circuit breaker's current state.
-pub async fn get_panic(
+/// Run the queue schema migration — the operator endpoint behind
+/// `POST /api/v1/admin/scheduler/migrate`, which `deploy-edge.yml`
+/// calls right after `skyzen deploy`. The only code path that issues
+/// DDL on the queue database.
+pub async fn migrate_scheduler(
     namespace: &CfDurableNamespace,
-) -> Result<stow_types::api::PanicSwitch, SchedulerClientError> {
-    get_json(namespace, SCHEDULER_PANIC_URL).await
+) -> Result<stow_types::api::SchemaMigrationReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_MIGRATE_URL, &serde_json::json!({})).await
 }
 
-/// Flip the circuit breaker; the object answers the value it stored.
-pub async fn set_panic(
+/// The dispatch freeze's current state — flag plus the stored record
+/// (trigger, notify outcome) when engaged.
+pub async fn get_dispatch_freeze(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::DispatchFreeze, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_FREEZE_URL).await
+}
+
+/// The manual transition that engages or lifts the dispatch freeze; the
+/// object answers the state it stored.
+pub async fn set_dispatch_freeze(
     namespace: &CfDurableNamespace,
     enabled: bool,
-) -> Result<stow_types::api::PanicSwitch, SchedulerClientError> {
+) -> Result<stow_types::api::DispatchFreeze, SchedulerClientError> {
     post_json(
         namespace,
-        SCHEDULER_PANIC_URL,
-        &stow_types::api::PanicSwitch { enabled },
+        SCHEDULER_FREEZE_URL,
+        &stow_types::api::DispatchFreeze {
+            enabled,
+            record: None,
+            transitions: Vec::new(),
+        },
     )
     .await
 }
@@ -123,6 +132,25 @@ pub async fn admin_status(
     namespace: &CfDurableNamespace,
 ) -> Result<stow_types::api::AdminStatus, SchedulerClientError> {
     get_json(namespace, SCHEDULER_ADMIN_STATUS_URL).await
+}
+
+/// Seed the production-shaped fixture through the Durable Object's probe
+/// route — the workerd cost harness's load step. The DO answers only on
+/// deploys carrying `STOW_SCHEDULER_BUDGET=1` (the mock stack).
+pub async fn seed_budget_fixture(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::SchedulerSeedRequest,
+) -> Result<stow_types::api::SchedulerSeedReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_BUDGET_SEED_URL, request).await
+}
+
+/// Run the workerd budget pass: every scheduler route and the alarm
+/// measured with the real `rowsRead`/`rowsWritten` cursor counters —
+/// the units Cloudflare bills on.
+pub async fn scheduler_budget(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::SchedulerBudgetReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_BUDGET_URL, &serde_json::json!({})).await
 }
 
 /// Admin queue listing behind `stow-admin queue list` and the mutation
@@ -153,24 +181,6 @@ pub async fn queue_mutation(
         namespace,
         &format!("{SCHEDULER_TASKS_URL}/{verb}"),
         selector,
-    )
-    .await
-}
-
-/// Stamp a GitHub Actions run id onto an in-flight queue row — called by
-/// the register handler when an OIDC-claimed run reports in.
-pub async fn observe_run(
-    namespace: &CfDurableNamespace,
-    task_id: &str,
-    github_run_id: &str,
-) -> Result<(), SchedulerClientError> {
-    send_json(
-        namespace,
-        SCHEDULER_OBSERVE_RUN_URL,
-        &stow_types::api::ObserveRun {
-            task_id: task_id.to_owned(),
-            github_run_id: github_run_id.to_owned(),
-        },
     )
     .await
 }

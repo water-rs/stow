@@ -8,8 +8,9 @@ OUT=/home/user/bench/results
 mkdir -p "$OUT"
 
 # The CLI resolves artifacts from the local signed index and streams each
-# bundle through the edge byte path; `stow-mock-registry serve` answers that
-# route from the published slice, so the edge URL is the registry port. The
+# bundle through the edge byte path; `stow-mock-registry serve` answers the
+# digest-addressed route straight from its blob store, so the edge URL is
+# the registry port. The
 # /admissions call on a miss lands there too and surfaces as a 404 in its
 # log instead of a silent connection-refused.
 export STOW_EDGE_URL=http://127.0.0.1:40123

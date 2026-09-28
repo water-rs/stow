@@ -2,11 +2,22 @@ name: Install skyzen-cli
 description: >-
   Install the pinned skyzen-cli release binary for x86_64 Linux runners and
   verify it against a digest recorded here, so a compromised upstream
-  release cannot run code in a job that holds deploy credentials.
+  release cannot run code in a job that holds deploy credentials. With
+  `rev` set, installs the exact upstream commit instead — for features not
+  yet in a release, where the commit SHA is itself the pin.
+inputs:
+  rev:
+    description: >-
+      Full commit SHA in zen-rs/skyzen to install from source
+      (`cargo install --git --rev`). Empty installs the pinned release
+      archive.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
     - shell: bash
+      if: inputs.rev == ''
       env:
         SKYZEN_CLI_VERSION: 0.4.4
         # sha256 of skyzen-cli-x86_64-unknown-linux-gnu.tar.xz from the
@@ -26,4 +37,15 @@ runs:
         tar -xJf "$workdir/$archive" -C "$workdir"
         install -m 0755 "$workdir/${archive%.tar.xz}/skyzen" "$HOME/.cargo/bin/skyzen"
         rm -rf "$workdir"
+        skyzen --version
+    # A commit pin is itself the integrity check — `--rev` resolves to that
+    # exact tree, so no second digest is needed. skyzen's Cargo.lock is
+    # gitignored upstream, so `--locked` cannot apply.
+    - shell: bash
+      if: inputs.rev != ''
+      env:
+        SKYZEN_REV: ${{ inputs.rev }}
+      run: |
+        set -euo pipefail
+        cargo install --git https://github.com/zen-rs/skyzen --rev "$SKYZEN_REV" skyzen-cli
         skyzen --version

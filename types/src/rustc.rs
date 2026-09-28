@@ -65,6 +65,12 @@ pub struct ParsedRustcArgs {
     pub strip: Option<String>,
     /// `-L native=…` search paths.
     pub native_search_paths: Vec<PathBuf>,
+    /// The `OUT_DIR` cargo exports to the rustc invocation of a crate that
+    /// `links` — where the unit's own build script wrote. Never parsed
+    /// from argv (it arrives as an environment variable): callers
+    /// populating a `ParsedRustcArgs` inside a rustc-wrapper process set
+    /// it from `std::env::var_os("OUT_DIR")`.
+    pub build_script_out_dir: Option<PathBuf>,
     /// `--extern` pairs, sorted by crate name then path.
     pub extern_crates: Vec<ParsedExternCrate>,
     /// `-Z embed-metadata` value. Nightly cargo passes this flag on every
@@ -74,7 +80,7 @@ pub struct ParsedRustcArgs {
     /// Whether the produced object files carry LLVM bitcode. rustc embeds
     /// bitcode unless `-C embed-bitcode=no`, the value cargo passes to every
     /// unit that no LTO consumer needs bitcode from; a unit compiled with
-    /// bitcode is a different artifact, so this participates in the compile
+    /// bitcode is a different artifact, so it participates in the compile
     /// key.
     pub embed_bitcode: bool,
     /// Whether the invocation (or `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS`)
@@ -122,6 +128,7 @@ impl ParsedRustcArgs {
             overflow_checks: None,
             strip: None,
             native_search_paths: Vec::new(),
+            build_script_out_dir: None,
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: true,

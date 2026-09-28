@@ -235,7 +235,7 @@ fn state_db_query_i64(pool: &sqlx::SqlitePool, sql: &str) -> i64 {
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            sqlx::query_scalar::<_, i64>(sql)
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
                 .fetch_one(pool)
                 .await
                 .expect("query state db")
@@ -248,7 +248,7 @@ fn state_db_exec(pool: &sqlx::SqlitePool, sql: &str) {
         .build()
         .expect("tokio runtime")
         .block_on(async {
-            sqlx::query(sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(pool)
                 .await
                 .expect("write state db");

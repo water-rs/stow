@@ -4,11 +4,20 @@
 #   1. build the four host binaries and generate a P-256 PKCS#8 key pair
 #   2. start stow-mock-registry (40123), the edge under `wrangler dev`
 #      (workerd, 8788; bundle built by `skyzen build`), and
-#      `stow-build serve` (40124)
+#      `stow-build serve` (40124), running the scheduler schema migration
+#      the deploy pipeline runs before the new build takes traffic
 #   3. submit one small registry crate (itoa, latest 1.0.x, host target)
-#      through `stow-admin` and wait for the scheduler to report completion
-#   4. export the signed artifact index from the edge and publish it into
-#      the mock registry (`stow-admin index export` + `index publish`)
+#      through `stow-admin` and wait for the scheduler to report
+#      completion via the local CI's `workflow_run` webhook POST
+#   4. export the signed artifact index from the registry's records
+#      artifacts, publish it back, report each slice to the scheduler
+#      gate and sync the folded records into the edge catalog
+#      (`stow-admin index export` + `index publish` + `index report` +
+#      `index sync`, as index-publish.yml runs them), then run the same
+#      wave by hand through
+#      `stow-admin preheat manual` on a crate with a real dependency
+#      (walkdir → same-file) so layering and per-layer publish are
+#      exercised
 #   5. `stow index refresh` + `stow check` a throwaway consumer crate in
 #      mock-key verify mode and assert the dependency was served from the
 #      cache via local index resolution and a direct digest pull
@@ -190,13 +199,9 @@ check_children_alive() {
 # dir. RUSTUP_HOME points back at the real one — `stow-build` resolves
 # `rustup_home()` from the real environment inside its sandbox, so the
 # toolchain (and the version install above) must live there anyway.
+# `ISOLATED_ENV` is set once `RUSTUP_HOME_REAL` is known, below.
 isolated_env() {
-    env \
-        HOME="$WORK_DIR/home" \
-        XDG_CONFIG_HOME="$WORK_DIR/config" \
-        CARGO_HOME="$WORK_DIR/cargo-home" \
-        RUSTUP_HOME="$RUSTUP_HOME_REAL" \
-        "$@"
+    env "${ISOLATED_ENV[@]}" "$@"
 }
 
 # Every stow-cli call carries the full mock env — config, cache, verify
@@ -228,6 +233,14 @@ require_command wrangler
 RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 RUSTUP_HOME_REAL="$(rustup show home)"
+# The environment every stow process of this run gets: its own home,
+# config and cargo home, with the real rustup toolchains.
+ISOLATED_ENV=(
+    HOME="$WORK_DIR/home"
+    XDG_CONFIG_HOME="$WORK_DIR/config"
+    CARGO_HOME="$WORK_DIR/cargo-home"
+    RUSTUP_HOME="$RUSTUP_HOME_REAL"
+)
 [ -n "$RUSTC_VERSION" ] && [ -n "$HOST_TARGET" ] || die "could not detect rustc version/host"
 
 # The build stage re-pins the task version as a rustup toolchain name
@@ -320,16 +333,58 @@ SERVICE_PID=$!
 CHILD_PIDS+=("$SERVICE_PID")
 CHILD_NAMES+=(edge)
 echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
+# The scheduler Durable Object applies its schema through the operator
+# migrate route — deployment work, never request work — so the mock
+# plays the deploy pipeline: wait only for the listener, then run the
+# same `stow-admin scheduler migrate` deploy-edge.yml runs, before any
+# scheduler traffic. A status read before the migration is a 500; the
+# listener probe takes the route's response code as its ready signal.
+wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
+    http_listening "$SCHEDULER_URL/status"
+migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler migrate 2>&1)" \
+    || die "stow-admin scheduler migrate failed: $migrate_out"
+echo "[mock-e2e] $migrate_out"
+current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
+    "$REPO_ROOT/edge/src/scheduler/queue.rs")"
+[ -n "$current_schema" ] || die "could not read SCHEMA_VERSION from queue.rs"
+[ "${migrate_out##* }" = "$current_schema" ] \
+    || die "scheduler migrate reported '$migrate_out', expected schema $current_schema"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
+
+# stow#336: production links every Linux unit against the Debian buster
+# (glibc 2.28) sysroot build-crate.yml provisions — the dispatched builds
+# link the same way through the same scripts, into a cache dir keyed by
+# the deb manifest's hash so each box installs it once. The stow
+# binaries themselves were built before this and keep the host glibc;
+# the sysroot env is exported only inside the server below.
+SYSROOT=""
+if [ "$(uname -s)" = "Linux" ]; then
+    SYSROOT="${XDG_CACHE_HOME:-$HOME/.cache}/stow/glibc-sysroot-$(sha256sum \
+        "$REPO_ROOT/ci/glibc-sysroot-debs.txt" | cut -d' ' -f1)"
+    if [ ! -d "$SYSROOT" ]; then
+        "$REPO_ROOT/ci/glibc-sysroot/install.sh" "$SYSROOT" \
+            || die "glibc sysroot install failed"
+    fi
+    "$REPO_ROOT/ci/glibc-sysroot/wrappers.sh" "$SYSROOT" \
+        || die "glibc sysroot wrapper write failed"
+fi
 
 # The dispatch tree (.tmp/local-ci-dispatch) is written under the server's
 # cwd; keep it inside the work dir.
 (
     cd "$WORK_DIR/local-ci"
-    exec env \
+    # The builds this server runs consume the mock registry and an
+    # isolated stow cache, never GHCR or the developer's ~/.stow.
+    [ -z "$SYSROOT" ] || eval "$("$REPO_ROOT/ci/glibc-sysroot/env.sh" "$SYSROOT")"
+    exec env "${ISOLATED_ENV[@]}" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+        STOW_VERIFY_MODE="mock-key" \
+        STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
+        STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
         STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
@@ -343,11 +398,12 @@ echo "[mock-e2e] started local-ci (pid $SERVICE_PID), log: $LOG_DIR/local-ci.log
 wait_for "local CI dispatch endpoint" 60 "$SERVICE_PID" \
     http_listening "http://${LOCAL_CI_ADDR}/dispatch"
 
-# Latest non-yanked 1.0.x on crates.io.
+# Latest non-yanked 1.0.x, read from the sparse index (one JSON line per
+# release) rather than the rate-limited crates.io API.
 TASK_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
-    'https://crates.io/api/v1/crates/itoa' \
-    | jq -r '[.versions[] | select(.yanked | not) | .num | select(startswith("1.0."))]
-             | sort_by(split(".") | map(tonumber)) | last // empty')"
+    'https://index.crates.io/it/oa/itoa' \
+    | jq -rs '[.[] | select(.yanked | not) | .vers | select(startswith("1.0."))]
+              | sort_by(split(".") | map(tonumber)) | last // empty')"
 [ -n "$TASK_VERSION" ] || die "no non-yanked itoa 1.0.x found on crates.io"
 echo "[mock-e2e] submitting $TASK_CRATE $TASK_VERSION features=$TASK_FEATURES target=$HOST_TARGET rustc=$RUSTC_VERSION"
 
@@ -379,28 +435,50 @@ while :; do
 done
 
 # The consumer resolves artifacts through the signed local index, so the
-# slice for this (target, rustc_version) must exist in the mock registry
-# before `stow check` runs: export it from the edge's D1 catalog and
-# publish — in mock-key mode `stow-admin` delegates the signed push to
-# `stow-mock-registry publish-index`, which writes the same layout the
-# GHCR path produces.
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+# slices the runs' records feed must exist in the mock registry before
+# `stow check` runs: `index export --out-dir` reads and verifies the
+# records artifacts (mock-key trust) in one pass, and `index publish`
+# delegates each slice's signed push to `stow-mock-registry
+# publish-index`, which writes the same layout the GHCR path produces.
+isolated_env \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     "$BIN/stow-admin" index export \
-    --target "$HOST_TARGET" \
+    --out-dir "$WORK_DIR/index-export" \
     --rustc-version "$RUSTC_VERSION" \
-    --out "$WORK_DIR/index.bin" \
     >"$LOG_DIR/index-export.log" 2>&1 \
     || die "stow-admin index export failed — see $LOG_DIR/index-export.log"
 
-isolated_env \
-    STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
-    STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-    "$BIN/stow-admin" index publish \
-    --file "$WORK_DIR/index.bin" \
-    --target "$HOST_TARGET" \
-    --rustc-version "$RUSTC_VERSION" \
-    >"$LOG_DIR/index-publish.log" 2>&1 \
-    || die "stow-admin index publish failed — see $LOG_DIR/index-publish.log"
+pairs="$(python3 -c 'import json,sys
+for s in json.load(open(sys.argv[1])):
+    print(s["index_file"], s["folded_file"])' "$WORK_DIR/index-export/slices.json")" \
+    || die "reading $WORK_DIR/index-export/slices.json failed"
+echo "$pairs" | while read -r index_file folded_file; do
+    [ -n "$index_file" ] || continue
+    isolated_env \
+        STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+        STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+        "$BIN/stow-admin" index publish \
+        --file "$WORK_DIR/index-export/$index_file" \
+        --folded "$WORK_DIR/index-export/$folded_file" \
+        >>"$LOG_DIR/index-publish.log" 2>&1 \
+        || die "stow-admin index publish failed for $index_file — see $LOG_DIR/index-publish.log"
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+        "$BIN/stow-admin" index report \
+        --file "$WORK_DIR/index-export/$index_file" \
+        >>"$LOG_DIR/index-report.log" 2>&1 \
+        || die "stow-admin index report failed for $index_file — see $LOG_DIR/index-report.log"
+done
+
+# D1's catalog is a read model of the records the export just folded:
+# `index sync` replays `new-records.json` into it, as index-publish.yml
+# does after its publish loop. The miss derivation reads it, so a
+# covered graph mints no admission only once the sync has landed.
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" index sync \
+    --file "$WORK_DIR/index-export/new-records.json" \
+    >"$LOG_DIR/index-sync.log" 2>&1 \
+    || die "stow-admin index sync failed — see $LOG_DIR/index-sync.log"
 
 # Exercise the consumer-facing commands before `check`: refresh pulls and
 # verifies the signed slice, status reports the cached row set the
@@ -417,6 +495,40 @@ grep -q "rustc-version: $RUSTC_VERSION" "$LOG_DIR/index-status.log" \
 index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 [ "${index_rows:-0}" -ge 1 ] \
     || die "cached index slice is empty (rows=$index_rows) — export/publish lost the task row"
+
+# The same wave, driven by hand: `preheat manual` resolves the crate
+# list in-process, layers it, dispatches straight to the local CI
+# server, and publishes the index slice between layers — the edge only
+# sees the runs' webhook completions. walkdir carries one unix dep
+# (same-file), so the wave lands in two layers.
+printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
+isolated_env \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+    STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+    STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+    "$BIN/stow-admin" preheat manual \
+    --crates "$WORK_DIR/manual-crates.txt" \
+    --rustc-version "$RUSTC_VERSION" \
+    --targets "$HOST_TARGET" \
+    --dispatch-url "http://${LOCAL_CI_ADDR}" \
+    --in-flight 4 \
+    >"$LOG_DIR/preheat-manual.log" 2>&1 \
+    || { cat "$LOG_DIR/preheat-manual.log"; die "stow-admin preheat manual failed — see $LOG_DIR/preheat-manual.log"; }
+
+# The manual run's publish must have landed a slice serving walkdir —
+# the driver's own wait loop already proved it, but assert the registry
+# view directly so a driver-side wait bug cannot hide a lost publish.
+# The mock registry, like GHCR, serves /v2 only to an anonymous bearer
+# minted by its token endpoint.
+registry_token="$(curl -fsS --max-time 10 \
+    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache:pull" \
+    | jq -er .token)" \
+    || die "mock registry token exchange failed"
+curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
+    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
+    -o /dev/null \
+    || die "index slice index.${HOST_TARGET}.${RUSTC_VERSION} missing after the manual wave"
 
 # Throwaway consumer pinned to the exact version the scheduler just built.
 CONSUMER="$WORK_DIR/itoa-consumer"
@@ -469,6 +581,43 @@ errors="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(errors),0) FROM crate_stats W
 echo "[mock-e2e] $TASK_CRATE cache stats: hits=$hits errors=$errors"
 [ "$hits" -ge 1 ] || die "$TASK_CRATE was not served from the cache (hits=$hits)"
 [ "$errors" -eq 0 ] || die "$TASK_CRATE fetch recorded $errors errors"
+
+# --- byte path: bundles served by digest, Cache API in front of GHCR ---
+#
+# `stow check` already fetched itoa's bundle through
+# GET /api/v1/bundles/{digest}; the assertions below pin the route's
+# contract directly. The index layer blob lives in the same registry
+# repository but the CLI pulled it straight from the registry, so the
+# edge has never served it: its first fetch here is a miss that tees
+# into the Cache API, and the second is a hit. A digest the registry
+# does not hold is a 404, a malformed digest is a 400 before any fetch,
+# and the retired /api/v1/artifacts/… path is gone.
+INDEX_SLICE="$WORK_DIR/index-export/index.${HOST_TARGET}.${RUSTC_VERSION}"
+[ -f "$INDEX_SLICE" ] || die "exported index slice missing: $INDEX_SLICE"
+INDEX_DIGEST="sha256:$(sha256sum "$INDEX_SLICE" | awk '{print $1}')"
+[ -f "$WORK_DIR/mock-registry/blobs/${INDEX_DIGEST/:/_}" ] \
+    || die "index blob not in the mock registry: $INDEX_DIGEST"
+
+headers="$(curl -fsS -D - -o "$WORK_DIR/bundle-miss.bin" \
+    "$EDGE_URL/api/v1/bundles/$INDEX_DIGEST")"
+grep -qi '^x-stow-cache: *miss' <<<"$headers" \
+    || die "first digest fetch was not a cache miss: $headers"
+cmp -s "$WORK_DIR/bundle-miss.bin" "$INDEX_SLICE" \
+    || die "digest fetch served bytes other than the blob"
+headers="$(curl -fsS -D - -o /dev/null "$EDGE_URL/api/v1/bundles/$INDEX_DIGEST")"
+grep -qi '^x-stow-cache: *hit' <<<"$headers" \
+    || die "second digest fetch was not a cache hit: $headers"
+echo "[mock-e2e] digest fetch: miss then hit (expected)"
+
+code="$(curl -s -o /dev/null -w '%{http_code}' \
+    "$EDGE_URL/api/v1/bundles/sha256:0000000000000000000000000000000000000000000000000000000000000000")"
+[ "$code" = "404" ] || die "unknown bundle digest returned $code, expected 404"
+code="$(curl -s -o /dev/null -w '%{http_code}' "$EDGE_URL/api/v1/bundles/sha256:nothex")"
+[ "$code" = "400" ] || die "malformed bundle digest returned $code, expected 400"
+code="$(curl -s -o /dev/null -w '%{http_code}' \
+    "$EDGE_URL/api/v1/artifacts/$HOST_TARGET/$RUSTC_VERSION/0000000000000000")"
+[ "$code" = "404" ] || die "retired artifacts route returned $code, expected 404"
+echo "[mock-e2e] digest byte path: 404 miss, 400 malformed, old route gone (expected)"
 
 # The hit already proved the new path end-to-end: local index resolution
 # plus a direct signed bundle pull. What remains on the edge is

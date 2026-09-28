@@ -41,9 +41,8 @@ identity. The build order is the edges. The unit rule is what may be a node.
 ## Trust model
 - Trust GitHub-hosted CI as the builder.
 - Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
-- Trusted CI registers artifact records via the edge worker's authenticated `/api/v1/admin/artifacts/register` endpoint (the caller proves a GitHub identity — Actions OIDC for CI, a push-user token otherwise). The edge owns the only write path to D1's `artifacts` table; CI does NOT hold a D1 credential.
-- Edge workers are untrusted-by-default serving infrastructure: every register write is gated by GitHub-identity auth (the `build-crate.yml` OIDC pin or a repo push user), and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the CLI sees a 404, edge prunes the stale row).
-- Future direction: replace bearer-credential register auth with a cosign-signed request body, so the register path itself becomes signature-rooted.
+- Trusted CI never calls the edge: `build-crate.yml` stamps its `run-name` `<rustc>-<task_id>` and pushes each task's bundle and `Vec<ArtifactRecord>` to GHCR as one cosign-signed `records-<rustc>-<task_id hash>` artifact under the pinned builder identity, and GitHub's `workflow_run` webhook (HMAC-verified at `POST /api/v1/github/workflow-run`) reports completion. GHCR plus cosign is the only record store; the edge's D1 `artifacts` table is a mirror `index sync` fills from those verified records.
+- Edge workers are untrusted-by-default serving infrastructure: index exports and webhook completion both verify the records artifact's cosign signature against the `build-crate.yml` identity before trusting a row, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the consumer sees a 404 or a digest failure and compiles locally).
 
 ## Architecture map
 - `cli/`: end-user CLI and runtime wrappers.
@@ -54,20 +53,21 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `cache_policy.rs`: controls whether a rustc invocation is allowed to use public cache.
   - `inject.rs`: writes cached outputs back into Cargo target dirs.
   - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
-- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`, Cache API in front of GHCR) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
-  - `api.rs`: exact byte-path GET/HEAD, `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
+- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/bundles/{digest}`, Cache API in front of the GHCR blob — no catalog lookup) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
+  - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
   - `worker_resolver.rs`: the request lane, preheat lanes and admin enqueue resolve — cargo's resolver (`stow-resolve`) over fetched manifests.
   - `dependency_resolver.rs`: miss derivation for admissions and the shared crates.io record helpers.
   - `db.rs`: D1 schema helpers and artifact-catalog queries.
   - `scheduler/`: Durable Object queue, dispatch, and miss draining.
 - `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.
   - `stow-build build` (untrusted job, `contents: read`, no secrets/OIDC): builds the crate, scans artifacts, writes task + plan + content-addressed blobs to an output directory (`stage.rs`).
-  - `stow-build publish` (trusted job): re-hashes the blobs, validates the plan against the dispatched task and a self-resolved dependency closure (`closure.rs`, `validate.rs`), then pushes OCI artifacts, signs, POSTs `Vec<ArtifactRecord>` to the edge admin/register endpoint, and reports to the scheduler.
+  - `stow-build publish` (trusted job): re-hashes the blobs, validates the plan against the dispatched task and a self-resolved dependency closure (`closure.rs`, `validate.rs`), then pushes the bundle and the signed records artifact to GHCR. GitHub's `workflow_run` webhook — not the runner — reports completion to the edge.
   - The scheduler dispatches `workflow_dispatch` of `build-crate.yml` on `main`; the trusted identity lives in `types/src/trusted_builder.rs`.
 - `oci/`: shared OCI push/sign/pull machinery (`stow-oci`) — bundle publish for `stow-build`, index publish for `stow-admin`, digest pulls for the CLI.
 - `mock-registry/`: local mock OCI registry for simulation and tests (`populate`, `publish-index`, `index-from-records`, `serve`; speaks GHCR's anonymous bearer exchange).
 - `types/`: shared API and artifact key types (`index.rs` carries the signed `ArtifactIndex` wire format).
-- `admin/`: operations CLI for preheating the cache via the scheduler and publishing index slices (`index export|publish`).
+- `resolver/`: native graph resolver (`stow-resolver`) on the published `cargo` crate — materializes a fetched source (project tree or `.crate`), runs cargo's own `resolve_ws_with_opts`/`FeatureResolver` per CI target with the toolchain's real rustc facts, and emits the per-target unit set (package, feature set, dependency edges, host/target side) plus the `EnqueueRequest` conversion the lanes share.
+- `admin/`: operations CLI for preheating the cache and publishing index slices (`index export|publish|sync`). Every lane resolves in-process with `stow-resolver` (`resolve::RESOLVE_CONCURRENCY` worker threads); `preheat manual` drives a whole wave with no edge at all — in-process resolve, topological layering, `workflow_dispatch` through the operator's GitHub token, index-rooted resume.
 
 ## Important repo assumptions
 - water-rs Actions capacity is 60 concurrent runners (20 on macOS) — a full `CI_TARGET_TRIPLES` request wave dispatches in one window; wall clock is set by the slowest (Windows) leg.
@@ -120,7 +120,8 @@ that is exactly what semver promises. So every task builds at the latest
 semver-compatible version: the bundled lockfile is dropped unless `preserve_lockfile`
 is set (`ci/src/task.rs:239`), and a project contributes crate names and feature
 sets, never version pins — though the dropped lockfile's pins still admit the
-yanked versions they name, as cargo's own lockfile handling does.
+yanked registry versions they name, and its git entries still lock git
+dependencies to the sha they record, as cargo's own lockfile handling does.
 
 Feature sets are not like that and may never be forced. `A` with `{c, d}` and `A`
 with `{c}` are two legitimate artifacts with no ordering between them; neither
@@ -203,6 +204,35 @@ forwarding; it will not, because its entire content is one dependency declaratio
 construction. Designing for a need that does not exist is over-engineering even when
 the design it produces looks careful.
 
+## Operator notifications
+
+Every alert, incident, breaker trip and watchdog report does two things.
+
+- **Email notification** through Cloudflare Email Service **Email Sending**:
+  - sent from `alerts@stow.waterui.dev` (the onboarded sending domain) to the operator;
+  - one mail when the incident opens, one when it clears, and at most an hourly digest in between;
+  - the Worker uses the `send_email` binding;
+  - everything else uses the REST API, `POST /accounts/{account_id}/email/sending/send`, with `CLOUDFLARE_API_TOKEN`.
+- **Issue record**: a GitHub issue labelled `incident`:
+  - opened when the incident starts, updated at most hourly, closed when it clears;
+  - deduplicated by label and title prefix.
+
+If one channel fails, the other still happens, and the failure is recorded.
+
+## Platform-native first
+
+Before building any infrastructure mechanism, search Cloudflare's and GitHub's documentation for a native feature and use it when it fits. Examples: a kill switch, rate limiting, alerting, a canary, logging, queues, scheduling, merge gating. Cloudflare offers WAF custom and rate-limiting rules, the Workers rate-limiting binding, usage and budget notifications, Workers Logs, gradual deployments, Queues, Workflows, cron triggers and Analytics Engine. GitHub offers rulesets, merge queues, concurrency groups and environments. The panic switch reimplemented WAF custom rules inside the Worker and cost a Worker invocation and a Durable Object read on every request it shed. The issue or pull request that builds such a mechanism names the native options it checked and why none fits.
+
+## Resources are spent deliberately
+
+Everything stow runs on is metered or scarce: Durable Object rows, duration and requests, D1 rows, Worker CPU, R2 operations, runner slots, GitHub API quota. Stow is a service whose whole purpose is saving other people's compute, and wasting its own is the same failure.
+
+- **Per-event cost.** An operation costs what the event it handles touches, never what the stored data holds. A request that reads rows in proportion to a table is a defect even when the table is small today.
+- **Idle cost is zero.** Once its work is done, a Durable Object holds no timers, background promises, `waitUntil` tasks or open connections, so it hibernates at the platform minimum. An alarm is armed only while there is work pending.
+- **Independent outbound calls run concurrently** under a stated bound, so billed wall time is the slowest call rather than the sum.
+- **Runner slots are never held by waiting.** No job occupies a runner to poll, idle or stay resident.
+- **Every change states its cost.** A pull request that adds or changes a component on a request, alarm or scheduled path states its per-event and idle cost in its description, and the cost gate measures it.
+
 ## Measuring a performance claim
 
 Measure what the developer pays repeatedly, on a project large enough for the effect
@@ -256,7 +286,7 @@ claims to list every variable stow reads, so that claim is checkable and has to 
 - The CLI binds bundle identity to the cosign signature by requiring `manifest.json`'s config to equal the signature-covered `oci/config.json`.
 - `stow-cli predict` was sped up by removing `cargo metadata` from the CLI dependency parsing path.
 - Cache policy checks were optimized away from full JSON parse per rustc invocation to marker-file existence checks.
-- `POST /api/v1/requests` is the Turnstile-admitted human lane: the scheduler `queue.lane` column orders `human` ahead of `miss` (FIFO within a lane, min-age exempt, promotion only ever `miss -> human`), tasks enqueue `EnqueueSource::HumanRequest` for the crate's dependency closure across `stow_types::api::CI_TARGET_TRIPLES`, and `rustc_version` comes from the DO-cached stable channel manifest (`edge/src/rust_channel.rs`, 60-minute TTL).
+- `POST /api/v1/requests` is the Turnstile-admitted human lane: the scheduler `queue.lane` column orders `human` ahead of `miss` (FIFO within a lane, min-age exempt, promotion only ever `miss -> human`), tasks enqueue `EnqueueSource::HumanRequest` for the crate's dependency closure across `stow_types::api::CI_TARGET_TRIPLES`, and `rustc_version` comes from the stable channel manifest cached in the Worker's Cache API (`edge/src/rust_channel.rs`, 60-minute TTL).
 
 ## Validation guidance
 - First preference: `cargo check -q` for repo-wide type safety.
@@ -272,6 +302,10 @@ claims to list every variable stow reads, so that claim is checkable and has to 
   - D1 schema/query path
   - scheduler forward path
   - local Wrangler/runtime
+
+## Per-request cost on the edge
+
+A Worker route, a Durable Object handler and the scheduler alarm run on every request, so their cost is multiplied by traffic and by table size. Each scheduler route and the alarm pass is a drive in `edge/src/scheduler/drives.rs`, measured by `scripts/scheduler-budget.sh` with workerd's billed `rowsRead`/`rowsWritten` at two fixture sizes: a drive fails when its cost grows with the stored bulk (more than 10% + 50 rows between the sizes) or exceeds its absolute budget, and a route without a drive fails the gate. A cost legitimately bounded by something other than the event (human-lane depth, the dispatch cap, a day's completions) names that bound beside its drive. Schema changes are operations work: request code and the alarm never create, alter, index or backfill anything, and never check the schema. Migrations run only through the operator migrate route, which the deploy pipeline calls right after the new version goes live, and they are additive so the running code keeps working while they apply. When a fix names a defect class, the same PR searches for every other instance of that class and lists them.
 
 ## What to avoid
 - Do not replace crates.io as the production dependency graph source.

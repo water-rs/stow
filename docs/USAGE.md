@@ -291,8 +291,9 @@ acting unless `--yes` is given.
   catalog rows (GHCR tags are not deleted).
 - `stow-admin cache stats` / `cache clear --prefix <p> --yes` — the
   repository's GitHub Actions cache quota and prefix eviction.
-- `stow-admin panic on|off|status` — the anonymous-traffic circuit
-  breaker (`on`/`off` are mutations).
+- `stow-admin maintenance ensure|on|off|status [--scope anonymous|lanes|all]`
+  — the zone WAF maintenance rules; `ensure` creates the entrypoint and
+  any missing rule disabled (`ensure`/`on`/`off` are mutations).
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
 - `stow-admin preheat top --target ... --rustc-version ... [--limit 100] --yes`
@@ -300,12 +301,13 @@ acting unless `--yes` is given.
   feature/version selections. Standalone builds; intended for the base
   library pool. A ranked crate whose newest release ships no library
   target (a bin-only crate that slipped into the ranking) is resolved
-  as a name source instead: the edge fetches its `.crate` tarball and
-  resolves its crates.io graph, exactly like `preheat binary`.
+  as a name source instead: stow-admin fetches its `.crate` tarball and
+  resolves its crates.io graph in-process, exactly like
+  `preheat binary`.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
   — preheat one named **binary** crate's dependency graph from
-  crates.io: the edge fetches the `.crate` tarball and runs cargo's
-  resolver once per CI target — every crates.io node an
+  crates.io: stow-admin fetches the `.crate` tarball and runs cargo's
+  resolver in-process once per CI target — every crates.io node an
   ordinary crate task at its resolved feature set, with its crates.io
   dependencies as `depends_on` edges. The binary's own package is a name
   source, never a task. The published tarball decides the resolution —
@@ -329,10 +331,12 @@ acting unless `--yes` is given.
   from the `stow_cache_misses` Analytics Engine dataset.
 - `stow-admin preheat projects submit [--file preheat/projects.toml] --rustc-version ... [--targets a,b] --yes`
   — resolve every repository the reviewed `preheat/projects.toml` lists:
-  the edge fetches its codeload tarball, drops the committed
+  stow-admin fetches its codeload tarball, drops the committed
   `Cargo.lock` so cargo re-resolves the latest semver-compatible
-  versions, and runs the resolve once per CI target. Every crates.io
-  node in
+  versions, and runs the resolve once per CI target — in-process, four
+  projects at a time (`resolve::RESOLVE_CONCURRENCY`; cargo's
+  `GlobalContext` is not `Sync`, so each worker thread builds its own).
+  Every crates.io node in
   the resolve is enqueued as an ordinary crate task at its resolved
   feature set — feature sets are never merged — with its crates.io
   dependencies as `depends_on` edges at the same `(target,
@@ -353,13 +357,28 @@ acting unless `--yes` is given.
   request.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
-- `stow-admin index export --target T --rustc-version V --out <file>` /
-  `index publish --file <file> --target T --rustc-version V` /
-  `index targets` — export one signed index slice from the edge's admin
-  endpoint, push it to GHCR (mock deploys delegate to
-  `stow-mock-registry publish-index`), and list the `(target, rustc)`
-  pairs a published index covers. `index-publish.yml` runs this loop
-  after every `build-crate` wave.
+- `stow-admin preheat manual --crates <file>|--projects <file>
+  --rustc-version <v> [--targets a,b] [--in-flight 45]` — the
+  edge-free wave: resolve the input in-process, layer it against the
+  published index, dispatch `build-crate.yml` straight through GitHub's
+  `workflow_dispatch`, and publish each index slice as its layer lands.
+  Works while Cloudflare is down. Resumable by index, exits non-zero
+  with the failed runs' URLs. `--dispatch-url` aims it at the mock's
+  local CI server instead; `--adopt-since <RFC 3339>` (default 24 h ago)
+  bounds how far back a resumed wave adopts already-dispatched runs;
+  `--edge-url` (or `STOW_EDGE_URL`) is forwarded to the index-publish
+  workflow so it can sync the D1 catalog.
+- `stow-admin index export --out-dir <dir>` /
+  `index publish --file <index> --folded <folded>` /
+  `index sync --file <new-records.json>` / `index targets` — export
+  every changed index slice in one pass from the registry's verified
+  records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
+  companion; only the records tags no folded set covers are pulled),
+  push both to GHCR signed under the index workflow (mock deploys
+  delegate to `stow-mock-registry publish-index`), and sync just this
+  pass's new records into the edge's D1 catalog. `index-publish.yml`
+  runs this loop after every `build-crate` wave. `index targets` lists
+  the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
 whole wave — `preheat top`, `preheat top-binaries`, and
@@ -373,5 +392,7 @@ wave builds only what is missing or previously failed.
 
 `stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
 access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
-`preheat projects generate` is the one exception — it touches only
-GitHub, never the edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
+The exceptions never touch the edge: `preheat manual` needs only the
+GitHub credential (plus crates.io and GHCR), `preheat projects generate`
+touches only GitHub, and `index export`/`publish`/`targets` touch only
+the registry. See [`ENVIRONMENT.md`](ENVIRONMENT.md).

@@ -3,15 +3,19 @@
 This document describes how to deploy the production trust topology:
 
 ```
-GitHub Actions ──register──► Edge Worker ──D1──► Cloudflare D1
-     ▲                            │
-     │ workflow_dispatch          ▼
-     │                       GHCR (OCI)
-     └──────── Scheduler DO ─┘
+GitHub Actions ──records artifact (cosign-signed)──► GHCR (OCI)
+     ▲                                               │
+     │ workflow_dispatch                             │ reads + verifies
+     │                                               ▼
+     └─── Scheduler DO ──► Edge Worker ──D1──► Cloudflare D1
+                               ▲
+     GitHub webhook ──workflow_run──┘
 ```
 
-CI is the only producer of artifacts; the edge owns the D1 binding;
-end users only ever talk to the edge. Detailed trust analysis lives in
+CI is the only producer of artifacts and writes them — bundles and
+records alike — straight into GHCR; the edge owns the D1 binding and
+learns build completion from GitHub's `workflow_run` webhook; end
+users only ever talk to the edge. Detailed trust analysis lives in
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries).
 
 ## One-time Cloudflare setup
@@ -37,8 +41,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen secret set GITHUB_APP_PRIVATE_KEY  # stow-ci GitHub App PEM; same key as the STOW_APP_PRIVATE_KEY repository secret
    skyzen secret set STOW_POW_CHALLENGE_SECRET  # HMAC key for enqueue-admission challenges
    skyzen secret set TURNSTILE_SECRET_KEY       # Turnstile secret key paired with the TURNSTILE_SITE_KEY var
-   skyzen secret set STOW_STATS_SALT_SECRET     # HMAC key for the daily-salted install hash (any strong random string)
    skyzen secret set CF_ANALYTICS_TOKEN         # API token with Analytics Engine read, used by GET /api/v1/stats
+   skyzen secret set STOW_GITHUB_WEBHOOK_SECRET # HMAC key verifying GitHub's workflow_run webhook (below)
    ```
 
    `CF_ANALYTICS_TOKEN` is an account-level API token (dashboard: *My
@@ -48,8 +52,11 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    queries against the Analytics Engine SQL API. The `CF_ACCOUNT_ID`
    var in the manifest names the account those queries run under.
 
-   There are deliberately no shared scheduler/register secrets — the
-   trusted endpoints authenticate GitHub identities instead (see
+   The one shared secret on the edge write surface is
+   `STOW_GITHUB_WEBHOOK_SECRET` — it verifies GitHub's own
+   `workflow_run` deliveries, which only GitHub can send. Every
+   operator/CI-facing trusted endpoint still authenticates a GitHub
+   identity, never a shared token (see
    [Trusted-endpoint authentication](#trusted-endpoint-authentication)).
 
 3. Deploys run from GitHub Actions — see below. The first deploy also
@@ -70,7 +77,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    catalog — but enumerating paths would leave the other anonymous
    routes (request and scheduler status, routes added later) unlimited,
    so the rule matches the `/api/v1/` path prefix and carves out only
-   `/api/v1/artifacts/`. The byte path is excluded on purpose: a warm
+   `/api/v1/bundles/`. The byte path is excluded on purpose: a warm
    build streams its closure at the CLI's prefetch concurrency and the
    per-`rustc` wrapper fetches on demand under cargo's own job
    parallelism, so one address legitimately sends tens of bundle
@@ -78,8 +85,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    local compile mid-build. That path is the cheap one — a Cache API hit
    costs one Worker request and no D1 or Durable Object work — and its
    volume is bounded by the DDoS managed ruleset, the billing
-   notifications below, and the edge panic switch rather than by this
-   rule. The Free plan allows exactly one rate-limiting rule, which is
+   notifications below, and the zone maintenance rules rather than by
+   this rule. The Free plan allows exactly one rate-limiting rule, which is
    why the split is an exclusion inside a single expression rather than
    a second, looser rule on artifacts.
 
@@ -121,7 +128,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      --data @- <<'JSON'
    {
      "description": "stow: per-IP limit on /api/v1/",
-     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/bundles/\")",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src"],
@@ -144,7 +151,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
      --data @- <<'JSON'
    {
      "description": "stow: per-IP limit on /api/v1/",
-     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/artifacts/\")",
+     "expression": "starts_with(http.request.uri.path, \"/api/v1/\") and not starts_with(http.request.uri.path, \"/api/v1/bundles/\")",
      "action": "block",
      "ratelimit": {
        "characteristics": ["ip.src"],
@@ -170,8 +177,40 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    The same rule in the dashboard: *Security → Security rules → Create
    rule → Rate limiting rules*, match `URI Path` `starts with`
    `/api/v1/` **and** `URI Path` `does not start with`
-   `/api/v1/artifacts/`, 60 requests per 10 seconds per IP, block for
+   `/api/v1/bundles/`, 60 requests per 10 seconds per IP, block for
    10 seconds.
+
+6. **Maintenance rules (the breaker, stow#453).** Three WAF custom
+   rules live on the zone's `http_request_firewall_custom` phase and are
+   the anonymous-traffic breaker — a blocked request never invokes the
+   Worker, so the shed costs nothing and a broken edge cannot keep it
+   open:
+
+   - `stow maintenance: anonymous` —
+     `http.host eq "<edge host>" and not starts_with(http.request.uri.path, "/api/v1/admin") and not starts_with(http.request.uri.path, "/api/v1/scheduler")`,
+     action `block`. Sheds every public route while the trusted CI and
+     admin lanes keep working.
+   - `stow maintenance: scheduler lanes` —
+     `http.host eq "<edge host>" and (starts_with(http.request.uri.path, "<lane>") or …)`,
+     action `block`, over exactly the public routes whose handlers reach
+     the scheduler Durable Object (`scheduler_lanes` in
+     `types/src/api.rs`). The bundle byte path and catalog reads keep
+     serving — the partial reopening.
+   - `stow maintenance: all` — `http.host eq "<edge host>"`,
+     action `block`. The whole site down at zero usage.
+
+   `<edge host>` is the host of `STOW_EDGE_URL` — the rules follow
+   whichever edge they were ensured against. `deploy-edge.yml` runs
+   `stow-admin maintenance ensure --yes` with the deployed commit's
+   signed toolchain `stow-admin` (#431): it creates all three rules
+   **disabled** and the `http_request_firewall_custom` entrypoint itself
+   when the phase has never had a ruleset (the API answers error 10003),
+   matching rules by `description`, so they exist before anyone needs
+   them and a redeploy never stomps a live toggle. Toggle by hand:
+   `stow-admin maintenance on|off --scope anonymous|lanes|all --yes`,
+   with `CLOUDFLARE_API_TOKEN` (needs *Zone WAF → Edit* on
+   `waterui.dev`), `CF_ZONE_ID` and `STOW_EDGE_URL` exported;
+   `stow-admin maintenance status` prints the current state.
 
 ### Billing notifications
 
@@ -186,17 +225,79 @@ for the alert type.
 
 ## Automated deploys
 
-`.github/workflows/deploy-edge.yml` runs `skyzen deploy --provider
-cloudflare --manifest edge/Skyzen.toml` on every push to `main` that
-touches the edge (`edge/`, `types/`, `shim/`, `Cargo.lock`) and on
-`workflow_dispatch`. `skyzen deploy` resolves the declared `[[secret]]`
-values from the job environment and delivers them through `wrangler
-secret bulk`, so the Worker and its secrets move together.
+`.github/workflows/deploy-edge.yml` deploys a tested commit only: on a
+green `Test` run of a `main` push (`workflow_run`), and on
+`workflow_dispatch`, which takes the commit `sha` (verified to have a
+completed green `Test` run via `gh run list --commit`) plus
+`canary_share` (default `5`).
+
+No job waits: the deploy is four jobs, and the observation windows are
+GitHub environment wait timers, which hold no runner. Operator setup
+(once per repository): under Settings → Environments create
+
+- `deploy-canary` — wait timer `15` minutes (the canary observation
+  window, the `canary-verdict` job's delay);
+- `deploy-promoted` — wait timer `15` minutes (the post-promotion
+  window, the `promoted-verdict` job's delay).
+
+Change a window by editing that environment's wait timer; the verdict
+reads the window's bounds from timestamps, so nothing else moves.
+
+The `prepare` job uploads the new Worker version without deploying it —
+`skyzen deploy --upload-only` plans `wrangler versions upload`, and the
+declared `[[secret]]` values travel in the same upload through
+`--secrets-file` — then adds it to the deployment at `0%` so that
+version overrides reach it, runs `stow-admin scheduler migrate` against
+the candidate via the `Cloudflare-Workers-Version-Overrides` header
+(the scheduler schema version stamp must equal the candidate's own
+`SCHEMA_VERSION`, else the deploy fails before any traffic shifts),
+fires the synthetic suite through the same override — 50 requests on the
+candidate interleaved with 50 on the baseline across the site, crate
+lookup, artifact HEAD, stats and scheduler status paths, the floor the
+verdict's `--min-requests-per-version` expects on each side — and
+finally shifts `canary_share`% of traffic onto it.
+
+Promotion is gated on two verdict phases of
+`stow-admin deploy verdict`, each printing every metric's baseline and
+candidate values and exiting non-zero on a breach — which runs
+`wrangler rollback` and fails that job:
+
+- `--phase canary`, run by `canary-verdict` after the `deploy-canary`
+  wait timer: worker error rate and cpu/wall-time p50/p99 per
+  `scriptVersion` from `workersInvocationsAdaptive`, plus DO requests,
+  errors and wall time per request per `scriptVersion` from
+  `durableObjectsInvocationsAdaptiveGroups`. Both sides are measured in
+  the same window — the suite pinned its requests to each version, so
+  either side serving nothing or fewer than the suite's count fails
+  closed; DO rows report `skipped` when the Scheduler object stayed on
+  the baseline (objects are assigned one version per deployment config —
+  a reassigned object is reset once, and SQLite state survives).
+- `--phase promoted`, run by `promoted-verdict` after `promote` and the
+  `deploy-promoted` wait timer: the metrics that carry no
+  `scriptVersion` compare the post-promotion window against the
+  equal-length window ending at the deploy start — DO cpu and rows
+  read/written per DO request from `durableObjectsPeriodicGroups`, and
+  D1 rows read/written per worker request from
+  `d1AnalyticsAdaptiveGroups`. A breach here rolls back too.
+
+`stow-admin` comes from the deployed commit's signed toolchain image —
+`.github/actions/stow-toolchain` pulls
+`ghcr.io/water-rs/stow-toolchain:<sha>-<platform>` and verifies the
+cosign signature against the commit's own workflow sha, so nothing
+compiles it at deploy time.
 
 Required GitHub Actions secrets:
 
 - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` — Wrangler
-  authentication for the deploy itself.
+  authentication for the deploy itself. The watchdog workflow
+  (`watchdog.yml`) reuses `CLOUDFLARE_API_TOKEN` for its Cloudflare
+  calls, so on top of the Workers deploy scopes the token also needs
+  `Account Analytics:Read` (the GraphQL analytics and the
+  `analytics_engine/sql` `overloaded`-event query), Email Sending
+  (the `POST …/email/sending/send` alert mail), and `Zone WAF:Edit` on
+  `waterui.dev` (the maintenance rules below and the watchdog's trip).
+  The zone's id goes in the `CF_ZONE_ID` repository variable — the
+  WAF step below and `stow-admin maintenance`/`watchdog` read it.
 - `STOW_APP_PRIVATE_KEY` → Worker `GITHUB_APP_PRIVATE_KEY` — the same
   GitHub App private key release-plz mints tokens from (see Releases
   below).
@@ -207,9 +308,6 @@ Required GitHub Actions secrets:
   `0x4AAAAAAE8LjhnMsqdVhiSp`, invisible mode, hostname
   `stow.waterui.dev`); `POST /api/v1/requests` verifies every submitted
   token against it.
-- `STOW_STATS_SALT_SECRET` → Worker `STOW_STATS_SALT_SECRET` — HMAC key
-  the daily-salted install hash is derived from (any strong random
-  string; rotating it only re-baselines the active-installs estimate).
 - `CF_ANALYTICS_TOKEN` → Worker `CF_ANALYTICS_TOKEN` — the
   Analytics-Engine-read API token `GET /api/v1/stats` queries with.
 
@@ -229,36 +327,37 @@ the runner is picked from the task's target (`ubuntu-latest`,
 `macos-14`, `windows-latest`). Add a target by extending the
 `runs-on` map in the workflow.
 
-The workflow is three jobs. `build` compiles the crate with
-`contents: read` only — no secrets, no OIDC — and uploads its output
-directory as a workflow artifact. `publish` runs only when `build`
-succeeds: it downloads the output, validates it against the task and an
-independently resolved dependency closure, and only then pushes to GHCR,
-signs with cosign (keyless, `id-token: write`), registers with the edge,
-and reports to the scheduler. `report-failure` runs when `build` does
-not succeed — a bare `ubuntu-latest` job holding only `id-token: write`,
-no checkout, no toolchain — and POSTs the failure report to the
-scheduler directly. See
+The workflow is two jobs and needs no edge URL: `build` compiles the
+crate with `contents: read` only — no secrets, no OIDC — and uploads
+its output directory as a workflow artifact. `publish` runs only when
+`build` succeeds: it downloads the output, validates it against the
+task and an independently resolved dependency closure, and only then
+pushes the bundle plus the task's `Vec<ArtifactRecord>` (as one signed
+OCI artifact tagged `records-<rustc>-<task_id hash>`) to GHCR, cosign-signing both
+(keyless, `id-token: write`). The job never calls the edge — GitHub's
+`workflow_run` webhook delivery reports the outcome instead, and the
+edge checks the records artifact exists before completing the task. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
 
-Repository configuration the `publish` and `report-failure` jobs read:
-
-| Kind | Name | Value |
-|---|---|---|
-| variable | `STOW_EDGE_URL` | `https://stow.waterui.dev` |
-| variable | `SCHEDULER_URL` | `https://stow.waterui.dev/api/v1/scheduler` |
-| variable | `STOW_OIDC_AUDIENCE` | `https://stow.waterui.dev` — the `aud` the job requests when it mints its OIDC token; must equal the edge's `STOW_OIDC_AUDIENCE` var |
+`build-crate.yml` reads no repository variables — `run-name` carries
+`<rustc>-<task_id>` so the webhook's `display_title` parses back into
+the run's rustc and task id.
 
 `GHCR_TOKEN` is the job's own `GITHUB_TOKEN` (`packages: write`), and
 cosign signs with the job's OIDC identity, so the certificate subject is
 `https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
 — the identity `stow_types::trusted_builder` pins and the CLI verifies.
 
-`index-publish.yml` (the artifact-index lane) reads the same
-`STOW_EDGE_URL` and `STOW_OIDC_AUDIENCE` variables and the same
-`id-token: write` grant — nothing beyond the existing OIDC grant needs
-configuring.
+`index-publish.yml` (the artifact-index lane) folds the signed
+records artifacts into per-`(target, rustc)` slices and pushes them to
+GHCR under the same keyless identity scheme (the pinned
+`index-publish.yml` certificate identity). Its `stow_edge_url`
+dispatch input is optional: when it names a live edge the job also
+POSTs the rows to `/api/v1/admin/artifacts/sync` (the D1 `artifacts`
+catalog mirror the admission gate reads) and prints the export report;
+when empty — Cloudflare down or the edge unprovisioned — the publish
+still lands.
 
 Every artifact is a tag of the single GHCR package
 `ghcr.io/water-rs/stow-cache` —
@@ -283,39 +382,58 @@ the `GITHUB_APP_PRIVATE_KEY` secret are used to sign an RS256 JWT
 (WebCrypto) and exchange it at the GitHub API. The `stow-ci` App is
 installed on `water-rs` (selected repositories: `water-rs/stow`) with
 **Actions: Read and write**, which is the permission the dispatch call
-requires. Minted tokens are cached in the Durable Object's SQL storage
-and reused while more than five minutes of validity remain.
+requires. The `incident` issue record is the external watchdog's (#450)
+— the App deliberately carries no `issues` grant, because the edge is
+untrusted serving infrastructure. Minted tokens are
+cached in the Durable Object's SQL storage and reused while more than
+five minutes of validity remain.
 
 The crucial property: CI never holds a Cloudflare API token, and no
 shared secret exists anywhere on the edge write surface — every trusted
 call is a GitHub identity, verified as described below.
 
+### GitHub webhook — `workflow_run`
+
+Task completion reaches the scheduler through GitHub's webhook, not
+through CI: `build-crate.yml` sets `run-name` to `<rustc>-<task_id>` and a
+repository webhook POSTs `workflow_run` `completed` events to
+`https://stow.waterui.dev/api/v1/github/workflow-run`. Configure it once
+in the repo settings:
+
+- **Payload URL:** `https://stow.waterui.dev/api/v1/github/workflow-run`
+- **Content type:** `application/json`
+- **Secret:** the `STOW_GITHUB_WEBHOOK_SECRET` value (the edge verifies
+  `X-Hub-Signature-256` with it)
+- **Events:** *Workflow runs* only
+- **Active:** on
+
+The route accepts a delivery only when the run is `completed` for
+`build-crate.yml` on `main`; it parses `display_title` into the run's
+rustc and task id and completes the task only after the records
+artifact for that task
+exists and verifies in GHCR, so a spoofed success cannot mint a catalog
+entry.
+
 ## Trusted-endpoint authentication
 
 Every authenticated endpoint — the whole `/api/v1/admin/*` surface
 (artifact registration, listing, inspection and prune, coverage, the
-panic switch, queue transitions, the admin index export, preheat
+queue transitions, the admin index export, preheat
 planning, operator status) plus `POST /api/v1/scheduler/tasks/submit`
 and `POST /api/v1/scheduler/complete` — takes
 `Authorization: Bearer <credential>` and resolves the credential to a
 GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
 
-- **GitHub Actions OIDC JWT.** The `publish` job of `build-crate.yml`
-  already holds `id-token: write` for cosign; the same grant mints a
-  per-run JWT (`ci/src/auth.rs` calls the `ACTIONS_ID_TOKEN_REQUEST_*`
-  endpoint with `audience=$STOW_OIDC_AUDIENCE`), and the
-  `report-failure` job mints one through the same endpoint for its
-  `/complete` POST. The edge verifies the
-  RS256 signature against GitHub's JWKS
+- **GitHub Actions OIDC JWT.** `preheat-admin.yml`'s submit step mints
+  a per-run JWT (`audience=$STOW_OIDC_AUDIENCE`), and so does
+  `index-publish.yml` when it syncs the D1 catalog. The edge verifies
+  the RS256 signature against GitHub's JWKS
   (`token.actions.githubusercontent.com/.well-known/jwks`, fetched per
   call) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
   `repository` (to the `GITHUB_REPO` var), `exp`/`nbf`, and
-  `job_workflow_ref`. Register and `/complete` additionally require
-  `job_workflow_ref` to be exactly
-  `…/build-crate.yml@refs/heads/main` — the same identity the cosign
-  signature pins; `tasks/submit` accepts any workflow running inside the
-  trusted repo (that is how `preheat-admin.yml` calls it). Nothing is
-  stored or rotated — a leaked run token dies with the run.
+  `job_workflow_ref`. `tasks/submit` accepts any workflow running inside
+  the trusted repo. Nothing is stored or rotated — a leaked run token
+  dies with the run.
 - **Repo-push credential.** `stow-admin` and the local dev loop send the
   operator's own credential (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth
   token`). The edge probes push capability directly — a GET on the repo's
@@ -334,10 +452,30 @@ recorded in the worker log on each write.
 ## Initial cache population
 
 The cache preheats itself — `preheat-cron.yml` dispatches a wave
-daily and on every new stable rustc. To seed it by hand before that
-lands, run the top-binaries preheat from a machine that has `STOW_EDGE_URL` exported and a GitHub credential with
-push access to `water-rs/stow` — `GH_TOKEN`/`GITHUB_TOKEN`, or an
-authenticated `gh` CLI (`gh auth login`):
+daily and on every new stable rustc. To seed it by hand — including
+while Cloudflare is fully offline — `preheat manual` needs only a
+GitHub credential with push access to `water-rs/stow` and network to
+crates.io and GHCR; it resolves the graph, dispatches
+`build-crate.yml` runs itself, and publishes each index slice as its
+layer lands:
+
+```sh
+GH_TOKEN=<operator token> \
+stow-admin preheat manual \
+    --crates crates.txt \        # one `name` or `name@version` per line
+    --rustc-version 1.91.1     --in-flight 45                # default; stays under the 60-runner pool
+```
+
+The same driver takes `--projects preheat/projects.toml` for a
+repository list and `--edge-url https://stow.waterui.dev` (or
+`STOW_EDGE_URL`) when the edge is up and the D1 sync should run. It is
+resumable — coverage is recomputed from the published index, so a
+re-run dispatches only what is still missing — and exits non-zero with
+the failed runs' URLs when any task does not land.
+
+The scheduler-driven lanes still work the same way when the edge is up —
+from a machine that has `STOW_EDGE_URL` exported and the same GitHub
+credential:
 
 ```sh
 stow-admin preheat top-binaries \
@@ -359,108 +497,15 @@ pool. The library pool and the binary pool are independent.
 ## Operating
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
-- **Under attack:** `stow-admin panic on`, watch the request graph,
-  `stow-admin panic off`. The flag lives in the scheduler Durable Object;
-  while it is set every anonymous route answers `503` with
-  `Retry-After: 300` and the trusted CI endpoints keep working.
-  `stow-admin panic status` prints the current state.
+- **Under attack:** `stow-admin maintenance on --scope anonymous`, watch
+  the request graph, `stow-admin maintenance off --scope anonymous`. The
+  rule lives on the `waterui.dev` zone's `http_request_firewall_custom`
+  phase — blocked requests never invoke the Worker — and the trusted CI
+  endpoints keep working. `--scope lanes` sheds only the scheduler-backed
+  lanes (bundle bytes keep serving); `--scope all` takes the whole
+  hostname down. `stow-admin maintenance status` prints all three
+  rules' state.
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
-- **Rows without a published bundle:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest = ''"`.
-  Such rows predate bundle publishing and are a miss until republished, so
-  run the backfill right after the deploy that adds the column, from a
-  machine with package write access:
-
-  ```sh
-  GHCR_USERNAME=<github user> GHCR_TOKEN=<PAT with write:packages> \
-  STOW_EDGE_URL=https://stow.waterui.dev \
-  stow-build backfill-bundles --batch 200
-  ```
-
-  The edge bearer is the developer's GitHub token (`GH_TOKEN`, else
-  `gh auth token`), which must have push access to `water-rs/stow`.
-- **Rows with no measured glibc floor:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest != '' AND min_glibc IS NULL"`.
-  Rows that predate the `min_glibc` column are invisible to v2 index
-  readers — the index endpoint omits them. Rather than let a signed
-  export silently shrink while any remain, the index endpoint *refuses*
-  to serve the first page of an affected slice until the backlog
-  drains: `index-publish.yml` fails loud with the unmeasured count
-  instead of signing an index missing rows. (The alternative — the
-  export running the backfill itself — was rejected: a heavy,
-  credentialed repair pass does not belong inside what the publish
-  workflow runs as a cheap read.) One `stow-admin` pass drains it: it
-  pages the `unmeasured-glibc` listing, pulls each row's stored
-  `<tag>.bundle` anonymously (no registry credential — the package is
-  public), measures the highest `GLIBC_x.y` version-needed entry across
-  the bundle's `files/` members, and re-registers the record
-  (push-caller binding, no `task_id`). A row whose measured floor is
-  above the builder baseline (2.28) is also enqueued as a scheduler
-  task through the trusted `tasks/submit` path — the sysroot is not
-  part of the compile key, so the rebuild lands the same identity and
-  the register upsert replaces the row with its servable floor — and
-  prints the touched `(target, rustc)` slices for the follow-up
-  publish. The backfill never publishes itself: index slices are
-  cosign-signed keyless and clients accept only the
-  `index-publish.yml`-on-main certificate identity, so a slice signed
-  under an operator or other-workflow identity would overwrite the
-  production slice with one every client rejects:
-
-  ```sh
-  STOW_EDGE_URL=https://stow.waterui.dev \
-  stow-admin index backfill-min-glibc --yes
-  ```
-
-  **Deploy order for the `min_glibc` change:**
-
-  1. Deploy the edge — register now accepts `min_glibc`, and index
-     exports begin refusing any slice that still has unmeasured rows.
-  2. Pause dispatch *before* merging the workflow change: set
-     `STOW_MAX_CONCURRENT_JOBS = "0"` in `edge/Skyzen.toml`'s
-     `[cloudflare.vars]` and redeploy the worker. A limit of `0` is a
-     paused scheduler, not an unreachable limit: the claim pass sends
-     nothing while both submit lanes keep queueing tasks — the backlog
-     waits, nothing is dropped. (`stow-admin panic on` is not a
-     substitute: it 503s anonymous routes and the dispatch loop keeps
-     running.)
-  3. Merge the `build-crate.yml` sysroot change to main. From here a
-     dispatched build resolves its task against a v2 slice that does
-     not exist yet — coverage reads as empty and the build refuses —
-     which is what the pause is for. Builds dispatched after step 6
-     land at or below 2.28.
-  4. Run `backfill-min-glibc --yes` once from an operator machine: it
-     measures each stored bundle's floor, re-registers the row,
-     enqueues a trusted rebuild for every row above 2.28 (they pend in
-     the queue while dispatch is paused), and prints the touched
-     `(target, rustc)` slices. The edge bearer may be the operator's
-     `GH_TOKEN`/`gh auth token` (push access to `water-rs/stow`) or a
-     `GITHUB_TOKEN` with contents:write — the push-capable check
-     accepts installation tokens, which is how the command runs in
-     practice.
-  5. Publish every slice as v2 — the reader fails fast on the old
-     format, so no slice may stay v1. This is the step that signs:
-     `index-publish.yml` iterates `stow-admin index targets` and runs
-     `index export` + `index publish` + `index report` per slice on
-     main, the only certificate identity clients accept. Dispatch it on
-     main; nothing else may write index slices.
-  6. Unpause: restore `STOW_MAX_CONCURRENT_JOBS` (production `45`) and
-     redeploy, then kick a dispatch pass so the queue doesn't wait on an
-     unrelated submit — an empty trusted submit runs the dispatch pass
-     and the alarm schedule without enqueueing anything:
-
-     ```sh
-     curl -fsS -X POST https://stow.waterui.dev/api/v1/scheduler/tasks/submit \
-       -H "Authorization: Bearer $(gh auth token)" \
-       -H "Content-Type: application/json" \
-       -d '[]'
-     ```
-
-     The enqueued rebuilds dispatch at the 2.28 floor and the
-     register upsert replaces each over-floor row as builds complete.
-  Without `--yes` the command previews the first listing page and
-  changes nothing; the apply drains the whole listing in
-  `--limit`-sized pages (default 1000), so one run covers any backlog.
-  It needs the usual operator GitHub credential (`GH_TOKEN`/`gh auth
-  token`, push access to `water-rs/stow`) plus network reach to the
-  registry (`STOW_REGISTRY_BASE_URL` overrides for a mock).
 - **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
   package (every artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.

@@ -1,0 +1,40 @@
+stow dispatch freeze engaged — the scheduler is no longer handing queue
+rows to CI runners, so the current damage stops here.
+
+Frozen at: {{ frozen_at }}
+{% if manual %}Reason: manual operator freeze (POST /api/v1/admin/dispatch-freeze)
+{% else %}{% if let Some(trip) = trip %}Reason: systematic build failure trip
+
+  window:      {{ trip.window_minutes }}m
+  outcomes:    {{ trip.outcomes }} completed attempts
+  failures:    {{ trip.failures }} ({{ trip.failure_percent }}%)
+  condition:   >= {{ trip.min_outcomes }} outcomes AND >= {{ trip.fail_percent }}% failures,
+               evaluated on the fleet stream and on each target
+{% if trip.fleet_tripped %}  tripped:     fleet-wide stream
+{% endif %}{% for target in trip.targets %}  {% if target.tripped %}tripped:     {% else %}             {% endif %}{{ target.target }} — {{ target.failures }}/{{ target.outcomes }} failed
+{% endfor %}{% if !trip.classes.is_empty() %}
+  failure classes:
+{% for class in trip.classes %}    {{ class.count }}x {{ class.class }}
+{% endfor %}{% endif %}{% if !trip.example_run_urls.is_empty() %}
+  example runs:
+{% for url in trip.example_run_urls %}    {{ url }}
+{% endfor %}{% endif %}{% endif %}{% if let Some(cost) = cost %}Reason: cost trip — daily Workers Paid budget crossed
+
+  metric:      {{ cost.metric_label }}
+  used today:  {{ cost.used }}
+  budget:      {{ cost.budget }}
+{% if !cost.over.is_empty() %}
+  over budget:
+{% for entry in cost.over %}    {{ entry.metric_label }} — {{ entry.used }} of {{ entry.budget }}
+{% endfor %}{% endif %}{% if !cost.top_routes.is_empty() %}
+  today's top request groups (by scriptName):
+{% for route in cost.top_routes %}    {{ route.label }} — {{ route.requests }} requests
+{% endfor %}{% endif %}
+{% endif %}{% endif %}
+The queue still accepts misses; they stay pending until a human clears
+the freeze. Nothing unfreezes automatically.
+
+Read or clear:
+  {{ status_command }}
+  {{ clear_command }}
+

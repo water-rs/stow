@@ -1,8 +1,8 @@
 //! Worker-side graph resolution through `stow-resolve`.
 //!
 //! Every lane that expands a name into build tasks — the human request
-//! lane, the preheat lanes (crates.io binaries and GitHub projects), and
-//! the register-scope closure check — resolves the published manifest
+//! lane and the preheat lanes (crates.io binaries and GitHub projects) —
+//! resolves the published manifest
 //! itself rather than walking crates.io metadata by hand. The resolver is
 //! cargo's own code carried into `stow-resolve`; the worker supplies the
 //! three things a real `cargo` invocation would have read from the machine:
@@ -15,8 +15,10 @@
 //!   --locked` reproduces — the projects lane drops the committed
 //!   lockfile so its resolve lands on the latest semver-compatible
 //!   versions, as it did when the admin CLI ran `cargo metadata` locally;
-//!   the dropped lockfile's pins still admit the yanked versions they
-//!   name, cargo's own rule ([`stow_resolve::ops::lockfile_package_ids`]);
+//!   the dropped lockfile travels into the session, where its registry
+//!   pins still admit the yanked versions they name and its git pins
+//!   lock each git dep to the sha they name — cargo's own lockfile
+//!   rules;
 //! - the registry: cargo's sparse-index machinery over a [`worker::Fetch`]
 //!   transport, with the index `.cache` files persisting under the shared
 //!   in-memory cargo home for the whole request;
@@ -47,15 +49,13 @@ use crate::errors::ResolverError;
 use crate::fetch_guard::OutboundPool;
 use semver::Version;
 use skyzen_services::Db;
-use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitKind};
-use stow_resolve::core::PackageId;
+use stow_resolve::api::{self, StowUnit, StowUnitKey, StowUnitKind};
 use stow_resolve::github_tree;
-use stow_resolve::ops::lockfile_package_ids;
 use stow_resolve::rustc_data;
 use stow_resolve::sources::registry::IndexCachesRoot;
 use stow_resolve::util::context::{Env, GlobalContext};
 use stow_resolve::util::fs::{MemoryVfs, Vfs, poll_scoped};
-use stow_resolve::util::network::http_async::{BodyStream, Client, HttpClient};
+use stow_resolve::util::network::http_async::{self, BodyStream, Client, HttpClient};
 use stow_resolve::util::shell::Shell;
 use stow_resolve::util::tarball::{self, TarPrefix};
 use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource, runner_family};
@@ -182,11 +182,12 @@ struct SourceWorkspace {
     members_are_crates_io: bool,
     /// Whether the tree carried a `Cargo.lock` into the resolve.
     ships_lockfile: bool,
-    /// The crates.io and git pins of the dropped workspace lockfiles,
-    /// admissible to version selection even when yanked — cargo's own
-    /// rule for the versions a project's `Cargo.lock` names. Empty for
-    /// lanes that keep their lockfile or never had one.
-    yanked_allowlist: BTreeSet<PackageId>,
+    /// Contents of the workspace root's `Cargo.lock`, dropped from the
+    /// tree but carried into the resolve — its registry pins stay
+    /// admissible while yanked and each git pin locks that dep's sha,
+    /// cargo's own lockfile rules. `None` for lanes that keep their
+    /// lockfile or never had one.
+    dropped_lockfile: Option<String>,
 }
 
 /// The in-memory tree every resolve in this request shares. The
@@ -251,49 +252,6 @@ pub async fn expand_crate_request_on_targets(
         ));
     }
     Ok(plans)
-}
-
-/// The name/version closure a dispatched task may publish — every package
-/// the resolve pulls into the unit graph is inside it. Register-scope
-/// check for `task_binding`, replacing the old crates.io closure walk.
-///
-/// # Errors
-/// [`ResolverError`] on fetch, parse, or resolution failures.
-pub async fn expand_task_closure(
-    crate_name: &CrateName,
-    version: &Version,
-    seed_features: &BTreeSet<String>,
-    target: &TargetTriple,
-    rustc_version: &WireRustcVersion,
-    rustc_data_base_url: Option<&str>,
-    pool: &OutboundPool,
-) -> Result<BTreeSet<(CrateName, CrateVersion)>, ResolverError> {
-    let http = fetch_http(pool);
-    let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
-    let output = resolve_workspace(
-        &http,
-        &source,
-        seed_features,
-        no_default_features_for(seed_features),
-        target,
-        rustc_version,
-        rustc_data_base_url,
-        &IndexCachesRoot::default(),
-    )
-    .await?;
-    output
-        .units
-        .iter()
-        .filter(|unit| unit.is_crates_io)
-        .map(|unit| {
-            Ok((
-                CrateName::parse(unit.name.clone()).map_err(ResolverError::Identity)?,
-                CrateVersion::new(
-                    semver::Version::parse(&unit.version).expect("resolver emits semver versions"),
-                ),
-            ))
-        })
-        .collect::<Result<_, ResolverError>>()
 }
 
 /// What an admin resolve lane learns about the source: publish-shape
@@ -456,7 +414,7 @@ async fn crate_workspace(
     )
     .await
     .map_err(|error| {
-        ResolverError::CratesIo(format!("unpack {crate_name}-{version}.crate: {error}"))
+        ResolverError::Upstream(format!("unpack {crate_name}-{version}.crate: {error}"))
     })?;
     tracing::info!(crate = %crate_name, %version, files = files.len(), "resolve: source workspace built");
     build_workspace(files, keep_lockfile, true)
@@ -475,7 +433,17 @@ async fn github_workspace(
     let tree = github_tree::fetch_github_tree(&Client::new(http.clone()), repo, git_ref)
         .await
         .map_err(|error| {
-            ResolverError::CratesIo(format!("fetch {repo}@{git_ref} tree: {error:#}"))
+            if error
+                .chain()
+                .any(<dyn std::error::Error + 'static>::is::<github_tree::RepoNotFound>)
+            {
+                ResolverError::RepoNotFound {
+                    repo: repo.to_owned(),
+                    git_ref: git_ref.to_owned(),
+                }
+            } else {
+                ResolverError::Upstream(format!("fetch {repo}@{git_ref} tree: {error:#}"))
+            }
         })?;
     tracing::info!(
         repo,
@@ -509,23 +477,20 @@ fn build_workspace(
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let ships_lockfile = keep_lockfile && files.contains_key(&ws_root.join("Cargo.lock"));
-    // The workspace root's `Cargo.lock` leaves its pins in
-    // `yanked_allowlist` before it goes: a version the project locked
-    // stays selectable even though the index yanked it, which is what
-    // cargo itself does with a lockfile in hand. The set is admission,
-    // not preference — nothing else about selection changes.
-    let yanked_allowlist = match files.get(&ws_root.join("Cargo.lock")) {
-        Some(data) if !keep_lockfile => {
-            // A lockfile cargo could not read fails cargo's own build of
-            // the project, so it fails this resolve too.
-            let contents = std::str::from_utf8(data).map_err(|error| {
-                ResolverError::BadRequest(format!("workspace Cargo.lock is not UTF-8: {error}"))
-            })?;
-            lockfile_package_ids(contents).map_err(|error| {
-                ResolverError::BadRequest(format!("workspace Cargo.lock: {error:#}"))
-            })?
-        }
-        _ => BTreeSet::new(),
+    // The workspace root's `Cargo.lock` travels into the resolve as
+    // `dropped_lockfile` before it goes: the versions it pins stay
+    // admissible even when the index yanked them, and each git dep
+    // locks to the sha it names — which is what cargo itself does
+    // with a lockfile in hand.
+    let dropped_lockfile = match files.get(&ws_root.join("Cargo.lock")) {
+        Some(data) if !keep_lockfile => Some(
+            std::str::from_utf8(data)
+                .map_err(|error| {
+                    ResolverError::BadRequest(format!("workspace Cargo.lock is not UTF-8: {error}"))
+                })?
+                .to_owned(),
+        ),
+        _ => None,
     };
     for (path, data) in files {
         // Every `Cargo.lock` under the selected workspace is dropped
@@ -544,7 +509,7 @@ fn build_workspace(
         cargo_home: PathBuf::from(CARGO_HOME_DIR),
         members_are_crates_io,
         ships_lockfile,
-        yanked_allowlist,
+        dropped_lockfile,
     })
 }
 
@@ -888,20 +853,37 @@ fn enqueue_requests_inner(
     (requests, uncovered)
 }
 
+/// Classify a resolver-machinery failure by what produced it: an error
+/// chain containing the transport's [`http_async::Error`] — every fetch
+/// [`Client`] makes marks its failures that way — is an upstream problem
+/// (5xx, retryable). Anything else is the project's own manifest or
+/// dependency graph failing, which the caller answers 422 — the same
+/// request resolves the same way.
+fn classify_resolve_failure(what: &str, error: &anyhow::Error) -> ResolverError {
+    if error
+        .chain()
+        .any(<dyn std::error::Error + 'static>::is::<http_async::Error>)
+    {
+        ResolverError::Upstream(format!("{what}: {error:#}"))
+    } else {
+        ResolverError::Unresolvable(format!("{what}: {error:#}"))
+    }
+}
+
 /// `GET` the URL body — one fetch, no retry: the index machinery retries
 /// on its own machinery's `Retry` policy; tarballs and one-shot GETs pass
 /// through the same transport.
 async fn get_bytes(client: &ResolveHttp, url: &str) -> Result<Vec<u8>, ResolverError> {
     let request = http::Request::get(url)
         .body(Vec::new())
-        .map_err(|error| ResolverError::CratesIo(format!("build request {url}: {error}")))?;
+        .map_err(|error| ResolverError::Upstream(format!("build request {url}: {error}")))?;
     let response = client
         .request(request)
         .await
-        .map_err(|error| ResolverError::CratesIo(format!("fetch {url}: {error}")))?;
+        .map_err(|error| ResolverError::Upstream(format!("fetch {url}: {error}")))?;
     let (parts, body) = response.into_parts();
     if !(200..300).contains(&parts.status.as_u16()) {
-        return Err(ResolverError::CratesIo(format!(
+        return Err(ResolverError::Upstream(format!(
             "{url} returned HTTP {}",
             parts.status
         )));
@@ -919,14 +901,14 @@ async fn get_stream(
 ) -> Result<(BodyStream, Option<u64>), ResolverError> {
     let request = http::Request::get(url)
         .body(Vec::new())
-        .map_err(|error| ResolverError::CratesIo(format!("build request {url}: {error}")))?;
+        .map_err(|error| ResolverError::Upstream(format!("build request {url}: {error}")))?;
     let response = client
         .request_stream(request)
         .await
-        .map_err(|error| ResolverError::CratesIo(format!("fetch {url}: {error}")))?;
+        .map_err(|error| ResolverError::Upstream(format!("fetch {url}: {error}")))?;
     let (parts, body) = response.into_parts();
     if !(200..300).contains(&parts.status.as_u16()) {
-        return Err(ResolverError::CratesIo(format!(
+        return Err(ResolverError::Upstream(format!(
             "{url} returned HTTP {}",
             parts.status
         )));
@@ -955,22 +937,7 @@ async fn fetch_rustc_data(
     let url = format!("{}/{path}", base.trim_end_matches('/'));
     let bytes = get_bytes(http, &url).await?;
     String::from_utf8(bytes)
-        .map_err(|error| ResolverError::CratesIo(format!("{url} is not UTF-8: {error}")))
-}
-
-/// The `rustc -vV`/`--print cfg` inputs one resolve needs — vendored
-/// tables first, then the generated tree `STOW_RUSTC_DATA_BASE_URL`
-/// serves for a stable newer than the bundle.
-async fn rustc_inputs(
-    http: &ResolveHttp,
-    base_url: Option<&str>,
-    rustc_version: &WireRustcVersion,
-    host_triple: &str,
-    cfg_keys: &BTreeSet<String>,
-) -> Result<(String, BTreeMap<String, Vec<String>>), ResolverError> {
-    let verbose = rustc_verbose(http, base_url, rustc_version, host_triple).await?;
-    let cfg = rustc_cfg(http, base_url, rustc_version, cfg_keys).await?;
-    Ok((verbose, cfg))
+        .map_err(|error| ResolverError::Upstream(format!("{url} is not UTF-8: {error}")))
 }
 
 /// `rustc -vV` stdout for one host triple — the vendored table first,
@@ -1088,7 +1055,7 @@ async fn resolve_session_outputs(
             Env::new(),
             false,
         )
-        .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
+        .map_err(|error| classify_resolve_failure("resolver context", &error))?;
         gctx.set_http(Client::new(http.clone()));
         gctx.share_index_caches(index_caches.clone());
         tracing::info!("resolve: session prepare begin");
@@ -1109,11 +1076,11 @@ async fn resolve_session_outputs(
                 members_are_crates_io: source.members_are_crates_io,
                 rustc_verbose_version: session_rustc,
                 cfg,
-                yanked_allowlist: source.yanked_allowlist.clone(),
+                dropped_lockfile: source.dropped_lockfile.clone(),
             },
         )
         .await
-        .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+        .map_err(|error| classify_resolve_failure("resolve failed", &error))?;
         let mut outputs = Vec::with_capacity(targets.len());
         for (target, host_triple) in targets.iter().zip(hosts.iter()) {
             tracing::info!(target = %target, "resolve: projection begin");
@@ -1124,7 +1091,7 @@ async fn resolve_session_outputs(
                     &verbose_by_host[host_triple],
                 )
                 .await
-                .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
+                .map_err(|error| classify_resolve_failure("resolve failed", &error))?;
             // Wasm linear memory never shrinks, so the size at resolve end
             // is the request's high-water mark against the isolate's
             // 128 MiB cap.
@@ -1137,89 +1104,6 @@ async fn resolve_session_outputs(
             outputs.push(output);
         }
         Ok(outputs)
-    })
-    .await
-}
-
-/// Run one resolve against the shared workspace for one target.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the resolve needs the request's fields plus the shared index caches"
-)]
-async fn resolve_workspace(
-    http: &ResolveHttp,
-    source: &SourceWorkspace,
-    seed_features: &BTreeSet<String>,
-    no_default_features: bool,
-    target: &TargetTriple,
-    rustc_version: &WireRustcVersion,
-    rustc_data_base_url: Option<&str>,
-    index_caches: &IndexCachesRoot,
-) -> Result<api::StowResolveOutput, ResolverError> {
-    let host_triple = runner_family(target.as_str())
-        .ok_or_else(|| {
-            ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
-        })?
-        .host_triple()
-        .to_string();
-    let cfg_keys = BTreeSet::from([host_triple.clone(), target.as_str().to_owned()]);
-    tracing::info!(target = %target, "resolve: rustc inputs begin");
-    let (verbose, cfg) = rustc_inputs(
-        http,
-        rustc_data_base_url,
-        rustc_version,
-        &host_triple,
-        &cfg_keys,
-    )
-    .await?;
-    tracing::info!(target = %target, "resolve: rustc inputs ready");
-
-    // The ambient VFS is thread-local while resolves interleave on the
-    // isolate's single thread, so the section that depends on it swaps
-    // this request's tree in for each poll and restores it afterwards —
-    // no cross-request lock: a request the runtime abandons mid-resolve
-    // can no longer strand every later resolve on a permit nobody
-    // releases.
-    let vfs = source.vfs.clone();
-    tracing::info!(target = %target, "resolve: vfs section begin");
-    poll_scoped(vfs, async move {
-        let mut gctx = GlobalContext::new_for_resolve(
-            PathBuf::from(WORKSPACE_DIR),
-            source.cargo_home.clone(),
-            Shell::new(),
-            Env::new(),
-            false,
-        )
-        .map_err(|error| ResolverError::CratesIo(format!("resolver context: {error}")))?;
-        gctx.set_http(Client::new(http.clone()));
-        gctx.share_index_caches(index_caches.clone());
-        tracing::info!(target = %target, "resolve: api::resolve begin");
-        let output = api::resolve(
-            &gctx,
-            StowResolveInput {
-                manifest_path: source.manifest_path.clone(),
-                filter_platforms: vec![target.as_str().to_owned()],
-                host_triple,
-                features: seed_features.iter().cloned().collect(),
-                all_features: false,
-                no_default_features,
-                members_are_crates_io: source.members_are_crates_io,
-                rustc_verbose_version: verbose.clone(),
-                cfg,
-                yanked_allowlist: source.yanked_allowlist.clone(),
-            },
-        )
-        .await
-        .map_err(|error| ResolverError::CratesIo(format!("resolve failed: {error:#}")))?;
-        // Wasm linear memory never shrinks, so the size at resolve end is
-        // the request's high-water mark against the isolate's 128 MiB cap.
-        tracing::info!(
-            target = %target,
-            units = output.units.len(),
-            memory = linear_memory_bytes(),
-            "resolve: api::resolve done"
-        );
-        Ok(output)
     })
     .await
 }
@@ -1491,12 +1375,13 @@ mod tests {
         );
     }
 
-    /// The dropped workspace-root `Cargo.lock` leaves its sourced pins in
-    /// the `yanked_allowlist` — source-less member entries contribute
-    /// nothing, and a lane that keeps the lockfile admits them through
-    /// the previous-resolve path instead.
+    /// The dropped workspace-root `Cargo.lock` travels into the resolve
+    /// as `dropped_lockfile` contents; a lane that keeps the lockfile
+    /// leaves it in the tree for the previous-resolve path instead, and
+    /// a lockfile nested under a member dir is dropped without being
+    /// carried.
     #[test]
-    fn build_workspace_feeds_lockfile_pins_to_allowlist() {
+    fn build_workspace_carries_dropped_lockfile() {
         let lockfile = concat!(
             "version = 4\n\n",
             "[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\n\n",
@@ -1517,21 +1402,81 @@ mod tests {
         .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
         .collect();
         let ws = build_workspace(files.clone(), false, false).unwrap();
-        let names: BTreeSet<_> = ws
-            .yanked_allowlist
-            .iter()
-            .map(|id| (id.name().as_str().to_string(), id.version().to_string()))
-            .collect();
-        assert_eq!(
-            names,
-            BTreeSet::from([
-                ("bisync".to_string(), "0.3.0".to_string()),
-                ("tool".to_string(), "1.2.3".to_string()),
-            ])
-        );
+        let lockfile_path = Path::new(WORKSPACE_DIR).join("Cargo.lock");
+        assert_eq!(ws.dropped_lockfile.as_deref(), Some(lockfile));
+        assert!(!ws.vfs.exists(&lockfile_path));
 
         let kept = build_workspace(files, true, false).unwrap();
-        assert!(kept.yanked_allowlist.is_empty());
+        assert!(kept.dropped_lockfile.is_none());
+        assert!(kept.vfs.exists(&lockfile_path));
+    }
+
+    /// `classify_resolve_failure` splits a resolve error on whether its
+    /// chain carries the transport's own [`http_async::Error`]: a manifest
+    /// whose requirement no recorded index version satisfies is the
+    /// project's problem (`Unresolvable` → 422), while a crate the index
+    /// fetch cannot even serve fails on the wire (`Upstream` → 5xx).
+    #[tokio::test]
+    async fn resolve_failure_classifies_graph_vs_transport() {
+        let http: ResolveHttp = Rc::new(RecordedHttp::new(PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../resolve/tests/resolve-diff-fixture/http"
+        ))));
+        let rustc_version = WireRustcVersion::parse("1.98.1").unwrap();
+        let targets = vec![TargetTriple::parse("wasm32-unknown-unknown").unwrap()];
+        let resolve = |manifest: &'static str| {
+            let http = http.clone();
+            let rustc_version = rustc_version.clone();
+            let targets = targets.clone();
+            async move {
+                let files: BTreeMap<PathBuf, Vec<u8>> =
+                    [("Cargo.toml", manifest), ("src/lib.rs", "")]
+                        .into_iter()
+                        .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
+                        .collect();
+                let source = build_workspace(files, false, false).expect("workspace");
+                source_resolve(&http, &source, &targets, &rustc_version, 0, None).await
+            }
+        };
+
+        // `unicode-ident` is in the recorded index but not at 999: the
+        // index answers, cargo's resolver rejects — the project's graph.
+        let error = resolve(concat!(
+            "[package]\n",
+            "name = \"app\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+            "\n",
+            "[dependencies]\n",
+            "unicode-ident = \"=999.0.0\"\n",
+        ))
+        .await
+        .err()
+        .expect("an unsatisfiable requirement fails");
+        assert!(
+            matches!(error, ResolverError::Unresolvable(_)),
+            "expected Unresolvable, got {error:?}"
+        );
+        assert!(error.to_string().contains("unicode-ident"));
+
+        // `nope-not-in-recording` has no recorded index response: the
+        // fetch itself fails — upstream transport, not the project's.
+        let error = resolve(concat!(
+            "[package]\n",
+            "name = \"app\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+            "\n",
+            "[dependencies]\n",
+            "nope-not-in-recording = \"1\"\n",
+        ))
+        .await
+        .err()
+        .expect("an unservable index fetch fails");
+        assert!(
+            matches!(error, ResolverError::Upstream(_)),
+            "expected Upstream, got {error:?}"
+        );
     }
 
     fn unit(

@@ -1,0 +1,86 @@
+name: Watchdog
+
+# The external incident watchdog (stow#450): every 15 minutes it reads
+# the Cloudflare usage/health signals, the build-pipeline failure rate,
+# the scheduler queue and the public endpoints. On a breach it trips the
+# breaker itself — the `stow maintenance: anonymous` WAF rule on,
+# dispatching workflows disabled — then
+# keeps the `incident` issue and the alert mail current. It runs outside
+# the edge, so a broken edge cannot silence it.
+#
+# A detected incident is a normal exit; the job fails only when the
+# watchdog itself failed (an unreadable signal, a trip that did not
+# apply, a notification that did not land). Recovery is manual:
+# `stow-admin watchdog clear` un-trips — the watchdog never un-trips on
+# its own.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Evaluate and report without actuating or notifying.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  # Disable/enable the dispatching workflows on a trip/clear.
+  actions: write
+  # Open, update, comment and close the incident issue.
+  issues: write
+  # Mints the Actions OIDC JWT the edge's admin routes accept.
+  id-token: write
+  # Pull the signed toolchain artifact from ghcr.io/water-rs/stow-toolchain.
+  packages: read
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # A 15-minute cadence cannot afford a Rust build; the binary is
+      # the toolchain artifact toolchain-publish.yml builds and
+      # cosign-signs once per platform on main's merge queue (stow#431).
+      # This workflow runs from the default branch, whose own sha has no
+      # toolchain — main's head does, so resolve it and pull that sha's
+      # artifact. The action fails the step if the artifact is absent or
+      # the signature does not verify; there is no compile fallback.
+      - name: Resolve main's head
+        id: main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" \
+            >> "$GITHUB_OUTPUT"
+      # A local action resolves from the workspace, so its directory has
+      # to be checked out; nothing else in the tree is needed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - name: stow-admin from the signed toolchain
+        uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ steps.main.outputs.sha }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Watchdog
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ vars.CF_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "${{ inputs.dry_run || 'false' }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          stow-admin watchdog "${args[@]}"

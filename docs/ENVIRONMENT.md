@@ -11,7 +11,7 @@ default, and the purpose.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | `https://stow.waterui.dev` | HTTPS URL of the edge worker — the CLI streams bundles from `/api/v1/artifacts/…` (the byte path) and posts `/api/v1/admissions` (miss minting) and `/api/v1/enqueue` (PoW redemption) to it. Falls back to `edge_url` in `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux), then to the production edge. |
+| `STOW_EDGE_URL` | `https://stow.waterui.dev` | HTTPS URL of the edge worker — the CLI streams bundles from `/api/v1/bundles/{digest}` (the byte path) and posts `/api/v1/admissions` (miss minting) and `/api/v1/enqueue` (PoW redemption) to it. Falls back to `edge_url` in `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux), then to the production edge. |
 | `STOW_REGISTRY_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache` | OCI base URL (`scheme://host/v2/repository`) the CLI pulls signed index slices from (bundle bytes stream through the edge). Override for mock-registry runs; `registry_base_url` in the config file does the same. |
 | `STOW_INDEX_REFRESH_SECS` | `600` | Seconds a cached index slice may sit before the driver revalidates its manifest digest against the registry. `index_refresh_secs` in the config file. |
 | `STOW_CACHE_BUDGET_SECS` | `150ms x covered units, capped at 30` | Seconds the pre-cargo work budget lasts — the graph analysis and blocking prefetch a `stow check`/`build`/`test` pays before handing off to cargo; what is not prefetched is fetched on demand by the wrapper. `0` disables the pre-build phase entirely, the cheapest way to measure stow's overhead against a plain cargo run. |
@@ -52,37 +52,54 @@ JSON) and sends nothing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required_ | Edge base URL the admin's trusted calls go to: scheduler task submits, `panic on\|off\|status` (the `/api/v1/admin/panic` circuit breaker) and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). |
+| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits, `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path), `index sync` and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `preheat manual` and `index export`/`publish` never read it — they run against GitHub and GHCR only. |
+| `STOW_EDGE_VERSION_OVERRIDE` | _optional_ | Verbatim `Cloudflare-Workers-Version-Overrides` header value (e.g. `stow-edge="<version-id>"`) pinned onto every edge call — `deploy-edge.yml` sets it so `scheduler migrate` runs on the uploaded candidate before traffic shifts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints and the GitHub REST calls (`runs`, `cache`, `preheat projects generate`); the owner must have push access to `water-rs/stow`. |
-| `CF_ACCOUNT_ID` | _required for `preheat missed`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
+| `CF_ACCOUNT_ID` | _required for `preheat missed` and `watchdog`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
+| `CF_ZONE_ID` | _required for `maintenance` and `watchdog`_ | Cloudflare zone ID of `waterui.dev`, whose `http_request_firewall_custom` phase holds the three `stow maintenance:` WAF rules. In CI it is the `CF_ZONE_ID` repository variable. |
 | `CF_ANALYTICS_TOKEN` | _required for `preheat missed`_ | Cloudflare API token with `Account Analytics: Read`, used to query the `stow_cache_misses` dataset. In CI it comes from the `CF_ANALYTICS_TOKEN` repository secret (see `DEPLOYMENT.md`). |
+| `CLOUDFLARE_API_TOKEN` | _required for `watchdog`, `deploy verdict` and `maintenance`_ | Cloudflare API token. The watchdog queries the GraphQL analytics and Analytics Engine APIs with it and sends the alert mail through the Email Sending REST API (`POST /accounts/{id}/email/sending/send`); `deploy verdict` queries the GraphQL Analytics API (`workersInvocationsAdaptive`, `durableObjectsInvocationsAdaptiveGroups`, `durableObjectsPeriodicGroups`, `d1AnalyticsAdaptiveGroups`); `maintenance` toggles the zone's WAF maintenance rules. Needs `Account Analytics:Read`, Email Sending and `Zone WAF:Edit` on `waterui.dev`. In CI it is the `CLOUDFLARE_API_TOKEN` repository secret — see `DEPLOYMENT.md`. |
 | `STOW_OIDC_AUDIENCE` | _required in Actions_ | `aud` the admin requests when it mints a GitHub Actions OIDC token for an edge call; must equal the edge's `STOW_OIDC_AUDIENCE` var. Set from `vars.STOW_OIDC_AUDIENCE` in the workflow. |
 | `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | injected by Actions | Endpoint + bearer the runtime exposes for OIDC mints; the admin reads both to mint a fresh token per edge call. Absent them (outside Actions), the admin uses `GH_TOKEN`. |
-| `STOW_REGISTRY_BASE_URL` | production GHCR | OCI base URL (`scheme://host/v2/repository`) `index backfill-min-glibc` pulls stored bundles from anonymously. Override for mock-registry runs. |
+| `STOW_REGISTRY_BASE_URL` | production GHCR | OCI base URL (`scheme://host/v2/repository`) `index export`/`preheat manual` pull records, bundles and published slices from — anonymously, signatures verified. Override for mock-registry runs. |
+| `STOW_MOCK_PUBLIC_KEY_PATH` | unset | Mock cosign key `index export`/`preheat manual` verify records and index slices against under a mock registry — the `mock-verify` code path, never production. |
+| `STOW_CACHE_DIR` | `~/.cache/stow` | Fulcio/Rekor trust material cache for `index export` and `preheat manual` signature verification. |
 
-`stow-admin index export --target <t> --rustc-version <v> --out <file>`
-pages the admin index endpoint for one `(target, rustc)` slice, assembles
-the `ArtifactIndex` (`stow_types::index`), writes it zstd-compressed to
-`--out`, and prints a one-line JSON summary (`rows`, `bytes`, `sha256`,
-`content_sha256`, `tag`) — the same export
-`.github/workflows/index-publish.yml` runs for every CI target.
+`stow-admin index export --out-dir <dir>` lists the registry's
+`records-*` tags once, pulls and verifies only the records artifacts the
+previous slices' folded sets have not covered (each is signed by the
+`build-crate.yml` cosign identity — a signature that fails the pin is
+fatal), folds the previous rows plus the new ones into every
+`(target, rustc)` `ArtifactIndex` (`stow_types::index`), writes each
+slice zstd-compressed under `--out-dir`, and prints a one-line JSON
+summary per slice (`rows`, `bytes`, `sha256`, `content_sha256`, `tag`)
+plus `new-records.json`, the records this pass newly folded —
+`.github/workflows/index-publish.yml` runs the same export for every CI
+target, and `index sync` POSTs exactly those new rows to the edge's
+`/api/v1/admin/artifacts/sync` so the D1 catalog stays a mirror.
+`--full` ignores the folded sets and re-pulls everything — for the first
+publish of a new rustc and for disaster recovery.
 
-`stow-admin index backfill-min-glibc [--limit N] [--yes]` is the stow#336
-repair pass: it lists catalog rows whose `min_glibc` was never measured,
-pulls each row's stored bundle anonymously, re-registers the measured
-records, and re-publishes every affected index slice. See
-`DEPLOYMENT.md`.
+`stow-admin preheat manual --crates|--projects <file> --rustc-version <v>
+[--targets a,b] [--in-flight 45] [--edge-url <url>] [--dispatch-url
+<url>]` is the operator-driven wave of stow#455: it resolves the graph
+in-process for every CI target, layers it so each layer's deps sit in
+the published index, dispatches `build-crate.yml` through GitHub's
+`workflow_dispatch` API under the operator token, dispatches
+`index-publish.yml` between layers, and resumes by re-reading the
+published index — no edge, no local state. `--dispatch-url` points the
+wave at the mock's local CI server (`GET /tasks` polling, in-process
+index publish) for `scripts/mock-e2e.sh`.
 
 ## stow-build (CI runner)
 
-The runner has four subcommands. `stow-build build --output-dir <dir>` is
+The runner has three subcommands. `stow-build build --output-dir <dir>` is
 the untrusted stage (compiles the task crate, writes task, plan and blobs
 into `<dir>`); `stow-build publish --input-dir <dir>` is the trusted stage
-(validates `<dir>`, then pushes, signs, registers and reports);
-`stow-build backfill-bundles [--batch N]` is the one-time migration that
-publishes `<tag>.bundle` for rows registered before bundles existed (see
-`DEPLOYMENT.md`); `stow-build serve --listen <host:port>` is the dev-only
-local dispatch endpoint. Both stages read the task from
+(validates `<dir>`, then pushes and signs the bundle plus the task's
+records artifact into GHCR — GitHub's `workflow_run` webhook reports
+the run, so publish never calls the edge); `stow-build serve --listen
+<host:port>` is the dev-only local dispatch endpoint. Both stages read the task from
 `STOW_BUILD_TASK_JSON`, which the workflow fills from its
 `workflow_dispatch` input.
 
@@ -96,10 +113,10 @@ local dispatch endpoint. Both stages read the task from
 | `STOW_BUILD_WRAPPER_CRATE_NAME` | build (set by the runner inside the heel sandbox) | Package name of the generated wrapper package the task crate builds under; the rustc wrapper records its units as observed scaffolding, never publishable artifacts. |
 | `STOW_GLIBC_SYSROOT` | build (set by the Linux leg of `build-crate.yml`) | Root of the glibc-2.28 sysroot the Linux build job installs under `$HOME/stow-glibc-2.28` — the heel sandbox grants the whole tree to the untrusted crate build so its compiles and links read the sysroot's headers and libraries. The job's PATH shim dir (`<root>/bin`, canonical driver names carrying `-B`/`--sysroot`) is reached through the `PATH` passthrough; `STOW_GLIBC_SYSROOT` itself rides the toolchain passthrough like every other `CC_*`/`CARGO_TARGET_*` variable. |
 | `GHCR_USERNAME` / `GHCR_TOKEN` | publish | Credentials for `oci-client` to push bundles to GHCR. Required. |
-| `STOW_EDGE_URL` | publish, serve | Edge base URL for `/api/v1/admin/artifacts/register`. Required. |
-| `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` the run requests when it mints its OIDC token; must equal the edge's `STOW_OIDC_AUDIENCE` var. Required in Actions. |
+| `STOW_EDGE_URL` | serve | Edge base URL the local server's `workflow_run` webhook POSTs to. Required. |
+| `STOW_GITHUB_WEBHOOK_SECRET` | serve | HMAC key the webhook signature is computed with — the same value the edge verifies `X-Hub-Signature-256` against. Required. |
+| `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` for the edge OIDC token minted when a publish step calls a trusted edge route (`index publish` D1 sync); unused when the run only pushes GHCR artifacts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | serve (falls back to `gh auth token`) | Developer GitHub credential the edge's trusted endpoints accept outside Actions. |
-| `SCHEDULER_URL` | publish, serve | The edge `/api/v1/scheduler` URL that receives `/complete` reports. Required. |
 | `STOW_MOCK_PUBLIC_KEY_PATH` / `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign key pair and mock registry root the local dispatcher populates. Required. |
 
 ## stow-mock-registry
@@ -116,8 +133,6 @@ The mock registry is a one-shot CLI; everything else is positional args.
 |---|---|---|
 | `STOW_DB` | _required_ (D1 binding) | Artifact catalog database. |
 | `STOW_ANALYTICS` | _required_ (Analytics Engine binding) | `stow_cache_misses` dataset — every cache miss is one data point here, so demand analytics never spend D1 row writes. |
-| `STOW_STATS` | _required_ (Analytics Engine binding) | `stow_events` dataset — sampled served-hit events (see [`PRIVACY.md`](../PRIVACY.md)). |
-| `STOW_STATS_SALT_SECRET` | _required_ (secret) | HMAC-SHA256 key the daily-salted install hash is derived from; the derived daily key is never stored. |
 | `CF_ACCOUNT_ID` | _required_ (var) | Cloudflare account id the Analytics Engine SQL API is queried under for `GET /api/v1/stats`. |
 | `CF_ANALYTICS_TOKEN` | _required_ (secret) | API token with Analytics Engine read on the account — the `Authorization: Bearer` credential `GET /api/v1/stats` queries with. |
 | `SCHEDULER` | _required_ (Durable Object binding) | Build scheduler queue. |
@@ -127,9 +142,10 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `STOW_BATCH_FETCH_CONCURRENCY` | `32` | Concurrent crates.io metadata fetches while `/api/v1/admissions` resolves a graph's cold direct entries. |
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |
 | `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `workflow_dispatch`. Used by mock fixtures. |
+| `STOW_SCHEDULER_BUDGET` | unset | **Mock-only.** When `"1"`, the Durable Object answers the `/budget` and `/budget/seed` probe routes the workerd cost gate (`scripts/scheduler-budget.sh`) drives. Set only by `edge/Skyzen.mock.toml`; a test asserts it never appears in `edge/Skyzen.toml`, so the probe cannot reach production. |
 | `STOW_RUSTC_DATA_BASE_URL` | `https://raw.githubusercontent.com/water-rs/stow/dev/resolve/rustc-data` | Base URL serving the generated `resolve/rustc-data/` tree. When a resolve asks for a `rustc -vV`/`--print cfg` pair missing from the vendored bundle (a stable rustc newer than the deploy), the worker fetches `{base}/<version>/verbose/{host}.txt` and `{base}/<version>/cfg/{triple}.txt` from here — the scheduled `rustc-data.yml` job keeps the tree current, so a channel bump needs no worker redeploy. Unset restricts resolves to vendored versions. |
 | `STOW_DISPATCH_MIN_AGE_MINUTES` | `5` | Minimum age (minutes) a task must wait in `pending` before being dispatched, so misses can coalesce. Mock fixtures set `0`. |
-| `STOW_MAX_CONCURRENT_JOBS` | `45` | Maximum concurrently dispatched CI builds across all runner families. Sized against the org's 60-runner pool, leaving 15 runners for the repo's own CI. Mock fixtures set `3` because miniflare OOMs under parallel register/complete bursts. `"0"` pauses dispatch: submits keep queueing, nothing is claimed, and the alarm wakes only for stale recovery on builds already in flight — see `DEPLOYMENT.md`'s pause procedure. |
+| `STOW_MAX_CONCURRENT_JOBS` | `45` | Maximum concurrently dispatched CI builds across all runner families. Sized against the org's 60-runner pool, leaving 15 runners for the repo's own CI. Mock fixtures set `3` because miniflare OOMs under parallel complete bursts. `"0"` pauses dispatch: submits keep queueing, nothing is claimed, and the alarm wakes only for stale recovery on builds already in flight — see `DEPLOYMENT.md`'s pause procedure. |
 | `STOW_MAX_CONCURRENT_MACOS_JOBS` | `16` | Maximum concurrently dispatched CI builds on macOS targets (`aarch64-apple-*`). The org has 20 macOS runners; the cap leaves 4 for the repo's own CI, and macOS rows past the cap stay pending until a slot frees. |
 | `STOW_STALE_DISPATCH_MINUTES` | `60` | Age after which a `dispatched` task with no completion is assumed lost and re-queued. Must exceed the slowest expected CI build or long builds get double-dispatched. |
 | `STOW_POW_CHALLENGE_SECRET` | _required_ (secret) | HMAC-SHA256 key for the enqueue-admission challenge minted on public cache misses and verified by `POST /api/v1/enqueue`. |
@@ -137,8 +153,15 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `STOW_MAX_QUEUE_PENDING` | `2000` | Pending-task count at which the miss lane refuses `POST /api/v1/enqueue` with 429 and `Retry-After: 600`. Checked in the edge handler before forwarding and again inside the scheduler Durable Object; human-lane and RepoWriter-trusted submits are exempt. |
 | `STOW_HUMAN_MAX_CLOSURE` | `150` | Largest dependency closure `POST /api/v1/requests` accepts per target; larger closures are refused with 422 naming the size and the cap. |
 | `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks the scheduler accepts per UTC day. The Durable Object keeps the counter (`human_daily_task_budget` table) and refuses an overspending submit with 429; the edge sets `Retry-After` to seconds until 00:00 UTC. |
+| `STOW_FREEZE_WINDOW_MINUTES` | `60` | Trailing window (minutes) the dispatch-freeze trip counts terminal attempt outcomes over (the DO's `attempt_outcome_buckets` counters — one five-minute bucket per target, so the read set is window-bounded whatever the traffic). |
+| `STOW_FREEZE_MIN_OUTCOMES` | `50` | Sample floor for the trip: a stream (the fleet aggregate or any single target) must reach this many terminal outcomes in the window before its failure ratio is read — below it nothing trips however bad the ratio. |
+| `STOW_FREEZE_FAIL_PERCENT` | `50` | Failure ratio (percent, integer-compared) a sufficiently-sampled stream must reach to freeze dispatch — the trip needs both the floor and the ratio, never either alone. |
+| `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Scales the scheduler DO's daily SQL budget — it self-meters `rowsRead`/`rowsWritten` off every statement's cursor and freezes dispatch the moment the day passes (monthly Workers Paid allowance / 30) × this value; `0.5` trips at half the allowance. `edge/Skyzen.mock.toml` inflates it (`10000`) so the budget probe's destructive fixture seeds — millions of billed writes — never trip the freeze; the production value lives in `edge/Skyzen.toml`. |
+| `STOW_ALERT_FROM` | `alerts@stow.waterui.dev` | Sender address of the freeze/clear alert emails; must live on a domain onboarded and Enabled under Compute → Email Service → Email Sending (`E_SENDER_NOT_VERIFIED` otherwise). |
+| `STOW_ALERT_TO` | `me@lexo.cool` | Recipient of the freeze/clear transition alert emails — should match the binding's `allowed_destination_addresses`. |
+| `STOW_ALERT_EMAIL` | _declared in `Skyzen.toml` only_ (`send_email` binding, `remote = true`) | Email Service send binding the alert emails go through — `send({to, from, subject, text, html})`. The mock/local manifests deliberately omit it, so their alert path resolves to `Disabled` and can never reach Cloudflare's sending API. |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the invisible Turnstile widget the request page renders; paired with `TURNSTILE_SECRET_KEY`. Mock fixtures use Cloudflare's always-pass test key `1x00000000000000000000AA`. |
 | `TURNSTILE_HOSTNAME` | `stow.waterui.dev` | Hostname the Turnstile widget is registered for; a `POST /api/v1/requests` token whose siteverify report names another host is rejected `hostname-mismatch`. Mock fixtures use `example.com`, the hostname Cloudflare's test keys always report. |
 | `TURNSTILE_SECRET_KEY` | _required_ (secret) | Turnstile secret key the worker posts to siteverify for `POST /api/v1/requests` token checks. Never logged or returned in a response. Mock fixtures use the always-pass test secret `1x0000000000000000000000000000000AA`; production deploys source it from the `STOW_TURNSTILE_SECRET_KEY` repository secret. |
 | `GITHUB_APP_ID` / `GITHUB_APP_INSTALLATION_ID` | `4985635` / `162649982` | The `stow-ci` GitHub App's ID and its installation ID on `water-rs`. Required when `STOW_LOCAL_CI_URL` is unset. |
-| `GITHUB_APP_PRIVATE_KEY` | _required when STOW_LOCAL_CI_URL is unset_ (secret) | The App's private-key PEM. The scheduler signs an RS256 JWT with it (WebCrypto) and exchanges it for an installation token that authorizes `workflow_dispatch`; the App needs **Actions: Read and write**. The token is cached in the Durable Object's SQL storage while more than 5 minutes of validity remain. Deploy jobs source it from the `STOW_APP_PRIVATE_KEY` repository secret — the same one release-plz uses. |
+| `GITHUB_APP_PRIVATE_KEY` | _required when STOW_LOCAL_CI_URL is unset_ (secret) | The App's private-key PEM. The scheduler signs an RS256 JWT with it (WebCrypto) and exchanges it for an installation token that authorizes `workflow_dispatch` — the App needs **Actions: Read and write** on `GITHUB_REPO` (deliberately no `issues`: the edge is untrusted serving infrastructure; the `incident` issue record is the watchdog's job). The token is cached in the Durable Object's SQL storage while more than 5 minutes of validity remain. Deploy jobs source it from the `STOW_APP_PRIVATE_KEY` repository secret — the same one release-plz uses. |

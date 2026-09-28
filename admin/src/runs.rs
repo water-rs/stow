@@ -45,8 +45,6 @@ pub enum FailureClass {
     /// A git dependency could not be fetched (the sandboxed build has no
     /// git access).
     GitDependencyOffline,
-    /// The edge rejected `artifacts/register` or `/complete`.
-    RegisterRejected,
     /// The trusted publish job's plan validation refused the build
     /// output.
     PlanValidation,
@@ -64,12 +62,11 @@ pub enum FailureClass {
 
 impl FailureClass {
     /// Stable string form for the table view.
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ToolchainTargetMissing => "toolchain-target-missing",
             Self::CratesIoDownload => "crates-io-download",
             Self::GitDependencyOffline => "git-dependency-offline",
-            Self::RegisterRejected => "register-rejected",
             Self::PlanValidation => "plan-validation",
             Self::WrapperNeverExecuted => "wrapper-never-executed",
             Self::LinkerUnusable => "linker-unusable",
@@ -81,7 +78,7 @@ impl FailureClass {
 
 /// The class one error line belongs to, when it matches a known class.
 /// Matchers run in the spec's order: toolchain → crates.io → git →
-/// register → plan. The first error line that classifies wins the run.
+/// plan. The first error line that classifies wins the run.
 fn class_of(line: &str) -> Option<FailureClass> {
     // rustup/cargo language for a target the toolchain does not carry.
     if line.contains("does not support target")
@@ -111,15 +108,6 @@ fn class_of(line: &str) -> Option<FailureClass> {
         || line.contains("failed to fetch `https://index.crates.io")
     {
         return Some(FailureClass::CratesIoDownload);
-    }
-    // The edge's register/complete rejections — stow-build's
-    // `edge admin register rejected records` and the workflow's
-    // `scheduler rejected completion report`.
-    if line.contains("register rejected")
-        || line.contains("artifacts/register")
-        || line.contains("scheduler rejected completion report")
-    {
-        return Some(FailureClass::RegisterRejected);
     }
     // A linker that is missing, or present and unable to run. This is what
     // 316 of 320 failed runs in one preheat wave were classified `unknown`:
@@ -217,8 +205,9 @@ fn is_error_line(line: &str) -> bool {
 /// Classify one job log. Scans error lines top-down for a known class;
 /// when none match, a run whose log never shows the `stow-build build`
 /// step starting died before the wrapper executed — the runner-loss and
-/// setup-failure bucket.
-fn classify_log(log: &str) -> (FailureClass, Option<String>) {
+/// setup-failure bucket. `watchdog` reuses it for the incident's
+/// failure-class breakdown.
+pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
     for line in log.lines() {
         let line = log_line_body(line);
         let line = line.as_str();
@@ -522,12 +511,6 @@ mod tests {
     fn classifies_git_dependency_offline() {
         let log = "error: failed to load source for dependency `waterui`\nCaused by: Unable to update https://github.com/x/y.git\n";
         assert_eq!(classify_log(log).0, FailureClass::GitDependencyOffline);
-    }
-
-    #[test]
-    fn classifies_register_rejected() {
-        let log = "##[error]edge admin register rejected records: HTTP 403 forbidden\n";
-        assert_eq!(classify_log(log).0, FailureClass::RegisterRejected);
     }
 
     #[test]

@@ -96,8 +96,18 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
                 saw_canonical_rmeta |= output.file_name == format!("{canonical_stem}.rmeta");
             }
             STOW_DYLIB_MEDIA_TYPE | STOW_PROC_MACRO_MEDIA_TYPE => {
-                saw_canonical_dynamic |=
-                    output.file_name.starts_with(&format!("{canonical_stem}."));
+                // Dynamic output names are platform-shaped: unix takes
+                // `lib<crate><extra>.{so,dylib}`, Windows takes
+                // `<crate><extra>.dll` with no `lib` prefix.
+                let prefix = if config.target.is_windows() {
+                    format!(
+                        "{canonical_crate_name}{extra}.dll",
+                        extra = config.extra_filename
+                    )
+                } else {
+                    format!("{canonical_stem}.")
+                };
+                saw_canonical_dynamic |= output.file_name.starts_with(&prefix);
             }
             other => {
                 return Err(BundleSchemaError(format!(
@@ -260,6 +270,37 @@ mod tests {
         ]));
 
         assert!(validate_bundle_schema(&bytes).is_err());
+    }
+
+    #[test]
+    fn validate_bundle_schema_accepts_windows_proc_macro_without_lib_prefix() {
+        // Windows dynamic artifacts are `<crate><extra>.dll` — no `lib`
+        // prefix — so a windows-target proc-macro bundle must not be held
+        // to the unix stem (stow#431).
+        let mut config = stable_config(vec![bundle_file(
+            "dyn_stack_macros-df1c5df8d44a9ede.dll",
+            crate::bundle::STOW_PROC_MACRO_MEDIA_TYPE,
+        )]);
+        config.crate_name = CrateName::parse("dyn-stack-macros").unwrap();
+        config.target = TargetTriple::parse("x86_64-pc-windows-msvc").unwrap();
+        config.kind = ArtifactKind::ProcMacro;
+        config.crate_types = vec![RustCrateType::ProcMacro];
+
+        validate_bundle_schema(&bundle_bytes(config)).unwrap();
+    }
+
+    #[test]
+    fn validate_bundle_schema_rejects_windows_proc_macro_with_lib_prefix() {
+        let mut config = stable_config(vec![bundle_file(
+            "libdyn_stack_macros-df1c5df8d44a9ede.dll",
+            crate::bundle::STOW_PROC_MACRO_MEDIA_TYPE,
+        )]);
+        config.crate_name = CrateName::parse("dyn-stack-macros").unwrap();
+        config.target = TargetTriple::parse("x86_64-pc-windows-msvc").unwrap();
+        config.kind = ArtifactKind::ProcMacro;
+        config.crate_types = vec![RustCrateType::ProcMacro];
+
+        assert!(validate_bundle_schema(&bundle_bytes(config)).is_err());
     }
 
     #[test]

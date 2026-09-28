@@ -24,14 +24,13 @@ pub struct FetchRequest<'a> {
     pub c_metadata: &'a str,
 }
 
-/// One bundle on the edge byte path: the exact key the edge streams under,
-/// the crate name it logs a miss for, and the `sha256:…` digest the signed
-/// index pins for the bytes.
+/// One bundle on the edge byte path: the `sha256:…` digest the signed
+/// index pins is the request address; the remaining fields key the local
+/// cache entry the verified bundle lands under.
 #[derive(Debug, Clone)]
 pub struct BundleRef<'a> {
     pub target: &'a str,
     pub rustc_version: &'a str,
-    pub crate_name: &'a str,
     pub c_metadata: &'a str,
     pub bundle_digest: &'a str,
 }
@@ -47,7 +46,6 @@ impl<'a> BundleRef<'a> {
         Self {
             target,
             rustc_version,
-            crate_name: row.crate_name.as_str(),
             c_metadata: row.c_metadata.as_str(),
             bundle_digest: &row.bundle_digest,
         }
@@ -83,25 +81,12 @@ pub struct ArtifactBundle {
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
-/// The edge byte-path URL for one bundle. `crate` is demand data for the
-/// edge's miss log; the identity the edge resolves is the path.
-/// The byte-path URL for one bundle, carrying the digest the signed index
-/// pins.
-///
-/// The digest is not a hint: the edge's row cache is per-datacenter, so a
-/// re-registered artifact leaves stale rows in every colo that did not
-/// serve the register call, and a stale row names the previous bundle. The
-/// digest lets the edge notice that its cached row disagrees with what the
-/// client was promised and answer from the catalog instead of from a body
-/// the client would have to reject.
+/// The edge byte-path URL for one bundle — the `sha256:…` digest the
+/// signed index pins is the whole address.
 fn artifact_url(bundle: &BundleRef<'_>, edge_url: &str) -> String {
     format!(
-        "{}/api/v1/artifacts/{}/{}/{}?crate={}&digest={}",
+        "{}/api/v1/bundles/{}",
         edge_url.trim_end_matches('/'),
-        bundle.target,
-        bundle.rustc_version,
-        bundle.c_metadata,
-        bundle.crate_name,
         bundle.bundle_digest
     )
 }
@@ -113,9 +98,10 @@ fn artifact_url(bundle: &BundleRef<'_>, edge_url: &str) -> String {
 ///
 /// # Errors
 ///
-/// `NotFound` when the edge has no row for the key (the index is ahead of
-/// a pruned catalog row), `Digest` when the body does not hash to the
-/// index's `bundle_digest`, transport and HTTP failures otherwise.
+/// `NotFound` when the registry holds no blob under the digest (the index
+/// is ahead of a pruned registry object), `Digest` when the body does not
+/// hash to the index's `bundle_digest`, transport and HTTP failures
+/// otherwise.
 pub async fn download_bundle_bytes(
     config: &StowConfig,
     bundle: &BundleRef<'_>,
@@ -680,6 +666,122 @@ mod tests {
         bundle_file_path, emit_covers_request, finalize_bundle, sha256_prefixed,
         validate_oci_manifest, validate_output_entries_present, validate_semantic_bundle_version,
     };
+
+    /// One canned answer from the stub edge: the request line is captured,
+    /// `status`/`body` are written back.
+    fn serve_once(status: &str, body: &[u8]) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub edge");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = std::sync::Arc::clone(&captured);
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let body = body.to_vec();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read request line");
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read header");
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            *seen.lock().expect("captured lock") = request_line;
+            stream.write_all(response.as_bytes()).expect("write head");
+            stream.write_all(&body).expect("write body");
+            stream.flush().expect("flush");
+        });
+        (url, captured)
+    }
+
+    fn stub_config(edge_url: String) -> crate::config::StowConfig {
+        crate::config::StowConfig {
+            edge_url,
+            registry_base_url: String::new(),
+            cache_dir: std::path::PathBuf::new(),
+            request_timeout: std::time::Duration::from_secs(30),
+            negative_cache_ttl: std::time::Duration::from_secs(0),
+            circuit_reset_after: std::time::Duration::from_secs(0),
+            circuit_trip_threshold: 0,
+            artifact_cache_max_bytes: 0,
+            index_refresh_interval: std::time::Duration::from_secs(0),
+            verify_mode: crate::config::VerifyMode::GithubCi,
+            state_db_pool: crate::config::StowConfig::default_state_db_pool(),
+            trust_material: std::sync::Arc::default(),
+        }
+    }
+
+    fn test_bundle_ref(bundle_digest: &str) -> super::BundleRef<'_> {
+        super::BundleRef {
+            target: "x86_64-unknown-linux-gnu",
+            rustc_version: "1.85.0",
+            c_metadata: "eeeeeeeeeeeeeeee",
+            bundle_digest,
+        }
+    }
+
+    /// The byte-path request addresses the bundle by the index row's
+    /// `bundle_digest` alone — crate name and key travel only for the
+    /// local side of the pipeline — and the served bytes must hash to it.
+    #[test]
+    fn download_bundle_bytes_requests_the_index_digest() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let body = b"the bundle bytes the stub edge serves".to_vec();
+            let digest = sha256_prefixed(&body);
+            let (edge_url, captured) = serve_once("200 OK", &body);
+            let bytes =
+                super::download_bundle_bytes(&stub_config(edge_url), &test_bundle_ref(&digest))
+                    .await
+                    .expect("bundle downloads");
+            assert_eq!(bytes, body);
+            let request_line = captured.lock().expect("captured lock").clone();
+            assert_eq!(
+                request_line.trim_end(),
+                format!("GET /api/v1/bundles/{digest} HTTP/1.1"),
+            );
+        });
+    }
+
+    /// A body that does not hash to the pinned digest is rejected, and a
+    /// 404 is the miss signal the caller falls back on.
+    #[test]
+    fn download_bundle_bytes_verifies_the_digest() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let digest = sha256_prefixed(b"the promised bytes");
+            let (edge_url, _captured) = serve_once("200 OK", b"other bytes");
+            let error =
+                super::download_bundle_bytes(&stub_config(edge_url), &test_bundle_ref(&digest))
+                    .await
+                    .expect_err("mismatched bytes are rejected");
+            assert!(matches!(error, super::FetchError::Digest { .. }), "{error}");
+
+            let (edge_url, _captured) = serve_once("404 Not Found", b"");
+            let error =
+                super::download_bundle_bytes(&stub_config(edge_url), &test_bundle_ref(&digest))
+                    .await
+                    .expect_err("a missing blob is a miss");
+            assert!(matches!(error, super::FetchError::NotFound), "{error}");
+        });
+    }
 
     #[test]
     fn semantic_emit_accepts_superset() {

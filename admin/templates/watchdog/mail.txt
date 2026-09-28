@@ -1,0 +1,24 @@
+stow watchdog — {{ kind }} ({{ now }} UTC)
+
+{% for breach in breaches -%}
+- {{ breach.id }} ({{ breach.window }}): {{ breach.observed }} vs {{ breach.threshold }} [{{ breach.effect }}]
+{% for line in breach.evidence %}    {{ line }}
+{% endfor -%}
+{% endfor -%}
+
+{% if !actions.is_empty() %}
+Actions:
+{% for action in actions -%}
+- {{ action }}
+{% endfor %}
+{% endif %}
+
+{% if !failures.is_empty() %}
+Watchdog partial failures:
+{% for failure in failures -%}
+- {{ failure }}
+{% endfor %}
+{% endif %}
+
+{% if let Some(url) = issue_url %}Incident: {{ url }}
+{% endif %}Recovery is manual: stow-admin watchdog clear

@@ -10,20 +10,32 @@
 
 mod artifacts;
 mod cache;
+mod cloudflare;
 mod coverage;
 mod crates_io;
+mod deploy;
 mod github;
 mod index_cmd;
+mod maintenance;
+mod manual;
 mod preheat;
 mod projects;
 mod queue;
 mod render;
+mod resolve;
 mod runs;
+mod rust_channel;
+mod scheduler;
+mod watchdog;
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use stow_types::api::{AdminStatus, EnqueueRequest, PanicSwitch, SchedulerSubmitResponse};
+use stow_types::api::{
+    AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, EnqueueRequest,
+    FreezeTransitionEvent, SchedulerSubmitResponse,
+};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
@@ -41,6 +53,18 @@ const STOW_OIDC_AUDIENCE_ENV: &str = "STOW_OIDC_AUDIENCE";
 /// per job when `id-token: write` is granted.
 const ACTIONS_ID_TOKEN_REQUEST_URL_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
+/// Pinned verbatim onto every edge call as the
+/// `Cloudflare-Workers-Version-Overrides` header when set — the deploy
+/// workflow uses it to aim `scheduler migrate` (and any other trusted
+/// call) at the uploaded candidate version before traffic shifts.
+const STOW_EDGE_VERSION_OVERRIDE_ENV: &str = "STOW_EDGE_VERSION_OVERRIDE";
+/// The header `STOW_EDGE_VERSION_OVERRIDE` fills.
+const VERSION_OVERRIDES_HEADER: &str = "Cloudflare-Workers-Version-Overrides";
+/// Every edge call the admin client makes is bounded — an unanswered
+/// request (a wedged dev-runtime stub, a vanished connection) must fail
+/// the command, not hang it. Same 45 s the `cloudflare.rs` client uses.
+/// The scheduler budget probe carries its own, larger bound.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Parser)]
 #[command(name = "stow-admin", about = "Operations CLI for the stow build fleet")]
@@ -60,6 +84,9 @@ enum Command {
     Status,
     /// Inspect and mutate scheduler queue rows.
     Queue(queue::QueueArgs),
+    /// Scheduler operations — the schema migration route and anything
+    /// else that runs on operator cadence, not per request.
+    Scheduler(scheduler::SchedulerArgs),
     /// Per-target servable identities for one crate.
     Coverage(coverage::CoverageArgs),
     /// Enqueue cache-warming task batches.
@@ -70,30 +97,41 @@ enum Command {
     Artifacts(artifacts::ArtifactsArgs),
     /// GitHub Actions cache usage and eviction.
     Cache(cache::CacheArgs),
-    /// Read or flip the edge's anonymous-traffic circuit breaker.
-    Panic(PanicArgs),
+    /// Ensure or toggle the zone's WAF maintenance rules — the breaker
+    /// that stops traffic before it reaches the Worker.
+    Maintenance(maintenance::MaintenanceArgs),
+    /// External watchdog: evaluate the incident signals, trip the
+    /// breaker on a breach, keep the incident issue and the alert mail
+    /// current. `watchdog clear` is the manual recovery.
+    Watchdog(watchdog::WatchdogArgs),
+    /// Read or clear the scheduler's dispatch freeze — the manual
+    /// recovery path after a systematic-failure or cost trip.
+    DispatchFreeze(DispatchFreezeArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
+    /// Canary deployment verdicts for the edge Worker.
+    Deploy(deploy::DeployArgs),
 }
 
 #[derive(Args)]
-struct PanicArgs {
-    /// `on`/`off` write the flag; `status` reads it.
+struct DispatchFreezeArgs {
+    /// `status` reads the freeze; `clear` lifts it, resuming dispatch of
+    /// everything that queued during it. Engagement is automatic — a
+    /// systematic-failure or cost trip — or the dispatch-freeze POST.
     #[arg(value_enum)]
-    action: PanicAction,
-    /// Apply the flip. `status` never mutates; `on`/`off` without `--yes`
-    /// print the plan and exit 0.
+    action: DispatchFreezeAction,
+    /// Apply the clear. `status` never mutates; `clear` without `--yes`
+    /// prints the plan and exits 0.
     #[arg(long)]
     yes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum PanicAction {
-    On,
-    Off,
+enum DispatchFreezeAction {
     Status,
+    Clear,
 }
 
 #[derive(Args)]
@@ -123,6 +161,22 @@ struct SubmitArgs {
 }
 
 fn main() -> stow_types::error::Result<()> {
+    // Multi-call binary: a copy of this executable named
+    // `rustc-shim-<host>` is cargo's `build.rustc-wrapper` for the
+    // resolver's host probing — dispatch before clap sees its args.
+    if std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            std::path::Path::new(&arg0)
+                .file_stem()
+                .map(std::ffi::OsStr::to_os_string)
+        })
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|stem| stem.starts_with(stow_resolver::shim::STEM_PREFIX))
+    {
+        stow_resolver::shim::run();
+    }
     install_tracing();
     let cli = Cli::parse();
     let output = if cli.json {
@@ -134,6 +188,9 @@ fn main() -> stow_types::error::Result<()> {
         Command::Status => with_edge(|edge| async move { status(&edge, output).await }),
         Command::Queue(args) => {
             with_edge(|edge| async move { queue::run(&edge, args, output).await })
+        }
+        Command::Scheduler(args) => {
+            with_edge(|edge| async move { scheduler::run(&edge, args, output).await })
         }
         Command::Coverage(args) => {
             with_edge(|edge| async move { coverage::run(&edge, args, output).await })
@@ -151,8 +208,12 @@ fn main() -> stow_types::error::Result<()> {
         Command::Cache(args) => {
             with_github(|token| async move { cache::run(&token, args, output).await })
         }
-        Command::Panic(args) => {
-            with_edge(|edge| async move { panic_switch(&edge, args, output).await })
+        Command::Maintenance(args) => smol::block_on(maintenance::run(args, output)),
+        Command::Watchdog(args) => {
+            with_edge(|edge| async move { watchdog::run(&edge, args, output).await })
+        }
+        Command::DispatchFreeze(args) => {
+            with_edge(|edge| async move { dispatch_freeze_switch(&edge, args, output).await })
         }
         // The index commands pick their own executor: `publish` drives
         // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
@@ -161,6 +222,10 @@ fn main() -> stow_types::error::Result<()> {
         Command::Submit(args) => {
             with_edge(|edge| async move { submit_command(&edge, args, output).await })
         }
+        // The verdict reads Cloudflare's GraphQL API, not the edge and not
+        // GitHub — its credential is CLOUDFLARE_API_TOKEN, so it runs its
+        // own executor like `preheat` and `index` do.
+        Command::Deploy(args) => smol::block_on(deploy::run(args, output)),
     }
 }
 
@@ -197,6 +262,10 @@ pub(crate) struct Edge {
     /// caller apart, so a per-request mint is also what keeps the run
     /// under its own identity rather than a staged `GH_TOKEN`.
     token: Option<String>,
+    /// `STOW_EDGE_VERSION_OVERRIDE` verbatim — a Dictionary Structured
+    /// Header entry such as `stow-edge="<version-id>"`, pinned onto every
+    /// request so the call runs against that deployed version.
+    version_override: Option<String>,
 }
 
 impl Edge {
@@ -213,6 +282,9 @@ impl Edge {
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
             token,
+            version_override: std::env::var(STOW_EDGE_VERSION_OVERRIDE_ENV)
+                .ok()
+                .filter(|value| !value.is_empty()),
         })
     }
 
@@ -239,11 +311,16 @@ impl Edge {
     ) -> stow_types::error::Result<T> {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
-        let mut client = zenwave::client();
-        let response = client
+        let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
+        let request = client
             .get(&url)
             .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
-            .map_err(|error| stow_error!("GET {url}: {error}"))?
+            .and_then(|request| match &self.version_override {
+                Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
+                None => Ok(request),
+            })
+            .map_err(|error| stow_error!("GET {url}: {error}"))?;
+        let response = request
             .await
             .map_err(|error| stow_error!("GET {url}: {error}"))?;
         response
@@ -261,14 +338,35 @@ impl Edge {
         path: &str,
         body: &B,
     ) -> stow_types::error::Result<T> {
+        self.post_json_with_timeout(path, body, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`post_json`](Self::post_json) at an explicit bound — for the
+    /// routes that legitimately outlive the default, like the scheduler
+    /// budget probe replaying every drive on a seeded fixture.
+    pub(crate) async fn post_json_with_timeout<
+        B: serde::Serialize + Sync,
+        T: serde::de::DeserializeOwned,
+    >(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> stow_types::error::Result<T> {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
-        let mut client = zenwave::client();
-        let response = client
+        let mut client = zenwave::client().timeout(timeout);
+        let request = client
             .post(&url)
             .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
+            .and_then(|request| match &self.version_override {
+                Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
+                None => Ok(request),
+            })
             .and_then(|request| request.json_body(body))
-            .map_err(|error| stow_error!("POST {url}: {error}"))?
+            .map_err(|error| stow_error!("POST {url}: {error}"))?;
+        let response = request
             .await
             .map_err(|error| stow_error!("POST {url}: {error}"))?;
         response
@@ -352,8 +450,8 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "panic        {}",
-            if status.panic_enabled { "on" } else { "off" }
+            "freeze       {}",
+            if status.dispatch_frozen { "on" } else { "off" }
         );
         let _ = writeln!(
             out,
@@ -419,46 +517,121 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
     })
 }
 
-/// `stow-admin panic on|off|status` — read or flip the circuit breaker.
-/// `on`/`off` are mutations: they print the target state and only apply
-/// under `--yes`.
-async fn panic_switch(
+/// `stow-admin dispatch-freeze status|clear` — read the dispatch
+/// freeze or drive the manual transition that is its only recovery
+/// path. `status` shows the whole record — the trigger, and the alert
+/// outcome so a freeze nobody was emailed about is visible. `clear` is
+/// a mutation: it prints the plan and only applies under `--yes`.
+async fn dispatch_freeze_switch(
     edge: &Edge,
-    args: PanicArgs,
+    args: DispatchFreezeArgs,
     output: Output,
 ) -> stow_types::error::Result<()> {
-    if args.action == PanicAction::Status {
-        let switch: PanicSwitch = edge.get_json("/api/v1/admin/panic").await?;
-        return render::emit(output, &switch, |switch| {
-            format!("panic {}", if switch.enabled { "on" } else { "off" })
-        });
+    if args.action == DispatchFreezeAction::Status {
+        let switch: DispatchFreeze = edge.get_json("/api/v1/admin/dispatch-freeze").await?;
+        return render::emit(output, &switch, render_freeze);
     }
-    let target_enabled = matches!(args.action, PanicAction::On);
-    let plan = PanicSwitch {
-        enabled: target_enabled,
+    let plan = DispatchFreeze {
+        enabled: false,
+        record: None,
+        transitions: Vec::new(),
     };
     render::mutation(
         output,
         args.yes,
         plan,
-        |envelope: &render::Planned<PanicSwitch, PanicSwitch>| {
-            let mut out = format!(
-                "set panic {}\n",
-                if envelope.plan.enabled { "on" } else { "off" }
-            );
+        |envelope: &render::Planned<DispatchFreeze, DispatchFreeze>| {
+            let mut out = "clear dispatch freeze\n".to_owned();
             if let Some(result) = &envelope.result {
-                let _ = writeln!(
-                    out,
-                    "panic is now {}",
-                    if result.enabled { "on" } else { "off" }
-                );
+                let _ = writeln!(out, "{}", render_freeze(result));
             }
             let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |plan: &PanicSwitch| edge.post_json("/api/v1/admin/panic", plan).await,
+        async move |plan: &DispatchFreeze| {
+            edge.post_json("/api/v1/admin/dispatch-freeze", plan).await
+        },
     )
     .await
+}
+
+/// Human rendering of the freeze state — the flag line, the stored
+/// record's trigger and alert outcome, and the transition log the
+/// incident record is written from.
+fn render_freeze(switch: &DispatchFreeze) -> String {
+    let mut out = format!("freeze {}", if switch.enabled { "on" } else { "off" });
+    if let Some(record) = &switch.record {
+        let _ = write!(out, "\n  frozen at  {}", record.frozen_at);
+        let _ = write!(out, "\n  trigger    {}", summarize_trigger(&record.trigger));
+        let _ = write!(out, "\n  alert      {}", summarize_notify(&record.notify));
+    }
+    if !switch.transitions.is_empty() {
+        out.push_str("\n  transitions (newest first):");
+        for transition in &switch.transitions {
+            let event = match transition.event {
+                FreezeTransitionEvent::Engaged => "engaged",
+                FreezeTransitionEvent::Cleared => "cleared",
+            };
+            let _ = write!(out, "\n    {} {}", transition.at, event);
+            if let Some(trigger) = &transition.trigger {
+                let _ = write!(out, " — {}", summarize_trigger(trigger));
+            }
+        }
+    }
+    out
+}
+
+/// One-line summary of a stored trigger — the same wording the
+/// cleared-transition email carries.
+fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
+    match trigger {
+        DispatchFreezeTrigger::Manual => "manual (dispatch-freeze POST)".to_owned(),
+        DispatchFreezeTrigger::Tripped(trip) => {
+            let tripped: Vec<&str> = trip
+                .targets
+                .iter()
+                .filter(|target| target.tripped)
+                .map(|target| target.target.as_str())
+                .collect();
+            let streams = if trip.fleet_tripped {
+                if tripped.is_empty() {
+                    "fleet".to_owned()
+                } else {
+                    format!("fleet + {}", tripped.join(", "))
+                }
+            } else {
+                tripped.join(", ")
+            };
+            format!(
+                "tripped: {}/{} outcomes failed ({}%) over {}m — {}",
+                trip.failures, trip.outcomes, trip.failure_percent, trip.window_minutes, streams
+            )
+        }
+        DispatchFreezeTrigger::Cost(cost) => {
+            format!(
+                "cost trip: {:?} used {:.0} of a {:.0} daily budget",
+                cost.metric, cost.used, cost.budget
+            )
+        }
+    }
+}
+
+/// One-line summary of the stored alert outcome — a failure is
+/// shouted, not summarized away.
+fn summarize_notify(notify: &ChannelOutcome) -> String {
+    match notify {
+        ChannelOutcome::Sent { message_id } => message_id
+            .as_ref()
+            .map_or_else(|| "sent".to_owned(), |id| format!("sent (messageId {id})")),
+        ChannelOutcome::Opened { url } => format!("opened {url}"),
+        ChannelOutcome::Commented { url } => format!("commented {url}"),
+        ChannelOutcome::Resolved { url } => format!("resolved {url}"),
+        ChannelOutcome::Failed { message, hint } => hint.as_ref().map_or_else(
+            || format!("FAILED: {message}"),
+            |hint| format!("FAILED: {message} — {hint}"),
+        ),
+        ChannelOutcome::Disabled { reason } => format!("disabled: {reason}"),
+    }
 }
 
 /// `stow-admin submit` — one `EnqueueRequest` batch, one POST. The
@@ -555,7 +728,7 @@ pub(crate) async fn submit(
 /// The operator's GitHub credential for the edge's trusted endpoints and
 /// the GitHub REST calls (`runs`, `cache`): `GH_TOKEN`/`GITHUB_TOKEN`
 /// when set — the precedence `gh` itself follows — else `gh auth token`.
-async fn github_token() -> stow_types::error::Result<String> {
+pub(crate) async fn github_token() -> stow_types::error::Result<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)
             && !token.is_empty()

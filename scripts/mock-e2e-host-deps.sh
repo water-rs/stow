@@ -340,8 +340,43 @@ SERVICE_PID=$!
 CHILD_PIDS+=("$SERVICE_PID")
 CHILD_NAMES+=(edge)
 echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
+# The scheduler Durable Object applies its schema through the operator
+# migrate route — deployment work, never request work — so the mock
+# plays the deploy pipeline: wait only for the listener, then run the
+# same `stow-admin scheduler migrate` deploy-edge.yml runs, before any
+# scheduler traffic. A status read before the migration is a 500; the
+# listener probe takes the route's response code as its ready signal.
+wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
+    http_listening "$SCHEDULER_URL/status"
+migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler migrate 2>&1)" \
+    || die "stow-admin scheduler migrate failed: $migrate_out"
+echo "[mock-e2e] $migrate_out"
+current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
+    "$REPO_ROOT/edge/src/scheduler/queue.rs")"
+[ -n "$current_schema" ] || die "could not read SCHEMA_VERSION from queue.rs"
+[ "${migrate_out##* }" = "$current_schema" ] \
+    || die "scheduler migrate reported '$migrate_out', expected schema $current_schema"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
+
+# stow#336: production links every Linux unit against the Debian buster
+# (glibc 2.28) sysroot build-crate.yml provisions — the dispatched builds
+# link the same way through the same scripts, into a cache dir keyed by
+# the deb manifest's hash so each box installs it once. The stow
+# binaries themselves were built before this and keep the host glibc;
+# the sysroot env is exported only inside the server below.
+SYSROOT=""
+if [ "$(uname -s)" = "Linux" ]; then
+    SYSROOT="${XDG_CACHE_HOME:-$HOME/.cache}/stow/glibc-sysroot-$(sha256sum \
+        "$REPO_ROOT/ci/glibc-sysroot-debs.txt" | cut -d' ' -f1)"
+    if [ ! -d "$SYSROOT" ]; then
+        "$REPO_ROOT/ci/glibc-sysroot/install.sh" "$SYSROOT" \
+            || die "glibc sysroot install failed"
+    fi
+    "$REPO_ROOT/ci/glibc-sysroot/wrappers.sh" "$SYSROOT" \
+        || die "glibc sysroot wrapper write failed"
+fi
 
 # The dispatch tree (.tmp/local-ci-dispatch) is written under the server's
 # cwd; keep it inside the work dir. The builder keeps its own cache: a
@@ -349,9 +384,11 @@ wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
 # caches mid-publish is one the consumer's own ensure would reuse stale.
 (
     cd "$WORK_DIR/local-ci"
+    [ -z "$SYSROOT" ] || eval "$("$REPO_ROOT/ci/glibc-sysroot/env.sh" "$SYSROOT")"
     exec env \
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
+        STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
         STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
         STOW_CACHE_DIR="$WORK_DIR/ci-cache" \
         STOW_VERIFY_MODE="mock-key" \
@@ -417,32 +454,135 @@ echo "[mock-e2e] submit: $submit_json"
 # The gate opens a dependent only when the published index serves every
 # shape its edge requires — host-side deps of a host-side owner need all
 # four (both invocations, both kinds). Publish waves release the queue
-# depth-first: each round drains the unblocked tasks, then exports,
-# publishes and reports the host slice so the next layer can go.
-publish_slice() {
-    local target="$1" out="$WORK_DIR/index-$1.bin" tag="$2"
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-        "$BIN/stow-admin" index export \
-        --target "$target" \
-        --rustc-version "$RUSTC_VERSION" \
-        --out "$out" \
-        >"$LOG_DIR/index-export-$tag.log" 2>&1 \
-        || die "stow-admin index export ($target) failed — see $LOG_DIR/index-export-$tag.log"
+# depth-first: each round drains the unblocked tasks, then runs the
+# export/publish/report/sync pass index-publish.yml drives so the next
+# layer can go.
+#
+# `index export --out-dir` reads and verifies the records artifacts
+# (mock-key trust) in one pass — the out-dir is fixed across waves
+# because its `.prev` sidecars are what the export reads to stamp each
+# slice's next generation (a missing `.prev` is legal only at generation
+# 1). `index publish` delegates each slice's signed push to
+# `stow-mock-registry publish-index`, `index report` feeds the gate's
+# published_slice_rows, and `index sync` replays new-records.json into
+# the D1 catalog — the catalog reads below hold only once the sync has
+# landed.
+publish_slices() {
+    local tag="$1"
     isolated_env \
-        STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
-        STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-        "$BIN/stow-admin" index publish \
-        --file "$out" \
-        --target "$target" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+        "$BIN/stow-admin" index export \
+        --out-dir "$WORK_DIR/index-export" \
         --rustc-version "$RUSTC_VERSION" \
-        >"$LOG_DIR/index-publish-$tag.log" 2>&1 \
-        || die "stow-admin index publish ($target) failed — see $LOG_DIR/index-publish-$tag.log"
+        >"$LOG_DIR/index-export-$tag.log" 2>&1 \
+        || die "stow-admin index export failed — see $LOG_DIR/index-export-$tag.log"
+    local pairs
+    pairs="$(python3 -c 'import json,sys
+for s in json.load(open(sys.argv[1])):
+    print(s["index_file"], s["folded_file"])' "$WORK_DIR/index-export/slices.json")" \
+        || die "reading $WORK_DIR/index-export/slices.json failed"
+    echo "$pairs" | while read -r index_file folded_file; do
+        [ -n "$index_file" ] || continue
+        isolated_env \
+            STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+            STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+            "$BIN/stow-admin" index publish \
+            --file "$WORK_DIR/index-export/$index_file" \
+            --folded "$WORK_DIR/index-export/$folded_file" \
+            >>"$LOG_DIR/index-publish-$tag.log" 2>&1 \
+            || die "stow-admin index publish failed for $index_file — see $LOG_DIR/index-publish-$tag.log"
+        isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+            "$BIN/stow-admin" index report \
+            --file "$WORK_DIR/index-export/$index_file" \
+            >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
+            || die "stow-admin index report failed for $index_file — see $LOG_DIR/index-report-$tag.log"
+    done
     isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-        "$BIN/stow-admin" index report \
-        --file "$out" \
-        >"$LOG_DIR/index-report-$tag.log" 2>&1 \
-        || die "stow-admin index report ($target) failed — see $LOG_DIR/index-report-$tag.log"
+        "$BIN/stow-admin" index sync \
+        --file "$WORK_DIR/index-export/new-records.json" \
+        >>"$LOG_DIR/index-sync-$tag.log" 2>&1 \
+        || die "stow-admin index sync failed — see $LOG_DIR/index-sync-$tag.log"
 }
+
+# --- retried pre-migration dependent row -----------------------------------
+#
+# The production Class-B failure's scheduler spelling: a queue row minted
+# before the side model keeps the edges it was minted with when it is
+# retried — `dep_host_side` defaulted 0, and the wire could not name a
+# side. The migration re-derives every such edge from where the dep's
+# task sits; a dep on the family host triple under an owner on the same
+# triple is ambiguous, so the edge stays unestablished (-1). The gate's
+# `p.unit_side = -1` clause matches no published row, so the dependent
+# holds until a resolver resync — any re-request carrying `depends_on` —
+# rewrites the edge.
+#
+# snafu is the library the proc-macro crate derives for: its
+# $HOST_TARGET target node edges snafu-derive host-side. Its submit and
+# legacy spelling must happen before the waves below publish any
+# coverage: `tasks/submit` arms the dispatch alarm at now, so an edge
+# that is already servable releases in the window before the UPDATE can
+# land. Spelled while nothing is published, the -1 edge then holds snafu
+# deterministically — the check after the waves is what proves the hold
+# survives published coverage.
+#
+# The queue is a Durable Object's sqlite store — `wrangler d1` reaches
+# only the catalog; workerd persists the DO under the run's edge-state.
+sched_db() {
+    find "$WORK_DIR/edge-state/v3/do" -name '*.sqlite' \
+        ! -name 'metadata.sqlite' ! -name '*-wal' ! -name '*-shm' | head -1
+}
+sched() {
+    sqlite3 -batch "$(sched_db)" ".timeout 15000" "$1"
+}
+LEGACY_VERSION="$(curl -fsS --max-time 30 -A 'stow-mock-e2e' \
+    'https://crates.io/api/v1/crates/snafu' \
+    | jq -r '.crate.max_stable_version')"
+[ -n "$LEGACY_VERSION" ] && [ "$LEGACY_VERSION" != "null" ] \
+    || die "crates.io returned no version for snafu"
+echo "[mock-e2e] legacy-row lane: snafu $LEGACY_VERSION"
+
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" --json preheat plan \
+    "snafu@${LEGACY_VERSION}" \
+    --features-json '[]' \
+    --target "$HOST_TARGET" \
+    --rustc-version "$RUSTC_VERSION" \
+    >"$WORK_DIR/preheat-plan-legacy.json" 2>"$LOG_DIR/preheat-plan-legacy.log" \
+    || die "snafu preheat plan failed — see $LOG_DIR/preheat-plan-legacy.log"
+
+legacy_tasks="$(jq '[.targets[].tasks[]]' "$WORK_DIR/preheat-plan-legacy.json")"
+jq -e '.[] | select(.crate_name == "snafu" and .host_side != true)' <<<"$legacy_tasks" >/dev/null \
+    || die "snafu plan minted no $HOST_TARGET target node: $(jq -c '[.[].crate_name]' <<<"$legacy_tasks")"
+jq -e '.[] | select(.crate_name == "snafu") | [.depends_on[].crate_name] | index("snafu-derive") != null' \
+    <<<"$legacy_tasks" >/dev/null \
+    || die "snafu's resolved edges do not name snafu-derive"
+
+curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
+    -H "Authorization: Bearer $EDGE_BEARER" \
+    -H 'content-type: application/json' \
+    --data "$legacy_tasks" >/dev/null \
+    || die "snafu submit failed"
+
+snafu_id="$(sched "SELECT task_id FROM queue WHERE crate_name = 'snafu' AND host_side = 0")"
+[ -n "$snafu_id" ] || die "snafu queue row missing after submit"
+
+# The spelling a retried pre-migration row leaves after the column
+# ALTERs: side columns exist, but no resolver ever wrote them.
+sched "UPDATE queue_dependencies SET dep_host_side = 0, dep_side_known = 0 \
+    WHERE task_id = '$snafu_id'"
+
+# The side derivation is part of the migration pass, which runs only
+# through the operator route — rerun it the way a deploy would. The
+# edge's stored side must read -1: owner and dep both sit on the family
+# host triple, so the derivation cannot prove which side the edge meant.
+migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler migrate 2>&1)" \
+    || die "stow-admin scheduler migrate failed: $migrate_out"
+edge_side="$(sched "SELECT dep_host_side FROM queue_dependencies \
+    WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'")"
+[ "$edge_side" = "-1" ] \
+    || die "the migration left snafu->snafu-derive at dep_host_side $edge_side — expected -1 (unestablished)"
 
 deadline=$((SECONDS + TASK_DEADLINE))
 wave=0
@@ -462,7 +602,11 @@ while :; do
     failed="$(jq -r '.failed' <<<"$status_json")"
     echo "[mock-e2e] scheduler: $status_json"
     [ "$failed" -ge 1 ] && die "scheduler reported a failed task: $status_json"
-    if [ "$pending" -eq 0 ] && [ "$dispatched" -eq 0 ] && [ "$running" -eq 0 ]; then
+    # The wave drain counts only the plan's rows — snafu sits pending on
+    # its unestablished edge through the whole build, by design.
+    wave_open="$(sched "SELECT COUNT(*) FROM queue WHERE status IN ('pending','dispatched','running') \
+        AND task_id != '$snafu_id'")"
+    if [ "$wave_open" -eq 0 ]; then
         [ "$completed" -eq "$task_count" ] \
             || die "queue drained at $completed completed tasks, expected $task_count"
         break
@@ -477,7 +621,7 @@ while :; do
         # wake.
         wave=$((wave + 1))
         echo "[mock-e2e] publishing host slice (wave $wave)"
-        publish_slice "$HOST_TARGET" "wave-$wave"
+        publish_slices "wave-$wave"
         last_completed="$completed"
         last_publish=$SECONDS
     fi
@@ -526,89 +670,19 @@ for dep in snafu-derive proc-macro2 quote syn unicode-ident; do
 done
 echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
 
-# The mock's proc-macro unit linked on this box measures a glibc floor
-# above the index's published baseline (2.28) — a production builder
-# emits the baseline value — so its rows are set to it, the spelling a
-# conforming runner's register would leave. Without it the slice export
-# drops the proc-macro and every lane downstream misses a servable dep.
-d1 "UPDATE artifacts SET min_glibc = '2.28' WHERE crate_name = 'snafu-derive'" >/dev/null
-
-# --- retried pre-migration dependent row -----------------------------------
-#
-# The production Class-B failure's scheduler spelling: a queue row minted
-# before the side model keeps the edges it was minted with when it is
-# retried — `dep_host_side` defaulted 0, and the wire could not name a
-# side. The migration re-derives every such edge from where the dep's
-# task sits; a dep on the family host triple under an owner on the same
-# triple is ambiguous, so the edge stays unestablished (-1). The gate's
-# `p.unit_side = -1` clause matches no published row, so the dependent
-# holds until a resolver resync — any re-request carrying `depends_on` —
-# rewrites the edge.
-#
-# snafu is the library the proc-macro crate derives for: its
-# $HOST_TARGET target node edges snafu-derive host-side, coverage this
-# run already published. Dev-spelling the edge after submit reproduces
-# the retried row; resubmitting the same plan reproduces the heal.
-#
-# The queue is a Durable Object's sqlite store — `wrangler d1` reaches
-# only the catalog; workerd persists the DO under the run's edge-state.
-sched_db() {
-    find "$WORK_DIR/edge-state/v3/do" -name '*.sqlite' \
-        ! -name 'metadata.sqlite' ! -name '*-wal' ! -name '*-shm' | head -1
-}
-sched() {
-    sqlite3 -batch "$(sched_db)" ".timeout 15000" "$1"
-}
-LEGACY_VERSION="$(curl -fsS --max-time 30 -A 'stow-mock-e2e' \
-    'https://crates.io/api/v1/crates/snafu' \
-    | jq -r '.crate.max_stable_version')"
-[ -n "$LEGACY_VERSION" ] && [ "$LEGACY_VERSION" != "null" ] \
-    || die "crates.io returned no version for snafu"
-echo "[mock-e2e] legacy-row lane: snafu $LEGACY_VERSION"
-
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" --json preheat plan \
-    "snafu@${LEGACY_VERSION}" \
-    --features-json '[]' \
-    --target "$HOST_TARGET" \
-    --rustc-version "$RUSTC_VERSION" \
-    >"$WORK_DIR/preheat-plan-legacy.json" 2>"$LOG_DIR/preheat-plan-legacy.log" \
-    || die "snafu preheat plan failed — see $LOG_DIR/preheat-plan-legacy.log"
-
-legacy_tasks="$(jq '[.targets[].tasks[]]' "$WORK_DIR/preheat-plan-legacy.json")"
-jq -e '.[] | select(.crate_name == "snafu" and .host_side != true)' <<<"$legacy_tasks" >/dev/null \
-    || die "snafu plan minted no $HOST_TARGET target node: $(jq -c '[.[].crate_name]' <<<"$legacy_tasks")"
-jq -e '.[] | select(.crate_name == "snafu") | [.depends_on[].crate_name] | index("snafu-derive") != null' \
-    <<<"$legacy_tasks" >/dev/null \
-    || die "snafu's resolved edges do not name snafu-derive"
-
-curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
-    -H "Authorization: Bearer $EDGE_BEARER" \
-    -H 'content-type: application/json' \
-    --data "$legacy_tasks" >/dev/null \
-    || die "snafu submit failed"
-
-snafu_id="$(sched "SELECT task_id FROM queue WHERE crate_name = 'snafu' AND host_side = 0")"
-[ -n "$snafu_id" ] || die "snafu queue row missing after submit"
-
-# The spelling a retried pre-migration row leaves after the column
-# ALTERs: side columns exist, but no resolver ever wrote them.
-sched "UPDATE queue_dependencies SET dep_host_side = 0, dep_side_known = 0 \
-    WHERE task_id = '$snafu_id'"
-
-# `ensure_schema` runs on every scheduler touch — poll until the edge's
-# stored side reads -1: owner and dep both sit on the family host
-# triple, so the derivation cannot prove which side the edge meant.
-edge_side=""
-for _ in $(seq 1 30); do
-    curl -fsS --max-time 10 "$SCHEDULER_URL/status" >/dev/null 2>&1 || true
-    edge_side="$(sched "SELECT dep_host_side FROM queue_dependencies \
-        WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'")"
-    [ "$edge_side" = "-1" ] && break
-    sleep 2
-done
-[ "$edge_side" = "-1" ] \
-    || die "the migration left snafu->snafu-derive at dep_host_side $edge_side — expected -1 (unestablished)"
+# The proc-macro unit's honest floor — measured by the sysrooted build
+# the way production links — must sit at or under the index's published
+# baseline: an above-baseline row publishes but `index report` excludes
+# it, so the lanes below would find snafu-derive unservable forever.
+# Versions order numerically, not as strings (2.4 < 2.34), so the
+# highest floor is picked with `sort -V` rather than SQL's max().
+snafu_floors="$(d1 "SELECT min_glibc FROM artifacts \
+    WHERE crate_name = 'snafu-derive' AND min_glibc != ''")"
+floor="$(jq -r '.[0].results[].min_glibc' <<<"$snafu_floors" | sort -V | tail -1)"
+[ -n "$floor" ] \
+    || die "snafu-derive's linked unit registered no glibc floor — the sysroot build did not measure it"
+[ "$(printf '%s\n2.28\n' "$floor" | sort -V | tail -1)" = "2.28" ] \
+    || die "snafu-derive's glibc floor $floor exceeds the 2.28 baseline — the build linked outside the sysroot"
 
 # Held although snafu-derive's host coverage is published — the -1 edge
 # matches no slice row, unlike the target-side 0 the dev-era row
@@ -649,7 +723,7 @@ while :; do
     if [ "$pending" -gt 0 ] && [ "$last_publish" -lt "$((SECONDS - 30))" ]; then
         legacy_wave=$((legacy_wave + 1))
         echo "[mock-e2e] publishing host slice (legacy wave $legacy_wave)"
-        publish_slice "$HOST_TARGET" "legacy-wave-$legacy_wave"
+        publish_slices "legacy-wave-$legacy_wave"
         last_publish=$SECONDS
     fi
     [ "$SECONDS" -ge "$legacy_deadline" ] \
@@ -665,12 +739,11 @@ echo "[mock-e2e] resynced snafu completed — a retried pre-migration row heals 
 # slice of the platform its rustc invocation records — host units come
 # from the host slice at the invocation spelling's own key.
 
-# Both slices exist now; wasm32's is empty (no target-side node ever ran)
-# but the wasm32 consumer's own units miss on purpose — the crate is not a
-# node. Publish the wasm32 slice once so `stow index refresh --target`
-# has a tag to pull.
-publish_slice "$CONSUMER_TARGET" "final"
-publish_slice "$HOST_TARGET" "final"
+# One last pass so the final wave's records fold into the slices the
+# consumer lanes fetch: export reads whatever the legacy wave left
+# unpublished, publish pushes the slices, report feeds the gate, sync
+# fills the catalog.
+publish_slices "final"
 
 # The consumer's own `stow check` fetches its slices — the wasm32 check
 # ensures the wasm32 AND the host slice it resolves host units from.

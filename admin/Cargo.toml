@@ -13,24 +13,28 @@ path = "src/main.rs"
 [dependencies]
 strip-ansi-escapes = "0.2"
 stow-types.workspace = true
-stow-oci.workspace = true
+stow-oci = { workspace = true, features = ["mock-verify"] }
+stow-resolver.workspace = true
 rustls.workspace = true
 zenwave.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 flate2.workspace = true
 tar.workspace = true
 humantime = "2"
 serde_html_form = "0.4"
 smol = "2"
 semver.workspace = true
-time = { version = "0.3", features = ["formatting"] }
+askama = "0.14"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1"
+dirs = "7"
+oci-client = { version = "0.16.1", default-features = false }
 futures-util = "0.3"
-tokio = { version = "1", features = ["net", "rt", "time"] }
+tokio = { version = "1", features = ["net", "process", "rt", "time"] }
 
 [lints]
 workspace = true

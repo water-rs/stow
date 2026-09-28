@@ -24,9 +24,8 @@ pub enum ArtifactsCommand {
     /// The catalog row plus the bundle image's OCI manifest for one
     /// `(target, rustc, c_metadata)` identity.
     Inspect(InspectArgs),
-    /// Delete every catalog row built by a retired rustc and invalidate
-    /// its lookup-cache entries. GHCR image tags are not deleted — they
-    /// age out under the package's own retention.
+    /// Delete every catalog row built by a retired rustc. GHCR image tags
+    /// are not deleted — they age out under the package's own retention.
     Prune(PruneArgs),
 }
 

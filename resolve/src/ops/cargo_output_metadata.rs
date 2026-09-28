@@ -19,9 +19,10 @@ pub struct OutputMetadataOptions {
     pub no_deps: bool,
     pub version: u32,
     pub filter_platforms: Vec<String>,
-    /// As [`crate::ops::select_ws_with_opts`]'s `yanked_allowlist` — the
-    /// project's own lockfile pins, admissible even when yanked.
-    pub yanked_allowlist: std::collections::BTreeSet<PackageId>,
+    /// As [`crate::ops::select_ws_with_opts`]'s `dropped_lockfile` — the
+    /// contents of the project's own `Cargo.lock` when the caller drops
+    /// it from the tree before resolving.
+    pub dropped_lockfile: Option<String>,
 }
 
 /// This is the structure that is serialized and displayed to the user.
@@ -168,7 +169,7 @@ pub async fn build_resolve_graph_with<'gctx>(
         HasDevUnits::Yes,
         force_all,
         dry_run,
-        &metadata_opts.yanked_allowlist,
+        metadata_opts.dropped_lockfile.as_deref(),
     )
     .await?;
 

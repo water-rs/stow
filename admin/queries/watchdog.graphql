@@ -1,0 +1,22 @@
+query StowWatchdog($accountTag: String!, $scriptName: String!, $sinceHour: Time!, $sinceQuarter: Time!, $now: Time!) {
+  viewer {
+    accounts(filter: {accountTag: $accountTag}) {
+      doPeriodic: durableObjectsPeriodicGroups(filter: {datetime_geq: $sinceHour, datetime_leq: $now}, limit: 100) {
+        sum { activeTime cpuTime duration exceededCpuErrors exceededMemoryErrors fatalInternalErrors rowsRead rowsWritten storageDeletes storageReadUnits storageWriteUnits subrequests }
+      }
+      doInvoke: durableObjectsInvocationsAdaptiveGroups(filter: {datetime_geq: $sinceHour, datetime_leq: $now}, limit: 100) {
+        sum { requests wallTime errors }
+      }
+      worker: workersInvocationsAdaptive(filter: {datetime_geq: $sinceHour, datetime_leq: $now, scriptName: $scriptName}, limit: 100) {
+        sum { clientDisconnects cpuTimeUs duration errors requestDuration requests responseBodySize subrequests wallTime }
+      }
+      workerStatus: workersInvocationsAdaptive(filter: {datetime_geq: $sinceQuarter, datetime_leq: $now, scriptName: $scriptName}, limit: 100) {
+        dimensions { status }
+        sum { requests }
+      }
+      d1: d1AnalyticsAdaptiveGroups(filter: {datetime_geq: $sinceHour, datetime_leq: $now}, limit: 100) {
+        sum { rowsRead rowsWritten }
+      }
+    }
+  }
+}

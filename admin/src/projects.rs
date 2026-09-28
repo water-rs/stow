@@ -280,7 +280,7 @@ pub async fn run(args: ProjectsArgs, output: Output) -> stow_types::error::Resul
         }
         ProjectsCommand::Submit(args) => {
             let edge = crate::Edge::connect().await?;
-            submit(&edge, &args, output).await
+            submit(&edge, &args, output)
         }
     }
 }
@@ -368,12 +368,14 @@ async fn generate(
     })
 }
 
-/// `preheat projects submit` — resolve the list, render the plan, and
-/// under `--yes` apply it repository by repository: each repository's
-/// tasks post to the scheduler right after it resolves, so a token or
-/// network failure mid-lane costs the wave only the repositories it
-/// never reached, never the work it already did.
-async fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::Result<()> {
+/// `preheat projects submit` — resolve the list in-process (the pool's
+/// [`crate::resolve::RESOLVE_CONCURRENCY`] workers fetch each tree and
+/// run cargo's resolver on it), render the plan, and under `--yes`
+/// apply it repository by repository: each repository's tasks post to
+/// the scheduler as soon as its resolve lands, so a token or network
+/// failure mid-lane costs the wave only the repositories it never
+/// reached, never the work it already did.
+fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
     let targets: Vec<TargetTriple> = crate::preheat::ci_targets(args.targets.clone())?
@@ -384,6 +386,7 @@ async fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::e
         })
         .collect::<stow_types::error::Result<_>>()?;
     let repos = load_projects_file(&args.file)?;
+    let pool = crate::resolve::ResolvePool::new()?;
     let mut plan = ProjectsPlan {
         file: args.file.display().to_string(),
         tasks: Vec::new(),
@@ -397,12 +400,20 @@ async fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::e
         inserted: 0,
         dropped: 0,
     };
-    for repo in &repos {
-        match resolve_repository(edge, repo, &targets, &rustc_version).await {
+    // Results stream out of the pool in completion order: a repo's
+    // batch submits the moment its resolve returns — the crash-safety
+    // property the sequential loop had. The submit is async; the
+    // resolve side is threaded, so the drain drives it with a nested
+    // `block_on` on this thread (the executor has nothing else in
+    // flight while the lane drains).
+    pool.run(
+        &repos,
+        |resolver, repo| resolve_repository(resolver, repo, &targets, &rustc_version),
+        |_index, repo, result| match result {
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
                 if args.yes && !tasks.is_empty() {
-                    match submit_chunked(edge, &tasks).await {
+                    match smol::block_on(submit_chunked(edge, &tasks)) {
                         Ok(chunk_outcome) => {
                             outcome.batches += chunk_outcome.batches;
                             outcome.submitted += chunk_outcome.submitted;
@@ -428,11 +439,11 @@ async fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::e
                 tracing::warn!(%repo, reason = %error, "skipped");
                 plan.skipped.push(SkippedRepo {
                     repo: repo.clone(),
-                    reason: error.to_string(),
+                    reason: error,
                 });
             }
-        }
-    }
+        },
+    );
     let envelope = render::Planned {
         dry_run: !args.yes,
         plan,
@@ -795,7 +806,7 @@ fn render_projects_file(repos: &[String]) -> String {
 }
 
 /// Read and validate `preheat/projects.toml` into its repository URLs.
-fn load_projects_file(path: &Path) -> stow_types::error::Result<Vec<String>> {
+pub fn load_projects_file(path: &Path) -> stow_types::error::Result<Vec<String>> {
     let raw = fs::read(path).map_err(|error| stow_error!("read {}: {error}", path.display()))?;
     let file: ProjectsFile =
         toml::from_slice(&raw).map_err(|error| stow_error!("parse {}: {error}", path.display()))?;
@@ -827,33 +838,31 @@ fn normalize_repo_url(raw: &str) -> stow_types::error::Result<String> {
     Ok(format!("https://github.com/{tail}"))
 }
 
-/// Resolve one listed repository into its enqueue batch — `POST
-/// /api/v1/admin/resolve/project` has the edge fetch the repository's
-/// codeload tarball and run cargo's own resolver on it, once per CI
-/// target: the committed lockfile's pins are dropped so the resolve
-/// lands on the latest semver-compatible version — a project
-/// contributes crate names and feature sets, never version pins.
-async fn resolve_repository(
-    edge: &Edge,
+/// Resolve one listed repository into its enqueue batch — the pool
+/// worker fetches the tree (depth-1, `HEAD`) and runs cargo's own
+/// resolver on it, once per CI target: the committed lockfile's pins
+/// are dropped so the resolve lands on the latest semver-compatible
+/// version — a project contributes crate names and feature sets, never
+/// version pins.
+pub fn resolve_repository(
+    resolver: &stow_resolver::Resolver,
     repo: &str,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<Vec<EnqueueRequest>> {
-    let full_name = repo.trim_start_matches("https://github.com/");
-    let request = stow_types::api::AdminResolveProjectRequest {
-        repo: full_name.to_owned(),
-        git_ref: "HEAD".to_owned(),
-        targets: targets.to_vec(),
-        rustc_version: rustc_version.clone(),
-        downloads: 0,
-    };
-    let resolved: stow_types::api::AdminResolveResponse = edge
-        .post_json("/api/v1/admin/resolve/project", &request)
-        .await?;
-    Ok(resolved
+) -> Result<Vec<EnqueueRequest>, String> {
+    let source = resolver
+        .resolve_git(
+            repo,
+            "HEAD",
+            &crate::resolve::target_strings(targets),
+            rustc_version,
+            0,
+        )
+        .map_err(|error| format!("resolve {repo}: {error:#}"))?;
+    Ok(source
         .targets
         .into_iter()
-        .flat_map(|batch| batch.tasks)
+        .flat_map(|(_target, tasks)| tasks)
         .collect())
 }
 

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_fs::{create_dir_all, read, write};
@@ -37,7 +37,11 @@ use stow_types::bundle_schema::validate_bundle_schema;
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
-    STOW_INDEX_CONFIG_MEDIA_TYPE, STOW_INDEX_MEDIA_TYPE, content_sha256, index_tag,
+    STOW_FOLDED_CONFIG_MEDIA_TYPE, STOW_FOLDED_MEDIA_TYPE, STOW_INDEX_CONFIG_MEDIA_TYPE,
+    STOW_INDEX_MEDIA_TYPE, content_sha256, folded_tag, index_tag,
+};
+use stow_types::records::{
+    RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION, records_tag,
 };
 use stow_types::registry::{GHCR_BASE, bundle_oci_reference, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
@@ -75,6 +79,7 @@ async fn async_main() -> stow_types::error::Result<()> {
         Command::Populate(request) => populate_registry(request).await,
         Command::PublishIndex(request) => publish_index(request).await,
         Command::IndexFromRecords(request) => index_from_records(request).await,
+        Command::PushRecords(request) => push_records(request).await,
         Command::Serve(request) => serve_registry(request).await,
     }
 }
@@ -153,6 +158,14 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
         &index,
         &index_bytes,
     )
+    .await?;
+    write_signed_folded(
+        &request.registry_root,
+        &request.private_key_path,
+        index.header.target.as_str(),
+        index.header.rustc_version.as_str(),
+        &request.folded,
+    )
     .await
 }
 
@@ -206,6 +219,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
                 generated_at: time::OffsetDateTime::now_utc()
                     .format(&time::format_description::well_known::Rfc3339)
                     .map_err(|error| stow_types::stow_error!("format generated_at: {error}"))?,
+                generation: 1,
                 row_count: u64::try_from(rows.len())
                     .map_err(|_| stow_types::stow_error!("row count {} exceeds u64", rows.len()))?,
             },
@@ -221,6 +235,79 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
         )
         .await?;
     }
+    Ok(())
+}
+
+/// `push-records` — write the task's signed records artifact the same
+/// shape `stow_oci::push_records` pushes to GHCR: the JSON layer under
+/// `application/vnd.stow.records.v1+json`, a `{}` config, the task-id
+/// annotation on the manifest, and the mock signature image.
+async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()> {
+    let bytes = read(&request.records).await.map_err(|error| {
+        stow_types::stow_error!("read records {}: {error}", request.records.display())
+    })?;
+    let records: Vec<ArtifactRecord> = serde_json::from_slice(&bytes).map_err(|error| {
+        stow_types::stow_error!("decode records {}: {error}", request.records.display())
+    })?;
+    // The signature binds the canonical GHCR reference — the same string
+    // production's cosign signs — never the mock transport base.
+    let oci_reference = format!(
+        "{GHCR_BASE}:{}",
+        records_tag(&request.rustc_version, &request.task_id)
+    );
+
+    let layer_digest = sha256_digest(&bytes);
+    write_blob(&request.registry_root, &layer_digest, &bytes).await?;
+    let config_bytes = b"{}".to_vec();
+    let config_digest = sha256_digest(&config_bytes);
+    write_blob(&request.registry_root, &config_digest, &config_bytes).await?;
+    let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "artifactType": RECORDS_ARTIFACT_TYPE,
+        "config": {
+            "mediaType": RECORDS_CONFIG_MEDIA_TYPE,
+            "digest": config_digest,
+            "size": config_bytes.len(),
+        },
+        "layers": [{
+            "mediaType": RECORDS_ARTIFACT_TYPE,
+            "digest": layer_digest,
+            "size": bytes.len(),
+        }],
+        "annotations": {
+            RECORDS_TASK_ID_ANNOTATION: request.task_id,
+        },
+    }))?;
+    let manifest_digest = sha256_digest(&manifest_bytes);
+    let (repo, tag) = split_reference(&oci_reference)?;
+    write_manifest(&request.registry_root, &repo, &tag, &manifest_bytes).await?;
+    write_manifest(
+        &request.registry_root,
+        &repo,
+        &manifest_digest,
+        &manifest_bytes,
+    )
+    .await?;
+
+    let key_pair = load_key_pair(&request.private_key_path).await?;
+    let signer = key_pair
+        .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
+        .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
+    write_mock_signature(
+        &request.registry_root,
+        &signer,
+        &oci_reference,
+        &manifest_digest,
+    )
+    .await?;
+    tracing::info!(
+        oci_reference = %oci_reference,
+        digest = %manifest_digest,
+        task_id = %request.task_id,
+        records = records.len(),
+        "pushed mock records artifact"
+    );
     Ok(())
 }
 
@@ -293,35 +380,16 @@ async fn write_signed_index(
 
     let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
     let payload_bytes = serde_json::to_vec(&payload)?;
-    let payload_digest = sha256_digest(&payload_bytes);
-    write_blob(registry_root, &payload_digest, &payload_bytes).await?;
     let signature = signer.sign(&payload_bytes).map_err(|error| {
         stow_types::stow_error!("sign mock index payload for {reference}: {error}")
     })?;
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    let signature_manifest_bytes = serde_json::to_vec(&serde_json::json!({
-        "schemaVersion": 2,
-        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
-        "config": {
-            "mediaType": OCI_CONFIG_MEDIA_TYPE,
-            "digest": config_digest,
-            "size": config_bytes.len(),
-        },
-        "layers": [{
-            "mediaType": SIGSTORE_OCI_MEDIA_TYPE,
-            "digest": payload_digest,
-            "size": payload_bytes.len(),
-            "annotations": {
-                SIGSTORE_SIGNATURE_ANNOTATION: signature_b64,
-                SIGSTORE_CERT_ANNOTATION: MOCK_CERTIFICATE,
-            }
-        }],
-    }))?;
-    write_manifest(
+    append_mock_signature(
         registry_root,
         repository,
-        &sigstore_signature_tag(&manifest_digest),
-        &signature_manifest_bytes,
+        &manifest_digest,
+        &payload_bytes,
+        &signature_b64,
     )
     .await?;
     tracing::info!(%reference, %manifest_digest, "published mock index artifact");
@@ -384,14 +452,13 @@ fn registry_app_with_probe(
         )
         .route("/token", get(issue_token))
         .route(
-            "/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}",
-            get(serve_edge_artifact).head(serve_edge_artifact),
+            "/api/v1/bundles/{digest}",
+            get(serve_edge_bundle).head(serve_edge_bundle),
         )
         .with_state(MockRegistryState {
             registry_root,
             token_realm: format!("http://{listen}/token"),
             tokens: Arc::new(Mutex::new(TokenState::default())),
-            index_slices: Arc::new(RwLock::new(HashMap::new())),
             requests: probe.as_ref().map(|probe| Arc::clone(&probe.requests)),
             rate_limits: probe.as_ref().map(|probe| Arc::clone(&probe.rate_limits)),
             toggles: probe.as_ref().map(|probe| Arc::clone(&probe.toggles)),
@@ -775,11 +842,99 @@ async fn write_mock_registry_entry(
     })
 }
 
+/// Append `payload_bytes` + `signature_b64` to the `sha256-<digest>.sig`
+/// manifest — cosign's layout of one layer per signature. Several tags
+/// whose manifests share a digest sign into the same `.sig`, so the
+/// manifest accumulates one payload per tag; a layer whose payload is
+/// already there byte-for-byte (the same tag re-published, since mock
+/// signing is deterministic in content but not bytes) is skipped.
+async fn append_mock_signature(
+    registry_root: &Path,
+    repository: &str,
+    manifest_digest: &str,
+    payload_bytes: &[u8],
+    signature_b64: &str,
+) -> stow_types::error::Result<()> {
+    let signature_manifest_ref = sigstore_signature_tag(manifest_digest);
+    let signature_path = registry_root
+        .join("manifests")
+        .join(repository)
+        .join(&signature_manifest_ref);
+    let mut manifest: serde_json::Value = match read(&signature_path).await {
+        Ok(existing) => serde_json::from_slice(&existing).map_err(|error| {
+            stow_types::stow_error!(
+                "parse signature manifest {}: {error}",
+                signature_path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let config_bytes = b"{}".to_vec();
+            let config_digest = sha256_digest(&config_bytes);
+            write_blob(registry_root, &config_digest, &config_bytes).await?;
+            serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+                "config": {
+                    "mediaType": OCI_CONFIG_MEDIA_TYPE,
+                    "digest": config_digest,
+                    "size": config_bytes.len(),
+                },
+                "layers": [],
+            })
+        }
+        Err(error) => {
+            return Err(stow_types::stow_error!(
+                "read signature manifest {}: {error}",
+                signature_path.display()
+            ));
+        }
+    };
+    let layers = manifest
+        .get_mut("layers")
+        .and_then(|layers| layers.as_array_mut())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "signature manifest {} has no layers array",
+                signature_path.display()
+            )
+        })?;
+    for layer in layers.iter() {
+        let Some(digest) = layer.get("digest").and_then(|digest| digest.as_str()) else {
+            continue;
+        };
+        let blob_path = registry_root.join("blobs").join(digest.replace(':', "_"));
+        if let Ok(existing) = read(&blob_path).await
+            && existing == payload_bytes
+        {
+            return Ok(());
+        }
+    }
+    let payload_digest = sha256_digest(payload_bytes);
+    write_blob(registry_root, &payload_digest, payload_bytes).await?;
+    layers.push(serde_json::json!({
+        "mediaType": SIGSTORE_OCI_MEDIA_TYPE,
+        "digest": payload_digest,
+        "size": payload_bytes.len(),
+        "annotations": {
+            SIGSTORE_SIGNATURE_ANNOTATION: signature_b64,
+            SIGSTORE_CERT_ANNOTATION: MOCK_CERTIFICATE,
+        }
+    }));
+    write_manifest(
+        registry_root,
+        repository,
+        &signature_manifest_ref,
+        &serde_json::to_vec(&manifest)?,
+    )
+    .await
+}
+
 /// The signature pair the push path reads back through
 /// `pull_signature_materials`: the simple-signing payload as a blob and
-/// the `sha256-<digest>.sig` manifest whose layer carries the signature
-/// and certificate annotations. Returns the base64 signature and the
-/// payload bytes — the bundle embeds both.
+/// the `sha256-<digest>.sig` manifest whose layers carry each tag's
+/// signature and certificate annotations — appended, so a digest shared
+/// by several tags accumulates them all. Returns the base64 signature
+/// and the payload bytes — the bundle embeds both.
 async fn write_mock_signature(
     registry_root: &Path,
     signer: &SigStoreSigner,
@@ -788,45 +943,17 @@ async fn write_mock_signature(
 ) -> stow_types::error::Result<(String, Vec<u8>)> {
     let payload = SimpleSigning::new(&oci_reference.parse()?, manifest_digest);
     let payload_bytes = serde_json::to_vec(&payload)?;
-    let payload_digest = sha256_digest(&payload_bytes);
-    write_blob(registry_root, &payload_digest, &payload_bytes).await?;
     let signature = signer.sign(&payload_bytes).map_err(|error| {
         stow_types::stow_error!("sign mock payload for {oci_reference}: {error}")
     })?;
-    let signature_manifest_ref = sigstore_signature_tag(manifest_digest);
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
-    let signature_config_bytes = b"{}".to_vec();
-    let signature_config_digest = sha256_digest(&signature_config_bytes);
-    write_blob(
-        registry_root,
-        &signature_config_digest,
-        &signature_config_bytes,
-    )
-    .await?;
-    let signature_manifest_bytes = serde_json::to_vec(&serde_json::json!({
-        "schemaVersion": 2,
-        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
-        "config": {
-            "mediaType": OCI_CONFIG_MEDIA_TYPE,
-            "digest": signature_config_digest,
-            "size": signature_config_bytes.len(),
-        },
-        "layers": [{
-            "mediaType": SIGSTORE_OCI_MEDIA_TYPE,
-            "digest": payload_digest,
-            "size": payload_bytes.len(),
-            "annotations": {
-                SIGSTORE_SIGNATURE_ANNOTATION: signature_b64,
-                SIGSTORE_CERT_ANNOTATION: MOCK_CERTIFICATE,
-            }
-        }],
-    }))?;
     let (repo, _) = split_reference(oci_reference)?;
-    write_manifest(
+    append_mock_signature(
         registry_root,
         &repo,
-        &signature_manifest_ref,
-        &signature_manifest_bytes,
+        manifest_digest,
+        &payload_bytes,
+        &signature_b64,
     )
     .await?;
     Ok((signature_b64, payload_bytes))
@@ -886,6 +1013,9 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
             let crate_types_json = serde_json::to_string(&record.crate_types)?;
             let profile_json = serde_json::to_string(&record.profile)?;
             let emit_json = serde_json::to_string(&record.emit)?;
+            // SQLite integers are i64; rusqlite no longer binds u64
+            // directly.
+            let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
             statement
                 .execute(rusqlite::params![
                     record.compile_key,
@@ -904,10 +1034,10 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
                     crate_types_json,
                     profile_json,
                     emit_json,
-                    record.artifact_size,
+                    to_i64(record.artifact_size),
                     record.bundle_digest,
-                    record.bundle_size,
-                    record.compile_millis,
+                    to_i64(record.bundle_size),
+                    to_i64(record.compile_millis),
                 ])
                 .map_err(|error| stow_types::stow_error!("upsert sqlite artifact {} {} {}: {error}", record.crate_name, record.target, record.c_metadata))?;
         }
@@ -1018,6 +1148,78 @@ async fn write_manifest(
         .map_err(|error| stow_types::stow_error!("write manifest {}: {error}", path.display()))
 }
 
+/// The folded companion to `write_signed_index`: the slice's folded-tag
+/// list under `folded.<target>.<rustc>`, signed the same way. The bytes
+/// are deterministic (sorted tags, `{}` config), so an equal manifest
+/// digest skips the rewrite — no annotation needed.
+async fn write_signed_folded(
+    registry_root: &Path,
+    private_key_path: &Path,
+    target: &str,
+    rustc_version: &str,
+    folded_path: &Path,
+) -> stow_types::error::Result<()> {
+    let folded_bytes = read(folded_path).await.map_err(|error| {
+        stow_types::stow_error!("read folded file {}: {error}", folded_path.display())
+    })?;
+    let tag = folded_tag(target, rustc_version);
+    let repository = stow_types::registry::GHCR_REPOSITORY;
+    let reference = format!("{GHCR_BASE}:{tag}");
+
+    let layer_digest = sha256_digest(&folded_bytes);
+    let config_bytes = b"{}".to_vec();
+    let config_digest = sha256_digest(&config_bytes);
+    let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        "config": {
+            "mediaType": STOW_FOLDED_CONFIG_MEDIA_TYPE,
+            "digest": config_digest,
+            "size": config_bytes.len(),
+        },
+        "layers": [{
+            "mediaType": STOW_FOLDED_MEDIA_TYPE,
+            "digest": layer_digest,
+            "size": folded_bytes.len(),
+        }],
+    }))?;
+    let manifest_digest = sha256_digest(&manifest_bytes);
+    let manifest_path = registry_root.join("manifests").join(repository).join(&tag);
+    if let Ok(existing) = read(&manifest_path).await
+        && published_manifest_digest(&existing)? == manifest_digest
+    {
+        tracing::info!(%reference, %manifest_digest, "folded set unchanged — skipping publish");
+        return Ok(());
+    }
+
+    let key_pair = load_key_pair(private_key_path).await?;
+    let signer = key_pair
+        .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
+        .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
+
+    write_blob(registry_root, &layer_digest, &folded_bytes).await?;
+    write_blob(registry_root, &config_digest, &config_bytes).await?;
+    write_manifest(registry_root, repository, &tag, &manifest_bytes).await?;
+    write_manifest(registry_root, repository, &manifest_digest, &manifest_bytes).await?;
+
+    let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let signature = signer.sign(&payload_bytes).map_err(|error| {
+        stow_types::stow_error!("sign mock folded payload for {reference}: {error}")
+    })?;
+    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    append_mock_signature(
+        registry_root,
+        repository,
+        &manifest_digest,
+        &payload_bytes,
+        &signature_b64,
+    )
+    .await?;
+    tracing::info!(%reference, %manifest_digest, "published mock folded artifact");
+    Ok(())
+}
+
 fn split_reference(reference: &str) -> stow_types::error::Result<(String, String)> {
     let tag = stow_types::registry::oci_reference_tag(reference)
         .ok_or_else(|| stow_types::stow_error!("unexpected OCI reference shape: {reference}"))?;
@@ -1120,7 +1322,30 @@ enum Command {
     /// straight from a `populate --records-out` file — the bench pipeline
     /// has no edge to `stow-admin index export` from.
     IndexFromRecords(IndexFromRecordsArgs),
+    /// Write one task's records artifact — the records blob, the
+    /// `dev.stow.records.task-id`-annotated manifest under
+    /// `records-<rustc>-<task_id hash>`, and its mock signature — the write
+    /// the production publish stage performs on GHCR once a build's
+    /// records live there (stow#455).
+    PushRecords(PushRecordsArgs),
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct PushRecordsArgs {
+    /// `populate --records-out` JSON file — the task's `Vec<ArtifactRecord>`.
+    #[arg(long)]
+    records: PathBuf,
+    /// The task the records belong to — the tag and annotation carry it.
+    #[arg(long = "task-id")]
+    task_id: String,
+    /// The rustc the task ran under — the tag's `records-<rustc>-` half.
+    #[arg(long = "rustc-version")]
+    rustc_version: String,
+    #[arg(long = "registry-root")]
+    registry_root: PathBuf,
+    #[arg(long = "private-key")]
+    private_key_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1128,6 +1353,10 @@ struct PublishIndexArgs {
     /// The encoded (`zstd` JSON) index file `stow-admin index export` wrote.
     #[arg(long)]
     file: PathBuf,
+    /// The slice's folded-tag list JSON, written under
+    /// `folded.<target>.<rustc>` beside the index manifest.
+    #[arg(long)]
+    folded: PathBuf,
     #[arg(long)]
     registry_root: PathBuf,
     #[arg(long = "private-key")]
@@ -1181,11 +1410,6 @@ struct MockRegistryState {
     /// own `/token` endpoint.
     token_realm: String,
     tokens: Arc<Mutex<TokenState>>,
-    /// Decoded index slices behind the edge byte-path stand-in, keyed by
-    /// tag and revalidated against the published manifest's digest on
-    /// every request, so a republished slice is picked up without a
-    /// restart.
-    index_slices: Arc<RwLock<HashMap<String, CachedIndexSlice>>>,
     /// The probe's request log — `Some` only when a test attached one.
     requests: Option<Arc<Mutex<Vec<RequestRecord>>>>,
     /// The probe's scripted `429`s — `Some` only when a test attached one.
@@ -1193,13 +1417,6 @@ struct MockRegistryState {
     /// The probe's behavior toggles — `None` means the well-behaved
     /// registry: single `POST` uploads, digest headers, honest serving.
     toggles: Option<Arc<ProbeToggles>>,
-}
-
-/// One decoded slice plus the digest of the manifest it was decoded from.
-#[derive(Debug, Clone)]
-struct CachedIndexSlice {
-    manifest_digest: String,
-    index: Arc<ArtifactIndex>,
 }
 
 /// Issued bearer tokens and their expirations; `Instant` is enough
@@ -1288,8 +1505,74 @@ async fn serve_v2(
         (Method::PUT, RegistryAsset::Manifest { reference }) => {
             store_manifest(&state, &reference, body).await
         }
+        (Method::GET, RegistryAsset::TagsList) => list_tags(&state, &query).await,
         _ => Err(StatusCode::METHOD_NOT_ALLOWED),
     }
+}
+
+/// `GET /v2/{repo}/tags/list` — every manifest file that is a tag (digest
+/// files land as `sha256_*`, so they cannot leak in), honoring the spec's
+/// `n`/`last` window: a page under the limit is the whole list, one at
+/// the limit answers `Link: rel="next"` so the caller continues.
+async fn list_tags(
+    state: &MockRegistryState,
+    query: &BTreeMap<String, String>,
+) -> Result<Response<Body>, StatusCode> {
+    let dir = state
+        .registry_root
+        .join("manifests")
+        .join(stow_types::registry::GHCR_REPOSITORY);
+    let mut names: Vec<String> = Vec::new();
+    let mut entries = std::fs::read_dir(&dir).map_err(|error| {
+        tracing::warn!(path = %dir.display(), %error, "mock registry manifests dir missing");
+        StatusCode::NOT_FOUND
+    })?;
+    while let Some(entry) = entries.next().transpose().map_err(|error| {
+        tracing::warn!(%error, "mock registry manifests dir read failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("sha256_") {
+            names.push(name);
+        }
+    }
+    names.sort();
+    let after = query.get("last").cloned();
+    let limit: usize = query
+        .get("n")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(usize::MAX);
+    let window: Vec<String> = names
+        .into_iter()
+        .filter(|name| after.as_ref().is_none_or(|last| name > last))
+        .take(limit)
+        .collect();
+    let has_more = window.len() == limit;
+    let body = serde_json::json!({
+        "name": stow_types::registry::GHCR_REPOSITORY,
+        "tags": window,
+    });
+    let mut response = Response::new(Body::from(
+        serde_json::to_vec(&body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ));
+    *response.status_mut() = StatusCode::OK;
+    if has_more && let Some(last) = body["tags"].as_array().and_then(|tags| tags.last()) {
+        response.headers_mut().insert(
+            header::LINK,
+            HeaderValue::from_str(&format!(
+                "</v2/{}/tags/list?n={}&last={}>; rel=\"next\"",
+                stow_types::registry::GHCR_REPOSITORY,
+                limit,
+                last.as_str().unwrap_or_default(),
+            ))
+            .expect("link header value"),
+        );
+    }
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
 }
 
 /// `GET|HEAD` of a stored manifest or blob — the file-serving side of
@@ -1309,7 +1592,7 @@ async fn serve_asset(
             .registry_root
             .join("blobs")
             .join(digest.replace(':', "_")),
-        RegistryAsset::BlobUpload | RegistryAsset::BlobUploadSession => {
+        RegistryAsset::BlobUpload | RegistryAsset::BlobUploadSession | RegistryAsset::TagsList => {
             return Err(StatusCode::METHOD_NOT_ALLOWED);
         }
     };
@@ -1507,28 +1790,22 @@ async fn store_manifest(
 }
 
 /// The edge byte path for hosts that run no worker (the bench lane):
-/// `GET|HEAD /api/v1/artifacts/{target}/{rustc_version}/{c_metadata}`
-/// resolves the key through the signed index slice published into this
-/// registry root and serves the bundle blob it pins — the same contract the
-/// real edge answers from D1 and GHCR, so `STOW_EDGE_URL` can point here.
-async fn serve_edge_artifact(
+/// `GET|HEAD /api/v1/bundles/{digest}` serves the blob the digest names —
+/// the same contract the real edge answers between its Cache API and the
+/// registry, so `STOW_EDGE_URL` can point here.
+async fn serve_edge_bundle(
     State(state): State<MockRegistryState>,
     method: Method,
-    AxumPath((target, rustc_version, c_metadata)): AxumPath<(String, String, String)>,
+    AxumPath(digest): AxumPath<String>,
 ) -> Result<Response<Body>, StatusCode> {
-    let index = state.index_slice(&target, &rustc_version).await?;
-    let Some(row) = index
-        .rows
-        .iter()
-        .find(|row| row.c_metadata.as_str() == c_metadata)
-    else {
-        tracing::warn!(%target, %rustc_version, %c_metadata, "byte path: no index row");
-        return Err(StatusCode::NOT_FOUND);
-    };
+    if !stow_types::registry::is_sha256_digest(&digest) {
+        tracing::warn!(%digest, "byte path: malformed bundle digest");
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let path = state
         .registry_root
         .join("blobs")
-        .join(row.bundle_digest.replace(':', "_"));
+        .join(digest.replace(':', "_"));
     let bytes = read(&path).await.map_err(|error| {
         tracing::warn!(path = %path.display(), %error, "byte path: bundle blob missing");
         StatusCode::NOT_FOUND
@@ -1555,73 +1832,6 @@ async fn serve_edge_artifact(
 }
 
 impl MockRegistryState {
-    /// The decoded slice for `(target, rustc_version)`: the cached copy
-    /// when the published manifest still hashes the same, otherwise the
-    /// slice re-read from the registry root. A missing or malformed
-    /// publication is a 404 — the byte path answers exactly what the index
-    /// pins, nothing else.
-    async fn index_slice(
-        &self,
-        target: &str,
-        rustc_version: &str,
-    ) -> Result<Arc<ArtifactIndex>, StatusCode> {
-        let tag = index_tag(target, rustc_version);
-        let manifest_path = self
-            .registry_root
-            .join("manifests")
-            .join(stow_types::registry::GHCR_REPOSITORY)
-            .join(&tag);
-        let manifest_bytes = read(&manifest_path).await.map_err(|error| {
-            tracing::warn!(path = %manifest_path.display(), %error, "byte path: index slice not published");
-            StatusCode::NOT_FOUND
-        })?;
-        let manifest_digest = sha256_digest(&manifest_bytes);
-        if let Some(cached) = self
-            .index_slices
-            .read()
-            .expect("index slice cache poisoned")
-            .get(&tag)
-            && cached.manifest_digest == manifest_digest
-        {
-            return Ok(Arc::clone(&cached.index));
-        }
-        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).map_err(|error| {
-            tracing::error!(path = %manifest_path.display(), %error, "byte path: malformed index manifest");
-            StatusCode::NOT_FOUND
-        })?;
-        let layer_digest = manifest
-            .pointer("/layers/0/digest")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                tracing::error!(path = %manifest_path.display(), "byte path: index manifest has no layer");
-                StatusCode::NOT_FOUND
-            })?;
-        let blob_path = self
-            .registry_root
-            .join("blobs")
-            .join(layer_digest.replace(':', "_"));
-        let index_bytes = read(&blob_path).await.map_err(|error| {
-            tracing::error!(path = %blob_path.display(), %error, "byte path: index blob missing");
-            StatusCode::NOT_FOUND
-        })?;
-        let index = stow_types::index::decode(&index_bytes).map_err(|error| {
-            tracing::error!(path = %blob_path.display(), %error, "byte path: index blob does not decode");
-            StatusCode::NOT_FOUND
-        })?;
-        let index = Arc::new(index);
-        self.index_slices
-            .write()
-            .expect("index slice cache poisoned")
-            .insert(
-                tag,
-                CachedIndexSlice {
-                    manifest_digest,
-                    index: Arc::clone(&index),
-                },
-            );
-        Ok(index)
-    }
-
     /// The digest the probe claims for a forged manifest file, if the
     /// test registered one — served in place of the bytes' real hash.
     fn forged_digest(&self, file_name: &str) -> Option<String> {
@@ -1767,6 +1977,9 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
     }
     let identifier = segments[repository.len() + 1].to_owned();
     match segments[repository.len()] {
+        "tags" if identifier == "list" && segments.len() == repository.len() + 2 => {
+            Ok(RegistryAsset::TagsList)
+        }
         "manifests" if segments.len() == repository.len() + 2 => Ok(RegistryAsset::Manifest {
             reference: identifier,
         }),
@@ -1792,6 +2005,8 @@ enum RegistryAsset {
     Blob {
         digest: String,
     },
+    /// `GET .../tags/list` — the distribution spec's tag listing.
+    TagsList,
     /// `POST .../blobs/uploads/` — the monolithic or session-opening
     /// upload endpoint.
     BlobUpload,
@@ -1818,7 +2033,7 @@ mod tests {
 
     use super::{
         Body, RegistryProbe, SigningScheme, registry_app, write_blob, write_manifest,
-        write_mock_signature,
+        write_mock_signature, write_public_key,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
@@ -1937,6 +2152,7 @@ mod tests {
                 target: TARGET.parse().expect("target"),
                 rustc_version: RUSTC.parse().expect("rustc"),
                 generated_at: "2026-09-20T00:00:00Z".to_owned(),
+                generation: 1,
                 row_count: 1,
             },
             rows: vec![ArtifactIndexRow {
@@ -1978,16 +2194,18 @@ mod tests {
             .expect("index manifest");
     }
 
-    /// The edge byte-path stand-in answers the exact-key route from the
-    /// published slice: the pinned bundle for a listed key, 404 for an
-    /// unlisted one, and HEAD carries the length without the body.
+    /// The edge byte-path stand-in serves blobs by digest — the same
+    /// contract the worker answers in front of the registry: the blob for
+    /// a digest it holds, 404 for a well-formed digest that names none,
+    /// 400 for a malformed digest, and HEAD carries the length without the
+    /// body.
     #[tokio::test]
-    async fn byte_path_serves_the_bundle_the_index_pins() {
+    async fn byte_path_serves_bundles_by_digest() {
         let root = tempfile::tempdir().expect("registry root");
         let bundle = b"not really a tar, but the bytes the index pins".to_vec();
         publish_slice(root.path(), &bundle).await;
         let app = registry_app("127.0.0.1:40123", root.path().to_path_buf());
-        let uri = format!("/api/v1/artifacts/{TARGET}/{RUSTC}/{C_METADATA}?crate=serde");
+        let uri = format!("/api/v1/bundles/{}", sha256_digest(&bundle));
 
         let response = app
             .clone()
@@ -2030,18 +2248,37 @@ mod tests {
             .expect("head body");
         assert!(body.is_empty());
 
+        // A well-formed digest no blob is stored under is a registry miss.
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/api/v1/artifacts/{TARGET}/{RUSTC}/0011aabbccddeeff"
-                    ))
+                    .uri(format!("/api/v1/bundles/sha256:{}", "1".repeat(64)))
                     .body(Body::empty())
                     .expect("miss request builds"),
             )
             .await
             .expect("miss response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A malformed digest is rejected before any blob lookup.
+        for malformed in [
+            "sha256:zz",
+            "notadigest",
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/bundles/{malformed}"))
+                        .body(Body::empty())
+                        .expect("malformed request builds"),
+                )
+                .await
+                .expect("malformed response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{malformed}");
+        }
     }
 
     /// Bind an ephemeral loopback port, serve the probe-instrumented
@@ -2352,5 +2589,63 @@ mod tests {
             !error.is_not_found(),
             "a forged body is a refusal, not an absence: {error}"
         );
+    }
+
+    /// Two tags whose manifests share a digest sign into the same
+    /// `.sig` manifest — cosign's layout of one layer per signature.
+    /// Both layers must land and verify, and re-publishing a tag must
+    /// not grow the manifest.
+    #[tokio::test]
+    async fn shared_digest_signature_manifest_carries_every_tag() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let key_pair = sigstore::crypto::signing_key::SigStoreKeyPair::ECDSA(
+            sigstore::crypto::signing_key::ecdsa::ECDSAKeys::new(
+                sigstore::crypto::signing_key::ecdsa::EllipticCurve::P256,
+            )
+            .expect("ecdsa key pair"),
+        );
+        let signer = key_pair
+            .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
+            .expect("mock signer");
+        let public_key_path = root.path().join("public.pem");
+        write_public_key(&public_key_path, &key_pair)
+            .await
+            .expect("public key");
+
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let tag_a = "folded.aarch64-apple-darwin.1.98.1";
+        let tag_b = "folded.x86_64-pc-windows-msvc.1.98.1";
+        for tag in [tag_a, tag_b, tag_a] {
+            write_mock_signature(root.path(), &signer, &format!("{GHCR_BASE}:{tag}"), digest)
+                .await
+                .expect("sign");
+        }
+
+        let (listen, _probe) = serve_probe_registry(root.path()).await;
+        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
+            .expect("registry base");
+        let session = base.session();
+        let reference = base.reference(tag_a).expect("reference");
+        let materials = stow_oci::pull_signature_materials(&session, &reference, digest)
+            .await
+            .expect("signature materials");
+        assert_eq!(
+            materials.len(),
+            2,
+            "one layer per tag — the byte-identical re-publish adds none"
+        );
+
+        let trust = stow_oci::verify::Trust::MockKey(public_key_path);
+        for tag in [tag_a, tag_b] {
+            stow_oci::verify::verify_materials(
+                &trust,
+                &format!("{GHCR_BASE}:{tag}"),
+                digest,
+                &materials,
+                "",
+            )
+            .unwrap_or_else(|error| panic!("{tag} must verify: {error}"));
+        }
     }
 }
