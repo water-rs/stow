@@ -306,6 +306,7 @@ mod tests {
                 target: "x86_64-unknown-linux-gnu".parse().expect("target"),
                 rustc_version: "1.98.1".parse().expect("rustc"),
                 generated_at: "2026-09-22T00:00:00Z".to_owned(),
+                generation: 1,
                 row_count: 0,
             },
             rows: Vec::new(),

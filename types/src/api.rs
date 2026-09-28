@@ -1102,12 +1102,38 @@ pub struct ArtifactIndexPage {
 /// a dependent dispatches only when every dependency resolves to a row
 /// the latest report for that dependency's own `(target, rustc_version)`
 /// covers.
+///
+/// Two report shapes share the wire:
+///
+/// - **Delta** — `base_generation` is the index generation the report's
+///   base was taken from; `added`/`retired` carry only what moved. The
+///   scheduler 409s when its live generation moved past the base — the
+///   reporter must then resync with a full report, never retry a stale
+///   delta.
+/// - **Full** — `base_generation` is `None`, `added` carries the slice's
+///   whole membership and `retired` is empty; the scheduler computes the
+///   delta itself. This is the first-publish path and the
+///   `stow-admin index report --full` resync.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedSliceReport {
-    /// Semantic identities the published slice serves. Artifact rows
-    /// sharing one identity (`c_metadata`/`compile_key` variants)
-    /// collapse into it; the order is irrelevant.
-    pub rows: Vec<PublishedSliceRow>,
+    /// The index generation this report's delta is based on — `None`
+    /// marks the explicit full report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_generation: Option<i64>,
+    /// The generation of the index this report publishes — the value
+    /// stamped in the index header. Present on every report the
+    /// current reporter sends; absent from older reporters. The
+    /// scheduler records it as the slice's applied generation so a
+    /// full resync brings the optimistic-lock counter back into sync
+    /// with the index sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    /// Rows entering the slice (a delta's additions, or the whole
+    /// membership on a full report).
+    pub added: Vec<PublishedSliceRow>,
+    /// Rows leaving the slice — always empty on a full report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<PublishedSliceRow>,
 }
 
 /// One servable identity inside a [`PublishedSliceReport`]: the semantic
@@ -1144,8 +1170,20 @@ pub struct PublishedSlice {
     pub target: TargetTriple,
     /// The slice's stable rustc version.
     pub rustc_version: WireRustcVersion,
-    /// Semantic identities the slice serves.
-    pub rows: Vec<PublishedSliceRow>,
+    /// The index generation this report's delta is based on — `None`
+    /// marks the explicit full report (`added` = whole membership,
+    /// `retired` empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_generation: Option<i64>,
+    /// The generation of the index this report publishes — the value
+    /// stamped in the index header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    /// Rows entering the slice.
+    pub added: Vec<PublishedSliceRow>,
+    /// Rows leaving the slice — always empty on a full report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<PublishedSliceRow>,
 }
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
@@ -1214,6 +1252,101 @@ pub struct SchemaMigrationReport {
     /// Schema version the queue carries now — the build's own
     /// `SCHEMA_VERSION`, since a successful pass always ends stamped.
     pub after: i64,
+}
+
+/// Body of `POST /api/v1/admin/scheduler/budget/seed`.
+///
+/// The workerd budget harness's fixture load. Only deploys that set
+/// `STOW_SCHEDULER_BUDGET` answer it; production has no such binding and
+/// the route 404s.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerSeedRequest {
+    /// Queue rows to seed; absent means the production-shaped 100k.
+    #[serde(default)]
+    pub queue_rows: Option<u32>,
+    /// Clear the seeded tables first — the probe re-runs against a
+    /// persistent local DO store without an operator cleanup in between.
+    /// Restarting clears chunk by chunk, so the first `reset` call only
+    /// begins the wipe; keep calling until `done`.
+    #[serde(default)]
+    pub reset: Option<bool>,
+    /// Rows one call may seed at most; absent means the server's
+    /// bounded default.
+    #[serde(default)]
+    pub batch: Option<u32>,
+}
+
+/// What the seed reports back. A request carries one chunk of work, so
+/// the caller loops until `done` — `seeded` says whether this call
+/// wrote fixture rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerSeedReport {
+    /// Rows `queue` holds now.
+    pub queue_rows: u64,
+    /// Rows `queue_dependencies` holds now.
+    pub dependency_rows: u64,
+    /// Rows `published_slice_rows` holds now.
+    pub slice_rows: u64,
+    /// Whether this call wrote fixture rows (false once the seed is
+    /// already `done` and no `reset` was passed).
+    pub seeded: bool,
+    /// Whether the fixture is fully seeded (or was already populated).
+    pub done: bool,
+}
+
+/// One statement's real Durable Object cursor counters — the units
+/// Cloudflare bills on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerBudgetStatement {
+    /// The SQL the drive issued.
+    pub sql: String,
+    /// Rows the statement returned to its caller.
+    pub rows_returned: u64,
+    /// `cursor.rowsRead` — every row the statement touched, index
+    /// entries and probe rows included.
+    pub rows_read: u64,
+    /// `cursor.rowsWritten` — table rows plus index entries and
+    /// trigger-made writes.
+    pub rows_written: u64,
+}
+
+/// One drive's workerd measurement against its budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerBudgetRow {
+    /// The route or pass the drive exercises.
+    pub name: String,
+    /// Statements the drive issued.
+    pub statements: u64,
+    /// Σ `rowsRead` over the drive's statements.
+    pub rows_read: u64,
+    /// Σ `rowsWritten` over the drive's statements.
+    pub rows_written: u64,
+    /// Budgeted statement count.
+    pub statement_budget: u64,
+    /// Budgeted `rowsRead` total.
+    pub read_budget: u64,
+    /// Budgeted `rowsWritten` total.
+    pub write_budget: u64,
+    /// `true` when any of the three budgets is exceeded.
+    pub over_budget: bool,
+    /// The per-statement log the totals are summed over.
+    pub log: Vec<SchedulerBudgetStatement>,
+}
+
+/// What `POST /api/v1/admin/scheduler/budget` returns: every route and
+/// the alarm pass measured on the production-shaped fixture with the
+/// real cursor counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerBudgetReport {
+    /// Queue rows the fixture holds.
+    pub queue_rows: u64,
+    /// The schema version the queue reports.
+    pub schema_version: i64,
+    /// Per-drive measurements, in drive order.
+    pub rows: Vec<SchedulerBudgetRow>,
+    /// `true` when any row is over budget — `stow-admin scheduler
+    /// budget` exits nonzero on it.
+    pub over_budget: bool,
 }
 
 /// One queue row as `GET /api/v1/admin/queue` reports it.

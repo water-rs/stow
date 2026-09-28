@@ -16,6 +16,8 @@ const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/statu
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
 const SCHEDULER_MIGRATE_URL: &str = "https://scheduler.internal/migrate";
+const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
+const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -120,6 +122,25 @@ pub async fn admin_status(
     namespace: &CfDurableNamespace,
 ) -> Result<stow_types::api::AdminStatus, SchedulerClientError> {
     get_json(namespace, SCHEDULER_ADMIN_STATUS_URL).await
+}
+
+/// Seed the production-shaped fixture through the Durable Object's probe
+/// route — the workerd cost harness's load step. The DO answers only on
+/// deploys carrying `STOW_SCHEDULER_BUDGET=1` (the mock stack).
+pub async fn seed_budget_fixture(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::SchedulerSeedRequest,
+) -> Result<stow_types::api::SchedulerSeedReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_BUDGET_SEED_URL, request).await
+}
+
+/// Run the workerd budget pass: every scheduler route and the alarm
+/// measured with the real `rowsRead`/`rowsWritten` cursor counters —
+/// the units Cloudflare bills on.
+pub async fn scheduler_budget(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::SchedulerBudgetReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_BUDGET_URL, &serde_json::json!({})).await
 }
 
 /// Admin queue listing behind `stow-admin queue list` and the mutation

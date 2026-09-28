@@ -188,6 +188,21 @@ pub enum QueueError {
         /// Configured `STOW_HUMAN_DAILY_TASK_BUDGET`.
         budget: u64,
     },
+    /// A delta slice report's `base_generation` no longer matches the
+    /// slice's live applied generation — the delta was computed on a
+    /// stale base (another report landed first, or the slice was never
+    /// reported). Handlers map this to `409 Conflict`: the reporter must
+    /// resync with a full report; retrying the same delta can never
+    /// succeed.
+    #[error(
+        "slice report base generation {base_generation} conflicts with the live generation {live_generation}"
+    )]
+    SliceGenerationConflict {
+        /// The `base_generation` the report claimed.
+        base_generation: i64,
+        /// The generation the slice is actually on.
+        live_generation: i64,
+    },
     /// A queue mutation selector named no rows: empty `task_ids` and a
     /// filter with no predicates would touch every row in the queue.
     /// Handlers map this to `400 Bad Request`.

@@ -10,7 +10,7 @@ use skyzen_services::durable::{
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _, sqlite::SqliteRow};
 
 use crate::errors::QueueError;
-use crate::scheduler::queue;
+use crate::scheduler::queue::{self, SchedulerSettings};
 
 /// `DurableDbBackend` backed by a `sqlx` `SQLite` pool.
 #[derive(Debug, Clone)]
@@ -48,7 +48,7 @@ impl SqliteBackend {
 pub async fn memory_db() -> Result<DurableDb, QueueError> {
     let backend = memory_backend().await?;
     let db = DurableDb::new(backend.clone());
-    queue::migrate(&db).await?;
+    queue::migrate(&db, &SchedulerSettings::default()).await?;
     backend.close_migration();
     Ok(db)
 }
@@ -65,13 +65,32 @@ pub async fn memory_db_raw() -> Result<DurableDb, QueueError> {
     Ok(DurableDb::new(memory_backend().await?))
 }
 
-/// Every statement the wrapped backend ran, in order —
-/// `(sql, elapsed, rows_read)`. `rows_read` is the result-row count the
-/// host backend reports; queries written so the result set is the scan
-/// set (e.g. reading bucket rows rather than a server-side aggregate)
-/// make it equal the Durable Object's billed `rowsRead`.
-pub type StatementLog =
-    std::sync::Arc<std::sync::Mutex<Vec<(std::string::String, std::time::Duration, u64)>>>;
+/// One statement the wrapped backend ran: the SQL text, its bound
+/// parameters (so the statement can be replayed under `EXPLAIN QUERY
+/// PLAN`), the rows the engine returned or wrote, and the wall time.
+/// The submit-path measurements for issue #418 read this after a run to
+/// report statement counts per request and per dependency edge; the
+/// stow#433 cost gate reads it for statement counts, rows written,
+/// result rows and query plans per route.
+#[derive(Debug, Clone)]
+pub struct LoggedStatement {
+    /// The SQL exactly as the queue code issued it.
+    pub sql: String,
+    /// The parameters bound to it, in bind order.
+    pub params: Vec<DbValue>,
+    /// Rows the statement returned (its result cardinality — not the
+    /// rows its plan touched; the plan is what bounds those).
+    pub rows_read: u64,
+    /// Rows the statement wrote (`changes()`/`total_changes()` per
+    /// statement).
+    pub rows_written: u64,
+    /// Wall time on the in-memory backend — a size signal only; the
+    /// budgets key on counts and plans, never on elapsed time.
+    pub elapsed: std::time::Duration,
+}
+
+/// Every statement the wrapped backend ran, in order.
+pub type StatementLog = std::sync::Arc<std::sync::Mutex<Vec<LoggedStatement>>>;
 
 /// Open a fresh in-memory queue database (schema applied) whose backend
 /// records every statement it executes, returning the log alongside.
@@ -87,8 +106,23 @@ pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueErro
         inner: inner.clone(),
         log: log.clone(),
     });
-    queue::migrate(&db).await?;
+    queue::migrate(&db, &SchedulerSettings::default()).await?;
     inner.close_migration();
+    Ok((db, log))
+}
+
+/// [`counting_memory_db`] without closing the migration permit — for the
+/// one route that legitimately issues DDL: the operator `migrate`
+/// handler itself, which the stow#433 gate measures against the same
+/// fixture but outside the no-DDL rule.
+pub async fn counting_memory_db_raw() -> Result<(DurableDb, StatementLog), QueueError> {
+    let log = StatementLog::default();
+    let inner = memory_backend().await?;
+    let db = DurableDb::new(CountingBackend {
+        inner,
+        log: log.clone(),
+    });
+    queue::migrate(&db, &SchedulerSettings::default()).await?;
     Ok((db, log))
 }
 
@@ -113,11 +147,26 @@ struct CountingBackend {
 }
 
 impl CountingBackend {
-    fn record(&self, sql: &str, elapsed: std::time::Duration, rows_read: u64) {
+    fn record(
+        &self,
+        sql: &str,
+        params: &[DbValue],
+        elapsed: std::time::Duration,
+        result: &Result<DbExecResult, DurableDbError>,
+    ) {
+        let (rows_read, rows_written) = result
+            .as_ref()
+            .map_or((0, 0), |result| (result.rows_read, result.rows_written));
         self.log
             .lock()
             .expect("statement log")
-            .push((sql.to_owned(), elapsed, rows_read));
+            .push(LoggedStatement {
+                sql: sql.to_owned(),
+                params: params.to_vec(),
+                rows_read,
+                rows_written,
+                elapsed,
+            });
     }
 }
 
@@ -125,8 +174,7 @@ impl DurableDbBackend for CountingBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         let start = std::time::Instant::now();
         let result = self.inner.query(query, params).await;
-        let rows_read = result.as_ref().map_or(0, |result| result.rows_read);
-        self.record(query, start.elapsed(), rows_read);
+        self.record(query, params, start.elapsed(), &result);
         result
     }
 
@@ -137,8 +185,7 @@ impl DurableDbBackend for CountingBackend {
     ) -> Result<DbExecResult, DurableDbError> {
         let start = std::time::Instant::now();
         let result = self.inner.execute(query, params).await;
-        let rows_read = result.as_ref().map_or(0, |result| result.rows_read);
-        self.record(query, start.elapsed(), rows_read);
+        self.record(query, params, start.elapsed(), &result);
         result
     }
 

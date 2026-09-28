@@ -206,6 +206,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
                 generated_at: time::OffsetDateTime::now_utc()
                     .format(&time::format_description::well_known::Rfc3339)
                     .map_err(|error| stow_types::stow_error!("format generated_at: {error}"))?,
+                generation: 1,
                 row_count: u64::try_from(rows.len())
                     .map_err(|_| stow_types::stow_error!("row count {} exceeds u64", rows.len()))?,
             },
@@ -1854,6 +1855,7 @@ mod tests {
                 target: TARGET.parse().expect("target"),
                 rustc_version: RUSTC.parse().expect("rustc"),
                 generated_at: "2026-09-20T00:00:00Z".to_owned(),
+                generation: 1,
                 row_count: 1,
             },
             rows: vec![ArtifactIndexRow {

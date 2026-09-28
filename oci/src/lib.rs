@@ -15,6 +15,8 @@ pub use artifacts::{
     UploadOutcome, pull_signature_materials, push_artifacts, push_artifacts_with, republish_bundle,
 };
 pub use client::{RegistryError, RegistrySession};
-pub use index::{IndexPublishOutcome, publish_index, published_index_content_sha256};
+pub use index::{
+    IndexPublishOutcome, publish_index, published_index_content_sha256, pull_published_index,
+};
 pub use registry::{RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest};
 pub use sign::sign_artifact;

@@ -21,6 +21,7 @@ use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
+use crate::scheduler::budget;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
@@ -151,6 +152,11 @@ impl DurableObject for Scheduler {
             "/admin/status".at(admin_status),
             "/index/published".post(record_published_index),
             "/migrate".post(migrate_scheduler),
+            // The workerd budget probe — gated on the
+            // `STOW_SCHEDULER_BUDGET` deploy var, which only mock stacks
+            // carry; production requests hit the guard and 404.
+            "/budget".post(scheduler_budget),
+            "/budget/seed".post(scheduler_budget_seed),
             // A nested Route under the root — the outer tuple caps at
             // 15 nodes.
             Route::new(("/dispatch-freeze"
@@ -168,14 +174,60 @@ impl DurableObject for Scheduler {
 /// `deploy-edge.yml` calls right after `skyzen deploy` and `stow-admin
 /// scheduler migrate` calls manually. Runs the full migration pass and
 /// returns the schema version before and after.
-async fn migrate_scheduler(db: DurableDb) -> Result<Json<SchemaMigrationReport>> {
-    let report = queue::migrate(&db).await.map_err(to_error)?;
+async fn migrate_scheduler(env: WasmEnv, db: DurableDb) -> Result<Json<SchemaMigrationReport>> {
+    let report = queue::migrate(&db, &scheduler_settings(&env)?)
+        .await
+        .map_err(to_error)?;
     tracing::warn!(
         before = report.before,
         after = report.after,
         "scheduler schema migrated"
     );
     Ok(Json(report))
+}
+
+/// `POST /budget/seed` — load the production-shaped fixture through the
+/// operator path. Reached from `POST /api/v1/admin/scheduler/budget/seed`.
+/// Answers only on deploys carrying `STOW_SCHEDULER_BUDGET=1` — the mock
+/// stack's `Skyzen.mock.toml` sets it; production never does.
+async fn scheduler_budget_seed(
+    env: WasmEnv,
+    db: DurableDb,
+    Json(request): Json<stow_types::api::SchedulerSeedRequest>,
+) -> Result<Json<stow_types::api::SchedulerSeedReport>> {
+    if !budget_probe_enabled(&env) {
+        return Err(
+            Error::msg("scheduler budget probe is not enabled on this deploy")
+                .set_status(StatusCode::NOT_FOUND),
+        );
+    }
+    Ok(Json(
+        budget::seed(&db, &request, &scheduler_settings(&env)?)
+            .await
+            .map_err(to_error)?,
+    ))
+}
+
+/// `POST /budget` — replay every drive under the metering backend and
+/// return the real `rowsRead`/`rowsWritten` per route. Same guard as the
+/// seed endpoint. Reached from `POST /api/v1/admin/scheduler/budget`.
+async fn scheduler_budget(
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::SchedulerBudgetReport>> {
+    if !budget_probe_enabled(&env) {
+        return Err(
+            Error::msg("scheduler budget probe is not enabled on this deploy")
+                .set_status(StatusCode::NOT_FOUND),
+        );
+    }
+    let settings = scheduler_settings(&env)?;
+    Ok(Json(budget::run(&db, &settings).await.map_err(to_error)?))
+}
+
+fn budget_probe_enabled(env: &WasmEnv) -> bool {
+    read_optional_string_binding(env, budget::BUDGET_PROBE_BINDING)
+        .is_some_and(|value| value == "1")
 }
 
 /// `POST /tasks/submit` — the anonymous-lane submit. The pending-depth
@@ -343,7 +395,7 @@ async fn apply_queue_mutation(
     mutation: queue::QueueMutation,
     selector: stow_types::api::QueueSelector,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
-    let affected = queue::apply_mutation(&db, mutation, &selector)
+    let affected = queue::apply_mutation(&db, &scheduler_settings(&env)?, mutation, &selector)
         .await
         .map_err(|error| {
             let status = match &error {
@@ -620,14 +672,27 @@ async fn record_published_index(
     alarm: Alarm,
     Json(slice): Json<stow_types::api::PublishedSlice>,
 ) -> Result<Json<OkResponse>> {
-    queue::record_published_slice(
+    match queue::record_published_slice(
         &db,
         slice.target.as_str(),
         slice.rustc_version.as_str(),
-        &slice.rows,
+        slice.base_generation,
+        slice.generation,
+        &slice.added,
+        &slice.retired,
     )
     .await
-    .map_err(to_error)?;
+    {
+        Ok(()) => {}
+        Err(error @ QueueError::SliceGenerationConflict { .. }) => {
+            // A delta report on a stale base can never apply — the live
+            // generation moved since the reporter read it — so the error
+            // names both generations and the reporter resyncs with a
+            // full report rather than retrying.
+            return Err(to_error(error).set_status(StatusCode::CONFLICT));
+        }
+        Err(error) => return Err(to_error(error)),
+    }
     dispatch_pending(&env, &db).await.map_err(|error| {
         tracing::error!(%error, "scheduler published-index dispatch_pending failed");
         error
@@ -750,9 +815,14 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
                 Err(error) => {
                     let error = dispatch::DispatchError::TokenMint(error.to_string());
                     for task in &tasks {
-                        queue::mark_dispatch_failed(db, &task.task_id, &error.to_string())
-                            .await
-                            .map_err(to_error)?;
+                        queue::mark_dispatch_failed(
+                            db,
+                            &settings,
+                            &task.task_id,
+                            &error.to_string(),
+                        )
+                        .await
+                        .map_err(to_error)?;
                         tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
                     }
                     return Ok(());
@@ -767,7 +837,7 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
     let pool = crate::fetch_guard::OutboundPool::new();
     for task in tasks {
         if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo, &pool).await {
-            queue::mark_dispatch_failed(db, &task.task_id, &error.to_string())
+            queue::mark_dispatch_failed(db, &settings, &task.task_id, &error.to_string())
                 .await
                 .map_err(to_error)?;
             tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
