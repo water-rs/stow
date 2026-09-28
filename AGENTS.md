@@ -206,13 +206,18 @@ the design it produces looks careful.
 
 ## Operator notifications
 
-Every alert, incident, breaker trip and watchdog report is a GitHub issue in this repository labelled `incident`:
-- one issue per incident, opened when it starts;
-- updated at most hourly while it stays open;
-- closed when it is cleared;
-- deduplicated by label and title prefix.
+Every alert, incident, breaker trip and watchdog report does two things.
 
-GitHub's notifications reach the operator. Actions jobs use their `GITHUB_TOKEN` with `issues: write`. The edge uses the GitHub App installation token it already mints.
+- **Email notification** through Cloudflare Email Service **Email Sending**:
+  - sent from `alerts@stow.waterui.dev` (the onboarded sending domain) to the operator;
+  - one mail when the incident opens, one when it clears, and at most an hourly digest in between;
+  - the Worker uses the `send_email` binding;
+  - everything else uses the REST API, `POST /accounts/{account_id}/email/sending/send`, with `CLOUDFLARE_API_TOKEN`.
+- **Issue record**: a GitHub issue labelled `incident`:
+  - opened when the incident starts, updated at most hourly, closed when it clears;
+  - deduplicated by label and title prefix.
+
+If one channel fails, the other still happens, and the failure is recorded.
 
 ## Platform-native first
 
