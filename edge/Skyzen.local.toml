@@ -13,6 +13,7 @@ GITHUB_REPO = "water-rs/stow"
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 STOW_RUSTC_DATA_BASE_URL = "https://raw.githubusercontent.com/water-rs/stow/dev/resolve/rustc-data"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
+STOW_GITHUB_WEBHOOK_SECRET = "mock-github-webhook-secret"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"

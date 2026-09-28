@@ -256,13 +256,21 @@ pub const DRIVES: &[Drive] = &[
         },
     },
     Drive {
-        name: "POST /runs/{id}",
+        name: "POST /tasks/complete-run",
         run: |db, shape, _settings| {
             Box::pin(async move {
-                let row = shape.running_row();
-                queue::observe_run(db, &hex_id(u64::from(row)), &format!("run-{row}"))
-                    .await
-                    .map_err(|error| error.to_string())
+                queue::complete_run(
+                    db,
+                    &stow_types::api::WorkflowRunComplete {
+                        task_id: hex_id(u64::from(shape.running_row())),
+                        success: true,
+                        error: None,
+                        github_run_id: Some("12345".to_owned()),
+                    },
+                    crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
+                )
+                .await
+                .map_err(|error| error.to_string())
             })
         },
     },

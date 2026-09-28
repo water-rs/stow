@@ -64,6 +64,11 @@ pub enum PreheatCommand {
     /// one crate request — the tasks a dispatch wave would enqueue per
     /// target. Nothing is enqueued.
     Plan(PlanArgs),
+    /// Drive a wave without the edge at all: resolve in-process, layer
+    /// the graph, dispatch `build-crate.yml` straight through the GitHub
+    /// API (or the local CI server under `--dispatch-url`), publish the
+    /// index between layers, and report failures at the end.
+    Manual(crate::manual::ManualArgs),
     /// The stars-ranked lane: `generate` rebuilds the reviewed
     /// `preheat/projects.toml` list from GitHub, `submit` resolves every
     /// listed repository and enqueues its crates.io graph as ordinary
@@ -171,6 +176,11 @@ pub struct PlanArgs {
 /// per-lane: `projects generate` runs against GitHub only, and every
 /// lane that posts to the scheduler connects the edge itself.
 pub fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result<()> {
+    // The manual driver owns a Tokio runtime — dispatch it before the
+    // smol executor spins up.
+    if let PreheatCommand::Manual(manual) = args.command {
+        return crate::manual::run(manual, output);
+    }
     smol::block_on(async move {
         match args.command {
             PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
@@ -196,8 +206,8 @@ async fn run_on_edge(
         PreheatCommand::TopBinaries(args) => top_binaries(edge, &mut crates_io, args, output).await,
         PreheatCommand::Missed(args) => missed(edge, &crates_io, args, output).await,
         PreheatCommand::Plan(args) => plan(edge, &mut crates_io, args, output).await,
-        PreheatCommand::Projects(_) => {
-            unreachable!("projects commands dispatch before the edge connect")
+        PreheatCommand::Projects(_) | PreheatCommand::Manual(_) => {
+            unreachable!("projects and manual commands dispatch before the edge connect")
         }
     }
 }

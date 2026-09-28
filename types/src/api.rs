@@ -259,24 +259,6 @@ pub struct ArtifactRecord {
     pub min_glibc: Option<GlibcVersion>,
 }
 
-/// Request body for `POST /api/v1/admin/artifacts/register`.
-///
-/// `task_id` binds the record set to the scheduler task the calling run
-/// was dispatched for: the edge requires the task to be in flight and
-/// every record to belong to the task's dependency closure before it
-/// writes a row. The Actions OIDC identity must name a task; a repo-push
-/// caller (the operator/backfill path) may omit it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RegisterArtifactsRequest {
-    /// Scheduler task id the registering run was dispatched for
-    /// (`BuildTaskPayload::task_id`). Required from the Actions OIDC
-    /// identity; optional for repo-push callers.
-    #[serde(default)]
-    pub task_id: Option<String>,
-    /// Artifact records to upsert into the catalog.
-    pub records: Vec<ArtifactRecord>,
-}
-
 /// Request body for scheduler task submission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
@@ -494,6 +476,65 @@ pub struct BuildCompleteReport {
     pub github_run_id: Option<String>,
 }
 
+/// Canonical scheduler task identity — the blake3-derived id `enqueue`
+/// deduplicates on and `build-crate.yml`'s `run-name` carries.
+///
+/// The workflow-run webhook maps a finished run back to the task by this
+/// id. It lives in this crate so `stow-admin`'s manual driver mints
+/// exactly the ids the scheduler queue assigns.
+///
+/// `host_side` carries the unit's compile side: the same crate
+/// legitimately exists as both a target-side node and a host-side node at
+/// the host triple — a `-host` suffix distinguishes them while leaving
+/// every pre-existing target-side id spelled exactly as before.
+#[must_use]
+pub fn task_id(
+    crate_name: &str,
+    version: &str,
+    features_json: &str,
+    target: &str,
+    rustc_version: &str,
+    host_side: bool,
+) -> String {
+    let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
+    let base = format!(
+        "{}-{}-{}-{}-{}",
+        crate_name,
+        version,
+        features_hash,
+        target.replace('-', "_"),
+        rustc_version.replace('-', "_")
+    );
+    if host_side {
+        format!("{base}-host")
+    } else {
+        base
+    }
+}
+
+/// Completion the edge's `POST /api/v1/github/workflow-run` handler sends
+/// the scheduler Durable Object for a finished `build-crate.yml` run.
+///
+/// The webhook answer carries no `attempt`, so the object resolves the
+/// row's live attempt at apply time.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkflowRunComplete {
+    /// The run's `display_title` — `build-crate.yml` sets `run-name` to
+    /// the task id, so this string IS `BuildTaskPayload::task_id`.
+    pub task_id: String,
+    /// The run's `conclusion` mapped onto success: only a run that
+    /// finished green *and* whose records artifact exists in GHCR counts
+    /// as a completed build.
+    pub success: bool,
+    /// Failure description when `success` is false — the conclusion and,
+    /// on a missing records artifact, which tag the edge looked for.
+    pub error: Option<String>,
+    /// The GitHub Actions run id, stamped onto the queue row so
+    /// `stow-admin status` surfaces the run URL.
+    #[serde(default)]
+    pub github_run_id: Option<String>,
+}
+
 /// A normalized dependency entry from a resolved Cargo dependency graph.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
 pub struct DependencyGraphEntry {
@@ -694,9 +735,9 @@ pub struct DispatchFreezeClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CostMetric {
-    /// Scheduler Durable Object SQLite rows read.
+    /// Scheduler Durable Object `SQLite` rows read.
     DurableObjectRowsRead,
-    /// Scheduler Durable Object SQLite rows written.
+    /// Scheduler Durable Object `SQLite` rows written.
     DurableObjectRowsWritten,
     /// Durable Object invocations (requests + alarms).
     DurableObjectRequests,
@@ -1712,20 +1753,6 @@ pub struct ArtifactPruneRequest {
 pub struct ArtifactPruneResponse {
     /// Catalog rows deleted.
     pub deleted: u32,
-}
-
-/// Body for the scheduler DO's `/tasks/observe-run`.
-///
-/// Stamps the GitHub Actions run id onto an in-flight queue row so
-/// `status` can surface a run URL. Stamping does not touch `updated_at`
-/// — the stale-dispatch lease clock only moves on real state
-/// transitions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ObserveRun {
-    /// Task id the run was dispatched for.
-    pub task_id: String,
-    /// GitHub Actions run id from the OIDC token's `run_id` claim.
-    pub github_run_id: String,
 }
 
 #[cfg(test)]

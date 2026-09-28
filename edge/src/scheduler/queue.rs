@@ -3,6 +3,7 @@ use std::future::Future;
 use std::num::NonZeroU32;
 
 use skyzen_services::durable::{DbValue, DurableDb};
+pub use stow_types::api::task_id;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueRequest,
     EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
@@ -125,7 +126,7 @@ impl Dispatch {
 /// `STOW_HUMAN_DAILY_TASK_BUDGET`).
 ///
 /// Defaults match production; the local mock lowers `dispatch` via `vars`
-/// because miniflare's workerd OOMs under parallel register/complete
+/// because miniflare's workerd OOMs under parallel complete
 /// bursts.
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerSettings {
@@ -1168,6 +1169,49 @@ fn failure_class(report: &BuildCompleteReport) -> Option<String> {
         (None, Some(prefix)) => Some(prefix),
         (None, None) => Some("unknown".to_owned()),
     }
+}
+
+/// Apply a GitHub `workflow_run` completion — the webhook's wire report,
+/// which names the task and its outcome but no attempt number.
+///
+/// The webhook cannot carry `attempt` (GitHub invented the event), so the
+/// row's live attempt is resolved here and [`complete`] applies the same
+/// in-flight predicate — a stale event can only fail the attempt it
+/// names when the artifact check upstream already refused the success.
+///
+/// # Errors
+///
+/// [`QueueError::UnknownTask`] when no queue row carries the task id;
+/// [`QueueError::StaleCompletion`] when the live row's attempt or status
+/// has moved past what the event describes.
+pub async fn complete_run(
+    db: &DurableDb,
+    report: &stow_types::api::WorkflowRunComplete,
+    window_minutes: u32,
+) -> Result<(), QueueError> {
+    let row = db
+        .query("SELECT attempt, status FROM queue WHERE task_id = ?")
+        .bind(report.task_id.clone())
+        .fetch_optional::<AttemptStatusRow>()
+        .await
+        .map_err(|error| format!("load task {} for run completion: {error}", report.task_id))?;
+    let Some(row) = row else {
+        return Err(QueueError::UnknownTask(report.task_id.clone()));
+    };
+    complete(
+        db,
+        &BuildCompleteReport {
+            task_id: report.task_id.clone(),
+            attempt: row.attempt,
+            success: report.success,
+            error: report.error.clone(),
+            failure_step: None,
+            github_run_id: report.github_run_id.clone(),
+            artifacts_uploaded: 0,
+        },
+        window_minutes,
+    )
+    .await
 }
 
 pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
@@ -2845,31 +2889,6 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
     })
 }
 
-/// Stamp the GitHub Actions run id a dispatched build reported back
-/// through its OIDC-claimed register/complete calls onto the queue row.
-///
-/// The stamp deliberately does not touch `updated_at`: that column is the
-/// stale-dispatch lease clock and must only move on real state
-/// transitions. Rows that already left the in-flight set (resurrected by
-/// a re-request or completed) are not stamped — their `github_run_id`
-/// still names the run that acted on the live attempt.
-pub async fn observe_run(
-    db: &DurableDb,
-    task_id: &str,
-    github_run_id: &str,
-) -> Result<(), QueueError> {
-    db.query(
-        "UPDATE queue SET github_run_id = ? \
-         WHERE task_id = ? AND status IN ('dispatched', 'running')",
-    )
-    .bind(github_run_id.to_owned())
-    .bind(task_id.to_owned())
-    .execute()
-    .await
-    .map_err(|error| format!("observe run id for {task_id}: {error}"))?;
-    Ok(())
-}
-
 /// One in-flight queue row for [`admin_status`].
 #[derive(Debug, skyzen::FromRow)]
 struct AdminInFlightRow {
@@ -4496,39 +4515,6 @@ async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueE
     Ok(ActiveByFamily { total, by_family })
 }
 
-/// Canonical scheduler task identity — the same id `enqueue` deduplicates
-/// on. Miss responses mint admissions against this id and
-/// `POST /api/v1/enqueue` redeems them, so the derivation must stay exactly
-/// in step with the queue's own.
-///
-/// `host_side` carries the unit's compile side: the same crate legitimately
-/// exists as both a target-side node and a host-side node at the host
-/// triple — a `-host` suffix distinguishes them while leaving every
-/// pre-existing target-side id spelled exactly as before.
-pub fn task_id(
-    crate_name: &str,
-    version: &str,
-    features_json: &str,
-    target: &str,
-    rustc_version: &str,
-    host_side: bool,
-) -> String {
-    let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
-    let base = format!(
-        "{}-{}-{}-{}-{}",
-        crate_name,
-        version,
-        features_hash,
-        target.replace('-', "_"),
-        rustc_version.replace('-', "_")
-    );
-    if host_side {
-        format!("{base}-host")
-    } else {
-        base
-    }
-}
-
 fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
     format!("-{dispatch_min_age_minutes} minutes")
 }
@@ -5480,7 +5466,7 @@ mod sqlite_tests {
         assert_eq!(gated, 1);
     }
 
-    /// The lane a `backfill-min-glibc` rebuild submit takes: a completed
+    /// The lane an operator's rebuild submit takes: a completed
     /// row ignores a miss-lane re-request (its artifacts sit in the
     /// catalog), but the human lane — the lane an operator's re-request
     /// rides — resurrects it. With the catalog's coverage oracle no
@@ -6866,11 +6852,9 @@ mod sqlite_tests {
         ));
     }
 
-    /// The register binding reads `preserve_lockfile` off the status row
-    /// to decide whether the task's dependency closure is reproducible from
-    /// crates.io — `tasks_status` must surface it, or every record write
-    /// against a lockfile task is either blindly accepted or wrongly
-    /// rejected.
+    /// `tasks_status` must surface `preserve_lockfile`: it is the flag
+    /// that says whether the task's dependency closure is reproducible
+    /// from crates.io, and every status consumer reads it off this row.
     #[tokio::test]
     async fn tasks_status_surfaces_lockfile() {
         let db = memory_db().await.expect("memory db");
@@ -7168,34 +7152,6 @@ mod sqlite_tests {
     }
 
     #[tokio::test]
-    async fn observe_run_stamps_only_in_flight_rows() {
-        let db = memory_db().await.expect("memory db");
-        enqueue(
-            &db,
-            &[request("alpha", Vec::new()), request("beta", Vec::new())],
-        )
-        .await
-        .expect("enqueue");
-        mark_active(&db, "alpha", TARGET, "dispatched").await;
-
-        super::observe_run(&db, &task_id_on("alpha", TARGET), "12345")
-            .await
-            .expect("observe run");
-        assert_eq!(row_column(&db, "alpha", "github_run_id").await, "12345");
-
-        // A pending row is not a run — the stamp must not reach it.
-        super::observe_run(&db, &task_id_on("beta", TARGET), "99999")
-            .await
-            .expect("observe pending");
-        let status = super::admin_status(&db).await.expect("admin status");
-        let beta = status
-            .in_flight
-            .iter()
-            .find(|task| task.crate_name.as_str() == "beta");
-        assert!(beta.is_none(), "pending row must not appear in-flight");
-    }
-
-    #[tokio::test]
     async fn admin_status_reports_lanes_in_flight_and_targets() {
         let db = memory_db().await.expect("memory db");
         let mut human = request("human", Vec::new());
@@ -7211,9 +7167,12 @@ mod sqlite_tests {
         .await
         .expect("enqueue");
         mark_active(&db, "miss-b", TARGET, "dispatched").await;
-        super::observe_run(&db, &task_id_on("miss-b", TARGET), "777")
+        db.query("UPDATE queue SET github_run_id = ? WHERE task_id = ?")
+            .bind("777")
+            .bind(task_id_on("miss-b", TARGET))
+            .execute()
             .await
-            .expect("observe run");
+            .expect("stamp run id");
         // Terminal rows inside the 24 h window feed the per-target tally.
         db.query("UPDATE queue SET status = 'completed' WHERE task_id = ?")
             .bind(task_id_on("human", TARGET))
@@ -7280,7 +7239,7 @@ mod sqlite_tests {
 
     /// The objects a pre-`host_side` queue carried on top of
     /// `DEV_ERA_QUEUE`: the counter triggers and the status index. On
-    /// `ALTER TABLE queue RENAME TO queue_migrated` SQLite moves them
+    /// `ALTER TABLE queue RENAME TO queue_migrated` `SQLite` moves them
     /// with the table, so a rebuild that recreates the table and drops
     /// the copy without re-running the include afterwards loses them
     /// all — the regression `migrate_rebuilds_queue_triggers_and_indexes`

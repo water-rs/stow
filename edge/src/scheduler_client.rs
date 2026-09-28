@@ -9,12 +9,12 @@ const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/status";
 const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
+const SCHEDULER_RUN_COMPLETE_URL: &str = "https://scheduler.internal/tasks/complete-run";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
-const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
 const SCHEDULER_MIGRATE_URL: &str = "https://scheduler.internal/migrate";
 const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
 const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
@@ -53,6 +53,16 @@ pub async fn send_complete(
     report: &stow_types::api::BuildCompleteReport,
 ) -> Result<(), SchedulerClientError> {
     send_json(namespace, SCHEDULER_COMPLETE_URL, report).await
+}
+
+/// The GitHub `workflow_run` webhook's completion channel (stow#455):
+/// the event names the task and its conclusion, never an attempt — the
+/// object resolves the live attempt.
+pub async fn send_run_complete(
+    namespace: &CfDurableNamespace,
+    report: &stow_types::api::WorkflowRunComplete,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_RUN_COMPLETE_URL, report).await
 }
 
 pub async fn get_status(
@@ -171,24 +181,6 @@ pub async fn queue_mutation(
         namespace,
         &format!("{SCHEDULER_TASKS_URL}/{verb}"),
         selector,
-    )
-    .await
-}
-
-/// Stamp a GitHub Actions run id onto an in-flight queue row — called by
-/// the register handler when an OIDC-claimed run reports in.
-pub async fn observe_run(
-    namespace: &CfDurableNamespace,
-    task_id: &str,
-    github_run_id: &str,
-) -> Result<(), SchedulerClientError> {
-    send_json(
-        namespace,
-        SCHEDULER_OBSERVE_RUN_URL,
-        &stow_types::api::ObserveRun {
-            task_id: task_id.to_owned(),
-            github_run_id: github_run_id.to_owned(),
-        },
     )
     .await
 }

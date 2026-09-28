@@ -51,8 +51,10 @@ invocation without them keeps the key it produced before they were modeled:
 
 ### `artifacts`
 
-The edge worker upserts rows here from the trusted CI register endpoint
-(`edge/src/db.rs::insert_artifact_record`). The SQL template lives at
+The edge worker upserts rows here from the `POST /api/v1/admin/artifacts/sync`
+endpoint (`edge/src/db.rs::insert_artifact_record`) — the D1 table is a
+mirror of GHCR's signed records artifacts, populated by
+`stow-admin index sync` inside `index-publish.yml`. The SQL template lives at
 `edge/src/sql/insert_artifact.sql`; adding a column requires editing that
 file plus the matching `bind` calls in `insert_artifact_record`. Column list
 (in INSERT order):
@@ -265,8 +267,8 @@ trusted publish stage pushes `<tag>.bundle`, a single-layer image whose
 layer is the bundle tar a CLI consumes (`stow_types::bundle::assemble_bundle`).
 The bundle needs no signature of its own: it embeds the signed manifest and
 config, the signature materials, and the layers byte-for-byte, and the CLI
-verifies that material after download. The record registered with the
-edge carries the bundle layer's digest and size (`bundle_digest`,
+verifies that material after download. The task's records artifact
+carries the bundle layer's digest and size (`bundle_digest`,
 `bundle_size`), republished verbatim into the index row; the CLI asks the
 edge for `GET /api/v1/bundles/{bundle_digest}`, which serves the blob
 Cache-API-first and tees a GHCR miss into the cache, and the CLI requires
@@ -282,11 +284,9 @@ ever assembles, buffers or inspects it. The publish stage validated the tar
 | `sigstore/payload-<n>.json` | Cosign simple-signing payloads, one per signature layer |
 | `files/<name>` | One entry per layer in manifest order: `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, the native archive |
 
-Rows registered before bundles were published carry an empty
-`bundle_digest`; the index export omits them — a row with no pullable
-digest is not coverage. `stow-build backfill-bundles` lists them through
-`GET /api/v1/admin/artifacts/unbundled`, republishes each bundle from the
-signed image already in GHCR, and re-registers the record.
+A record whose artifact predates bundle publishing carries an empty
+`bundle_digest`; the index export omits it — a row with no pullable
+digest is not coverage.
 
 Constants (media types, paths) are defined in `types/src/bundle.rs`.
 
@@ -308,12 +308,17 @@ foreign version — and a `row_count` checked against the decoded body.
 identity the CLI rejects, so `index-publish-cron.yml` dispatches it on
 `main` after every completed `build-crate` run (a ten-minute schedule is
 the backstop; GitHub delivers those ticks hours apart), and its first
-step refuses any other ref. A run
-resolves the current stable rustc from the
-channel manifest, exports each `CI_TARGET_TRIPLES` slice through
-`GET /api/v1/admin/index/{target}/{rustc_version}` (keyset-paginated by
-`c_metadata`, `SchedulerCaller`-gated) via `stow-admin index export`, and
-pushes it with `stow-admin index publish`. Because the header's
+step refuses any other ref. A run does one `stow-admin index export
+--out-dir --rustc-version` pass scoped to one rustc — the completed
+run's `<rustc>-<task_id>` title names it, and the pass pulls and
+verifies the published `index`/`folded` pair per `(target, rustc)`
+slice of that rustc and then only the `records-<rustc>-*` artifacts no
+folded set covers, all from GHCR with no edge round-trip — and emits an
+empty generation-1 slice for every `CI_TARGET_TRIPLES` member that got
+no rows and has no published pair, so a `--target` consumer always
+finds the tag —
+then loops the pass's `slices.json` for `stow-admin index publish`,
+which pushes the `index` plus `folded` pair and signs both. Because the header's
 `generated_at` makes every
 export byte-unique, the run does not compare blob digests: the export
 reports a `content_sha256` over everything but the timestamp, the
@@ -365,29 +370,39 @@ charges whoever arrives next for a backlog everyone built — which is why
    │ build job (untrusted)        │ upload │ publish job (trusted)        │
    │ contents: read, no secrets   │──────► │ packages: write, id-token    │
    │ stow-build build             │ artifact│ stow-build publish           │
-   │ runs third-party build.rs    │        │ validates, pushes, signs,    │
-   └──────────────────────────────┘        │ registers, reports           │
+   │ runs third-party build.rs    │        │ validates, pushes bundles +  │
+   └──────────────────────────────┘        │ records, cosign-signs        │
                                            └─┬────────────────────────────┘
-                                             │ POST /api/v1/admin/artifacts/register
-                                             │ (Bearer: github-oidc)
+                                             │
                                              ▼
-  client (cli)  ──── zenwave ──►  edge worker (skyzen) ──► CF D1 (authoritative)
+  GitHub ──workflow_run webhook──►  edge worker (skyzen) ──► CF D1 (catalog mirror)
         ▲                              │ CfFetch
-        │ inject                       ▼
-   cargo target/                  GHCR (OCI)
+        │                              ▼
+  client (cli)  ──── zenwave ──►  GHCR (OCI): bundles, records, index slices
+        │
+        │ inject
+        ▼
+   cargo target/
 ```
+
+The build job never calls the edge: records live only in GHCR, and the
+scheduler learns the outcome from GitHub's `workflow_run` webhook — the
+edge verifies `X-Hub-Signature-256`, parses `display_title`
+(`<rustc>-<task_id>`) into its rustc and task id, and completes the
+task only after the task's records artifact verifies in GHCR. `stow-admin index export` rebuilds each index slice
+from those signed records, and the `artifacts` D1 table is a mirror
+populated by `index sync`, not the write target.
 
 What each hop is allowed to do:
 
 | Hop | Reads | Writes |
 |---|---|---|
 | stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
-| edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/register`, gated by the `build-crate.yml` OIDC pin / repo push users, and bound to the dispatched task's dependency closure — an OIDC write must name an in-flight task and every record's `(crate, version)` must be the task crate or a closure member); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
+| edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/sync`, gated by repo push users and bound to records already published in GHCR); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
-| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign plus the edge's trusted endpoints) | GHCR objects; sigstore signatures; admin/register POSTs; scheduler `/complete` |
-| `report-failure` job (`build-crate.yml`) | the dispatch task input; OIDC (`id-token: write`) | scheduler `/complete` failure reports |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | D1 `artifacts` via the edge admin index endpoint; GHCR manifests; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache` |
+| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>` artifacts); sigstore signatures |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
 
 The build and publish jobs never share a process or an environment. The build job's
 `GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a
@@ -473,23 +488,21 @@ match the trusted builder's workflow URL and OIDC issuer; and only then is the E
 signature over the payload checked. A key leaked from a short-lived Fulcio
 certificate therefore cannot sign anything after that certificate expires.
 
-> **Register binding.** The endpoint is authenticated by GitHub identity,
-> and an OIDC write must additionally name the scheduler task the run was
-> dispatched for (`RegisterArtifactsRequest.task_id`). The edge requires
-> the task to be in flight and every record to carry the task's target and
-> rustc version, and it expands the task's crates.io dependency closure
-> with the same resolver `POST /api/v1/requests` uses: a record for a
-> `(crate, version)` outside that closure rejects the whole request before
-> any row is written. A compromised publish job for crate X can therefore
-> only register rows crate X's own build could produce. Tasks that resolve
-> a lockfile the edge cannot reproduce (`preserve_lockfile` overlays)
-> skip the crates.io expansion — their
-> binding narrows to the task's target/rustc identity — and push-user
-> callers may omit `task_id` for the operator backfill path.
+> **Records binding.** CI never calls the edge to record builds — each
+> task's records land in GHCR as a cosign-signed `records-<rustc>-<task_id hash>`
+> artifact under the pinned `build-crate.yml` identity, and every reader
+> (`index export`, the webhook completion check) verifies that signature
+> before trusting the rows. The D1 `artifacts` table is a mirror: the
+> `sync` endpoint only accepts rows identical to what the registry's
+> verified records carry, so the catalog can lag or be rebuilt wholesale
+> without ever becoming the source of truth.
 >
-> **Future direction.** Requiring the request body itself to be
-> cosign-signed by the same identity that signs OCI bundles would make
-> register signature-rooted end to end.
+> **Completion binding.** GitHub's `workflow_run` webhook is HMAC-signed
+> with `STOW_GITHUB_WEBHOOK_SECRET`, which only GitHub and the edge hold;
+> the edge accepts a completion only for a `build-crate.yml` run on `main`
+> whose `display_title` parses as `<rustc>-<task_id>`, and only after
+> the task's records
+> artifact verifies in GHCR — a forged "success" cannot mint catalog rows.
 
 ## Local artifact cache
 
@@ -632,8 +645,7 @@ short-circuit before deserialization.
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
 | GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Cache-API-cached for one hour |
 | GET `/api/v1/bundles/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Digest-addressed byte fetch — the only artifact-serving route; the `sha256:<64 hex>` path segment is the index row's `bundle_digest`, served Cache-API-first over GHCR |
-| POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `RegisterArtifactsRequest` | `OkResponse` | Trusted CI registers built artifacts; the OIDC caller's `task_id` binds the write to the dispatched task's target/rustc and dependency closure |
-| GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
+| POST `/api/v1/admin/artifacts/sync` | Bearer: repo push user | `Vec<ArtifactRecord>` chunk | `OkResponse` | Mirror the GHCR records into the D1 catalog — `stow-admin index sync` inside `index-publish.yml` |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|clear`) |
 | GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
@@ -654,7 +666,8 @@ short-circuit before deserialization.
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
 | POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
-| POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI reports completion |
+| POST `/api/v1/scheduler/complete` | Bearer: `build-crate.yml` OIDC or push user | `BuildCompleteReport` | `OkResponse` | CI completion reports (superseded by the `workflow_run` webhook) |
+| POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and completes the task only once that task's records artifact verifies in GHCR |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
 
 Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
@@ -667,9 +680,10 @@ its closure at the CLI's prefetch concurrency and the per-`rustc` wrapper
 fetches on demand under cargo's job parallelism, so one address
 legitimately sends tens of bundle requests a second, and a Cache API hit
 there costs one Worker request and no D1 or Durable Object work. The trusted
-write endpoints (`admin/artifacts/register`, `scheduler/tasks/submit`,
-`scheduler/complete`) are inside the limited prefix, which is fine at
-CI's request rate: a build makes one register call per task chunk.
+write endpoints (`admin/artifacts/sync`, `scheduler/tasks/submit`,
+`github/workflow-run`) are inside the limited prefix, which is fine at
+their request rate: a wave makes one sync batch per slice and GitHub
+delivers one webhook per run.
 
 When even that is too much — Cloudflare has no spend cap — the zone's
 maintenance rules stop traffic outright. Three WAF custom rules live on
@@ -687,9 +701,9 @@ rule's `enabled` flag through the Rulesets API; the watchdog (#450)
 trips by enabling `anonymous`. Blocked requests are answered in the
 security phase — they never invoke the Worker and never reach the
 Durable Object, so the shed costs nothing and a broken edge cannot
-silence the breaker. The trusted prefixes stay up under `anonymous`, so
-CI keeps registering and completing builds and the operator can always
-flip the rule back off.
+silence the breaker. The trusted prefixes and the GitHub webhook route
+stay up under `anonymous`, so record syncs and completion webhooks keep
+flowing and the operator can always flip the rule back off.
 
 The zone's WAF maintenance rules protect the worker; the **dispatch freeze** protects the
 runner allowance and the Cloudflare bill. The object is event-driven —

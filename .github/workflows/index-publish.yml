@@ -1,12 +1,25 @@
 name: Index publish
 
 # Publishes the signed artifact index the CLI resolves against
-# (water-rs/stow#188): each `stow_types::api::CI_TARGET_TRIPLES` slice of
-# the current stable rustc is exported from the edge, pushed to GHCR as a
-# single-layer OCI artifact (`index.<target>.<rustc>` on
-# ghcr.io/water-rs/stow-cache), and cosign-signed keyless under this
+# (water-rs/stow#188, #455): each slice is folded from the registry's
+# signed records artifacts — `stow-admin index export --out-dir
+# --rustc-version` pulls and verifies the previous `index`/`folded` pair
+# per slice of that rustc, then only the `records-<rustc>-*` artifacts
+# the union of folded sets does not already cover, no edge round-trip —
+# pushed to GHCR as single-layer OCI
+# artifacts (`index.<target>.<rustc>` plus the `folded.<target>.<rustc>`
+# companion listing every records tag already folded, both on
+# ghcr.io/water-rs/stow-cache) and cosign-signed keyless under this
 # workflow's identity on `main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
+#
+# The D1 catalog is a mirror of those records, not the source: the
+# `index sync` step replays the delta the export just folded —
+# `new-records.json`, not a re-pull — into the edge's
+# `/api/v1/admin/artifacts/sync` route. It is gated on the
+# `stow_edge_url` dispatch input — an edge URL given by configuration,
+# never probed at runtime — so a dispatch while Cloudflare is offline
+# simply publishes the index and skips the sync.
 #
 # A `schedule` or `workflow_run` trigger would run on the default branch
 # (`dev`) and sign under an identity the CLI rejects, so this workflow is
@@ -24,6 +37,17 @@ name: Index publish
 
 on:
   workflow_dispatch:
+    inputs:
+      stow_edge_url:
+        description: "Edge base URL the D1 catalog sync posts to; the sync step runs only when set"
+        required: false
+        default: ""
+        type: string
+      rustc_version:
+        description: "Rustc the export pass scopes to; defaults to the current stable channel"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -62,62 +86,96 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build stow-admin
         run: cargo build --release -p stow-admin
-      # The same channel read preheat-cron.yml uses: the stable
-      # manifest's rust version is the slice key the index tags carry.
-      - name: Read the current stable rustc version
-        id: channel
-        run: |
-          set -euo pipefail
-          version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
-            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
       # cosign is still what signs — `stow-admin index publish` shells out
       # to it exactly as `stow-build publish` does.
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      # One loop, one job: a slice's export/publish/sign is cheap enough
-      # that a matrix would only multiply the stow-admin build. `index
-      # publish` pushes the single-layer artifact with the
-      # `dev.stow.index.content-sha256` annotation and skips the push when
-      # the published annotation already equals the fresh export's; the
-      # signature is skipped only if its `.sig` tag is there, otherwise the
-      # published manifest is signed in place. `index report` then tells
-      # the edge what the live slice serves — the scheduler's dependency
-      # gate learns servability from the publish path itself, not from
-      # task completions.
-      - name: Export, publish, and sign each target's index
+      # The export pass is scoped to one rustc: only `records-<rustc>-*`
+      # artifacts and `index.<t>.<rustc>`/`folded.<t>.<rustc>` pairs are
+      # touched. `index-publish-cron` forwards the rustc the completed
+      # run's title names; an unset input takes the stable channel, the
+      # same resolution preheat-cron.yml does.
+      - name: Resolve the rustc the export scopes to
         env:
-          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          INPUT_RUSTC: ${{ inputs.rustc_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_RUSTC" ]; then
+            rustc_version="$INPUT_RUSTC"
+          else
+            rustc_version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
+              | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          fi
+          echo "RUSTC_VERSION=$rustc_version" >> "$GITHUB_ENV"
+      # One export pass for every slice of this rustc: `index export
+      # --out-dir --rustc-version` lists the registry once, pulls the
+      # published `index`/`folded` pairs for R's slices, and verifies
+      # only the records tags no folded set covers — the pass is
+      # O(new work), not O(store). It writes `index.<t>.<r>` +
+      # `folded.<t>.<r>` per changed slice, `slices.json` describing them,
+      # and `new-records.json` for `index sync`. The publish loop then
+      # pushes each pair (`index publish` signs both under this
+      # workflow's identity) and `index report` tells the edge what the
+      # live slice serves — the scheduler's dependency gate learns
+      # servability from the publish path itself, not from task
+      # completions.
+      - name: Export every index slice in one pass
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/index-export"
+          mkdir -p "$out"
+          ./target/release/stow-admin index export --out-dir "$out" --rustc-version "$RUSTC_VERSION"
+          cp "$out/slices.json" "$RUNNER_TEMP/slices.json"
+          cp "$out/new-records.json" "$RUNNER_TEMP/new-records.json"
+          echo "export_dir=$out" >> "$GITHUB_ENV"
+      - name: Publish and sign each changed slice
+        env:
+          # The dispatch input, not a runtime probe: when the edge URL is
+          # configured the loop reports each slice to the edge's
+          # scheduler gate; when it is absent (Cloudflare offline) the
+          # report simply does not run.
+          STOW_EDGE_URL: ${{ inputs.stow_edge_url }}
           # stow-admin mints a fresh Actions OIDC JWT for every edge
           # request under this audience; the RepoWriter policy admits any
           # workflow inside water-rs/stow.
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
-          RUSTC_VERSION: ${{ steps.channel.outputs.version }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # A target whose export or push fails must not cost every later
-        # target its slice: the slices are independent, and a stale slice
-        # is what every CLI on that target resolves against until the next
-        # run. Failures are collected and reported at the end.
+        # A slice whose publish fails must not cost every later slice its
+        # update: slices are independent, and a stale slice is what every
+        # CLI on that target resolves against until the next run.
+        # Failures are collected and reported at the end.
         run: |
-          set -uo pipefail
-          targets="$(./target/release/stow-admin index targets)" || exit 1
-          failed=""
-          for target in $targets; do
-            echo "::group::$target"
-            file="$RUNNER_TEMP/index-$target.zst"
-            if ./target/release/stow-admin index export \
-              --target "$target" --rustc-version "$RUSTC_VERSION" --out "$file" \
-              && ./target/release/stow-admin index publish \
-                --file "$file" --target "$target" --rustc-version "$RUSTC_VERSION" \
-              && ./target/release/stow-admin index report --file "$file"; then
-              echo "::endgroup::"
-              continue
-            fi
-            echo "::error::index publish failed for $target"
-            failed="$failed $target"
-            echo "::endgroup::"
-          done
-          if [ -n "$failed" ]; then
-            echo "::error::index publish incomplete:$failed"
-            exit 1
-          fi
+          python3 - "$export_dir" <<'EOF'
+          import json, os, subprocess, sys
+          out = sys.argv[1]
+          slices = json.load(open(os.path.join(out, "slices.json")))
+          failed = []
+          for s in slices:
+              print(f"::group::{s['tag']}", flush=True)
+              file = os.path.join(out, s["index_file"])
+              folded = os.path.join(out, s["folded_file"])
+              steps = [["./target/release/stow-admin", "index", "publish",
+                        "--file", file, "--folded", folded]]
+              if os.environ.get("STOW_EDGE_URL"):
+                  steps.append(["./target/release/stow-admin", "index", "report", "--file", file])
+              ok = all(subprocess.run(step).returncode == 0 for step in steps)
+              print("::endgroup::", flush=True)
+              if not ok:
+                  print(f"::error::index publish failed for {s['tag']}", flush=True)
+                  failed.append(s["tag"])
+          if failed:
+              print(f"::error::index publish incomplete: {' '.join(failed)}", flush=True)
+              sys.exit(1)
+          EOF
+      # D1's `artifacts` table is a read model of the same GHCR records —
+      # populated only here, and only the delta this pass folded —
+      # `new-records.json` — never written by CI itself.
+      - name: Sync the new records into the edge catalog
+        if: inputs.stow_edge_url != ''
+        env:
+          STOW_EDGE_URL: ${{ inputs.stow_edge_url }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+        run: ./target/release/stow-admin index sync --file "$export_dir/new-records.json"

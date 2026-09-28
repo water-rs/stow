@@ -451,6 +451,58 @@ impl RegistrySession {
         Ok(digest)
     }
 
+    /// `GET tags/list` — every tag the session's repository carries,
+    /// following the spec's `n`/`last` continuation while the registry
+    /// answers a `Link: …rel="next"` header. Admin's records export lists
+    /// the `records-*` tag space through this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] on a transport failure, a refusal, or an
+    /// undecodable page body.
+    pub async fn list_tags(&self) -> Result<Vec<String>, RegistryError> {
+        /// Tags per page — large enough that the records tag space is one
+        /// request for a long time.
+        const PAGE_SIZE: u32 = 1000;
+        #[derive(serde::Deserialize)]
+        struct TagsList {
+            #[serde(default)]
+            tags: Vec<String>,
+        }
+        let mut tags = Vec::new();
+        let mut last: Option<String> = None;
+        loop {
+            let url = self.api("tags/list");
+            let url = last.as_ref().map_or_else(
+                || format!("{url}?n={PAGE_SIZE}"),
+                |last| format!("{url}?n={PAGE_SIZE}&last={last}"),
+            );
+            let response = self
+                .send(
+                    "list tags",
+                    SessionRequest::authenticated(Method::GET, url.clone()),
+                )
+                .await?;
+            response.ensure_success("list tags", &url)?;
+            let page: TagsList =
+                serde_json::from_slice(&response.body).map_err(|error| RegistryError {
+                    what: format!("list tags {url}"),
+                    kind: RegistryErrorKind::Transport(format!("decode tags list: {error}")),
+                })?;
+            let has_next = response
+                .headers
+                .get(header::LINK)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|link| link.contains("rel=\"next\""));
+            last = page.tags.last().cloned();
+            tags.extend(page.tags);
+            if !has_next || last.is_none() {
+                break;
+            }
+        }
+        Ok(tags)
+    }
+
     /// GET the manifest `reference` names: its bytes exactly as stored and
     /// the body's own sha256 — `Docker-Content-Digest` is only ever checked
     /// to agree with the bytes, never trusted alone: a header that names a

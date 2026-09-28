@@ -8,10 +8,10 @@ name: Index publish cron
 # way `preheat-cron.yml` dispatches the admin lane.
 #
 # The tick is event-driven: every completed `build-crate` run — the only
-# thing that changes the catalog — dispatches a publish, so a freshly
-# registered artifact reaches the index within one publish run. The
-# schedule is the backstop for catalog changes that arrive any other way
-# (backfills, pruned rows); GitHub delivers `*/10` ticks hours apart on
+# thing that lands records in GHCR — dispatches a publish, so a newly
+# pushed records artifact reaches the index within one publish run. The
+# schedule is the backstop for a `workflow_run` event GitHub failed to
+# deliver; GitHub delivers `*/10` ticks hours apart on
 # this repository, so it cannot be the primary trigger.
 
 on:
@@ -39,7 +39,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # The edge URL rides the dispatch input: configured, the publish
+      # run syncs the D1 catalog and reports each slice; unset, it
+      # publishes the index and skips both — the workflow never probes.
+      # A `workflow_run` tick also forwards the rustc the completed run's
+      # `<rustc>-<task_id>` title names; a schedule or manual tick leaves
+      # the input empty and index-publish takes the stable channel.
       - name: Dispatch index-publish on main
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run index-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+        run: |
+          set -euo pipefail
+          args=(--repo "$GITHUB_REPOSITORY" --ref main -f stow_edge_url="$STOW_EDGE_URL")
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            args+=(-f "rustc_version=${RUN_TITLE%%-*}")
+          fi
+          gh workflow run index-publish.yml "${args[@]}"

@@ -21,6 +21,7 @@ pub mod native_capture;
 pub mod platform;
 pub mod pow;
 pub mod public_cache;
+pub mod records;
 pub mod registry;
 pub mod rustc;
 pub mod trusted_builder;

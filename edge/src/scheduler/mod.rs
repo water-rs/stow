@@ -24,6 +24,11 @@ pub mod test_db;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod cost_gate;
 
+/// The workerd budget table — data only, compiled wherever either the
+/// probe or the host drift test needs it.
+#[cfg(any(test, target_arch = "wasm32"))]
+pub mod do_budgets;
+
 #[cfg(target_arch = "wasm32")]
 pub mod budget;
 #[cfg(target_arch = "wasm32")]

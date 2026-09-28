@@ -76,13 +76,13 @@ fn parse_semver(raw: &str) -> Result<Version, DbError> {
     })
 }
 
-/// Build the upsert statement for one trusted artifact record — all of
+/// Build the upsert statement for one artifact record — all of
 /// `insert_artifact_records`' checks and encodes, expressed as a
-/// [`BatchStatement`] so a register request writes every row through one
+/// [`BatchStatement`] so a sync request writes every row through one
 /// [`Db::execute_batch`] call.
 ///
 /// The composite uniqueness key is `(c_metadata, target, rustc_version)`;
-/// the upsert keeps registration idempotent so CI retries do not
+/// the upsert keeps syncs idempotent so replays do not
 /// duplicate rows, and `created_at` is excluded from the update list so
 /// a re-register preserves the first-registration timestamp.
 fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, DbError> {
@@ -133,7 +133,7 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
     // `min_glibc` stores the floor as text: `''` for a measured artifact
     // with no glibc requirement, `'x.y'` for the floor itself. NULL means
     // "not yet measured" and is reserved for rows that predate the
-    // column — a re-register always writes a concrete value.
+    // column — a sync write always writes a concrete value.
     let min_glibc = record
         .min_glibc
         .map_or_else(String::new, |floor| floor.to_string());
@@ -169,7 +169,7 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
         .bind(min_glibc.as_str()))
 }
 
-/// Insert (or update) every record of a register request in one
+/// Insert (or update) every record of a sync request in one
 /// [`Db::execute_batch`] call — a single D1 round trip rather than one
 /// per record. The batch is D1's transaction: a failed statement rolls
 /// the whole request's writes back, so a request that fails at the
@@ -409,27 +409,6 @@ fn decode_min_glibc(raw: Option<&str>) -> Result<Option<stow_types::glibc::Glibc
     }
 }
 
-/// Rows registered before bundle publishing — no `bundle_digest` — oldest
-/// first, as the records that registered them, so a backfill can push the
-/// missing bundle and re-register each one.
-pub async fn unbundled_artifact_records(
-    db: &Db,
-    limit: usize,
-) -> Result<Vec<ArtifactRecord>, DbError> {
-    let limit = i64::try_from(limit)
-        .map_err(|_| DbError::Invariant(format!("unbundled limit {limit} exceeds i64")))?;
-    let rows = db
-        .query(&format!(
-            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
-             WHERE bundle_digest = '' ORDER BY created_at, c_metadata LIMIT ?"
-        ))
-        .bind(limit)
-        .fetch_all::<FullArtifactRow>()
-        .await
-        .map_err(|error| DbError::Query(format!("db query: {error}")))?;
-    rows.into_iter().map(FullArtifactRow::into_record).collect()
-}
-
 /// One servable artifact row as the published index needs it — every
 /// field [`stow_types::index::ArtifactIndexRow`] carries, with the
 /// JSON-encoded columns still raw for the shared decode.
@@ -527,15 +506,14 @@ pub async fn artifact_index_page(
     } else {
         // The page query drops unmeasured rows, so exporting a slice
         // that still has any would sign an index missing rows it used
-        // to carry. Refuse instead — the export fails fast on the
-        // first page until `stow-admin index backfill-min-glibc` has
-        // measured them all.
+        // to carry. Refuse instead — a NULL floor means a row older
+        // than the column survived into the mirror, which should not
+        // exist: fix the row before re-exporting.
         let unmeasured = unmeasured_glibc_count_in_slice(db, target, rustc_version).await?;
         if unmeasured > 0 {
             return Err(DbError::Invariant(format!(
                 "slice {target}/{rustc_version} has {unmeasured} artifact rows with \
-                 no measured glibc floor — run `stow-admin index backfill-min-glibc \
-                 --yes` before publishing the index",
+                 no measured glibc floor",
             )));
         }
     }
@@ -573,28 +551,6 @@ const FULL_ARTIFACT_COLUMNS: &str = "compile_key, c_metadata, extra_filename, ta
      oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, \
      profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, \
      unit_side, unit_invocation, unit_linked, min_glibc";
-
-/// Rows registered before `min_glibc` existed — floor still NULL —
-/// oldest first, as the records that registered them, so
-/// `stow-admin index backfill-min-glibc` can measure each stored bundle
-/// and re-register the row with its floor.
-pub async fn unmeasured_glibc_artifact_records(
-    db: &Db,
-    limit: usize,
-) -> Result<Vec<ArtifactRecord>, DbError> {
-    let limit = i64::try_from(limit)
-        .map_err(|_| DbError::Invariant(format!("unmeasured limit {limit} exceeds i64")))?;
-    let rows = db
-        .query(&format!(
-            "SELECT {FULL_ARTIFACT_COLUMNS} FROM artifacts \
-             WHERE bundle_digest != '' AND min_glibc IS NULL ORDER BY created_at, c_metadata LIMIT ?"
-        ))
-        .bind(limit)
-        .fetch_all::<FullArtifactRow>()
-        .await
-        .map_err(|error| DbError::Query(format!("db query: {error}")))?;
-    rows.into_iter().map(FullArtifactRow::into_record).collect()
-}
 
 /// How many bundled rows in one `(target, rustc_version)` slice still
 /// have no measured floor — the rows the index page's `min_glibc IS NOT
@@ -899,51 +855,6 @@ struct CoveredIdentityRow {
     min_glibc: Option<String>,
 }
 
-/// The `(c_metadata, target, rustc_version)` keys among `keys` whose
-/// existing row is a pre-column shapeless row (`-1` on all three legs).
-/// A register record without a shape may only re-write such a row —
-/// the backfill paths that re-register legacy records depend on that —
-/// while nothing new may land shapeless.
-pub async fn shapeless_artifact_keys(
-    db: &Db,
-    keys: &[(String, String, String)],
-) -> Result<BTreeSet<(String, String, String)>, DbError> {
-    const PARAMS_PER_KEY: usize = 3;
-    const BATCH: usize = sql_batch::D1_MAX_BOUND_PARAMS / PARAMS_PER_KEY;
-    let mut shapeless = BTreeSet::new();
-    for batch in keys.chunks(BATCH) {
-        let sql = format!(
-            "SELECT c_metadata, target, rustc_version FROM artifacts \
-             WHERE unit_side = -1 AND unit_invocation = -1 AND unit_linked = -1 \
-               AND (c_metadata, target, rustc_version) IN (VALUES {})",
-            sql_batch::values_rows("(?, ?, ?)", batch.len())
-        );
-        let mut query = db.query(&sql);
-        for (c_metadata, target, rustc_version) in batch {
-            query = query
-                .bind(c_metadata.as_str())
-                .bind(target.as_str())
-                .bind(rustc_version.as_str());
-        }
-        let rows = query
-            .fetch_all::<ShapelessKeyRow>()
-            .await
-            .map_err(|error| DbError::Query(format!("db query: {error}")))?;
-        shapeless.extend(
-            rows.into_iter()
-                .map(|row| (row.c_metadata, row.target, row.rustc_version)),
-        );
-    }
-    Ok(shapeless)
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct ShapelessKeyRow {
-    c_metadata: String,
-    target: String,
-    rustc_version: String,
-}
-
 pub async fn take_dependency_graph_misses(
     db: &Db,
     limit: usize,
@@ -1162,7 +1073,6 @@ mod sqlite_tests {
         apply_migrations, artifact_index_page, artifact_record as fetch_artifact_record,
         covered_semantic_identities, insert_artifact_records, record_admitted_miss,
         set_dependency_graph_misses_queued, take_dependency_graph_misses,
-        unbundled_artifact_records,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1406,56 +1316,6 @@ mod sqlite_tests {
         );
     }
 
-    /// A row registered before bundles existed is not servable — the
-    /// index page's `bundle_digest != ''` predicate excludes it — and the
-    /// backfill listing hands back the record that registered it so the
-    /// bundle can be published and re-registered.
-    #[tokio::test]
-    async fn unbundled_rows_are_a_miss_until_backfilled() {
-        async fn servable(db: &skyzen_services::Db) -> u64 {
-            db.query("SELECT COUNT(*) FROM artifacts WHERE bundle_digest != ''")
-                .fetch_scalar::<u64>()
-                .await
-                .expect("servable count")
-        }
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        apply_migrations(&db).await;
-        let record = artifact_record(FIRST_DIGEST);
-        insert_artifact_records(&db, std::slice::from_ref(&record))
-            .await
-            .expect("insert");
-        db.query("UPDATE artifacts SET bundle_digest = '', bundle_size = 0")
-            .execute()
-            .await
-            .expect("age the row to the pre-bundle schema");
-
-        assert_eq!(servable(&db).await, 0);
-        let unbundled = unbundled_artifact_records(&db, 10)
-            .await
-            .expect("unbundled listing");
-        assert_eq!(
-            unbundled,
-            vec![ArtifactRecord {
-                bundle_digest: String::new(),
-                bundle_size: 0,
-                ..record.clone()
-            }]
-        );
-
-        insert_artifact_records(&db, std::slice::from_ref(&record))
-            .await
-            .expect("re-register with the bundle");
-        assert_eq!(
-            unbundled_artifact_records(&db, 10)
-                .await
-                .expect("unbundled listing"),
-            Vec::new()
-        );
-        assert_eq!(servable(&db).await, 1);
-    }
-
     /// Coverage is exact on every identity column and ignores rows without
     /// a published bundle, which serving lookups treat as a miss too.
     #[tokio::test]
@@ -1666,7 +1526,7 @@ mod sqlite_tests {
             };
         // Four identities at distinct floors: 2.39 (over), 2.28 (at
         // baseline), measured-no-floor (''), and NULL (unmeasured —
-        // pre-column rows the backfill has not reached).
+        // pre-column rows).
         let mut rows: Vec<ArtifactRecord> = Vec::new();
         rows.extend(shaped_pair("bbbbbbbbbbbbbbb", "1.0.0", floor(39)));
         rows.extend(shaped_pair("ccccccccccccccc", "1.0.1", floor(28)));

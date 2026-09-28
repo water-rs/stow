@@ -62,28 +62,29 @@ Every Rust developer compiles the same popular crates over and over. Stow replac
 ```
   your machine              Cloudflare (untrusted)              GitHub (trusted)
 ┌────────────┐           ┌───────────────────┐              ┌──────────────────┐
-│ stow CLI   │─admissions>│  Edge Worker      │              │ GitHub Actions   │
-│ (rustc     │  on miss  │  (mint PoW        │              │ CI (stow-build): │
-│  wrapper)  │<──PoW─────│   admissions,     │<──records────│ builds, signs,   │
-└─────┬──────┘           │   D1 owner)       │   Bearer:    │ pushes, registers│
-      │                  └────────┬──────────┘  github-oidc └──┬─────────▲─────┘
+│ stow CLI   │─admissions>│  Edge Worker      │   workflow_run│ GitHub Actions   │
+│ (rustc     │  on miss  │  (mint PoW        │<──webhook─────│ CI (stow-build): │
+│  wrapper)  │<──PoW─────│   admissions,     │   (HMAC)      │ builds, signs,   │
+└─────┬──────┘           │   D1 owner)       │               │ pushes           │
+      │                  └────────┬──────────┘               └──┬─────────▲─────┘
       │ inject               miss │  ^ status            push+sign     │ dispatch
-      v                           v  │                        │  (workflow_dispatch)
-  cargo target/          ┌───────────────────┐                │
-      ▲                  │  Scheduler (DO)   │<───────────────┘ /complete
-      │                  │  (priority queue, │
-      │                  │   dedup, dispatch)│
-      │                  └────────┬──────────┘
-      │                           │ writes
-      │                           v
-      │                       ┌──────────┐      D1 rows feed index export
-      │                       │  CF D1   │      (signed, then published)
-      │                       │(artifact │              │
-      │                       │ records) │              v
+      v                           v  │                    bundles +    │  (workflow_dispatch)
+  cargo target/          ┌───────────────────┐       records-<r>-<id>    │
+      ▲                  │  Scheduler (DO)   │<───────────────┘         │
+      │                  │  (priority queue, │    a run's task is done  │
+      │                  │   dedup, dispatch)│    only once its records │
+      │                  └────────┬──────────┘    artifact verifies      │
+      │                           │ writes                            │
+      │                           v                                   │
+      │                       ┌──────────┐   D1 is a mirror, filled    │
+      │                       │  CF D1   │   by `index sync` from      │
+      │                       │(artifact │   verified GHCR records    │
+      │                       │ records) │                            │
       │                       └──────────┘      ┌──────────────────┐
       │ signed index slices, verified locally   │  GHCR (OCI):     │
       └────────────────────────────────────────>│  signed index.*  │
         (bundles stream via the edge byte path) │  + bundle blobs  │
+                                                │  + records-*     │
                                                 └──────────────────┘
 ```
 
@@ -133,8 +134,7 @@ The trusted build runner, hosted on GitHub Actions. This is the root of trust �
 1. Receives the task as a `workflow_dispatch` input from the scheduler.
 2. `build` job (read-only token, no secrets): builds the crate with the specified features, target, and rustc version, and hands the outputs over as a workflow artifact. Third-party build scripts run here and nowhere else.
 3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them with cosign.
-4. Registers the artifact records by POSTing to the edge's authenticated `/api/v1/admin/artifacts/register` endpoint (`Authorization: Bearer` carrying the run's GitHub Actions OIDC token). The edge worker owns the D1 binding and writes the row; CI never holds a D1 credential.
-5. Reports completion back to the scheduler, which then dispatches the next queued task.
+4. Pushes the task's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed run to the edge, which verifies the records artifact exists before the scheduler dispatches the next queued task.
 
 ### Admin (`admin/`)
 
@@ -151,12 +151,12 @@ You never have to ask for a patch release specifically: a request for `1.6.8` is
 Stow does **not** rely on trusting the edge or the scheduler. Both are treated as untrusted infrastructure that could be compromised without affecting artifact integrity.
 
 - **CI is the sole producer of artifacts.** Builds run on GitHub Actions, where every workflow run is public and fully auditable.
-- **CI registers artifact records through one authenticated edge endpoint.** Records are POSTed to `/api/v1/admin/artifacts/register` with the run's GitHub Actions OIDC token — a per-run identity, not a stored secret. The edge worker owns the only D1 write path; CI holds no D1 credential.
+- **CI never calls the edge.** Records live in GHCR as cosign-signed OCI artifacts — the same keyless signature clients verify on bundles — and completion reaches the edge through GitHub's `workflow_run` webhook, HMAC-verified with a stored secret. The edge's D1 catalog is a mirror `index sync` replays from the verified records.
 - **Artifacts are stored in OCI (GHCR).** Content-addressable storage with digest verification.
 - **Artifacts are signed, and identity is signature-bound.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk, and additionally require the bundle's identity fields (crate name, version, target, rustc version, features, dependency identities) to byte-for-byte match the OCI config that the signature covers — a tamperer cannot relabel a validly-signed bundle as a different artifact. A record that points at a digest the attacker doesn't control fails signature verification on the client and is pruned by the edge.
 - **The edge cannot publish or forge artifacts.** It writes D1 records authorized by the `build-crate.yml` OIDC identity (or a repo push user), mints miss admissions, and relays bundle bytes from GHCR — but it cannot forge OCI bundles, index slices, or sigstore signatures: every bundle a client receives must hash to the digest the signed index pins and carry a valid signature, both checked locally.
 
-Even if the edge or scheduler were fully compromised, an attacker cannot inject malicious artifacts. The worst they can do is pollute D1 with rows that point at digests they do not own — and those rows are detected and pruned the first time a client tries to fetch them. A future iteration will replace bearer-credential register auth with cosign-signed register requests, removing even that surface.
+Even if the edge or scheduler were fully compromised, an attacker cannot inject malicious artifacts. The worst they can do is pollute D1 with rows that point at digests they do not own — and those rows are detected and pruned the first time a client tries to fetch them.
 
 ## Project structure
 

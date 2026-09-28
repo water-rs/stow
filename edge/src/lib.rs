@@ -42,8 +42,6 @@ mod index_slice;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod miss_logger;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod register;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod registry_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod rust_channel;
@@ -81,3 +79,7 @@ mod ghcr;
 mod runtime_settings;
 #[cfg(target_arch = "wasm32")]
 mod scheduler_client;
+// The handler's deps are wasm-only, but its signature/decode/pin logic
+// is what the tests exercise — test builds need it on host too.
+#[cfg(any(target_arch = "wasm32", test))]
+mod webhook;

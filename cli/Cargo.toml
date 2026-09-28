@@ -26,7 +26,7 @@ path = "src/bin/stow.rs"
 # Local mock verification (`STOW_VERIFY_MODE=mock-key`): a single PEM key
 # replaces the Fulcio/Rekor trust root. Only the mock end-to-end lane
 # builds with it; release binaries verify against GitHub CI alone.
-mock-verify = []
+mock-verify = ["stow-oci/mock-verify"]
 
 [dependencies]
 tracing.workspace = true

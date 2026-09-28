@@ -112,6 +112,11 @@ name = "GITHUB_APP_PRIVATE_KEY"
 [[secret]]
 name = "STOW_POW_CHALLENGE_SECRET"
 
+# HMAC secret verifying GitHub's workflow_run webhook deliveries to
+# /api/v1/github/workflow-run — the scheduler's completion channel.
+[[secret]]
+name = "STOW_GITHUB_WEBHOOK_SECRET"
+
 [[secret]]
 name = "TURNSTILE_SECRET_KEY"
 
