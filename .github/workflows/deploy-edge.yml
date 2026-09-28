@@ -4,16 +4,29 @@ name: deploy-edge
 # main, and a manual dispatch must name a commit that has one. The job uploads
 # the new Worker version without deploying it (`wrangler versions upload`,
 # via `skyzen deploy --upload-only`), shifts a slice of traffic onto it
-# (`wrangler versions deploy <id>@<share>%`), and after the observation window
-# `stow-admin deploy verdict` compares the canary's metrics against the version
-# it would replace: a breach runs `wrangler rollback` and fails the job, a pass
-# promotes the version to 100%.
+# (`wrangler versions deploy <id>@<share>%`), and gates promotion on two
+# verdict phases of `stow-admin deploy verdict`:
 #
-# Durable Objects and gradual deployments: the Scheduler DO's migration
-# (`new_sqlite_classes`, tag v1) is already live, so an upload that changes no
-# DO lifecycle is legal and a rollback to the baseline never crosses a
-# migration boundary. DOs pin to the version they were created under, so the
-# verdict reads DO metrics per window rather than per version.
+#   Phase 1, `canary` — per-`scriptVersion` worker metrics (error rate,
+#   cpu/wall p50+p99) plus DO requests/errors/wall-per-request from
+#   `durableObjectsInvocationsAdaptiveGroups`.
+#   Phase 2, `promoted` — after promotion to 100%, the metrics that carry
+#   no version dimension compare the post-promotion window against the
+#   equal-length window ending at the canary shift: DO cpu/rows per DO
+#   request (`durableObjectsPeriodicGroups`) and D1 rows per worker
+#   request (`d1AnalyticsAdaptiveGroups`).
+#
+# A breach in either phase runs `wrangler rollback` and fails the job.
+#
+# Durable Objects and gradual deployments (per the Cloudflare "With Durable
+# Objects" doc): each object is *assigned* one version per deployment config,
+# proportionally — the singleton Scheduler either stays on the baseline for
+# the whole canary (its DO rows then report `skipped`, not a breach) or is
+# reassigned to the candidate, which resets it once (in-memory state is lost,
+# SQLite storage survives; the API contract between the two versions must be
+# compatible either way). The Scheduler's migration (`new_sqlite_classes`,
+# tag v1) is already live, so a version upload that changes no DO lifecycle is
+# legal and a rollback to the baseline never crosses a migration boundary.
 on:
   workflow_run:
     workflows: [Test]
@@ -47,10 +60,9 @@ env:
   DEPLOY_SHA: ${{ inputs.sha || github.event.workflow_run.head_sha }}
   CANARY_SHARE: ${{ inputs.canary_share || '5' }}
   CANARY_WINDOW_MINUTES: ${{ inputs.canary_window_minutes || '15' }}
-  # zen-rs/skyzen commit that provides `deploy --upload-only`
-  # (zen-rs/skyzen#98). A squash-merge there changes the SHA — repin to the
-  # commit that lands on skyzen's dev.
-  SKYZEN_REV: 393356ae4f6d4f556cfa281e2da7f618f3ba92d4
+  # zen-rs/skyzen commit that provides `deploy --upload-only` — the
+  # squash-merged commit of zen-rs/skyzen#98 on skyzen's dev.
+  SKYZEN_REV: 0271f693d253a9b32660affacbafaeffca455620
   # The generated wrangler config, relative to edge/ (the manifest root).
   WRANGLER_CONFIG: .skyzen/gen/wrangler.toml
 
@@ -207,7 +219,7 @@ jobs:
       # `deploy verdict` prints every metric's baseline/candidate pair and
       # exits non-zero on a breach or on no signal — a canary that served
       # nothing proved nothing.
-      - name: Canary verdict
+      - name: Canary verdict (phase 1)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -216,7 +228,7 @@ jobs:
           start_epoch=$(date -u -d "$DEPLOY_START" +%s)
           baseline_from=$(date -u -d "@$((start_epoch - CANARY_WINDOW_MINUTES * 60))" +%Y-%m-%dT%H:%M:%SZ)
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          cargo run --quiet -p stow-admin -- deploy verdict \
+          cargo run --quiet -p stow-admin -- deploy verdict --phase canary \
             --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
             --script stow-edge \
             --baseline-version "$BASELINE_VERSION" \
@@ -226,11 +238,48 @@ jobs:
             --candidate-from "$DEPLOY_START" \
             --candidate-to "$now"
 
-      # Anything after `versions deploy` failing — the verdict, the build,
-      # the runner — leaves the canary serving its share; roll it back.
-      # `CANDIDATE_VERSION` is only set once a version exists, so failures
-      # before the upload skip this.
-      - name: Roll back the canary
+      # The post-promotion window starts where 100% traffic starts — record
+      # it before the shift, the same way the canary window did.
+      - name: Promote the candidate to 100%
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "PROMOTE_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@100%"
+
+      - name: Observe the post-promotion window
+        run: sleep "${CANARY_WINDOW_MINUTES}m"
+
+      # Phase 2: the metrics that carry no `scriptVersion` — DO periodic
+      # cpu/rows per DO request and D1 rows per worker request — compare
+      # the post-promotion window against the same baseline window. A
+      # breach here rolls back to the baseline too.
+      - name: Post-promotion verdict (phase 2)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          start_epoch=$(date -u -d "$DEPLOY_START" +%s)
+          baseline_from=$(date -u -d "@$((start_epoch - CANARY_WINDOW_MINUTES * 60))" +%Y-%m-%dT%H:%M:%SZ)
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cargo run --quiet -p stow-admin -- deploy verdict --phase promoted \
+            --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
+            --script stow-edge \
+            --baseline-version "$BASELINE_VERSION" \
+            --candidate-version "$CANDIDATE_VERSION" \
+            --baseline-from "$baseline_from" \
+            --baseline-to "$DEPLOY_START" \
+            --candidate-from "$PROMOTE_START" \
+            --candidate-to "$now"
+
+      # Anything after `versions deploy` failing — a verdict breach in
+      # either phase, the admin build, the runner — leaves the candidate
+      # serving traffic; roll it back. `CANDIDATE_VERSION` is only set
+      # once a version exists, so failures before the upload skip this.
+      - name: Roll back to the baseline
         if: failure() && env.CANDIDATE_VERSION != ''
         working-directory: edge
         env:
@@ -238,12 +287,4 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           wrangler rollback "$BASELINE_VERSION" --config "$WRANGLER_CONFIG" \
-            --message "deploy-edge: canary verdict breach or post-deploy failure" --yes
-
-      - name: Promote the candidate to 100%
-        working-directory: edge
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@100%"
+            --message "deploy-edge: verdict breach or post-deploy failure" --yes

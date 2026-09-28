@@ -197,13 +197,26 @@ The job uploads the new Worker version without deploying it —
 `skyzen deploy --upload-only` plans `wrangler versions upload`, and the
 declared `[[secret]]` values travel in the same upload through
 `--secrets-file` — then shifts `canary_share`% of traffic onto it with
-`wrangler versions deploy`. After the window,
-`stow-admin deploy verdict` compares the canary against the version it
-would replace: worker error rate and cpu p50/p99 per `scriptVersion`
-from `workersInvocationsAdaptive`, DO cpu and rows read/written per
-request from `durableObjectsInvocationsAdaptiveGroups`. A breach — or a
-canary that served nothing — runs `wrangler rollback` and fails the job;
-a pass promotes the version to 100%.
+`wrangler versions deploy`. Promotion is gated on two verdict phases of
+`stow-admin deploy verdict`, each printing every metric's baseline and
+candidate values and exiting non-zero on a breach — which runs
+`wrangler rollback` and fails the job:
+
+- `--phase canary`, at the end of the observation window: worker error
+  rate and cpu/wall-time p50/p99 per `scriptVersion` from
+  `workersInvocationsAdaptive`, plus DO requests, errors and wall time
+  per request per `scriptVersion` from
+  `durableObjectsInvocationsAdaptiveGroups`. A canary that served
+  nothing fails closed; DO rows report `skipped` when the Scheduler
+  object stayed on the baseline (objects are assigned one version per
+  deployment config — a reassigned object is reset once, and SQLite
+  state survives).
+- `--phase promoted`, after promotion to 100% and a second window: the
+  metrics that carry no `scriptVersion` compare the post-promotion
+  window against the same baseline window — DO cpu and rows
+  read/written per DO request from `durableObjectsPeriodicGroups`, and
+  D1 rows read/written per worker request from
+  `d1AnalyticsAdaptiveGroups`. A breach here rolls back too.
 
 Required GitHub Actions secrets:
 
