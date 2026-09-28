@@ -865,27 +865,44 @@ async fn publish_and_wait(
         // serial for GitHub's secondary rate limits.
         let served: Vec<bool> = futures_util::stream::iter(slices.iter().map(|target| async {
             let rows = published_slice_rows(index, target, rustc_version).await?;
-            Ok::<_, stow_types::error::Error>(slice_serves_layer(rows.as_deref(), layer, nodes))
+            Ok::<_, stow_types::error::Error>(slice_serves_layer(
+                rows.as_deref(),
+                target,
+                layer,
+                nodes,
+            ))
         }))
         .buffered(SLICE_PULL_CONCURRENCY)
         .try_collect()
         .await?;
-        if served.iter().all(|served| *served) {
+        let waiting: Vec<&str> = slices
+            .iter()
+            .zip(&served)
+            .filter(|(_, served)| !**served)
+            .map(|(target, _)| target.as_str())
+            .collect();
+        if waiting.is_empty() {
             return Ok(());
         }
         if std::time::Instant::now() > deadline {
             return Err(stow_error!(
-                "index publish did not serve the layer within {PUBLISH_TIMEOUT_MINUTES} minutes"
+                "index publish did not serve the layer within {PUBLISH_TIMEOUT_MINUTES} minutes; \
+                 still waiting on {}",
+                waiting.join(", ")
             ));
         }
+        tracing::info!(waiting = ?waiting, "layer not yet served by its published slices");
         tokio::time::sleep(std::time::Duration::from_secs(INDEX_POLL_SECONDS)).await;
     }
 }
 
-/// Do every done node of this layer appear in `rows` at the shapes a
-/// dependent's edge requires?
+/// Does `target`'s slice (`rows`) carry every done node of this layer
+/// that lives on `target`, at the shapes a dependent's edge requires?
+/// A node on another target is that target's slice's business: a layer
+/// spans every CI target, and no single slice holds them all.
 fn slice_serves_layer(
     rows: Option<&[ArtifactIndexRow]>,
+    target: &TargetTriple,
     layer: &[String],
     nodes: &BTreeMap<String, NodeRun>,
 ) -> bool {
@@ -905,7 +922,7 @@ fn slice_serves_layer(
     }
     layer.iter().all(|id| {
         let node = nodes.get(id).expect("layer node");
-        if !node.done {
+        if !node.done || node.request.target != *target {
             return true;
         }
         let request = &node.request;
@@ -1214,6 +1231,71 @@ mod tests {
         nodes.get_mut(&other).expect("other").done = true;
         let blocked = mark_blocked(std::slice::from_ref(&other), &mut nodes, &edges);
         assert!(blocked.is_empty());
+    }
+
+    /// One published row for `request` at `shape`.
+    fn row_for(
+        request: &EnqueueRequest,
+        shape: stow_types::public_cache::UnitShape,
+    ) -> ArtifactIndexRow {
+        ArtifactIndexRow {
+            crate_name: request.crate_name.clone(),
+            version: request.version.clone(),
+            features_json: request.features_json.clone(),
+            dependency_c_metadata_json: stow_types::identity::DependencyCMetadataJson::default(),
+            c_metadata: stow_types::identity::CMetadata::parse("0123456789abcdef")
+                .expect("c_metadata"),
+            compile_key: "0123456789abcdef".repeat(4),
+            bundle_digest: format!("sha256:{}", "0".repeat(64)),
+            bundle_size: 1,
+            artifact_kind: stow_types::artifact::ArtifactKind::Rlib,
+            crate_types: vec![stow_types::artifact::RustCrateType::Rlib],
+            profile: stow_types::platform::Profile {
+                opt_level: "3".to_owned(),
+                debuginfo: 0,
+                debug_assertions: false,
+                overflow_checks: false,
+                panic: stow_types::platform::PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
+            },
+            emit: vec!["link".to_owned(), "metadata".to_owned()],
+            min_glibc: None,
+            unit_shape: Some(shape),
+        }
+    }
+
+    /// A layer spans every CI target, and each slice holds only its own
+    /// target's nodes: a slice serves the layer once it carries the done
+    /// nodes that live on it, whatever the other targets' nodes are.
+    #[test]
+    fn each_slice_serves_only_its_own_targets_nodes() {
+        const HOST: &str = "x86_64-unknown-linux-gnu";
+        const WASM: &str = "wasm32-unknown-unknown";
+        let (mut nodes, _) = build_graph(vec![
+            request("macro-dep", HOST, true, &[]),
+            request("lib", WASM, false, &[]),
+        ]);
+        for node in nodes.values_mut() {
+            node.done = true;
+        }
+        let layer: Vec<String> = nodes.keys().cloned().collect();
+        let host = TargetTriple::parse(HOST).expect("host");
+        let wasm = TargetTriple::parse(WASM).expect("wasm");
+        let rows_for = |name: &str, invocation: UnitInvocation, host_side: bool| {
+            let request = request_by_name(name, &nodes);
+            required_unit_shapes(host_side, invocation)
+                .into_iter()
+                .map(|shape| row_for(request, shape))
+                .collect::<Vec<_>>()
+        };
+        let host_rows = rows_for("macro-dep", UnitInvocation::Native, true);
+        let wasm_rows = rows_for("lib", UnitInvocation::Target, false);
+
+        assert!(slice_serves_layer(Some(&host_rows), &host, &layer, &nodes));
+        assert!(slice_serves_layer(Some(&wasm_rows), &wasm, &layer, &nodes));
+        // A slice still missing one of its own nodes does not serve.
+        assert!(!slice_serves_layer(Some(&[]), &wasm, &layer, &nodes));
+        assert!(!slice_serves_layer(None, &host, &layer, &nodes));
     }
 
     fn request_by_name<'a>(name: &str, nodes: &'a BTreeMap<String, NodeRun>) -> &'a EnqueueRequest {
