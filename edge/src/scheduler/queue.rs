@@ -2317,27 +2317,26 @@ pub async fn record_published_slice(
 }
 
 /// The scheduler schema version this build serves, stored in the
-/// database's `PRAGMA user_version`. Bump it whenever `schema.sql` or
+/// `scheduler_schema_version` singleton row — `PRAGMA user_version` is
+/// the usual carrier but the Durable Object SQL authorizer refuses it
+/// (<https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/>),
+/// so the version lives in a table. Bump it whenever `schema.sql` or
 /// any step of [`migrate_schema`] changes: a queue stamped below it runs
 /// the migration pass once and is re-stamped, and a queue stamped above
 /// it fails fast rather than being served by code older than its schema.
 const SCHEMA_VERSION: i64 = 1;
 
-/// Gate the migration pass on `PRAGMA user_version` so an up-to-date
-/// queue pays one pragma read and nothing else — the pass below costs
-/// ~1 s of DO CPU per call when it ran at the top of every queue
+/// Gate the migration pass on the stored schema version so an up-to-date
+/// queue pays one indexed row read and nothing else — the pass below
+/// costs ~1 s of DO CPU per call when it ran at the top of every queue
 /// operation (stow#432). The version is stamped only after every
 /// migration step has succeeded — the same per-statement commit
 /// discipline `migrate_queue_schema` and the column migrations already
-/// use — so a pass that dies midway leaves `user_version` behind and
+/// use — so a pass that dies midway leaves the version behind and
 /// simply re-runs: every step is idempotent, exactly as it was when the
 /// pass ran per request.
 pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
-    let version = db
-        .query("PRAGMA user_version")
-        .fetch_scalar::<i64>()
-        .await
-        .map_err(|error| format!("read scheduler schema version: {error}"))?;
+    let version = stored_schema_version(db).await?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
@@ -2348,17 +2347,39 @@ pub async fn ensure_schema(db: &DurableDb) -> Result<(), QueueError> {
         )));
     }
     migrate_schema(db).await?;
-    db.query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-        .execute()
-        .await
-        .map_err(|error| format!("stamp scheduler schema version: {error}"))?;
+    db.query(
+        "INSERT INTO scheduler_schema_version (id, version) VALUES (1, ?) \
+         ON CONFLICT(id) DO UPDATE SET version = excluded.version",
+    )
+    .bind(SCHEMA_VERSION)
+    .execute()
+    .await
+    .map_err(|error| format!("stamp scheduler schema version: {error}"))?;
     Ok(())
 }
 
-/// The full schema migration pass [`ensure_schema`] gates behind
-/// `PRAGMA user_version`. Runs unchanged on any pre-versioned
-/// (`user_version = 0`) or older-versioned queue: production queues are
-/// modern and at 0, so they take the migration branch exactly once and
+/// The stored schema version, or 0 on a queue that predates the marker
+/// table: its read fails `no such table`, and a stamp row that was never
+/// written reads the same. Both mean the migration pass has not run
+/// under this versioning scheme, so they fold into 0 — the pass is
+/// idempotent and is what creates the table (via `schema.sql`) and the
+/// row in the first place.
+async fn stored_schema_version(db: &DurableDb) -> Result<i64, QueueError> {
+    match db
+        .query("SELECT version FROM scheduler_schema_version WHERE id = 1")
+        .fetch_scalar_optional::<i64>()
+        .await
+    {
+        Ok(version) => Ok(version.unwrap_or(0)),
+        Err(error) if error.to_string().contains("no such table") => Ok(0),
+        Err(error) => Err(format!("read scheduler schema version: {error}").into()),
+    }
+}
+
+/// The full schema migration pass [`ensure_schema`] gates behind the
+/// stored schema version. Runs unchanged on any pre-versioned
+/// (unstamped) or older-versioned queue: production queues are modern
+/// and unstamped, so they take the migration branch exactly once and
 /// are stamped. No transaction exists on `DurableDb`, so every step is
 /// written to be safe to re-run after a mid-pass failure.
 async fn migrate_schema(db: &DurableDb) -> Result<(), QueueError> {
@@ -5678,36 +5699,34 @@ mod sqlite_tests {
                 .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0)
         );
 
-        let version = db
-            .query("PRAGMA user_version")
-            .fetch_scalar::<i64>()
-            .await
-            .expect("schema version");
         assert_eq!(
-            version,
+            super::stored_schema_version(&db)
+                .await
+                .expect("schema version"),
             super::SCHEMA_VERSION,
             "a migrated queue is stamped at the current schema version"
         );
     }
 
     /// A fresh database runs the migration pass and ends stamped at
-    /// `SCHEMA_VERSION` — production's `user_version = 0` queues take the
+    /// `SCHEMA_VERSION` — production's pre-versioned queues take the
     /// same path exactly once.
     #[tokio::test]
     async fn a_fresh_database_migrates_and_is_stamped() {
         let db = memory_db_raw().await.expect("raw memory db");
         super::ensure_schema(&db).await.expect("ensure_schema");
-        let version = db
-            .query("PRAGMA user_version")
-            .fetch_scalar::<i64>()
-            .await
-            .expect("schema version");
-        assert_eq!(version, super::SCHEMA_VERSION);
+        assert_eq!(
+            super::stored_schema_version(&db)
+                .await
+                .expect("schema version"),
+            super::SCHEMA_VERSION
+        );
     }
 
     /// The whole point of the version gate (stow#432): once a queue is
     /// stamped, `ensure_schema` issues exactly one statement — the
-    /// `PRAGMA user_version` read — instead of the full migration pass.
+    /// `scheduler_schema_version` read — instead of the full migration
+    /// pass.
     #[tokio::test]
     async fn a_current_queue_pays_one_version_read() {
         let (db, log) = counting_memory_db().await.expect("counting db");
@@ -5720,8 +5739,8 @@ mod sqlite_tests {
             "a current queue's schema check is the version read alone: {issued:?}"
         );
         assert!(
-            issued[0].0.contains("user_version"),
-            "the one statement is `PRAGMA user_version`: {}",
+            issued[0].0.contains("scheduler_schema_version"),
+            "the one statement reads the version row: {}",
             issued[0].0
         );
     }
@@ -5733,7 +5752,7 @@ mod sqlite_tests {
     async fn ensure_schema_refuses_a_newer_schema() {
         let db = memory_db().await.expect("memory db");
         db.query(&format!(
-            "PRAGMA user_version = {}",
+            "UPDATE scheduler_schema_version SET version = {}",
             super::SCHEMA_VERSION + 1
         ))
         .execute()
@@ -5746,6 +5765,28 @@ mod sqlite_tests {
             error.to_string().contains("newer"),
             "the error names the version skew, got: {error}"
         );
+    }
+
+    /// The host backend enforces the Durable Object authorizer's PRAGMA
+    /// rules (stow#432): `PRAGMA user_version` — the obvious carrier for
+    /// the schema version — is refused, while the documented `table_info`
+    /// the migrations rely on passes.
+    #[tokio::test]
+    async fn the_test_backend_refuses_what_the_do_authorizer_refuses() {
+        let db = memory_db().await.expect("memory db");
+        let error = db
+            .query("PRAGMA user_version")
+            .execute()
+            .await
+            .expect_err("PRAGMA user_version must fail on the host backend");
+        assert!(
+            error.to_string().contains("user_version"),
+            "the rejection names the pragma, got: {error}"
+        );
+        db.query("PRAGMA table_info(queue)")
+            .fetch_all::<super::QueueTableInfoRow>()
+            .await
+            .expect("documented pragmas still work");
     }
 
     /// The side derivation each dev-era edge takes: a dep on the family

@@ -121,8 +121,103 @@ impl DurableDbBackend for CountingBackend {
     }
 }
 
+/// The PRAGMA names the Durable Object SQL authorizer accepts — the set
+/// D1 documents as compatible, which the DO authorizer mirrors:
+/// <https://developers.cloudflare.com/d1/sql-api/sql-statements/>
+/// lists `table_list` and `table_info`, and
+/// <https://developers.cloudflare.com/d1/sql-api/foreign-keys/> adds
+/// `defer_foreign_keys`. `PRAGMA user_version` is explicitly
+/// unsupported on DO storage:
+/// <https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/>.
+/// The host backend refuses what the DO refuses so a disallowed pragma
+/// fails a host test instead of taking production down (stow#432).
+const DO_ALLOWED_PRAGMAS: &[&str] = &["defer_foreign_keys", "table_info", "table_list"];
+
+/// Refuse what the Durable Object SQL authorizer refuses: a `PRAGMA`
+/// outside [`DO_ALLOWED_PRAGMAS`], at the head of any statement in the
+/// string. String literals and `--`/`/* */` comments are skipped so a
+/// false positive cannot block a statement that merely mentions the
+/// word — and an injection mid-string cannot hide a real `PRAGMA` from
+/// the check.
+fn check_do_authorizer(sql: &str) -> Result<(), DurableDbError> {
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut statement_start = true;
+    while index < bytes.len() {
+        match bytes[index] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == quote {
+                        // A doubled quote is an escape, not the end.
+                        if bytes.get(index + 1) == Some(&quote) {
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b';' => {
+                statement_start = true;
+                index += 1;
+            }
+            byte if byte.is_ascii_whitespace() => index += 1,
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                if statement_start && sql[start..index].eq_ignore_ascii_case("pragma") {
+                    // The pragma name follows, after any whitespace.
+                    let mut cursor = index;
+                    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                        cursor += 1;
+                    }
+                    let name_start = cursor;
+                    while cursor < bytes.len()
+                        && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+                    {
+                        cursor += 1;
+                    }
+                    let name = sql[name_start..cursor].to_ascii_lowercase();
+                    if !DO_ALLOWED_PRAGMAS.contains(&name.as_str()) {
+                        return Err(backend_error(format!(
+                            "PRAGMA {name} is not supported by Durable Objects SQLite storage"
+                        )));
+                    }
+                }
+                statement_start = false;
+            }
+            _ => {
+                statement_start = false;
+                index += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl DurableDbBackend for SqliteBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        check_do_authorizer(query)?;
         let rows = bind_params(sqlx::query(query), params)
             .fetch_all(&self.pool)
             .await
@@ -143,6 +238,7 @@ impl DurableDbBackend for SqliteBackend {
         query: &str,
         params: &[DbValue],
     ) -> Result<DbExecResult, DurableDbError> {
+        check_do_authorizer(query)?;
         let result = bind_params(sqlx::query(query), params)
             .execute(&self.pool)
             .await

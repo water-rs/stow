@@ -140,6 +140,15 @@ CREATE TABLE IF NOT EXISTS github_app_token (
     expires_at TEXT NOT NULL
 );
 
+-- The schema version this queue was migrated to, kept as a singleton
+-- row. `PRAGMA user_version` would be the conventional carrier but the
+-- Durable Object SQL authorizer refuses it, so `ensure_schema` reads
+-- and stamps this row instead (see SCHEMA_VERSION in queue.rs).
+CREATE TABLE IF NOT EXISTS scheduler_schema_version (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL
+);
+
 -- Operator-flipped settings. Currently holds only `panic`, the
 -- anonymous-traffic circuit breaker: 'true'/'false', absent means off.
 CREATE TABLE IF NOT EXISTS settings (
