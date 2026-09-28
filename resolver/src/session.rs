@@ -310,7 +310,13 @@ impl Resolver {
             .to_str()
             .with_context(|| format!("shim path `{}` is not UTF-8", shim.display()))?;
         let mut gctx = GlobalContext::new(Shell::new(), cwd.to_path_buf(), self.cargo_home.clone());
-        let target_dir = Some(self.dir.path().join("target").join(host.replace('/', "_")));
+        // cargo persists the family's rustc probe facts in
+        // `<target dir>/.rustc_info.json`; the dir must exist before
+        // the context is handed it, or every resolve re-probes.
+        let target_dir = self.dir.path().join("target").join(host.replace('/', "_"));
+        std::fs::create_dir_all(&target_dir)
+            .with_context(|| format!("create target dir {}", target_dir.display()))?;
+        let target_dir = Some(target_dir);
         gctx.configure(
             0,
             false,
