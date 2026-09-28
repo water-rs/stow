@@ -202,9 +202,9 @@ target/debug/stow-admin preheat top \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
-**Top binaries** — top-N binaries with their own `Cargo.lock`
-preserved (this is the only mode that makes `cargo install --locked
-<bin>` hit cache, because c_metadata matches by construction):
+**Top binaries** — the top-N binary crates resolved as name sources through
+the crate lane (each one's bundled `Cargo.lock` is dropped like every
+lane's, so tasks land on the latest semver-compatible versions):
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \

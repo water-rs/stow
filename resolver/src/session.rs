@@ -58,8 +58,7 @@ pub struct ResolveOptions {
     /// sources only (`members_are_crates_io`).
     pub members_are_crates_io: bool,
     /// Contents of the root `Cargo.lock` the caller dropped — yanked
-    /// admission + git pins. `None` when the tree's lockfile was kept
-    /// (crate lane) or never existed.
+    /// admission + git pins. `None` when the tree never had a lockfile.
     pub dropped_lockfile: Option<String>,
 }
 
@@ -73,10 +72,6 @@ pub struct SourceResolve {
     pub has_binary: bool,
     /// Whether a workspace member publishes a library target.
     pub has_library: bool,
-    /// Whether the source shipped a `Cargo.lock` the resolve honored —
-    /// a `.crate`'s bundled lockfile; a project's committed one is
-    /// dropped before the resolve, so the flag reads `false` there.
-    pub ships_lockfile: bool,
     /// One task batch per requested target, in request order.
     pub targets: Vec<(String, Vec<EnqueueRequest>)>,
 }
@@ -405,8 +400,10 @@ impl Resolver {
     }
 
     /// The admin crate lane: resolve one published `.crate` into
-    /// per-target task batches. The tarball's bundled `Cargo.lock`
-    /// stays in place — the `cargo install --locked` resolve.
+    /// per-target task batches. The tarball's bundled `Cargo.lock` is
+    /// dropped like every other lane's — its pins survive only as
+    /// `dropped_lockfile` admission, and the resolve lands on the
+    /// latest semver-compatible versions.
     ///
     /// # Errors
     /// Fetch, manifest, resolve, or emission failures.
@@ -418,15 +415,10 @@ impl Resolver {
         rustc_version: &WireRustcVersion,
         downloads: u64,
     ) -> CargoResult<SourceResolve> {
-        let (outputs, ships_lockfile) = self
+        let outputs = self
             .resolve_crate_units(crate_name, version, &ResolveOptions::default(), targets)
             .await?;
-        Ok(Self::source_resolve(
-            ships_lockfile,
-            &outputs,
-            rustc_version,
-            downloads,
-        ))
+        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
     }
 
     /// Resolve one published `.crate` into its raw per-target unit
@@ -444,21 +436,38 @@ impl Resolver {
         version: &semver::Version,
         opts: &ResolveOptions,
         targets: &[String],
-    ) -> CargoResult<(Vec<(String, StowResolveOutput)>, bool)> {
+    ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
         let dir = self
             .dir
             .path()
             .join(format!("crate-{crate_name}-{version}"));
         std::fs::create_dir_all(&dir).context("crate dir")?;
         let package_dir = crate::fetch::fetch_crate(crate_name, version, &dir).await?;
-        let manifest = package_dir.join("Cargo.toml");
-        let ships_lockfile = package_dir.join("Cargo.lock").exists();
+        self.resolve_package_dir(&package_dir, opts, targets)
+    }
+
+    /// The post-fetch half of [`Resolver::resolve_crate_units`], split
+    /// out so a test can drive it on a fixture package dir: the
+    /// unpacked tree's bundled `Cargo.lock` is dropped exactly like
+    /// [`Resolver::resolve_git`]'s checkout — every lane resolves at
+    /// the latest semver-compatible versions, the lockfile's pins
+    /// surviving only as `dropped_lockfile` admission.
+    ///
+    /// # Errors
+    /// Manifest, resolve, or emission failures.
+    pub fn resolve_package_dir(
+        &self,
+        package_dir: &Path,
+        opts: &ResolveOptions,
+        targets: &[String],
+    ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
+        let tree = crate::fetch::prepare_project_tree(package_dir, true)?;
         let opts = ResolveOptions {
             members_are_crates_io: true,
+            dropped_lockfile: tree.dropped_lockfile,
             ..opts.clone()
         };
-        let outputs = self.resolve(&manifest, &opts, targets)?;
-        Ok((outputs, ships_lockfile))
+        self.resolve(&tree.manifest_path, &opts, targets)
     }
 
     /// The admin projects lane: fetch a git tree (any https host,
@@ -488,18 +497,12 @@ impl Resolver {
             ..ResolveOptions::default()
         };
         let outputs = self.resolve(&tree.manifest_path, &opts, targets)?;
-        Ok(Self::source_resolve(
-            false,
-            &outputs,
-            rustc_version,
-            downloads,
-        ))
+        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
     }
 
     /// `source_resolve` parity: per-target unit outputs → per-target
     /// enqueue batches, plus the lane's publish-shape flags.
     fn source_resolve(
-        ships_lockfile: bool,
         outputs: &[(String, StowResolveOutput)],
         rustc_version: &WireRustcVersion,
         downloads: u64,
@@ -524,7 +527,6 @@ impl Resolver {
         SourceResolve {
             has_binary,
             has_library,
-            ships_lockfile,
             targets: batches,
         }
     }

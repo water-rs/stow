@@ -310,14 +310,13 @@ acting unless `--yes` is given.
   resolver in-process once per CI target — every crates.io node an
   ordinary crate task at its resolved feature set, with its crates.io
   dependencies as `depends_on` edges. The binary's own package is a name
-  source, never a task. The published tarball decides the resolution —
-  a release that ships a `Cargo.lock` unpacks with it in place, so the
-  resolve lands on the pins `cargo install --locked` reproduces and
-  those pins bake into each task's `version` and `features_json`; one
-  that ships none resolves fresh, what plain `cargo install` does.
-  `preserve_lockfile` stays `false` on every derived task — on the
-  runner it names the task crate's own lockfile, not the source
-  binary's. A crate with no binary target is refused and pointed at
+  source, never a task. The published tarball's bundled `Cargo.lock` is
+  dropped before the resolve like every other lane's — the resolve
+  lands on the latest semver-compatible versions, its pins surviving
+  only as yanked/git admission. `preserve_lockfile` stays `false` on
+  every derived task — on the runner it names the task crate's own
+  lockfile, not the source binary's. A crate with no binary target is
+  refused and pointed at
   `preheat top`. `--rustc-version` defaults to the scheduler's current
   stable channel version, `--targets` to every CI target.
 - `stow-admin preheat top-binaries --rustc-version ... [--targets a,b] [--limit 100] --yes`

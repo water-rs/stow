@@ -121,7 +121,8 @@ pub fn target_strings(targets: &[TargetTriple]) -> Vec<String> {
 
 /// Resolve one published `.crate` into its task batch plus publish
 /// flags — the edge's `resolve_crate` contract. The tarball's bundled
-/// `Cargo.lock` stays in place: the `cargo install --locked` resolve.
+/// `Cargo.lock` is dropped like every other lane's — the resolve lands
+/// on the latest semver-compatible versions.
 /// Sync: callers run it on a pool worker or inside `smol::unblock`.
 pub fn resolve_crate(
     resolver: &stow_resolver::Resolver,

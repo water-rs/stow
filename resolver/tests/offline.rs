@@ -264,6 +264,55 @@ fn newer_release_beats_the_pin() {
     assert_eq!(units_named(&out, "dep")[0].version, "1.0.1");
 }
 
+/// The crate lane drops the tarball's bundled `Cargo.lock` like every
+/// other lane — the `dep` pin is admission, never preference, so the
+/// resolve lands on the index's newest compatible `1.0.1`, not the
+/// locked `1.0.0`. (The `.crate` package dir stands in for
+/// `fetch_crate`'s unpacked tree; `resolve_package_dir` is the shared
+/// post-fetch half.)
+#[test]
+fn crate_lane_drops_bundled_lockfile() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    for version in ["1.0.0", "1.0.1"] {
+        publish(
+            &reg,
+            &Fixture {
+                name: "dep",
+                version,
+                deps: vec![],
+                features: &[],
+                yanked: false,
+                proc_macro: false,
+            },
+        );
+    }
+    // An unpacked `.crate` root: manifest, sources, and the bundled
+    // lockfile pinning `dep` a patch behind the index's newest.
+    let package_dir = work.path().join("crate-root-0.0.0");
+    project(&package_dir, &json!({ "dep": "1" }));
+    std::fs::write(
+        package_dir.join("Cargo.lock"),
+        dropped_lockfile(
+            vec![lock_entry("dep", "1.0.0", CRATES_IO)],
+            &["dep 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"],
+        ),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions::default(),
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+    // (Cargo regenerates a lockfile in the tree after resolving — the
+    // bundled one's pins are what the resolve must not honor.)
+    assert_eq!(units_named(&out, "dep")[0].version, "1.0.1");
+}
+
 /// A git dep resolves to the sha the dropped lockfile pinned, not the
 /// branch's head.
 #[test]
