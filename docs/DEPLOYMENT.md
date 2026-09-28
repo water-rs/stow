@@ -196,7 +196,12 @@ secret bulk`, so the Worker and its secrets move together.
 Required GitHub Actions secrets:
 
 - `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` — Wrangler
-  authentication for the deploy itself.
+  authentication for the deploy itself. The watchdog workflow
+  (`watchdog.yml`) reuses `CLOUDFLARE_API_TOKEN` for its Cloudflare
+  calls, so on top of the Workers deploy scopes the token also needs
+  `Account Analytics:Read` (the GraphQL analytics and the
+  `analytics_engine/sql` `overloaded`-event query) and Email Sending
+  (the `POST …/email/sending/send` alert mail).
 - `STOW_APP_PRIVATE_KEY` → Worker `GITHUB_APP_PRIVATE_KEY` — the same
   GitHub App private key release-plz mints tokens from (see Releases
   below).

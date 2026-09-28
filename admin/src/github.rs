@@ -80,6 +80,112 @@ pub async fn get_text(token: &str, url: &str) -> stow_types::error::Result<Strin
         .map_err(|error| stow_error!("read {url}: {error}"))
 }
 
+/// `POST` one API path under `/repos/{REPO}/` with a JSON body and
+/// decode the JSON response.
+pub async fn post<T: serde::de::DeserializeOwned>(
+    token: &str,
+    path: &str,
+    body: &(impl serde::Serialize + Sync),
+) -> stow_types::error::Result<T> {
+    send_json(
+        token,
+        zenwave::Method::POST,
+        &format!("/repos/{REPO}/{path}"),
+        Some(body),
+    )
+    .await
+}
+
+/// `PATCH` one API path under `/repos/{REPO}/` with a JSON body and
+/// decode the JSON response.
+pub async fn patch<T: serde::de::DeserializeOwned>(
+    token: &str,
+    path: &str,
+    body: &(impl serde::Serialize + Sync),
+) -> stow_types::error::Result<T> {
+    send_json(
+        token,
+        zenwave::Method::PATCH,
+        &format!("/repos/{REPO}/{path}"),
+        Some(body),
+    )
+    .await
+}
+
+/// `PUT` an empty body to one API path under `/repos/{REPO}/` —
+/// `PUT`/`POST` endpoints that take no payload, like the workflow
+/// enable/disable routes, which answer 204.
+pub async fn put(token: &str, path: &str) -> stow_types::error::Result<()> {
+    send_empty(
+        token,
+        zenwave::Method::PUT,
+        &format!("/repos/{REPO}/{path}"),
+    )
+    .await
+}
+
+/// One `send_json`/`send_empty` implementation behind the verb helpers:
+/// an authenticated request to `api.github.com` whose 2xx body decodes
+/// as `T`.
+async fn send_json<T: serde::de::DeserializeOwned>(
+    token: &str,
+    method: zenwave::Method,
+    path: &str,
+    body: Option<&(impl serde::Serialize + Sync)>,
+) -> stow_types::error::Result<T> {
+    let url = format!("{API_BASE}{path}");
+    let mut client = zenwave::client();
+    let request = client
+        .method(method.clone(), &url)
+        .map_err(|error| stow_error!("build {method} {url}: {error}"))?
+        .header("Authorization", format!("Bearer {token}"))
+        .and_then(|request| request.header("User-Agent", USER_AGENT))
+        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
+        .and_then(|request| request.header("X-GitHub-Api-Version", "2022-11-28"))
+        .map_err(|error| stow_error!("build {method} {url}: {error}"))?;
+    let request = match body {
+        Some(body) => request
+            .json_body(body)
+            .map_err(|error| stow_error!("build {method} {url} body: {error}"))?,
+        None => request,
+    };
+    let response = request
+        .await
+        .map_err(|error| stow_error!("{method} {url}: {error}"))?
+        .error_for_status()
+        .await
+        .map_err(|error| stow_error!("{method} {url}: {error}"))?;
+    response
+        .into_json()
+        .await
+        .map_err(|error| stow_error!("read {method} {url}: {error}"))
+}
+
+/// Like [`send_json`] for endpoints whose 2xx answer carries no body —
+/// the response is status-checked and dropped.
+async fn send_empty(
+    token: &str,
+    method: zenwave::Method,
+    path: &str,
+) -> stow_types::error::Result<()> {
+    let url = format!("{API_BASE}{path}");
+    let mut client = zenwave::client();
+    let response = client
+        .method(method.clone(), &url)
+        .map_err(|error| stow_error!("build {method} {url}: {error}"))?
+        .header("Authorization", format!("Bearer {token}"))
+        .and_then(|request| request.header("User-Agent", USER_AGENT))
+        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
+        .map_err(|error| stow_error!("build {method} {url}: {error}"))?
+        .await
+        .map_err(|error| stow_error!("{method} {url}: {error}"))?
+        .error_for_status()
+        .await
+        .map_err(|error| stow_error!("{method} {url}: {error}"))?;
+    drop(response);
+    Ok(())
+}
+
 /// `DELETE` one API path under `/repos/{REPO}/`; 2xx/404 both count —
 /// deleting an entry that is already gone achieves the same end state.
 pub async fn delete(token: &str, path: &str) -> stow_types::error::Result<()> {
