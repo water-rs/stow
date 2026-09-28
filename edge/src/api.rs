@@ -30,7 +30,7 @@ use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
     admission, cache, catalog, crates_io, dependency_resolver, ghcr, index_slice, miss_logger,
-    register, scheduler, scheduler_client, stats, worker_resolver,
+    register, rust_channel, scheduler, scheduler_client, stats, worker_resolver,
 };
 
 /// Header value for `x-stow-cache: hit|miss`.
@@ -871,7 +871,7 @@ pub async fn preheat_plan(
     SchedulerCaller(_caller): SchedulerCaller,
     Json(request): Json<stow_types::api::PreheatPlanRequest>,
     db: Db,
-    State(scheduler): State<CfDurableNamespace>,
+    State(cache): State<CfCache>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
     if let Some(target) = &request.target
@@ -909,7 +909,7 @@ pub async fn preheat_plan(
         async {
             match &request.rustc_version {
                 Some(rustc_version) => Ok(rustc_version.clone()),
-                None => scheduler_client::get_stable_rustc(&scheduler)
+                None => rust_channel::stable_rustc_version(&cache, &rust_channel::CfRustChannel)
                     .await
                     .map_err(GetArtifactError::from),
             }
@@ -1271,6 +1271,7 @@ pub async fn submit_crate_request(
     Json(request): Json<CrateRequest>,
     db: Db,
     State(scheduler): State<CfDurableNamespace>,
+    State(cache): State<CfCache>,
     State(turnstile): State<CfTurnstileVerifier>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Response, GetArtifactError> {
@@ -1304,12 +1305,12 @@ pub async fn submit_crate_request(
     // and the resolve expansion below draw from the same budget.
     let pool = OutboundPool::new();
     let crates_io = crates_io::CfCratesIo::new(pool.clone());
-    // Schema-then-version stays ordered (version resolution reads the db);
-    // the scheduler's rustc lookup is independent and overlaps them.
+    // The request's version resolve (db reads) and the stable rustc
+    // resolve (a Cache API read) are independent, so they overlap.
     let (version, rustc_version) = futures_util::try_join!(
         async { resolve_request_version(&db, &crates_io, &request).await },
         async {
-            scheduler_client::get_stable_rustc(&scheduler)
+            rust_channel::stable_rustc_version(&cache, &rust_channel::CfRustChannel)
                 .await
                 .map_err(Into::into)
         },
@@ -1887,14 +1888,16 @@ fn path_target(params: &Params) -> Result<TargetTriple, GetArtifactError> {
 }
 
 /// Resolve the `{rustc_version}` path segment for the index routes:
-/// `stable` asks the scheduler (which caches the channel manifest for
-/// an hour); any other value must already be a wire rustc version.
+/// `stable` resolves in the Worker from the Cache-API-cached channel
+/// answer (`rust_channel`), so an index view never wakes the scheduler
+/// Durable Object; any other value must already be a wire rustc
+/// version.
 async fn index_rustc_version(
-    scheduler: &CfDurableNamespace,
+    cache: &CfCache,
     raw: &str,
 ) -> Result<WireRustcVersion, GetArtifactError> {
     if raw == "stable" {
-        return scheduler_client::get_stable_rustc(scheduler)
+        return rust_channel::stable_rustc_version(cache, &rust_channel::CfRustChannel)
             .await
             .map_err(GetArtifactError::from);
     }
@@ -1963,11 +1966,11 @@ async fn index_slice_layer(
 pub async fn get_index_slice_digest(
     params: Params,
     State(ghcr): State<GhcrConfig>,
-    State(scheduler): State<CfDurableNamespace>,
+    State(cache): State<CfCache>,
 ) -> Result<Response, GetArtifactError> {
     let target = path_target(&params)?;
     let rustc_version = index_rustc_version(
-        &scheduler,
+        &cache,
         params
             .get("rustc_version")
             .map_err(|_| GetArtifactError::BadRequest)?,
@@ -2121,7 +2124,6 @@ fn slice_response(
 pub async fn get_index_slice(
     params: Params,
     accept: AcceptEncoding,
-    State(scheduler): State<CfDurableNamespace>,
     streams: BundleStreams,
 ) -> Result<Response, GetArtifactError> {
     let BundleStreams {
@@ -2131,7 +2133,7 @@ pub async fn get_index_slice(
     } = streams;
     let target = path_target(&params)?;
     let rustc_version = index_rustc_version(
-        &scheduler,
+        &cache,
         params
             .get("rustc_version")
             .map_err(|_| GetArtifactError::BadRequest)?,

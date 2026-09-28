@@ -2387,7 +2387,7 @@ pub async fn record_published_slice(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Run the scheduler schema migration — the only code that may issue
 /// DDL or a backfill against the queue database. Migrations are
@@ -2468,6 +2468,16 @@ async fn migrate_schema(db: &DurableDb) -> Result<(), QueueError> {
         .into_iter()
         .map(|row| row.name)
         .collect::<BTreeSet<_>>();
+
+    // Nothing reads `rust_stable_channel` — stable resolution lives in
+    // the Worker's Cache API — so the drop is additive-safe. It runs
+    // ahead of the queue-shape branches so a database holding the
+    // retired table alone loses it too; `IF EXISTS` keeps every other
+    // pass a no-op.
+    db.query("DROP TABLE IF EXISTS rust_stable_channel")
+        .execute()
+        .await
+        .map_err(|error| format!("drop rust_stable_channel: {error}"))?;
 
     if columns.is_empty() {
         db.query(include_str!("schema.sql"))
@@ -5818,6 +5828,33 @@ mod sqlite_tests {
             super::SCHEMA_VERSION,
             "a migrated queue is stamped at the current schema version"
         );
+    }
+
+    /// A queue carrying the retired `rust_stable_channel` cache table
+    /// loses it in the same pass that stamps the version — `IF EXISTS`
+    /// makes the step idempotent, so the version bump's retry test is
+    /// also the cover for the table never having existed.
+    #[tokio::test]
+    async fn migration_drops_the_retired_channel_cache_table() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        db.query(
+            "CREATE TABLE rust_stable_channel (\
+             id INTEGER PRIMARY KEY CHECK (id = 1),\
+             version TEXT NOT NULL,\
+             fetched_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        )
+        .execute()
+        .await
+        .expect("create retired table");
+
+        super::migrate(&db).await.expect("migrate");
+
+        let columns = db
+            .query("PRAGMA table_info(rust_stable_channel)")
+            .fetch_all::<super::QueueTableInfoRow>()
+            .await
+            .expect("table_info");
+        assert!(columns.is_empty(), "the retired table is gone");
     }
 
     /// A fresh database runs the migration pass and ends stamped at

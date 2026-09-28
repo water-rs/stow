@@ -185,8 +185,9 @@ optional-dependency feature activation, `cfg(...)` target restrictions —
 and submits every uncovered node as an `EnqueueSource::HumanRequest`
 task for each of `stow_types::api::CI_TARGET_TRIPLES`. `rustc_version`
 is the current stable channel release, parsed from
-`channel-rust-stable.toml` and cached in the Durable Object's
-`rust_stable_channel` table for 60 minutes. `GET
+`channel-rust-stable.toml` and cached in the Worker's Cache API for 60
+minutes (`edge/src/rust_channel.rs`), so the lane never wakes the
+scheduler Durable Object to resolve it. `GET
 /api/v1/requests/{task_id}` returns the task's `RequestStatus` — lane,
 queue status, and its 1-based `human_lane_position` while it is still
 pending in the human lane.

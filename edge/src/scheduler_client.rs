@@ -10,7 +10,6 @@ const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/sub
 const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/status";
 const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
-const SCHEDULER_STABLE_RUSTC_URL: &str = "https://scheduler.internal/rustc/stable";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
@@ -68,25 +67,6 @@ pub async fn get_tasks_status(
     task_ids: &[String],
 ) -> Result<Vec<stow_types::api::RequestStatus>, SchedulerClientError> {
     post_json(namespace, SCHEDULER_TASKS_STATUS_URL, task_ids).await
-}
-
-/// The stable rustc version the human lane builds against, resolved (and
-/// cached) inside the scheduler Durable Object.
-pub async fn get_stable_rustc(
-    namespace: &CfDurableNamespace,
-) -> Result<stow_types::identity::WireRustcVersion, SchedulerClientError> {
-    #[derive(serde::Deserialize)]
-    struct StableRustcResponse {
-        version: String,
-    }
-
-    let parsed = get_json::<StableRustcResponse>(namespace, SCHEDULER_STABLE_RUSTC_URL).await?;
-    stow_types::identity::WireRustcVersion::parse(&parsed.version).map_err(|error| {
-        SchedulerClientError::Decode(format!(
-            "scheduler reported invalid rustc version `{}`: {error}",
-            parsed.version
-        ))
-    })
 }
 
 /// The index-publish path's report that a `(target, rustc_version)`

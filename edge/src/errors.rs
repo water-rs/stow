@@ -240,9 +240,12 @@ pub enum RustChannelError {
     /// The channel manifest could not be parsed into a rustc version.
     #[error("parse rust channel manifest: {0}")]
     Parse(String),
-    /// Durable Object cache access failed.
+    /// The Workers Cache API rejected the version read or write.
+    /// `CacheError` exists only on wasm (the cache module binds CF
+    /// types), so the variant does too.
+    #[cfg(target_arch = "wasm32")]
     #[error("rust channel cache: {0}")]
-    Cache(#[from] QueueError),
+    Cache(#[from] crate::cache::CacheError),
 }
 
 /// Errors raised when the edge talks to the scheduler Durable Object.
@@ -444,6 +447,15 @@ impl From<SchedulerClientError> for GetArtifactError {
 
 impl From<DbError> for GetArtifactError {
     fn from(error: DbError) -> Self {
+        Self::InternalWithMessage(error.to_string())
+    }
+}
+
+impl From<RustChannelError> for GetArtifactError {
+    fn from(error: RustChannelError) -> Self {
+        // Fetch and parse failures are upstream problems
+        // (static.rust-lang.org, or the Cache API) — the caller cannot
+        // fix them, so they surface as the 500 the detail string rides.
         Self::InternalWithMessage(error.to_string())
     }
 }
