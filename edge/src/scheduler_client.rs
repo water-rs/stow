@@ -16,6 +16,7 @@ const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
+const SCHEDULER_MIGRATE_URL: &str = "https://scheduler.internal/migrate";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -116,6 +117,16 @@ pub async fn set_panic(
         &stow_types::api::PanicSwitch { enabled },
     )
     .await
+}
+
+/// Run the queue schema migration — the operator endpoint behind
+/// `POST /api/v1/admin/scheduler/migrate`, which `deploy-edge.yml`
+/// calls right after `skyzen deploy`. The only code path that issues
+/// DDL on the queue database.
+pub async fn migrate_scheduler(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::SchemaMigrationReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_MIGRATE_URL, &serde_json::json!({})).await
 }
 
 /// The operator view behind `stow-admin status`.

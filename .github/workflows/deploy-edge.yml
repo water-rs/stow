@@ -8,6 +8,9 @@ on:
 
 permissions:
   contents: read
+  # Mints the run's OIDC token — the scheduler migrate step calls the
+  # admin route, which admits any workflow OIDC minted inside water-rs/stow.
+  id-token: write
 
 concurrency: deploy-edge
 
@@ -73,3 +76,17 @@ jobs:
           TURNSTILE_SECRET_KEY: ${{ secrets.STOW_TURNSTILE_SECRET_KEY }}
           STOW_STATS_SALT_SECRET: ${{ secrets.STOW_STATS_SALT_SECRET }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+      - name: Build stow-admin
+        run: cargo build --release -p stow-admin
+      # The scheduler Durable Object's database is not D1 — its migrations
+      # run through the operator route, never in request code, so the deploy
+      # drives it explicitly. `stow-admin` mints a fresh Actions OIDC JWT
+      # for the request (`id-token: write` above); the RepoWriter policy
+      # admits any workflow inside water-rs/stow. Migrations are additive —
+      # expand then contract — so the build just deployed keeps serving
+      # while they apply, and a non-2xx answer fails the deploy.
+      - name: Migrate the scheduler queue schema
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+        run: ./target/release/stow-admin scheduler migrate

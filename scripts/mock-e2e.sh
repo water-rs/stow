@@ -4,7 +4,8 @@
 #   1. build the four host binaries and generate a P-256 PKCS#8 key pair
 #   2. start stow-mock-registry (40123), the edge under `wrangler dev`
 #      (workerd, 8788; bundle built by `skyzen build`), and
-#      `stow-build serve` (40124)
+#      `stow-build serve` (40124), running the scheduler schema migration
+#      the deploy pipeline runs before the new build takes traffic
 #   3. submit one small registry crate (itoa, latest 1.0.x, host target)
 #      through `stow-admin` and wait for the scheduler to report completion
 #   4. export the signed artifact index from the edge and publish it into
@@ -320,6 +321,23 @@ SERVICE_PID=$!
 CHILD_PIDS+=("$SERVICE_PID")
 CHILD_NAMES+=(edge)
 echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
+# The scheduler Durable Object applies its schema through the operator
+# migrate route — deployment work, never request work — so the mock
+# plays the deploy pipeline: wait only for the listener, then run the
+# same `stow-admin scheduler migrate` deploy-edge.yml runs, before any
+# scheduler traffic. A status read before the migration is a 500; the
+# listener probe takes the route's response code as its ready signal.
+wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
+    http_listening "$SCHEDULER_URL/status"
+migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler migrate 2>&1)" \
+    || die "stow-admin scheduler migrate failed: $migrate_out"
+echo "[mock-e2e] $migrate_out"
+current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
+    "$REPO_ROOT/edge/src/scheduler/queue.rs")"
+[ -n "$current_schema" ] || die "could not read SCHEMA_VERSION from queue.rs"
+[ "${migrate_out##* }" = "$current_schema" ] \
+    || die "scheduler migrate reported '$migrate_out', expected schema $current_schema"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 

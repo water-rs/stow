@@ -2,18 +2,37 @@
 //! scheduler's SQL (queue schema, eligibility predicates, lease arithmetic)
 //! is exercised by unit tests instead of only the pure `plan_alarm` policy.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use skyzen_services::durable::{
     DbExecResult, DbValue, DurableDb, DurableDbBackend, DurableDbError,
 };
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _, sqlite::SqliteRow};
 
 use crate::errors::QueueError;
-use crate::scheduler::queue::ensure_schema;
+use crate::scheduler::queue;
 
 /// `DurableDbBackend` backed by a `sqlx` `SQLite` pool.
 #[derive(Debug, Clone)]
 struct SqliteBackend {
     pool: sqlx::SqlitePool,
+    /// Whether DDL and PRAGMA statements pass [`check_do_statements`].
+    /// Migrations are operations work — only the migrate path may issue
+    /// them — so the flag is on while a migration-capable database is
+    /// constructed or handed to a migration test (`memory_db_raw`), and
+    /// off on every database the request paths see. A statement that
+    /// creates, alters, drops or probes the schema from request code
+    /// fails the test instead of slipping to production, where the DO
+    /// would accept the DDL but the ops rule forbids it.
+    ddl_permitted: std::sync::Arc<AtomicBool>,
+}
+
+impl SqliteBackend {
+    /// Revert the backend to request-path mode — every constructor that
+    /// runs the migration calls this once it has applied the schema.
+    fn close_migration(&self) {
+        self.ddl_permitted.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Open a fresh in-memory queue database with the scheduler schema applied.
@@ -24,28 +43,26 @@ struct SqliteBackend {
 ///
 /// # Errors
 ///
-/// Returns `QueueError::Sql` if the pool cannot be opened or `ensure_schema`
+/// Returns `QueueError::Sql` if the pool cannot be opened or `migrate`
 /// fails.
 pub async fn memory_db() -> Result<DurableDb, QueueError> {
-    let db = memory_db_raw().await?;
-    ensure_schema(&db).await?;
+    let backend = memory_backend().await?;
+    let db = DurableDb::new(backend.clone());
+    queue::migrate(&db).await?;
+    backend.close_migration();
     Ok(db)
 }
 
-/// Open a fresh in-memory queue database with NO schema applied — the
-/// migration tests write an older schema's DDL themselves before calling
-/// `ensure_schema`.
+/// Open a fresh in-memory queue database with NO schema applied and the
+/// DDL/PRAGMA permit still on — the migrate path's fixture: migration
+/// tests write an older schema's DDL themselves before calling
+/// `queue::migrate`, the only code that may issue DDL.
 ///
 /// # Errors
 ///
 /// Returns `QueueError::Sql` if the pool cannot be opened.
 pub async fn memory_db_raw() -> Result<DurableDb, QueueError> {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .map_err(|error| QueueError::Sql(format!("open in-memory sqlite: {error}")))?;
-    Ok(DurableDb::new(SqliteBackend { pool }))
+    Ok(DurableDb::new(memory_backend().await?))
 }
 
 /// Every statement the wrapped backend ran, in order — `(sql, elapsed)`.
@@ -59,15 +76,17 @@ pub type StatementLog =
 ///
 /// # Errors
 ///
-/// Returns `QueueError::Sql` if the pool cannot be opened or
-/// `ensure_schema` fails.
+/// Returns `QueueError::Sql` if the pool cannot be opened or `migrate`
+/// fails.
 pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueError> {
     let log = StatementLog::default();
+    let inner = memory_backend().await?;
     let db = DurableDb::new(CountingBackend {
-        inner: memory_backend().await?,
+        inner: inner.clone(),
         log: log.clone(),
     });
-    ensure_schema(&db).await?;
+    queue::migrate(&db).await?;
+    inner.close_migration();
     Ok((db, log))
 }
 
@@ -77,7 +96,10 @@ async fn memory_backend() -> Result<SqliteBackend, QueueError> {
         .connect("sqlite::memory:")
         .await
         .map_err(|error| QueueError::Sql(format!("open in-memory sqlite: {error}")))?;
-    Ok(SqliteBackend { pool })
+    Ok(SqliteBackend {
+        pool,
+        ddl_permitted: std::sync::Arc::new(AtomicBool::new(true)),
+    })
 }
 
 /// A `SqliteBackend` wrapper that appends every statement and its wall
@@ -121,8 +143,130 @@ impl DurableDbBackend for CountingBackend {
     }
 }
 
+/// The PRAGMA names the Durable Object SQL authorizer accepts — the set
+/// D1 documents as compatible, which the DO authorizer mirrors:
+/// <https://developers.cloudflare.com/d1/sql-api/sql-statements/>
+/// lists `table_list` and `table_info`, and
+/// <https://developers.cloudflare.com/d1/sql-api/foreign-keys/> adds
+/// `defer_foreign_keys`. `PRAGMA user_version` is explicitly
+/// unsupported on DO storage:
+/// <https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/>.
+/// The host backend refuses what the DO refuses so a disallowed pragma
+/// fails a host test instead of taking production down (stow#432).
+const DO_ALLOWED_PRAGMAS: &[&str] = &["defer_foreign_keys", "table_info", "table_list"];
+
+/// Statement heads that mutate or probe schema: the DO accepts them,
+/// but the ops rule is that only the migrate route may issue them —
+/// request paths and the alarm never create, alter, drop, index or
+/// backfill anything (stow#432). The backend enforces it by refusing
+/// them unless `ddl_permitted` is set, so host tests exercise the same
+/// boundary production conventions draw.
+const DDL_HEADS: &[&str] = &[
+    "alter", "analyze", "attach", "create", "detach", "drop", "reindex", "vacuum",
+];
+
+/// Gate one statement string on the two boundaries the host backend
+/// stands in for: the DO authorizer's pragma allowlist
+/// ([`DO_ALLOWED_PRAGMAS`], applied even inside the migrate path — the
+/// real DO authorizer checks the migrate handler's statements too) and
+/// the ops rule that only migration code may issue DDL or pragmas
+/// (`ddl_permitted`, set only while `queue::migrate` is reachable).
+/// Statement heads are read after `;`; string literals and
+/// `--`/`/* */` comments are skipped so a false positive cannot block a
+/// statement that merely mentions the word — and an injection
+/// mid-string cannot hide a real head from the check.
+fn check_do_statements(sql: &str, ddl_permitted: bool) -> Result<(), DurableDbError> {
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut statement_start = true;
+    while index < bytes.len() {
+        match bytes[index] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == quote {
+                        // A doubled quote is an escape, not the end.
+                        if bytes.get(index + 1) == Some(&quote) {
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b';' => {
+                statement_start = true;
+                index += 1;
+            }
+            byte if byte.is_ascii_whitespace() => index += 1,
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                if statement_start {
+                    let head = sql[start..index].to_ascii_lowercase();
+                    if head == "pragma" {
+                        // The pragma name follows, after any whitespace.
+                        let mut cursor = index;
+                        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                            cursor += 1;
+                        }
+                        let name_start = cursor;
+                        while cursor < bytes.len()
+                            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+                        {
+                            cursor += 1;
+                        }
+                        let name = sql[name_start..cursor].to_ascii_lowercase();
+                        if !ddl_permitted {
+                            return Err(backend_error(format!(
+                                "PRAGMA {name} outside the scheduler migrate route"
+                            )));
+                        }
+                        if !DO_ALLOWED_PRAGMAS.contains(&name.as_str()) {
+                            return Err(backend_error(format!(
+                                "PRAGMA {name} is not supported by Durable Objects SQLite storage"
+                            )));
+                        }
+                    } else if !ddl_permitted && DDL_HEADS.contains(&head.as_str()) {
+                        return Err(backend_error(format!(
+                            "{head} outside the scheduler migrate route — request code \
+                             and the alarm never issue DDL"
+                        )));
+                    }
+                }
+                statement_start = false;
+            }
+            _ => {
+                statement_start = false;
+                index += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl DurableDbBackend for SqliteBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
         let rows = bind_params(sqlx::query(query), params)
             .fetch_all(&self.pool)
             .await
@@ -143,6 +287,7 @@ impl DurableDbBackend for SqliteBackend {
         query: &str,
         params: &[DbValue],
     ) -> Result<DbExecResult, DurableDbError> {
+        check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
         let result = bind_params(sqlx::query(query), params)
             .execute(&self.pool)
             .await
