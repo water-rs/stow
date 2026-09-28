@@ -864,7 +864,6 @@ fn resolve_response(
     stow_types::api::AdminResolveResponse {
         has_binary: resolved.has_binary,
         has_library: resolved.has_library,
-        ships_lockfile: resolved.ships_lockfile,
         targets: resolved
             .targets
             .into_iter()

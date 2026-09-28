@@ -46,12 +46,11 @@ pub enum PreheatCommand {
     /// runs once per CI target — every crates.io node an ordinary crate
     /// task at its resolved feature set, with its crates.io deps as
     /// `depends_on`. The binary's own package is a name source, never a
-    /// task. A release that ships `Cargo.lock` unpacks with it in
-    /// place, so the resolve lands on the pins `cargo install --locked`
-    /// reproduces — the pins bake into each task's `version` and
-    /// `features_json`, and `preserve_lockfile` stays `false`: on the
-    /// runner it names the task crate's own lockfile, not the source
-    /// binary's.
+    /// task. A release that ships `Cargo.lock` has it dropped before
+    /// the resolve like every other lane's — the resolve lands on the
+    /// latest semver-compatible versions, and `preserve_lockfile` stays
+    /// `false`: on the runner it names the task crate's own lockfile,
+    /// not the source binary's.
     Binary(BinaryArgs),
     /// The download-ranked binary lane: resolve each of the top-N
     /// most-downloaded *binary* crates exactly the way `preheat binary`
@@ -375,7 +374,6 @@ async fn top(
             tracing::info!(
                 krate = %job.name,
                 version = %job.version,
-                ships_lockfile = resolved.ships_lockfile,
                 "ranked crate ships no library — resolved as a name source"
             );
         }
@@ -418,16 +416,15 @@ fn flatten_source(resolved: stow_resolver::SourceResolve) -> Vec<EnqueueRequest>
 /// `preheat binary <crate>[@version]` — cache the whole dependency
 /// graph of one named crates.io binary.
 ///
-/// The published tarball decides the resolution rather than a guess: a
-/// release that ships a `Cargo.lock` unpacks with it in place, so
-/// a resolve lands on the pins `cargo install --locked`
-/// reproduces and those pins bake into each task's `version` and
-/// `features_json`; one that ships none resolves fresh, which is what
-/// plain `cargo install` does for it. `preserve_lockfile` stays `false`
-/// on every derived task — on the runner it names the task crate's own
-/// lockfile, not the source binary's. The binary's own package is a
-/// path member in this resolve — a name source, never a task
-/// (`ArtifactKind` has no `Bin`).
+/// The published tarball decides the resolution rather than a guess,
+/// but its bundled `Cargo.lock` is dropped like every other lane's —
+/// the resolve lands on the latest semver-compatible versions. The
+/// dropped lockfile's registry pins still admit the yanked versions
+/// they name. `preserve_lockfile` stays `false` on every derived task
+/// — on the runner it names the task crate's own lockfile, not the
+/// source binary's. The binary's own package is a path member in this
+/// resolve — a name source, never a task (`ArtifactKind` has no
+/// `Bin`).
 async fn binary(
     edge: &Edge,
     crates_io: &mut crates_io::CratesIo,
@@ -453,14 +450,13 @@ async fn binary(
         &rustc_version,
     );
     let requests = match resolved.map_err(|error| stow_error!("{error}"))? {
-        BinaryResolve::Tasks { tasks, published } => {
+        BinaryResolve::Tasks { tasks } => {
             tracing::info!(
                 %crate_name,
                 version = %release.version,
                 targets = targets.len(),
                 tasks = tasks.len(),
                 %rustc_version,
-                ships_lockfile = published.ships_lockfile,
                 "planned named-binary preheat tasks"
             );
             tasks
@@ -487,19 +483,6 @@ fn typed_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<
         .collect()
 }
 
-/// What the published `.crate` says about a release — the flags the
-/// edge's crate resolve reports back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PublishedCrate {
-    /// The package declares or auto-discovers at least one `[[bin]]`.
-    has_binary: bool,
-    /// The package declares a `[lib]` or auto-discovers `src/lib.rs`.
-    has_library: bool,
-    /// The package ships the `Cargo.lock` `cargo install --locked`
-    /// resolves against.
-    ships_lockfile: bool,
-}
-
 /// What resolving one binary crate produced: the task batch its
 /// dependency graph yields, or the answer that this lane does not
 /// apply — the crate ships no binary target.
@@ -508,8 +491,6 @@ enum BinaryResolve {
     Tasks {
         /// Every enqueue request the resolve produced.
         tasks: Vec<EnqueueRequest>,
-        /// What the published tarball declared, kept for the log line.
-        published: PublishedCrate,
     },
     /// The crate has no `[[bin]]` — a name source this lane skips.
     NoBinary,
@@ -521,13 +502,14 @@ enum BinaryResolve {
 /// `depends_on`. The binary's own package is a path member in the
 /// resolve — a name source, never a task.
 ///
-/// The lockfile treatment is the lane's existing one: a release that
-/// ships a `Cargo.lock` unpacks with it in place, so the resolve lands
-/// on the pins `cargo install --locked` reproduces and those pins bake
-/// into each task's `version` and `features_json`; one that ships none
-/// resolves fresh, the plain-`cargo install` resolve. `preserve_lockfile`
-/// stays `false` on every derived task — on the runner it names the
-/// task crate's own lockfile, not the source binary's.
+/// The lockfile treatment is every lane's one: a bundled `Cargo.lock`
+/// is dropped before the resolve, so the resolve lands on the latest
+/// semver-compatible versions and those land in each task's `version`
+/// and `features_json`; the dropped pins survive only as the
+/// `dropped_lockfile` admission (yanked versions, git shas).
+/// `preserve_lockfile` stays `false` on every derived task — on the
+/// runner it names the task crate's own lockfile, not the source
+/// binary's.
 fn resolve_binary_crate(
     resolver: &stow_resolver::Resolver,
     crate_name: &str,
@@ -544,17 +526,11 @@ fn resolve_binary_crate(
         rustc_version,
         downloads,
     )?;
-    let published = PublishedCrate {
-        has_binary: source.has_binary,
-        has_library: source.has_library,
-        ships_lockfile: source.ships_lockfile,
-    };
     if !source.has_binary {
         return Ok(BinaryResolve::NoBinary);
     }
     Ok(BinaryResolve::Tasks {
         tasks: flatten_source(source),
-        published,
     })
 }
 
@@ -725,7 +701,7 @@ fn resolve_binaries(
     };
     for (job, slot) in jobs.iter().zip(slots) {
         match slot.expect("the pool produces one result per job") {
-            Ok(BinaryResolve::Tasks { tasks, .. }) => {
+            Ok(BinaryResolve::Tasks { tasks }) => {
                 tracing::info!(binary = %job.name, tasks = tasks.len(), "resolved");
                 plan.per_binary.push(BinaryContribution {
                     binary: job.name.clone(),
@@ -994,7 +970,7 @@ async fn plan(
     let resolver = pool.shared();
     let version = release.version.as_semver().clone();
     let crate_name_string = crate_name.to_string();
-    let (outputs, _ships_lockfile) = smol::block_on(resolver.resolve_crate_units(
+    let outputs = smol::block_on(resolver.resolve_crate_units(
         &crate_name_string,
         &version,
         &stow_resolver::ResolveOptions {

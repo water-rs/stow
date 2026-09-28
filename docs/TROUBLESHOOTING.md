@@ -59,7 +59,7 @@ slowdown:
      upgrades, which move direct deps onto covered versions (`stow check
      --silent-compatible-upgrades` applies them), and the request form
      on https://stow.waterui.dev, which asks for a crate's closure to be
-     prebuilt. (Operators seed lockfile-preserving builds with
+     prebuilt. (Operators seed the binary-derived pool with
      `stow-admin preheat top-binaries`; see
      [`prebuild-pool-algorithm.md`](prebuild-pool-algorithm.md).)
    - The index has zero rows for your deps. Run `stow predict` to

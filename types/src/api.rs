@@ -143,11 +143,10 @@ pub struct BuildTaskPayload {
     /// Stable rustc version (e.g. `"1.83.0"`).
     pub rustc_version: WireRustcVersion,
     /// When true, the trusted build runner keeps the bundled `Cargo.lock` from
-    /// the crates.io tarball instead of removing it. Used by the top-binaries
-    /// preheat (`stow-admin preheat top-binaries`) so transitive `c_metadata`
-    /// matches what `cargo install --locked <bin>` would produce on the user's
-    /// machine. Defaults to false to preserve the historical "build against
-    /// latest semver-compatible deps" behavior for library preheats.
+    /// the crates.io tarball instead of removing it — an operator escape
+    /// hatch on hand-submitted tasks; every resolver-emitted task carries
+    /// false. Defaults to false to preserve the "build against
+    /// latest semver-compatible deps" behavior.
     #[serde(default)]
     pub preserve_lockfile: bool,
     /// Whether the task builds the crate as a host-side unit — the shape a
@@ -1609,9 +1608,9 @@ pub struct PreheatPlanTarget {
 /// Request body for `POST /api/v1/admin/resolve/crate`.
 ///
 /// Resolves one published `.crate` into the task batch its crates.io
-/// dependency graph produces. The tarball's bundled `Cargo.lock` stays
-/// in place, so the resolve lands on the pins `cargo install --locked`
-/// would use.
+/// dependency graph produces. The tarball's bundled `Cargo.lock` is
+/// dropped before the resolve, so the resolve lands on the latest
+/// semver-compatible versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AdminResolveCrateRequest {
     /// Crate name on crates.io.
@@ -1656,9 +1655,6 @@ pub struct AdminResolveResponse {
     pub has_binary: bool,
     /// Whether the resolved root package ships a library target.
     pub has_library: bool,
-    /// Whether the resolved source shipped a `Cargo.lock` the resolve
-    /// honored — kept for the lane's log line.
-    pub ships_lockfile: bool,
     /// One task batch per requested target, in request order.
     pub targets: Vec<AdminResolveTarget>,
 }

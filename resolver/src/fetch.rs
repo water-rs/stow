@@ -1,8 +1,7 @@
 //! Fetch a resolve input into a real directory on disk.
 //!
-//! The `.crate` tarball lane (`resolve_crate` parity — the bundled
-//! `Cargo.lock` stays in place) and the git lane (a tree fetched
-//! without cloning history at any https git host,
+//! The `.crate` tarball lane (`resolve_crate` parity) and the git lane
+//! (a tree fetched without cloning history at any https git host,
 //! `resolve_github_project` generalized per #417). Everything lands
 //! under a caller-owned directory; the resolve reads the tree with
 //! cargo's own manifest/config walk.
