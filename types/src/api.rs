@@ -495,19 +495,6 @@ pub struct ResolvedDependencyGraphEntry {
     pub dependencies: Vec<ResolvedDependencyGraphDependency>,
 }
 
-/// The anonymous-traffic circuit breaker ("panic switch").
-///
-/// Held by the scheduler Durable Object. `enabled: true` makes every
-/// anonymous edge route answer `503 Service Unavailable` while the trusted
-/// `/api/v1/admin/*` and `/api/v1/scheduler/*` routes keep working. Wire
-/// shape of `GET`/`POST /api/v1/admin/panic` and of the scheduler object's
-/// `/panic` routes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PanicSwitch {
-    /// Whether anonymous traffic is being shed.
-    pub enabled: bool,
-}
-
 /// Scheduler DO queue status for monitoring.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerStatus {
@@ -1010,8 +997,6 @@ pub struct AdminStatus {
     pub in_flight: Vec<AdminInFlight>,
     /// Per-target completion tallies over the trailing 24 hours.
     pub targets: Vec<AdminTargetStats>,
-    /// Whether the anonymous-traffic circuit breaker is engaged.
-    pub panic_enabled: bool,
 }
 
 /// Response of `POST /api/v1/scheduler/tasks/submit` — what a request batch
@@ -1348,4 +1333,32 @@ pub struct UsageStatEntry {
     pub name: String,
     /// Sample-scaled hit count for the bucket.
     pub hits: u64,
+}
+
+/// The public routes whose handlers reach the scheduler Durable Object —
+/// the "scheduler lanes".
+///
+/// The edge router mounts these paths verbatim and the zone's
+/// `stow maintenance: scheduler lanes` WAF rule turns the same list into
+/// `starts_with` clauses (stow#453), so this is the one place a lane is
+/// added or removed. The index routes are deliberately absent: they
+/// reach the DO only to resolve `rustc_version=stable`, and blocking
+/// them would shed the bundle byte path the lanes scope exists to keep
+/// serving.
+pub mod scheduler_lanes {
+    /// `POST /api/v1/admissions` — miss-admission minting drains to the
+    /// scheduler's enqueue path.
+    pub const ADMISSIONS: &str = "/api/v1/admissions";
+    /// `POST /api/v1/enqueue` — admission redemption enqueues on the DO.
+    pub const ENQUEUE: &str = "/api/v1/enqueue";
+    /// `POST /api/v1/requests` — the human request lane submits to the DO.
+    pub const REQUESTS: &str = "/api/v1/requests";
+    /// `GET /api/v1/requests/{task_id}` — the JSON status read hits the DO.
+    pub const REQUEST: &str = "/api/v1/requests/{task_id}";
+    /// `GET /requests/{task_id}` — the request-status page reads the DO.
+    pub const REQUEST_PAGE: &str = "/requests/{task_id}";
+
+    /// Every scheduler-lane path — the router's mount list and the WAF
+    /// rule's block list are both built from this.
+    pub const ALL: &[&str] = &[ADMISSIONS, ENQUEUE, REQUESTS, REQUEST, REQUEST_PAGE];
 }

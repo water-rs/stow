@@ -140,8 +140,9 @@ CREATE TABLE IF NOT EXISTS github_app_token (
     expires_at TEXT NOT NULL
 );
 
--- Operator-flipped settings. Currently holds only `panic`, the
--- anonymous-traffic circuit breaker: 'true'/'false', absent means off.
+-- Operator-flipped settings, a shared key/value table. Currently
+-- unused by the running code (the `panic` flag moved out to the zone's
+-- WAF maintenance rules, stow#453); kept so future flags have a home.
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

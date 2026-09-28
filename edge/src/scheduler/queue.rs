@@ -1606,41 +1606,6 @@ pub async fn store_github_app_token(
     Ok(())
 }
 
-/// Read the anonymous-traffic circuit breaker from the `settings` table.
-/// An absent row means off; any stored value other than 'true'/'false'
-/// violates the schema's contract and is an invariant error rather than a
-/// guess.
-pub async fn panic_enabled(db: &DurableDb) -> Result<bool, QueueError> {
-    ensure_schema(db).await?;
-    let value = db
-        .query("SELECT value FROM settings WHERE key = 'panic'")
-        .fetch_scalar_optional::<String>()
-        .await
-        .map_err(|error| format!("read panic setting: {error}"))?;
-    match value.as_deref() {
-        Some("true") => Ok(true),
-        // An absent row, like a stored 'false', means off.
-        None | Some("false") => Ok(false),
-        Some(other) => Err(QueueError::Invariant(format!(
-            "settings row `panic` holds unexpected value `{other}`"
-        ))),
-    }
-}
-
-/// Write the anonymous-traffic circuit breaker into the `settings` table.
-pub async fn set_panic(db: &DurableDb, enabled: bool) -> Result<(), QueueError> {
-    ensure_schema(db).await?;
-    db.query(
-        "INSERT INTO settings (key, value) VALUES ('panic', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(if enabled { "true" } else { "false" })
-    .execute()
-    .await
-    .map_err(|error| format!("write panic setting: {error}"))?;
-    Ok(())
-}
-
 // ===== Admin operations (`stow-admin` through the DO's `/tasks*` routes) =====
 
 /// Row cap for admin queue listings and the mutation preview the CLI
@@ -1883,7 +1848,7 @@ pub async fn apply_mutation(
 
 /// Operator view of the whole queue for `GET /admin/status`: lane depths,
 /// the oldest pending row's age, the in-flight set, per-target outcome
-/// tallies over the trailing 24 hours, and the panic flag.
+/// tallies over the trailing 24 hours.
 pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
     ensure_schema(db).await?;
     let queue_status = status(db).await?;
@@ -1955,7 +1920,6 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
         oldest_pending_seconds,
         in_flight,
         targets,
-        panic_enabled: panic_enabled(db).await?,
     })
 }
 
@@ -3822,19 +3786,6 @@ mod sqlite_tests {
     }
 
     #[tokio::test]
-    async fn panic_flag_round_trips_and_defaults_off() {
-        let db = memory_db().await.expect("memory db");
-        assert!(
-            !super::panic_enabled(&db).await.expect("panic_enabled"),
-            "panic flag defaults to off"
-        );
-        super::set_panic(&db, true).await.expect("set panic on");
-        assert!(super::panic_enabled(&db).await.expect("panic_enabled"));
-        super::set_panic(&db, false).await.expect("set panic off");
-        assert!(!super::panic_enabled(&db).await.expect("panic_enabled"));
-    }
-
-    #[tokio::test]
     async fn a_ci_target_still_enters_the_queue() {
         let db = memory_db().await.expect("memory db");
 
@@ -5598,7 +5549,6 @@ mod sqlite_tests {
         assert_eq!(status.pending_miss, 1);
         assert_eq!(status.pending_human, 0);
         assert!(status.oldest_pending_seconds.is_some());
-        assert!(!status.panic_enabled);
         assert_eq!(status.in_flight.len(), 1);
         let in_flight = &status.in_flight[0];
         assert_eq!(in_flight.task_id, task_id_on("miss-b", TARGET));

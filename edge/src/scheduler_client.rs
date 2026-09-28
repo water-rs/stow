@@ -12,7 +12,6 @@ const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_STABLE_RUSTC_URL: &str = "https://scheduler.internal/rustc/stable";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
-const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
@@ -96,26 +95,6 @@ pub async fn record_published_index(
     slice: &stow_types::api::PublishedSlice,
 ) -> Result<(), SchedulerClientError> {
     send_json(namespace, SCHEDULER_PUBLISHED_INDEX_URL, slice).await
-}
-
-/// The anonymous-traffic circuit breaker's current state.
-pub async fn get_panic(
-    namespace: &CfDurableNamespace,
-) -> Result<stow_types::api::PanicSwitch, SchedulerClientError> {
-    get_json(namespace, SCHEDULER_PANIC_URL).await
-}
-
-/// Flip the circuit breaker; the object answers the value it stored.
-pub async fn set_panic(
-    namespace: &CfDurableNamespace,
-    enabled: bool,
-) -> Result<stow_types::api::PanicSwitch, SchedulerClientError> {
-    post_json(
-        namespace,
-        SCHEDULER_PANIC_URL,
-        &stow_types::api::PanicSwitch { enabled },
-    )
-    .await
 }
 
 /// The operator view behind `stow-admin status`.

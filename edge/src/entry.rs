@@ -10,9 +10,7 @@ use skyzen_services::Db;
 
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
-use crate::{
-    admission, api, env_binding, ghcr, github_auth, panic, runtime_settings, scheduler, site,
-};
+use crate::{admission, api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site};
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
@@ -93,17 +91,11 @@ fn worker(env: &wasm::Env) -> Router {
         turnstile_site_key: env_binding::required_string(env, TURNSTILE_SITE_KEY_BINDING),
     };
 
-    // One gate shared by every anonymous node: while the scheduler-held
-    // panic flag is on, each of these sheds with 503 + Retry-After before
-    // its handler runs. The trusted `/api/v1/admin/*` and
-    // `/api/v1/scheduler/*` nodes never carry it.
-    let panic_gate = panic::PanicGate::new(scheduler.clone(), cache.clone());
-    // The trusted nodes' counterpart: when the GitHub trust check
-    // upstream is rate-limited, this renders the 503 with the
-    // `Retry-After` GitHub asked for.
+    // When the GitHub trust check upstream is rate-limited, this renders
+    // the 503 with the `Retry-After` GitHub asked for.
     let trust_gate = github_auth::TrustRateLimitGate;
 
-    let mut nodes = anonymous_nodes(&panic_gate);
+    let mut nodes = anonymous_nodes();
     nodes.extend(trusted_nodes(&trust_gate));
 
     Route::new(nodes)
@@ -142,9 +134,6 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/index/{target}/{rustc_version}"
                     .at(api::list_artifact_index)
                     .post(api::record_published_index),
-                "/panic"
-                    .at(api::get_panic_switch)
-                    .post(api::set_panic_switch),
                 "/preheat/plan".post(api::preheat_plan),
                 "/queue".at(api::admin_queue_list),
                 "/queue/retry".post(api::admin_queue_retry),
@@ -183,16 +172,20 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
 
 /// Every route an unauthenticated caller can reach — artifact byte reads,
 /// catalog search, miss-admission minting and enqueue redemption, the
-/// human request lane,
-/// and the site pages — each wrapped in `gate` so the panic switch sheds
-/// them all from one place.
-fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
+/// human request lane, and the site pages. The anonymous-traffic breaker
+/// is the zone's `stow maintenance: anonymous` WAF rule (`stow-admin
+/// maintenance`), not a gate here — blocked requests never invoke the
+/// Worker. The `scheduler_lanes` mounts share their path constants with
+/// that rule's `scheduler lanes` scope, so the rule and the router can
+/// never disagree on which lanes reach the Durable Object.
+fn anonymous_nodes() -> Vec<RouteNode> {
+    use stow_types::api::scheduler_lanes as lanes;
     vec![
         "/".at(site::index),
         "/install.sh".at(site::install_sh),
         "/install.ps1".at(site::install_ps1),
         "/stats".at(site::stats_page),
-        "/requests/{task_id}".at(site::request_status),
+        lanes::REQUEST_PAGE.at(site::request_status),
         "/api/v1/artifacts".route((
             "/{target}/{rustc_version}/{c_metadata}".at(api::get_artifact),
             "/{target}/{rustc_version}/{c_metadata}".endpoint(
@@ -209,13 +202,10 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
             "/{target}/{rustc_version}".at(api::get_index_slice_digest),
             "/{target}/{rustc_version}/{digest}".at(api::get_index_slice),
         )),
-        "/api/v1/admissions".post(api::mint_miss_admissions),
+        lanes::ADMISSIONS.post(api::mint_miss_admissions),
         "/api/v1/stats".at(api::usage_stats),
-        "/api/v1/enqueue".post(api::enqueue_admitted_task),
-        "/api/v1/requests".post(api::submit_crate_request),
-        "/api/v1/requests/{task_id}".at(api::crate_request_status),
+        lanes::ENQUEUE.post(api::enqueue_admitted_task),
+        lanes::REQUESTS.post(api::submit_crate_request),
+        lanes::REQUEST.at(api::crate_request_status),
     ]
-    .into_iter()
-    .map(|node| node.with(gate.clone()))
-    .collect()
 }

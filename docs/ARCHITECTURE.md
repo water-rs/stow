@@ -350,7 +350,7 @@ Four layers, and one of them is deliberately outside this repository:
    declare. A client cannot mint identities from arbitrary strings, so
    every task it can create is a legitimate one that will serve real
    users.
-4. **The anonymous-traffic circuit breaker** (`stow-admin panic`).
+4. **The zone maintenance rules** (`stow-admin maintenance`).
 
 Proof-of-work is a cost speed bump on top of these, not one of them. It
 cannot be sized to stop abuse: the legitimate client and the attacker pay
@@ -644,10 +644,8 @@ short-circuit before deserialization.
 | HEAD `/api/v1/artifacts/{target}/{rustc_version}/{c_metadata}` | none | — | 200 / 404 + `content-length` (the bundle's size) | Existence probe |
 | POST `/api/v1/admin/artifacts/register` | Bearer: `build-crate.yml` OIDC or repo push user | `RegisterArtifactsRequest` | `OkResponse` | Trusted CI registers built artifacts; the OIDC caller's `task_id` binds the write to the dispatched task's target/rustc and dependency closure |
 | GET `/api/v1/admin/artifacts/unbundled?limit=N` | Bearer: `build-crate.yml` OIDC or repo push user | — | `Vec<ArtifactRecord>` | Rows without a published bundle, for `stow-build backfill-bundles` |
-| GET `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | — | `PanicSwitch` | Read the anonymous-traffic circuit breaker |
-| POST `/api/v1/admin/panic` | Bearer: repo-workflow OIDC or push user | `PanicSwitch` | `PanicSwitch` | Flip the circuit breaker — anonymous routes shed with 503 + `Retry-After` |
 | GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
-| GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes, panic flag — `stow-admin status` |
+| GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: repo-workflow OIDC or push user | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
@@ -681,18 +679,25 @@ write endpoints (`admin/artifacts/register`, `scheduler/tasks/submit`,
 `scheduler/complete`) are inside the limited prefix, which is fine at
 CI's request rate: a build makes one register call per task chunk.
 
-When even that is too much — Cloudflare has no spend cap — the panic
-switch sheds anonymous traffic outright. `POST /api/v1/admin/panic`
-(`stow-admin panic on`) writes a flag into the scheduler Durable Object's
-`settings` table, and a middleware on the anonymous route group answers
-every such request `503 Service Unavailable` with `Retry-After: 300`
-before its handler runs. The flag is read through the Cache API under a
-fixed key (`s-maxage=60`), so a per-request read costs one local cache
-probe and a flip propagates within 60 s — immediately in the colo
-that wrote it, whose cache entry is deleted. The trusted
-`/api/v1/admin/*` and `/api/v1/scheduler/*` routes are never gated, so CI
-keeps registering and completing builds and the operator can always flip
-the switch back off.
+When even that is too much — Cloudflare has no spend cap — the zone's
+maintenance rules stop traffic outright. Three WAF custom rules live on
+the `waterui.dev` zone's `http_request_firewall_custom` phase (created
+disabled by `stow-admin maintenance ensure` in `deploy-edge.yml`,
+matched by description, so a redeploy never stomps a live toggle):
+`stow maintenance: anonymous` blocks every route on the edge host
+except the trusted `/api/v1/admin/*` and `/api/v1/scheduler/*`
+prefixes; `stow maintenance: scheduler lanes` blocks exactly the public
+routes whose handlers reach the scheduler Durable Object
+(`scheduler_lanes` in `types/src/api.rs`) — the partial reopening where
+bundle bytes keep serving; and `stow maintenance: all` blocks the
+whole hostname. `stow-admin maintenance on --scope anonymous` flips the
+rule's `enabled` flag through the Rulesets API; the watchdog (#450)
+trips by enabling `anonymous`. Blocked requests are answered in the
+security phase — they never invoke the Worker and never reach the
+Durable Object, so the shed costs nothing and a broken edge cannot
+silence the breaker. The trusted prefixes stay up under `anonymous`, so
+CI keeps registering and completing builds and the operator can always
+flip the rule back off.
 
 ## Tunables (Cloudflare bindings)
 

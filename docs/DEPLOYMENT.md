@@ -78,8 +78,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    local compile mid-build. That path is the cheap one — a Cache API hit
    costs one Worker request and no D1 or Durable Object work — and its
    volume is bounded by the DDoS managed ruleset, the billing
-   notifications below, and the edge panic switch rather than by this
-   rule. The Free plan allows exactly one rate-limiting rule, which is
+   notifications below, and the zone maintenance rules rather than by
+   this rule. The Free plan allows exactly one rate-limiting rule, which is
    why the split is an exclusion inside a single expression rather than
    a second, looser rule on artifacts.
 
@@ -173,6 +173,38 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `/api/v1/artifacts/`, 60 requests per 10 seconds per IP, block for
    10 seconds.
 
+6. **Maintenance rules (the breaker, stow#453).** Three WAF custom
+   rules live on the zone's `http_request_firewall_custom` phase and are
+   the anonymous-traffic breaker — a blocked request never invokes the
+   Worker, so the shed costs nothing and a broken edge cannot keep it
+   open:
+
+   - `stow maintenance: anonymous` —
+     `http.host eq "<edge host>" and not starts_with(http.request.uri.path, "/api/v1/admin") and not starts_with(http.request.uri.path, "/api/v1/scheduler")`,
+     action `block`. Sheds every public route while the trusted CI and
+     admin lanes keep working.
+   - `stow maintenance: scheduler lanes` —
+     `http.host eq "<edge host>" and (starts_with(http.request.uri.path, "<lane>") or …)`,
+     action `block`, over exactly the public routes whose handlers reach
+     the scheduler Durable Object (`scheduler_lanes` in
+     `types/src/api.rs`). The bundle byte path and catalog reads keep
+     serving — the partial reopening.
+   - `stow maintenance: all` — `http.host eq "<edge host>"`,
+     action `block`. The whole site down at zero usage.
+
+   `<edge host>` is the host of `STOW_EDGE_URL` — the rules follow
+   whichever edge they were ensured against. `deploy-edge.yml` runs
+   `stow-admin maintenance ensure --yes` with the deployed commit's
+   signed toolchain `stow-admin` (#431): it creates all three rules
+   **disabled** and the `http_request_firewall_custom` entrypoint itself
+   when the phase has never had a ruleset (the API answers error 10003),
+   matching rules by `description`, so they exist before anyone needs
+   them and a redeploy never stomps a live toggle. Toggle by hand:
+   `stow-admin maintenance on|off --scope anonymous|lanes|all --yes`,
+   with `CLOUDFLARE_API_TOKEN` (needs *Zone WAF → Edit* on
+   `waterui.dev`), `CF_ZONE_ID` and `STOW_EDGE_URL` exported;
+   `stow-admin maintenance status` prints the current state.
+
 ### Billing notifications
 
 The zone rule bounds request volume; usage-based billing notifications
@@ -200,8 +232,11 @@ Required GitHub Actions secrets:
   (`watchdog.yml`) reuses `CLOUDFLARE_API_TOKEN` for its Cloudflare
   calls, so on top of the Workers deploy scopes the token also needs
   `Account Analytics:Read` (the GraphQL analytics and the
-  `analytics_engine/sql` `overloaded`-event query) and Email Sending
-  (the `POST …/email/sending/send` alert mail).
+  `analytics_engine/sql` `overloaded`-event query), Email Sending
+  (the `POST …/email/sending/send` alert mail), and `Zone WAF:Edit` on
+  `waterui.dev` (the maintenance rules below and the watchdog's trip).
+  The zone's id goes in the `CF_ZONE_ID` repository variable — the
+  WAF step below and `stow-admin maintenance`/`watchdog` read it.
 - `STOW_APP_PRIVATE_KEY` → Worker `GITHUB_APP_PRIVATE_KEY` — the same
   GitHub App private key release-plz mints tokens from (see Releases
   below).
@@ -299,7 +334,7 @@ call is a GitHub identity, verified as described below.
 
 Every authenticated endpoint — the whole `/api/v1/admin/*` surface
 (artifact registration, listing, inspection and prune, coverage, the
-panic switch, queue transitions, the admin index export, preheat
+queue transitions, the admin index export, preheat
 planning, operator status) plus `POST /api/v1/scheduler/tasks/submit`
 and `POST /api/v1/scheduler/complete` — takes
 `Authorization: Bearer <credential>` and resolves the credential to a
@@ -364,11 +399,14 @@ pool. The library pool and the binary pool are independent.
 ## Operating
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
-- **Under attack:** `stow-admin panic on`, watch the request graph,
-  `stow-admin panic off`. The flag lives in the scheduler Durable Object;
-  while it is set every anonymous route answers `503` with
-  `Retry-After: 300` and the trusted CI endpoints keep working.
-  `stow-admin panic status` prints the current state.
+- **Under attack:** `stow-admin maintenance on --scope anonymous`, watch
+  the request graph, `stow-admin maintenance off --scope anonymous`. The
+  rule lives on the `waterui.dev` zone's `http_request_firewall_custom`
+  phase — blocked requests never invoke the Worker — and the trusted CI
+  endpoints keep working. `--scope lanes` sheds only the scheduler-backed
+  lanes (bundle bytes keep serving); `--scope all` takes the whole
+  hostname down. `stow-admin maintenance status` prints all three
+  rules' state.
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
 - **Rows without a published bundle:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts WHERE bundle_digest = ''"`.
   Such rows predate bundle publishing and are a miss until republished, so
@@ -423,9 +461,9 @@ pool. The library pool and the binary pool are independent.
      `[cloudflare.vars]` and redeploy the worker. A limit of `0` is a
      paused scheduler, not an unreachable limit: the claim pass sends
      nothing while both submit lanes keep queueing tasks — the backlog
-     waits, nothing is dropped. (`stow-admin panic on` is not a
-     substitute: it 503s anonymous routes and the dispatch loop keeps
-     running.)
+     waits, nothing is dropped. (`stow-admin maintenance on` is not a
+     substitute: it blocks anonymous routes at the zone and the dispatch
+     loop keeps running.)
   3. Merge the `build-crate.yml` sysroot change to main. From here a
      dispatched build resolves its task against a v2 slice that does
      not exist yet — coverage reads as empty and the build refuses —

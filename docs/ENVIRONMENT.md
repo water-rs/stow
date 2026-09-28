@@ -52,11 +52,12 @@ JSON) and sends nothing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required_ | Edge base URL the admin's trusted calls go to: scheduler task submits, `panic on\|off\|status` (the `/api/v1/admin/panic` circuit breaker) and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). |
+| `STOW_EDGE_URL` | _required_ | Edge base URL the admin's trusted calls go to: scheduler task submits and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints and the GitHub REST calls (`runs`, `cache`, `preheat projects generate`); the owner must have push access to `water-rs/stow`. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed` and `watchdog`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
 | `CF_ANALYTICS_TOKEN` | _required for `preheat missed`_ | Cloudflare API token with `Account Analytics: Read`, used to query the `stow_cache_misses` dataset. In CI it comes from the `CF_ANALYTICS_TOKEN` repository secret (see `DEPLOYMENT.md`). |
-| `CLOUDFLARE_API_TOKEN` | _required for `watchdog`_ | Cloudflare API token the watchdog queries the GraphQL analytics and Analytics Engine APIs with, and sends the alert mail through the Email Sending REST API (`POST /accounts/{id}/email/sending/send`). Needs `Account Analytics:Read` and Email Sending — see `DEPLOYMENT.md`. |
+| `CLOUDFLARE_API_TOKEN` | _required for `watchdog` and `maintenance`_ | Cloudflare API token the watchdog queries the GraphQL analytics and Analytics Engine APIs with, sends the alert mail through the Email Sending REST API (`POST /accounts/{id}/email/sending/send`), and toggles the zone maintenance rules with. Needs `Account Analytics:Read`, Email Sending and `Zone WAF:Edit` on `waterui.dev` — see `DEPLOYMENT.md`. |
+| `CF_ZONE_ID` | _required for `watchdog` and `maintenance`_ | The `waterui.dev` zone id the WAF maintenance rules live on — the `http_request_firewall_custom` phase entrypoint the deploy step creates and the toggles patch. A repository variable (`vars.CF_ZONE_ID`) in CI. |
 | `STOW_OIDC_AUDIENCE` | _required in Actions_ | `aud` the admin requests when it mints a GitHub Actions OIDC token for an edge call; must equal the edge's `STOW_OIDC_AUDIENCE` var. Set from `vars.STOW_OIDC_AUDIENCE` in the workflow. |
 | `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | injected by Actions | Endpoint + bearer the runtime exposes for OIDC mints; the admin reads both to mint a fresh token per edge call. Absent them (outside Actions), the admin uses `GH_TOKEN`. |
 | `STOW_REGISTRY_BASE_URL` | production GHCR | OCI base URL (`scheme://host/v2/repository`) `index backfill-min-glibc` pulls stored bundles from anonymously. Override for mock-registry runs. |

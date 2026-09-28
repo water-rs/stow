@@ -14,6 +14,7 @@ mod coverage;
 mod crates_io;
 mod github;
 mod index_cmd;
+mod maintenance;
 mod preheat;
 mod projects;
 mod queue;
@@ -23,8 +24,8 @@ mod watchdog;
 
 use std::fmt::Write as _;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use stow_types::api::{AdminStatus, EnqueueRequest, PanicSwitch, SchedulerSubmitResponse};
+use clap::{Args, Parser, Subcommand};
+use stow_types::api::{AdminStatus, EnqueueRequest, SchedulerSubmitResponse};
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
@@ -71,8 +72,9 @@ enum Command {
     Artifacts(artifacts::ArtifactsArgs),
     /// GitHub Actions cache usage and eviction.
     Cache(cache::CacheArgs),
-    /// Read or flip the edge's anonymous-traffic circuit breaker.
-    Panic(PanicArgs),
+    /// Ensure or toggle the zone's WAF maintenance rules — the breaker
+    /// that stops traffic before it reaches the Worker.
+    Maintenance(maintenance::MaintenanceArgs),
     /// External watchdog: evaluate the incident signals, trip the
     /// breaker on a breach, keep the incident issue and the alert mail
     /// current. `watchdog clear` is the manual recovery.
@@ -81,24 +83,6 @@ enum Command {
     Index(index_cmd::IndexArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
-}
-
-#[derive(Args)]
-struct PanicArgs {
-    /// `on`/`off` write the flag; `status` reads it.
-    #[arg(value_enum)]
-    action: PanicAction,
-    /// Apply the flip. `status` never mutates; `on`/`off` without `--yes`
-    /// print the plan and exit 0.
-    #[arg(long)]
-    yes: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum PanicAction {
-    On,
-    Off,
-    Status,
 }
 
 #[derive(Args)]
@@ -156,9 +140,7 @@ fn main() -> stow_types::error::Result<()> {
         Command::Cache(args) => {
             with_github(|token| async move { cache::run(&token, args, output).await })
         }
-        Command::Panic(args) => {
-            with_edge(|edge| async move { panic_switch(&edge, args, output).await })
-        }
+        Command::Maintenance(args) => smol::block_on(maintenance::run(args, output)),
         Command::Watchdog(args) => {
             with_edge(|edge| async move { watchdog::run(&edge, args, output).await })
         }
@@ -360,11 +342,6 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "panic        {}",
-            if status.panic_enabled { "on" } else { "off" }
-        );
-        let _ = writeln!(
-            out,
             "pending      {} miss, {} human",
             status.pending_miss, status.pending_human
         );
@@ -425,48 +402,6 @@ async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
         }
         out.trim_end().to_owned()
     })
-}
-
-/// `stow-admin panic on|off|status` — read or flip the circuit breaker.
-/// `on`/`off` are mutations: they print the target state and only apply
-/// under `--yes`.
-async fn panic_switch(
-    edge: &Edge,
-    args: PanicArgs,
-    output: Output,
-) -> stow_types::error::Result<()> {
-    if args.action == PanicAction::Status {
-        let switch: PanicSwitch = edge.get_json("/api/v1/admin/panic").await?;
-        return render::emit(output, &switch, |switch| {
-            format!("panic {}", if switch.enabled { "on" } else { "off" })
-        });
-    }
-    let target_enabled = matches!(args.action, PanicAction::On);
-    let plan = PanicSwitch {
-        enabled: target_enabled,
-    };
-    render::mutation(
-        output,
-        args.yes,
-        plan,
-        |envelope: &render::Planned<PanicSwitch, PanicSwitch>| {
-            let mut out = format!(
-                "set panic {}\n",
-                if envelope.plan.enabled { "on" } else { "off" }
-            );
-            if let Some(result) = &envelope.result {
-                let _ = writeln!(
-                    out,
-                    "panic is now {}",
-                    if result.enabled { "on" } else { "off" }
-                );
-            }
-            let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
-            out
-        },
-        async move |plan: &PanicSwitch| edge.post_json("/api/v1/admin/panic", plan).await,
-    )
-    .await
 }
 
 /// `stow-admin submit` — one `EnqueueRequest` batch, one POST. The

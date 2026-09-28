@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: read
+  # Pull the deployed commit's signed stow-admin toolchain from GHCR.
+  packages: read
 
 concurrency: deploy-edge
 
@@ -73,3 +75,23 @@ jobs:
           TURNSTILE_SECRET_KEY: ${{ secrets.STOW_TURNSTILE_SECRET_KEY }}
           STOW_STATS_SALT_SECRET: ${{ secrets.STOW_STATS_SALT_SECRET }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+      # The maintenance rules are the zone-level breaker (stow#453):
+      # `stow-admin maintenance ensure` creates the phase's entrypoint
+      # ruleset when the zone has never had one (the API answers error
+      # 10003) and appends whichever of the three rules is missing —
+      # created disabled and matched by description, so a redeploy
+      # never stomps a live toggle. The binary is the deployed commit's
+      # own toolchain artifact, cosign-verified by the action (#431);
+      # the push trigger's github.sha is the commit just deployed.
+      - name: stow-admin from the signed toolchain
+        uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ github.sha }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Ensure WAF maintenance rules
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE_ID: ${{ vars.CF_ZONE_ID }}
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+        run: stow-admin maintenance ensure --yes
