@@ -41,7 +41,8 @@ impl ResolvePool {
     /// # Errors
     /// Toolchain probing failures.
     pub(crate) fn new() -> stow_types::error::Result<Self> {
-        let resolver = stow_resolver::Resolver::new()
+        let shim = std::env::current_exe().wrap_err("current executable path")?;
+        let resolver = stow_resolver::Resolver::new(shim)
             .wrap_err("resolver session (rustc on PATH must be the lane's toolchain)")?;
         Ok(Self {
             resolver: Arc::new(resolver),

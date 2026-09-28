@@ -7,10 +7,11 @@
 //! ## Host probing
 //!
 //! Host-side units must answer cfg questions for the runner family's
-//! host triple, not this machine's. Cargo's probe binary is
-//! `build.rustc`, so each family gets a `GlobalContext` whose
-//! `build.rustc` is a shim: `rustc -vV` returns the real output with
-//! the `host:` line rewritten to the family triple (so
+//! host triple, not this machine's. Cargo runs rustc through
+//! `build.rustc-wrapper`, so each family gets a `GlobalContext` whose
+//! wrapper is a copy of the session's shim executable named
+//! `rustc-shim-<host>` ([`crate::shim`]): `rustc -vV` returns the real
+//! output with the `host:` line rewritten to the family triple (so
 //! `Rustc::host` — the `CompileKind::Host` target — is the family
 //! triple), and every `--print` probe that lacks `--target` gets
 //! `--target <family>` injected, so host `cfg` / file-name probing is
@@ -85,7 +86,7 @@ pub struct SourceResolve {
 /// owner runs.
 #[derive(Debug)]
 pub struct Resolver {
-    /// Session-owned scratch: shim scripts and per-family rustc caches.
+    /// Session-owned scratch: shim executables and per-family rustc caches.
     dir: tempfile::TempDir,
     /// The `CARGO_HOME` every context in this session gets — isolated
     /// from the user's real cargo home so no user config leaks in, and
@@ -94,6 +95,10 @@ pub struct Resolver {
     cargo_home: PathBuf,
     /// Real rustc binary this machine's toolchain resolves to.
     rustc: PathBuf,
+    /// The executable copied per family host as `rustc-shim-<host>` —
+    /// `stow-admin`'s own binary in production, `stow-rustc-shim` in
+    /// tests.
+    shim_source: PathBuf,
     /// This machine's own triple — the fallback host for a target no
     /// [`runner_family`] names.
     host_triple: String,
@@ -103,9 +108,9 @@ pub struct Resolver {
     /// minus `CARGO*`/`RUST*` so neither user cargo config nor rustup
     /// state leaks into a resolve.
     env: HashMap<String, String>,
-    /// Precomputed rustc shim scripts, one per runner-family host
-    /// triple plus this machine's own — written once so concurrent
-    /// resolves on a shared `Resolver` never rewrite a script another
+    /// Precomputed rustc shim executables, one per runner-family host
+    /// triple plus this machine's own — copied once so concurrent
+    /// resolves on a shared `Resolver` never rewrite a copy another
     /// thread may be executing.
     shims: HashMap<String, PathBuf>,
 }
@@ -113,15 +118,17 @@ pub struct Resolver {
 impl Resolver {
     /// A session with a fresh, session-owned `CARGO_HOME` — the default
     /// isolation the issue states ("an isolated `CARGO_HOME` per run that
-    /// the process owns").
+    /// the process owns"). `shim_source` is the executable copied per
+    /// family host as `rustc-shim-<host>` — it must dispatch a
+    /// `rustc-shim-*` `argv[0]` to [`crate::shim::run`].
     ///
     /// # Errors
     /// No rustc on PATH, or toolchain probing failed.
-    pub fn new() -> CargoResult<Self> {
+    pub fn new(shim_source: PathBuf) -> CargoResult<Self> {
         let dir = tempfile::tempdir().context("resolver scratch dir")?;
         let cargo_home = dir.path().join("cargo-home");
         std::fs::create_dir_all(&cargo_home).context("cargo home")?;
-        Self::setup(dir, cargo_home)
+        Self::setup(dir, cargo_home, shim_source)
     }
 
     /// A session whose `CARGO_HOME` is a caller-owned directory — still
@@ -130,16 +137,21 @@ impl Resolver {
     /// resolves. The directory is created if absent; the caller owns
     /// its lifecycle (concurrent writers must serialize themselves —
     /// cargo's own file locks arbitrate within the directory).
+    /// `shim_source` is as [`Resolver::new`]'s.
     ///
     /// # Errors
     /// Directory creation or toolchain probing failures.
-    pub fn with_cargo_home(cargo_home: PathBuf) -> CargoResult<Self> {
+    pub fn with_cargo_home(cargo_home: PathBuf, shim_source: PathBuf) -> CargoResult<Self> {
         std::fs::create_dir_all(&cargo_home).context("cargo home")?;
         let dir = tempfile::tempdir().context("resolver scratch dir")?;
-        Self::setup(dir, cargo_home)
+        Self::setup(dir, cargo_home, shim_source)
     }
 
-    fn setup(dir: tempfile::TempDir, cargo_home: PathBuf) -> CargoResult<Self> {
+    fn setup(
+        dir: tempfile::TempDir,
+        cargo_home: PathBuf,
+        shim_source: PathBuf,
+    ) -> CargoResult<Self> {
         // `rustup which rustc` resolves the active toolchain's real
         // binary — the `rustc` on PATH may itself be a rustup proxy,
         // and `rustc -vV` through the proxy resolves a *default*
@@ -180,6 +192,7 @@ impl Resolver {
             dir,
             cargo_home,
             rustc,
+            shim_source,
             host_triple,
             version,
             env: Self::sanitized_env(),
@@ -232,64 +245,43 @@ impl Resolver {
         runner_family(target).map_or(self.host_triple.as_str(), |family| family.host_triple())
     }
 
-    /// The rustc shim for `host`: `rustc -vV` answers the family triple
-    /// on its `host:` line (so `Rustc::host` is the family triple), and
-    /// a `--print` probe that passes no `--target` gets `--target
-    /// <host>` injected (so host cfg/file-name probing answers for the
-    /// family). Every other invocation is the real rustc verbatim.
+    /// The shim for `host`: a copy of the session's shim executable
+    /// named `rustc-shim-<host>`, so the copy's file stem carries the
+    /// family triple to [`crate::shim::run`].
     fn write_shim(&self, host: &str) -> CargoResult<PathBuf> {
-        let path = self
-            .dir
-            .path()
-            .join(format!("rustc-{}.sh", host.replace('/', "_")));
-        let real = self.rustc.display();
-        let script = format!(
-            "#!/bin/sh\n\
-             # stow resolver: pretend to be rustc for host {host}.\n\
-             for arg in \"$@\"; do\n\
-             \x20   case \"$arg\" in\n\
-             \x20       -vV|--version|-V)\n\
-             \x20           exec \"{real}\" \"$@\" | sed \"s/^host: .*/host: {host}/\"\n\
-             \x20           ;;\n\
-             \x20   esac\n\
-             done\n\
-             has_print=0; has_target=0\n\
-             for arg in \"$@\"; do\n\
-             \x20   case \"$arg\" in\n\
-             \x20       --print|--print=*) has_print=1 ;;\n\
-             \x20       --target|--target=*) has_target=1 ;;\n\
-             \x20   esac\n\
-             done\n\
-             if [ \"$has_print\" = 1 ] && [ \"$has_target\" = 0 ]; then\n\
-             \x20   exec \"{real}\" --target {host} \"$@\"\n\
-             else\n\
-             \x20   exec \"{real}\" \"$@\"\n\
-             fi\n"
-        );
-        // Temp-file + rename: a lazy shim write for a non-CI host can
+        let path = self.dir.path().join(format!(
+            "rustc-shim-{}{}",
+            host.replace('/', "_"),
+            std::env::consts::EXE_SUFFIX
+        ));
+        // Temp-file + rename: a lazy shim copy for a non-CI host can
         // race a sibling resolve — rename keeps the visible file whole.
-        let tmp = path.with_extension("sh.tmp");
-        std::fs::write(&tmp, script).with_context(|| format!("write {}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("chmod {}", tmp.display()))?;
-        }
+        let tmp = path.with_extension("tmp");
+        std::fs::copy(&self.shim_source, &tmp)
+            .with_context(|| format!("copy {} to {}", self.shim_source.display(), tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
         Ok(path)
     }
 
     /// A `GlobalContext` for a resolve rooted at `cwd`, probing rustc
     /// through the `host` family's shim. Isolated `CARGO_HOME`,
-    /// sanitized env, `build.rustc` pinned to the shim — the highest-
-    /// priority config source, so no ambient config can override it.
+    /// sanitized env, `build.rustc`/`build.rustc-wrapper` pinned — the
+    /// highest-priority config source, so no ambient config can
+    /// override them. Values go through `toml::Value`'s `Display` so
+    /// Windows paths escape correctly; a non-UTF-8 path is an error.
     fn gctx(&self, cwd: &Path, host: &str) -> CargoResult<GlobalContext> {
         let shim = self
             .shims
             .get(host)
             .cloned()
             .map_or_else(|| self.write_shim(host), Ok)?;
+        let rustc = self
+            .rustc
+            .to_str()
+            .with_context(|| format!("rustc path `{}` is not UTF-8", self.rustc.display()))?;
+        let shim = shim
+            .to_str()
+            .with_context(|| format!("shim path `{}` is not UTF-8", shim.display()))?;
         let mut gctx = GlobalContext::new(Shell::new(), cwd.to_path_buf(), self.cargo_home.clone());
         let target_dir = Some(self.dir.path().join("target").join(host.replace('/', "_")));
         gctx.configure(
@@ -301,7 +293,13 @@ impl Resolver {
             false,
             &target_dir,
             &[],
-            &[format!("build.rustc=\"{}\"", shim.display())],
+            &[
+                format!("build.rustc={}", toml::Value::String(rustc.to_owned())),
+                format!(
+                    "build.rustc-wrapper={}",
+                    toml::Value::String(shim.to_owned())
+                ),
+            ],
         )?;
         gctx.set_env(self.env.clone());
         Ok(gctx)
@@ -541,4 +539,24 @@ fn fnv(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    /// A `--config` value built through `toml::Value`'s `Display`
+    /// parses back to the verbatim path — backslashes and quotes
+    /// escape instead of breaking the dotted-key expression.
+    #[test]
+    fn config_path_round_trips_through_toml() {
+        let path = r#"C:\Users\RUNNER~1\AppData\Local\Temp\stow "quoted"\rustc-shim-x86_64-pc-windows-msvc.exe"#;
+        for key in ["build.rustc", "build.rustc-wrapper"] {
+            let arg = format!("{key}={}", toml::Value::String(path.to_owned()));
+            let parsed = toml::from_str::<toml::Table>(&arg).unwrap();
+            let (top, leaf) = key.split_once('.').unwrap();
+            assert_eq!(
+                parsed.get(top).and_then(|top| top.get(leaf)),
+                Some(&toml::Value::String(path.to_owned())),
+            );
+        }
+    }
 }

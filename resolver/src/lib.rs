@@ -20,6 +20,7 @@ pub mod fetch;
 mod lockfile;
 mod select;
 mod session;
+pub mod shim;
 mod units;
 
 pub use enqueue::{

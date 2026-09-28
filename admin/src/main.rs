@@ -134,6 +134,22 @@ struct SubmitArgs {
 }
 
 fn main() -> stow_types::error::Result<()> {
+    // Multi-call binary: a copy of this executable named
+    // `rustc-shim-<host>` is cargo's `build.rustc-wrapper` for the
+    // resolver's host probing — dispatch before clap sees its args.
+    if std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            std::path::Path::new(&arg0)
+                .file_stem()
+                .map(std::ffi::OsStr::to_os_string)
+        })
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|stem| stem.starts_with(stow_resolver::shim::STEM_PREFIX))
+    {
+        stow_resolver::shim::run();
+    }
     install_tracing();
     let cli = Cli::parse();
     let output = if cli.json {

@@ -150,7 +150,11 @@ fn resolver_at(reg: &Path) -> (tempfile::TempDir, Resolver) {
         ),
     )
     .unwrap();
-    let resolver = Resolver::with_cargo_home(home.path().to_path_buf()).unwrap();
+    let resolver = Resolver::with_cargo_home(
+        home.path().to_path_buf(),
+        PathBuf::from(env!("CARGO_BIN_EXE_stow-rustc-shim")),
+    )
+    .unwrap();
     (home, resolver)
 }
 
