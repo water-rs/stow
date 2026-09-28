@@ -357,7 +357,13 @@ dispatch input is optional: when it names a live edge the job also
 POSTs the rows to `/api/v1/admin/artifacts/sync` (the D1 `artifacts`
 catalog mirror the admission gate reads) and prints the export report;
 when empty — Cloudflare down or the edge unprovisioned — the publish
-still lands.
+still lands. The remaining dispatch inputs shape the export pass
+itself: `rustc_version` names the rustc it scopes to (empty resolves
+the current stable channel), and `full` — per rustc, like the pass —
+rebuilds that rustc's slices from every `records-<rustc>-*` artifact
+while ignoring the published `index`/`folded` pairs entirely, so a
+slice published in a format the current `stow-admin` can no longer
+decode is replaced rather than read.
 
 Every artifact is a tag of the single GHCR package
 `ghcr.io/water-rs/stow-cache` —
