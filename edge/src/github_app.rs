@@ -19,7 +19,7 @@ use base64::Engine as _;
 use serde::Serialize;
 
 #[cfg(target_arch = "wasm32")]
-use skyzen_services::durable::DurableDb;
+use crate::scheduler::meter::MeteredDb;
 
 use crate::errors::QueueError;
 
@@ -205,7 +205,7 @@ pub fn encode_jwt(signing_input: &str, signature: &[u8]) -> String {
 /// [`GitHubAppError::ExchangeStatus`]).
 #[cfg(target_arch = "wasm32")]
 pub async fn installation_token(
-    db: &DurableDb,
+    db: &MeteredDb,
     config: &AppConfig,
 ) -> Result<InstallationToken, GitHubAppError> {
     if let Some(cached) = crate::scheduler::queue::github_app_token(db).await? {
@@ -221,7 +221,7 @@ pub async fn installation_token(
 }
 
 /// Build the JWT from the App key and exchange it for an installation
-/// token — uncached; callers with a `DurableDb` should use
+/// token — uncached; callers with a `MeteredDb` should use
 /// [`installation_token`], which caches. The Worker's scheduled
 /// handler uses this directly (the token cache lives in DO storage).
 #[cfg(target_arch = "wasm32")]

@@ -574,6 +574,41 @@ pub struct DispatchFreeze {
     /// The stored freeze record — present only while `enabled` holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<DispatchFreezeRecord>,
+    /// The recent freeze transitions — newest first, bounded. The
+    /// watchdog (#450, Actions, `issues: write`) reads these through
+    /// `stow-admin dispatch-freeze status` / the admin route to write
+    /// the `incident` issue record the edge deliberately cannot write.
+    #[serde(default)]
+    pub transitions: Vec<DispatchFreezeTransition>,
+}
+
+/// The incident dedup key the freeze's `incident` issue lives under —
+/// `[incident] dispatch-freeze:` on the title. Shared so the watchdog
+/// (#450) and the edge agree.
+pub const DISPATCH_FREEZE_INCIDENT_KEY: &str = "dispatch-freeze";
+
+/// One line of the dispatch-freeze transition log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchFreezeTransition {
+    /// ISO 8601 timestamp of the transition.
+    pub at: String,
+    /// Which way the flag moved.
+    pub event: FreezeTransitionEvent,
+    /// The trigger that engaged the freeze — present on `engaged`
+    /// lines; on `cleared` lines it echoes the trigger the cleared
+    /// record held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<DispatchFreezeTrigger>,
+}
+
+/// A freeze flag transition kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FreezeTransitionEvent {
+    /// Not frozen → frozen.
+    Engaged,
+    /// Frozen → not frozen.
+    Cleared,
 }
 
 /// The record stored while a dispatch freeze is engaged.
@@ -583,16 +618,14 @@ pub struct DispatchFreezeRecord {
     pub frozen_at: String,
     /// What engaged the freeze.
     pub trigger: DispatchFreezeTrigger,
-    /// What happened to the freeze alert — which incident issue carried
-    /// it, or why none did. Persisted so a freeze nobody was told about
+    /// What happened to the freeze alert — Email Sending's outcome, or
+    /// why none went out. Persisted so a freeze nobody was told about
     /// is visible to whoever eventually reads it — the exact failure
-    /// this feature exists to prevent.
-    pub notify: AlertOutcome,
-    /// ISO 8601 timestamp of the last hourly digest send, set once a
-    /// digest lands. Absent means none has gone out — `frozen_at` then
-    /// marks the last notification (the open alert itself).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub digested_at: Option<String>,
+    /// this feature exists to prevent. The `incident` issue record is
+    /// the watchdog's (#450): the edge's App token has no `issues`
+    /// grant, deliberately — the edge is untrusted serving
+    /// infrastructure.
+    pub notify: ChannelOutcome,
 }
 
 /// What engaged a dispatch freeze.
@@ -605,8 +638,8 @@ pub enum DispatchFreezeTrigger {
     /// report: enough outcomes inside the window *and* a failure ratio
     /// over them, both required.
     Tripped(DispatchFreezeTrip),
-    /// The scheduled usage check found a metered dimension over its
-    /// daily budget (`Cost` also flips the panic switch on).
+    /// The scheduler object's own SQL meter crossed a daily budget
+    /// (`Cost` also flips the panic switch on).
     Cost(DispatchFreezeCost),
 }
 
@@ -669,8 +702,9 @@ pub struct DispatchFreezeClass {
     pub count: u32,
 }
 
-/// The metered dimension a cost trip crossed — one per paid-allowance
-/// budget line the scheduled check reads.
+/// The metered dimension a cost trip crossed — the DO's SQL meter
+/// reports the `DurableObject*` variants; the rest exist for the
+/// watchdog's (#450) account-wide view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CostMetric {
@@ -710,7 +744,7 @@ pub struct TopRouteCount {
 pub struct DispatchFreezeCost {
     /// The first metric found over budget.
     pub metric: CostMetric,
-    /// Usage since 00:00 UTC in the metric's unit.
+    /// Usage so far today (UTC) in the metric's unit.
     pub used: f64,
     /// The daily budget the usage is compared against — the monthly
     /// Workers Paid allowance divided by 30, times
@@ -720,8 +754,9 @@ pub struct DispatchFreezeCost {
     /// all of them).
     #[serde(default)]
     pub over: Vec<DispatchFreezeCostEntry>,
-    /// Today's top request groups — `scriptName` from the Workers
-    /// dataset.
+    /// Today's top request groups — populated by the watchdog's
+    /// account view; the DO sees statements, not URLs, so an
+    /// edge-fired trip carries an empty list.
     #[serde(default)]
     pub top_routes: Vec<TopRouteCount>,
 }
@@ -737,28 +772,13 @@ pub struct DispatchFreezeCostEntry {
     pub budget: f64,
 }
 
-/// The edge scheduled handler's verdict of one usage check.
-///
-/// Posted to the scheduler object's `/usage-check` route, which trips
-/// the freeze when `over` is non-empty. `top_routes` rides along either
-/// way so a trip record carries the day's traffic shape.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct UsageCheck {
-    /// Every metered dimension over its daily budget today — empty
-    /// means the day is inside allowance and the check is a no-op.
-    #[serde(default)]
-    pub over: Vec<DispatchFreezeCostEntry>,
-    /// Today's top request groups (`scriptName` from the Workers
-    /// dataset) — the "top routes" the cost-trip email names.
-    #[serde(default)]
-    pub top_routes: Vec<TopRouteCount>,
-}
-
 /// One alert channel's delivery result.
 ///
-/// The freeze/fault alerts fan out to Email Sending (the notification)
-/// and a GitHub `incident` issue (the record); each channel reports
-/// independently so the other's failure never blocks it.
+/// The edge alerts by email only (Email Sending) — its App token has
+/// no `issues` grant by design; the `Opened`/`Commented`/`Resolved`
+/// variants are what a caller-side recorder (the #450 watchdog,
+/// `issues: write` in Actions) reports when it turns a transition into
+/// the `incident` issue record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ChannelOutcome {
@@ -800,17 +820,6 @@ pub enum ChannelOutcome {
         /// Why the channel is off (names the missing binding/var).
         reason: String,
     },
-}
-
-/// What happened to one alert across both channels — recorded on the
-/// state row so a notification that went nowhere is visible to whoever
-/// reads `stow-admin` later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AlertOutcome {
-    /// The Email Sending notify.
-    pub email: ChannelOutcome,
-    /// The GitHub `incident` issue.
-    pub issue: ChannelOutcome,
 }
 
 /// Scheduler DO queue status for monitoring.

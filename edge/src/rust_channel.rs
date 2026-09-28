@@ -8,7 +8,7 @@
 
 use std::future::Future;
 
-use skyzen_services::durable::DurableDb;
+use crate::scheduler::meter::MeteredDb;
 use stow_types::identity::WireRustcVersion;
 
 use crate::errors::{QueueError, RustChannelError};
@@ -61,7 +61,7 @@ pub fn parse_channel_rustc_version(manifest: &str) -> Result<WireRustcVersion, R
 /// Read the cached stable rustc version, or `None` when no row is stored
 /// or the row is older than the TTL.
 pub async fn cached_stable_version(
-    db: &DurableDb,
+    db: &MeteredDb,
 ) -> Result<Option<WireRustcVersion>, RustChannelError> {
     let version = db
         .query(
@@ -84,7 +84,7 @@ pub async fn cached_stable_version(
 
 /// Persist a freshly resolved stable version over the singleton cache row.
 pub async fn store_stable_version(
-    db: &DurableDb,
+    db: &MeteredDb,
     version: &WireRustcVersion,
 ) -> Result<(), RustChannelError> {
     db.query(
@@ -103,7 +103,7 @@ pub async fn store_stable_version(
 /// Resolve the current stable rustc: serve the cached row while it is
 /// fresh, otherwise fetch + parse the manifest and refresh the cache.
 pub async fn stable_rustc_version(
-    db: &DurableDb,
+    db: &MeteredDb,
     source: &impl RustChannelSource,
 ) -> Result<WireRustcVersion, RustChannelError> {
     if let Some(cached) = cached_stable_version(db).await? {
@@ -213,7 +213,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn stable_version_fetches_once_then_serves_cache() {
-        let db = memory_db().await.expect("memory db");
+        let db = crate::scheduler::meter::MeteredDb::new(memory_db().await.expect("memory db"));
         let source = StubRustChannel {
             manifest: MANIFEST,
             fetches: AtomicUsize::new(0),
@@ -232,7 +232,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn stale_cache_row_is_refreshed() {
-        let db = memory_db().await.expect("memory db");
+        let db = crate::scheduler::meter::MeteredDb::new(memory_db().await.expect("memory db"));
         store_stable_version(&db, &WireRustcVersion::parse("1.90.0").expect("version"))
             .await
             .expect("store");

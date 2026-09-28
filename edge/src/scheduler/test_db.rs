@@ -10,6 +10,7 @@ use skyzen_services::durable::{
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _, sqlite::SqliteRow};
 
 use crate::errors::QueueError;
+use crate::scheduler::meter::MeteredDb;
 use crate::scheduler::queue;
 
 /// `DurableDbBackend` backed by a `sqlx` `SQLite` pool.
@@ -48,7 +49,7 @@ impl SqliteBackend {
 pub async fn memory_db() -> Result<DurableDb, QueueError> {
     let backend = memory_backend().await?;
     let db = DurableDb::new(backend.clone());
-    queue::migrate(&db).await?;
+    queue::migrate(&MeteredDb::new(db.clone())).await?;
     backend.close_migration();
     Ok(db)
 }
@@ -85,7 +86,7 @@ pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueErro
         inner: inner.clone(),
         log: log.clone(),
     });
-    queue::migrate(&db).await?;
+    queue::migrate(&MeteredDb::new(db.clone())).await?;
     inner.close_migration();
     Ok((db, log))
 }

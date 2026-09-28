@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroU32;
 
-use skyzen_services::durable::{DbValue, DurableDb};
+use super::meter::MeteredDb;
+use skyzen_services::durable::DbValue;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueRequest,
     EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
@@ -311,7 +312,7 @@ fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
 /// dispatch failure would apply, and the lane only ever moves toward
 /// 'human'.
 async fn apply_batched_updates(
-    db: &DurableDb,
+    db: &MeteredDb,
     updates: &[BatchedUpdate],
 ) -> Result<(), QueueError> {
     for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
@@ -345,7 +346,7 @@ async fn apply_batched_updates(
 /// the write stays untouched, and `rows_written` still counts exactly
 /// the rows this batch inserted.
 async fn apply_batched_inserts(
-    db: &DurableDb,
+    db: &MeteredDb,
     inserts: &[BatchedInsert],
 ) -> Result<u64, QueueError> {
     let mut inserted = 0u64;
@@ -384,7 +385,7 @@ async fn apply_batched_inserts(
 /// per-dep deltas the in-memory replay computed — one keyed UPDATE,
 /// same columns as the old per-edge statement.
 async fn apply_batched_dependency_sync(
-    db: &DurableDb,
+    db: &MeteredDb,
     resync_ids: &[String],
     edges: &[BatchedDepEdge],
     requeues: &[BatchedRequeue],
@@ -445,7 +446,7 @@ async fn apply_batched_dependency_sync(
 
 /// Pending rows in the queue — the count the `STOW_MAX_QUEUE_PENDING`
 /// gate compares against.
-async fn pending_count(db: &DurableDb) -> Result<u32, QueueError> {
+async fn pending_count(db: &MeteredDb) -> Result<u32, QueueError> {
     let pending = db
         .query("SELECT count(*) AS count FROM queue WHERE status = 'pending'")
         .fetch_scalar::<u64>()
@@ -474,7 +475,7 @@ pub const fn seconds_until_utc_midnight(now_unix: i64) -> u64 {
 /// check from the spend. `false` means the charge does not fit — the
 /// caller refuses the submit.
 async fn charge_human_daily_budget(
-    db: &DurableDb,
+    db: &MeteredDb,
     tasks: u32,
     budget: u32,
 ) -> Result<bool, QueueError> {
@@ -506,7 +507,7 @@ async fn charge_human_daily_budget(
 /// the `STOW_MAX_QUEUE_PENDING` gate on miss-lane work and charging
 /// human-lane tasks against `STOW_HUMAN_DAILY_TASK_BUDGET`.
 pub async fn enqueue(
-    db: &DurableDb,
+    db: &MeteredDb,
     requests: &[EnqueueRequest],
     settings: &SchedulerSettings,
 ) -> Result<u32, QueueError> {
@@ -517,7 +518,7 @@ pub async fn enqueue(
 /// pending-depth gate does not apply — the credential check already
 /// bounds this path — but human-lane tasks still spend the daily budget.
 pub async fn enqueue_trusted(
-    db: &DurableDb,
+    db: &MeteredDb,
     requests: &[EnqueueRequest],
     settings: &SchedulerSettings,
 ) -> Result<u32, QueueError> {
@@ -525,7 +526,7 @@ pub async fn enqueue_trusted(
 }
 
 async fn enqueue_inner(
-    db: &DurableDb,
+    db: &MeteredDb,
     requests: &[EnqueueRequest],
     settings: &SchedulerSettings,
     enforce_pending_cap: bool,
@@ -668,7 +669,7 @@ struct EnqueuePlan {
 /// row-at-a-time loop ran, including each `WHERE status = 'failed'`
 /// the per-edge requeue issued.
 async fn probe_task_statuses(
-    db: &DurableDb,
+    db: &MeteredDb,
     prepared: &[Prepared<'_>],
 ) -> Result<BTreeMap<String, String>, QueueError> {
     let probe_ids: BTreeSet<&str> = prepared
@@ -842,7 +843,7 @@ fn plan_enqueue(
     Ok(plan)
 }
 
-pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<(), QueueError> {
+pub async fn complete(db: &MeteredDb, report: &BuildCompleteReport) -> Result<(), QueueError> {
     let status = if report.success {
         "completed"
     } else {
@@ -917,7 +918,7 @@ pub async fn complete(db: &DurableDb, report: &BuildCompleteReport) -> Result<()
 /// groups by: the report's error prefix (first line, truncated)
 /// qualified by the step that failed.
 async fn record_attempt_outcome(
-    db: &DurableDb,
+    db: &MeteredDb,
     report: &BuildCompleteReport,
 ) -> Result<(), QueueError> {
     #[derive(skyzen::FromRow)]
@@ -976,7 +977,7 @@ fn failure_class(report: &BuildCompleteReport) -> Option<String> {
     }
 }
 
-pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
+pub async fn status(db: &MeteredDb) -> Result<SchedulerStatus, QueueError> {
     // One pass over the queue's (status, lane) groups — six sequential
     // count(*) scans would read ~6x the rows for the same answer, and every
     // graph analysis and enqueue redemption calls this.
@@ -1033,7 +1034,7 @@ pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
 /// single-id form exists for tests.
 #[cfg(test)]
 pub async fn task_status(
-    db: &DurableDb,
+    db: &MeteredDb,
     task_id: &str,
 ) -> Result<Option<RequestStatus>, QueueError> {
     let row = db
@@ -1058,7 +1059,7 @@ pub async fn task_status(
 /// Batch form of [`task_status`] for the request API's per-target root
 /// lookups; skips ids with no queue row and preserves the input order.
 pub async fn tasks_status(
-    db: &DurableDb,
+    db: &MeteredDb,
     task_ids: &[String],
 ) -> Result<Vec<RequestStatus>, QueueError> {
     if task_ids.is_empty() {
@@ -1102,7 +1103,7 @@ pub async fn tasks_status(
 /// Map a queue row to its wire status, computing the human-lane position
 /// for pending human rows.
 async fn request_status(
-    db: &DurableDb,
+    db: &MeteredDb,
     row: RequestStatusRow,
 ) -> Result<RequestStatus, QueueError> {
     let lane = TaskLane::parse(&row.lane).ok_or_else(|| {
@@ -1145,7 +1146,7 @@ async fn request_status(
 /// 1-based position of a pending human task in dispatch order: the number
 /// of pending human rows that sort ahead of it (matching the
 /// `claim_dispatchable_tasks` ordering) plus one.
-async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u32, QueueError> {
+async fn human_lane_position(db: &MeteredDb, row: &RequestStatusRow) -> Result<u32, QueueError> {
     // The position must equal `claim_dispatchable_tasks` dispatch order:
     // Windows-family rows sort first within the lane, then the FIFO
     // tie-breakers. The subject row's own Windows rank is computed in
@@ -1301,7 +1302,7 @@ fn blocked_by_sql() -> String {
 }
 
 pub async fn claim_dispatchable_tasks(
-    db: &DurableDb,
+    db: &MeteredDb,
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
 ) -> Result<Vec<QueuedTask>, QueueError> {
@@ -1411,7 +1412,7 @@ pub async fn claim_dispatchable_tasks(
 /// published at, which is exactly what the dependent's wrapper manifest
 /// pins so its resolve lands on the published unit (stow#431).
 async fn load_claimed_dep_pins(
-    db: &DurableDb,
+    db: &MeteredDb,
     claimed: &mut [QueuedTask],
 ) -> Result<(), QueueError> {
     if claimed.is_empty() {
@@ -1481,7 +1482,7 @@ async fn load_claimed_dep_pins(
 /// crates.io tasks are asked about: a lockfile-preserving overlay build is
 /// a different artifact from the unlocked one the catalog row describes.
 async fn retire_covered_rows(
-    db: &DurableDb,
+    db: &MeteredDb,
     rows: Vec<TaskRow>,
     coverage: &impl CoverageOracle,
 ) -> Result<Vec<TaskRow>, QueueError> {
@@ -1555,7 +1556,7 @@ async fn retire_covered_rows(
 /// family-capped row must be skippable without hiding the rows behind
 /// it; the claim walk stops once the total slot count is spent.
 async fn select_dispatchable_rows(
-    db: &DurableDb,
+    db: &MeteredDb,
     settings: &SchedulerSettings,
 ) -> Result<Vec<TaskRow>, QueueError> {
     let windows_targets = RunnerFamily::Windows.targets();
@@ -1585,7 +1586,7 @@ async fn select_dispatchable_rows(
 }
 
 pub async fn mark_dispatch_failed(
-    db: &DurableDb,
+    db: &MeteredDb,
     task_id: &str,
     error: &str,
 ) -> Result<(), QueueError> {
@@ -1637,7 +1638,7 @@ const GITHUB_APP_TOKEN_MIN_REMAINING_SECS: i64 = 300;
 /// GitHub `expires_at` RFC 3339 format and `SQLite` datetime strings
 /// compare correctly.
 pub async fn github_app_token(
-    db: &DurableDb,
+    db: &MeteredDb,
 ) -> Result<Option<crate::github_app::InstallationToken>, QueueError> {
     let row = db
         .query(
@@ -1658,7 +1659,7 @@ pub async fn github_app_token(
 /// Persist a freshly minted GitHub App installation token over the
 /// singleton cache row.
 pub async fn store_github_app_token(
-    db: &DurableDb,
+    db: &MeteredDb,
     token: &crate::github_app::InstallationToken,
 ) -> Result<(), QueueError> {
     db.query(
@@ -1678,7 +1679,7 @@ pub async fn store_github_app_token(
 /// An absent row means off; any stored value other than 'true'/'false'
 /// violates the schema's contract and is an invariant error rather than a
 /// guess.
-pub async fn panic_enabled(db: &DurableDb) -> Result<bool, QueueError> {
+pub async fn panic_enabled(db: &MeteredDb) -> Result<bool, QueueError> {
     let value = db
         .query("SELECT value FROM settings WHERE key = 'panic'")
         .fetch_scalar_optional::<String>()
@@ -1695,7 +1696,7 @@ pub async fn panic_enabled(db: &DurableDb) -> Result<bool, QueueError> {
 }
 
 /// Write the anonymous-traffic circuit breaker into the `settings` table.
-pub async fn set_panic(db: &DurableDb, enabled: bool) -> Result<(), QueueError> {
+pub async fn set_panic(db: &MeteredDb, enabled: bool) -> Result<(), QueueError> {
     db.query(
         "INSERT INTO settings (key, value) VALUES ('panic', ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1721,7 +1722,7 @@ pub async fn set_panic(db: &DurableDb, enabled: bool) -> Result<(), QueueError> 
 /// that fails to deserialize violates the key's contract and is an
 /// invariant error rather than a guess.
 pub async fn freeze_record(
-    db: &DurableDb,
+    db: &MeteredDb,
 ) -> Result<Option<stow_types::api::DispatchFreezeRecord>, QueueError> {
     let value = db
         .query("SELECT value FROM settings WHERE key = 'dispatch_freeze'")
@@ -1739,32 +1740,9 @@ pub async fn freeze_record(
         .transpose()
 }
 
-/// Whether the live freeze's digest is due — the record's
-/// `digested_at` (falling back to `frozen_at`, since the open alert is
-/// itself a notification) compared in SQLite, where `strftime('%s')`
-/// reads the ISO strings without a Rust-side parser. `false` when the
-/// freeze isn't engaged or the stored timestamp won't parse.
-pub async fn freeze_digest_due(db: &DurableDb, minutes: u32) -> Result<bool, QueueError> {
-    let Some(record) = freeze_record(db).await? else {
-        return Ok(false);
-    };
-    let last_notified = record.digested_at.as_deref().unwrap_or(&record.frozen_at);
-    let due = db
-        .query(
-            "SELECT CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', ?) AS INTEGER) \
-             >= ? * 60 AS due",
-        )
-        .bind(last_notified)
-        .bind(i64::from(minutes))
-        .fetch_scalar::<i64>()
-        .await
-        .map_err(|error| format!("compare digest timestamp: {error}"))?;
-    Ok(due != 0)
-}
-
 /// Whether dispatch is frozen — the `dispatch_freeze` row's presence is
 /// the flag.
-pub async fn freeze_enabled(db: &DurableDb) -> Result<bool, QueueError> {
+pub async fn freeze_enabled(db: &MeteredDb) -> Result<bool, QueueError> {
     let count = db
         .query("SELECT count(*) AS count FROM settings WHERE key = 'dispatch_freeze'")
         .fetch_scalar::<u64>()
@@ -1777,7 +1755,7 @@ pub async fn freeze_enabled(db: &DurableDb) -> Result<bool, QueueError> {
 /// already resolved to, so a failed send is persisted rather than
 /// propagated: the freeze is the load-bearing action.
 pub async fn set_freeze(
-    db: &DurableDb,
+    db: &MeteredDb,
     record: &stow_types::api::DispatchFreezeRecord,
 ) -> Result<(), QueueError> {
     let value = serde_json::to_string(record).map_err(|error| {
@@ -1791,19 +1769,122 @@ pub async fn set_freeze(
     .execute()
     .await
     .map_err(|error| format!("write dispatch freeze record: {error}"))?;
+    record_freeze_transition(
+        db,
+        stow_types::api::FreezeTransitionEvent::Engaged,
+        Some(&record.trigger),
+    )
+    .await?;
     tracing::warn!("dispatch freeze engaged — dispatch stops, enqueue stays open");
     Ok(())
 }
 
 /// Lift the freeze by deleting the record row — the caller already
-/// holds the record for the cleared-transition alert.
-pub async fn delete_freeze(db: &DurableDb) -> Result<(), QueueError> {
+/// holds the record for the cleared-transition alert. The transition
+/// log still records the cleared record's trigger so the watchdog's
+/// issue can name what had been engaged.
+pub async fn delete_freeze(db: &MeteredDb) -> Result<(), QueueError> {
+    let trigger = freeze_record(db).await?.map(|record| record.trigger);
     db.query("DELETE FROM settings WHERE key = 'dispatch_freeze'")
         .execute()
         .await
         .map_err(|error| format!("clear dispatch freeze record: {error}"))?;
+    record_freeze_transition(
+        db,
+        stow_types::api::FreezeTransitionEvent::Cleared,
+        trigger.as_ref(),
+    )
+    .await?;
     tracing::warn!("dispatch freeze cleared — dispatch resumes");
     Ok(())
+}
+
+/// Append one `dispatch_freeze_log` row — the transition log the #450
+/// watchdog reads over `dispatch-freeze status` to write the
+/// `incident` issue record the edge deliberately cannot. Bounded: the
+/// oldest rows past 200 drop off on each append.
+async fn record_freeze_transition(
+    db: &MeteredDb,
+    event: stow_types::api::FreezeTransitionEvent,
+    trigger: Option<&stow_types::api::DispatchFreezeTrigger>,
+) -> Result<(), QueueError> {
+    let event = match event {
+        stow_types::api::FreezeTransitionEvent::Engaged => "engaged",
+        stow_types::api::FreezeTransitionEvent::Cleared => "cleared",
+    };
+    let trigger = trigger
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| QueueError::Invariant(format!("serialize freeze trigger: {error}")))?;
+    db.query("INSERT INTO dispatch_freeze_log (event, trigger) VALUES (?, ?)")
+        .bind(event)
+        .bind(trigger)
+        .execute()
+        .await
+        .map_err(|error| format!("write freeze transition: {error}"))?;
+    db.query(
+        "DELETE FROM dispatch_freeze_log WHERE id <= \
+         (SELECT MAX(id) FROM dispatch_freeze_log) - 200",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("prune freeze transition log: {error}"))?;
+    Ok(())
+}
+
+/// One `dispatch_freeze_log` row.
+#[derive(Debug, skyzen::FromRow)]
+struct FreezeLogRow {
+    at: String,
+    event: String,
+    trigger: Option<String>,
+}
+
+/// The freeze transition log, newest first, capped at `limit` —
+/// `GET /dispatch-freeze` (and so `stow-admin dispatch-freeze status`
+/// and the watchdog) answers with it.
+pub async fn freeze_transitions(
+    db: &MeteredDb,
+    limit: u32,
+) -> Result<Vec<stow_types::api::DispatchFreezeTransition>, QueueError> {
+    let rows = db
+        .query(
+            "SELECT at, event, trigger FROM dispatch_freeze_log \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(i64::from(limit))
+        .fetch_all::<FreezeLogRow>()
+        .await
+        .map_err(|error| format!("read freeze transitions: {error}"))?;
+    rows.into_iter()
+        .map(|row| {
+            let event = serde_json::from_value::<stow_types::api::FreezeTransitionEvent>(
+                serde_json::Value::String(row.event.clone()),
+            )
+            .map_err(|error| {
+                QueueError::Invariant(format!(
+                    "dispatch_freeze_log row holds unknown event `{}`: {error}",
+                    row.event
+                ))
+            })?;
+            let trigger =
+                row.trigger
+                    .map(|json| {
+                        serde_json::from_str::<stow_types::api::DispatchFreezeTrigger>(&json)
+                            .map_err(|error| {
+                                QueueError::Invariant(format!(
+                                    "dispatch_freeze_log row holds unparseable trigger: {error}"
+                                ))
+                            })
+                    })
+                    .transpose()?;
+            Ok(stow_types::api::DispatchFreezeTransition {
+                at: row.at,
+                event,
+                trigger,
+            })
+        })
+        .collect()
 }
 
 /// The evidence a failure-rate trip verdict becomes: the evaluated
@@ -1832,7 +1913,7 @@ const TRIP_EXAMPLE_RUNS: i64 = 3;
 /// Dispatch failures never land there (no run was burned), so they are
 /// not the signal this watches.
 pub async fn evaluate_freeze_trip(
-    db: &DurableDb,
+    db: &MeteredDb,
     settings: &crate::freeze::FreezeSettings,
 ) -> Result<Option<FreezeTripDraft>, QueueError> {
     let window = format!("-{} minutes", settings.window_minutes);
@@ -2053,7 +2134,7 @@ fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>)
 
 /// Queue rows matching a selector, newest state transition first.
 pub async fn list_tasks(
-    db: &DurableDb,
+    db: &MeteredDb,
     selector: &QueueSelector,
 ) -> Result<Vec<QueueTask>, QueueError> {
     // A listing accepts a fully empty selector — it means "everything" —
@@ -2114,7 +2195,7 @@ pub enum QueueMutation {
 /// completed one, `promote` cannot move a human or non-pending row, and
 /// `purge` cannot delete anything still capable of running.
 pub async fn apply_mutation(
-    db: &DurableDb,
+    db: &MeteredDb,
     mutation: QueueMutation,
     selector: &QueueSelector,
 ) -> Result<u32, QueueError> {
@@ -2161,7 +2242,7 @@ pub async fn apply_mutation(
 /// Operator view of the whole queue for `GET /admin/status`: lane depths,
 /// the oldest pending row's age, the in-flight set, per-target outcome
 /// tallies over the trailing 24 hours, and the panic flag.
-pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
+pub async fn admin_status(db: &MeteredDb) -> Result<AdminStatus, QueueError> {
     let queue_status = status(db).await?;
     let oldest_pending_seconds = db
         .query(
@@ -2245,7 +2326,7 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
 /// a re-request or completed) are not stamped — their `github_run_id`
 /// still names the run that acted on the live attempt.
 pub async fn observe_run(
-    db: &DurableDb,
+    db: &MeteredDb,
     task_id: &str,
     github_run_id: &str,
 ) -> Result<(), QueueError> {
@@ -2397,7 +2478,7 @@ pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
 /// dispatch is gated, so the alarm is deleted; the manual clear re-arms
 /// it through the `/dispatch-freeze` route's dispatch pass.
 pub async fn next_alarm(
-    db: &DurableDb,
+    db: &MeteredDb,
     now_ms: i64,
     settings: &SchedulerSettings,
 ) -> Result<AlarmPlan, QueueError> {
@@ -2448,7 +2529,7 @@ pub async fn next_alarm(
 /// its pending rows are excluded so an eligibility the scheduler could
 /// not act on cannot wake the alarm at `now`.
 async fn earliest_pending_eligible_ms(
-    db: &DurableDb,
+    db: &MeteredDb,
     settings: &SchedulerSettings,
     full_family: Option<RunnerFamily>,
 ) -> Result<Option<i64>, QueueError> {
@@ -2501,7 +2582,7 @@ async fn earliest_pending_eligible_ms(
 /// goes stale: `updated_at + stale_dispatch_minutes`, minimized. May be in
 /// the past (already recoverable).
 async fn earliest_active_lease_expiry_ms(
-    db: &DurableDb,
+    db: &MeteredDb,
     settings: &SchedulerSettings,
 ) -> Result<Option<i64>, QueueError> {
     let lease_epoch = db
@@ -2591,7 +2672,7 @@ const PUBLISHED_SLICE_INSERT_BATCH_SIZE: usize =
 /// orphans are deleted by the next report's cleanup pass; they can never
 /// show a half-written slice.
 pub async fn record_published_slice(
-    db: &DurableDb,
+    db: &MeteredDb,
     target: &str,
     rustc_version: &str,
     rows: &[PublishedSliceRow],
@@ -2685,7 +2766,7 @@ pub async fn record_published_slice(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Run the scheduler schema migration — the only code that may issue
 /// DDL or a backfill against the queue database. Migrations are
@@ -2704,7 +2785,7 @@ const SCHEMA_VERSION: i64 = 1;
 /// and the column migrations already use — so a pass that dies midway
 /// leaves the version behind and re-runs: every step is idempotent, and
 /// a queue already at `SCHEMA_VERSION` reports `before == after`.
-pub async fn migrate(db: &DurableDb) -> Result<SchemaMigrationReport, QueueError> {
+pub async fn migrate(db: &MeteredDb) -> Result<SchemaMigrationReport, QueueError> {
     let before = stored_schema_version(db).await?;
     if before > SCHEMA_VERSION {
         return Err(QueueError::Invariant(format!(
@@ -2734,7 +2815,7 @@ pub async fn migrate(db: &DurableDb) -> Result<SchemaMigrationReport, QueueError
 /// Whether the table exists is asked of `PRAGMA table_info`, which the
 /// Durable Object authorizer admits and which answers an empty set for a
 /// missing table, rather than read off a failed query's message.
-async fn stored_schema_version(db: &DurableDb) -> Result<i64, QueueError> {
+async fn stored_schema_version(db: &MeteredDb) -> Result<i64, QueueError> {
     let marker_columns = db
         .query("PRAGMA table_info(scheduler_schema_version)")
         .fetch_all::<QueueTableInfoRow>()
@@ -2757,7 +2838,7 @@ async fn stored_schema_version(db: &DurableDb) -> Result<i64, QueueError> {
 /// `DurableDb`, so every step is written to be safe to re-run after a
 /// mid-pass failure. Every statement may run while the previous build
 /// still serves requests: additive only, expand then contract.
-async fn migrate_schema(db: &DurableDb) -> Result<(), QueueError> {
+async fn migrate_schema(db: &MeteredDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue)")
         .fetch_all::<QueueTableInfoRow>()
@@ -2881,7 +2962,7 @@ struct UnmaskedEdge {
 /// `depends_on_task_id` still points at; an edge whose dependency left
 /// the queue keeps '' and never satisfies the gate. `dep_host_side`
 /// defaults to the target-side requirement the gate always applied.
-async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueError> {
+async fn migrate_queue_dependencies_columns(db: &MeteredDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue_dependencies)")
         .fetch_all::<QueueTableInfoRow>()
@@ -2980,7 +3061,7 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
 /// ran: a retry after a migration that committed the column adds but
 /// failed mid-backfill heals here instead of gating dependents on a
 /// permanently-zero mask.
-async fn backfill_dev_era_edge_masks(db: &DurableDb) -> Result<(), QueueError> {
+async fn backfill_dev_era_edge_masks(db: &MeteredDb) -> Result<(), QueueError> {
     let edges = db
         .query(
             "SELECT d.task_id, d.depends_on_task_id, \
@@ -3024,7 +3105,7 @@ async fn backfill_dev_era_edge_masks(db: &DurableDb) -> Result<(), QueueError> {
 /// only honest signal left: where the dep's task minted relative to the
 /// owner's target and the family's host triple. `dep_side_known` runs
 /// the derivation exactly once — resolver-written edges carry 1.
-async fn derive_dev_era_edge_sides(db: &DurableDb) -> Result<(), QueueError> {
+async fn derive_dev_era_edge_sides(db: &MeteredDb) -> Result<(), QueueError> {
     let side_edges = db
         .query(
             "SELECT d.task_id, d.depends_on_task_id, \
@@ -3100,7 +3181,7 @@ fn derive_edge_side(owner_target: &str, owner_host_side: bool, dep_target: &str)
 /// dropped. Rows keep their target-side identity: `task_id`s and
 /// `queue_dependencies` edges are spelled identically at `host_side =
 /// 0`, so no dependent or admission needs rewriting.
-async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
+async fn migrate_queue_host_side(db: &MeteredDb) -> Result<(), QueueError> {
     tracing::warn!("migrating scheduler queue: adding host_side to the task identity");
     db.query("ALTER TABLE queue RENAME TO queue_migrated")
         .execute()
@@ -3141,7 +3222,7 @@ async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
 /// before the columns existed covers nothing under the gate, so a
 /// dependent behind one waits for the slice's next publish rather than
 /// releasing on membership alone.
-async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueError> {
+async fn migrate_published_slice_row_shape(db: &MeteredDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(published_slice_rows)")
         .fetch_all::<QueueTableInfoRow>()
@@ -3178,7 +3259,7 @@ async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueEr
     Ok(())
 }
 
-async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
+async fn migrate_queue_schema(db: &MeteredDb) -> Result<(), QueueError> {
     // Legacy rows lack features_json and rustc_version — these are essential
     // identity fields. Instead of backfilling with bogus data ('[]' / ''),
     // drop the table and recreate it from the canonical schema. Dropped
@@ -3199,7 +3280,7 @@ async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
 }
 
 async fn recover_stale_active_tasks(
-    db: &DurableDb,
+    db: &MeteredDb,
     settings: &SchedulerSettings,
 ) -> Result<(), QueueError> {
     db.query(
@@ -3228,7 +3309,7 @@ async fn recover_stale_active_tasks(
 /// was never established (`dep_host_side = -1`) asks for a side the dep
 /// can never publish — both leave nothing to re-queue: the first has no
 /// dep, the second is the resolver's rewrite, not the dep's rebuild.
-async fn requeue_incomplete_shape_deps(db: &DurableDb) -> Result<(), QueueError> {
+async fn requeue_incomplete_shape_deps(db: &MeteredDb) -> Result<(), QueueError> {
     db.query(&format!(
         "UPDATE queue \
          SET status = 'pending', \
@@ -3267,7 +3348,7 @@ impl ActiveByFamily {
     }
 }
 
-async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueError> {
+async fn count_active_by_family(db: &MeteredDb) -> Result<ActiveByFamily, QueueError> {
     let rows = db
         .query(
             "SELECT target, count(*) AS count FROM queue \
@@ -3578,7 +3659,6 @@ mod sqlite_tests {
     use std::collections::BTreeSet;
     use std::future::Future;
 
-    use skyzen_services::durable::DurableDb;
     use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource};
     use stow_types::identity::FeaturesJson;
 
@@ -3587,6 +3667,7 @@ mod sqlite_tests {
         task_id,
     };
     use crate::errors::QueueError;
+    use crate::scheduler::meter::MeteredDb;
     use crate::scheduler::test_db::{counting_memory_db, memory_db, memory_db_raw};
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
@@ -3596,6 +3677,12 @@ mod sqlite_tests {
             invocation,
             kind,
         }
+    }
+
+    /// `memory_db` plus the meter — host tests exercise the same
+    /// `MeteredDb` surface the DO runs against.
+    async fn metered_db() -> Result<MeteredDb, QueueError> {
+        memory_db().await.map(MeteredDb::new)
     }
 
     /// Fixed column timestamp used for exact lease/eligibility assertions:
@@ -3641,7 +3728,7 @@ mod sqlite_tests {
     /// `super::enqueue` with the test settings, so existing call sites keep
     /// their `(db, requests)` shape; cap tests call `super::enqueue` and
     /// `super::enqueue_trusted` directly.
-    async fn enqueue(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
+    async fn enqueue(db: &MeteredDb, requests: &[EnqueueRequest]) -> Result<u32, QueueError> {
         super::enqueue(db, requests, &settings()).await
     }
 
@@ -3736,7 +3823,7 @@ mod sqlite_tests {
     /// Force a row into an in-flight status with a deterministic `updated_at`
     /// — a state no public queue function produces (claim always stamps
     /// `datetime('now')`), so one raw UPDATE is required.
-    async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &str) {
+    async fn mark_active(db: &MeteredDb, crate_name: &str, target: &str, status: &str) {
         db.query("UPDATE queue SET status = ?, updated_at = ? WHERE task_id = ?")
             .bind(status.to_owned())
             .bind(ROW_TS.to_owned())
@@ -3748,12 +3835,12 @@ mod sqlite_tests {
 
     /// `enqueue` always stamps `first_requested_at = datetime('now')`; tests
     /// that assert exact eligibility timestamps need a deterministic value.
-    async fn set_first_requested_at(db: &DurableDb, crate_name: &str, timestamp: &str) {
+    async fn set_first_requested_at(db: &MeteredDb, crate_name: &str, timestamp: &str) {
         set_first_requested_at_on(db, crate_name, TARGET, timestamp).await;
     }
 
     async fn set_first_requested_at_on(
-        db: &DurableDb,
+        db: &MeteredDb,
         crate_name: &str,
         target: &str,
         timestamp: &str,
@@ -3768,7 +3855,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn empty_queue_deletes_alarm() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let plan = next_alarm(&db, ROW_TS_MS, &settings())
             .await
             .expect("next_alarm");
@@ -3777,7 +3864,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn active_only_wakes_at_lease_expiry() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
@@ -3794,7 +3881,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn pending_blocked_by_active_dependency_wakes_at_lease_expiry() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
@@ -3814,7 +3901,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn exhausted_capacity_with_eligible_pending_wakes_at_lease_expiry() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[request("busy", Vec::new()), request("waiting", Vec::new())],
@@ -3842,7 +3929,7 @@ mod sqlite_tests {
     /// queue waits out the pause instead of spinning on eligibility.
     #[tokio::test]
     async fn paused_with_nothing_in_flight_deletes_alarm() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         super::enqueue(&db, &[request("waiting", Vec::new())], &paused_settings())
             .await
             .expect("enqueue");
@@ -3860,7 +3947,7 @@ mod sqlite_tests {
     /// still wakes at its lease expiry so stale recovery can reclaim it.
     #[tokio::test]
     async fn paused_with_in_flight_row_wakes_at_lease_expiry() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         super::enqueue(
             &db,
             &[request("busy", Vec::new()), request("waiting", Vec::new())],
@@ -3881,7 +3968,7 @@ mod sqlite_tests {
     /// nothing — the queue fills until the unpause deploy.
     #[tokio::test]
     async fn submit_while_paused_enqueues_but_claims_nothing() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let inserted = super::enqueue(&db, &[request("waiting", Vec::new())], &paused_settings())
             .await
             .expect("enqueue while paused");
@@ -3899,7 +3986,7 @@ mod sqlite_tests {
     /// check turns it away.
     #[tokio::test]
     async fn paused_claim_still_recovers_stale_in_flight_row() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         super::enqueue(&db, &[request("busy", Vec::new())], &paused_settings())
             .await
             .expect("enqueue");
@@ -3920,7 +4007,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn eligible_pending_with_capacity_wakes_at_eligibility() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("ready", Vec::new())])
             .await
             .expect("enqueue");
@@ -3939,7 +4026,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn overdue_pending_with_capacity_wakes_now() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("ready", Vec::new())])
             .await
             .expect("enqueue");
@@ -3973,7 +4060,7 @@ mod sqlite_tests {
     /// Overwrite the cached token's `expires_at` with a `datetime()`
     /// modifier evaluated by `SQLite` itself — the value under test is
     /// stored in the RFC 3339 shape GitHub's API returns.
-    async fn set_cached_expiry(db: &DurableDb, modifier: &str) {
+    async fn set_cached_expiry(db: &MeteredDb, modifier: &str) {
         db.query("UPDATE github_app_token SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?) WHERE id = 1")
             .bind(modifier.to_owned())
             .execute()
@@ -3990,7 +4077,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn repeated_requests_do_not_overtake_older_pending_tasks() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("old", Vec::new())])
             .await
             .expect("enqueue old");
@@ -4015,7 +4102,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn newer_high_downloads_task_still_loses_to_older_first_seen() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("old", Vec::new())])
             .await
             .expect("enqueue old");
@@ -4038,7 +4125,7 @@ mod sqlite_tests {
     /// skipped row stays pending for the next pass.
     #[tokio::test]
     async fn macos_cap_skips_macos_rows_but_claims_other_families() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[
@@ -4080,7 +4167,7 @@ mod sqlite_tests {
     /// slowest in a wave, so they start first.
     #[tokio::test]
     async fn windows_tasks_claim_before_linux_within_a_lane() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request_on("lin", TARGET, Vec::new())])
             .await
             .expect("enqueue linux");
@@ -4106,7 +4193,7 @@ mod sqlite_tests {
     /// would spin the object in a zero-delay alarm loop.
     #[tokio::test]
     async fn saturated_macos_family_wakes_at_lease_expiry() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[
@@ -4134,7 +4221,7 @@ mod sqlite_tests {
     /// human-lane Linux row claims ahead of a miss-lane Windows row.
     #[tokio::test]
     async fn human_lane_still_claims_first_regardless_of_family() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
             .await
             .expect("enqueue windows");
@@ -4166,7 +4253,7 @@ mod sqlite_tests {
         // `runs-on`, so such a row could only ever become a dispatch that
         // dies before any job starts — no job, no log, no completion
         // report, and the slot held until the stale sweep reclaims it.
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let mut unrunnable = request("serde", Vec::new());
         unrunnable.target = "aarch64-unknown-linux-musl"
             .parse()
@@ -4187,7 +4274,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn panic_flag_round_trips_and_defaults_off() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         assert!(
             !super::panic_enabled(&db).await.expect("panic_enabled"),
             "panic flag defaults to off"
@@ -4200,7 +4287,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn a_ci_target_still_enters_the_queue() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
 
         let inserted = enqueue(&db, &[request("serde", Vec::new())])
             .await
@@ -4212,7 +4299,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn failed_task_re_request_respects_backoff_window() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("flaky", Vec::new())])
             .await
             .expect("enqueue");
@@ -4270,7 +4357,7 @@ mod sqlite_tests {
     /// claims rather than retiring.
     #[tokio::test]
     async fn human_rerequest_resurrects_completed_and_claims() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("stale-glibc", Vec::new())])
             .await
             .expect("enqueue");
@@ -4325,7 +4412,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn github_app_token_cache_reuses_fresh_token() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         assert!(
             super::github_app_token(&db).await.expect("read").is_none(),
             "empty cache yields no token"
@@ -4345,7 +4432,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn github_app_token_cache_drops_token_inside_refresh_margin() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         super::store_github_app_token(&db, &token())
             .await
             .expect("store");
@@ -4360,7 +4447,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn github_app_token_cache_drops_expired_token() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         super::store_github_app_token(&db, &token())
             .await
             .expect("store");
@@ -4373,7 +4460,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn github_app_token_store_overwrites_singleton_row() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         super::store_github_app_token(&db, &token())
             .await
             .expect("store first");
@@ -4405,7 +4492,7 @@ mod sqlite_tests {
     /// rebuilding the pool on a timer.
     #[tokio::test]
     async fn a_preheat_re_request_does_not_rebuild_a_completed_task() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
@@ -4451,7 +4538,7 @@ mod sqlite_tests {
     /// dispatching by hand.
     #[tokio::test]
     async fn a_preheat_re_request_retries_a_failed_task() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
@@ -4489,7 +4576,7 @@ mod sqlite_tests {
     /// oracle is asked only about plain crates.io rows.
     #[tokio::test]
     async fn claim_retires_tasks_the_catalog_already_covers() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[
@@ -4544,7 +4631,7 @@ mod sqlite_tests {
     /// thing deciding order is the lane.
     #[tokio::test]
     async fn human_task_dispatches_before_older_miss_task() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("missed", Vec::new())])
             .await
             .expect("enqueue miss");
@@ -4565,7 +4652,7 @@ mod sqlite_tests {
     /// minimum-age window; the same-age human task must be claimable now.
     #[tokio::test]
     async fn human_task_bypasses_dispatch_min_age() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("missed", Vec::new())])
             .await
             .expect("enqueue miss");
@@ -4586,7 +4673,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn human_rerequest_promotes_miss_task() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("asked", Vec::new())])
             .await
             .expect("enqueue miss");
@@ -4608,7 +4695,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn miss_rerequest_never_demotes_human_task() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[human_request("asked")])
             .await
             .expect("enqueue human");
@@ -4628,7 +4715,7 @@ mod sqlite_tests {
     /// min_age` like a miss task would.
     #[tokio::test]
     async fn pending_human_task_makes_alarm_eligible_now() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[human_request("asked")])
             .await
             .expect("enqueue human");
@@ -4661,7 +4748,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn status_reports_human_pending_separately() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[request("missed", Vec::new()), human_request("asked")],
@@ -4678,7 +4765,7 @@ mod sqlite_tests {
     /// task is first, the younger one second.
     #[tokio::test]
     async fn task_status_reports_human_lane_position() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[human_request("first"), human_request("second")])
             .await
             .expect("enqueue");
@@ -4702,7 +4789,7 @@ mod sqlite_tests {
     /// order `claim_dispatchable_tasks` dispatches in.
     #[tokio::test]
     async fn human_lane_position_ties_break_on_task_id() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[human_request("zed"), human_request("alpha")])
             .await
             .expect("enqueue");
@@ -4740,7 +4827,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn task_status_omits_position_outside_pending_human_lane() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("missed", Vec::new())])
             .await
             .expect("enqueue");
@@ -4765,7 +4852,7 @@ mod sqlite_tests {
     /// longer be exercised without a claim.
     #[tokio::test]
     async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
@@ -4827,7 +4914,7 @@ mod sqlite_tests {
     /// `StaleCompletion` (409 at the handler), never a silent success.
     #[tokio::test]
     async fn stale_report_for_a_superseded_attempt_leaves_the_live_row_untouched() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
@@ -4887,7 +4974,7 @@ mod sqlite_tests {
     /// stale-completion rejection answers it.
     #[tokio::test]
     async fn duplicate_report_for_the_current_attempt_conflicts() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
@@ -4921,7 +5008,7 @@ mod sqlite_tests {
     /// `record_published_slice` after `index publish` lands. The rows
     /// cover the shapes a native `(TARGET)` consumer's target-side dep
     /// edge requires: its own invocation, both kinds.
-    async fn publish(db: &DurableDb, crate_name: &str) {
+    async fn publish(db: &MeteredDb, crate_name: &str) {
         let rows = [UnitKind::Linked, UnitKind::Unlinked]
             .iter()
             .map(|kind| stow_types::api::PublishedSliceRow {
@@ -4939,7 +5026,7 @@ mod sqlite_tests {
     /// The same, carrying the row's unit shape — what `index report`
     /// sends once the publish path registers the builder-recorded shape
     /// (`None` is the legacy shapeless row that covers nothing).
-    async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: &[UnitShape]) {
+    async fn publish_shapes(db: &MeteredDb, crate_name: &str, target: &str, shapes: &[UnitShape]) {
         let rows = shapes
             .iter()
             .map(|shape| stow_types::api::PublishedSliceRow {
@@ -4960,7 +5047,7 @@ mod sqlite_tests {
     /// the signed index, and only a publish makes it appear there.
     #[tokio::test]
     async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
@@ -4997,7 +5084,7 @@ mod sqlite_tests {
     /// the gate holds the parent until a build and a publish land.
     #[tokio::test]
     async fn dependent_waits_while_a_failed_dependency_retries() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
@@ -5030,7 +5117,7 @@ mod sqlite_tests {
     /// to `pending`, since `blocked` is derived, never stored.
     #[tokio::test]
     async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
@@ -5108,7 +5195,7 @@ mod sqlite_tests {
     /// reports `pending`, never `blocked`. Only an unmet edge blocks.
     #[tokio::test]
     async fn dependent_is_not_blocked_by_a_failed_dependency_the_slice_already_serves() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
@@ -5138,7 +5225,7 @@ mod sqlite_tests {
     /// deadlock.
     #[tokio::test]
     async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
@@ -5189,7 +5276,7 @@ mod sqlite_tests {
     /// the new report no longer carries must not keep the gate open.
     #[tokio::test]
     async fn republishing_a_slice_replaces_its_membership() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("parent", vec![dependency("dep")])])
             .await
             .expect("enqueue parent");
@@ -5219,7 +5306,7 @@ mod sqlite_tests {
     /// publishes — does not (stow#349).
     #[tokio::test]
     async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let host_dep = EnqueueDependency {
             crate_name: "heck".parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
@@ -5280,7 +5367,7 @@ mod sqlite_tests {
     /// derive failure reported (stow#349).
     #[tokio::test]
     async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let host_dep = EnqueueDependency {
             crate_name: "heck".parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
@@ -5333,7 +5420,7 @@ mod sqlite_tests {
     /// missing either leaves the dependent held.
     #[tokio::test]
     async fn a_host_side_dependent_needs_both_shapes_of_a_host_dep() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let host_dep = EnqueueDependency {
             crate_name: "heck".parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
@@ -5390,7 +5477,7 @@ mod sqlite_tests {
     /// one chunk must still record whole, including the partial tail.
     #[tokio::test]
     async fn a_larger_slice_reports_through_every_insert_chunk() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let rows = (0..(super::PUBLISHED_SLICE_INSERT_BATCH_SIZE + 3))
             .flat_map(|index| {
                 [UnitKind::Linked, UnitKind::Unlinked].map(|kind| {
@@ -5426,7 +5513,7 @@ mod sqlite_tests {
     /// include a crate the report never named.
     #[tokio::test]
     async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         publish(&db, "dep").await;
 
         // Simulate a crashed second report: rows land at a generation
@@ -5482,7 +5569,7 @@ mod sqlite_tests {
     /// forever, and the report says why.
     #[tokio::test]
     async fn an_unresolvable_dependency_edge_reports_blocked_with_unknown_identity() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("parent", vec![dependency("dep")])])
             .await
             .expect("enqueue parent");
@@ -5524,7 +5611,7 @@ mod sqlite_tests {
     /// submits away; human-lane and trusted submits still get in.
     #[tokio::test]
     async fn full_queue_refuses_miss_lane_but_not_human_or_trusted() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let cap_settings = SchedulerSettings {
             max_queue_pending: 2,
             ..settings()
@@ -5558,7 +5645,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn human_daily_budget_refuses_the_submit_that_would_exceed_it() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let budget_settings = SchedulerSettings {
             human_daily_task_budget: 3,
             ..settings()
@@ -5622,7 +5709,7 @@ mod sqlite_tests {
     /// rejected.
     #[tokio::test]
     async fn tasks_status_surfaces_lockfile() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let mut locked = request("locked", Vec::new());
         locked.preserve_lockfile = true;
         enqueue(&db, &[request("plain", Vec::new()), locked])
@@ -5666,7 +5753,7 @@ mod sqlite_tests {
     }
 
     /// One column of one queue row, for post-mutation assertions.
-    async fn row_column(db: &DurableDb, crate_name: &str, column: &str) -> String {
+    async fn row_column(db: &MeteredDb, crate_name: &str, column: &str) -> String {
         db.query(&format!("SELECT {column} FROM queue WHERE task_id = ?"))
             .bind(task_id_on(crate_name, TARGET))
             .fetch_scalar::<String>()
@@ -5675,7 +5762,7 @@ mod sqlite_tests {
     }
 
     /// Whether a queue row exists at all — purge assertions.
-    async fn row_exists(db: &DurableDb, crate_name: &str) -> bool {
+    async fn row_exists(db: &MeteredDb, crate_name: &str) -> bool {
         db.query("SELECT count(*) FROM queue WHERE task_id = ?")
             .bind(task_id_on(crate_name, TARGET))
             .fetch_scalar::<i64>()
@@ -5686,7 +5773,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn list_tasks_filters_by_status_crate_and_ids() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[request("alpha", Vec::new()), request("beta", Vec::new())],
@@ -5728,7 +5815,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn retry_returns_failed_rows_to_pending() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[request("alpha", Vec::new()), request("beta", Vec::new())],
@@ -5761,7 +5848,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn cancel_fails_pending_and_dispatched_rows() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[
@@ -5808,7 +5895,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn promote_moves_miss_lane_pending_to_human() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let mut human = request("human", Vec::new());
         human.source = EnqueueSource::HumanRequest;
         enqueue(
@@ -5842,7 +5929,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn purge_deletes_only_old_terminal_rows() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[
@@ -5895,7 +5982,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn mutations_reject_an_empty_selector() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("alpha", Vec::new())])
             .await
             .expect("enqueue");
@@ -5911,7 +5998,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn observe_run_stamps_only_in_flight_rows() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(
             &db,
             &[request("alpha", Vec::new()), request("beta", Vec::new())],
@@ -5939,7 +6026,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn admin_status_reports_lanes_in_flight_and_targets() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let mut human = request("human", Vec::new());
         human.source = EnqueueSource::HumanRequest;
         enqueue(
@@ -6040,7 +6127,7 @@ mod sqlite_tests {
             host_side: i64,
             shape_requeue: i64,
         }
-        let db = memory_db_raw().await.expect("raw memory db");
+        let db = MeteredDb::new(memory_db_raw().await.expect("raw memory db"));
         for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
             db.query(statement).execute().await.expect("dev-era ddl");
         }
@@ -6241,7 +6328,7 @@ mod sqlite_tests {
         }
         const CROSS: &str = "aarch64-unknown-linux-gnu";
         const WASM: &str = "wasm32-unknown-unknown";
-        let db = memory_db_raw().await.expect("raw memory db");
+        let db = MeteredDb::new(memory_db_raw().await.expect("raw memory db"));
         for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
             db.query(statement).execute().await.expect("dev-era ddl");
         }
@@ -6311,7 +6398,7 @@ mod sqlite_tests {
     /// real side, which is what a re-request carrying `depends_on` does.
     #[tokio::test]
     async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
@@ -6363,7 +6450,7 @@ mod sqlite_tests {
     /// uncovered second completion does not loop the rebuild.
     #[tokio::test]
     async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         enqueue(&db, &[request("dep", Vec::new())])
             .await
             .expect("enqueue dep");
@@ -6427,7 +6514,7 @@ mod sqlite_tests {
         request_count: i64,
     }
 
-    async fn queue_counters(db: &DurableDb, crate_name: &str) -> QueueCounters {
+    async fn queue_counters(db: &MeteredDb, crate_name: &str) -> QueueCounters {
         db.query("SELECT status, attempt, request_count FROM queue WHERE task_id = ?")
             .bind(task_id_on(crate_name, TARGET))
             .fetch_one::<QueueCounters>()
@@ -6437,7 +6524,7 @@ mod sqlite_tests {
 
     /// Seed a row as failed with known counters so the assertions about
     /// what one chunk did to it are exact.
-    async fn seed_failed(db: &DurableDb, crate_name: &str, attempt: i64, request_count: i64) {
+    async fn seed_failed(db: &MeteredDb, crate_name: &str, attempt: i64, request_count: i64) {
         enqueue(db, &[request(crate_name, Vec::new())])
             .await
             .expect("seed enqueue");
@@ -6461,7 +6548,7 @@ mod sqlite_tests {
     /// named it. The batched requeue must land the same.
     #[tokio::test]
     async fn a_chunk_revives_a_failed_dependency_once_for_many_parents() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         seed_failed(&db, "dep", 7, 5).await;
 
         enqueue(
@@ -6490,7 +6577,7 @@ mod sqlite_tests {
     /// nothing — net +1/+1, the row pending.
     #[tokio::test]
     async fn dep_request_before_its_parent_in_one_chunk() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         seed_failed(&db, "dep", 7, 5).await;
 
         enqueue(
@@ -6520,7 +6607,7 @@ mod sqlite_tests {
     /// differs — see `dep_request_before_its_parent_in_one_chunk`).
     #[tokio::test]
     async fn parent_request_before_its_failed_dep_in_one_chunk() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         seed_failed(&db, "dep", 7, 5).await;
 
         enqueue(
@@ -6552,6 +6639,7 @@ mod sqlite_tests {
     #[tokio::test]
     async fn a_submit_chunk_issues_a_constant_statement_count() {
         let (db, log) = counting_memory_db().await.expect("counting db");
+        let db = MeteredDb::new(db);
         let requests: Vec<EnqueueRequest> = (0..1000)
             .map(|i| {
                 request(
@@ -6592,7 +6680,7 @@ mod sqlite_tests {
     /// one — `Some((step, error, run_id))` fails it, `None` succeeds —
     /// leaving exactly `count` rows in `attempt_outcomes`.
     async fn seed_outcomes(
-        db: &DurableDb,
+        db: &MeteredDb,
         batch: u32,
         count: usize,
         target: &str,
@@ -6626,15 +6714,9 @@ mod sqlite_tests {
         stow_types::api::DispatchFreezeRecord {
             frozen_at: "2026-09-22T03:51:00Z".to_owned(),
             trigger: stow_types::api::DispatchFreezeTrigger::Manual,
-            notify: stow_types::api::AlertOutcome {
-                email: stow_types::api::ChannelOutcome::Disabled {
-                    reason: "test".to_owned(),
-                },
-                issue: stow_types::api::ChannelOutcome::Disabled {
-                    reason: "test".to_owned(),
-                },
+            notify: stow_types::api::ChannelOutcome::Disabled {
+                reason: "test".to_owned(),
             },
-            digested_at: None,
         }
     }
 
@@ -6642,7 +6724,7 @@ mod sqlite_tests {
     /// reports true, delete clears both.
     #[tokio::test]
     async fn freeze_record_roundtrips_and_deletes() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         assert!(super::freeze_record(&db).await.expect("read").is_none());
         assert!(!super::freeze_enabled(&db).await.expect("enabled"));
 
@@ -6660,37 +6742,12 @@ mod sqlite_tests {
         assert!(super::freeze_record(&db).await.expect("read").is_none());
     }
 
-    /// The digest-due comparison lives in SQLite `strftime`, which must
-    /// read the record's ISO strings: an old `frozen_at` is due, a
-    /// `digested_at` newer than the window resets it, and no record is
-    /// simply not due.
-    #[tokio::test]
-    async fn freeze_digest_due_reads_iso_timestamps() {
-        let db = memory_db().await.expect("memory db");
-        assert!(!super::freeze_digest_due(&db, 60).await.expect("due"));
-
-        let record = freeze_record_fixture(); // frozen_at is 2026 — past
-        super::set_freeze(&db, &record).await.expect("set");
-        assert!(
-            super::freeze_digest_due(&db, 60).await.expect("due"),
-            "a freeze days old is digest-due"
-        );
-
-        let mut stamped = record;
-        stamped.digested_at = Some("9999-01-01T00:00:00Z".to_owned());
-        super::set_freeze(&db, &stamped).await.expect("stamp");
-        assert!(
-            !super::freeze_digest_due(&db, 60).await.expect("due"),
-            "a future digested_at is not due"
-        );
-    }
-
     /// While frozen, claim returns nothing and enqueue keeps accepting —
     /// and `next_alarm` plans `Delete` so no dispatch pass even wakes.
     /// Clearing restores dispatch.
     #[tokio::test]
     async fn freeze_gates_dispatch_but_not_enqueue_and_clear_resumes() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         super::set_freeze(&db, &freeze_record_fixture())
             .await
             .expect("set freeze");
@@ -6723,7 +6780,7 @@ mod sqlite_tests {
     /// a retried task keeps every failed attempt inside the window.
     #[tokio::test]
     async fn evaluate_freeze_trip_reads_attempt_outcomes() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let freeze = crate::freeze::FreezeSettings {
             window_minutes: 60,
             min_outcomes: 10,
@@ -6790,7 +6847,7 @@ mod sqlite_tests {
     /// stream even when the fleet aggregate stays under the ratio.
     #[tokio::test]
     async fn evaluate_freeze_trip_trips_a_single_target_stream() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let freeze = crate::freeze::FreezeSettings {
             window_minutes: 60,
             min_outcomes: 10,
@@ -6830,7 +6887,7 @@ mod sqlite_tests {
     /// outcomes*fail_percent` at the sample floor.
     #[tokio::test]
     async fn freeze_trip_boundary_is_inclusive() {
-        let db = memory_db().await.expect("memory db");
+        let db = metered_db().await.expect("memory db");
         let freeze = crate::freeze::FreezeSettings {
             window_minutes: 60,
             min_outcomes: 10,

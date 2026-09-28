@@ -197,3 +197,25 @@ CREATE TABLE IF NOT EXISTS rust_stable_channel (
     version TEXT NOT NULL,
     fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- The dispatch-freeze transition log the watchdog (#450) turns into the
+-- `incident` issue record: one append-only row per engage/clear so a
+-- recorder that missed a transition still sees it. `trigger` is the
+-- serialized DispatchFreezeTrigger — set on engage and echoed on clear
+-- (the cleared record's trigger).
+CREATE TABLE IF NOT EXISTS dispatch_freeze_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    event TEXT NOT NULL, -- 'engaged' | 'cleared'
+    trigger TEXT         -- serialized DispatchFreezeTrigger, NULL when unknown
+);
+
+-- The DO's own billed SQL work, per UTC day — the self-meter the
+-- event-driven cost trip reads (GraphQL analytics used to do this on a
+-- cron; the DO sees its own cursor rowsRead/rowsWritten immediately and
+-- for free). Two statements per request max: one upsert, one read.
+CREATE TABLE IF NOT EXISTS do_meter (
+    day TEXT PRIMARY KEY,
+    rows_read INTEGER NOT NULL,
+    rows_written INTEGER NOT NULL
+);

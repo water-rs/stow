@@ -697,38 +697,47 @@ keeps registering and completing builds and the operator can always flip
 the switch back off.
 
 The panic switch protects the worker; the **dispatch freeze** protects the
-runner allowance and the Cloudflare bill. Two instruments engage the same
-flag: the scheduler Durable Object counts terminal attempt outcomes (the
-append-only `attempt_outcomes` table — one row per completion report, so
-retried attempts keep counting) over a trailing window and trips when a
-stream — the fleet aggregate, or any single target — reaches both the
+runner allowance and the Cloudflare bill. The object is event-driven —
+nothing polls, nothing wakes on a timer: two trips evaluate on the events
+that change their inputs. A completion report (`/complete`) lands one row
+in the append-only `attempt_outcomes` table — retried attempts keep
+counting — and the object counts that trailing window and trips when a
+stream (the fleet aggregate, or any single target) reaches both the
 minimum sample and the failure ratio (never either alone: a bare ratio
 false-positives on tiny samples, a bare count trips constantly at high
-volume); and a `*/10 * * * *` scheduled handler reads the day's account
-usage off the GraphQL Analytics API, posting an over-budget verdict to
-the DO, which trips the same freeze and flips panic too — a cost wave can
-arrive on trusted traffic the panic gate never sees. On a trip the object
-writes a `dispatch_freeze` record into `settings` — a different flag,
-storage key, and purpose from `panic` — and `dispatch_pending` gates on
-it, so the queue keeps accepting misses while nothing more is handed to
-runners. While frozen, the work-submitting routes (`tasks/submit/trusted`,
-`admin/preheat`, `admin/resolve/*`) answer 503 naming the trigger; the
-`complete`/`register` reports stay open so in-flight builds still land.
-Recovery is manual only: `POST /api/v1/admin/dispatch-freeze`
-(`stow-admin dispatch-freeze clear --yes`) lifts the freeze and
-immediately resumes dispatch, while `dispatch-freeze status` shows the
-trigger and the alert outcome. Each state change sends one alert —
-freeze and clear — fanned out to both channels: an email through the
-`send_email` binding, and a GitHub `incident`-labelled issue on
-`GITHUB_REPO` (opened by title prefix, commented at most hourly while
-open, commented and closed on resolve), naming the counts, window,
+volume). The cost trip is self-metered: `MeteredDb` wraps the object's
+`DurableDb` and reads `rowsRead`/`rowsWritten` off every statement's
+cursor — the exact counters Cloudflare bills on — and a per-request
+settle folds them into the `do_meter` day row; the moment a UTC day's
+totals pass (the monthly included allowance / 30 ×
+`STOW_COST_BUDGET_MULTIPLIER`), dispatch freezes on the operation that
+crossed it. Cost trips also flip the panic switch — a cost wave can
+arrive on trusted traffic the panic gate never sees. On a trip the
+object writes a `dispatch_freeze` record into `settings` — a different
+flag, storage key, and purpose from `panic` — and `dispatch_pending`
+gates on it, so the queue keeps accepting misses while nothing more is
+handed to runners. While frozen, the work-submitting routes
+(`tasks/submit/trusted`, `admin/preheat`, `admin/resolve/*`) answer 503
+naming the trigger; the `complete`/`register` reports stay open so
+in-flight builds still land. Recovery is manual only:
+`POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
+--yes`) lifts the freeze and immediately resumes dispatch, while
+`dispatch-freeze status` shows the trigger, the alert outcome, and the
+transition log (engaged/cleared events with their triggers).
+
+Alerting is split by who owns the fact. The edge sends **email only** —
+one transition mail per change through the `send_email` binding
+(`alerts@stow.waterui.dev` → `me@lexo.cool`), naming the counts, window,
 dominant failure classes (`step: error-prefix`), and example Actions
-run URLs. While a freeze stays open, the scheduled run's
-`incident-digest` tick posts at most one digest an hour (`digested_at`
-on the record is the guard). Either channel's failure is recorded in
-the issue and on the freeze record rather than breaking the freeze —
-the issue path reuses the `stow-ci` App's installation token, so it
-needs **Issues: Read and write** on top of Actions.
+run URLs. The `incident`-labelled issue record is the external
+watchdog's (#450): it runs in Actions with `issues: write`, reads the
+freeze state and transition log off the admin route every 15 minutes,
+writes and closes the issue, and posts the hourly still-frozen digest —
+the edge's `stow-ci` App token carries no `issues` grant by design (the
+edge is untrusted serving infrastructure). Account-wide cost and
+edge-health signals (request error rate, exceeded CPU/memory, usage
+percentages) are the watchdog's too — the GraphQL Analytics API is only
+read from Actions, never from the edge.
 
 ## Tunables (Cloudflare bindings)
 
@@ -754,7 +763,7 @@ is unset or malformed.
 | `STOW_FREEZE_WINDOW_MINUTES` | `60` | Trailing window the dispatch-freeze trip counts terminal outcomes over; long enough to see the measured failure-wave rate decisively, short enough that a stale burst cannot haunt the next day |
 | `STOW_FREEZE_MIN_OUTCOMES` | `50` | Sample floor for the trip condition: a stream (fleet aggregate or one target) must record this many terminal outcomes in the window before its failure ratio is read — below it nothing trips however bad the ratio |
 | `STOW_FREEZE_FAIL_PERCENT` | `50` | Failure ratio (percent) a sufficiently-sampled stream must reach to freeze dispatch; the trip needs both the sample floor and this ratio, never either alone |
-| `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Multiplies every daily budget the scheduled cost check evaluates (Workers Paid monthly allowances / 30) |
+| `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Scales the scheduler object's self-metered daily SQL budget (Workers Paid monthly allowances / 30) — the trip fires on the operation that crosses it |
 | `STOW_ALERT_FROM` | `alerts@stow.waterui.dev` | Sender address of freeze-transition alert emails; must live on a domain onboarded and Enabled under Compute → Email Service → Email Sending (`E_SENDER_NOT_VERIFIED` otherwise) |
 | `STOW_ALERT_TO` | `me@lexo.cool` | Recipient of the freeze + clear transition emails |
 | `STOW_ALERT_EMAIL` (`send_email` binding) | declared in `Skyzen.toml` only | Email Service send binding the transition alerts go through; the mock/local manifests deliberately omit it so their alert path resolves to `Disabled` and can never reach Cloudflare's sending API |

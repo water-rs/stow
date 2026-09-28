@@ -26,8 +26,8 @@ use std::fmt::Write as _;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use stow_types::api::{
-    AdminStatus, AlertOutcome, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger,
-    EnqueueRequest, PanicSwitch, SchedulerSubmitResponse,
+    AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, EnqueueRequest,
+    FreezeTransitionEvent, PanicSwitch, SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -526,6 +526,7 @@ async fn dispatch_freeze_switch(
     let plan = DispatchFreeze {
         enabled: false,
         record: None,
+        transitions: Vec::new(),
     };
     render::mutation(
         output,
@@ -546,14 +547,28 @@ async fn dispatch_freeze_switch(
     .await
 }
 
-/// Human rendering of the freeze state — the flag line plus the stored
-/// record's trigger and alert outcome when engaged.
+/// Human rendering of the freeze state — the flag line, the stored
+/// record's trigger and alert outcome, and the transition log the
+/// incident record is written from.
 fn render_freeze(switch: &DispatchFreeze) -> String {
     let mut out = format!("freeze {}", if switch.enabled { "on" } else { "off" });
     if let Some(record) = &switch.record {
         let _ = write!(out, "\n  frozen at  {}", record.frozen_at);
         let _ = write!(out, "\n  trigger    {}", summarize_trigger(&record.trigger));
         let _ = write!(out, "\n  alert      {}", summarize_notify(&record.notify));
+    }
+    if !switch.transitions.is_empty() {
+        out.push_str("\n  transitions (newest first):");
+        for transition in &switch.transitions {
+            let event = match transition.event {
+                FreezeTransitionEvent::Engaged => "engaged",
+                FreezeTransitionEvent::Cleared => "cleared",
+            };
+            let _ = write!(out, "\n    {} {}", transition.at, event);
+            if let Some(trigger) = &transition.trigger {
+                let _ = write!(out, " — {}", summarize_trigger(trigger));
+            }
+        }
     }
     out
 }
@@ -593,19 +608,10 @@ fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
     }
 }
 
-/// One-line summary of a stored alert outcome — both channels shown;
-/// a failure is shouted, not summarized away.
-fn summarize_notify(notify: &AlertOutcome) -> String {
-    format!(
-        "email: {} · issue: {}",
-        summarize_channel(&notify.email),
-        summarize_channel(&notify.issue),
-    )
-}
-
-/// One channel's outcome as one clause.
-fn summarize_channel(channel: &ChannelOutcome) -> String {
-    match channel {
+/// One-line summary of the stored alert outcome — a failure is
+/// shouted, not summarized away.
+fn summarize_notify(notify: &ChannelOutcome) -> String {
+    match notify {
         ChannelOutcome::Sent { message_id } => message_id
             .as_ref()
             .map_or_else(|| "sent".to_owned(), |id| format!("sent (messageId {id})")),

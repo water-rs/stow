@@ -43,13 +43,18 @@
 //! Everything here is platform-free: the trip decisions, the alert-body
 //! rendering, and the outcome interpretation are unit-testable on the
 //! host without a Worker. The wasm glue lives in `scheduler/object.rs`
-//! (gate + evaluation points), `email.rs` (the `send_email` binding
-//! call), and `incidents.rs` (the GitHub issues channel); the usage
-//! fetch lives in `cost.rs`.
+//! (gate + evaluation points) and `email.rs` (the `send_email` binding
+//! call the alert sink lives on); the usage fetch lives in `cost.rs`.
+//!
+//! Alerting is email-only on the edge: the edge's GitHub App token
+//! deliberately carries no `issues` grant (untrusted serving
+//! infrastructure), so the `incident`-issue record is the #450
+//! watchdog's job — it reads the freeze state and its transition log
+//! over the admin route.
 
 use askama::Template;
 use stow_types::api::{
-    AlertOutcome, ChannelOutcome, DispatchFreezeCost, DispatchFreezeRecord, DispatchFreezeTarget,
+    ChannelOutcome, DispatchFreezeCost, DispatchFreezeRecord, DispatchFreezeTarget,
     DispatchFreezeTrigger, DispatchFreezeTrip,
 };
 use stow_types::identity::TargetTriple;
@@ -81,12 +86,6 @@ pub const DEFAULT_FREEZE_FAIL_PERCENT: u32 = 50;
 pub const DEFAULT_ALERT_FROM: &str = "alerts@stow.waterui.dev";
 /// Default for `STOW_ALERT_TO` — where freeze/clear alerts go.
 pub const DEFAULT_ALERT_TO: &str = "me@lexo.cool";
-
-/// The incident-issue dedup key for dispatch-freeze alerts — rendered
-/// into the title prefix `[incident] dispatch-freeze:` the open-issue
-/// lookup matches on, so a re-engaged freeze reuses rather than
-/// duplicates its issue.
-pub const FREEZE_INCIDENT_KEY: &str = "dispatch-freeze";
 
 /// The operator-facing name of the clear command — the alert emails and
 /// the stored-record summaries point at it.
@@ -311,13 +310,6 @@ pub fn freeze_subject(trigger: &DispatchFreezeTrigger) -> String {
 /// The clear-transition subject.
 pub const FREEZE_CLEARED_SUBJECT: &str = "[stow] dispatch freeze cleared";
 
-/// Subject of the hourly digest while a freeze stays open.
-pub const FREEZE_DIGEST_SUBJECT: &str = "[stow] dispatch freeze — still frozen";
-
-/// Minimum gap between digest sends while a freeze stays open — the
-/// "at most one an hour" rule.
-pub const FREEZE_DIGEST_MINUTES: u32 = 60;
-
 /// The actionable hint a known `send_email` error code gets — the
 /// failure modes a configuration can actually cause, each naming the
 /// setting or console surface that owns it.
@@ -392,27 +384,17 @@ pub fn summarize_channel(outcome: &ChannelOutcome) -> String {
     }
 }
 
-/// One-line summary of a stored notify outcome — both channels — for
-/// the cleared alert and `stow-admin dispatch-freeze status`.
+/// One-line summary of a stored notify outcome — for the cleared
+/// alert and `stow-admin dispatch-freeze status`.
 #[must_use]
-pub fn summarize_notify(notify: &AlertOutcome) -> String {
-    format!(
-        "email {}; issue {}",
-        summarize_channel(&notify.email),
-        summarize_channel(&notify.issue)
-    )
+pub fn summarize_notify(notify: &ChannelOutcome) -> String {
+    format!("email {}", summarize_channel(notify))
 }
 
-/// Whether either channel actually reached a human-readable surface.
+/// Whether the channel actually reached a human-readable surface.
 #[must_use]
-pub const fn notify_reached(notify: &AlertOutcome) -> bool {
-    matches!(notify.email, ChannelOutcome::Sent { .. })
-        || matches!(
-            notify.issue,
-            ChannelOutcome::Opened { .. }
-                | ChannelOutcome::Commented { .. }
-                | ChannelOutcome::Resolved { .. }
-        )
+pub const fn notify_reached(notify: &ChannelOutcome) -> bool {
+    matches!(notify, ChannelOutcome::Sent { .. })
 }
 
 /// One-line summary of a stored trigger, for the cleared alert and
@@ -527,50 +509,26 @@ struct FreezeAlertHtmlTemplate<'a> {
     status_command: &'a str,
 }
 
-/// Incident-issue title — the dedup prefix `[incident] {key}:` the
-/// issue lookup matches, so title changes after the colon never fork
-/// the record.
-#[derive(Template)]
-#[template(source = "[incident] {{ key }}: {{ summary }}", ext = "txt")]
-struct IncidentTitle<'a> {
-    key: &'a str,
-    summary: &'a str,
-}
+/// The incident key the freeze's alert and record live under — shared
+/// with the watchdog's `incident` issue (`[incident] dispatch-freeze:`
+/// on the title), which is the watchdog's to write, not the edge's.
+pub const FREEZE_INCIDENT_KEY: &str = stow_types::api::DISPATCH_FREEZE_INCIDENT_KEY;
 
-/// Render the `[incident] {key}: {summary}` issue title.
-pub fn incident_title(key: &'static str, summary: &str) -> Result<String, askama::Error> {
-    IncidentTitle { key, summary }.render()
-}
-
-/// One rendered alert — every channel sends from this: the email
-/// takes `subject`/`body`/`html`, the issue takes `title`/`body`.
+/// One rendered alert — the email takes `subject`/`body`/`html`; the
+/// watchdog composes its own issue title from `key` plus the freeze
+/// state it reads over the admin route.
 #[derive(Debug, Clone)]
 pub struct AlertDraft {
-    /// The incident dedup key — `[incident] {key}` on the issue title.
+    /// The incident key — the watchdog's dedup anchor and the log's
+    /// signal identity.
+    #[allow(dead_code)] // the fault-signal sinks (#438) dedupe on it
     pub key: &'static str,
     /// Email subject.
     pub subject: String,
-    /// Incident-issue title.
-    pub title: String,
-    /// Markdown body — the issue post and the email's `text` part.
+    /// Markdown body — the email's `text` part.
     pub body: String,
-    /// HTML body — the email's `html` part (unused by the issue).
+    /// HTML body — the email's `html` part.
     pub html: String,
-}
-
-/// The short phrase the freeze incident's title carries after the
-/// dedup prefix.
-fn freeze_title_summary(trigger: &DispatchFreezeTrigger) -> String {
-    match trigger {
-        DispatchFreezeTrigger::Manual => "manual engagement".to_owned(),
-        DispatchFreezeTrigger::Tripped(_) => "systematic build failures".to_owned(),
-        DispatchFreezeTrigger::Cost(cost) => {
-            format!(
-                "cost trip — {} over daily budget",
-                metric_label(cost.metric)
-            )
-        }
-    }
 }
 
 fn trip_context(trip: &DispatchFreezeTrip) -> TripContext<'_> {
@@ -629,11 +587,9 @@ pub fn render_freeze_alert(
             Ok((body, html))
         };
     let (body, html) = render_bodies(trigger)?;
-    let title = incident_title(FREEZE_INCIDENT_KEY, &freeze_title_summary(trigger))?;
     Ok(AlertDraft {
         key: FREEZE_INCIDENT_KEY,
         subject: freeze_subject(trigger),
-        title,
         body,
         html,
     })
@@ -667,7 +623,7 @@ pub fn render_freeze_cleared(
     frozen_at: &str,
     cleared_at: &str,
     trigger: &DispatchFreezeTrigger,
-    notify: &AlertOutcome,
+    notify: &ChannelOutcome,
 ) -> Result<AlertDraft, askama::Error> {
     let trigger_summary = summarize_trigger(trigger);
     let notify_summary = summarize_notify(notify);
@@ -685,67 +641,9 @@ pub fn render_freeze_cleared(
         notify_summary: &notify_summary,
     }
     .render()?;
-    let title = incident_title(FREEZE_INCIDENT_KEY, "resolved")?;
     Ok(AlertDraft {
         key: FREEZE_INCIDENT_KEY,
         subject: FREEZE_CLEARED_SUBJECT.to_owned(),
-        title,
-        body,
-        html,
-    })
-}
-
-/// Askama context for `templates/freeze_digest.txt` — the hourly
-/// still-frozen comment's markdown body / the digest mail's `text`.
-#[derive(Template)]
-#[template(path = "freeze_digest.txt")]
-struct FreezeDigestTemplate<'a> {
-    frozen_at: &'a str,
-    now: &'a str,
-    trigger_summary: &'a str,
-    clear_command: &'a str,
-    status_command: &'a str,
-}
-
-/// Askama context for `templates/freeze_digest.html`.
-#[derive(Template)]
-#[template(path = "freeze_digest.html")]
-struct FreezeDigestHtmlTemplate<'a> {
-    frozen_at: &'a str,
-    now: &'a str,
-    trigger_summary: &'a str,
-    clear_command: &'a str,
-    status_command: &'a str,
-}
-
-/// Render the hourly digest — the issue comment that shows the
-/// incident is still live, and the matching digest mail.
-pub fn render_freeze_digest(
-    record: &DispatchFreezeRecord,
-    now: &str,
-) -> Result<AlertDraft, askama::Error> {
-    let trigger_summary = summarize_trigger(&record.trigger);
-    let body = FreezeDigestTemplate {
-        frozen_at: &record.frozen_at,
-        now,
-        trigger_summary: &trigger_summary,
-        clear_command: CLEAR_COMMAND,
-        status_command: STATUS_COMMAND,
-    }
-    .render()?;
-    let html = FreezeDigestHtmlTemplate {
-        frozen_at: &record.frozen_at,
-        now,
-        trigger_summary: &trigger_summary,
-        clear_command: CLEAR_COMMAND,
-        status_command: STATUS_COMMAND,
-    }
-    .render()?;
-    let title = incident_title(FREEZE_INCIDENT_KEY, "still frozen")?;
-    Ok(AlertDraft {
-        key: FREEZE_INCIDENT_KEY,
-        subject: FREEZE_DIGEST_SUBJECT.to_owned(),
-        title,
         body,
         html,
     })
@@ -768,53 +666,25 @@ pub trait FreezeStore {
     fn delete(&self) -> impl Future<Output = Result<(), QueueError>> + Send;
 }
 
-/// Alert seam for the transition coordinator: the wasm impl fans a
-/// draft out to both channels — the Email Sending notify and the
-/// GitHub `incident` issue record — with each outcome independent of
-/// the other's failure. Host tests count calls.
+/// Alert seam for the transition coordinator: the wasm impl sends the
+/// draft through Email Sending. Host tests count calls.
 ///
-/// Every call reports an [`AlertOutcome`], never an error: a missing
+/// Every call reports a [`ChannelOutcome`], never an error: a missing
 /// binding or a failed API call comes back inside the outcome so
 /// alerting can never wedge a transition (the outcome lands on the
-/// freeze record).
+/// freeze record). The `incident` issue record is not this sink's job
+/// — the #450 watchdog records it from the freeze status and its
+/// transition log; the edge's App token has no `issues` grant.
 pub trait AlertSink {
-    /// An incident opened — email the draft and open-or-comment the
-    /// `incident`-labelled issue whose title starts `[incident] {key}:`.
-    fn opened(&self, draft: &AlertDraft) -> impl Future<Output = AlertOutcome> + Send;
-    /// The incident is still open — an hourly digest comment on its
-    /// issue (email digest rides the same cadence).
-    fn updated(&self, draft: &AlertDraft) -> impl Future<Output = AlertOutcome> + Send;
-    /// The incident cleared — email the summary, then comment the
-    /// issue and close it.
-    fn resolved(&self, draft: &AlertDraft) -> impl Future<Output = AlertOutcome> + Send;
-}
-
-/// The digest half of the transition coordinator: while a freeze is
-/// live, `digest_due` (answered in SQL by the store's backend, since
-/// ISO timestamps compare cleanly there) says whether the last
-/// notification is `FREEZE_DIGEST_MINUTES` old. When it is, one
-/// `sink.updated` goes out and `digested_at` stamps `now` — the open
-/// alert's own `notify` outcome is left on the record untouched.
-#[allow(clippy::future_not_send)]
-pub async fn maybe_digest(
-    store: &impl FreezeStore,
-    digest_due: bool,
-    sink: &impl AlertSink,
-    now: &str,
-) -> Result<Option<AlertOutcome>, QueueError> {
-    let Some(record) = store.record().await? else {
-        return Ok(None);
-    };
-    if !digest_due {
-        return Ok(None);
-    }
-    let draft = render_freeze_digest(&record, now)
-        .map_err(|error| QueueError::Invariant(format!("render freeze digest: {error}")))?;
-    let outcome = sink.updated(&draft).await;
-    let mut stamped = record;
-    stamped.digested_at = Some(now.to_owned());
-    store.set(&stamped).await?;
-    Ok(Some(outcome))
+    /// An incident opened — email the draft.
+    fn opened(&self, draft: &AlertDraft) -> impl Future<Output = ChannelOutcome> + Send;
+    /// The incident is still open — a digest/update send. The freeze's
+    /// digest is the watchdog's (#450); fault signals (#438) still use
+    /// this verb edge-side.
+    #[allow(dead_code)]
+    fn updated(&self, draft: &AlertDraft) -> impl Future<Output = ChannelOutcome> + Send;
+    /// The incident cleared — email the summary.
+    fn resolved(&self, draft: &AlertDraft) -> impl Future<Output = ChannelOutcome> + Send;
 }
 
 /// What an operator/command asks the freeze to do.
@@ -863,30 +733,18 @@ pub async fn apply_transition(
             let mut record = DispatchFreezeRecord {
                 frozen_at: now.to_owned(),
                 trigger,
-                notify: AlertOutcome {
-                    email: ChannelOutcome::Disabled {
-                        reason: "alert render failed".to_owned(),
-                    },
-                    issue: ChannelOutcome::Disabled {
-                        reason: "alert render failed".to_owned(),
-                    },
+                notify: ChannelOutcome::Disabled {
+                    reason: "alert render failed".to_owned(),
                 },
-                digested_at: None,
             };
             match render_freeze_alert(now, &record.trigger) {
                 Ok(draft) => {
                     record.notify = sink.opened(&draft).await;
                 }
                 Err(error) => {
-                    record.notify = AlertOutcome {
-                        email: ChannelOutcome::Failed {
-                            message: format!("alert template: {error}"),
-                            hint: None,
-                        },
-                        issue: ChannelOutcome::Failed {
-                            message: format!("alert template: {error}"),
-                            hint: None,
-                        },
+                    record.notify = ChannelOutcome::Failed {
+                        message: format!("alert template: {error}"),
+                        hint: None,
                     };
                 }
             }
@@ -920,7 +778,7 @@ mod tests {
         summarize_trigger,
     };
     use stow_types::api::{
-        AlertOutcome, ChannelOutcome, CostMetric, DispatchFreezeClass, DispatchFreezeCost,
+        ChannelOutcome, CostMetric, DispatchFreezeClass, DispatchFreezeCost,
         DispatchFreezeCostEntry, DispatchFreezeRecord, DispatchFreezeTarget, DispatchFreezeTrigger,
         DispatchFreezeTrip, TopRouteCount,
     };
@@ -1090,10 +948,7 @@ mod tests {
             &DispatchFreezeTrigger::Tripped(trip()),
         )
         .expect("template renders");
-        assert_eq!(
-            draft.title,
-            "[incident] dispatch-freeze: systematic build failures"
-        );
+        assert_eq!(draft.key, "dispatch-freeze");
         for needle in [
             "480",
             "512",
@@ -1120,7 +975,7 @@ mod tests {
     fn manual_freeze_alert_renders_without_trip_stats() {
         let draft = render_freeze_alert("2026-09-22T03:51:00Z", &DispatchFreezeTrigger::Manual)
             .expect("template renders");
-        assert_eq!(draft.title, "[incident] dispatch-freeze: manual engagement");
+        assert_eq!(draft.key, "dispatch-freeze");
         assert!(draft.body.contains("manual"));
         assert!(
             draft
@@ -1156,7 +1011,7 @@ mod tests {
             .expect("template renders");
         assert!(
             draft
-                .title
+                .subject
                 .contains("durable object rows read over daily budget")
         );
         for needle in [
@@ -1194,23 +1049,17 @@ mod tests {
             "2026-09-22T03:51:00Z",
             "2026-09-22T05:10:00Z",
             &DispatchFreezeTrigger::Tripped(trip()),
-            &AlertOutcome {
-                email: ChannelOutcome::Failed {
-                    message: "E_RECIPIENT_NOT_ALLOWED: recipient not allowed".to_owned(),
-                    hint: Some("check the allowlist".to_owned()),
-                },
-                issue: ChannelOutcome::Opened {
-                    url: "https://github.com/water-rs/stow/issues/999".to_owned(),
-                },
+            &ChannelOutcome::Failed {
+                message: "E_RECIPIENT_NOT_ALLOWED: recipient not allowed".to_owned(),
+                hint: Some("check the allowlist".to_owned()),
             },
         )
         .expect("template renders");
-        assert_eq!(draft.title, "[incident] dispatch-freeze: resolved");
+        assert_eq!(draft.key, "dispatch-freeze");
         assert!(draft.body.contains("2026-09-22T03:51:00Z"));
         assert!(draft.body.contains("2026-09-22T05:10:00Z"));
         assert!(draft.body.contains("480/512"));
         assert!(draft.body.contains("E_RECIPIENT_NOT_ALLOWED"));
-        assert!(draft.body.contains("issues/999"));
     }
 
     #[test]
@@ -1228,39 +1077,21 @@ mod tests {
 
     #[test]
     fn notify_summary_marks_a_failed_send_loudly() {
-        let notify = AlertOutcome {
-            email: ChannelOutcome::Failed {
-                message: "E_DAILY_LIMIT_EXCEEDED: quota".to_owned(),
-                hint: None,
-            },
-            issue: ChannelOutcome::Opened {
-                url: "https://github.com/water-rs/stow/issues/999".to_owned(),
-            },
+        let notify = ChannelOutcome::Failed {
+            message: "E_DAILY_LIMIT_EXCEEDED: quota".to_owned(),
+            hint: None,
         };
         let summary = summarize_notify(&notify);
         assert!(summary.contains("FAILED"), "{summary}");
         assert!(summary.contains("E_DAILY_LIMIT_EXCEEDED"), "{summary}");
-        assert!(summary.contains("issues/999"), "{summary}");
-        let sent = AlertOutcome {
-            email: ChannelOutcome::Sent {
-                message_id: Some("abc".to_owned()),
-            },
-            issue: ChannelOutcome::Disabled {
-                reason: "no app creds".to_owned(),
-            },
+        let sent = ChannelOutcome::Sent {
+            message_id: Some("abc".to_owned()),
         };
         let summary = summarize_notify(&sent);
         assert!(summary.contains("abc"), "{summary}");
-        assert!(summary.contains("disabled"), "{summary}");
         assert!(super::notify_reached(&sent));
-        let silent = AlertOutcome {
-            email: ChannelOutcome::Disabled {
-                reason: "no binding".to_owned(),
-            },
-            issue: ChannelOutcome::Failed {
-                message: "403".to_owned(),
-                hint: None,
-            },
+        let silent = ChannelOutcome::Disabled {
+            reason: "no binding".to_owned(),
         };
         assert!(!super::notify_reached(&silent));
     }
@@ -1289,48 +1120,39 @@ mod tests {
         }
     }
 
-    /// Counting [`AlertSink`]: every call appends `(kind, title)`.
+    /// Counting [`AlertSink`]: every call appends `(kind, subject)`.
     struct FakeSink(std::sync::Mutex<Vec<(&'static str, String)>>);
 
     impl super::AlertSink for FakeSink {
-        fn opened(&self, draft: &super::AlertDraft) -> impl Future<Output = AlertOutcome> + Send {
+        fn opened(&self, draft: &super::AlertDraft) -> impl Future<Output = ChannelOutcome> + Send {
             self.0
                 .lock()
                 .expect("sent")
-                .push(("opened", draft.title.clone()));
-            std::future::ready(AlertOutcome {
-                email: ChannelOutcome::Sent {
-                    message_id: Some("fake".to_owned()),
-                },
-                issue: ChannelOutcome::Opened {
-                    url: "https://github.com/water-rs/stow/issues/42".to_owned(),
-                },
+                .push(("opened", draft.subject.clone()));
+            std::future::ready(ChannelOutcome::Sent {
+                message_id: Some("fake".to_owned()),
             })
         }
-        fn updated(&self, draft: &super::AlertDraft) -> impl Future<Output = AlertOutcome> + Send {
+        fn updated(
+            &self,
+            draft: &super::AlertDraft,
+        ) -> impl Future<Output = ChannelOutcome> + Send {
             self.0
                 .lock()
                 .expect("sent")
-                .push(("updated", draft.title.clone()));
-            std::future::ready(AlertOutcome {
-                email: ChannelOutcome::Sent { message_id: None },
-                issue: ChannelOutcome::Commented {
-                    url: "https://github.com/water-rs/stow/issues/42".to_owned(),
-                },
-            })
+                .push(("updated", draft.subject.clone()));
+            std::future::ready(ChannelOutcome::Sent { message_id: None })
         }
-        fn resolved(&self, draft: &super::AlertDraft) -> impl Future<Output = AlertOutcome> + Send {
+        fn resolved(
+            &self,
+            draft: &super::AlertDraft,
+        ) -> impl Future<Output = ChannelOutcome> + Send {
             self.0
                 .lock()
                 .expect("sent")
-                .push(("resolved", draft.title.clone()));
-            std::future::ready(AlertOutcome {
-                email: ChannelOutcome::Sent {
-                    message_id: Some("fake".to_owned()),
-                },
-                issue: ChannelOutcome::Resolved {
-                    url: "https://github.com/water-rs/stow/issues/42".to_owned(),
-                },
+                .push(("resolved", draft.subject.clone()));
+            std::future::ready(ChannelOutcome::Sent {
+                message_id: Some("fake".to_owned()),
             })
         }
     }
@@ -1378,7 +1200,7 @@ mod tests {
         );
         assert_eq!(sink.sent().len(), 1);
         let record = store.record().await.expect("record").expect("engaged");
-        assert!(matches!(record.notify.issue, ChannelOutcome::Opened { .. }));
+        assert!(matches!(record.notify, ChannelOutcome::Sent { .. }));
         assert!(super::notify_reached(&record.notify));
 
         assert!(matches!(
@@ -1411,66 +1233,12 @@ mod tests {
             [
                 (
                     "opened",
-                    "[incident] dispatch-freeze: systematic build failures".to_owned()
+                    "[stow] dispatch frozen — systematic failures".to_owned()
                 ),
-                (
-                    "resolved",
-                    "[incident] dispatch-freeze: resolved".to_owned()
-                ),
+                ("resolved", "[stow] dispatch freeze cleared".to_owned()),
             ],
             "exactly one alert per state transition"
         );
         assert!(store.record().await.expect("record").is_none());
-    }
-
-    /// A live freeze digests only when the store says the hour elapsed:
-    /// a due tick sends `updated` and stamps `digested_at`; a not-due
-    /// tick sends nothing; no record means nothing either way.
-    #[tokio::test]
-    async fn digest_caps_at_one_per_due_window() {
-        let store = FakeStore(std::sync::Mutex::new(Some(DispatchFreezeRecord {
-            frozen_at: "2026-09-22T03:51:00Z".to_owned(),
-            trigger: DispatchFreezeTrigger::Manual,
-            notify: AlertOutcome {
-                email: ChannelOutcome::Sent { message_id: None },
-                issue: ChannelOutcome::Opened {
-                    url: "https://github.com/water-rs/stow/issues/42".to_owned(),
-                },
-            },
-            digested_at: None,
-        })));
-        let sink = FakeSink(std::sync::Mutex::new(Vec::new()));
-
-        // Not due → silent.
-        assert!(
-            super::maybe_digest(&store, false, &sink, "2026-09-22T04:30:00Z")
-                .await
-                .expect("digest")
-                .is_none()
-        );
-        assert!(sink.sent().is_empty());
-
-        // Due → one digest; the stamp lands but the record's `notify`
-        // keeps the open alert's outcome.
-        assert!(
-            super::maybe_digest(&store, true, &sink, "2026-09-22T04:51:00Z")
-                .await
-                .expect("digest")
-                .is_some()
-        );
-        let record = store
-            .record()
-            .await
-            .expect("record")
-            .expect("still engaged");
-        assert_eq!(record.digested_at.as_deref(), Some("2026-09-22T04:51:00Z"));
-        assert!(matches!(record.notify.issue, ChannelOutcome::Opened { .. }));
-        assert_eq!(
-            sink.sent(),
-            [(
-                "updated",
-                "[incident] dispatch-freeze: still frozen".to_owned()
-            )]
-        );
     }
 }

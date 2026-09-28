@@ -68,9 +68,10 @@ pub struct AlertConfig {
 /// outcome naming the missing piece — for the mock/local deployments
 /// that is the binding itself, by design.
 ///
-/// The `AlertConfig` this returns is one half of the alert pair —
-/// [`crate::incidents::EdgeAlerter`] fans every draft out to it and
-/// the `incident`-issue channel.
+/// The `AlertConfig` this returns backs the edge's only alert channel
+/// — [`EdgeAlerter`] sends every draft through it. The `incident`
+/// issue record is the #450 watchdog's job: the edge's App token has
+/// no `issues` grant by design.
 pub fn alert_config(env: &JsValue) -> Result<AlertConfig, ChannelOutcome> {
     let value =
         Reflect::get(env, &JsValue::from_str(STOW_ALERT_EMAIL_BINDING)).map_err(|error| {
@@ -161,4 +162,50 @@ fn send_error(error: &JsValue) -> ChannelOutcome {
         .and_then(|value| value.as_string())
         .unwrap_or_else(|| format!("{error:?}"));
     freeze::notify_failed(code, message)
+}
+
+/// The email alert sink the object and the scheduled handler use —
+/// every draft (freeze transition, digest, fault signal, usage-check
+/// failure) goes out through the one `send_email` binding.
+pub struct EdgeAlerter {
+    config: Result<AlertConfig, ChannelOutcome>,
+}
+
+impl EdgeAlerter {
+    /// Resolve the binding once — the same constructor serves the
+    /// object context and the Worker's scheduled context (no
+    /// per-callsite credential is needed: `send_email` is a binding).
+    pub fn new(env: &JsValue) -> Self {
+        Self {
+            config: alert_config(env),
+        }
+    }
+
+    async fn send(&self, draft: &crate::freeze::AlertDraft) -> ChannelOutcome {
+        match &self.config {
+            Ok(config) => send_alert(config, &draft.subject, &draft.body, &draft.html).await,
+            Err(outcome) => outcome.clone(),
+        }
+    }
+}
+
+impl crate::freeze::AlertSink for EdgeAlerter {
+    fn opened(
+        &self,
+        draft: &crate::freeze::AlertDraft,
+    ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+        self.send(draft)
+    }
+    fn updated(
+        &self,
+        draft: &crate::freeze::AlertDraft,
+    ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+        self.send(draft)
+    }
+    fn resolved(
+        &self,
+        draft: &crate::freeze::AlertDraft,
+    ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+        self.send(draft)
+    }
 }

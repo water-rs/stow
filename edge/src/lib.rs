@@ -15,8 +15,6 @@ mod admission;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod cost;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod crates_io_fetch;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod crates_io_index;
@@ -81,8 +79,6 @@ mod entry;
 mod env_binding;
 #[cfg(target_arch = "wasm32")]
 mod ghcr;
-#[cfg(target_arch = "wasm32")]
-mod incidents;
 #[cfg(target_arch = "wasm32")]
 mod runtime_settings;
 #[cfg(target_arch = "wasm32")]

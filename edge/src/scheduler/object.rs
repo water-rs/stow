@@ -8,7 +8,7 @@ use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::runtime::wasm::WasmEnv;
 use skyzen::utils::Json;
 use skyzen::{Error, Result, StatusCode};
-use skyzen_services::durable::{Alarm, DurableDb};
+use skyzen_services::durable::Alarm;
 use wasm_bindgen::JsValue;
 
 use std::collections::BTreeSet;
@@ -21,6 +21,7 @@ use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
+use crate::scheduler::meter::{self, MeterGuard, MeteredDb};
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
 
@@ -39,6 +40,7 @@ const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 const STOW_FREEZE_WINDOW_MINUTES_BINDING: &str = "STOW_FREEZE_WINDOW_MINUTES";
 const STOW_FREEZE_MIN_OUTCOMES_BINDING: &str = "STOW_FREEZE_MIN_OUTCOMES";
 const STOW_FREEZE_FAIL_PERCENT_BINDING: &str = "STOW_FREEZE_FAIL_PERCENT";
+const STOW_COST_BUDGET_MULTIPLIER_BINDING: &str = "STOW_COST_BUDGET_MULTIPLIER";
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     let defaults = SchedulerSettings::default();
@@ -87,7 +89,7 @@ fn freeze_settings(env: &WasmEnv) -> Result<FreezeSettings> {
 
 /// `freeze::FreezeStore` over the object's own `settings` row — the
 /// storage seam the transition coordinator runs on.
-struct DbStore<'a>(&'a DurableDb);
+struct DbStore<'a>(&'a MeteredDb);
 
 impl freeze::FreezeStore for DbStore<'_> {
     fn record(
@@ -110,12 +112,14 @@ impl freeze::FreezeStore for DbStore<'_> {
     }
 }
 
-/// `freeze::AlertSink` over both alert channels — the `send_email`
-/// notify and the GitHub `incident` issue record
-/// (`crate::incidents::EdgeAlerter`). Either channel's missing
-/// binding/credential degrades to a `Disabled` outcome instead of
-/// erroring, so a transition always lands its record.
-type EdgeAlerter = crate::incidents::EdgeAlerter;
+/// `freeze::AlertSink` over the edge's one alert channel — the
+/// `send_email` notify (`crate::email::EdgeAlerter`). A missing
+/// binding degrades to a `Disabled` outcome instead of erroring, so a
+/// transition always lands its record. The `incident` issue record is
+/// the #450 watchdog's: it reads this object's freeze state and its
+/// transition log over the admin route, because the edge's App token
+/// has no `issues` grant and will not get one.
+type EdgeAlerter = crate::email::EdgeAlerter;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
@@ -155,12 +159,11 @@ impl DurableObject for Scheduler {
                 "/dispatch-freeze"
                     .at(read_dispatch_freeze)
                     .post(write_dispatch_freeze),
-                "/usage-check".post(usage_check),
-                "/incident-digest".post(incident_digest),
             )),
         ))
         .on_alarm(run_alarm)
         .build()
+        .layer(MeterGuard)
     }
 }
 
@@ -169,7 +172,7 @@ impl DurableObject for Scheduler {
 /// `deploy-edge.yml` calls right after `skyzen deploy` and `stow-admin
 /// scheduler migrate` calls manually. Runs the full migration pass and
 /// returns the schema version before and after.
-async fn migrate_scheduler(db: DurableDb) -> Result<Json<SchemaMigrationReport>> {
+async fn migrate_scheduler(db: MeteredDb) -> Result<Json<SchemaMigrationReport>> {
     let report = queue::migrate(&db).await.map_err(to_error)?;
     tracing::warn!(
         before = report.before,
@@ -184,7 +187,7 @@ async fn migrate_scheduler(db: DurableDb) -> Result<Json<SchemaMigrationReport>>
 /// tasks spend against the daily budget; either refusal answers 429.
 async fn submit_tasks(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
 ) -> Result<Json<InsertedResponse>> {
@@ -196,7 +199,7 @@ async fn submit_tasks(
 /// trust check, so a full queue must not turn their work away.
 async fn submit_tasks_trusted(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
 ) -> Result<Json<InsertedResponse>> {
@@ -205,7 +208,7 @@ async fn submit_tasks_trusted(
 
 async fn submit(
     env: &WasmEnv,
-    db: &DurableDb,
+    db: &MeteredDb,
     alarm: &Alarm,
     requests: &[stow_types::api::EnqueueRequest],
     enforce_pending_cap: bool,
@@ -243,7 +246,7 @@ async fn submit(
 /// would merely wait are declined with the freeze reason. Anonymous
 /// submits stay open: a miss costs nothing until it dispatches, and
 /// dropping it would just blind the queue.
-async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
+async fn refuse_if_frozen(db: &MeteredDb) -> Result<()> {
     if let Some(record) = queue::freeze_record(db).await.map_err(to_error)? {
         let reason = format!(
             "dispatch is frozen ({})",
@@ -275,7 +278,7 @@ async fn arm_dispatch_alarm(alarm: &Alarm) -> Result<()> {
 
 async fn complete(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(report): Json<stow_types::api::BuildCompleteReport>,
 ) -> Result<Json<OkResponse>> {
@@ -309,13 +312,13 @@ async fn complete(
     Ok(Json(OkResponse { ok: true }))
 }
 
-async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
+async fn status(db: MeteredDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
     let status = queue::status(&db).await.map_err(to_error)?;
     Ok(Json(status))
 }
 
 /// `GET /admin/status` — the operator view behind `stow-admin status`.
-async fn admin_status(db: DurableDb) -> Result<Json<stow_types::api::AdminStatus>> {
+async fn admin_status(db: MeteredDb) -> Result<Json<stow_types::api::AdminStatus>> {
     let status = queue::admin_status(&db).await.map_err(to_error)?;
     Ok(Json(status))
 }
@@ -324,7 +327,7 @@ async fn admin_status(db: DurableDb) -> Result<Json<stow_types::api::AdminStatus
 /// request's flattened query string
 /// (`?task_ids=…&status=&target=&crate=&older_than=&limit=`).
 async fn list_tasks(
-    db: DurableDb,
+    db: MeteredDb,
     skyzen::extract::Query(selector): skyzen::extract::Query<stow_types::api::QueueSelector>,
 ) -> Result<Json<Vec<stow_types::api::QueueTask>>> {
     let tasks = queue::list_tasks(&db, &selector).await.map_err(to_error)?;
@@ -336,7 +339,7 @@ async fn list_tasks(
 /// frees a slot, so every non-purge verb runs a dispatch pass.
 async fn apply_queue_mutation(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     mutation: queue::QueueMutation,
     selector: stow_types::api::QueueSelector,
@@ -365,7 +368,7 @@ async fn apply_queue_mutation(
 
 async fn queue_retry(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
@@ -374,7 +377,7 @@ async fn queue_retry(
 
 async fn queue_cancel(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
@@ -383,7 +386,7 @@ async fn queue_cancel(
 
 async fn queue_promote(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
@@ -392,7 +395,7 @@ async fn queue_promote(
 
 async fn queue_purge(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
@@ -403,7 +406,7 @@ async fn queue_purge(
 /// act on this task (artifact registration); stamp the run id so `status`
 /// can surface its URL.
 async fn observe_run(
-    db: DurableDb,
+    db: MeteredDb,
     Json(observe): Json<stow_types::api::ObserveRun>,
 ) -> Result<Json<OkResponse>> {
     queue::observe_run(&db, &observe.task_id, &observe.github_run_id)
@@ -413,7 +416,7 @@ async fn observe_run(
 }
 
 async fn tasks_status(
-    db: DurableDb,
+    db: MeteredDb,
     Json(task_ids): Json<Vec<String>>,
 ) -> Result<Json<Vec<stow_types::api::RequestStatus>>> {
     let statuses = queue::tasks_status(&db, &task_ids)
@@ -423,14 +426,14 @@ async fn tasks_status(
 }
 
 /// `GET /panic` — the anonymous-traffic circuit breaker's current state.
-async fn read_panic(db: DurableDb) -> Result<Json<stow_types::api::PanicSwitch>> {
+async fn read_panic(db: MeteredDb) -> Result<Json<stow_types::api::PanicSwitch>> {
     let enabled = queue::panic_enabled(&db).await.map_err(to_error)?;
     Ok(Json(stow_types::api::PanicSwitch { enabled }))
 }
 
 /// `POST /panic` — write the flag, then answer what was stored.
 async fn write_panic(
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(switch): Json<stow_types::api::PanicSwitch>,
 ) -> Result<Json<stow_types::api::PanicSwitch>> {
@@ -449,11 +452,13 @@ async fn write_panic(
 /// `GET /dispatch-freeze` — the dispatch freeze's current state: the
 /// flag plus the stored record (trigger and notify outcome) when
 /// engaged.
-async fn read_dispatch_freeze(db: DurableDb) -> Result<Json<stow_types::api::DispatchFreeze>> {
+async fn read_dispatch_freeze(db: MeteredDb) -> Result<Json<stow_types::api::DispatchFreeze>> {
     let record = queue::freeze_record(&db).await.map_err(to_error)?;
+    let transitions = queue::freeze_transitions(&db, 25).await.map_err(to_error)?;
     Ok(Json(stow_types::api::DispatchFreeze {
         enabled: record.is_some(),
         record,
+        transitions,
     }))
 }
 
@@ -462,11 +467,11 @@ async fn read_dispatch_freeze(db: DurableDb) -> Result<Json<stow_types::api::Dis
 /// writing the state already held is a no-op so alerts never repeat.
 async fn write_dispatch_freeze(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>> {
-    let sink = EdgeAlerter::for_object(&db, env.as_js()).await;
+    let sink = EdgeAlerter::new(env.as_js());
     let action = if switch.enabled {
         freeze::FreezeAction::Freeze
     } else {
@@ -493,6 +498,7 @@ async fn write_dispatch_freeze(
             Ok(Json(stow_types::api::DispatchFreeze {
                 enabled: true,
                 record: Some(record),
+                transitions: queue::freeze_transitions(&db, 25).await.unwrap_or_default(),
             }))
         }
         freeze::FreezeTransition::Cleared(_) => {
@@ -509,99 +515,19 @@ async fn write_dispatch_freeze(
             Ok(Json(stow_types::api::DispatchFreeze {
                 enabled: false,
                 record: None,
+                transitions: queue::freeze_transitions(&db, 25).await.unwrap_or_default(),
             }))
         }
         freeze::FreezeTransition::Unchanged => {
             let record = queue::freeze_record(&db).await.map_err(to_error)?;
+            let transitions = queue::freeze_transitions(&db, 25).await.unwrap_or_default();
             Ok(Json(stow_types::api::DispatchFreeze {
                 enabled: record.is_some(),
                 record,
+                transitions,
             }))
         }
     }
-}
-
-/// `POST /usage-check` — the edge's scheduled cost probe posts its
-/// verdict here; a non-empty `over` list trips the same freeze the
-/// failure-rate breaker engages, and flips the panic switch because a
-/// cost wave can arrive on trusted traffic the panic gate never sees.
-/// The check's verdict while already frozen is logged and dropped —
-/// state transitions are exactly one email.
-async fn usage_check(
-    env: WasmEnv,
-    db: DurableDb,
-    alarm: Alarm,
-    Json(check): Json<stow_types::api::UsageCheck>,
-) -> Result<Json<OkResponse>> {
-    if check.over.is_empty() {
-        return Ok(Json(OkResponse { ok: true }));
-    }
-    let Some(trigger) = crate::cost::cost_trigger(&check) else {
-        return Err(Error::msg(
-            "usage check over list non-empty but produced no cost trigger",
-        ));
-    };
-    let sink = EdgeAlerter::for_object(&db, env.as_js()).await;
-    let transition = freeze::apply_transition(
-        &DbStore(&db),
-        &sink,
-        freeze::FreezeAction::Freeze,
-        trigger,
-        &iso_now(),
-    )
-    .await
-    .map_err(to_error)?;
-    match transition {
-        freeze::FreezeTransition::Engaged(record) => {
-            // The panic switch sheds anonymous traffic too: an
-            // over-budget day is not the moment to keep paying miss
-            // lookups for it.
-            queue::set_panic(&db, true).await.map_err(to_error)?;
-            schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
-                tracing::error!(%error, "scheduler cost-trip schedule_alarm failed");
-                error
-            })?;
-            if freeze::notify_reached(&record.notify) {
-                tracing::warn!(trigger = ?record.trigger, notify = %freeze::summarize_notify(&record.notify), "dispatch freeze tripped on cost");
-            } else {
-                tracing::error!(
-                    trigger = ?record.trigger,
-                    notify = %freeze::summarize_notify(&record.notify),
-                    "dispatch freeze tripped on cost — alert reached nobody"
-                );
-            }
-        }
-        freeze::FreezeTransition::Unchanged => {
-            tracing::info!(
-                over = check.over.len(),
-                "usage check over budget — dispatch already frozen"
-            );
-        }
-        freeze::FreezeTransition::Cleared(_) => {}
-    }
-    Ok(Json(OkResponse { ok: true }))
-}
-
-/// `POST /incident-digest` — the cron's digest tick: when a freeze is
-/// live and its last notification is `FREEZE_DIGEST_MINUTES` old, one
-/// digest fans out and `digested_at` stamps now. The stamp guards the
-/// "at most one an hour" rule — the cron fires every ten minutes.
-async fn incident_digest(env: WasmEnv, db: DurableDb) -> Result<Json<OkResponse>> {
-    let due = queue::freeze_digest_due(&db, freeze::FREEZE_DIGEST_MINUTES)
-        .await
-        .map_err(to_error)?;
-    let sink = EdgeAlerter::for_object(&db, env.as_js()).await;
-    if let Some(outcome) = freeze::maybe_digest(&DbStore(&db), due, &sink, &iso_now())
-        .await
-        .map_err(to_error)?
-    {
-        if freeze::notify_reached(&outcome) {
-            tracing::info!(notify = %freeze::summarize_notify(&outcome), "dispatch freeze digest sent");
-        } else {
-            tracing::error!(notify = %freeze::summarize_notify(&outcome), "dispatch freeze digest reached nobody");
-        }
-    }
-    Ok(Json(OkResponse { ok: true }))
 }
 
 /// `Date#toISOString` — the timestamp format the record and alert
@@ -618,7 +544,7 @@ fn iso_now() -> String {
 /// rule: a live freeze answers `Unchanged` without rewriting the
 /// record or resending the alert. Storage and query errors propagate
 /// (loud); the alert's outcome only ever lands on the record.
-async fn evaluate_dispatch_freeze(env: &WasmEnv, db: &DurableDb) -> Result<()> {
+async fn evaluate_dispatch_freeze(env: &WasmEnv, db: &MeteredDb) -> Result<()> {
     // Cheap gate first — skip the window query entirely when frozen.
     if queue::freeze_enabled(db).await.map_err(to_error)? {
         return Ok(());
@@ -631,7 +557,7 @@ async fn evaluate_dispatch_freeze(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         return Ok(());
     };
     let trigger = trip_trigger(env, draft, &settings)?;
-    let sink = EdgeAlerter::for_object(db, env.as_js()).await;
+    let sink = EdgeAlerter::new(env.as_js());
     if let freeze::FreezeTransition::Engaged(record) = freeze::apply_transition(
         &DbStore(db),
         &sink,
@@ -653,6 +579,46 @@ async fn evaluate_dispatch_freeze(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `MeterGuard`'s and `run_alarm`'s shared tail: settle the
+/// operation's statement counts into the day meter and — when it just
+/// crossed the budget — engage the freeze on this operation, not a
+/// later poll (`settle_and_trip` owns the verdict→freeze→panic
+/// sequence). A settle failure is logged, never raised: a metering bug
+/// must not take dispatch down with it.
+pub(super) async fn settle_meter(db: &MeteredDb, env: &WasmEnv) {
+    let multiplier = crate::env_binding::optional_string(
+        env.as_js(),
+        STOW_COST_BUDGET_MULTIPLIER_BINDING,
+    )
+    .and_then(|raw| match raw.parse::<f64>() {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(%raw, %error, "ignoring unparseable STOW_COST_BUDGET_MULTIPLIER");
+            None
+        }
+    })
+    .unwrap_or(meter::DEFAULT_COST_BUDGET_MULTIPLIER);
+    let sink = EdgeAlerter::new(env.as_js());
+    match db
+        .settle_and_trip(&DbStore(db), &sink, multiplier, &iso_now())
+        .await
+    {
+        Ok(Some(freeze::FreezeTransition::Engaged(record))) => {
+            if freeze::notify_reached(&record.notify) {
+                tracing::warn!(trigger = ?record.trigger, notify = %freeze::summarize_notify(&record.notify), "dispatch freeze tripped on cost");
+            } else {
+                tracing::error!(
+                    trigger = ?record.trigger,
+                    notify = %freeze::summarize_notify(&record.notify),
+                    "dispatch freeze tripped on cost — alert reached nobody"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, "do meter settle failed"),
+    }
 }
 
 /// Turn a trip verdict into the wire `Tripped` trigger — the example
@@ -684,7 +650,7 @@ fn trip_trigger(
 /// claim in the same turn.
 async fn record_published_index(
     env: WasmEnv,
-    db: DurableDb,
+    db: MeteredDb,
     alarm: Alarm,
     Json(slice): Json<stow_types::api::PublishedSlice>,
 ) -> Result<Json<OkResponse>> {
@@ -707,7 +673,7 @@ async fn record_published_index(
     Ok(Json(OkResponse { ok: true }))
 }
 
-async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {
+async fn stable_rustc(db: MeteredDb) -> Result<Json<StableRustcResponse>> {
     let version =
         crate::rust_channel::stable_rustc_version(&db, &crate::rust_channel::CfRustChannel)
             .await
@@ -717,24 +683,33 @@ async fn stable_rustc(db: DurableDb) -> Result<Json<StableRustcResponse>> {
     }))
 }
 
-async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
-    // The panic switch freezes the scheduler as well as anonymous traffic:
-    // a dispatch pass reads the whole pending queue, so while the switch is
-    // on the alarm neither dispatches nor re-arms itself, and nothing runs
-    // until `write_panic` turns the switch off and re-arms it.
-    if queue::panic_enabled(&db).await.map_err(to_error)? {
-        tracing::warn!("scheduler alarm stopped: the panic switch is on");
-        return Ok("frozen");
+/// The panic switch freezes the scheduler as well as anonymous traffic:
+/// a dispatch pass reads the whole pending queue, so while the switch is
+/// on the alarm neither dispatches nor re-arms itself, and nothing runs
+/// until `write_panic` turns the switch off and re-arms it.
+///
+/// The alarm handler's `MeteredDb` is extracted fresh (alarms bypass
+/// the router middleware), so it meters the whole dispatch pass — the
+/// panic gate's own read included — and settles regardless of outcome.
+async fn run_alarm(env: WasmEnv, db: MeteredDb, alarm: Alarm) -> Result<&'static str> {
+    let result = async {
+        if queue::panic_enabled(&db).await.map_err(to_error)? {
+            tracing::warn!("scheduler alarm stopped: the panic switch is on");
+            return Ok("frozen");
+        }
+        dispatch_pending(&env, &db).await.map_err(|error| {
+            tracing::error!(%error, "scheduler alarm dispatch_pending failed");
+            error
+        })?;
+        schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+            tracing::error!(%error, "scheduler alarm schedule_alarm failed");
+            error
+        })?;
+        Ok("ok")
     }
-    dispatch_pending(&env, &db).await.map_err(|error| {
-        tracing::error!(%error, "scheduler alarm dispatch_pending failed");
-        error
-    })?;
-    schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
-        tracing::error!(%error, "scheduler alarm schedule_alarm failed");
-        error
-    })?;
-    Ok("ok")
+    .await;
+    settle_meter(&db, &env).await;
+    result
 }
 
 /// Where a dispatch pass sends claimed tasks, resolved from the Worker's
@@ -764,7 +739,7 @@ impl queue::CoverageOracle for CatalogCoverage {
     }
 }
 
-async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
+async fn dispatch_pending(env: &WasmEnv, db: &MeteredDb) -> Result<()> {
     // The dispatch freeze gates here and inside `claim_dispatchable_tasks`
     // — the enqueue side never consults it, so misses keep arriving and
     // stay pending for the first pass after a human lifts the freeze. It
@@ -848,7 +823,7 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
     Ok(())
 }
 
-async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {
+async fn schedule_alarm(env: &WasmEnv, db: &MeteredDb, alarm: &Alarm) -> Result<()> {
     // `Date::now()` returns whole milliseconds well below 2^53; the value is
     // exactly representable and always fits i64.
     #[allow(clippy::cast_possible_truncation)]

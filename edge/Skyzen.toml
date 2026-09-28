@@ -47,7 +47,7 @@ TURNSTILE_HOSTNAME = "stow.waterui.dev"
 # token; the edge rejects OIDC credentials carrying any other `aud`.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 # Account id the Analytics Engine SQL API is queried under — powers
-# GET /api/v1/stats and the scheduled cost trip's GraphQL read.
+# GET /api/v1/stats.
 CF_ACCOUNT_ID = "76e9b86d5be8efabd346f9b2c4da0d41"
 # Dispatch-freeze trip condition: a stream (the fleet aggregate, or any
 # single target) must record at least STOW_FREEZE_MIN_OUTCOMES terminal
@@ -65,24 +65,18 @@ STOW_FREEZE_FAIL_PERCENT = "50"
 # (E_SENDER_NOT_VERIFIED otherwise); the recipient is whoever owns
 # runner-allowance incidents. The send_email binding itself is declared
 # under cloudflare.raw below — mock/local manifests deliberately omit
-# it so they can never reach Cloudflare's sending API. The alert also
-# opens an `incident`-labelled issue on GITHUB_REPO through the
-# stow-ci App's installation token (needs Issues: Read and write); each
-# channel survives the other's failure.
+# it so they can never reach Cloudflare's sending API. The `incident`
+# issue record is the watchdog's (#450), which reads the freeze state
+# off `stow-admin dispatch-freeze status` — the edge's App token has no
+# `issues` grant, deliberately.
 STOW_ALERT_FROM = "alerts@stow.waterui.dev"
 STOW_ALERT_TO = "me@lexo.cool"
-# Multiplies every cost budget the scheduled check evaluates — 1.0
-# checks the Workers Paid included allowances (each /30 for the daily
-# budget); lower it to trip earlier on a shared account.
+# Scales the scheduler DO's per-day SQL budget (monthly included
+# allowance / 30): the object self-meters rowsRead/rowsWritten off its
+# own cursors and freezes dispatch the moment a day crosses budget —
+# no scheduled probe, so nothing here costs while idle. Lower it to
+# trip earlier on a shared account.
 STOW_COST_BUDGET_MULTIPLIER = "1.0"
-
-# The scheduled probe: every ten minutes the edge reads today's
-# account usage off the GraphQL Analytics API and POSTs the verdict to
-# the scheduler Durable Object, which trips the dispatch freeze over
-# budget; the same run ticks the incident digest (at most one an hour
-# while a freeze stays open).
-[cloudflare.triggers]
-crons = ["*/10 * * * *"]
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"

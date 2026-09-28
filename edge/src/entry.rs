@@ -11,7 +11,7 @@ use skyzen_services::Db;
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
 use crate::{
-    admission, api, cost, env_binding, ghcr, github_auth, panic, runtime_settings, scheduler, site,
+    admission, api, env_binding, ghcr, github_auth, panic, runtime_settings, scheduler, site,
 };
 
 const STOW_DB_BINDING: &str = "STOW_DB";
@@ -34,7 +34,6 @@ const STOW_STATS_BINDING: &str = "STOW_STATS";
 const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
-const STOW_COST_BUDGET_MULTIPLIER_BINDING: &str = "STOW_COST_BUDGET_MULTIPLIER";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -223,58 +222,4 @@ fn anonymous_nodes(gate: &panic::PanicGate) -> Vec<RouteNode> {
     .into_iter()
     .map(|node| node.with(gate.clone()))
     .collect()
-}
-
-/// The scheduled probe — `crons = ["*/10 * * * *"]` in `Skyzen.toml`
-/// lands here. Every run does two things against the scheduler Durable
-/// Object:
-/// - the cost check queries the GraphQL Analytics API for today's
-///   usage and posts the verdict, which owns the freeze transition and
-///   its alert;
-/// - the digest tick fans out a still-frozen note at most once an hour
-///   (`digested_at` on the record is the guard).
-/// A broken check (GraphQL `errors`, transport, decode) is itself a
-/// fault worth an alert — the trip it would have masked is invisible
-/// otherwise.
-#[skyzen::scheduled]
-async fn cost_check(
-    _event: skyzen_cloudflare::CfScheduledEvent,
-    env: wasm::Env,
-    _ctx: skyzen_cloudflare::CfScheduleContext,
-) -> skyzen::Result<()> {
-    crate::console_log::init();
-    let account_id = env_binding::required_string(&env, CF_ACCOUNT_ID_BINDING);
-    let analytics_token = env_binding::required_string(&env, CF_ANALYTICS_TOKEN_BINDING);
-    let scheduler = CfDurableNamespace::from_env(&env, SCHEDULER_BINDING)
-        .map_err(|error| skyzen::Error::msg(format!("load scheduler binding: {error}")))?;
-    let multiplier = env_binding::optional_string(&env, STOW_COST_BUDGET_MULTIPLIER_BINDING)
-        .and_then(|raw| match raw.parse::<f64>() {
-            Ok(value) => Some(value),
-            Err(error) => {
-                tracing::warn!(%raw, %error, "ignoring unparseable STOW_COST_BUDGET_MULTIPLIER");
-                None
-            }
-        })
-        .unwrap_or(cost::DEFAULT_COST_BUDGET_MULTIPLIER);
-    if let Err(error) =
-        cost::run_usage_check(&account_id, &analytics_token, &scheduler, multiplier).await
-    {
-        tracing::error!(%error, "usage check failed");
-        if let Ok(draft) = cost::render_usage_check_error(&error) {
-            let outcome = crate::freeze::AlertSink::opened(
-                &crate::incidents::EdgeAlerter::for_worker(&env).await,
-                &draft,
-            )
-            .await;
-            if !crate::freeze::notify_reached(&outcome) {
-                tracing::error!(?outcome, "usage-check failure alert reached nobody");
-            }
-        }
-    }
-    // The digest rides its own call so a usage-check failure never
-    // eats a due digest, and vice versa.
-    if let Err(error) = crate::scheduler_client::report_incident_digest(&scheduler).await {
-        tracing::error!(%error, "incident digest tick failed");
-    }
-    Ok(())
 }

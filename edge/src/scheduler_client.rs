@@ -14,8 +14,6 @@ const SCHEDULER_STABLE_RUSTC_URL: &str = "https://scheduler.internal/rustc/stabl
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_PANIC_URL: &str = "https://scheduler.internal/panic";
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
-const SCHEDULER_USAGE_CHECK_URL: &str = "https://scheduler.internal/usage-check";
-const SCHEDULER_INCIDENT_DIGEST_URL: &str = "https://scheduler.internal/incident-digest";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
@@ -152,36 +150,11 @@ pub async fn set_dispatch_freeze(
         &stow_types::api::DispatchFreeze {
             enabled,
             record: None,
+            transitions: Vec::new(),
         },
     )
     .await
 }
-
-/// The scheduled cost probe's verdict: the object trips the freeze (and
-/// the panic switch) when `over` is non-empty, and is a no-op otherwise.
-/// Used by the edge's `#[skyzen::scheduled]` handler — see `cost.rs`.
-pub async fn report_usage_check(
-    namespace: &CfDurableNamespace,
-    check: &stow_types::api::UsageCheck,
-) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_USAGE_CHECK_URL, check).await
-}
-
-/// The cron's digest tick: the object sends at most one digest an hour
-/// while a freeze is live (`digested_at` on the record is the guard),
-/// and no-ops otherwise. Fires every scheduled run — cheap no-op when
-/// nothing is frozen.
-pub async fn report_incident_digest(
-    namespace: &CfDurableNamespace,
-) -> Result<(), SchedulerClientError> {
-    send_json(
-        namespace,
-        SCHEDULER_INCIDENT_DIGEST_URL,
-        &serde_json::json!({}),
-    )
-    .await
-}
-
 
 /// The operator view behind `stow-admin status`.
 pub async fn admin_status(
