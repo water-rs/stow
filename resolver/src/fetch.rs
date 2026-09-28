@@ -50,7 +50,7 @@ pub async fn fetch_crate(
 
     let url = crate_tarball_url(crate_name, version);
     let mut client = zenwave::client()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_mins(2))
         .follow_redirect();
     let response = client
         .get(&url)
