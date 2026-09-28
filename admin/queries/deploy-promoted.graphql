@@ -1,0 +1,30 @@
+query DeployVerdict($account: String!, $script: String!, $from: Time!, $to: Time!) {
+  viewer {
+    accounts(filter: { accountTag: $account }) {
+      durableObjectsPeriodicGroups(
+        filter: { datetime_geq: $from, datetime_leq: $to }
+        limit: 500
+      ) {
+        sum { cpuTime rowsRead rowsWritten }
+      }
+      durableObjectsInvocationsAdaptiveGroups(
+        filter: { datetime_geq: $from, datetime_leq: $to }
+        limit: 500
+      ) {
+        sum { requests }
+      }
+      d1AnalyticsAdaptiveGroups(
+        filter: { datetime_geq: $from, datetime_leq: $to }
+        limit: 500
+      ) {
+        sum { rowsRead rowsWritten }
+      }
+      workersInvocationsAdaptive(
+        filter: { scriptName: $script, datetime_geq: $from, datetime_leq: $to }
+        limit: 500
+      ) {
+        sum { requests }
+      }
+    }
+  }
+}

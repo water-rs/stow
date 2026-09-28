@@ -186,12 +186,66 @@ for the alert type.
 
 ## Automated deploys
 
-`.github/workflows/deploy-edge.yml` runs `skyzen deploy --provider
-cloudflare --manifest edge/Skyzen.toml` on every push to `main` that
-touches the edge (`edge/`, `types/`, `shim/`, `Cargo.lock`) and on
-`workflow_dispatch`. `skyzen deploy` resolves the declared `[[secret]]`
-values from the job environment and delivers them through `wrangler
-secret bulk`, so the Worker and its secrets move together.
+`.github/workflows/deploy-edge.yml` deploys a tested commit only: on a
+green `Test` run of a `main` push (`workflow_run`), and on
+`workflow_dispatch`, which takes the commit `sha` (verified to have a
+completed green `Test` run via `gh run list --commit`) plus
+`canary_share` (default `5`).
+
+No job waits: the deploy is four jobs, and the observation windows are
+GitHub environment wait timers, which hold no runner. Operator setup
+(once per repository): under Settings → Environments create
+
+- `deploy-canary` — wait timer `15` minutes (the canary observation
+  window, the `canary-verdict` job's delay);
+- `deploy-promoted` — wait timer `15` minutes (the post-promotion
+  window, the `promoted-verdict` job's delay).
+
+Change a window by editing that environment's wait timer; the verdict
+reads the window's bounds from timestamps, so nothing else moves.
+
+The `prepare` job uploads the new Worker version without deploying it —
+`skyzen deploy --upload-only` plans `wrangler versions upload`, and the
+declared `[[secret]]` values travel in the same upload through
+`--secrets-file` — then adds it to the deployment at `0%` so that
+version overrides reach it, runs `stow-admin scheduler migrate` against
+the candidate via the `Cloudflare-Workers-Version-Overrides` header
+(the scheduler schema version stamp must equal the candidate's own
+`SCHEMA_VERSION`, else the deploy fails before any traffic shifts),
+fires the synthetic suite through the same override — 50 requests on the
+candidate interleaved with 50 on the baseline across the site, crate
+lookup, artifact HEAD, stats and scheduler status paths, the floor the
+verdict's `--min-requests-per-version` expects on each side — and
+finally shifts `canary_share`% of traffic onto it.
+
+Promotion is gated on two verdict phases of
+`stow-admin deploy verdict`, each printing every metric's baseline and
+candidate values and exiting non-zero on a breach — which runs
+`wrangler rollback` and fails that job:
+
+- `--phase canary`, run by `canary-verdict` after the `deploy-canary`
+  wait timer: worker error rate and cpu/wall-time p50/p99 per
+  `scriptVersion` from `workersInvocationsAdaptive`, plus DO requests,
+  errors and wall time per request per `scriptVersion` from
+  `durableObjectsInvocationsAdaptiveGroups`. Both sides are measured in
+  the same window — the suite pinned its requests to each version, so
+  either side serving nothing or fewer than the suite's count fails
+  closed; DO rows report `skipped` when the Scheduler object stayed on
+  the baseline (objects are assigned one version per deployment config —
+  a reassigned object is reset once, and SQLite state survives).
+- `--phase promoted`, run by `promoted-verdict` after `promote` and the
+  `deploy-promoted` wait timer: the metrics that carry no
+  `scriptVersion` compare the post-promotion window against the
+  equal-length window ending at the deploy start — DO cpu and rows
+  read/written per DO request from `durableObjectsPeriodicGroups`, and
+  D1 rows read/written per worker request from
+  `d1AnalyticsAdaptiveGroups`. A breach here rolls back too.
+
+`stow-admin` comes from the deployed commit's signed toolchain image —
+`.github/actions/stow-toolchain` pulls
+`ghcr.io/water-rs/stow-toolchain:<sha>-<platform>` and verifies the
+cosign signature against the commit's own workflow sha, so nothing
+compiles it at deploy time.
 
 Required GitHub Actions secrets:
 
