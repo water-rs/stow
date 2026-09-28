@@ -194,6 +194,8 @@ permanent admission into the pool.
 Instead, misses are turned into prioritized overlay candidates and ranked
 against the rest of the queue.
 
+> **Not implemented — tracked in [#442](https://github.com/water-rs/stow/issues/442).** A miss today enters the queue in the miss lane and is dispatched first-come first-served once its dependencies are published.
+
 ## Candidate Identity
 
 The pool should reason about candidates using a normalized semantic identity,
@@ -217,6 +219,8 @@ overlay candidates using one common abstraction.
 
 ## Budgeting Model
 
+> **Not implemented — tracked in [#442](https://github.com/water-rs/stow/issues/442).** Dispatch today orders ready nodes by the human lane, then Windows targets, then first-request time; nothing below scores or budgets candidates yet.
+
 The pool is not allowed to expand indefinitely.
 
 Instead, Stow should:
@@ -239,6 +243,8 @@ The budget may be expressed in terms of:
 The implementation may use one or more of these simultaneously.
 
 ## Recommended Scoring Signals
+
+> **Not implemented — tracked in [#442](https://github.com/water-rs/stow/issues/442).** Dispatch today orders ready nodes by the human lane, then Windows targets, then first-request time; nothing below scores or budgets candidates yet.
 
 Candidate ranking should combine signals from several sources:
 
