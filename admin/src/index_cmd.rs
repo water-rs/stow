@@ -30,7 +30,7 @@ use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport, P
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
-    content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
+    IndexError, content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
 };
 use stow_types::records::{record_to_index_row, records_tag_rustc};
 use stow_types::registry::{GHCR_BASE, sha256_digest};
@@ -362,34 +362,29 @@ impl PullContext {
                  re-export with --full"
             ));
         };
-        let index_reference = self
-            .base
-            .reference(&index_tag(target.as_str(), rustc_version.as_str()))?;
+        let itag = index_tag(target.as_str(), rustc_version.as_str());
+        let index_reference = self.base.reference(&itag)?;
         verify_artifact(
             &self.session,
             &self.trust,
             &index_reference,
-            &format!(
-                "{GHCR_BASE}:{}",
-                index_tag(target.as_str(), rustc_version.as_str())
-            ),
+            &format!("{GHCR_BASE}:{itag}"),
             &pulled_index.manifest_digest,
             INDEX_CERT_URL,
         )
         .await?;
-        if pulled_index.index.header.target != target
-            || pulled_index.index.header.rustc_version != rustc_version
-        {
+        let index = decode_published_slice(&index_reference, &rustc_version, &pulled_index.bytes)?;
+        if index.header.target != target || index.header.rustc_version != rustc_version {
             return Err(stow_error!(
                 "index.{target}.{rustc_version} carries header {}/{} — re-export with --full",
-                pulled_index.index.header.target,
-                pulled_index.index.header.rustc_version,
+                index.header.target,
+                index.header.rustc_version,
             ));
         }
         Ok(Some((
             (target, rustc_version),
             PrevSlice {
-                index: pulled_index.index,
+                index,
                 folded: pulled_folded.tags.into_iter().collect(),
             },
         )))
@@ -412,6 +407,25 @@ impl PullContext {
         .await?;
         Ok(pulled.records)
     }
+}
+
+/// `decode` a pulled published slice. The decoder stays strict — but a
+/// slice published in a format this reader predates is recoverable
+/// state, not corruption: a `--full` pass refolds every slice of that
+/// rustc from its records artifacts. The callers name that recovery —
+/// the workflow's `full` input plus the rustc the pass must run for.
+pub fn decode_published_slice(
+    reference: &oci_client::Reference,
+    rustc_version: &WireRustcVersion,
+    bytes: &[u8],
+) -> stow_types::error::Result<ArtifactIndex> {
+    decode(bytes).map_err(|error| match error {
+        IndexError::UnsupportedFormatVersion { .. } => stow_error!(
+            "decode index {reference}: {error}; \
+             re-export the slice with index-publish.yml `full: true` for rustc {rustc_version}"
+        ),
+        error => stow_error!("decode index {reference}: {error}"),
+    })
 }
 
 /// One slice's export output.

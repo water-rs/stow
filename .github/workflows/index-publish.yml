@@ -48,6 +48,11 @@ on:
         required: false
         default: ""
         type: string
+      full:
+        description: "Rebuild the scoped rustc's slices from every records artifact, ignoring the published index/folded pairs — the recovery for a slice in an unreadable format"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -122,11 +127,18 @@ jobs:
         env:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_FULL: ${{ inputs.full }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/index-export"
           mkdir -p "$out"
-          ./target/release/stow-admin index export --out-dir "$out" --rustc-version "$RUSTC_VERSION"
+          args=(--out-dir "$out" --rustc-version "$RUSTC_VERSION")
+          # A full pass stays scoped the way the export is: the resolved
+          # rustc's slices and records, no other rustc's tags.
+          if [[ "$INPUT_FULL" == "true" ]]; then
+            args+=(--full)
+          fi
+          ./target/release/stow-admin index export "${args[@]}"
           cp "$out/slices.json" "$RUNNER_TEMP/slices.json"
           cp "$out/new-records.json" "$RUNNER_TEMP/new-records.json"
           echo "export_dir=$out" >> "$GITHUB_ENV"

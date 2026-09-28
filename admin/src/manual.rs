@@ -21,7 +21,7 @@ use futures_util::{StreamExt as _, TryStreamExt as _};
 use oci_client::manifest::OciImageManifest;
 use stow_types::api::{BuildDepPin, BuildTaskPayload, EnqueueDependency, EnqueueRequest, task_id};
 use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
-use stow_types::index::{ArtifactIndexRow, STOW_INDEX_MEDIA_TYPE, decode, index_tag};
+use stow_types::index::{ArtifactIndexRow, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
 use stow_types::records::parse_run_title;
 use stow_types::registry::GHCR_BASE;
@@ -675,7 +675,7 @@ async fn published_slice_rows(
         &materials,
         INDEX_CERTIFICATE_IDENTITY,
     )?;
-    let index = decode(&blob).map_err(|error| stow_error!("decode index {reference}: {error}"))?;
+    let index = crate::index_cmd::decode_published_slice(&reference, rustc_version, &blob)?;
     if index.header.target.as_str() != target.as_str()
         || index.header.rustc_version.as_str() != rustc_version.as_str()
     {
