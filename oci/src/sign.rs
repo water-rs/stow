@@ -1,6 +1,54 @@
 use async_process::Command;
+use oci_client::Reference;
+use stow_types::registry::sha256_digest;
 
+use crate::client::RegistrySession;
 use crate::registry::RegistryCredentials;
+
+/// Push `manifest` so that `reference`'s tag never names an unsigned
+/// manifest: the bytes go up by digest first, `sign` signs that digest
+/// under the tagged identity, and only then does the tag move to it.
+///
+/// Tagging first leaves a window, as long as cosign takes, in which every
+/// reader resolves the tag to a digest whose `.sig` does not exist yet and
+/// fails verification; a signing failure would leave the tag there for
+/// good. Pushed this way, a reader sees the previous signed manifest or the
+/// new signed one, and a failed signature leaves the tag untouched.
+///
+/// Returns the manifest digest.
+///
+/// # Errors
+///
+/// Returns an error when either manifest `PUT` or the signature fails.
+pub async fn put_signed_manifest<S, Fut>(
+    session: &RegistrySession,
+    reference: &Reference,
+    manifest: &[u8],
+    sign: S,
+) -> stow_types::error::Result<String>
+where
+    S: FnOnce(String) -> Fut,
+    Fut: Future<Output = stow_types::error::Result<()>>,
+{
+    let digest = sha256_digest(manifest);
+    let by_digest: Reference = format!(
+        "{}/{}@{digest}",
+        reference.registry(),
+        reference.repository()
+    )
+    .parse()
+    .map_err(|error| stow_types::stow_error!("parse digest reference for {reference}: {error}"))?;
+    session
+        .put_manifest(&by_digest, manifest)
+        .await
+        .map_err(|error| stow_types::stow_error!("push manifest {by_digest}: {error}"))?;
+    sign(digest.clone()).await?;
+    session
+        .put_manifest(reference, manifest)
+        .await
+        .map_err(|error| stow_types::stow_error!("tag manifest {reference}: {error}"))?;
+    Ok(digest)
+}
 
 /// Sign one pushed artifact with cosign (keyless, the job's OIDC identity).
 ///

@@ -247,17 +247,18 @@ pub async fn publish_index(
         .await
         .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
-    let manifest_digest = session
-        .put_manifest(&parsed_reference, &manifest_bytes)
+    let manifest_digest =
+        sign::put_signed_manifest(&session, &parsed_reference, &manifest_bytes, |digest| {
+            let reference = &reference;
+            async move { sign::sign_artifact(reference, &digest, credentials).await }
+        })
         .await
         .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
     tracing::info!(
         %reference,
         digest = %manifest_digest,
-        "pushed artifact index to GHCR"
+        "pushed and signed artifact index on GHCR"
     );
-
-    sign::sign_artifact(&reference, &manifest_digest, credentials).await?;
 
     Ok(IndexPublishOutcome::Published { manifest_digest })
 }
@@ -440,17 +441,18 @@ pub async fn publish_folded(
         .push_blob(&sha256_digest(&config.data), &config.data)
         .await
         .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;
-    let manifest_digest = session
-        .put_manifest(&parsed_reference, &manifest_bytes)
+    let manifest_digest =
+        sign::put_signed_manifest(&session, &parsed_reference, &manifest_bytes, |digest| {
+            let reference = &reference;
+            async move { sign::sign_artifact(reference, &digest, credentials).await }
+        })
         .await
         .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;
     tracing::info!(
         %reference,
         digest = %manifest_digest,
-        "pushed folded set to GHCR"
+        "pushed and signed folded set on GHCR"
     );
-
-    sign::sign_artifact(&reference, &manifest_digest, credentials).await?;
 
     Ok(IndexPublishOutcome::Published { manifest_digest })
 }

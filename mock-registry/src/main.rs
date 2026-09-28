@@ -281,7 +281,6 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     }))?;
     let manifest_digest = sha256_digest(&manifest_bytes);
     let (repo, tag) = split_reference(&oci_reference)?;
-    write_manifest(&request.registry_root, &repo, &tag, &manifest_bytes).await?;
     write_manifest(
         &request.registry_root,
         &repo,
@@ -301,6 +300,8 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
         &manifest_digest,
     )
     .await?;
+    // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
+    write_manifest(&request.registry_root, &repo, &tag, &manifest_bytes).await?;
     tracing::info!(
         oci_reference = %oci_reference,
         digest = %manifest_digest,
@@ -375,7 +376,6 @@ async fn write_signed_index(
         },
     }))?;
     let manifest_digest = sha256_digest(&manifest_bytes);
-    write_manifest(registry_root, repository, &tag, &manifest_bytes).await?;
     write_manifest(registry_root, repository, &manifest_digest, &manifest_bytes).await?;
 
     let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
@@ -392,6 +392,8 @@ async fn write_signed_index(
         &signature_b64,
     )
     .await?;
+    // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
+    write_manifest(registry_root, repository, &tag, &manifest_bytes).await?;
     tracing::info!(%reference, %manifest_digest, "published mock index artifact");
     report_index_publish("published", &manifest_digest);
     Ok(())
@@ -769,11 +771,12 @@ async fn write_mock_registry_entry(
     }))?;
     let manifest_digest = sha256_digest(&manifest_bytes);
     let (repo, tag) = split_reference(&plan.oci_reference)?;
-    write_manifest(registry_root, &repo, &tag, &manifest_bytes).await?;
     write_manifest(registry_root, &repo, &manifest_digest, &manifest_bytes).await?;
 
     let (signature_b64, payload_bytes) =
         write_mock_signature(registry_root, signer, &plan.oci_reference, &manifest_digest).await?;
+    // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
+    write_manifest(registry_root, &repo, &tag, &manifest_bytes).await?;
 
     // The same bundle tar the trusted publish stage pushes as
     // `<tag>.bundle`: the edge streams this blob by digest.
@@ -1199,7 +1202,6 @@ async fn write_signed_folded(
 
     write_blob(registry_root, &layer_digest, &folded_bytes).await?;
     write_blob(registry_root, &config_digest, &config_bytes).await?;
-    write_manifest(registry_root, repository, &tag, &manifest_bytes).await?;
     write_manifest(registry_root, repository, &manifest_digest, &manifest_bytes).await?;
 
     let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
@@ -1216,6 +1218,8 @@ async fn write_signed_folded(
         &signature_b64,
     )
     .await?;
+    // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
+    write_manifest(registry_root, repository, &tag, &manifest_bytes).await?;
     tracing::info!(%reference, %manifest_digest, "published mock folded artifact");
     Ok(())
 }
@@ -2032,8 +2036,8 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::{
-        Body, RegistryProbe, SigningScheme, registry_app, write_blob, write_manifest,
-        write_mock_signature, write_public_key,
+        Body, RegistryProbe, SigningScheme, manifest_file_name, registry_app, split_reference,
+        write_blob, write_manifest, write_mock_signature, write_public_key,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
@@ -2429,10 +2433,19 @@ mod tests {
             4,
             "one monolithic POST per missing blob"
         );
+        let manifest_puts: Vec<&str> = log
+            .iter()
+            .filter(|record| record.method == Method::PUT && record.path.contains("/manifests/"))
+            .map(|record| record.path.as_str())
+            .collect();
         assert_eq!(
-            count(Method::PUT, "/manifests/"),
-            2,
-            "a PUT per manifest: artifact and bundle"
+            manifest_puts.len(),
+            3,
+            "the artifact by digest, then its tag, then the bundle: {manifest_puts:?}"
+        );
+        assert!(
+            manifest_puts[0].contains("/manifests/sha256:"),
+            "the artifact manifest goes up by digest before it is tagged: {manifest_puts:?}"
         );
         assert_eq!(
             count(Method::GET, "/manifests/"),
@@ -2448,7 +2461,43 @@ mod tests {
             !log.iter().any(|record| record.method == Method::PATCH),
             "no chunked upload session"
         );
-        assert_eq!(log.len(), 14, "the full push in fourteen requests");
+        assert_eq!(log.len(), 15, "the full push in fifteen requests");
+    }
+
+    /// The signer runs while the artifact manifest is stored by digest
+    /// alone: the tag appears only once its signature exists, so no reader
+    /// can resolve the tag to an unsigned manifest.
+    #[tokio::test]
+    async fn push_signs_before_it_tags() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, _probe) = serve_probe_registry(root.path()).await;
+        let manifests = root.path().join("manifests");
+        let sign = mock_sign(root.path());
+
+        let session = push_session(&listen);
+        stow_oci::push_artifacts_with(
+            &session,
+            &[plan],
+            |oci_reference: String, manifest_digest: String| {
+                let (repo, tag) = split_reference(&oci_reference).expect("tagged reference");
+                assert!(
+                    !manifests.join(&repo).join(&tag).exists(),
+                    "{tag} was tagged before it was signed"
+                );
+                assert!(
+                    manifests
+                        .join(&repo)
+                        .join(manifest_file_name(&manifest_digest))
+                        .exists(),
+                    "{manifest_digest} was signed before it was stored"
+                );
+                sign(oci_reference, manifest_digest)
+            },
+        )
+        .await
+        .expect("push succeeds");
     }
 
     /// GHCR's cap shape — `429 TOOMANYREQUESTS` carrying
@@ -2513,8 +2562,8 @@ mod tests {
         );
         assert_eq!(
             count(Method::PUT, "/manifests/"),
-            2,
-            "manifest puts are unchanged by the upload fallback"
+            3,
+            "manifest puts are unchanged by the upload fallback: the artifact by digest and by tag, then the bundle"
         );
     }
 
@@ -2542,8 +2591,8 @@ mod tests {
             })
             .count();
         assert_eq!(
-            read_backs, 2,
-            "artifact and bundle manifests each verified by digest"
+            read_backs, 3,
+            "every manifest PUT verified by digest: the artifact's digest and tag pushes, and the bundle"
         );
     }
 
