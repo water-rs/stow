@@ -186,12 +186,24 @@ for the alert type.
 
 ## Automated deploys
 
-`.github/workflows/deploy-edge.yml` runs `skyzen deploy --provider
-cloudflare --manifest edge/Skyzen.toml` on every push to `main` that
-touches the edge (`edge/`, `types/`, `shim/`, `Cargo.lock`) and on
-`workflow_dispatch`. `skyzen deploy` resolves the declared `[[secret]]`
-values from the job environment and delivers them through `wrangler
-secret bulk`, so the Worker and its secrets move together.
+`.github/workflows/deploy-edge.yml` deploys a tested commit only: on a
+green `Test` run of a `main` push (`workflow_run`), and on
+`workflow_dispatch`, which takes the commit `sha` (verified to have a
+completed green `Test` run via `gh run list --commit`) plus
+`canary_share` (default `5`) and `canary_window_minutes` (default `15`)
+inputs.
+
+The job uploads the new Worker version without deploying it —
+`skyzen deploy --upload-only` plans `wrangler versions upload`, and the
+declared `[[secret]]` values travel in the same upload through
+`--secrets-file` — then shifts `canary_share`% of traffic onto it with
+`wrangler versions deploy`. After the window,
+`stow-admin deploy verdict` compares the canary against the version it
+would replace: worker error rate and cpu p50/p99 per `scriptVersion`
+from `workersInvocationsAdaptive`, DO cpu and rows read/written per
+request from `durableObjectsInvocationsAdaptiveGroups`. A breach — or a
+canary that served nothing — runs `wrangler rollback` and fails the job;
+a pass promotes the version to 100%.
 
 Required GitHub Actions secrets:
 

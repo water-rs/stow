@@ -12,6 +12,7 @@ mod artifacts;
 mod cache;
 mod coverage;
 mod crates_io;
+mod deploy;
 mod github;
 mod index_cmd;
 mod preheat;
@@ -76,6 +77,8 @@ enum Command {
     Index(index_cmd::IndexArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
+    /// Canary deployment verdicts for the edge Worker.
+    Deploy(deploy::DeployArgs),
 }
 
 #[derive(Args)]
@@ -161,6 +164,10 @@ fn main() -> stow_types::error::Result<()> {
         Command::Submit(args) => {
             with_edge(|edge| async move { submit_command(&edge, args, output).await })
         }
+        // The verdict reads Cloudflare's GraphQL API, not the edge and not
+        // GitHub — its credential is CLOUDFLARE_API_TOKEN, so it runs its
+        // own executor like `preheat` and `index` do.
+        Command::Deploy(args) => smol::block_on(deploy::run(args, output)),
     }
 }
 

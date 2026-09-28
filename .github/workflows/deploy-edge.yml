@@ -1,30 +1,113 @@
 name: deploy-edge
 
+# The edge deploys a tested commit only: the trigger is a green `Test` run on
+# main, and a manual dispatch must name a commit that has one. The job uploads
+# the new Worker version without deploying it (`wrangler versions upload`,
+# via `skyzen deploy --upload-only`), shifts a slice of traffic onto it
+# (`wrangler versions deploy <id>@<share>%`), and after the observation window
+# `stow-admin deploy verdict` compares the canary's metrics against the version
+# it would replace: a breach runs `wrangler rollback` and fails the job, a pass
+# promotes the version to 100%.
+#
+# Durable Objects and gradual deployments: the Scheduler DO's migration
+# (`new_sqlite_classes`, tag v1) is already live, so an upload that changes no
+# DO lifecycle is legal and a rollback to the baseline never crosses a
+# migration boundary. DOs pin to the version they were created under, so the
+# verdict reads DO metrics per window rather than per version.
 on:
-  push:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
     branches: [main]
-    paths: [edge/**, resolve/**, types/**, shim/**, Cargo.toml, Cargo.lock]
   workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to deploy; must have a completed green `Test` run.
+        required: true
+        type: string
+      canary_share:
+        description: Percentage of traffic the canary version serves (1-99).
+        required: false
+        default: "5"
+        type: string
+      canary_window_minutes:
+        description: Minutes the canary serves before the verdict runs.
+        required: false
+        default: "15"
+        type: string
 
 permissions:
   contents: read
+  # `gh run list` in the dispatch gate reads the Test run's conclusion.
+  actions: read
 
 concurrency: deploy-edge
+
+env:
+  DEPLOY_SHA: ${{ inputs.sha || github.event.workflow_run.head_sha }}
+  CANARY_SHARE: ${{ inputs.canary_share || '5' }}
+  CANARY_WINDOW_MINUTES: ${{ inputs.canary_window_minutes || '15' }}
+  # zen-rs/skyzen commit that provides `deploy --upload-only`
+  # (zen-rs/skyzen#98). A squash-merge there changes the SHA — repin to the
+  # commit that lands on skyzen's dev.
+  SKYZEN_REV: 393356ae4f6d4f556cfa281e2da7f618f3ba92d4
+  # The generated wrangler config, relative to edge/ (the manifest root).
+  WRANGLER_CONFIG: .skyzen/gen/wrangler.toml
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      # A dispatch is only as tested as the commit it names — the deploy's
+      # justification is a green Test run, so verify one exists for the SHA.
+      - name: A dispatched SHA must have a green Test run
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh run list --commit "$DEPLOY_SHA" --workflow Test --limit 50 \
+            --json conclusion | jq '[.[] | select(.conclusion == "success")] | length')
+          if [ "$count" -lt 1 ]; then
+            echo "::error::no green Test run for $DEPLOY_SHA — refusing to deploy an untested commit" >&2
+            exit 1
+          fi
+          echo "$count green Test run(s) for $DEPLOY_SHA"
+
+      - name: Validate the canary inputs
+        run: |
+          case "$CANARY_SHARE" in ''|*[!0-9]*)
+            echo "::error::canary_share must be an integer 1-99, got '$CANARY_SHARE'" >&2
+            exit 1
+            ;;
+          esac
+          if [ "$CANARY_SHARE" -lt 1 ] || [ "$CANARY_SHARE" -gt 99 ]; then
+            echo "::error::canary_share must be 1-99, got $CANARY_SHARE" >&2
+            exit 1
+          fi
+          case "$CANARY_WINDOW_MINUTES" in ''|*[!0-9]*)
+            echo "::error::canary_window_minutes must be a positive integer, got '$CANARY_WINDOW_MINUTES'" >&2
+            exit 1
+            ;;
+          esac
+          if [ "$CANARY_WINDOW_MINUTES" -lt 1 ]; then
+            echo "::error::canary_window_minutes must be at least 1" >&2
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # skyzen-cli ships cargo-dist binaries; install-action does not know
-      # the tool and its cargo-binstall fallback compiles it from source
-      # (about eight minutes), so the pinned, digest-checked archive is used.
       - uses: ./.github/actions/install-skyzen-cli
+        with:
+          rev: ${{ env.SKYZEN_REV }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install -g wrangler@4
       - run: skyzen doctor --provider cloudflare --manifest edge/Skyzen.toml
@@ -46,10 +129,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       # skyzen deploy resolves every declared [[secret]] from the environment
-      # and delivers them through `wrangler secret bulk`, so the Worker
-      # secrets ride the same channel on every deploy. An unset repository
-      # secret reaches the job as an empty string, which skyzen would deliver
-      # as a real (empty) secret, so every value is checked first.
+      # and, under --upload-only, folds them into the version upload itself
+      # (`--secrets-file`), so the canary version already carries them when
+      # traffic shifts. An unset repository secret reaches the job as an
+      # empty string, which skyzen would deliver as a real (empty) secret,
+      # so every value is checked first.
       - run: |
           for pair in \
             GITHUB_APP_PRIVATE_KEY:STOW_APP_PRIVATE_KEY \
@@ -64,7 +148,7 @@ jobs:
               exit 1
             fi
           done
-          skyzen deploy --provider cloudflare --manifest edge/Skyzen.toml
+          skyzen deploy --upload-only --provider cloudflare --manifest edge/Skyzen.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -73,3 +157,93 @@ jobs:
           TURNSTILE_SECRET_KEY: ${{ secrets.STOW_TURNSTILE_SECRET_KEY }}
           STOW_STATS_SALT_SECRET: ${{ secrets.STOW_STATS_SALT_SECRET }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+
+      - name: Read the baseline and candidate version ids
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          # The baseline is whichever version currently holds the most
+          # traffic — 100% after a normal rollout, the majority half of a
+          # split deployment left behind by something else.
+          baseline=$(wrangler deployments status --config "$WRANGLER_CONFIG" --json \
+            | jq -r '.versions | max_by(.percentage).version_id')
+          candidate=$(wrangler versions list --config "$WRANGLER_CONFIG" --json \
+            | jq -r 'max_by(.metadata.created_on).id')
+          if [ -z "$baseline" ] || [ "$baseline" = "null" ]; then
+            echo "::error::could not read the deployed baseline version" >&2
+            exit 1
+          fi
+          if [ -z "$candidate" ] || [ "$candidate" = "null" ] || [ "$candidate" = "$baseline" ]; then
+            echo "::error::no new version to canary (candidate=$candidate, baseline=$baseline)" >&2
+            exit 1
+          fi
+          echo "baseline $baseline -> candidate $candidate"
+          echo "BASELINE_VERSION=$baseline" >> "$GITHUB_ENV"
+          echo "CANDIDATE_VERSION=$candidate" >> "$GITHUB_ENV"
+
+      # The baseline window ends where the candidate's begins — record it
+      # before traffic shifts.
+      - name: Shift $CANARY_SHARE% of traffic onto the candidate
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "DEPLOY_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@$CANARY_SHARE%"
+
+      # The build overlaps the observation window so the verdict binary is
+      # warm when the window ends; `wait` surfaces a build failure as a step
+      # failure, which the rollback step below also catches.
+      - name: Observe the canary window (building stow-admin meanwhile)
+        run: |
+          cargo build -p stow-admin &
+          sleep "${CANARY_WINDOW_MINUTES}m"
+          wait
+
+      # `deploy verdict` prints every metric's baseline/candidate pair and
+      # exits non-zero on a breach or on no signal — a canary that served
+      # nothing proved nothing.
+      - name: Canary verdict
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          start_epoch=$(date -u -d "$DEPLOY_START" +%s)
+          baseline_from=$(date -u -d "@$((start_epoch - CANARY_WINDOW_MINUTES * 60))" +%Y-%m-%dT%H:%M:%SZ)
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cargo run --quiet -p stow-admin -- deploy verdict \
+            --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
+            --script stow-edge \
+            --baseline-version "$BASELINE_VERSION" \
+            --candidate-version "$CANDIDATE_VERSION" \
+            --baseline-from "$baseline_from" \
+            --baseline-to "$DEPLOY_START" \
+            --candidate-from "$DEPLOY_START" \
+            --candidate-to "$now"
+
+      # Anything after `versions deploy` failing — the verdict, the build,
+      # the runner — leaves the canary serving its share; roll it back.
+      # `CANDIDATE_VERSION` is only set once a version exists, so failures
+      # before the upload skip this.
+      - name: Roll back the canary
+        if: failure() && env.CANDIDATE_VERSION != ''
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler rollback "$BASELINE_VERSION" --config "$WRANGLER_CONFIG" \
+            --message "deploy-edge: canary verdict breach or post-deploy failure" --yes
+
+      - name: Promote the candidate to 100%
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@100%"
