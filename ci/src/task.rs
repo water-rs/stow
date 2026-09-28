@@ -270,6 +270,11 @@ struct Package {
 #[derive(serde::Serialize)]
 struct Dependency {
     version: String,
+    /// The real package name when the table key is an alias: dep pins key
+    /// on `<name>-v<version>` so two versions of one crate survive in one
+    /// section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package: Option<String>,
     #[serde(rename = "default-features", skip_serializing_if = "Option::is_none")]
     default_features: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -288,10 +293,11 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
     } = TaskFeatureSelection::from_task(task);
     let dependency = Dependency {
         version: format!("={}", task.version),
+        package: None,
         default_features: no_default_features.then_some(false),
         features,
     };
-    let (dependencies, build_dependencies) = if task.host_side {
+    let (mut dependencies, mut build_dependencies) = if task.host_side {
         // The build-dependency declaration is what makes cargo compile
         // the crate as a host unit: the same unit kind a consumer's
         // build computes for a proc-macro's deps, at the same `-C
@@ -305,6 +311,45 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         dependencies.insert(task.crate_name.as_str().to_owned(), dependency);
         (dependencies, BTreeMap::new())
     };
+    // Every dependency edge the scheduler gated becomes an exact pin on
+    // the wrapper: `=<version>` with the dep's published feature set, in
+    // the section matching the side its consumers compile it on. Without
+    // the pins the wrapper's own resolution can land on a narrower
+    // feature set than the dep task published — cargo compiles the dep
+    // under a key nobody published and dep_scan fails the build
+    // (stow#431). Cargo's unification can only widen a pinned set, and
+    // everything the task crate requests of the dep is already inside it
+    // by construction.
+    //
+    // The table key cannot be the crate name: a closure that carries two
+    // semver-incompatible versions of one crate (`syn` 1 and 2 is common)
+    // — or a pin that shares the task crate's name at another version —
+    // would keep only the last insert. Each pin keys on a unique
+    // `<name>-v<version>` alias and names the package in `package`.
+    for pin in &task.dep_pins {
+        let selection = TaskFeatureSelection::from_features_json(&pin.features_json);
+        let pinned = Dependency {
+            version: format!("={}", pin.version),
+            package: Some(pin.crate_name.as_str().to_owned()),
+            default_features: selection.no_default_features.then_some(false),
+            features: selection.features,
+        };
+        let section = if pin.host_side {
+            &mut build_dependencies
+        } else {
+            &mut dependencies
+        };
+        let alias = format!(
+            "{}-v{}",
+            pin.crate_name.as_str(),
+            pin.version.to_string().replace('.', "_")
+        );
+        if section.insert(alias.clone(), pinned).is_some() {
+            return Err(stow_types::stow_error!(
+                "dep pin alias {alias} collides with an earlier entry in the wrapper manifest"
+            ));
+        }
+    }
     toml::to_string(&WrapperManifest {
         package: Package {
             name: WRAPPER_PACKAGE_NAME,
@@ -566,48 +611,7 @@ pub async fn build(
     };
     let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
 
-    // Phase 0 runs on the host: `cargo fetch` resolves the dependency graph
-    // and populates the registry cache, so the sandboxed phases can run
-    // `--frozen` — no lockfile writes, no index access — with every outbound
-    // connection an untrusted build script still attempts audited. Feature
-    // flags don't exist on `fetch`: it downloads the full dependency closure
-    // for every feature and every target.
-    let mut fetch = Command::new("cargo");
-    fetch
-        .arg("fetch")
-        .arg("--manifest-path")
-        .arg(workspace.manifest_path());
-    // Fetch never takes `--locked`: the generated wrapper's seeded lockfile
-    // is not one cargo can be held to — it must still prune bundled entries
-    // the wrapper graph cannot reach and fill in the dep edges. Under
-    // `preserve_lockfile` the lock's fidelity is proven by the diff check
-    // below instead of by the flag.
-    let status = fetch
-        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
-        .status()
-        .await
-        .map_err(|error| stow_types::stow_error!("run cargo fetch: {error}"))?;
-    if !status.success() {
-        return Err(stow_types::stow_error!(
-            "cargo fetch failed for {} {} on {} with status {}",
-            task.crate_name,
-            task.version,
-            task.target,
-            status
-        ));
-    }
-    if let Some(bundled_lockfile) = workspace.bundled_lockfile() {
-        let resolved_lockfile =
-            async_fs::read_to_string(workspace.workspace_root().join("Cargo.lock"))
-                .await
-                .map_err(|error| {
-                    stow_types::stow_error!(
-                        "read resolved Cargo.lock under {}: {error}",
-                        workspace.workspace_root().display()
-                    )
-                })?;
-        verify_preserved_lockfile(bundled_lockfile, &resolved_lockfile, task)?;
-    }
+    fetch_workspace_dependencies(task, &workspace).await?;
 
     let (_consume_store_dir, consume_store) = stage_consumption_store(task, &workspace).await?;
 
@@ -650,11 +654,29 @@ pub async fn build(
         rustflags: &rustflags,
         consume_store: consume_store.as_deref(),
     };
+    // One sandbox carries every phase and invocation. On Windows building
+    // it means a recursive ACL pass over every granted tree — the registry
+    // sources, the toolchain, the compiler search dirs — and doing that
+    // once per phase×invocation cost tens of minutes per build (stow#431).
+    // The grant set below is identical for all phases anyway: the only
+    // per-phase path is `CARGO_TARGET_DIR`, and every phase's target dir
+    // sits under `run_dir`, which the grant covers.
+    let msvc = MsvcToolchain::resolve();
+    let sandbox = phase_sandbox(&setup, run_dir.path(), &msvc).await?;
+    let ipc_endpoint = sandbox
+        .ipc_endpoint()
+        .ok_or_else(|| stow_types::stow_error!("IPC-configured sandbox exposed no endpoint"))?
+        .to_path_buf();
+    let run = PhaseRun {
+        setup: &setup,
+        sandbox: &sandbox,
+        ipc_endpoint: &ipc_endpoint,
+        msvc: &msvc,
+    };
     for &phase in phases {
         for &invocation in phase_invocations(task) {
             let target_dir = phase_target_dir(run_dir.path(), phase, invocation);
-            run_sandboxed_phase(&setup, task, phase, invocation, &target_dir, &mut collector)
-                .await?;
+            run_sandboxed_phase(&run, task, phase, invocation, &target_dir, &mut collector).await?;
         }
     }
 
@@ -674,6 +696,55 @@ pub async fn build(
     })
 }
 
+/// Phase 0 runs on the host: `cargo fetch` resolves the dependency graph
+/// and populates the registry cache, so the sandboxed phases can run
+/// `--frozen` — no lockfile writes, no index access — with every outbound
+/// connection an untrusted build script still attempts audited. Feature
+/// flags don't exist on `fetch`: it downloads the full dependency closure
+/// for every feature and every target.
+async fn fetch_workspace_dependencies(
+    task: &BuildTaskPayload,
+    workspace: &BuildWorkspace,
+) -> stow_types::error::Result<()> {
+    let mut fetch = Command::new("cargo");
+    fetch
+        .arg("fetch")
+        .arg("--manifest-path")
+        .arg(workspace.manifest_path());
+    // Fetch never takes `--locked`: the generated wrapper's seeded lockfile
+    // is not one cargo can be held to — it must still prune bundled entries
+    // the wrapper graph cannot reach and fill in the dep edges. Under
+    // `preserve_lockfile` the lock's fidelity is proven by the diff check
+    // below instead of by the flag.
+    let status = fetch
+        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
+        .status()
+        .await
+        .map_err(|error| stow_types::stow_error!("run cargo fetch: {error}"))?;
+    if !status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo fetch failed for {} {} on {} with status {}",
+            task.crate_name,
+            task.version,
+            task.target,
+            status
+        ));
+    }
+    if let Some(bundled_lockfile) = workspace.bundled_lockfile() {
+        let resolved_lockfile =
+            async_fs::read_to_string(workspace.workspace_root().join("Cargo.lock"))
+                .await
+                .map_err(|error| {
+                    stow_types::stow_error!(
+                        "read resolved Cargo.lock under {}: {error}",
+                        workspace.workspace_root().display()
+                    )
+                })?;
+        verify_preserved_lockfile(bundled_lockfile, &resolved_lockfile, task)?;
+    }
+    Ok(())
+}
+
 /// The per-run state every sandboxed phase shares.
 struct PhaseSetup<'a> {
     workspace: &'a BuildWorkspace,
@@ -688,25 +759,32 @@ struct PhaseSetup<'a> {
     consume_store: Option<&'a Path>,
 }
 
-/// Run one cargo phase inside its own sandbox, then absorb the capture
+/// The shared resources one sandboxed phase run draws on — the phase
+/// inputs plus the build's one sandbox (phases share it because creating
+/// one pays the grant-ACL walk over every granted tree, stow#431).
+struct PhaseRun<'a> {
+    setup: &'a PhaseSetup<'a>,
+    sandbox: &'a Sandbox<heel::Audited<heel::AllowAll>>,
+    /// heel's IPC socket, exported to sandboxed processes so shimmed
+    /// commands reach the host.
+    ipc_endpoint: &'a Path,
+    msvc: &'a MsvcToolchain,
+}
+
+/// Run one cargo phase inside the build's sandbox, then absorb the capture
 /// records it delivered. A duplicate identity is fatal, and so is cargo
 /// exiting non-zero — the build compiles one crate, and a phase that
 /// cannot finish means the task failed.
 async fn run_sandboxed_phase(
-    setup: &PhaseSetup<'_>,
+    run: &PhaseRun<'_>,
     task: &BuildTaskPayload,
     phase: CargoSubcommand,
     invocation: CargoInvocation,
     target_dir: &Path,
     collector: &mut CaptureCollector,
 ) -> stow_types::error::Result<()> {
+    let setup = run.setup;
     create_dir_all(target_dir).await?;
-    let msvc = MsvcToolchain::resolve();
-    let sandbox = phase_sandbox(setup, target_dir, &msvc).await?;
-    let ipc_endpoint = sandbox
-        .ipc_endpoint()
-        .ok_or_else(|| stow_types::stow_error!("IPC-configured sandbox exposed no endpoint"))?
-        .to_path_buf();
     let args = cargo_phase_args(setup.workspace, task, phase, invocation).await?;
 
     // A unit that links in more than one phase — a proc-macro's deps like
@@ -726,7 +804,8 @@ async fn run_sandboxed_phase(
         "stow-ci://target"
     );
 
-    let mut command = sandbox
+    let mut command = run
+        .sandbox
         .command("cargo")
         .args(args)
         .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
@@ -737,7 +816,7 @@ async fn run_sandboxed_phase(
             STOW_BUILD_CAPTURE_DIR_ENV,
             path_arg(setup.workspace.capture_dir())?,
         )
-        .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(&ipc_endpoint)?)
+        .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(run.ipc_endpoint)?)
         .env("CARGO_HOME", path_arg(&cargo_home()?)?)
         .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
         .current_dir(setup.workspace.workspace_root());
@@ -747,7 +826,7 @@ async fn run_sandboxed_phase(
     // PATH included: the MSVC bin directories come first in it, which is
     // what puts the real linker ahead of whatever else on the runner is
     // called `link`.
-    for (key, value) in &msvc.env {
+    for (key, value) in &run.msvc.env {
         command = command.env(os_str_arg(key)?, os_str_arg(value)?);
     }
     // The wrapper package is generated scaffolding: the capture wrapper
@@ -777,7 +856,6 @@ async fn run_sandboxed_phase(
     let status = command.status().await.map_err(|error| {
         stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
     })?;
-    drop(sandbox);
 
     // Absorb the records this phase delivered before looking at cargo's
     // exit status: a duplicate identity is fatal either way. The drain
@@ -905,16 +983,19 @@ async fn invocation_passes_target(
     })
 }
 
-/// Build the `heel` sandbox one cargo phase runs in.
+/// Build the `heel` sandbox every cargo phase of one build runs in.
 ///
 /// The child starts with no environment and no home directory; every path it
 /// can touch is an explicit grant below, and every network connection it
 /// attempts is proxied and audited into the run's `network-audit.jsonl`. The
 /// grants are what stop a build script from reaching the runner's
 /// credentials, the cargo registry sources, or this process's environment.
+/// `run_dir` is the parent of every phase's `CARGO_TARGET_DIR`: granting it
+/// once covers them all, since a directory grant reaches children created
+/// after the sandbox exists.
 async fn phase_sandbox(
     setup: &PhaseSetup<'_>,
-    target_dir: &Path,
+    run_dir: &Path,
     msvc: &MsvcToolchain,
 ) -> stow_types::error::Result<Sandbox<heel::Audited<heel::AllowAll>>> {
     let PhaseSetup {
@@ -953,7 +1034,7 @@ async fn phase_sandbox(
 
     for (path, access, reason) in sandbox_grants(
         workspace,
-        target_dir,
+        run_dir,
         wrappers,
         runtime_wrapper,
         msvc,
@@ -977,7 +1058,7 @@ async fn phase_sandbox(
 /// one is a hole in the boundary this task exists to close.
 fn sandbox_grants(
     workspace: &BuildWorkspace,
-    target_dir: &Path,
+    run_dir: &Path,
     wrappers: &wrapper_shim::WrapperShimPaths,
     runtime_wrapper: &Path,
     msvc: &MsvcToolchain,
@@ -1020,9 +1101,9 @@ fn sandbox_grants(
             "the rustc/cc shims resolve to the runtime wrapper binary",
         ),
         (
-            target_dir.to_path_buf(),
+            run_dir.to_path_buf(),
             Access::WRITE | Access::EXEC,
-            "the phase's CARGO_TARGET_DIR — build scripts and proc macros are compiled here and must execute; kept outside the working dir, which never executes",
+            "parent of every phase's CARGO_TARGET_DIR — build scripts and proc macros are compiled here and must execute; kept outside the working dir, which never executes",
         ),
         (
             workspace.capture_dir().to_path_buf(),
@@ -1048,7 +1129,32 @@ fn sandbox_grants(
     grants.extend(compiler_search_grants());
     grants.extend(msvc.grants());
 
+    // Under a root Windows opens to every AppContainer — %SystemRoot%,
+    // %ProgramFiles%, %ProgramFiles(x86)% — the container already has read
+    // and execute; granting again only re-ACLs the whole tree, which was
+    // the multi-minute stall each sandbox paid per creation (stow#431).
+    // Write grants are kept: the roots give no write access.
+    grants.retain(|(path, access, _)| access.can_write() || !in_windows_system_tree(path));
+
     Ok(grants)
+}
+
+/// Whether `path` sits under a directory Windows already opens to every
+/// `AppContainer`: `%SystemRoot%`, `%ProgramFiles%`, `%ProgramFiles(x86)%`.
+/// This is heel's own `in_system_directory` premise — the one its ancestor
+/// traversal relies on — checked the same way, case-insensitively on
+/// either separator.
+fn in_windows_system_tree(path: &Path) -> bool {
+    let path = path.to_string_lossy().to_lowercase();
+    ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|variable| std::env::var(variable).ok())
+        .any(|root| {
+            let root = root.to_lowercase();
+            path == root
+                || path.starts_with(&format!("{root}\\"))
+                || path.starts_with(&format!("{root}/"))
+        })
 }
 
 /// The existence-conditional grants — a bare `cargo_home` may carry no
@@ -1465,10 +1571,14 @@ pub struct TaskFeatureSelection {
 
 impl TaskFeatureSelection {
     pub(crate) fn from_task(task: &BuildTaskPayload) -> Self {
+        Self::from_features_json(&task.features_json)
+    }
+
+    pub(crate) fn from_features_json(features_json: &stow_types::identity::FeaturesJson) -> Self {
         // `FeaturesJson` is already validated (sorted + deduplicated + valid
         // feature names) at deserialize time, so we can read the canonical
         // list directly instead of re-parsing.
-        let mut features: Vec<String> = task.features_json.features().to_vec();
+        let mut features: Vec<String> = features_json.features().to_vec();
         let no_default_features = !features.iter().any(|feature| feature == "default");
         features.retain(|feature| feature != "default");
         Self {
@@ -1769,7 +1879,7 @@ mod tests {
     use flate2::Compression;
     use tempfile::TempDir;
 
-    use stow_types::api::BuildTaskPayload;
+    use stow_types::api::{BuildDepPin, BuildTaskPayload};
     use stow_types::identity::{
         CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
     };
@@ -1821,6 +1931,7 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
             host_side: false,
+            dep_pins: Vec::new(),
         }
     }
 
@@ -1881,6 +1992,126 @@ mod tests {
             Some([toml::Value::String("std".to_owned())].as_slice()),
         );
         assert_eq!(build_dependency["default-features"].as_bool(), Some(false),);
+    }
+
+    /// stow#431: without the scheduler's dep pins the wrapper's own
+    /// resolution can land on a narrower feature set than the dep task
+    /// published — cargo compiles the dep under a key nobody published
+    /// and `dep_scan` fails the build. Each pin is an exact `=` version
+    /// with the dep's published feature set, in the section matching the
+    /// side its consumers compile it on.
+    #[test]
+    fn wrapper_manifest_pins_task_dependencies_to_their_published_identities() {
+        let mut task = task_with_features(&["derive"]);
+        task.dep_pins = vec![
+            BuildDepPin {
+                crate_name: CrateName::parse("serde_core").expect("crate name"),
+                version: CrateVersion::new(semver::Version::parse("1.0.228").expect("version")),
+                features_json: FeaturesJson::canonicalize(vec![
+                    "alloc".to_owned(),
+                    "std".to_owned(),
+                ])
+                .expect("features"),
+                host_side: false,
+            },
+            BuildDepPin {
+                crate_name: CrateName::parse("syn").expect("crate name"),
+                version: CrateVersion::new(semver::Version::parse("2.0.106").expect("version")),
+                features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                    .expect("features"),
+                host_side: true,
+            },
+        ];
+        let manifest: toml::Table =
+            toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
+                .expect("generated manifest parses");
+
+        let dep = dependency(&manifest, "serde_core-v1_0_228");
+        assert_eq!(dep["version"].as_str(), Some("=1.0.228"));
+        assert_eq!(
+            dep["package"].as_str(),
+            Some("serde_core"),
+            "an aliased pin names its real package"
+        );
+        assert_eq!(
+            dep["features"].as_array().map(Vec::as_slice),
+            Some(
+                [
+                    toml::Value::String("alloc".to_owned()),
+                    toml::Value::String("std".to_owned())
+                ]
+                .as_slice()
+            ),
+            "the dep's published feature set is pinned verbatim"
+        );
+        assert_eq!(dep["default-features"].as_bool(), Some(false));
+
+        let host_dep = manifest["build-dependencies"]["syn-v2_0_106"]
+            .as_table()
+            .expect("a host-side dep pin lands in build-dependencies");
+        assert_eq!(host_dep["version"].as_str(), Some("=2.0.106"));
+        assert_eq!(host_dep["package"].as_str(), Some("syn"));
+        assert!(
+            host_dep.get("features").is_none() && host_dep.get("default-features").is_none(),
+            "a pin whose set is [\"default\"] resolves to cargo defaults: {host_dep:?}"
+        );
+        assert!(
+            manifest["dependencies"].get("syn-v2_0_106").is_none(),
+            "a host-side pin never lands in the target-side section"
+        );
+    }
+
+    /// Two semver-incompatible versions of one crate in a closure — and a
+    /// pin at the task crate's own name — must all survive the generated
+    /// manifest: a crate-name key keeps only the last insert (stow#431).
+    #[test]
+    fn wrapper_manifest_keeps_duplicate_crate_names_under_distinct_aliases() {
+        let mut task = task_with_features(&["derive"]);
+        let pin = |version: &str, host_side: bool| BuildDepPin {
+            crate_name: CrateName::parse("syn").expect("crate name"),
+            version: CrateVersion::new(semver::Version::parse(version).expect("version")),
+            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                .expect("features"),
+            host_side,
+        };
+        task.dep_pins = vec![
+            pin("1.0.109", false),
+            pin("2.0.106", false),
+            BuildDepPin {
+                crate_name: task.crate_name.clone(),
+                version: CrateVersion::new(semver::Version::parse("9.9.9").expect("version")),
+                features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+                host_side: false,
+            },
+        ];
+        let manifest: toml::Table =
+            toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
+                .expect("generated manifest parses");
+
+        let deps = manifest["dependencies"]
+            .as_table()
+            .expect("dependencies table");
+        for (alias, version) in [
+            ("syn-v1_0_109", "=1.0.109"),
+            ("syn-v2_0_106", "=2.0.106"),
+            ("itoa-v9_9_9", "=9.9.9"),
+        ] {
+            let dep = deps
+                .get(alias)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("pin {alias} must survive in the manifest"));
+            assert_eq!(dep["version"].as_str(), Some(version));
+        }
+        assert_eq!(
+            deps["itoa-v9_9_9"]["package"].as_str(),
+            Some("itoa"),
+            "the same-name pin points at the task crate's package"
+        );
+        assert_eq!(
+            deps["itoa"]["version"].as_str(),
+            Some("=1.0.15"),
+            "the task crate's own declaration is untouched"
+        );
     }
 
     #[test]

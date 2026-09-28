@@ -33,10 +33,15 @@ pub fn canonical_crate_name(name: &str) -> String {
 /// Detect `(crate_name, version)` for an invocation whose input file lives
 /// under a cargo registry `src/` directory (`<name>-<version>/src/lib.rs`).
 ///
-/// Walks the input path's ancestors and returns the first component of the
-/// form `<name>-<semver>` whose name canonicalizes to `parsed.crate_name`.
-/// Returns `Ok(None)` for non-registry builds (path or git deps), which the
-/// public cache does not serve.
+/// The identity comes from the directory at the canonical registry slot
+/// `…/registry/src/<index>/<package>-<version>` — both sides see that
+/// shape: the CLI wrapper under `$CARGO_HOME`, and the CI capture inside
+/// the sandbox where `CARGO_HOME` points at the granted registry. The
+/// directory name there is the package name, which the crate name need
+/// not equal, so the parse never filters on it. Returns `Ok(None)` for
+/// non-registry builds (path or git deps), which the public cache does
+/// not serve — a `<name>-<semver>` directory anywhere else in the path
+/// is a worktree or vendored copy, not an identity.
 ///
 /// # Errors
 /// Never fails today; the `Result` shape lets callers `?` it uniformly
@@ -47,16 +52,14 @@ pub fn detect_registry_crate_version(
     let Some(input_path) = parsed.input_path.as_ref() else {
         return Ok(None);
     };
-    let crate_name = canonical_crate_name(&parsed.crate_name);
     for ancestor in input_path.ancestors() {
-        let Some(component) = ancestor.file_name().and_then(|value| value.to_str()) else {
+        if !is_registry_package_slot(ancestor) {
             continue;
-        };
-        if let Some((package_name, version)) =
-            split_registry_package_component(component, &crate_name)
-        {
-            return Ok(Some((package_name, version)));
         }
+        let Some(component) = ancestor.file_name().and_then(|value| value.to_str()) else {
+            return Ok(None);
+        };
+        return Ok(split_package_version_component(component));
     }
     Ok(None)
 }
@@ -169,22 +172,37 @@ pub fn stable_c_metadata_for_compile_key(compile_key: &str) -> crate::error::Res
     Ok(compile_key[..STABLE_METADATA_HEX_LEN].to_owned())
 }
 
-fn split_registry_package_component(
-    component: &str,
-    expected_crate_name: &str,
-) -> Option<(String, String)> {
+/// Split a `<name>-<version>` directory component on the last `-` that
+/// leaves a valid semver on the right. Registry package dirs carry the
+/// *package* name, which differs from the lib crate name whenever the
+/// package renames its lib.
+fn split_package_version_component(component: &str) -> Option<(String, String)> {
     for (index, _) in component.match_indices('-').rev() {
         let crate_name = &component[..index];
         let version = &component[index + 1..];
-        if canonical_crate_name(crate_name) != expected_crate_name {
-            continue;
-        }
         if semver::Version::parse(version).is_err() {
             continue;
         }
         return Some((crate_name.to_owned(), version.to_owned()));
     }
     None
+}
+
+/// Whether `dir` sits at `…/registry/src/<index>/<pkg>` — the only layout
+/// cargo places extracted registry sources in. Anchoring the fallback to
+/// this slot keeps an unrelated `<name>-<version>` directory elsewhere in
+/// a path (a vendored copy, a checkout dir) from being read as identity.
+fn is_registry_package_slot(dir: &std::path::Path) -> bool {
+    let Some(src) = dir.parent().and_then(|index| index.parent()) else {
+        return false;
+    };
+    if src.file_name() != Some(std::ffi::OsStr::new("src")) {
+        return false;
+    }
+    let Some(registry) = src.parent() else {
+        return false;
+    };
+    registry.file_name() == Some(std::ffi::OsStr::new("registry"))
 }
 
 /// Normalize a captured invocation's profile for cache identity.
@@ -590,8 +608,8 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        UnitInvocation, UnitKind, UnitShape, UnitSide, normalized_cache_profile,
-        required_unit_shapes, stable_registry_artifact_identity,
+        UnitInvocation, UnitKind, UnitShape, UnitSide, detect_registry_crate_version,
+        normalized_cache_profile, required_unit_shapes, stable_registry_artifact_identity,
     };
     use crate::rustc::ParsedRustcArgs;
 
@@ -649,6 +667,102 @@ mod tests {
         let profile = normalized_cache_profile(&parsed).expect("normalize cache profile");
 
         assert_eq!(profile.debuginfo, 0);
+    }
+
+    #[test]
+    fn detect_registry_version_reads_package_dir_for_renamed_lib() {
+        // Package `redox_syscall` renames its lib to `syscall`; cargo's
+        // registry dir still carries the package name, so the slot read
+        // must return it — the crate name never filters the slot parse.
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "syscall",
+            "--edition=2021",
+            "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/redox_syscall-0.5.17/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "-C",
+            "metadata=a52ee596848c66ca",
+            "-C",
+            "extra-filename=-aa4980adf969014b",
+            "--out-dir",
+            "/tmp/out",
+        ]))
+        .expect("parse syscall rustc args");
+
+        assert_eq!(
+            detect_registry_crate_version(&parsed).expect("detect"),
+            Some(("redox_syscall".to_owned(), "0.5.17".to_owned()))
+        );
+    }
+
+    /// The CI capture runs inside the sandbox with `CARGO_HOME` pointing
+    /// at the granted registry — the slot there is the same
+    /// `registry/src/<index>/<pkg>-<version>` shape the CLI sees under
+    /// `$CARGO_HOME`.
+    #[test]
+    fn detect_registry_version_reads_the_sandbox_registry_slot() {
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "anyhow",
+            "--edition=2021",
+            "D:/a/_temp/stow/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.99/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "-C",
+            "metadata=a52ee596848c66ca",
+            "-C",
+            "extra-filename=-aa4980adf969014b",
+            "--out-dir",
+            "/tmp/out",
+        ]))
+        .expect("parse anyhow rustc args");
+
+        assert_eq!(
+            detect_registry_crate_version(&parsed).expect("detect"),
+            Some(("anyhow".to_owned(), "1.0.99".to_owned()))
+        );
+    }
+
+    #[test]
+    fn detect_registry_version_rejects_lookalike_dir_outside_registry() {
+        // A `<name>-<semver>` dir that does not sit at
+        // `registry/src/<index>/<pkg>` is not a package slot — a vendored
+        // copy or worktree must not be read as a registry identity, whether
+        // its name matches the crate name or not.
+        for input_path in [
+            "/Users/lexoliu/worktrees/redox_syscall-0.5.17/src/lib.rs",
+            // The crate name itself matches: still not an identity.
+            "/Users/lexoliu/worktrees/syscall-0.5.17/src/lib.rs",
+        ] {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "syscall",
+                "--edition=2021",
+                input_path,
+                "--crate-type",
+                "lib",
+                "--emit",
+                "dep-info,metadata,link",
+                "-C",
+                "metadata=a52ee596848c66ca",
+                "-C",
+                "extra-filename=-aa4980adf969014b",
+                "--out-dir",
+                "/tmp/out",
+            ]))
+            .expect("parse syscall rustc args");
+
+            assert_eq!(
+                detect_registry_crate_version(&parsed).expect("detect"),
+                None,
+                "{input_path} is not a registry slot"
+            );
+        }
     }
 
     #[test]

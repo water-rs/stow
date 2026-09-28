@@ -56,6 +56,11 @@ pub struct QueuedTask {
     /// wrapper package's dependency as the unit's consumers compile it.
     pub host_side: bool,
     pub preserve_lockfile: bool,
+    /// The task's `queue_dependencies` rows at claim time — the published
+    /// identity of every dep the unit needs. Dispatch carries them to
+    /// `BuildTaskPayload.dep_pins` so the generated wrapper package pins
+    /// each dep to the identity its own task published.
+    pub dep_pins: Vec<stow_types::api::BuildDepPin>,
 }
 
 // Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
@@ -1321,10 +1326,82 @@ pub async fn claim_dispatchable_tasks(
             rustc_version: row.rustc_version,
             host_side: row.host_side != 0,
             preserve_lockfile: row.preserve_lockfile != 0,
+            dep_pins: Vec::new(),
         });
     }
 
+    load_claimed_dep_pins(db, &mut claimed).await?;
+
     Ok(claimed)
+}
+
+/// Fill each claimed task's `dep_pins` from its `queue_dependencies` rows:
+/// the (name, version, unified features, side) the dep's own task was
+/// published at, which is exactly what the dependent's wrapper manifest
+/// pins so its resolve lands on the published unit (stow#431).
+async fn load_claimed_dep_pins(
+    db: &DurableDb,
+    claimed: &mut [QueuedTask],
+) -> Result<(), QueueError> {
+    if claimed.is_empty() {
+        return Ok(());
+    }
+    let task_ids = claimed
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+    let rows = db
+        .query(
+            "SELECT task_id, dep_crate_name, dep_version, dep_features_json, dep_host_side \
+             FROM queue_dependencies \
+             WHERE task_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(enqueue_json(&task_ids)?)
+        .fetch_all::<DepPinRow>()
+        .await
+        .map_err(|error| format!("load claimed task dep pins: {error}"))?;
+    let mut by_task: std::collections::HashMap<String, Vec<stow_types::api::BuildDepPin>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let pin = stow_types::api::BuildDepPin {
+            crate_name: CrateName::parse(row.dep_crate_name).map_err(|error| {
+                QueueError::Invariant(format!(
+                    "dep pin for {}: invalid crate name: {error}",
+                    row.task_id
+                ))
+            })?,
+            version: CrateVersion::new(semver::Version::parse(&row.dep_version).map_err(
+                |error| {
+                    QueueError::Invariant(format!(
+                        "dep pin for {}: invalid version: {error}",
+                        row.task_id
+                    ))
+                },
+            )?),
+            features_json: FeaturesJson::from_sorted(
+                serde_json::from_str(&row.dep_features_json).map_err(|error| {
+                    QueueError::Invariant(format!(
+                        "dep pin for {}: invalid features: {error}",
+                        row.task_id
+                    ))
+                })?,
+            )
+            .map_err(|error| {
+                QueueError::Invariant(format!(
+                    "dep pin for {}: invalid features: {error}",
+                    row.task_id
+                ))
+            })?,
+            host_side: row.dep_host_side != 0,
+        };
+        by_task.entry(row.task_id).or_default().push(pin);
+    }
+    for task in claimed.iter_mut() {
+        if let Some(pins) = by_task.remove(&task.task_id) {
+            task.dep_pins = pins;
+        }
+    }
+    Ok(())
 }
 
 /// Retire every candidate row whose semantic identity the artifact
@@ -2902,6 +2979,16 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
 struct TaskIdRow {
     task_id: String,
     status: String,
+}
+
+/// One `queue_dependencies` row reduced to a [`QueuedTask`]'s dep pin.
+#[derive(Debug, skyzen::FromRow)]
+struct DepPinRow {
+    task_id: String,
+    dep_crate_name: String,
+    dep_version: String,
+    dep_features_json: String,
+    dep_host_side: i64,
 }
 
 /// One `GROUP BY status, lane` aggregate row from [`status`].

@@ -46,7 +46,13 @@ pub async fn run_rustc_capture_wrapper(
     })?;
     let args = pinned_link_args(&args[3..]);
     let original_parsed = match ParsedRustcArgs::parse(&args) {
-        Ok(parsed) => parsed,
+        Ok(mut parsed) => {
+            // Cargo exports OUT_DIR on the rustc invocation of a links crate's
+            // unit; a served bundle's native artifacts must restore into it,
+            // never into a `-L native=` path (stow#431).
+            parsed.build_script_out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
+            parsed
+        }
         Err(error) if error.contains("missing --crate-name") => {
             let status = Command::new(rustc).args(&args).status().await?;
             std::process::exit(status.code().unwrap_or(1));
@@ -1457,6 +1463,7 @@ mod tests {
             overflow_checks: Some(true),
             strip: None,
             native_search_paths: Vec::new(),
+            build_script_out_dir: None,
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
@@ -1664,6 +1671,7 @@ mod tests {
             overflow_checks: Some(true),
             strip: None,
             native_search_paths: Vec::new(),
+            build_script_out_dir: None,
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,

@@ -159,6 +159,33 @@ pub struct BuildTaskPayload {
     /// as target-side tasks.
     #[serde(default)]
     pub host_side: bool,
+    /// The task's dependency pins: the identities the deps were published
+    /// at. The generated wrapper package declares each pin as an exact
+    /// dependency (`=<version>`, the request-global unified feature set, the
+    /// side's manifest section) so cargo resolves the dep's unit at the same
+    /// identity its own task published — a resolve that stops short of the
+    /// published feature set compiles the dep again and fails the
+    /// foreign-unit scan (stow#431).
+    pub dep_pins: Vec<BuildDepPin>,
+}
+
+/// One dependency edge of a build task — a crate's published identity.
+///
+/// Carried on [`BuildTaskPayload`] so the generated wrapper package can pin
+/// the dep to the identity its own task published rather than whatever the
+/// wrapper's resolution would pick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BuildDepPin {
+    /// The dependency's crate name as known to crates.io.
+    pub crate_name: CrateName,
+    /// The version the dependency's task published at.
+    pub version: CrateVersion,
+    /// The request-global unified feature set the dep was published under.
+    pub features_json: FeaturesJson,
+    /// Which side of the target's unit graph the pin belongs to: a
+    /// `build-dependencies` entry (host side — the shape proc-macro and
+    /// build-script deps compile at) or a `dependencies` entry.
+    pub host_side: bool,
 }
 
 /// Artifact record CI POSTs to the edge's register endpoint after a build.

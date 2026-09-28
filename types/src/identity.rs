@@ -302,6 +302,17 @@ string_newtype!(
     validate_target,
     InvalidTarget
 );
+
+impl TargetTriple {
+    /// Whether the triple targets Windows — an `*-windows-*` OS component
+    /// (`windows-msvc`, `windows-gnu`, `windows-gnullvm`).
+    #[must_use]
+    pub fn is_windows(&self) -> bool {
+        self.as_str()
+            .split('-')
+            .any(|component| component == "windows")
+    }
+}
 string_newtype!(
     /// Wire form of a rustc version string (e.g. `"1.83.0"`). Shape only.
     WireRustcVersion,

@@ -158,6 +158,10 @@ pub struct NativeArtifacts {
     /// Generated files from the build script's `OUT_DIR`.
     /// Stored as (`relative_path`, contents) pairs.
     pub out_dir_files: Vec<OutDirFile>,
+    /// The build script's `OUT_DIR` as captured on the producing machine.
+    /// Restore sites `out_dir_files` into the consumer's own `OUT_DIR` and
+    /// rewrites directives that name this path.
+    pub original_out_dir: std::path::PathBuf,
 }
 
 /// A static library produced by a build script.

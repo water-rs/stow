@@ -25,6 +25,7 @@ use stow_types::api::{ArtifactRecord, RegisterArtifactsRequest};
 use zenwave::{Client, ResponseExt};
 
 use crate::auth;
+use crate::notify;
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 
@@ -41,12 +42,16 @@ const REGISTER_CHUNK_SIZE: usize = 32;
 /// (`BuildTaskPayload::task_id`); the edge binds the record set to that
 /// task's dependency closure. `None` only on the operator backfill path,
 /// which registers as a repo-push caller rather than a dispatched run.
+///
+/// Returns `false` when the edge answered 409 — the task's attempt moved
+/// on and these records are superseded writes the queue will never
+/// consume; the caller should stop work and exit quietly.
 pub async fn register_artifacts(
     task_id: Option<&str>,
     records: &[ArtifactRecord],
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<bool> {
     if records.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let edge_url = env_required(STOW_EDGE_URL_ENV)?;
     let token = auth::edge_bearer().await?;
@@ -61,17 +66,25 @@ pub async fn register_artifacts(
             records: chunk.to_vec(),
         };
         let mut client = zenwave::client();
-        client
+        let response = client
             .post(&url)?
             .header("Authorization", format!("Bearer {token}"))?
             .json_body(&body)?
             .await
-            .map_err(|error| stow_types::stow_error!("POST {url}: {error}"))?
-            .error_for_status()
-            .await
-            .map_err(|error| {
-                stow_types::stow_error!("edge admin register rejected records: {error}")
-            })?;
+            .map_err(|error| stow_types::stow_error!("POST {url}: {error}"))?;
+        match response.error_for_status().await {
+            Ok(_) => {}
+            // A 409 says the task no longer accepts records — a newer
+            // attempt owns it after the stale-dispatch lease reclaimed
+            // this one. The registers it rejects are superseded writes:
+            // stop pushing and let the caller exit quietly (stow#431).
+            Err(error) if notify::is_attempt_conflict(&error) => return Ok(false),
+            Err(error) => {
+                return Err(stow_types::stow_error!(
+                    "edge admin register rejected records: {error}"
+                ));
+            }
+        }
     }
 
     tracing::info!(
@@ -80,7 +93,7 @@ pub async fn register_artifacts(
         "registered artifact records via edge admin endpoint"
     );
 
-    Ok(())
+    Ok(true)
 }
 
 fn env_required(name: &str) -> stow_types::error::Result<String> {

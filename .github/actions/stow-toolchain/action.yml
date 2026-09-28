@@ -1,0 +1,72 @@
+name: stow-toolchain
+description: >-
+  Download the stow toolchain artifact for a commit from GHCR, verify its
+  cosign signature against the merge-queue signing identity, and put the
+  requested binaries on PATH.
+# toolchain-publish.yml builds stow-build, stow-cli and stow-admin once per
+# platform on the merge queue and pushes them to ghcr.io/water-rs/stow-toolchain
+# as `<sha>-<os>-<arch>` — the merge group head sha is exactly what main is
+# fast-forwarded to (stow#431). The pull resolves the tag to its manifest
+# digest, cosign proves the signer was toolchain-publish.yml on a
+# gh-readonly-queue ref — only GitHub's merge queue can create those — and
+# --certificate-github-workflow-sha binds the signature to the requested
+# commit. An absent artifact or a failed verify fails the step; there is no
+# source-build fallback.
+#
+# `sha` is an input rather than `github.sha` because callers dispatching on
+# events like `workflow_run` deploy a commit that is not the run's own sha.
+inputs:
+  sha:
+    description: >-
+      The commit whose toolchain artifact to pull — the tag prefix and the
+      sha the cosign signature must carry.
+    required: false
+    default: ${{ github.sha }}
+  binaries:
+    description: >-
+      Space-separated binaries to extract from the tarball and put on PATH
+      (e.g. "stow-build stow-cli", or just "stow-admin" for the watchdog).
+      stow-build resolves its rustc wrapper as a sibling of its own
+      executable, so a build run needs both stow-build and stow-cli.
+    required: true
+  github-token:
+    description: >-
+      A token with packages:read on water-rs/stow-toolchain — the job's
+      GITHUB_TOKEN.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+    - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+    - shell: bash
+      env:
+        TOOLCHAIN_SHA: ${{ inputs.sha }}
+        BINARIES: ${{ inputs.binaries }}
+        GHCR_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        key="$(printf '%s-%s' "${RUNNER_OS,,}" "${RUNNER_ARCH,,}")"
+        repo="ghcr.io/water-rs/stow-toolchain"
+        ref="${repo}:${TOOLCHAIN_SHA}-${key}"
+        echo "$GHCR_TOKEN" | oras login ghcr.io \
+          --username "$GITHUB_ACTOR" --password-stdin
+        digest="$(oras manifest fetch --descriptor "$ref" | jq -r .digest)"
+        cosign verify "${repo}@${digest}" \
+          --certificate-identity-regexp '^https://github\.com/water-rs/stow/\.github/workflows/toolchain-publish\.yml@refs/heads/gh-readonly-queue/main/.+$' \
+          --certificate-github-workflow-sha "$TOOLCHAIN_SHA" \
+          --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+        oras pull "${repo}@${digest}" --output "$RUNNER_TEMP/stow-toolchain"
+        bin_dir="$RUNNER_TEMP/stow-toolchain/bin"
+        mkdir -p "$bin_dir"
+        members=()
+        # shellcheck disable=SC2086 # BINARIES is a deliberate word-splitting list
+        for bin in $BINARIES; do
+          if [ "$RUNNER_OS" = "Windows" ]; then bin="$bin.exe"; fi
+          members+=("$bin")
+        done
+        tar -xzf "$RUNNER_TEMP/stow-toolchain/stow-toolchain.tar.gz" \
+          -C "$bin_dir" "${members[@]}"
+        for bin in "${members[@]}"; do chmod 755 "$bin_dir/$bin"; done
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        ls -l "$bin_dir"

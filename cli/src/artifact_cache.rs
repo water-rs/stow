@@ -289,22 +289,34 @@ pub async fn load_cached_bundle(
     let outputs = load_artifact_outputs(&connection, &rustc_version, &cache_key).await?;
     let sigstore_signatures =
         load_sigstore_signatures(&connection, &rustc_version, &cache_key).await?;
-    let native = load_native_artifacts(&connection, &rustc_version, &cache_key).await?;
-    let profile = serde_json::from_str::<Profile>(&entry.profile_json).wrap_err_with(|| {
-        format!("parse artifact cache profile_json for rustc {rustc_version} cache key {cache_key}")
-    })?;
-    let emit = serde_json::from_str::<Vec<String>>(&entry.emit_json).wrap_err_with(|| {
-        format!("parse artifact cache emit_json for rustc {rustc_version} cache key {cache_key}")
-    })?;
-    let kind = serde_json::from_str::<ArtifactKind>(&entry.kind_json).wrap_err_with(|| {
-        format!("parse artifact cache kind_json for rustc {rustc_version} cache key {cache_key}")
-    })?;
-    let crate_types = serde_json::from_str::<Vec<RustCrateType>>(&entry.crate_types_json)
-        .wrap_err_with(|| {
-            format!(
-                "parse artifact cache crate_types_json for rustc {rustc_version} cache key {cache_key}"
+    let native = match load_native_artifacts(
+        &connection,
+        &rustc_version,
+        &cache_key,
+        entry.native_original_out_dir.as_deref(),
+    )
+    .await?
+    {
+        LoadedNativeArtifacts::Absent => None,
+        LoadedNativeArtifacts::Ready(native) => Some(native),
+        LoadedNativeArtifacts::MissingOutDir => {
+            // Released CLIs wrote entries with native rows and no
+            // `native_original_out_dir`. The cache is regenerable, so the
+            // row is invalid data: evict it and miss rather than fail the
+            // invocation.
+            drop(lease_lock);
+            evict_invalid_entry(
+                &connection,
+                &version_dir,
+                &entry_dir,
+                &rustc_version,
+                &cache_key,
             )
-        })?;
+            .await?;
+            return Ok(None);
+        }
+    };
+    let shape = EntryShape::parse(&entry, &rustc_version, &cache_key)?;
     Ok(Some(CachedArtifactBundle {
         provenance: ArtifactProvenance::from_column(&entry.provenance)?,
         oci_reference: entry.oci_reference,
@@ -318,10 +330,10 @@ pub async fn load_cached_bundle(
         dependency_compile_keys_json: entry.dependency_compile_keys_json,
         compile_millis: db_int(entry.compile_millis, "artifact cache entry compile_millis")?,
         size_bytes: db_int(entry.size_bytes, "artifact cache entry size_bytes")?,
-        profile,
-        emit,
-        kind,
-        crate_types,
+        profile: shape.profile,
+        emit: shape.emit,
+        kind: shape.kind,
+        crate_types: shape.crate_types,
         outputs,
         native,
         sigstore_signatures,
@@ -334,6 +346,50 @@ pub async fn load_cached_bundle(
         verified_marker_policy: entry.verified_marker_policy,
         _lease_lock: lease_lock,
     }))
+}
+
+/// The JSON-encoded unit shape columns of one artifact cache entry.
+struct EntryShape {
+    profile: Profile,
+    emit: Vec<String>,
+    kind: ArtifactKind,
+    crate_types: Vec<RustCrateType>,
+}
+
+impl EntryShape {
+    fn parse(
+        entry: &ArtifactCacheEntryRow,
+        rustc_version: &str,
+        cache_key: &str,
+    ) -> stow_types::error::Result<Self> {
+        let profile = serde_json::from_str::<Profile>(&entry.profile_json).wrap_err_with(|| {
+            format!(
+                "parse artifact cache profile_json for rustc {rustc_version} cache key {cache_key}"
+            )
+        })?;
+        let emit = serde_json::from_str::<Vec<String>>(&entry.emit_json).wrap_err_with(|| {
+            format!(
+                "parse artifact cache emit_json for rustc {rustc_version} cache key {cache_key}"
+            )
+        })?;
+        let kind = serde_json::from_str::<ArtifactKind>(&entry.kind_json).wrap_err_with(|| {
+            format!(
+                "parse artifact cache kind_json for rustc {rustc_version} cache key {cache_key}"
+            )
+        })?;
+        let crate_types = serde_json::from_str::<Vec<RustCrateType>>(&entry.crate_types_json)
+            .wrap_err_with(|| {
+                format!(
+                    "parse artifact cache crate_types_json for rustc {rustc_version} cache key {cache_key}"
+                )
+            })?;
+        Ok(Self {
+            profile,
+            emit,
+            kind,
+            crate_types,
+        })
+    }
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -2100,6 +2156,9 @@ struct ArtifactCacheEntryRow {
     verified_marker_version: Option<i64>,
     verified_marker_policy: Option<String>,
     provenance: String,
+    /// The producing build's recorded `OUT_DIR`; NULL on entries with no
+    /// native artifacts and on rows written before the column existed.
+    native_original_out_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -2170,7 +2229,7 @@ async fn load_artifact_cache_entry(
                 compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, \
                 compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
-                verified_marker_version, verified_marker_policy, provenance \
+                verified_marker_version, verified_marker_policy, provenance, native_original_out_dir \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND cache_key = ?",
     )
@@ -2291,11 +2350,23 @@ async fn load_sigstore_signatures(
         .collect())
 }
 
+/// What the native-artifact load found for one cache entry.
+enum LoadedNativeArtifacts {
+    /// The entry carries no native rows.
+    Absent,
+    /// Rows loaded; the recorded `OUT_DIR` anchors directive rewriting.
+    Ready(NativeArtifacts),
+    /// Rows exist but no `OUT_DIR` was recorded — an entry written before
+    /// the column existed; invalid data in a regenerable cache.
+    MissingOutDir,
+}
+
 async fn load_native_artifacts(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     cache_key: &str,
-) -> stow_types::error::Result<Option<NativeArtifacts>> {
+    original_out_dir: Option<&str>,
+) -> stow_types::error::Result<LoadedNativeArtifacts> {
     let static_lib_rows = sqlx::query_as::<_, NativeStaticLibRow>(
         "SELECT lib_name, bytes_sha256 \
          FROM artifact_cache_native_static_libs \
@@ -2342,10 +2413,18 @@ async fn load_native_artifacts(
         && dep_env_rows.is_empty()
         && out_dir_rows.is_empty()
     {
-        return Ok(None);
+        return Ok(LoadedNativeArtifacts::Absent);
     }
 
-    Ok(Some(NativeArtifacts {
+    let Some(original_out_dir) = original_out_dir else {
+        // An entry with native rows and no recorded OUT_DIR predates the
+        // column; without it directive rewriting has no anchor, so the row
+        // is unusable rather than merely incomplete. The caller evicts it
+        // and misses so the invocation rebuilds.
+        return Ok(LoadedNativeArtifacts::MissingOutDir);
+    };
+
+    Ok(LoadedNativeArtifacts::Ready(NativeArtifacts {
         static_libs: static_lib_rows
             .into_iter()
             .map(|row| NativeLib {
@@ -2357,6 +2436,7 @@ async fn load_native_artifacts(
             .into_iter()
             .map(|row| row.directive)
             .collect(),
+        original_out_dir: std::path::PathBuf::from(original_out_dir),
         dep_env_vars: dep_env_rows
             .into_iter()
             .map(|row| (row.env_key, row.env_value))
@@ -2470,10 +2550,19 @@ async fn upsert_artifact_cache_entry(
     last_accessed_ms: u64,
     metadata: &CacheEntryMetadata<'_>,
 ) -> stow_types::error::Result<()> {
+    let native_original_out_dir = match metadata.native {
+        Some(native) => Some(native.original_out_dir.to_str().ok_or_else(|| {
+            stow_types::stow_error!(
+                "bundle's recorded OUT_DIR {} is not UTF-8",
+                native.original_out_dir.display()
+            )
+        })?),
+        None => None,
+    };
     sqlx::query(
         "INSERT INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?) \
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance, native_original_out_dir) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?) \
          ON CONFLICT(rustc_version, cache_key) DO UPDATE SET \
              relative_dir = excluded.relative_dir, \
              size_bytes = excluded.size_bytes, \
@@ -2495,7 +2584,8 @@ async fn upsert_artifact_cache_entry(
              crate_types_json = excluded.crate_types_json, \
              verified_marker_version = NULL, \
              verified_marker_policy = NULL, \
-             provenance = excluded.provenance",
+             provenance = excluded.provenance, \
+             native_original_out_dir = excluded.native_original_out_dir",
     )
     .bind(rustc_version)
     .bind(cache_key)
@@ -2524,6 +2614,7 @@ async fn upsert_artifact_cache_entry(
     .bind(serde_json::to_string(metadata.kind)?)
     .bind(serde_json::to_string(metadata.crate_types)?)
     .bind(metadata.provenance.as_column())
+    .bind(native_original_out_dir)
     .execute(connection)
     .await?;
     Ok(())
@@ -2739,6 +2830,48 @@ pub async fn persist_cached_bundle_trust_marker(
     Ok(())
 }
 
+/// Evict an entry that cannot be served — currently a row carrying native
+/// artifacts but no recorded `OUT_DIR`, written by a CLI that predates the
+/// column. Takes the exclusive entry lock like any other eviction; when a
+/// concurrent reader holds it the row survives for the next lookup to evict.
+async fn evict_invalid_entry(
+    connection: &sqlx::SqlitePool,
+    version_dir: &Path,
+    entry_dir: &Path,
+    rustc_version: &str,
+    cache_key: &str,
+) -> stow_types::error::Result<()> {
+    let Some(eviction_lock) = tokio::task::spawn_blocking({
+        let version_dir = version_dir.to_path_buf();
+        let cache_key = cache_key.to_owned();
+        move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
+    })
+    .await
+    .wrap_err("join evict_invalid_entry lock task")??
+    else {
+        return Ok(());
+    };
+    tracing::warn!(
+        cache_key,
+        rustc_version,
+        "artifact cache entry carries native artifacts but no recorded OUT_DIR; evicted and reporting a miss"
+    );
+    delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
+    if entry_dir.exists() {
+        tokio::task::spawn_blocking({
+            let entry_dir = entry_dir.to_path_buf();
+            move || {
+                std::fs::remove_dir_all(&entry_dir)
+                    .wrap_err_with(|| format!("evict artifact cache entry {}", entry_dir.display()))
+            }
+        })
+        .await
+        .wrap_err("join evict_invalid_entry remove_dir task")??;
+    }
+    drop(eviction_lock);
+    Ok(())
+}
+
 async fn delete_artifact_cache_entry(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
@@ -2836,7 +2969,7 @@ mod tests {
     use std::time::Duration;
 
     use sha2::Digest;
-    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
     use stow_types::bundle::{
         ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, SigstoreSignature,
     };
@@ -3106,6 +3239,60 @@ mod tests {
                 .expect("cache entry")
                 .last_accessed_ms;
             assert!(updated > 1);
+        });
+    }
+
+    /// An entry written before `native_original_out_dir` existed has
+    /// native rows and NULL in the column. The cache is regenerable, so
+    /// the lookup evicts it — row and directory — and reports a miss; the
+    /// invocation falls back to compiling instead of failing.
+    #[test]
+    fn entry_without_recorded_out_dir_is_evicted_and_misses() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let request = fetch_request("deadbeefcafe0001");
+        let mut bundle = sample_bundle("deadbeefcafe0001", "libdemo-deadbeefcafe0001.rmeta");
+        bundle.manifest.config.native = Some(NativeArtifacts {
+            static_libs: Vec::new(),
+            cargo_directives: vec!["cargo:rustc-link-search=native=/build/out/lib".to_owned()],
+            dep_env_vars: BTreeMap::default(),
+            out_dir_files: Vec::new(),
+            original_out_dir: PathBuf::from("/build/out"),
+        });
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            let stored = super::store_downloaded_bundle(&config, &request, &bundle)
+                .await
+                .expect("store bundle");
+            let entry_dir = stored.entry_dir.clone();
+            assert!(entry_dir.exists());
+            drop(stored);
+
+            // Simulate a row written before the column existed.
+            let connection = connect(&config.cache_dir).await.expect("connect state db");
+            sqlx::query("UPDATE artifact_cache_entries SET native_original_out_dir = NULL")
+                .execute(&connection)
+                .await
+                .expect("null the recorded out dir");
+
+            assert!(
+                super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("load bundle")
+                    .is_none(),
+                "an entry without a recorded OUT_DIR misses so the invocation rebuilds"
+            );
+            assert!(!entry_dir.exists(), "evicted entry dir removed");
+            let remaining = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM artifact_cache_native_directives",
+            )
+            .fetch_one(&connection)
+            .await
+            .expect("count native directives");
+            assert_eq!(remaining, 0, "eviction cascades to native rows");
         });
     }
 
@@ -3491,8 +3678,8 @@ mod tests {
                 vec!["gen/bindings.rs", "libdemo.a"]
             );
 
-            // Restore into a fresh target dir: cargo passes the new OUT_DIR
-            // to rustc via -L native=..., which is where the files land.
+            // Restore into a fresh target dir: cargo exports the new OUT_DIR
+            // to the rustc invocation, which is where the files land.
             let fresh_deps = tempdir.path().join("fresh/debug/deps");
             let fresh_native_out = tempdir.path().join("fresh/debug/build/demo-bbbb2222/out");
             let mut restore_parsed = local_build_parsed(
@@ -3501,7 +3688,7 @@ mod tests {
                 fresh_deps,
                 &["dep-info", "metadata", "link"],
             );
-            restore_parsed.native_search_paths = vec![fresh_native_out.clone()];
+            restore_parsed.build_script_out_dir = Some(fresh_native_out.clone());
             write_artifacts(&restore_parsed, &bundle, OutputDirWriters::StowOnly)
                 .await
                 .expect("restore local entry");
@@ -4039,6 +4226,7 @@ mod tests {
             overflow_checks: Some(true),
             strip: None,
             native_search_paths: Vec::new(),
+            build_script_out_dir: None,
             extern_crates,
             embed_metadata: None,
             embed_bitcode: false,
@@ -4110,6 +4298,7 @@ mod tests {
             overflow_checks: None,
             strip: None,
             native_search_paths: Vec::new(),
+            build_script_out_dir: None,
             extern_crates: vec![ParsedExternCrate {
                 crate_name: "colorchoice".to_owned(),
                 path: dependency_rmeta,
