@@ -95,7 +95,6 @@ impl DurableObject for Scheduler {
             "/status".at(status),
             "/admin/status".at(admin_status),
             "/index/published".post(record_published_index),
-            "/panic".at(read_panic).post(write_panic),
             "/migrate".post(migrate_scheduler),
         ))
         .on_alarm(run_alarm)
@@ -334,30 +333,6 @@ async fn tasks_status(
     Ok(Json(statuses))
 }
 
-/// `GET /panic` — the anonymous-traffic circuit breaker's current state.
-async fn read_panic(db: DurableDb) -> Result<Json<stow_types::api::PanicSwitch>> {
-    let enabled = queue::panic_enabled(&db).await.map_err(to_error)?;
-    Ok(Json(stow_types::api::PanicSwitch { enabled }))
-}
-
-/// `POST /panic` — write the flag, then answer what was stored.
-async fn write_panic(
-    db: DurableDb,
-    alarm: Alarm,
-    Json(switch): Json<stow_types::api::PanicSwitch>,
-) -> Result<Json<stow_types::api::PanicSwitch>> {
-    queue::set_panic(&db, switch.enabled)
-        .await
-        .map_err(to_error)?;
-    tracing::warn!(enabled = switch.enabled, "panic switch flipped");
-    // The alarm stopped re-arming itself while the switch was on (see
-    // `run_alarm`); turning it off restarts the dispatch loop.
-    if !switch.enabled {
-        arm_dispatch_alarm(&alarm).await?;
-    }
-    Ok(Json(switch))
-}
-
 /// `POST /index/published` — the index-publish path's report that a slice
 /// went live, carrying the semantic identities it serves. Recording it
 /// before the dispatch pass lets a dependent the report just released
@@ -388,14 +363,6 @@ async fn record_published_index(
 }
 
 async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
-    // The panic switch freezes the scheduler as well as anonymous traffic:
-    // a dispatch pass reads the whole pending queue, so while the switch is
-    // on the alarm neither dispatches nor re-arms itself, and nothing runs
-    // until `write_panic` turns the switch off and re-arms it.
-    if queue::panic_enabled(&db).await.map_err(to_error)? {
-        tracing::warn!("scheduler alarm stopped: the panic switch is on");
-        return Ok("frozen");
-    }
     dispatch_pending(&env, &db).await.map_err(|error| {
         tracing::error!(%error, "scheduler alarm dispatch_pending failed");
         error

@@ -5,8 +5,9 @@
 //! invocation statuses, DO resource failures, `overloaded` events), the
 //! build pipeline (build-crate failure rate, dispatch retries, pending
 //! age, dispatch stalls), and the public endpoints — then acts on the
-//! verdict: `Trip` breaches disable the dispatching workflows and turn
-//! the panic gate on, and any breach opens or updates the `incident`
+//! verdict: `Trip` breaches disable the dispatching workflows and enable
+//! the zone's `stow maintenance: anonymous` WAF rule, and any breach opens
+//! or updates the `incident`
 //! issue and mails the alert. Health and latency signals alert without
 //! tripping; the watchdog never un-trips on its own — recovery is the
 //! manual `stow-admin watchdog clear`.
@@ -26,8 +27,10 @@ use std::fmt::Write as _;
 
 use askama::Template;
 use clap::{Args, Subcommand};
-use stow_types::api::{AdminStatus, PanicSwitch};
+use stow_types::api::AdminStatus;
 use stow_types::stow_error;
+
+use crate::maintenance::{self, MaintenanceScope};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use zenwave::{Client, ResponseExt};
@@ -51,7 +54,7 @@ pub struct WatchdogArgs {
 /// `stow-admin watchdog` subcommands.
 #[derive(Subcommand)]
 pub enum WatchdogCommand {
-    /// Manual recovery: panic off, workflows re-enabled, incident
+    /// Manual recovery: maintenance rule off, workflows re-enabled, incident
     /// commented and closed, and the clear mail sent. The watchdog
     /// itself never does this on its own.
     Clear,
@@ -72,7 +75,7 @@ pub async fn run(edge: &Edge, args: WatchdogArgs, output: Output) -> stow_types:
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Effect {
-    /// Breach trips the breaker: panic gate on, dispatching workflows
+    /// Breach trips the breaker: maintenance rule on, dispatching workflows
     /// disabled.
     Trip,
     /// Breach opens/updates the incident and alerts; nothing is cut.
@@ -439,6 +442,11 @@ struct Watcher<'a> {
     cf_token: &'a str,
     /// `CF_ACCOUNT_ID`.
     account: &'a str,
+    /// `CF_ZONE_ID` — the zone whose WAF rules the trip toggles.
+    zone: &'a str,
+    /// The edge URL's host — the `http.host` term the maintenance rules
+    /// carry.
+    host: &'a str,
     now: OffsetDateTime,
 }
 
@@ -1347,9 +1355,11 @@ struct ApplyOutcome {
     mailed: bool,
 }
 
-/// Trip the breaker: disable every dispatching workflow, then panic on.
-/// Both kinds of failure are collected — one failed disable never skips
-/// the panic call.
+/// Trip the breaker: disable every dispatching workflow, then enable the
+/// zone's `stow maintenance: anonymous` WAF rule — the shed happens in the
+/// security phase, before the Worker, so a broken edge cannot keep the
+/// breaker open. Both kinds of failure are collected — one failed disable
+/// never skips the rule enable.
 async fn apply_trip(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) {
     for workflow in TRIP_WORKFLOWS {
         match github::put(
@@ -1364,25 +1374,41 @@ async fn apply_trip(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) {
                 .push(format!("disable {workflow}: {error}")),
         }
     }
-    match watcher
-        .edge
-        .post_json::<_, serde_json::Value>("/api/v1/admin/panic", &PanicSwitch { enabled: true })
-        .await
+    match maintenance::set_scope(
+        watcher.cf_token,
+        watcher.zone,
+        MaintenanceScope::Anonymous,
+        true,
+        watcher.host,
+    )
+    .await
     {
-        Ok(_) => outcome.actions.push("panic gate on".to_owned()),
-        Err(error) => outcome.failures.push(format!("panic on: {error}")),
+        Ok(_) => outcome
+            .actions
+            .push("maintenance rule `stow maintenance: anonymous` enabled".to_owned()),
+        Err(error) => outcome
+            .failures
+            .push(format!("enable maintenance rule: {error}")),
     }
 }
 
 /// Lift the breaker — `watchdog clear`'s actuation half.
 async fn apply_clear(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) {
-    match watcher
-        .edge
-        .post_json::<_, serde_json::Value>("/api/v1/admin/panic", &PanicSwitch { enabled: false })
-        .await
+    match maintenance::set_scope(
+        watcher.cf_token,
+        watcher.zone,
+        MaintenanceScope::Anonymous,
+        false,
+        watcher.host,
+    )
+    .await
     {
-        Ok(_) => outcome.actions.push("panic gate off".to_owned()),
-        Err(error) => outcome.failures.push(format!("panic off: {error}")),
+        Ok(_) => outcome
+            .actions
+            .push("maintenance rule `stow maintenance: anonymous` disabled".to_owned()),
+        Err(error) => outcome
+            .failures
+            .push(format!("disable maintenance rule: {error}")),
     }
     for workflow in TRIP_WORKFLOWS {
         match github::put(
@@ -1822,11 +1848,15 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
     let cf_token = cloudflare::api_token()?;
     let account =
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
+    let zone = maintenance::zone_id()?;
+    let host = maintenance::host_from_url(edge.base()).map_err(|error| stow_error!("{error}"))?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
         cf_token: &cf_token,
         account: &account,
+        zone: &zone,
+        host: &host,
         now: OffsetDateTime::now_utc(),
     };
 
@@ -1853,7 +1883,9 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
             outcome
                 .actions
                 .push("would disable dispatching workflows".to_owned());
-            outcome.actions.push("would turn panic on".to_owned());
+            outcome
+                .actions
+                .push("would enable `stow maintenance: anonymous`".to_owned());
         } else {
             apply_trip(&watcher, &mut outcome).await;
         }
@@ -2082,7 +2114,7 @@ fn finish(output: Output, report: &WatchdogReport) -> stow_types::error::Result<
     Ok(())
 }
 
-/// `watchdog clear` — panic off, workflows re-enabled, incident
+/// `watchdog clear` — maintenance rule off, workflows re-enabled, incident
 /// commented+closed, clear-mail. Manual recovery; the watchdog never
 /// does this on its own.
 #[allow(clippy::too_many_lines)]
@@ -2091,17 +2123,23 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
     let cf_token = cloudflare::api_token()?;
     let account =
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
+    let zone = maintenance::zone_id()?;
+    let host = maintenance::host_from_url(edge.base()).map_err(|error| stow_error!("{error}"))?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
         cf_token: &cf_token,
         account: &account,
+        zone: &zone,
+        host: &host,
         now: OffsetDateTime::now_utc(),
     };
     let mut outcome = ApplyOutcome::default();
     let now_text = format_time(watcher.now);
     if dry_run {
-        outcome.actions.push("would turn panic off".to_owned());
+        outcome
+            .actions
+            .push("would disable `stow maintenance: anonymous`".to_owned());
         for workflow in TRIP_WORKFLOWS {
             outcome.actions.push(format!("would enable {workflow}"));
         }
@@ -2598,7 +2636,7 @@ mod tests {
         assert!(body.contains("disabled build-crate.yml"));
     }
 
-    /// `clear` plans panic-off plus every workflow enable.
+    /// `clear` plans maintenance-off plus every workflow enable.
     #[test]
     fn clear_reverses_the_trip_list() {
         assert_eq!(TRIP_WORKFLOWS.len(), 6);

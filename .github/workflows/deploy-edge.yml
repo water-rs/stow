@@ -235,6 +235,18 @@ jobs:
           binaries: stow-admin
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # The zone-level breaker (stow#453): `maintenance ensure` creates the
+      # WAF phase's entrypoint ruleset when the zone has none (API error
+      # 10003) and appends whichever of the three maintenance rules is
+      # missing — created disabled and matched by description, so a
+      # redeploy never flips a live toggle.
+      - name: Ensure the WAF maintenance rules
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE_ID: ${{ vars.CF_ZONE_ID }}
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+        run: stow-admin maintenance ensure --yes
+
       # The scheduler queue's schema is the DO's, not D1's: it migrates
       # through the admin route, never in request code. The override header
       # runs the call on the candidate build; migrations are additive, so
