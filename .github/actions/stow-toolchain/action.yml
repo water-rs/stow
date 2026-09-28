@@ -44,9 +44,24 @@ runs:
         TOOLCHAIN_SHA: ${{ inputs.sha }}
         BINARIES: ${{ inputs.binaries }}
         GHCR_TOKEN: ${{ inputs.github-token }}
+        # Git Bash on Windows rewrites arguments that look like paths, and
+        # it turns the identity regexp's `\.` escapes into `/.`, which then
+        # matches no signer. The regexp has to reach cosign verbatim.
+        MSYS_NO_PATHCONV: "1"
       run: |
         set -euo pipefail
-        key="$(printf '%s-%s' "${RUNNER_OS,,}" "${RUNNER_ARCH,,}")"
+        # The platform keys toolchain-publish.yml's matrix publishes. Spelled
+        # out rather than lowercased with `${VAR,,}`, which macOS's
+        # /bin/bash 3.2 rejects as a bad substitution.
+        case "${RUNNER_OS}/${RUNNER_ARCH}" in
+          Linux/X64) key=linux-x64 ;;
+          Windows/X64) key=windows-x64 ;;
+          macOS/ARM64) key=macos-arm64 ;;
+          *)
+            echo "::error::no stow toolchain is published for ${RUNNER_OS}/${RUNNER_ARCH}"
+            exit 1
+            ;;
+        esac
         repo="ghcr.io/water-rs/stow-toolchain"
         ref="${repo}:${TOOLCHAIN_SHA}-${key}"
         echo "$GHCR_TOKEN" | oras login ghcr.io \
@@ -65,8 +80,11 @@ runs:
           if [ "$RUNNER_OS" = "Windows" ]; then bin="$bin.exe"; fi
           members+=("$bin")
         done
-        tar -xzf "$RUNNER_TEMP/stow-toolchain/stow-toolchain.tar.gz" \
-          -C "$bin_dir" "${members[@]}"
+        # Relative paths from inside the pull directory: GNU tar reads a
+        # `D:\…` archive or -C argument as `host:path` and tries to reach
+        # a remote host named D.
+        (cd "$RUNNER_TEMP/stow-toolchain" \
+          && tar -xzf stow-toolchain.tar.gz -C bin "${members[@]}")
         for bin in "${members[@]}"; do chmod 755 "$bin_dir/$bin"; done
         echo "$bin_dir" >> "$GITHUB_PATH"
         ls -l "$bin_dir"
