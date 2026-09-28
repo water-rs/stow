@@ -387,19 +387,6 @@ pub enum GetArtifactError {
     /// message, which already names the task and both attempts.
     #[error("{0}", status = CONFLICT)]
     CompletionConflict(String),
-    /// A register request's record set escapes the authority of the task
-    /// the caller named — a record whose target or rustc version differs
-    /// from the task's, or a `(crate, version)` outside the task's
-    /// dependency closure. The message names the offending record.
-    #[error("{0}", status = FORBIDDEN)]
-    RegisterForbidden(String),
-    /// A register request named a task that cannot accept records —
-    /// unknown to the scheduler queue, or not in an in-flight
-    /// (`dispatched`/`running`) state. A conflict, not a credential
-    /// failure: the caller authenticated, the named work is just not the
-    /// live row it claims.
-    #[error("{0}", status = CONFLICT)]
-    RegisterConflict(String),
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
     /// GitHub (OIDC JWKS or the repo-permission API) could not be consulted

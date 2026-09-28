@@ -360,15 +360,35 @@ current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 
+# stow#336: production links every Linux unit against the Debian buster
+# (glibc 2.28) sysroot build-crate.yml provisions — the dispatched builds
+# link the same way through the same scripts, into a cache dir keyed by
+# the deb manifest's hash so each box installs it once. The stow
+# binaries themselves were built before this and keep the host glibc;
+# the sysroot env is exported only inside the server below.
+SYSROOT=""
+if [ "$(uname -s)" = "Linux" ]; then
+    SYSROOT="${XDG_CACHE_HOME:-$HOME/.cache}/stow/glibc-sysroot-$(sha256sum \
+        "$REPO_ROOT/ci/glibc-sysroot-debs.txt" | cut -d' ' -f1)"
+    if [ ! -d "$SYSROOT" ]; then
+        "$REPO_ROOT/ci/glibc-sysroot/install.sh" "$SYSROOT" \
+            || die "glibc sysroot install failed"
+    fi
+    "$REPO_ROOT/ci/glibc-sysroot/wrappers.sh" "$SYSROOT" \
+        || die "glibc sysroot wrapper write failed"
+fi
+
 # The dispatch tree (.tmp/local-ci-dispatch) is written under the server's
 # cwd; keep it inside the work dir. The builder keeps its own cache: a
 # build's slice prefetch must not warm the consumer's cache — a slice it
 # caches mid-publish is one the consumer's own ensure would reuse stale.
 (
     cd "$WORK_DIR/local-ci"
+    [ -z "$SYSROOT" ] || eval "$("$REPO_ROOT/ci/glibc-sysroot/env.sh" "$SYSROOT")"
     exec env \
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
+        STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
         STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
         STOW_CACHE_DIR="$WORK_DIR/ci-cache" \
         STOW_VERIFY_MODE="mock-key" \
@@ -434,121 +454,56 @@ echo "[mock-e2e] submit: $submit_json"
 # The gate opens a dependent only when the published index serves every
 # shape its edge requires — host-side deps of a host-side owner need all
 # four (both invocations, both kinds). Publish waves release the queue
-# depth-first: each round drains the unblocked tasks, then exports,
-# publishes and reports the host slice so the next layer can go.
-publish_slice() {
-    local target="$1" out="$WORK_DIR/index-$1.bin" tag="$2"
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-        "$BIN/stow-admin" index export \
-        --target "$target" \
-        --rustc-version "$RUSTC_VERSION" \
-        --out "$out" \
-        >"$LOG_DIR/index-export-$tag.log" 2>&1 \
-        || die "stow-admin index export ($target) failed — see $LOG_DIR/index-export-$tag.log"
-    isolated_env \
-        STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
-        STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-        "$BIN/stow-admin" index publish \
-        --file "$out" \
-        --target "$target" \
-        --rustc-version "$RUSTC_VERSION" \
-        >"$LOG_DIR/index-publish-$tag.log" 2>&1 \
-        || die "stow-admin index publish ($target) failed — see $LOG_DIR/index-publish-$tag.log"
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-        "$BIN/stow-admin" index report \
-        --file "$out" \
-        >"$LOG_DIR/index-report-$tag.log" 2>&1 \
-        || die "stow-admin index report ($target) failed — see $LOG_DIR/index-report-$tag.log"
-}
-
-deadline=$((SECONDS + TASK_DEADLINE))
-wave=0
-last_completed=-1
-last_publish=0
-while :; do
-    check_children_alive
-    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
-    if [ -z "$status_json" ]; then
-        sleep 5
-        continue
-    fi
-    pending="$(jq -r '.pending' <<<"$status_json")"
-    dispatched="$(jq -r '.dispatched' <<<"$status_json")"
-    running="$(jq -r '.running' <<<"$status_json")"
-    completed="$(jq -r '.completed' <<<"$status_json")"
-    failed="$(jq -r '.failed' <<<"$status_json")"
-    echo "[mock-e2e] scheduler: $status_json"
-    [ "$failed" -ge 1 ] && die "scheduler reported a failed task: $status_json"
-    if [ "$pending" -eq 0 ] && [ "$dispatched" -eq 0 ] && [ "$running" -eq 0 ]; then
-        [ "$completed" -eq "$task_count" ] \
-            || die "queue drained at $completed completed tasks, expected $task_count"
-        break
-    fi
-    if [ "$pending" -gt 0 ] && [ "$dispatched" -eq 0 ] && [ "$running" -eq 0 ] \
-        && { [ "$completed" -gt "$last_completed" ] || [ "$last_publish" -lt "$((SECONDS - 30))" ]; }; then
-        # Every dispatched task reported; the pending set is gated on the
-        # index — publish the host slice so the next wave releases. The
-        # second arm republishes while the queue sits idle-but-pending —
-        # the DO's gate re-evaluates per generation, so a publish that
-        # landed between evaluations is cheap insurance against a missed
-        # wake.
-        wave=$((wave + 1))
-        echo "[mock-e2e] publishing host slice (wave $wave)"
-        publish_slice "$HOST_TARGET" "wave-$wave"
-        last_completed="$completed"
-        last_publish=$SECONDS
-    fi
-    [ "$SECONDS" -ge "$deadline" ] \
-        && die "scheduler did not finish the graph within ${TASK_DEADLINE}s (last status: ${status_json})"
-    sleep 5
-done
-echo "[mock-e2e] all $task_count tasks completed — the own-node check passed on every build"
-
-# --- catalog assertions ----------------------------------------------------
+# depth-first: each round drains the unblocked tasks, then runs the
+# export/publish/report/sync pass index-publish.yml drives so the next
+# layer can go.
 #
-# The catalog's artifacts table must register every host-side unit under
-# the host triple with its stamped unit shape — side=host (1), both
-# invocations (0=native, 1=target), both kinds (0=unlinked, 1=linked).
-d1() {
-    wrangler d1 execute stow-mock --local \
-        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-        --persist-to "$WORK_DIR/edge-state" \
-        --command "$1" --json 2>/dev/null
+# `index export --out-dir` reads and verifies the records artifacts
+# (mock-key trust) in one pass — the out-dir is fixed across waves
+# because its `.prev` sidecars are what the export reads to stamp each
+# slice's next generation (a missing `.prev` is legal only at generation
+# 1). `index publish` delegates each slice's signed push to
+# `stow-mock-registry publish-index`, `index report` feeds the gate's
+# published_slice_rows, and `index sync` replays new-records.json into
+# the D1 catalog — the catalog reads below hold only once the sync has
+# landed.
+publish_slices() {
+    local tag="$1"
+    isolated_env \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+        "$BIN/stow-admin" index export \
+        --out-dir "$WORK_DIR/index-export" \
+        --rustc-version "$RUSTC_VERSION" \
+        >"$LOG_DIR/index-export-$tag.log" 2>&1 \
+        || die "stow-admin index export failed — see $LOG_DIR/index-export-$tag.log"
+    local pairs
+    pairs="$(python3 -c 'import json,sys
+for s in json.load(open(sys.argv[1])):
+    print(s["index_file"], s["folded_file"])' "$WORK_DIR/index-export/slices.json")" \
+        || die "reading $WORK_DIR/index-export/slices.json failed"
+    echo "$pairs" | while read -r index_file folded_file; do
+        [ -n "$index_file" ] || continue
+        isolated_env \
+            STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+            STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+            "$BIN/stow-admin" index publish \
+            --file "$WORK_DIR/index-export/$index_file" \
+            --folded "$WORK_DIR/index-export/$folded_file" \
+            >>"$LOG_DIR/index-publish-$tag.log" 2>&1 \
+            || die "stow-admin index publish failed for $index_file — see $LOG_DIR/index-publish-$tag.log"
+        isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+            "$BIN/stow-admin" index report \
+            --file "$WORK_DIR/index-export/$index_file" \
+            >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
+            || die "stow-admin index report failed for $index_file — see $LOG_DIR/index-report-$tag.log"
+    done
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+        "$BIN/stow-admin" index sync \
+        --file "$WORK_DIR/index-export/new-records.json" \
+        >>"$LOG_DIR/index-sync-$tag.log" 2>&1 \
+        || die "stow-admin index sync failed — see $LOG_DIR/index-sync-$tag.log"
 }
-
-heck_shapes="$(d1 "SELECT DISTINCT unit_invocation, unit_linked FROM artifacts \
-    WHERE crate_name = 'heck' AND target = '$HOST_TARGET' AND unit_side = 1")"
-echo "[mock-e2e] heck host-side shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
-[ "$(jq '.[0].results | length' <<<"$heck_shapes")" = "2" ] \
-    || die "heck host-side rows are not the two linked shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
-for want in '{"unit_invocation":0,"unit_linked":1}' '{"unit_invocation":1,"unit_linked":1}'; do
-    jq -e ".[0].results | map({unit_invocation, unit_linked}) | index($want) != null" \
-        <<<"$heck_shapes" >/dev/null \
-        || die "heck host-side rows miss shape $want"
-done
-
-# A host unit must never register under the task's *target* — the pre-#349
-# bug shape that produced heck@wasm32 at the consumer's key.
-heck_wasm="$(d1 "SELECT count(*) AS n FROM artifacts \
-    WHERE crate_name = 'heck' AND target = '$CONSUMER_TARGET'")"
-[ "$(jq -r '.[0].results[0].n' <<<"$heck_wasm")" = "0" ] \
-    || die "heck registered under $CONSUMER_TARGET — the task-target registration bug is back"
-
-# Every host dep lands under the host triple at host side.
-for dep in snafu-derive proc-macro2 quote syn unicode-ident; do
-    n="$(d1 "SELECT count(DISTINCT unit_invocation || '-' || unit_linked) AS n FROM artifacts \
-        WHERE crate_name = '$dep' AND target = '$HOST_TARGET' AND unit_side = 1" \
-        | jq -r '.[0].results[0].n')"
-    [ "$n" = "2" ] || die "$dep covers $n host shapes under $HOST_TARGET, expected 2"
-done
-echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
-
-# The mock's proc-macro unit linked on this box measures a glibc floor
-# above the index's published baseline (2.28) — a production builder
-# emits the baseline value — so its rows are set to it, the spelling a
-# conforming runner's register would leave. Without it the slice export
-# drops the proc-macro and every lane downstream misses a servable dep.
-d1 "UPDATE artifacts SET min_glibc = '2.28' WHERE crate_name = 'snafu-derive'" >/dev/null
 
 # --- retried pre-migration dependent row -----------------------------------
 #
@@ -563,9 +518,13 @@ d1 "UPDATE artifacts SET min_glibc = '2.28' WHERE crate_name = 'snafu-derive'" >
 # rewrites the edge.
 #
 # snafu is the library the proc-macro crate derives for: its
-# $HOST_TARGET target node edges snafu-derive host-side, coverage this
-# run already published. Dev-spelling the edge after submit reproduces
-# the retried row; resubmitting the same plan reproduces the heal.
+# $HOST_TARGET target node edges snafu-derive host-side. Its submit and
+# legacy spelling must happen before the waves below publish any
+# coverage: `tasks/submit` arms the dispatch alarm at now, so an edge
+# that is already servable releases in the window before the UPDATE can
+# land. Spelled while nothing is published, the -1 edge then holds snafu
+# deterministically — the check after the waves is what proves the hold
+# survives published coverage.
 #
 # The queue is a Durable Object's sqlite store — `wrangler d1` reaches
 # only the catalog; workerd persists the DO under the run's edge-state.
@@ -625,6 +584,106 @@ edge_side="$(sched "SELECT dep_host_side FROM queue_dependencies \
 [ "$edge_side" = "-1" ] \
     || die "the migration left snafu->snafu-derive at dep_host_side $edge_side — expected -1 (unestablished)"
 
+deadline=$((SECONDS + TASK_DEADLINE))
+wave=0
+last_completed=-1
+last_publish=0
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+    if [ -z "$status_json" ]; then
+        sleep 5
+        continue
+    fi
+    pending="$(jq -r '.pending' <<<"$status_json")"
+    dispatched="$(jq -r '.dispatched' <<<"$status_json")"
+    running="$(jq -r '.running' <<<"$status_json")"
+    completed="$(jq -r '.completed' <<<"$status_json")"
+    failed="$(jq -r '.failed' <<<"$status_json")"
+    echo "[mock-e2e] scheduler: $status_json"
+    [ "$failed" -ge 1 ] && die "scheduler reported a failed task: $status_json"
+    # The wave drain counts only the plan's rows — snafu sits pending on
+    # its unestablished edge through the whole build, by design.
+    wave_open="$(sched "SELECT COUNT(*) FROM queue WHERE status IN ('pending','dispatched','running') \
+        AND task_id != '$snafu_id'")"
+    if [ "$wave_open" -eq 0 ]; then
+        [ "$completed" -eq "$task_count" ] \
+            || die "queue drained at $completed completed tasks, expected $task_count"
+        break
+    fi
+    if [ "$pending" -gt 0 ] && [ "$dispatched" -eq 0 ] && [ "$running" -eq 0 ] \
+        && { [ "$completed" -gt "$last_completed" ] || [ "$last_publish" -lt "$((SECONDS - 30))" ]; }; then
+        # Every dispatched task reported; the pending set is gated on the
+        # index — publish the host slice so the next wave releases. The
+        # second arm republishes while the queue sits idle-but-pending —
+        # the DO's gate re-evaluates per generation, so a publish that
+        # landed between evaluations is cheap insurance against a missed
+        # wake.
+        wave=$((wave + 1))
+        echo "[mock-e2e] publishing host slice (wave $wave)"
+        publish_slices "wave-$wave"
+        last_completed="$completed"
+        last_publish=$SECONDS
+    fi
+    [ "$SECONDS" -ge "$deadline" ] \
+        && die "scheduler did not finish the graph within ${TASK_DEADLINE}s (last status: ${status_json})"
+    sleep 5
+done
+echo "[mock-e2e] all $task_count tasks completed — the own-node check passed on every build"
+
+# --- catalog assertions ----------------------------------------------------
+#
+# The catalog's artifacts table must register every host-side unit under
+# the host triple with its stamped unit shape — side=host (1), both
+# invocations (0=native, 1=target), both kinds (0=unlinked, 1=linked).
+d1() {
+    wrangler d1 execute stow-mock --local \
+        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
+        --persist-to "$WORK_DIR/edge-state" \
+        --command "$1" --json 2>/dev/null
+}
+
+heck_shapes="$(d1 "SELECT DISTINCT unit_invocation, unit_linked FROM artifacts \
+    WHERE crate_name = 'heck' AND target = '$HOST_TARGET' AND unit_side = 1")"
+echo "[mock-e2e] heck host-side shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
+[ "$(jq '.[0].results | length' <<<"$heck_shapes")" = "2" ] \
+    || die "heck host-side rows are not the two linked shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
+for want in '{"unit_invocation":0,"unit_linked":1}' '{"unit_invocation":1,"unit_linked":1}'; do
+    jq -e ".[0].results | map({unit_invocation, unit_linked}) | index($want) != null" \
+        <<<"$heck_shapes" >/dev/null \
+        || die "heck host-side rows miss shape $want"
+done
+
+# A host unit must never register under the task's *target* — the pre-#349
+# bug shape that produced heck@wasm32 at the consumer's key.
+heck_wasm="$(d1 "SELECT count(*) AS n FROM artifacts \
+    WHERE crate_name = 'heck' AND target = '$CONSUMER_TARGET'")"
+[ "$(jq -r '.[0].results[0].n' <<<"$heck_wasm")" = "0" ] \
+    || die "heck registered under $CONSUMER_TARGET — the task-target registration bug is back"
+
+# Every host dep lands under the host triple at host side.
+for dep in snafu-derive proc-macro2 quote syn unicode-ident; do
+    n="$(d1 "SELECT count(DISTINCT unit_invocation || '-' || unit_linked) AS n FROM artifacts \
+        WHERE crate_name = '$dep' AND target = '$HOST_TARGET' AND unit_side = 1" \
+        | jq -r '.[0].results[0].n')"
+    [ "$n" = "2" ] || die "$dep covers $n host shapes under $HOST_TARGET, expected 2"
+done
+echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
+
+# The proc-macro unit's honest floor — measured by the sysrooted build
+# the way production links — must sit at or under the index's published
+# baseline: an above-baseline row publishes but `index report` excludes
+# it, so the lanes below would find snafu-derive unservable forever.
+# Versions order numerically, not as strings (2.4 < 2.34), so the
+# highest floor is picked with `sort -V` rather than SQL's max().
+snafu_floors="$(d1 "SELECT min_glibc FROM artifacts \
+    WHERE crate_name = 'snafu-derive' AND min_glibc != ''")"
+floor="$(jq -r '.[0].results[].min_glibc' <<<"$snafu_floors" | sort -V | tail -1)"
+[ -n "$floor" ] \
+    || die "snafu-derive's linked unit registered no glibc floor — the sysroot build did not measure it"
+[ "$(printf '%s\n2.28\n' "$floor" | sort -V | tail -1)" = "2.28" ] \
+    || die "snafu-derive's glibc floor $floor exceeds the 2.28 baseline — the build linked outside the sysroot"
+
 # Held although snafu-derive's host coverage is published — the -1 edge
 # matches no slice row, unlike the target-side 0 the dev-era row
 # pretended to be.
@@ -664,7 +723,7 @@ while :; do
     if [ "$pending" -gt 0 ] && [ "$last_publish" -lt "$((SECONDS - 30))" ]; then
         legacy_wave=$((legacy_wave + 1))
         echo "[mock-e2e] publishing host slice (legacy wave $legacy_wave)"
-        publish_slice "$HOST_TARGET" "legacy-wave-$legacy_wave"
+        publish_slices "legacy-wave-$legacy_wave"
         last_publish=$SECONDS
     fi
     [ "$SECONDS" -ge "$legacy_deadline" ] \
@@ -680,12 +739,11 @@ echo "[mock-e2e] resynced snafu completed — a retried pre-migration row heals 
 # slice of the platform its rustc invocation records — host units come
 # from the host slice at the invocation spelling's own key.
 
-# Both slices exist now; wasm32's is empty (no target-side node ever ran)
-# but the wasm32 consumer's own units miss on purpose — the crate is not a
-# node. Publish the wasm32 slice once so `stow index refresh --target`
-# has a tag to pull.
-publish_slice "$CONSUMER_TARGET" "final"
-publish_slice "$HOST_TARGET" "final"
+# One last pass so the final wave's records fold into the slices the
+# consumer lanes fetch: export reads whatever the legacy wave left
+# unpublished, publish pushes the slices, report feeds the gate, sync
+# fills the catalog.
+publish_slices "final"
 
 # The consumer's own `stow check` fetches its slices — the wasm32 check
 # ensures the wasm32 AND the host slice it resolves host units from.

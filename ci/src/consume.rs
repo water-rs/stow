@@ -148,13 +148,20 @@ async fn stage_candidates(
     let slices = slices_for_task(&config, task).await.map_err(unavailable)?;
     let candidates = candidates(&slices, packages, task);
 
+    // The prefetch pulls bundle blobs straight from GHCR by digest — the
+    // offline-edge build never touches the byte path (stow#455). One
+    // anonymous session mints one bearer for the whole batch.
+    let registry =
+        stow_oci::RegistryBase::parse(config.registry_base_url()).map_err(unavailable)?;
+    let session = registry.session();
+
     let mut staged = 0usize;
     let mut seen_compile_keys = BTreeSet::new();
     for (slice, row) in candidates {
         if !seen_compile_keys.insert(row.compile_key.clone()) {
             continue;
         }
-        match fetch_and_stage(&config, slice, row, store_dir).await {
+        match fetch_and_stage(&config, &session, slice, row, store_dir).await {
             Ok(()) => staged += 1,
             Err(build_consume::StageFailure::Unavailable(error)) => {
                 tracing::warn!(
@@ -244,12 +251,13 @@ fn candidates<'a>(
     selected
 }
 
-/// One row through the CLI's own verified-download chain: edge byte path
-/// digest-checked against `bundle_digest`, manifest/config identity
-/// byte-compared against the signature-covered `oci/config.json`, cosign
-/// signature verified against the pinned `build-crate.yml` identity — then
-/// staged under the row's compile key inside the slice's own target
-/// namespace for the read-only sandbox grant.
+/// One row through the CLI's own verified-download chain: the bundle blob
+/// pulled from GHCR by digest — not the edge byte path, which a fully
+/// offline build cannot reach (stow#455) — hashed against `bundle_digest`,
+/// manifest/config identity byte-compared against the signature-covered
+/// `oci/config.json`, cosign signature verified against the pinned
+/// `build-crate.yml` identity — then staged under the row's compile key
+/// inside the slice's own target namespace for the read-only sandbox grant.
 ///
 /// The namespace is the served-is-vouched invariant: the serve path looks
 /// a compile key up only inside `store_dir/<the unit's effective target>`,
@@ -261,6 +269,7 @@ fn candidates<'a>(
 /// vouch for.
 async fn fetch_and_stage(
     config: &ConsumeConfig,
+    session: &stow_oci::RegistrySession,
     slice: &IndexSlice,
     row: &ArtifactIndexRow,
     store_dir: &Path,
@@ -268,7 +277,25 @@ async fn fetch_and_stage(
     let entry_dir = store_dir
         .join(slice.index.header.target.as_str())
         .join(&row.compile_key);
-    build_consume::stage_verified_bundle(config, slice, row, &entry_dir).await
+    let bytes = session
+        .pull_blob(&row.bundle_digest)
+        .await
+        .map_err(|error| {
+            build_consume::StageFailure::Unavailable(stow_types::stow_error!(
+                "pull bundle {} for `{}` {}: {error}",
+                row.bundle_digest,
+                row.crate_name.as_str(),
+                row.version
+            ))
+        })?;
+    stow_types::registry::verify_oci_digest(&bytes, &row.bundle_digest).map_err(|error| {
+        build_consume::StageFailure::Unverifiable(stow_types::stow_error!(
+            "bundle for `{}` {} did not hash to the index's bundle_digest: {error}",
+            row.crate_name.as_str(),
+            row.version
+        ))
+    })?;
+    build_consume::stage_bundle_bytes(config, slice, row, &entry_dir, bytes).await
 }
 
 #[cfg(test)]

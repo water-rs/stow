@@ -118,7 +118,7 @@ impl FixtureShape {
         self.failed_end() + 2
     }
 
-    /// The one `running` row the observe drive reports.
+    /// The one `running` row the run-completion drive reports.
     pub const fn running_row(self) -> u32 {
         self.failed_end() + 3
     }

@@ -145,9 +145,12 @@ impl DurableObject for Scheduler {
                 "/cancel".post(queue_cancel),
                 "/promote".post(queue_promote),
                 "/purge".post(queue_purge),
-                "/observe-run".post(observe_run),
             )),
             "/complete".post(complete),
+            // The GitHub `workflow_run` webhook's completion channel —
+            // carries task id + outcome and no attempt, which
+            // `queue::complete_run` resolves against the live row.
+            "/tasks/complete-run".post(complete_run),
             "/status".at(status),
             "/admin/status".at(admin_status),
             "/index/published".post(record_published_index),
@@ -363,6 +366,31 @@ async fn complete(
     Ok(Json(OkResponse { ok: true }))
 }
 
+/// `POST /tasks/complete-run` — the edge's webhook route forwards GitHub's
+/// `workflow_run` event here; the report carries the task id and outcome
+/// but no attempt, which `complete_run` resolves against the live row.
+/// The same 404/409 split as [`complete`] applies.
+async fn complete_run(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(report): Json<stow_types::api::WorkflowRunComplete>,
+) -> Result<Json<OkResponse>> {
+    let freeze = freeze_settings(&env)?;
+    queue::complete_run(&db, &report, freeze.window_minutes)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
+                crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    arm_dispatch_alarm(&alarm).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
 async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
     let status = queue::status(&db).await.map_err(to_error)?;
     Ok(Json(status))
@@ -451,19 +479,6 @@ async fn queue_purge(
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
     apply_queue_mutation(env, db, alarm, queue::QueueMutation::Purge, selector).await
-}
-
-/// `POST /tasks/observe-run` — a trusted caller saw a GitHub Actions run
-/// act on this task (artifact registration); stamp the run id so `status`
-/// can surface its URL.
-async fn observe_run(
-    db: DurableDb,
-    Json(observe): Json<stow_types::api::ObserveRun>,
-) -> Result<Json<OkResponse>> {
-    queue::observe_run(&db, &observe.task_id, &observe.github_run_id)
-        .await
-        .map_err(to_error)?;
-    Ok(Json(OkResponse { ok: true }))
 }
 
 async fn tasks_status(

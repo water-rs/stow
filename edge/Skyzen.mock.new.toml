@@ -16,6 +16,7 @@ STOW_DISPATCH_MIN_AGE_MINUTES = "0"
 STOW_MAX_CONCURRENT_JOBS = "3"
 STOW_STALE_DISPATCH_MINUTES = "10"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
+STOW_GITHUB_WEBHOOK_SECRET = "mock-github-webhook-secret"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"

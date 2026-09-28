@@ -8,25 +8,24 @@
 //!   the upload, and writes everything into an output directory (see
 //!   [`stage`]). Third-party build scripts and proc-macros execute here, so
 //!   nothing this job produces is trusted by itself.
-//! * `stow-build publish` runs in a job that holds the GHCR token, the OIDC
-//!   grant for cosign, and the edge register secret. It reads the build
-//!   output, re-derives every digest, checks the plan against the task it was
-//!   dispatched with and a dependency closure it resolves itself, and only
-//!   then pushes, signs, registers, and reports completion.
+//! * `stow-build publish` runs in a job that holds the GHCR token and the OIDC
+//!   grant for cosign — and nothing else. It reads the build output,
+//!   re-derives every digest, checks the plan against the task it was
+//!   dispatched with and a dependency closure it resolves itself, then pushes
+//!   and signs the artifacts and the task's records artifact into GHCR.
+//!   Nothing in this binary ever calls the edge: completion reaches the
+//!   scheduler through GitHub's `workflow_run` webhook instead
+//!   (stow#455).
 //!
 //! `stow-build serve` is the dev-only local dispatch server, and
 //! `stow-build rustc …` is the capture wrapper cargo invokes during `build`.
 
-mod auth;
-mod backfill;
 mod capture;
 mod closure;
 mod consume;
 mod dep_scan;
 mod local_server;
-mod notify;
 mod plan;
-mod register;
 mod retry;
 mod stage;
 mod task;
@@ -36,7 +35,7 @@ mod workspace_mirror;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use stow_types::api::{BuildCompleteReport, BuildTaskPayload};
+use stow_types::api::BuildTaskPayload;
 use tracing_subscriber::EnvFilter;
 
 const STOW_BUILD_TASK_JSON_ENV: &str = "STOW_BUILD_TASK_JSON";
@@ -44,7 +43,7 @@ const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
-const SCHEDULER_URL_ENV: &str = "SCHEDULER_URL";
+const STOW_GITHUB_WEBHOOK_SECRET_ENV: &str = "STOW_GITHUB_WEBHOOK_SECRET";
 
 #[derive(Debug, Parser)]
 #[command(name = "stow-build", about, version)]
@@ -61,21 +60,12 @@ enum Stage {
         #[arg(long)]
         output_dir: PathBuf,
     },
-    /// Trusted stage: validate a build output, then push, sign, register and
-    /// report it.
+    /// Trusted stage: validate a build output, then push, sign and publish
+    /// its records artifact into GHCR.
     Publish {
         /// Directory a `build` stage wrote.
         #[arg(long)]
         input_dir: PathBuf,
-    },
-    /// One-time migration: publish the `<tag>.bundle` of every artifact
-    /// row registered before bundles existed and re-register it. Needs
-    /// `GHCR_USERNAME`/`GHCR_TOKEN` with package write access and the
-    /// developer's GitHub token for the edge.
-    BackfillBundles {
-        /// Rows republished per edge round trip.
-        #[arg(long, default_value_t = 200)]
-        batch: usize,
     },
     /// Dev-only local dispatch server standing in for GitHub Actions.
     Serve {
@@ -107,11 +97,6 @@ fn main() -> stow_types::error::Result<()> {
         // reactor; the build stage is smol-only because cargo/rustc
         // capture never touches HTTP.
         Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
-        Stage::BackfillBundles { batch } => tokio_runtime()?.block_on(async move {
-            let republished = backfill::backfill_bundles(batch).await?;
-            tracing::info!(republished, "bundle backfill completed");
-            Ok(())
-        }),
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
 }
@@ -145,84 +130,18 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
 
 async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result<()> {
     let task = load_task_payload()?;
-    match publish(&task, input_dir).await {
-        Ok(report) => {
-            // A 409 means a newer attempt owns the task: the run's report
-            // cannot apply, so it is a warn, not a failure (stow#431).
-            if !notify::report_completion(&report).await? {
-                tracing::warn!(
-                    task_id = %task.task_id,
-                    "completion report rejected — a newer attempt owns the task"
-                );
-            }
-            Ok(())
-        }
-        Err(failure) => {
-            let (step, error) = (failure.step(), failure.into_error());
-            tracing::error!(task_id = %task.task_id, %error, step = %step.as_str(), "publish stage failed");
-            let report = BuildCompleteReport {
-                task_id: task.task_id.clone(),
-                attempt: task.attempt,
-                success: false,
-                error: Some(error.to_string()),
-                failure_step: Some(step),
-                artifacts_uploaded: 0,
-                github_run_id: None,
-            };
-            match notify::report_completion(&report).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!(
-                        task_id = %task.task_id,
-                        "failure report rejected — a newer attempt owns the task"
-                    );
-                }
-                Err(notify_error) => {
-                    return Err(stow_types::stow_error!(
-                        "{error}; reporting the failure to the scheduler also failed: {notify_error}"
-                    ));
-                }
-            }
-            Err(error)
-        }
-    }
-}
-
-/// `publish()`'s error split on the pipeline step that produced it —
-/// the report carries the step so the scheduler's failure classes can
-/// name `register` what a bare publish-job error text cannot.
-enum PublishFailure {
-    /// Validate/push/sign work the trusted job owns.
-    Stage(stow_types::error::Error),
-    /// The `artifacts/register` POST into the edge.
-    Register(stow_types::error::Error),
-}
-
-impl PublishFailure {
-    const fn step(&self) -> stow_types::api::FailureStep {
-        match self {
-            Self::Stage(_) => stow_types::api::FailureStep::Publish,
-            Self::Register(_) => stow_types::api::FailureStep::Register,
-        }
-    }
-
-    fn into_error(self) -> stow_types::error::Error {
-        match self {
-            Self::Stage(error) | Self::Register(error) => error,
-        }
-    }
-}
-
-impl From<stow_types::error::Error> for PublishFailure {
-    fn from(error: stow_types::error::Error) -> Self {
-        Self::Stage(error)
-    }
+    let pushed = publish(&task, input_dir).await.map_err(|error| {
+        tracing::error!(task_id = %task.task_id, %error, "publish stage failed");
+        error
+    })?;
+    tracing::info!(task_id = %task.task_id, pushed, "artifacts pushed");
+    Ok(())
 }
 
 async fn publish(
     task: &BuildTaskPayload,
     input_dir: &std::path::Path,
-) -> Result<BuildCompleteReport, PublishFailure> {
+) -> stow_types::error::Result<u32> {
     let output = stage::read_build_output(input_dir).await?;
     let closure = closure::resolve(task).await?;
     // Every cache-consumption claim is only as good as the signed index
@@ -257,20 +176,16 @@ async fn publish(
         &upload_outcome.published_by_reference,
         &measure_glibc_floors(&output.plan)?,
     )?;
-    // A 409 here means the scheduler reclaimed the task while this build
-    // ran and a newer attempt owns it — the records can never land, so the
-    // publish stops and reports; the report itself conflicts the same way
-    // and the job exits quietly (stow#431). A real register failure (5xx,
-    // transport) reports with `failure_step: register`.
-    if !register::register_artifacts(Some(&task.task_id), &artifact_records)
-        .await
-        .map_err(PublishFailure::Register)?
-    {
-        tracing::warn!(
-            task_id = %task.task_id,
-            "register rejected the records — a newer attempt owns the task"
-        );
-    }
+    // The records artifact is the only record the run writes: cosigned by
+    // this workflow's identity under `records-<rustc>-<task_id hash>`, where the
+    // webhook handler reads it back before marking the task done.
+    let records = stow_oci::push_records(
+        &credentials,
+        task.rustc_version.as_str(),
+        &task.task_id,
+        &artifact_records,
+    )
+    .await?;
 
     tracing::info!(
         task_id = %task.task_id,
@@ -278,17 +193,10 @@ async fn publish(
         version = %task.version,
         target = %task.target,
         artifact_records = artifact_records.len(),
+        records_tag = %records.tag,
         "publish stage completed"
     );
-    Ok(BuildCompleteReport {
-        task_id: task.task_id.clone(),
-        attempt: task.attempt,
-        success: true,
-        error: None,
-        failure_step: None,
-        artifacts_uploaded: upload_outcome.newly_pushed,
-        github_run_id: None,
-    })
+    Ok(upload_outcome.newly_pushed)
 }
 
 /// Measure every planned artifact's glibc floor from its output bytes —
@@ -333,14 +241,13 @@ fn measure_glibc_floors(
 }
 
 async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<()> {
-    let state = local_server::LocalServerState {
-        scheduler_url: env_required(SCHEDULER_URL_ENV)?,
-        edge_url: env_required(STOW_EDGE_URL_ENV)?,
-        mock_public_key_path: env_required(STOW_MOCK_PUBLIC_KEY_PATH_ENV)?,
-        mock_private_key_path: env_required(STOW_MOCK_PRIVATE_KEY_PATH_ENV)?,
-        mock_registry_root: env_required(STOW_MOCK_REGISTRY_ROOT_ENV)?,
-        edge_bearer: auth::edge_bearer().await?,
-    };
+    let state = local_server::LocalServerState::new(
+        env_required(STOW_EDGE_URL_ENV)?,
+        env_required(STOW_GITHUB_WEBHOOK_SECRET_ENV)?,
+        env_required(STOW_MOCK_PUBLIC_KEY_PATH_ENV)?,
+        env_required(STOW_MOCK_PRIVATE_KEY_PATH_ENV)?,
+        env_required(STOW_MOCK_REGISTRY_ROOT_ENV)?,
+    );
     local_server::serve(listen, state).await
 }
 

@@ -33,6 +33,13 @@ impl ConsumeConfig {
     pub fn load() -> stow_types::error::Result<Self> {
         StowConfig::load().map(Self)
     }
+
+    /// The OCI registry base URL the config resolved — where the GHCR
+    /// prefetch in `stow-build` pulls bundle blobs from.
+    #[must_use]
+    pub fn registry_base_url(&self) -> &str {
+        &self.0.registry_base_url
+    }
 }
 
 /// Pull and signature-verify the index slice for `(target, rustc_version)`,
@@ -129,6 +136,29 @@ pub async fn stage_verified_bundle(
                 row.crate_name, row.version
             )))
         })?;
+    stage_bundle_bytes(config, slice, row, entry_dir, bytes).await
+}
+
+/// The fetch-agnostic tail of [`stage_verified_bundle`].
+///
+/// Bytes already in hand, digest-checked against the row by whoever
+/// fetched them, now parsed, identity-checked, cosign-verified and
+/// staged. The CI consume path reaches it from a GHCR digest pull; the
+/// CLI's user path from the edge byte path.
+///
+/// # Errors
+///
+/// [`StageFailure::Unverifiable`] on any check failure; the caller owns
+/// the fetch and reports transport failures itself.
+pub async fn stage_bundle_bytes(
+    config: &ConsumeConfig,
+    slice: &IndexSlice,
+    row: &ArtifactIndexRow,
+    entry_dir: &Path,
+    bytes: Vec<u8>,
+) -> Result<(), StageFailure> {
+    let target = slice.index.header.target.as_str();
+    let rustc_version = slice.index.header.rustc_version.as_str();
     // Past this point the bytes are in hand and the index vouched for
     // them, so every remaining failure is a statement about the artifact
     // rather than about reachability.

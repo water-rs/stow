@@ -806,7 +806,7 @@ fn render_projects_file(repos: &[String]) -> String {
 }
 
 /// Read and validate `preheat/projects.toml` into its repository URLs.
-fn load_projects_file(path: &Path) -> stow_types::error::Result<Vec<String>> {
+pub fn load_projects_file(path: &Path) -> stow_types::error::Result<Vec<String>> {
     let raw = fs::read(path).map_err(|error| stow_error!("read {}: {error}", path.display()))?;
     let file: ProjectsFile =
         toml::from_slice(&raw).map_err(|error| stow_error!("parse {}: {error}", path.display()))?;
@@ -844,7 +844,7 @@ fn normalize_repo_url(raw: &str) -> stow_types::error::Result<String> {
 /// are dropped so the resolve lands on the latest semver-compatible
 /// version — a project contributes crate names and feature sets, never
 /// version pins.
-fn resolve_repository(
+pub fn resolve_repository(
     resolver: &stow_resolver::Resolver,
     repo: &str,
     targets: &[TargetTriple],

@@ -178,10 +178,10 @@ const BUDGETS: &[RouteBudget] = &[
     // Mutation routes — one keyed statement each against a bounded
     // selector.
     RouteBudget {
-        name: "POST /runs/{id}",
-        statements: 3,
-        rows_read: 10,
-        rows_written: 4,
+        name: "POST /tasks/complete-run",
+        statements: 7,
+        rows_read: 70,
+        rows_written: 20,
         scan_allowlist: &[],
         ddl_permitted: false,
     },
@@ -585,23 +585,56 @@ fn budget_of(name: &str) -> &'static RouteBudget {
         .unwrap_or_else(|| panic!("{name} has no entry in the scheduler cost-budget table"))
 }
 
+/// The drive list and both budget tables (the host gate's `BUDGETS` and
+/// workerd's `DO_BUDGETS`) must cover each other exactly: every drive has
+/// exactly one row in each table, and no table has a row no drive
+/// produces. A drifted row is the defect the workerd probe would
+/// otherwise turn into a panic inside the Durable Object.
+#[test]
+fn every_drive_has_exactly_one_row_in_each_budget_table() {
+    let drives = drives::DRIVES
+        .iter()
+        .map(|drive| drive.name)
+        .collect::<BTreeSet<_>>();
+    for name in &drives {
+        assert_eq!(
+            1,
+            drives::DRIVES
+                .iter()
+                .filter(|drive| drive.name == *name)
+                .count(),
+            "duplicate drive {name}",
+        );
+    }
+    let host_names = BUDGETS.iter().map(|budget| budget.name).collect::<Vec<_>>();
+    let workerd_names = crate::scheduler::do_budgets::DO_BUDGETS
+        .iter()
+        .map(|budget| budget.name)
+        .collect::<Vec<_>>();
+    for (table, names) in [
+        ("host BUDGETS", &host_names),
+        ("workerd DO_BUDGETS", &workerd_names),
+    ] {
+        assert_eq!(
+            drives,
+            names.iter().copied().collect::<BTreeSet<_>>(),
+            "{table} and the drive list drifted apart",
+        );
+        assert_eq!(
+            names.len(),
+            names.iter().copied().collect::<BTreeSet<_>>().len(),
+            "{table} has a duplicate row",
+        );
+    }
+}
+
 /// Every entry of [`drives::DRIVES`] holds its budget on the 10k gate
 /// fixture. The two tables must cover each other exactly — a drive with
 /// no budget row, or a row no drive produces, is a gate bug and fails
 /// either way.
 #[tokio::test]
 async fn per_request_cost_gate() {
-    assert_eq!(
-        drives::DRIVES
-            .iter()
-            .map(|drive| drive.name)
-            .collect::<BTreeSet<_>>(),
-        BUDGETS
-            .iter()
-            .map(|budget| budget.name)
-            .collect::<BTreeSet<_>>(),
-        "the budget table and the drive list drifted apart",
-    );
+    every_drive_has_exactly_one_row_in_each_budget_table();
     let settings = SchedulerSettings::default();
     let (db, log) = counting_memory_db().await.expect("counting db");
     let seed_base = log.lock().expect("log").len();

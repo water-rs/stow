@@ -206,3 +206,29 @@ pub async fn delete(token: &str, path: &str) -> stow_types::error::Result<()> {
         .map_err(|error| stow_error!("DELETE {url}: {error}"))?;
     Ok(())
 }
+
+/// `POST` one API path under `/repos/{REPO}/` with a JSON body whose
+/// 2xx answer carries no body of interest — the `workflow_dispatch`
+/// calls `preheat manual` drives, which answer 204.
+pub async fn post_empty(
+    token: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> stow_types::error::Result<()> {
+    let url = format!("{API_BASE}/repos/{REPO}/{path}");
+    let mut client = zenwave::client();
+    client
+        .post(&url)
+        .map_err(|error| stow_error!("build POST {url}: {error}"))?
+        .header("Authorization", format!("Bearer {token}"))
+        .and_then(|request| request.header("User-Agent", USER_AGENT))
+        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
+        .and_then(|request| request.json_body(body))
+        .map_err(|error| stow_error!("build POST {url}: {error}"))?
+        .await
+        .map_err(|error| stow_error!("POST {url}: {error}"))?
+        .error_for_status()
+        .await
+        .map_err(|error| stow_error!("POST {url}: {error}"))?;
+    Ok(())
+}

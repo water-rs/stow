@@ -41,9 +41,8 @@ identity. The build order is the edges. The unit rule is what may be a node.
 ## Trust model
 - Trust GitHub-hosted CI as the builder.
 - Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
-- Trusted CI registers artifact records via the edge worker's authenticated `/api/v1/admin/artifacts/register` endpoint (the caller proves a GitHub identity — Actions OIDC for CI, a push-user token otherwise). The edge owns the only write path to D1's `artifacts` table; CI does NOT hold a D1 credential.
-- Edge workers are untrusted-by-default serving infrastructure: every register write is gated by GitHub-identity auth (the `build-crate.yml` OIDC pin or a repo push user), and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the CLI sees a 404 or a digest failure and compiles locally).
-- Future direction: replace bearer-credential register auth with a cosign-signed request body, so the register path itself becomes signature-rooted.
+- Trusted CI never calls the edge: `build-crate.yml` stamps its `run-name` `<rustc>-<task_id>` and pushes each task's bundle and `Vec<ArtifactRecord>` to GHCR as one cosign-signed `records-<rustc>-<task_id hash>` artifact under the pinned builder identity, and GitHub's `workflow_run` webhook (HMAC-verified at `POST /api/v1/github/workflow-run`) reports completion. GHCR plus cosign is the only record store; the edge's D1 `artifacts` table is a mirror `index sync` fills from those verified records.
+- Edge workers are untrusted-by-default serving infrastructure: index exports and webhook completion both verify the records artifact's cosign signature against the `build-crate.yml` identity before trusting a row, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the consumer sees a 404 or a digest failure and compiles locally).
 
 ## Architecture map
 - `cli/`: end-user CLI and runtime wrappers.
@@ -62,13 +61,13 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `scheduler/`: Durable Object queue, dispatch, and miss draining.
 - `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.
   - `stow-build build` (untrusted job, `contents: read`, no secrets/OIDC): builds the crate, scans artifacts, writes task + plan + content-addressed blobs to an output directory (`stage.rs`).
-  - `stow-build publish` (trusted job): re-hashes the blobs, validates the plan against the dispatched task and a self-resolved dependency closure (`closure.rs`, `validate.rs`), then pushes OCI artifacts, signs, POSTs `Vec<ArtifactRecord>` to the edge admin/register endpoint, and reports to the scheduler.
+  - `stow-build publish` (trusted job): re-hashes the blobs, validates the plan against the dispatched task and a self-resolved dependency closure (`closure.rs`, `validate.rs`), then pushes the bundle and the signed records artifact to GHCR. GitHub's `workflow_run` webhook — not the runner — reports completion to the edge.
   - The scheduler dispatches `workflow_dispatch` of `build-crate.yml` on `main`; the trusted identity lives in `types/src/trusted_builder.rs`.
 - `oci/`: shared OCI push/sign/pull machinery (`stow-oci`) — bundle publish for `stow-build`, index publish for `stow-admin`, digest pulls for the CLI.
 - `mock-registry/`: local mock OCI registry for simulation and tests (`populate`, `publish-index`, `index-from-records`, `serve`; speaks GHCR's anonymous bearer exchange).
 - `types/`: shared API and artifact key types (`index.rs` carries the signed `ArtifactIndex` wire format).
 - `resolver/`: native graph resolver (`stow-resolver`) on the published `cargo` crate — materializes a fetched source (project tree or `.crate`), runs cargo's own `resolve_ws_with_opts`/`FeatureResolver` per CI target with the toolchain's real rustc facts, and emits the per-target unit set (package, feature set, dependency edges, host/target side) plus the `EnqueueRequest` conversion the lanes share.
-- `admin/`: operations CLI for preheating the cache via the scheduler and publishing index slices (`index export|publish`); every lane resolves in-process with `stow-resolver` (`resolve::RESOLVE_CONCURRENCY` worker threads).
+- `admin/`: operations CLI for preheating the cache and publishing index slices (`index export|publish|sync`). Every lane resolves in-process with `stow-resolver` (`resolve::RESOLVE_CONCURRENCY` worker threads); `preheat manual` drives a whole wave with no edge at all — in-process resolve, topological layering, `workflow_dispatch` through the operator's GitHub token, index-rooted resume.
 
 ## Important repo assumptions
 - water-rs Actions capacity is 60 concurrent runners (20 on macOS) — a full `CI_TARGET_TRIPLES` request wave dispatches in one window; wall clock is set by the slowest (Windows) leg.

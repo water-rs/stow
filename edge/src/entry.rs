@@ -9,7 +9,9 @@ use skyzen_services::Db;
 
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
-use crate::{admission, api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site};
+use crate::{
+    admission, api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook,
+};
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
@@ -29,6 +31,7 @@ const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
 const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
+const STOW_GITHUB_WEBHOOK_SECRET_BINDING: &str = "STOW_GITHUB_WEBHOOK_SECRET";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -92,6 +95,11 @@ fn worker(env: &wasm::Env) -> Router {
 
     let mut nodes = anonymous_nodes();
     nodes.extend(trusted_nodes(&trust_gate));
+    // The GitHub `workflow_run` webhook's authentication is its
+    // `X-Hub-Signature-256` HMAC — it carries neither the trust gate's
+    // caller credential nor the zone WAF rules' shedding (completions
+    // must drain during a partial reopen).
+    nodes.push("/api/v1/github/workflow-run".post(webhook::github_workflow_run));
 
     Route::new(nodes)
         .with(db)
@@ -113,6 +121,10 @@ fn worker(env: &wasm::Env) -> Router {
         }))
         .with(State(github_auth::Jwks::default()))
         .with(State(github_auth::PushVerdicts::default()))
+        .with(State(webhook::WebhookSecret(env_binding::required_string(
+            env,
+            STOW_GITHUB_WEBHOOK_SECRET_BINDING,
+        ))))
         .build()
 }
 
@@ -148,9 +160,7 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
         // route-tuple arity — the URLs are unchanged.
         "/api/v1/admin/artifacts"
             .route((
-                "/register".post(api::register_artifacts),
-                "/unbundled".at(api::list_unbundled_artifacts),
-                "/unmeasured-glibc".at(api::list_unmeasured_glibc_artifacts),
+                "/sync".post(api::sync_artifacts),
                 "/prune".post(api::prune_artifacts),
                 "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
             ))

@@ -17,6 +17,7 @@ mod deploy;
 mod github;
 mod index_cmd;
 mod maintenance;
+mod manual;
 mod preheat;
 mod projects;
 mod queue;
@@ -28,6 +29,7 @@ mod scheduler;
 mod watchdog;
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use stow_types::api::{
@@ -58,6 +60,11 @@ const ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN
 const STOW_EDGE_VERSION_OVERRIDE_ENV: &str = "STOW_EDGE_VERSION_OVERRIDE";
 /// The header `STOW_EDGE_VERSION_OVERRIDE` fills.
 const VERSION_OVERRIDES_HEADER: &str = "Cloudflare-Workers-Version-Overrides";
+/// Every edge call the admin client makes is bounded — an unanswered
+/// request (a wedged dev-runtime stub, a vanished connection) must fail
+/// the command, not hang it. Same 45 s the `cloudflare.rs` client uses.
+/// The scheduler budget probe carries its own, larger bound.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Parser)]
 #[command(name = "stow-admin", about = "Operations CLI for the stow build fleet")]
@@ -304,7 +311,7 @@ impl Edge {
     ) -> stow_types::error::Result<T> {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
         let request = client
             .get(&url)
             .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
@@ -331,9 +338,25 @@ impl Edge {
         path: &str,
         body: &B,
     ) -> stow_types::error::Result<T> {
+        self.post_json_with_timeout(path, body, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`post_json`](Self::post_json) at an explicit bound — for the
+    /// routes that legitimately outlive the default, like the scheduler
+    /// budget probe replaying every drive on a seeded fixture.
+    pub(crate) async fn post_json_with_timeout<
+        B: serde::Serialize + Sync,
+        T: serde::de::DeserializeOwned,
+    >(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> stow_types::error::Result<T> {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().timeout(timeout);
         let request = client
             .post(&url)
             .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))

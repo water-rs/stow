@@ -10,9 +10,9 @@
 //! and redeploys never stomp a live toggle:
 //!
 //! - `stow maintenance: anonymous` blocks the anonymous route families
-//!   on the edge hostname; the trusted `/api/v1/admin/*` and
-//!   `/api/v1/scheduler/*` prefixes keep working — what the panic switch
-//!   was for.
+//!   on the edge hostname; the trusted `/api/v1/admin/*`,
+//!   `/api/v1/scheduler/*` and `/api/v1/github/*` prefixes keep working —
+//!   what the panic switch was for.
 //! - `stow maintenance: scheduler lanes` blocks exactly the public
 //!   routes whose handlers reach the scheduler Durable Object
 //!   (`stow_types::api::scheduler_lanes`), leaving the bundle byte path
@@ -108,14 +108,16 @@ impl MaintenanceScope {
     /// The rule's WAF expression for the edge's hostname (from
     /// `STOW_EDGE_URL` — never a hardcoded name). `anonymous` blocks
     /// every route the old panic gate wrapped — everything on the edge
-    /// hostname except the trusted prefixes — so the expression is a
-    /// carve-out, not a path enumeration that would drift as routes
-    /// change. `lanes` is the opposite shape: exactly the
-    /// `scheduler_lanes` paths the router mounts.
+    /// hostname except the trusted prefixes, `/api/v1/github` included
+    /// so GitHub's webhook keeps draining completions while the public
+    /// surface is shed — so the expression is a carve-out, not a path
+    /// enumeration that would drift as routes change. `lanes` is the
+    /// opposite shape: exactly the `scheduler_lanes` paths the router
+    /// mounts.
     pub fn expression(self, host: &str) -> String {
         match self {
             Self::Anonymous => format!(
-                "http.host eq \"{host}\" and not starts_with(http.request.uri.path, \"/api/v1/admin\") and not starts_with(http.request.uri.path, \"/api/v1/scheduler\")"
+                "http.host eq \"{host}\" and not starts_with(http.request.uri.path, \"/api/v1/admin\") and not starts_with(http.request.uri.path, \"/api/v1/scheduler\") and not starts_with(http.request.uri.path, \"/api/v1/github\")"
             ),
             Self::Lanes => {
                 let clauses = lane_prefixes()
@@ -656,7 +658,7 @@ mod tests {
     const ENTRYPOINT_ABSENT: &str = r#"{"success":false,"errors":[{"code":10003,"message":"could not find entrypoint ruleset for phase http_request_firewall_custom"}],"messages":[],"result":null}"#;
 
     /// An entrypoint carrying all three maintenance rules disabled.
-    const ENTRYPOINT_PRESENT: &str = r#"{"success":true,"errors":[],"messages":[],"result":{"id":"rs-1","name":"stow maintenance","kind":"zone","phase":"http_request_firewall_custom","rules":[{"id":"r-anon","description":"stow maintenance: anonymous","expression":"http.host eq \"stow.waterui.dev\" and not starts_with(http.request.uri.path, \"/api/v1/admin\") and not starts_with(http.request.uri.path, \"/api/v1/scheduler\")","action":"block","enabled":false},{"id":"r-lanes","description":"stow maintenance: scheduler lanes","expression":"http.host eq \"stow.waterui.dev\" and (starts_with(http.request.uri.path, \"/api/v1/admissions\") or starts_with(http.request.uri.path, \"/api/v1/enqueue\") or starts_with(http.request.uri.path, \"/api/v1/requests\") or starts_with(http.request.uri.path, \"/requests/\"))","action":"block","enabled":true},{"id":"r-all","description":"stow maintenance: all","expression":"http.host eq \"stow.waterui.dev\"","action":"block","enabled":false}]}}"#;
+    const ENTRYPOINT_PRESENT: &str = r#"{"success":true,"errors":[],"messages":[],"result":{"id":"rs-1","name":"stow maintenance","kind":"zone","phase":"http_request_firewall_custom","rules":[{"id":"r-anon","description":"stow maintenance: anonymous","expression":"http.host eq \"stow.waterui.dev\" and not starts_with(http.request.uri.path, \"/api/v1/admin\") and not starts_with(http.request.uri.path, \"/api/v1/scheduler\") and not starts_with(http.request.uri.path, \"/api/v1/github\")","action":"block","enabled":false},{"id":"r-lanes","description":"stow maintenance: scheduler lanes","expression":"http.host eq \"stow.waterui.dev\" and (starts_with(http.request.uri.path, \"/api/v1/admissions\") or starts_with(http.request.uri.path, \"/api/v1/enqueue\") or starts_with(http.request.uri.path, \"/api/v1/requests\") or starts_with(http.request.uri.path, \"/requests/\"))","action":"block","enabled":true},{"id":"r-all","description":"stow maintenance: all","expression":"http.host eq \"stow.waterui.dev\"","action":"block","enabled":false}]}}"#;
 
     #[test]
     fn absent_entrypoint_decodes_as_10003_not_a_ruleset() {
@@ -701,13 +703,14 @@ mod tests {
         assert_eq!(json["description"], "stow maintenance: anonymous");
     }
 
-    /// The anonymous carve-out keeps the two trusted prefixes — the
-    /// admin routes the breaker exists to keep, and the scheduler lane
-    /// the builder callbacks arrive on.
+    /// The anonymous carve-out keeps the trusted prefixes — the admin
+    /// routes the breaker exists to keep, the scheduler lane the
+    /// builder callbacks arrive on, and the GitHub webhook completions
+    /// drain through.
     #[test]
     fn anonymous_expression_carves_out_trusted_prefixes() {
         let expression = MaintenanceScope::Anonymous.expression("stow.waterui.dev");
-        for trusted in ["/api/v1/admin", "/api/v1/scheduler"] {
+        for trusted in ["/api/v1/admin", "/api/v1/scheduler", "/api/v1/github"] {
             assert!(
                 expression.contains(&format!(
                     "not starts_with(http.request.uri.path, \"{trusted}\")"

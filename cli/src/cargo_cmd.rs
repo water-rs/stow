@@ -103,7 +103,7 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     {
         log_nonfatal_result(
             "failed to load the sigstore trust root before prefetch",
-            crate::verify::Trust::resolve(config).await.map(|_| ()),
+            crate::verify::resolve_trust(config).await.map(|_| ()),
         );
     }
 

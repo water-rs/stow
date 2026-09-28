@@ -1,6 +1,6 @@
 //! GitHub-identity authentication for the trusted write surface.
 //!
-//! The scheduler-control and artifact-register endpoints previously sat
+//! The scheduler-control and artifact-write endpoints previously sat
 //! behind two long-lived shared secrets (`x-stow-scheduler-token`,
 //! `x-stow-register-token`). Both are replaced by GitHub identity on a
 //! single `Authorization: Bearer` header — nothing is stored anywhere:
@@ -59,7 +59,7 @@ const JWKS_CACHE_TTL_SECS: i64 = 3600;
 /// revocation latency the cache adds: a token whose push access is
 /// revoked on GitHub stays trusted here for at most this long after its
 /// last probe. The probe it replaces is what GitHub rate-limited during
-/// a register burst, so the TTL bounds upstream traffic as well.
+/// a write burst, so the TTL bounds upstream traffic as well.
 const PUSH_VERDICT_TTL_SECS: i64 = 300;
 
 /// How long a *denied* verdict is held — shorter than a proven one, so
@@ -68,15 +68,14 @@ const PUSH_VERDICT_TTL_SECS: i64 = 300;
 const PUSH_DENIED_TTL_SECS: i64 = 60;
 
 /// A caller that cleared the trust check. Carried into tracing so the
-/// register/complete logs name *who* wrote rather than "someone with the
-/// token".
+/// write logs name *who* wrote rather than "someone with the token".
 #[derive(Debug, Clone)]
 pub enum TrustedCaller {
     /// A GitHub Actions OIDC identity.
     Actions {
         /// `owner/repo/.github/workflows/<file>.yml@refs/...` of the job.
         job_workflow_ref: String,
-        /// The workflow run id, for correlating a register back to its run.
+        /// The workflow run id, for correlating a write back to its run.
         run_id: String,
     },
     /// A GitHub credential that proved push access to the repo — a user
@@ -422,7 +421,7 @@ struct CachedVerdict {
 /// digest of the bearer token — the token itself is never stored.
 ///
 /// The probe it replaces ran on every trusted request, and the Worker's
-/// shared egress IPs got it rate-limited by GitHub during a register
+/// shared egress IPs got it rate-limited by GitHub during a write
 /// burst; caching by digest keeps the checks the burst needs at zero.
 /// An isolate restart cold-starts the cache — it re-probes once per
 /// credential and refills. Same mechanics as [`Jwks`]: `Arc<Mutex<_>>`
@@ -1099,7 +1098,7 @@ mod tests {
         )
         .await;
         assert!(matches!(caller, Ok(TrustedCaller::Actions { .. })));
-        // ...but only build-crate.yml may register artifacts.
+        // ...but only build-crate.yml carries the workflow pin.
         assert_unauthorized(
             &authenticate(
                 &test_config(),
@@ -1234,8 +1233,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_user_registers_artifacts() {
-        // Local dev drives the same register endpoint with the developer's
+    async fn push_user_writes() {
+        // Local dev drives the same write endpoints with the developer's
         // own GitHub token — push users pass under every policy.
         let key = test_key();
         let api = StubTrust::for_key(&key);

@@ -13,8 +13,7 @@ use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
     AdmissionRequest, ArtifactIndexPage, ArtifactRecord, BuildCompleteReport, CI_TARGET_TRIPLES,
-    CrateRequest, CrateRequestOutcome, EnqueueAdmission, EnqueueTicket, QueueTaskStatus,
-    RegisterArtifactsRequest,
+    CrateRequest, CrateRequestOutcome, EnqueueAdmission, EnqueueTicket,
 };
 use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
@@ -28,7 +27,7 @@ use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
     admission, cache, catalog, crates_io, dependency_resolver, ghcr, index_slice, miss_logger,
-    register, rust_channel, scheduler, scheduler_client, stats, worker_resolver,
+    rust_channel, scheduler, scheduler_client, stats, worker_resolver,
 };
 
 /// Header value for `x-stow-cache: hit|miss`.
@@ -42,7 +41,7 @@ const fn cache_status_header(cache_hit: bool) -> HeaderValue {
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct OkResponse {
-    ok: bool,
+    pub ok: bool,
 }
 
 /// Marker that the request's `Authorization: Bearer` credential cleared the
@@ -99,7 +98,7 @@ impl Extractor for BundleStreams {
 
 /// Marker that the caller cleared [`github_auth::Policy::BuildWorkflow`] —
 /// the OIDC pin that lets only `build-crate.yml` runs (or a repo-push user
-/// driving the same endpoint in local dev) write `artifacts` rows.
+/// driving the same endpoint in local dev) write completion reports.
 #[derive(Debug, Clone)]
 pub struct ArtifactWriteCaller(pub github_auth::TrustedCaller);
 
@@ -300,222 +299,25 @@ fn mint_admissions(
     Ok(admissions)
 }
 
-/// POST /api/v1/admin/artifacts/register
+/// POST /api/v1/admin/artifacts/sync — the D1 sync step of
+/// `index-publish.yml` (stow#455).
 ///
-/// Trusted CI registers freshly-built artifacts here. CI does NOT write to
-/// D1 directly; `ArtifactWriteCaller` pins the OIDC path to
-/// `build-crate.yml` runs (a push-user GitHub token also passes, which is
-/// what the local dev loop and `backfill-bundles` use) and the edge owns
-/// the D1 binding.
-///
-/// The request's `task_id` binds the write to one dispatched scheduler
-/// task: the Actions identity must name it, every record must carry the
-/// task's target and rustc version, and each `(crate, version)` must be
-/// the task crate or inside its crates.io dependency closure — checked in
-/// full before the first row is written, so a rejected request leaves no
-/// rows behind. A push caller may omit `task_id` (backfill/operator
-/// writes run outside a dispatched task); when present the same binding
-/// applies. Upsert semantics keep registration idempotent across CI
-/// retries while preserving each row's original `created_at`.
-pub async fn register_artifacts(
-    ArtifactWriteCaller(caller): ArtifactWriteCaller,
-    Json(request): Json<RegisterArtifactsRequest>,
+/// GHCR's records artifacts are the only record store; `artifacts` rows
+/// exist only to serve lookups, and they are written here by the sync
+/// step replaying the verified records it pulled — never by the build
+/// itself. The caller is a repo-writer credential (the workflow's
+/// `GITHUB_TOKEN` or an operator's token), so no task binding applies:
+/// the records' provenance was already proven by cosign verification
+/// before they were ever sent here.
+pub async fn sync_artifacts(
+    _caller: SchedulerCaller,
+    Json(records): Json<Vec<ArtifactRecord>>,
     db: Db,
-    State(scheduler): State<CfDurableNamespace>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let binding = resolve_register_binding(
-        &scheduler,
-        request.task_id.as_deref(),
-        settings.rustc_data_base_url.as_deref(),
-    )
-    .await?;
-    // Every record the builder writes carries the unit shape it stamped
-    // by construction; the only admissible shapeless records re-register
-    // rows that predate the columns — the backfill paths — so the check
-    // needs the pre-column keys among this request's shapeless records.
-    let shapeless_keys: Vec<(String, String, String)> = request
-        .records
-        .iter()
-        .filter(|record| record.unit_shape.is_none())
-        .map(|record| {
-            (
-                record.c_metadata.as_str().to_owned(),
-                record.target.as_str().to_owned(),
-                record.rustc_version.as_str().to_owned(),
-            )
-        })
-        .collect();
-    let existing_shapeless = if shapeless_keys.is_empty() {
-        BTreeSet::new()
-    } else {
-        db::shapeless_artifact_keys(&db, &shapeless_keys).await?
-    };
-    if let Some(violation) =
-        register::first_violation(&caller, &binding, &request.records, &existing_shapeless)
-    {
-        let message = violation.to_string();
-        tracing::warn!(
-            %caller,
-            task_id = ?request.task_id,
-            %violation,
-            "artifact registration rejected by task binding"
-        );
-        return Err(match violation.kind() {
-            register::ViolationKind::BadRequest => GetArtifactError::BadRequestWithMessage(message),
-            register::ViolationKind::Conflict => GetArtifactError::RegisterConflict(message),
-            register::ViolationKind::Forbidden => GetArtifactError::RegisterForbidden(message),
-        });
-    }
-    // An OIDC caller's run id is the build run acting on this task — stamp
-    // it so `stow-admin status` can surface the run URL. A failed stamp is
-    // logged, not fatal: it is observability metadata, and a scheduler
-    // hiccup must not lose the registration itself.
-    if let (github_auth::TrustedCaller::Actions { run_id, .. }, Some(task_id)) =
-        (&caller, request.task_id.as_deref())
-        && let Err(error) = scheduler_client::observe_run(&scheduler, task_id, run_id).await
-    {
-        tracing::warn!(%error, %task_id, %run_id, "failed to stamp run id on queue row");
-    }
-    let count = request.records.len();
-    // One atomic D1 batch writes every record: a failed statement rolls
-    // the request's rows back, and a thousand-record request is one
-    // round trip rather than a serial loop the worker timeout eats
-    // mid-flight.
-    db::insert_artifact_records(&db, &request.records).await?;
-    tracing::info!(
-        registered = count,
-        %caller,
-        task_id = ?request.task_id,
-        "registered artifact records via admin endpoint"
-    );
+    let count = records.len();
+    db::insert_artifact_records(&db, &records).await?;
+    tracing::info!(synced = count, "synced GHCR artifact records into D1");
     Ok(Json(OkResponse { ok: true }))
-}
-
-/// Resolve a register request's `task_id` against the scheduler queue and,
-/// for tasks whose closure is reproducible from crates.io, expand the
-/// task's dependency closure — the record set the dispatched run is
-/// allowed to write.
-///
-/// A task that resolves a lockfile the edge cannot see (a
-/// `preserve_lockfile` overlay) gets
-/// `closure: None`: a fresh crates.io expansion would resolve different
-/// versions than the pinned lockfile and reject legitimate records, so
-/// the binding narrows to the task's target/rustc identity.
-async fn resolve_register_binding(
-    scheduler: &CfDurableNamespace,
-    task_id: Option<&str>,
-    rustc_data_base_url: Option<&str>,
-) -> Result<register::TaskBinding, GetArtifactError> {
-    let Some(task_id) = task_id else {
-        return Ok(register::TaskBinding::Unbound);
-    };
-    let statuses = scheduler_client::get_tasks_status(scheduler, &[task_id.to_owned()]).await?;
-    let Some(task) = statuses
-        .into_iter()
-        .find(|status| status.task_id == task_id)
-    else {
-        return Ok(register::TaskBinding::Unknown(task_id.to_owned()));
-    };
-    let closure = if !matches!(
-        task.status,
-        QueueTaskStatus::Dispatched | QueueTaskStatus::Running
-    ) {
-        // `first_violation` rejects the request before consulting the
-        // closure — skip the crates.io expansion a refused request would
-        // never use.
-        None
-    } else if task.preserve_lockfile {
-        tracing::info!(
-            task_id = %task.task_id,
-            "register bound to a lockfile-pinned task; crates.io closure check skipped"
-        );
-        None
-    } else {
-        let pool = OutboundPool::new();
-        Some(
-            worker_resolver::expand_task_closure(
-                &task.crate_name,
-                task.version.as_semver(),
-                &task.features_json.features().iter().cloned().collect(),
-                &task.target,
-                &task.rustc_version,
-                rustc_data_base_url,
-                &pool,
-            )
-            .into_send()
-            .await?,
-        )
-    };
-    Ok(register::TaskBinding::Bound(register::TaskScope {
-        task_id: task.task_id,
-        status: task.status,
-        crate_name: task.crate_name,
-        version: task.version,
-        target: task.target,
-        rustc_version: task.rustc_version,
-        closure,
-    }))
-}
-
-/// Query for `GET /api/v1/admin/artifacts/unbundled`.
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-pub struct UnbundledQuery {
-    /// Most rows to return; defaults to [`DEFAULT_UNBUNDLED_LIMIT`].
-    pub limit: Option<usize>,
-}
-
-/// Rows one backfill pass takes: each costs the caller a manifest, a config,
-/// the layers and the signature image from GHCR plus one bundle push.
-const DEFAULT_UNBUNDLED_LIMIT: usize = 200;
-const MAX_UNBUNDLED_LIMIT: usize = 1000;
-
-/// GET /api/v1/admin/artifacts/unbundled?limit=N
-///
-/// The records of rows registered before bundle publishing, for
-/// `stow-build backfill-bundles`: it pushes each row's `<tag>.bundle` and
-/// re-registers the record with the bundle coordinates, which takes the
-/// row out of this listing.
-pub async fn list_unbundled_artifacts(
-    ArtifactWriteCaller(caller): ArtifactWriteCaller,
-    Query(query): Query<UnbundledQuery>,
-    db: Db,
-) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
-    let limit = query.limit.unwrap_or(DEFAULT_UNBUNDLED_LIMIT);
-    if limit == 0 || limit > MAX_UNBUNDLED_LIMIT {
-        return Err(GetArtifactError::BadRequestWithMessage(format!(
-            "limit must be 1..={MAX_UNBUNDLED_LIMIT}"
-        )));
-    }
-    let records = db::unbundled_artifact_records(&db, limit).await?;
-    tracing::info!(rows = records.len(), %caller, "listed unbundled artifact rows");
-    Ok(Json(records))
-}
-
-/// GET /api/v1/admin/artifacts/unmeasured-glibc?limit=N
-///
-/// The records of rows whose `min_glibc` floor has not been measured —
-/// the column is NULL on rows registered before the field existed — for
-/// `stow-admin index backfill-min-glibc`: it pulls each row's stored
-/// bundle, measures the floor, and re-registers the record, which takes
-/// the row out of this listing and back into the published index.
-/// `bundle_digest != ''` gates the listing the same way the index does:
-/// a row without a bundle is unservable regardless of its floor.
-/// The limit shape mirrors the unbundled listing.
-pub async fn list_unmeasured_glibc_artifacts(
-    ArtifactWriteCaller(caller): ArtifactWriteCaller,
-    Query(query): Query<UnbundledQuery>,
-    db: Db,
-) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
-    let limit = query.limit.unwrap_or(DEFAULT_UNBUNDLED_LIMIT);
-    if limit == 0 || limit > MAX_UNBUNDLED_LIMIT {
-        return Err(GetArtifactError::BadRequestWithMessage(format!(
-            "limit must be 1..={MAX_UNBUNDLED_LIMIT}"
-        )));
-    }
-    let records = db::unmeasured_glibc_artifact_records(&db, limit).await?;
-    tracing::info!(rows = records.len(), %caller, "listed unmeasured-glibc artifact rows");
-    Ok(Json(records))
 }
 
 /// GET /api/v1/admin/dispatch-freeze
@@ -1235,7 +1037,7 @@ pub async fn submit_scheduler_tasks(
 ///
 /// CI (or local simulated CI) reports build completion to the scheduler
 /// Durable Object. `ArtifactWriteCaller` — the same `build-crate.yml` OIDC
-/// pin as register — because a completion report is the other half of the
+/// pin as the record writes — because a completion report is the other half of the
 /// pipeline write: it tells the scheduler the artifacts exist.
 pub async fn complete_build(
     ArtifactWriteCaller(caller): ArtifactWriteCaller,

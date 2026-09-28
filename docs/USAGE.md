@@ -357,13 +357,28 @@ acting unless `--yes` is given.
   request.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
-- `stow-admin index export --target T --rustc-version V --out <file>` /
-  `index publish --file <file> --target T --rustc-version V` /
-  `index targets` — export one signed index slice from the edge's admin
-  endpoint, push it to GHCR (mock deploys delegate to
-  `stow-mock-registry publish-index`), and list the `(target, rustc)`
-  pairs a published index covers. `index-publish.yml` runs this loop
-  after every `build-crate` wave.
+- `stow-admin preheat manual --crates <file>|--projects <file>
+  --rustc-version <v> [--targets a,b] [--in-flight 45]` — the
+  edge-free wave: resolve the input in-process, layer it against the
+  published index, dispatch `build-crate.yml` straight through GitHub's
+  `workflow_dispatch`, and publish each index slice as its layer lands.
+  Works while Cloudflare is down. Resumable by index, exits non-zero
+  with the failed runs' URLs. `--dispatch-url` aims it at the mock's
+  local CI server instead; `--adopt-since <RFC 3339>` (default 24 h ago)
+  bounds how far back a resumed wave adopts already-dispatched runs;
+  `--edge-url` (or `STOW_EDGE_URL`) is forwarded to the index-publish
+  workflow so it can sync the D1 catalog.
+- `stow-admin index export --out-dir <dir>` /
+  `index publish --file <index> --folded <folded>` /
+  `index sync --file <new-records.json>` / `index targets` — export
+  every changed index slice in one pass from the registry's verified
+  records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
+  companion; only the records tags no folded set covers are pulled),
+  push both to GHCR signed under the index workflow (mock deploys
+  delegate to `stow-mock-registry publish-index`), and sync just this
+  pass's new records into the edge's D1 catalog. `index-publish.yml`
+  runs this loop after every `build-crate` wave. `index targets` lists
+  the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
 whole wave — `preheat top`, `preheat top-binaries`, and
@@ -377,5 +392,7 @@ wave builds only what is missing or previously failed.
 
 `stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
 access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
-`preheat projects generate` is the one exception — it touches only
-GitHub, never the edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
+The exceptions never touch the edge: `preheat manual` needs only the
+GitHub credential (plus crates.io and GHCR), `preheat projects generate`
+touches only GitHub, and `index export`/`publish`/`targets` touch only
+the registry. See [`ENVIRONMENT.md`](ENVIRONMENT.md).

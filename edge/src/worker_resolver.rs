@@ -1,8 +1,8 @@
 //! Worker-side graph resolution through `stow-resolve`.
 //!
 //! Every lane that expands a name into build tasks — the human request
-//! lane, the preheat lanes (crates.io binaries and GitHub projects), and
-//! the register-scope closure check — resolves the published manifest
+//! lane and the preheat lanes (crates.io binaries and GitHub projects) —
+//! resolves the published manifest
 //! itself rather than walking crates.io metadata by hand. The resolver is
 //! cargo's own code carried into `stow-resolve`; the worker supplies the
 //! three things a real `cargo` invocation would have read from the machine:
@@ -49,7 +49,7 @@ use crate::errors::ResolverError;
 use crate::fetch_guard::OutboundPool;
 use semver::Version;
 use skyzen_services::Db;
-use stow_resolve::api::{self, StowResolveInput, StowUnit, StowUnitKey, StowUnitKind};
+use stow_resolve::api::{self, StowUnit, StowUnitKey, StowUnitKind};
 use stow_resolve::github_tree;
 use stow_resolve::rustc_data;
 use stow_resolve::sources::registry::IndexCachesRoot;
@@ -252,49 +252,6 @@ pub async fn expand_crate_request_on_targets(
         ));
     }
     Ok(plans)
-}
-
-/// The name/version closure a dispatched task may publish — every package
-/// the resolve pulls into the unit graph is inside it. Register-scope
-/// check for `task_binding`, replacing the old crates.io closure walk.
-///
-/// # Errors
-/// [`ResolverError`] on fetch, parse, or resolution failures.
-pub async fn expand_task_closure(
-    crate_name: &CrateName,
-    version: &Version,
-    seed_features: &BTreeSet<String>,
-    target: &TargetTriple,
-    rustc_version: &WireRustcVersion,
-    rustc_data_base_url: Option<&str>,
-    pool: &OutboundPool,
-) -> Result<BTreeSet<(CrateName, CrateVersion)>, ResolverError> {
-    let http = fetch_http(pool);
-    let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
-    let output = resolve_workspace(
-        &http,
-        &source,
-        seed_features,
-        no_default_features_for(seed_features),
-        target,
-        rustc_version,
-        rustc_data_base_url,
-        &IndexCachesRoot::default(),
-    )
-    .await?;
-    output
-        .units
-        .iter()
-        .filter(|unit| unit.is_crates_io)
-        .map(|unit| {
-            Ok((
-                CrateName::parse(unit.name.clone()).map_err(ResolverError::Identity)?,
-                CrateVersion::new(
-                    semver::Version::parse(&unit.version).expect("resolver emits semver versions"),
-                ),
-            ))
-        })
-        .collect::<Result<_, ResolverError>>()
 }
 
 /// What an admin resolve lane learns about the source: publish-shape
@@ -983,21 +940,6 @@ async fn fetch_rustc_data(
         .map_err(|error| ResolverError::Upstream(format!("{url} is not UTF-8: {error}")))
 }
 
-/// The `rustc -vV`/`--print cfg` inputs one resolve needs — vendored
-/// tables first, then the generated tree `STOW_RUSTC_DATA_BASE_URL`
-/// serves for a stable newer than the bundle.
-async fn rustc_inputs(
-    http: &ResolveHttp,
-    base_url: Option<&str>,
-    rustc_version: &WireRustcVersion,
-    host_triple: &str,
-    cfg_keys: &BTreeSet<String>,
-) -> Result<(String, BTreeMap<String, Vec<String>>), ResolverError> {
-    let verbose = rustc_verbose(http, base_url, rustc_version, host_triple).await?;
-    let cfg = rustc_cfg(http, base_url, rustc_version, cfg_keys).await?;
-    Ok((verbose, cfg))
-}
-
 /// `rustc -vV` stdout for one host triple — the vendored table first,
 /// then the generated tree `STOW_RUSTC_DATA_BASE_URL` serves for a stable
 /// newer than the bundle.
@@ -1162,89 +1104,6 @@ async fn resolve_session_outputs(
             outputs.push(output);
         }
         Ok(outputs)
-    })
-    .await
-}
-
-/// Run one resolve against the shared workspace for one target.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the resolve needs the request's fields plus the shared index caches"
-)]
-async fn resolve_workspace(
-    http: &ResolveHttp,
-    source: &SourceWorkspace,
-    seed_features: &BTreeSet<String>,
-    no_default_features: bool,
-    target: &TargetTriple,
-    rustc_version: &WireRustcVersion,
-    rustc_data_base_url: Option<&str>,
-    index_caches: &IndexCachesRoot,
-) -> Result<api::StowResolveOutput, ResolverError> {
-    let host_triple = runner_family(target.as_str())
-        .ok_or_else(|| {
-            ResolverError::BadRequest(format!("`{}` is not a CI target", target.as_str()))
-        })?
-        .host_triple()
-        .to_string();
-    let cfg_keys = BTreeSet::from([host_triple.clone(), target.as_str().to_owned()]);
-    tracing::info!(target = %target, "resolve: rustc inputs begin");
-    let (verbose, cfg) = rustc_inputs(
-        http,
-        rustc_data_base_url,
-        rustc_version,
-        &host_triple,
-        &cfg_keys,
-    )
-    .await?;
-    tracing::info!(target = %target, "resolve: rustc inputs ready");
-
-    // The ambient VFS is thread-local while resolves interleave on the
-    // isolate's single thread, so the section that depends on it swaps
-    // this request's tree in for each poll and restores it afterwards —
-    // no cross-request lock: a request the runtime abandons mid-resolve
-    // can no longer strand every later resolve on a permit nobody
-    // releases.
-    let vfs = source.vfs.clone();
-    tracing::info!(target = %target, "resolve: vfs section begin");
-    poll_scoped(vfs, async move {
-        let mut gctx = GlobalContext::new_for_resolve(
-            PathBuf::from(WORKSPACE_DIR),
-            source.cargo_home.clone(),
-            Shell::new(),
-            Env::new(),
-            false,
-        )
-        .map_err(|error| classify_resolve_failure("resolver context", &error))?;
-        gctx.set_http(Client::new(http.clone()));
-        gctx.share_index_caches(index_caches.clone());
-        tracing::info!(target = %target, "resolve: api::resolve begin");
-        let output = api::resolve(
-            &gctx,
-            StowResolveInput {
-                manifest_path: source.manifest_path.clone(),
-                filter_platforms: vec![target.as_str().to_owned()],
-                host_triple,
-                features: seed_features.iter().cloned().collect(),
-                all_features: false,
-                no_default_features,
-                members_are_crates_io: source.members_are_crates_io,
-                rustc_verbose_version: verbose.clone(),
-                cfg,
-                dropped_lockfile: source.dropped_lockfile.clone(),
-            },
-        )
-        .await
-        .map_err(|error| classify_resolve_failure("resolve failed", &error))?;
-        // Wasm linear memory never shrinks, so the size at resolve end is
-        // the request's high-water mark against the isolate's 128 MiB cap.
-        tracing::info!(
-            target = %target,
-            units = output.units.len(),
-            memory = linear_memory_bytes(),
-            "resolve: api::resolve done"
-        );
-        Ok(output)
     })
     .await
 }

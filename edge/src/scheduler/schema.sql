@@ -22,8 +22,8 @@ CREATE TABLE IF NOT EXISTS queue (
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    -- GitHub Actions run id the dispatched build reported back through its
-    -- OIDC-claimed register/complete calls; NULL until a run checks in.
+    -- GitHub Actions run id recorded when the build's workflow_run
+    -- webhook completed the task; NULL until the webhook lands.
     github_run_id TEXT,
     -- The unit's compile side: 1 for a host-side node (a proc-macro,
     -- build dependency or build-script unit — minted on the runner

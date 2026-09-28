@@ -10,6 +10,12 @@ use stow_types::api::{SchedulerBudgetReport, SchedulerSeedReport, SchemaMigratio
 use crate::Edge;
 use crate::render::{self, Output};
 
+/// The budget pass replays every scheduler drive on the seeded fixture
+/// inside one Durable Object request, so it legitimately outlives the
+/// 45 s default edge bound — sized ~10× over the measured pass duration
+/// at the 100k fixture.
+const BUDGET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(15);
+
 #[derive(Args)]
 pub struct SchedulerArgs {
     #[command(subcommand)]
@@ -119,7 +125,11 @@ async fn budget(
         }
     }
     let report: SchedulerBudgetReport = edge
-        .post_json("/api/v1/admin/scheduler/budget", &serde_json::json!({}))
+        .post_json_with_timeout(
+            "/api/v1/admin/scheduler/budget",
+            &serde_json::json!({}),
+            BUDGET_PROBE_TIMEOUT,
+        )
         .await?;
     let over = report.over_budget;
     render::emit(output, &report, render_budget_table)?;

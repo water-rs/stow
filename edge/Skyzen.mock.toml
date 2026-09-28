@@ -25,6 +25,7 @@ STOW_SCHEDULER_BUDGET = "1"
 # on fixture writes. Production stays at the Skyzen.toml value.
 STOW_COST_BUDGET_MULTIPLIER = "10000"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
+STOW_GITHUB_WEBHOOK_SECRET = "mock-github-webhook-secret"
 # Cloudflare's documented always-pass Turnstile test pair: any token sent
 # through the request API verifies in the mock deployment.
 TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
