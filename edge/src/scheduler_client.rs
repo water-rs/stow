@@ -8,7 +8,6 @@ const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/status";
-const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
 const SCHEDULER_RUN_COMPLETE_URL: &str = "https://scheduler.internal/tasks/complete-run";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
@@ -31,7 +30,7 @@ pub async fn send_enqueue(
 
 /// The trusted submit channel: `/tasks/submit/trusted` skips the
 /// pending-depth cap because every caller arrives through the edge's
-/// `RepoWriter` credential check. Anonymous callers keep `send_enqueue`.
+/// repo-writer credential check. Anonymous callers keep `send_enqueue`.
 pub async fn send_enqueue_trusted(
     namespace: &CfDurableNamespace,
     requests: &[stow_types::api::EnqueueRequest],
@@ -46,13 +45,6 @@ pub async fn send_enqueue_trusted(
     let response: InsertedResponse =
         post_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, requests).await?;
     Ok(response.inserted)
-}
-
-pub async fn send_complete(
-    namespace: &CfDurableNamespace,
-    report: &stow_types::api::BuildCompleteReport,
-) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_COMPLETE_URL, report).await
 }
 
 /// The GitHub `workflow_run` webhook's completion channel (stow#455):

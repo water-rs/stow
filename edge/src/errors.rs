@@ -381,12 +381,6 @@ pub enum GetArtifactError {
         /// The ref the request asked for.
         git_ref: String,
     },
-    /// The scheduler refused a completion report because its attempt no
-    /// longer matches the queue row's live state — a stale report for a
-    /// superseded attempt or a duplicate. The body is the scheduler's own
-    /// message, which already names the task and both attempts.
-    #[error("{0}", status = CONFLICT)]
-    CompletionConflict(String),
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
     /// GitHub (OIDC JWKS or the repo-permission API) could not be consulted
@@ -444,11 +438,11 @@ impl From<SchedulerClientError> for GetArtifactError {
                 status: 503, body, ..
             } => Self::DispatchFrozen(scheduler_error_message(&body).to_owned()),
             // A 4xx from the scheduler is a client problem — e.g. a
-            // completion report naming a task the queue never held — and
-            // the body is the scheduler's own client-safe message, so it
-            // reaches the reporter verbatim instead of as a bare 500.
+            // submit naming a task the queue never held — and the body
+            // is the scheduler's own client-safe message, so it reaches
+            // the caller verbatim instead of as a bare 500.
             SchedulerClientError::Http { status, body, .. } if (400..500).contains(&status) => {
-                Self::BadRequestWithMessage(format!("scheduler rejected the report: {body}"))
+                Self::BadRequestWithMessage(format!("scheduler rejected the request: {body}"))
             }
             other => Self::InternalWithMessage(other.to_string()),
         }

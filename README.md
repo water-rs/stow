@@ -117,13 +117,14 @@ A Cloudflare Worker that serves as the public HTTP layer. It is explicitly **unt
 
 ### Scheduler (`edge/src/scheduler/`)
 
-A Cloudflare Durable Object that manages the build queue. It exposes three endpoints:
+A Cloudflare Durable Object that manages the build queue. It exposes two public-facing endpoints:
 
 | Endpoint | Access | Description |
 |---|---|---|
 | `/status` | Public | View current queue state |
 | `/tasks/submit` | Edge, Admin | Submit build tasks |
-| `/complete` | CI only | Mark a task as completed |
+
+Task completion arrives from GitHub's `workflow_run` webhook at `POST /api/v1/github/workflow-run` — trusted CI never calls the edge.
 
 Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — it raises the request count and recomputes the priority from the latest downloads and miss count, but `first_requested_at` is untouched, so a resubmit never lets a task jump its lane's queue. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main`.
 

@@ -5,9 +5,9 @@ use std::num::NonZeroU32;
 use skyzen_services::durable::{DbValue, DurableDb};
 pub use stow_types::api::task_id;
 use stow_types::api::{
-    AdminInFlight, AdminStatus, AdminTargetStats, BuildCompleteReport, EnqueueRequest,
-    EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
-    RunnerFamily, SchedulerStatus, SchemaMigrationReport, TaskLane, runner_family,
+    AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
+    QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus,
+    SchemaMigrationReport, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -43,9 +43,10 @@ pub trait CoverageOracle: Sync {
 #[derive(Debug, Clone)]
 pub struct QueuedTask {
     pub task_id: String,
-    /// The row's enqueue epoch at claim time. Dispatch carries it in
-    /// `BuildTaskPayload` and the completion report echoes it back, so a
-    /// late report for a superseded attempt cannot overwrite the live one.
+    /// The row's enqueue epoch at claim time. The `workflow_run` event
+    /// names no attempt — `complete_run` resolves the row's live one —
+    /// so a late report for a superseded attempt cannot overwrite the
+    /// live one.
     pub attempt: u32,
     pub crate_name: String,
     pub version: String,
@@ -646,7 +647,7 @@ pub async fn enqueue(
     enqueue_inner(db, requests, settings, true).await
 }
 
-/// Enqueue submissions from a RepoWriter-trusted caller: the
+/// Enqueue submissions from a repo-writer-trusted caller: the
 /// pending-depth gate does not apply — the credential check already
 /// bounds this path — but human-lane tasks still spend the daily budget.
 pub async fn enqueue_trusted(
@@ -985,10 +986,24 @@ fn plan_enqueue(
     Ok(plan)
 }
 
+/// A queue row's completion as [`complete`] applies it — reduced to the
+/// fields the `workflow_run` completion path fills; the old CI
+/// `POST /api/v1/scheduler/complete` wire type carried the same name.
+/// `complete_run` resolves `attempt` from the live row and fills the
+/// rest from the webhook event.
+#[derive(Debug)]
+struct BuildCompleteReport {
+    task_id: String,
+    attempt: u32,
+    success: bool,
+    error: Option<String>,
+    github_run_id: Option<String>,
+}
+
 /// `window_minutes` bounds the outcome evidence the record keeps: the
 /// freeze breaker's window, so the expiry deletes carried inside the
 /// insert drop exactly what the trip check can no longer read.
-pub async fn complete(
+async fn complete(
     db: &DurableDb,
     report: &BuildCompleteReport,
     window_minutes: u32,
@@ -1088,7 +1103,7 @@ pub async fn complete(
 const OUTCOME_BUCKET_SECS: i64 = 300;
 
 /// Count one completion report against the breaker's window and expire
-/// what aged out. The read set of a `/complete` is constant in traffic:
+/// what aged out. The read set of a completion is constant in traffic:
 /// the `UPDATE … RETURNING target` in `complete` names the row's target,
 /// one bucket upsert counts it, and — for failures — one raw
 /// `attempt_outcomes` row keeps the trip alert's class and run-id
@@ -1118,15 +1133,14 @@ async fn record_attempt_outcome(
     if !report.success {
         db.query(
             "INSERT INTO attempt_outcomes \
-                 (task_id, attempt, target, failure_step, failure_class, \
+                 (task_id, attempt, target, failure_class, \
                   github_run_id, finished_at) \
-             VALUES (?, ?, ?, ?, ?, ?, datetime('now')) \
+             VALUES (?, ?, ?, ?, ?, datetime('now')) \
              ON CONFLICT(task_id, attempt) DO NOTHING",
         )
         .bind(report.task_id.clone())
         .bind(i64::from(report.attempt))
         .bind(target.to_owned())
-        .bind(report.failure_step.map(|step| step.as_str().to_owned()))
         .bind(failure_class(report))
         .bind(report.github_run_id.clone())
         .execute()
@@ -1147,37 +1161,35 @@ async fn record_attempt_outcome(
     Ok(())
 }
 
-/// The label a failed attempt is counted under — `step: prefix` when the
-/// report carries both, whichever one it carries when it does not, and
-/// `unknown` for a bare failure. The prefix is the error's first line,
-/// capped so a stack dump cannot explode the class list.
+/// The label a failed attempt is counted under — the error's first line,
+/// capped so a stack dump cannot explode the class list, or `unknown`
+/// for a failure that carried no error.
 fn failure_class(report: &BuildCompleteReport) -> Option<String> {
     const MAX_PREFIX_CHARS: usize = 200;
     if report.success {
         return None;
     }
-    let prefix = report
-        .error
-        .as_deref()
-        .and_then(|error| error.lines().next())
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| line.chars().take(MAX_PREFIX_CHARS).collect::<String>());
-    match (report.failure_step, prefix) {
-        (Some(step), Some(prefix)) => Some(format!("{}: {prefix}", step.as_str())),
-        (Some(step), None) => Some(step.as_str().to_owned()),
-        (None, Some(prefix)) => Some(prefix),
-        (None, None) => Some("unknown".to_owned()),
-    }
+    Some(
+        report
+            .error
+            .as_deref()
+            .and_then(|error| error.lines().next())
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map_or_else(
+                || "unknown".to_owned(),
+                |line| line.chars().take(MAX_PREFIX_CHARS).collect::<String>(),
+            ),
+    )
 }
 
 /// Apply a GitHub `workflow_run` completion — the webhook's wire report,
 /// which names the task and its outcome but no attempt number.
 ///
 /// The webhook cannot carry `attempt` (GitHub invented the event), so the
-/// row's live attempt is resolved here and [`complete`] applies the same
-/// in-flight predicate — a stale event can only fail the attempt it
-/// names when the artifact check upstream already refused the success.
+/// row's live attempt is resolved here and the same in-flight predicate
+/// applies — a stale event can only fail the attempt it names when the
+/// records check upstream already refused the success.
 ///
 /// # Errors
 ///
@@ -1205,9 +1217,7 @@ pub async fn complete_run(
             attempt: row.attempt,
             success: report.success,
             error: report.error.clone(),
-            failure_step: None,
             github_run_id: report.github_run_id.clone(),
-            artifacts_uploaded: 0,
         },
         window_minutes,
     )
@@ -2989,8 +2999,8 @@ pub struct AlarmInputs {
 ///
 /// A wake-up is needed not only for pending rows becoming eligible but also
 /// for stale recovery: `recover_stale_active_tasks` only runs inside
-/// `claim_dispatchable_tasks`, so an in-flight build whose `/complete`
-/// callback never arrives would never be reclaimed unless the alarm fires at
+/// `claim_dispatchable_tasks`, so an in-flight build whose completion
+/// webhook never arrives would never be reclaimed unless the alarm fires at
 /// its lease expiry.
 pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
     match (inputs.capacity, inputs.earliest_pending_eligible_ms) {
@@ -4716,7 +4726,7 @@ mod tests {
     #[test]
     fn wakes_at_lease_expiry_when_only_active_rows_remain() {
         // No pending rows (or all blocked on active dependencies): the alarm
-        // still has to fire so a build whose `/complete` callback was lost
+        // still has to fire so a build whose completion webhook was lost
         // gets reclaimed once its lease goes stale.
         let inputs = AlarmInputs {
             earliest_active_lease_expiry_ms: Some(NOW_MS + 120_000),
@@ -5427,13 +5437,11 @@ mod sqlite_tests {
         assert_eq!(claimed.len(), 1);
         super::complete(
             &db,
-            &stow_types::api::BuildCompleteReport {
+            &super::BuildCompleteReport {
                 task_id: claimed[0].task_id.clone(),
                 attempt: claimed[0].attempt,
                 success: false,
                 error: Some("boom".to_owned()),
-                failure_step: None,
-                artifacts_uploaded: 0,
                 github_run_id: None,
             },
             TEST_WINDOW_MINUTES,
@@ -5486,13 +5494,11 @@ mod sqlite_tests {
         assert_eq!(claimed.len(), 1);
         super::complete(
             &db,
-            &stow_types::api::BuildCompleteReport {
+            &super::BuildCompleteReport {
                 task_id: claimed[0].task_id.clone(),
                 attempt: claimed[0].attempt,
                 success: true,
                 error: None,
-                failure_step: None,
-                artifacts_uploaded: 1,
                 github_run_id: None,
             },
             TEST_WINDOW_MINUTES,
@@ -5983,13 +5989,11 @@ mod sqlite_tests {
 
         super::complete(
             &db,
-            &stow_types::api::BuildCompleteReport {
+            &super::BuildCompleteReport {
                 task_id: id.clone(),
                 attempt: claimed[0].attempt,
                 success: true,
                 error: None,
-                failure_step: None,
-                artifacts_uploaded: 3,
                 github_run_id: None,
             },
             TEST_WINDOW_MINUTES,
@@ -6008,13 +6012,11 @@ mod sqlite_tests {
         // queue never held is a client error, not a server failure.
         let error = super::complete(
             &db,
-            &stow_types::api::BuildCompleteReport {
+            &super::BuildCompleteReport {
                 task_id: "never-enqueued".to_owned(),
                 attempt: 1,
                 success: true,
                 error: None,
-                failure_step: None,
-                artifacts_uploaded: 0,
                 github_run_id: None,
             },
             TEST_WINDOW_MINUTES,
@@ -6745,14 +6747,12 @@ mod sqlite_tests {
         assert_eq!(super::status(&db).await.expect("status").blocked, 1);
     }
 
-    fn report(task_id: &str, attempt: u32, success: bool) -> stow_types::api::BuildCompleteReport {
-        stow_types::api::BuildCompleteReport {
+    fn report(task_id: &str, attempt: u32, success: bool) -> super::BuildCompleteReport {
+        super::BuildCompleteReport {
             task_id: task_id.to_owned(),
             attempt,
             success,
             error: None,
-            failure_step: None,
-            artifacts_uploaded: 0,
             github_run_id: None,
         }
     }
@@ -6786,7 +6786,7 @@ mod sqlite_tests {
         super::enqueue(&db, &[human_request("asked")], &cap_settings)
             .await
             .expect("human-lane enqueue bypasses the pending cap");
-        // And so is a trusted (RepoWriter) submit of miss-lane work.
+        // And so is a trusted (repo-writer) submit of miss-lane work.
         super::enqueue_trusted(&db, &[request("four", Vec::new())], &cap_settings)
             .await
             .expect("trusted submit bypasses the pending cap");
@@ -8108,7 +8108,7 @@ mod sqlite_tests {
     }
 
     /// Enqueue then claim `count` tasks on `target`, then complete each
-    /// one — `Some((step, error, run_id))` fails it, `None` succeeds —
+    /// one — `Some((error, run_id))` fails it, `None` succeeds —
     /// leaving `count` outcomes counted in `attempt_outcome_buckets`
     /// (and `count` raw rows in `attempt_outcomes` when all fail).
     async fn seed_outcomes(
@@ -8116,7 +8116,7 @@ mod sqlite_tests {
         batch: u32,
         count: usize,
         target: &str,
-        failure: Option<(stow_types::api::FailureStep, &str, &str)>,
+        failure: Option<(&str, &str)>,
     ) {
         // Names carry the batch: a repeat name re-requests the failed
         // task, which re-arms the not_before backoff and hides the row
@@ -8133,8 +8133,7 @@ mod sqlite_tests {
         assert_eq!(claimed.len(), count);
         for task in claimed {
             let mut report = report(&task.task_id, task.attempt, failure.is_none());
-            if let Some((step, error, run_id)) = failure {
-                report.failure_step = Some(step);
+            if let Some((error, run_id)) = failure {
                 report.error = Some(error.to_owned());
                 report.github_run_id = Some(run_id.to_owned());
             }
@@ -8222,18 +8221,7 @@ mod sqlite_tests {
         };
 
         // Below the floor the ratio never trips, whatever it reads.
-        seed_outcomes(
-            &db,
-            0,
-            9,
-            TARGET,
-            Some((
-                stow_types::api::FailureStep::Register,
-                "register 500",
-                "run-1",
-            )),
-        )
-        .await;
+        seed_outcomes(&db, 0, 9, TARGET, Some(("build-crate 500", "run-1"))).await;
         assert!(
             super::evaluate_freeze_trip(&db, &freeze)
                 .await
@@ -8245,18 +8233,7 @@ mod sqlite_tests {
         // Crossing the floor *and* the ratio trips; the draft carries
         // the class tally and example run ids the alert prints.
         seed_outcomes(&db, 1, 1, TARGET, None).await;
-        seed_outcomes(
-            &db,
-            2,
-            1,
-            TARGET,
-            Some((
-                stow_types::api::FailureStep::Register,
-                "register 500",
-                "run-2",
-            )),
-        )
-        .await;
+        seed_outcomes(&db, 2, 1, TARGET, Some(("build-crate 500", "run-2"))).await;
         let draft = super::evaluate_freeze_trip(&db, &freeze)
             .await
             .expect("evaluate")
@@ -8266,8 +8243,8 @@ mod sqlite_tests {
         assert_eq!(draft.eval.failures, 10);
         assert_eq!(
             draft.classes.first().map(|class| class.class.as_str()),
-            Some("register: register 500"),
-            "the dominant class names step + error prefix"
+            Some("build-crate 500"),
+            "the dominant class names the error's first line"
         );
         assert_eq!(draft.classes.first().map(|class| class.count), Some(10));
         assert_eq!(
@@ -8295,11 +8272,7 @@ mod sqlite_tests {
             1,
             10,
             WINDOWS_TARGET,
-            Some((
-                stow_types::api::FailureStep::Build,
-                "linker exploded",
-                "run-9",
-            )),
+            Some(("linker exploded", "run-9")),
         )
         .await;
         let draft = super::evaluate_freeze_trip(&db, &freeze)
@@ -8328,14 +8301,7 @@ mod sqlite_tests {
             fail_percent: 50,
         };
         seed_outcomes(&db, 0, 5, TARGET, None).await;
-        seed_outcomes(
-            &db,
-            1,
-            5,
-            TARGET,
-            Some((stow_types::api::FailureStep::Build, "boom", "run-1")),
-        )
-        .await;
+        seed_outcomes(&db, 1, 5, TARGET, Some(("boom", "run-1"))).await;
         assert!(
             super::evaluate_freeze_trip(&db, &freeze)
                 .await
@@ -8345,15 +8311,15 @@ mod sqlite_tests {
         );
     }
 
-    /// The `/complete` read set must stay constant as the outcome window
+    /// A completion's read set must stay constant as the outcome window
     /// fills — a wave of N completions cannot cost N rows per
-    /// `/complete` (the raw-row design read the whole in-window log:
+    /// completion (the raw-row design read the whole in-window log:
     /// a wave of N completions read about N²/2 rows). Seed the window
     /// with 10, then 10,000 outcomes and measure the rows a failing
     /// completion plus its trip evaluation read: identical at both
     /// volumes.
     #[tokio::test]
-    async fn a_complete_reads_a_constant_row_count_as_the_window_fills() {
+    async fn a_completion_reads_a_constant_row_count_as_the_window_fills() {
         let freeze = crate::freeze::FreezeSettings {
             window_minutes: TEST_WINDOW_MINUTES,
             min_outcomes: 10,
@@ -8377,7 +8343,7 @@ mod sqlite_tests {
             .await
             .expect("seed buckets");
             db.query(
-                "WITH RECURSIVE seq(x) AS (                     SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x <= ?                 )                  INSERT INTO attempt_outcomes                      (task_id, attempt, target, failure_step, failure_class,                       github_run_id, finished_at)                  SELECT 'seed-' || x, 1, ?, 'register', 'register: boom',                         'run-' || x, datetime('now', '-' || (x % 50) || ' minutes')                  FROM seq",
+                "WITH RECURSIVE seq(x) AS (                     SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x <= ?                 )                  INSERT INTO attempt_outcomes                      (task_id, attempt, target, failure_class,                       github_run_id, finished_at)                  SELECT 'seed-' || x, 1, ?, 'boom',                         'run-' || x, datetime('now', '-' || (x % 50) || ' minutes')                  FROM seq",
             )
             .bind(i64::try_from(volume).expect("fits"))
             .bind(TARGET)
@@ -8385,7 +8351,7 @@ mod sqlite_tests {
             .await
             .expect("seed failure rows");
 
-            // The measured /complete: a live task reports a failure,
+            // The measured completion: a live task reports a failure,
             // then the trip evaluation runs — the production handler's
             // exact read path.
             enqueue(&db, &[request("measured", Vec::new())])
@@ -8397,13 +8363,11 @@ mod sqlite_tests {
             let base = log.lock().expect("log").len();
             super::complete(
                 &db,
-                &stow_types::api::BuildCompleteReport {
+                &super::BuildCompleteReport {
                     task_id: claimed[0].task_id.clone(),
                     attempt: claimed[0].attempt,
                     success: false,
                     error: Some("boom".to_owned()),
-                    failure_step: Some(stow_types::api::FailureStep::Register),
-                    artifacts_uploaded: 0,
                     github_run_id: Some("run-live".to_owned()),
                 },
                 TEST_WINDOW_MINUTES,
@@ -8421,7 +8385,7 @@ mod sqlite_tests {
         }
         assert_eq!(
             reads[0], reads[1],
-            "a /complete over 10 stored outcomes read {} rows; over 10,000 \
+            "a completion over 10 stored outcomes read {} rows; over 10,000 \
              it read {} — the read set must be window-bounded, not volume-\
              bounded",
             reads[0], reads[1]

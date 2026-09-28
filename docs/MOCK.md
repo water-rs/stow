@@ -28,7 +28,7 @@ scripts/mock-e2e.sh
 The script prints its log directory at the end and dumps every log on
 failure. CI runs it on every PR and push (`mock-e2e` in
 `.github/workflows/test.yml`), which is what keeps the trusted build
-path — dispatch → build → register → CLI cache hit — continuously
+path — dispatch → build → publish → CLI cache hit — continuously
 tested on a clean runner.
 
 The rest of this doc is the manual recipe the script automates, with
@@ -70,15 +70,14 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 ┌──────────────────────────────┐    POST /api/v1/scheduler/tasks/submit
 │ stow-admin (host)            │────────────────────────────────────────┐
 └──────────────────────────────┘                                        │
-         │ GET /api/v1/admin/index/{target}/{rustc} (index export)       ▼
+         │ GET /api/v1/admin/index/{target}/{rustc} (index export)       │
+         │ POST /api/v1/admin/artifacts/sync (index sync)                ▼
 ┌──────────────────────────────┐  POST {STOW_LOCAL_CI_URL}/dispatch  ┌──────────────┐
 │ wrangler dev (port 8788)     │────────────────────────────────────►│ stow-build   │
-│ stow-edge wasm + miniflare   │  POST /api/v1/admin/artifacts/      │ local CI     │
-│ D1, Durable Object           │◄──────────────── register ──────────│ port 40124   │
-│                              │  POST /api/v1/scheduler/complete    │              │
-│                              │◄────────────────────────────────────│              │
+│ stow-edge wasm + miniflare   │  POST /api/v1/github/workflow-run   │ local CI     │
+│ D1, Durable Object           │◄────────────────────────────────────│ port 40124   │
 └──────────┬───────────────────┘                                     └─────┬────────┘
-           │ GET /api/v1/bundles/{digest} (bundle bytes), POST /api/v1/admissions │ bundles +
+           │ GET /api/v1/bundles/{digest} (bundle bytes), POST /api/v1/admissions │ bundles + records
            ▲                                                               │ sigstore push
 ┌──────────┴───────────────────┐                                           ▼
 │ stow-cli (consumer machine)  │  OCI pulls: signed index.* slices ┌──────────────────┐
@@ -87,10 +86,14 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
                                                                    └──────────────────┘
 ```
 
-The trust path is unchanged from production: stow-build sends the
-developer's GitHub token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth
-token`) as the bearer to the edge admin endpoint, which checks the
-owner's push access to `water-rs/stow` before writing D1 records.
+The trust path is unchanged from production: stow-build signs and
+pushes the bundle and the records artifact to the mock registry — it
+never calls the edge — and reports completion through the same
+`workflow_run` webhook shape GitHub sends, HMAC-signed with the
+fixture's `STOW_GITHUB_WEBHOOK_SECRET`. `stow-admin index sync` then
+mirrors the verified records into D1 behind the developer's GitHub
+token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`), which the edge
+checks against the owner's push access to `water-rs/stow`.
 The edge owns the only D1-write credential.
 
 ## Bring services up
@@ -160,12 +163,11 @@ a 500 `no such table: queue` means the migrate step did not run.
 **Terminal 3 — local CI dispatch endpoint:**
 
 ```sh
-SCHEDULER_URL=http://127.0.0.1:8788/api/v1/scheduler \
 STOW_EDGE_URL=http://127.0.0.1:8788 \
+STOW_GITHUB_WEBHOOK_SECRET=mock-github-webhook-secret \
 STOW_MOCK_PUBLIC_KEY_PATH=/tmp/stow-bench/keys/public.pem \
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-GH_TOKEN="$(gh auth token)" \
 target/debug/stow-build serve --listen 127.0.0.1:40124
 ```
 
