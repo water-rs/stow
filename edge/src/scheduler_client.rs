@@ -11,6 +11,7 @@ const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/statu
 const SCHEDULER_COMPLETE_URL: &str = "https://scheduler.internal/complete";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
+const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_OBSERVE_RUN_URL: &str = "https://scheduler.internal/tasks/observe-run";
@@ -86,6 +87,32 @@ pub async fn migrate_scheduler(
     namespace: &CfDurableNamespace,
 ) -> Result<stow_types::api::SchemaMigrationReport, SchedulerClientError> {
     post_json(namespace, SCHEDULER_MIGRATE_URL, &serde_json::json!({})).await
+}
+
+/// The dispatch freeze's current state — flag plus the stored record
+/// (trigger, notify outcome) when engaged.
+pub async fn get_dispatch_freeze(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::DispatchFreeze, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_FREEZE_URL).await
+}
+
+/// The manual transition that engages or lifts the dispatch freeze; the
+/// object answers the state it stored.
+pub async fn set_dispatch_freeze(
+    namespace: &CfDurableNamespace,
+    enabled: bool,
+) -> Result<stow_types::api::DispatchFreeze, SchedulerClientError> {
+    post_json(
+        namespace,
+        SCHEDULER_FREEZE_URL,
+        &stow_types::api::DispatchFreeze {
+            enabled,
+            record: None,
+            transitions: Vec::new(),
+        },
+    )
+    .await
 }
 
 /// The operator view behind `stow-admin status`.

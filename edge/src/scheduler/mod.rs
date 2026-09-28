@@ -4,6 +4,7 @@
 //! every target so its logic is host-testable; `dispatch` and `object` are the
 //! Cloudflare-bound dispatch and Durable Object glue.
 
+pub mod meter;
 pub mod queue;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
