@@ -36,6 +36,11 @@ pub struct Plan {
     pub executable: Vec<u8>,
     /// Everything after the executable, in order.
     pub args: Vec<Vec<u8>>,
+    /// The `OUT_DIR` cargo exported on this invocation's environment,
+    /// for a crate with a build script. Per-invocation facts like this
+    /// only exist in the facade's environment — nothing on the
+    /// supervisor side could recover them from its own.
+    pub build_script_out_dir: Option<Vec<u8>>,
 }
 
 /// The facade reporting the compile the supervisor asked for.
@@ -68,11 +73,17 @@ pub enum Answer {
 impl Plan {
     /// Build a plan for this invocation.
     #[must_use]
-    pub fn new(token: String, executable: &std::ffi::OsStr, args: &[OsString]) -> Self {
+    pub fn new(
+        token: String,
+        executable: &std::ffi::OsStr,
+        args: &[OsString],
+        build_script_out_dir: Option<&std::ffi::OsStr>,
+    ) -> Self {
         Self {
             token,
             executable: os_bytes::encode(executable),
             args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
+            build_script_out_dir: build_script_out_dir.map(os_bytes::encode),
         }
     }
 
@@ -92,6 +103,19 @@ impl Plan {
     /// When the peer's encoding is not decodable on this platform.
     pub fn args(&self) -> Result<Vec<OsString>, String> {
         self.args.iter().map(|arg| os_bytes::decode(arg)).collect()
+    }
+
+    /// The `OUT_DIR` this invocation's environment carried, when cargo
+    /// exported one.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn build_script_out_dir(&self) -> Result<Option<OsString>, String> {
+        self.build_script_out_dir
+            .as_ref()
+            .map(|encoded| os_bytes::decode(encoded))
+            .transpose()
     }
 }
 
@@ -168,6 +192,7 @@ mod tests {
             "token".to_owned(),
             std::ffi::OsStr::new("/usr/bin/rustc"),
             &[OsString::from("--crate-name"), OsString::from("serde")],
+            Some(std::ffi::OsStr::new("/tmp/build/demo-aaa/out")),
         );
         let mut buffer = Vec::new();
         write_frame(&mut buffer, &Request::Plan(plan.clone()))
@@ -183,6 +208,13 @@ mod tests {
         };
         assert_eq!(decoded.executable().expect("executable"), "/usr/bin/rustc");
         assert_eq!(decoded.args().expect("args"), vec!["--crate-name", "serde"]);
+        assert_eq!(
+            decoded
+                .build_script_out_dir()
+                .expect("build_script_out_dir")
+                .as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/build/demo-aaa/out"))
+        );
     }
 
     /// A peer that closes between frames is not an error: that is how a
