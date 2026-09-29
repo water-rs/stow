@@ -56,7 +56,7 @@ stow-resolver = { path = "resolver", version = "0.6.0" }
 anyhow = "1.0.102"
 toml = "0.9"
 tempfile = "3"
-target-lexicon = "0.12"
+target-lexicon = "0.13"
 # The `.crate` tarball readers: the trusted runner unpacks a crate to build
 # it, `stow-admin` reads one to decide a preheat task's resolution mode.
 flate2 = "1.0"
