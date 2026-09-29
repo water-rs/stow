@@ -42,7 +42,7 @@ pub async fn decide<B: FetchedResponse>(
     }
     if !(200..300).contains(&status) {
         let error = ResolverError::Upstream(format!("crates.io {url} returned HTTP {status}"));
-        if is_retryable_status(status) {
+        if stow_types::transient::is_transient_status(status) {
             return FetchOutcome::Retryable {
                 error,
                 delay_ms: retry_delay(attempt, retry_after_ms(response.get_ref())),
@@ -57,12 +57,6 @@ pub async fn decide<B: FetchedResponse>(
             delay_ms: retry_delay(attempt, None),
         },
     }
-}
-
-/// Statuses worth a retry: rate limiting, gateway timeouts, and every
-/// server-side failure the index CDN might transiently produce.
-const fn is_retryable_status(status: u16) -> bool {
-    status == 408 || status == 429 || status >= 500
 }
 
 /// `Retry-After` as milliseconds; only the delta-seconds form is honored.

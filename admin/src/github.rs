@@ -5,6 +5,8 @@
 use stow_types::stow_error;
 use zenwave::{Client, ResponseExt};
 
+use crate::http_retry::{Backoff, is_retryable, retry_after_hint};
+
 /// The repository every request below addresses — `build-crate.yml` runs
 /// and the Actions cache live here.
 pub const REPO: &str = "water-rs/stow";
@@ -47,27 +49,54 @@ pub async fn get_path_result<T: serde::de::DeserializeOwned>(
     path: &str,
 ) -> std::result::Result<T, zenwave::Error> {
     let url = format!("{API_BASE}{path}");
-    let mut client = zenwave::client();
-    let response = client
-        .get(&url)?
-        .header("Authorization", format!("Bearer {token}"))
-        .and_then(|request| request.header("User-Agent", USER_AGENT))
-        .and_then(|request| request.header("Accept", "application/vnd.github+json"))?
-        .await?;
+    let response = send_get(token, &url, Some("application/vnd.github+json")).await?;
     Ok(response.error_for_status().await?.into_json().await?)
+}
+
+/// `GET` `url` under the operator token, retried on transport errors and
+/// transient statuses by the shared [`Backoff`] policy. Any other answer
+/// — success or a final status — returns for the caller to read; a
+/// transient failure that outlives the budget returns as its error.
+async fn send_get(
+    token: &str,
+    url: &str,
+    accept: Option<&str>,
+) -> std::result::Result<zenwave::Response, zenwave::Error> {
+    let mut backoff = Backoff::new();
+    loop {
+        let mut client = zenwave::client();
+        let request = client
+            .get(url)?
+            .header("Authorization", format!("Bearer {token}"))
+            .and_then(|request| request.header("User-Agent", USER_AGENT))?;
+        let request = match accept {
+            Some(accept) => request.header("Accept", accept)?,
+            None => request,
+        };
+        let (error, retry_after) = match request.await {
+            Ok(response) if !is_retryable(response.status()) => return Ok(response),
+            Ok(response) => {
+                let retry_after = retry_after_hint(&response);
+                match response.error_for_status().await {
+                    Ok(response) => return Ok(response),
+                    Err(error) => (error, retry_after),
+                }
+            }
+            Err(error) => (error, None),
+        };
+        let Some(wait) = backoff.next_wait(retry_after) else {
+            return Err(error);
+        };
+        tracing::warn!(url, %error, "GitHub request failed; retrying");
+        smol::Timer::after(wait).await;
+    }
 }
 
 /// `GET` an absolute URL as text — job-log fetches redirect to GitHub's
 /// signed blob host, where the `Authorization` header must not follow
 /// (zenwave strips it cross-origin).
 pub async fn get_text(token: &str, url: &str) -> stow_types::error::Result<String> {
-    let mut client = zenwave::client();
-    let response = client
-        .get(url)
-        .map_err(|error| stow_error!("build GET {url}: {error}"))?
-        .header("Authorization", format!("Bearer {token}"))
-        .and_then(|request| request.header("User-Agent", USER_AGENT))
-        .map_err(|error| stow_error!("build GET {url}: {error}"))?
+    let response = send_get(token, url, None)
         .await
         .map_err(|error| stow_error!("GET {url}: {error}"))?;
     response
