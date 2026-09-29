@@ -28,6 +28,7 @@ use std::fmt::Write as _;
 
 use askama::Template;
 use clap::{Args, Subcommand};
+use stow_types::analytics::{self, Envelope};
 use stow_types::api::{AdminStatus, DispatchFreeze};
 use stow_types::stow_error;
 
@@ -571,18 +572,22 @@ impl Watcher<'_> {
             .error_for_status()
             .await
             .map_err(|error| format!("POST {url}: {error}"))?;
-        let envelope: AnalyticsResponse = response
+        let envelope: Envelope<AnalyticsRow> = response
             .into_json()
             .await
             .map_err(|error| format!("decode {url}: {error}"))?;
-        let events = envelope.data.first().map_or(0.0, |row| row.events);
+        let events = envelope.data.first().map_or(0, |row| row.events);
         let signal = signal("edge.do.overloaded");
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "an hourly event count stays far below 2^52, where f64 is exact"
+        )]
         Ok(vec![Reading {
             signal,
             sample: 1,
-            value: events,
+            value: events as f64,
             evidence: vec![format!(
-                "stow_events blob1='overloaded' last hour: {events:.0}"
+                "stow_events blob1='overloaded' last hour: {events}"
             )],
         }])
     }
@@ -1344,15 +1349,10 @@ impl CfSnapshot {
 // ----- Analytics Engine wire -----
 
 #[derive(Debug, serde::Deserialize)]
-struct AnalyticsResponse {
-    #[serde(default)]
-    data: Vec<AnalyticsRow>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct AnalyticsRow {
-    #[serde(default)]
-    events: f64,
+    // `count()` is a UInt64 — `FORMAT JSON` emits it as a quoted string.
+    #[serde(default, deserialize_with = "analytics::de_u64")]
+    events: u64,
 }
 
 // ----- GitHub wire types -----
@@ -2667,6 +2667,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["edge.worker.errors"]
         );
+    }
+
+    /// The Analytics Engine `FORMAT JSON` response quotes 64-bit
+    /// integers — `count()` arrives as `"0"`, not `0` (issue #485).
+    #[test]
+    fn analytics_response_decodes_quoted_numbers() {
+        let json =
+            r#"{"meta":[{"name":"events","type":"UInt64"}],"data":[{"events":"0"}],"rows":1}"#;
+        let envelope: Envelope<AnalyticsRow> = serde_json::from_str(json).unwrap();
+        assert_eq!(envelope.data[0].events, 0);
+        // An unquoted integer decodes too — a narrower-than-64-bit
+        // column stays a JSON number on the wire.
+        let envelope: Envelope<AnalyticsRow> =
+            serde_json::from_str(r#"{"data":[{"events":17}]}"#).unwrap();
+        assert_eq!(envelope.data[0].events, 17);
     }
 
     /// A GraphQL `errors` array is a hard error — never a partial read.

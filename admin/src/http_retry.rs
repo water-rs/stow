@@ -80,7 +80,7 @@ mod tests {
             Some(Duration::from_secs(3))
         );
         assert_eq!(
-            backoff.next_wait(Some(Duration::from_secs(3600))),
+            backoff.next_wait(Some(Duration::from_hours(1))),
             Some(RETRY_AFTER_MAX)
         );
         assert_eq!(ATTEMPTS, 4);
