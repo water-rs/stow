@@ -319,8 +319,7 @@ code { font-family: var(--mono); }
   align-items: start;
 }
 
-.result { margin-top: 24px; }
-.result .window-body { overflow-x: auto; }
+.result { overflow-x: auto; }
 .result-table { width: 100%; border-collapse: collapse; font-size: 14px; }
 .result-table th, .result-table td { padding: 8px 10px; border-bottom: 1px solid var(--ink); text-align: left; vertical-align: top; }
 .result-table th { font-weight: 400; letter-spacing: 0.06em; text-transform: uppercase; font-size: 12px; }
