@@ -246,20 +246,23 @@ is published for the pair; `502` when GHCR is rate-limiting or down.
 
 ### `GET /api/v1/index/{target}/{rustc_version}/{digest}`
 
-The slice blob itself, fetched from GHCR through the worker's Cache API
-keyed on the digest. `{digest}` must be `sha256:` plus 64 lowercase hex
-digits — anything else is `400`. On a cache miss the digest must also
-name the layer the pair's index tag currently points at, or the route
-answers `404`; an already-cached older digest is still served.
+The slice blob itself, fetched from GHCR and cached at the edge by
+Workers Cache on the digest-addressed URL. `{digest}` must be `sha256:`
+plus 64 lowercase hex digits — anything else is `400`. On a cache miss
+the digest must also name the layer the pair's index tag currently
+points at, or the route answers `404`; an already-cached older digest
+is still served.
 
 Response `200`: the slice bytes with `Content-Type: application/json`,
 `Cache-Control: public, max-age=31536000, immutable` (the digest
-content-addresses the body), `Vary: Accept-Encoding`, and
-`x-stow-cache: hit|miss`. The `Content-Encoding` negotiates on the
-request's `Accept-Encoding`: clients naming `zstd` get the published
-blob byte-for-byte (`Content-Encoding: zstd`); anything else — an
-absent token, a `q=0` refusal — gets a gzip transcode produced once per
-digest per colo (`Content-Encoding: gzip`).
+content-addresses the body) and `Vary: Accept-Encoding`; a hit may
+answer from Workers Cache with the Worker never running — billed as a
+request, but spending no CPU or subrequests. The
+`Content-Encoding` negotiates on the request's `Accept-Encoding`:
+clients naming `zstd` get the published blob byte-for-byte
+(`Content-Encoding: zstd`); anything else — an absent token, a `q=0`
+refusal — gets a gzip transcode the platform caches under its own
+`Vary` variant (`Content-Encoding: gzip`).
 
 ## `GET /requests/{task_id}`
 
@@ -305,5 +308,5 @@ distinct daily-salted install hashes per day.
 
 The `GET /api/v1/stats` numbers rendered as a page for a person, linked
 from the landing page's nav. Both stats routes are anonymous and the
-JSON is Cache-API-cached for one hour. The collected fields, sampling,
+JSON is Workers-Cached for one hour. The collected fields, sampling,
 retention, and opt-out are documented in [`PRIVACY.md`](../PRIVACY.md).

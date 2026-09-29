@@ -82,8 +82,9 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    per-`rustc` wrapper fetches on demand under cargo's own job
    parallelism, so one address legitimately sends tens of bundle
    requests per second, and a block there turns a cache hit into a
-   local compile mid-build. That path is the cheap one — a Cache API hit
-   costs one Worker request and no D1 or Durable Object work — and its
+   local compile mid-build. That path is the cheap one — a Workers Cache
+   hit is billed as a request but the Worker never runs: no CPU,
+   subrequests, D1 or Durable Object work — and its
    volume is bounded by the DDoS managed ruleset, the billing
    notifications below, and the zone maintenance rules rather than by
    this rule. The Free plan allows exactly one rate-limiting rule, which is

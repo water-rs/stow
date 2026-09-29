@@ -53,7 +53,7 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `cache_policy.rs`: controls whether a rustc invocation is allowed to use public cache.
   - `inject.rs`: writes cached outputs back into Cargo target dirs.
   - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
-- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/bundles/{digest}`, Cache API in front of the GHCR blob — no catalog lookup) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
+- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/bundles/{digest}`, Workers Cache in front of the GHCR blob — no catalog lookup) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
   - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, trusted admin/scheduler routes.
   - `worker_resolver.rs`: the request lane, preheat lanes and admin enqueue resolve — cargo's resolver (`stow-resolve`) over fetched manifests.
   - `dependency_resolver.rs`: miss derivation for admissions and the shared crates.io record helpers.

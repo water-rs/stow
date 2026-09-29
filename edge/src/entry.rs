@@ -49,7 +49,7 @@ pub async fn fetch(
     wasm::launch(|env| async move { worker(&env) }, request, env, ctx).await
 }
 
-fn worker(env: &wasm::Env) -> Router {
+fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
     let d1 = CfD1::from_env(env, STOW_DB_BINDING)
         .unwrap_or_else(|error| panic!("failed to load D1 binding '{STOW_DB_BINDING}': {error}"));
     let db = Db::new(d1);
@@ -101,7 +101,7 @@ fn worker(env: &wasm::Env) -> Router {
     // must drain during a partial reopen).
     nodes.push("/api/v1/github/workflow-run".post(webhook::github_workflow_run));
 
-    Route::new(nodes)
+    let router = Route::new(nodes)
         .with(db)
         .with(State(scheduler))
         .with(State(cache))
@@ -125,7 +125,12 @@ fn worker(env: &wasm::Env) -> Router {
             env,
             STOW_GITHUB_WEBHOOK_SECRET_BINDING,
         ))))
-        .build()
+        .build();
+
+    // The outermost response boundary — every error answer leaves here,
+    // so `Cache-Control: no-store` is stamped in one place rather than
+    // per handler (`no_store` module docs).
+    crate::no_store::NoStoreOnError::new(router)
 }
 
 /// Every route that requires a trusted caller — the admin surface and
