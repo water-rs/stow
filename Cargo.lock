@@ -10209,7 +10209,7 @@ dependencies = [
 [[package]]
 name = "zenwave"
 version = "0.7.1"
-source = "git+https://github.com/zen-rs/zenwave?rev=596ffcc7f80e667a785702115c780f65aa7c9136#596ffcc7f80e667a785702115c780f65aa7c9136"
+source = "git+https://github.com/zen-rs/zenwave?rev=f2bb056f8a52b746082400a7c4a60ba79c11b38f#f2bb056f8a52b746082400a7c4a60ba79c11b38f"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -10229,6 +10229,7 @@ dependencies = [
  "futures-rustls",
  "futures-util",
  "gloo-timers",
+ "h2",
  "h3",
  "h3-quinn",
  "hickory-proto",
