@@ -15,6 +15,7 @@
 //! serves it; no cached slice and no reachable registry is a hard error
 //! naming the tag — resolution then proceeds only from signed bytes.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,6 +73,11 @@ pub struct CachedSliceStatus {
 /// cached slice, a registry failure is the error the caller surfaces — the
 /// resolver never runs against unsigned or absent data.
 ///
+/// The fetch itself runs once per process — a build holds one index, and
+/// every caller after the first consumes the memoized rows rather than
+/// paying the pull and the signature verification again (stow#347). A
+/// failure is not memoized: the next caller retries the fetch.
+///
 /// # Errors
 ///
 /// Returns an error when no usable slice can be produced.
@@ -80,7 +86,21 @@ pub async fn ensure_slice(
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<IndexSlice> {
-    fetch_slice(config, target, rustc_version, false).await
+    static SLICES: tokio::sync::OnceCell<
+        tokio::sync::Mutex<std::collections::BTreeMap<(String, String), IndexSlice>>,
+    > = tokio::sync::OnceCell::const_new();
+    let key = (target.to_owned(), rustc_version.to_owned());
+    let slices = SLICES
+        .get_or_init(|| async { tokio::sync::Mutex::new(BTreeMap::new()) })
+        .await;
+    let mut slices = slices.lock().await;
+    if let Some(slice) = slices.get(&key) {
+        return Ok(slice.clone());
+    }
+    let slice = fetch_slice(config, target, rustc_version, false).await?;
+    slices.insert(key, slice.clone());
+    drop(slices);
+    Ok(slice)
 }
 
 /// The wrapper's slice source: the verified cache only, never the network.

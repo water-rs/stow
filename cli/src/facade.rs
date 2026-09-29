@@ -1,16 +1,20 @@
 //! The rustc facade's uncovered-unit fast path.
 //!
-//! `stow build` resolves the workspace's dependency graph against the
-//! index before cargo starts, so the one question a rustc invocation can
-//! ask — could anything serve this unit — already has its answer when the
-//! facade starts. The answer travels in the environment as a serve map:
-//! the `(crate, version)` pairs this build's index slices and local cache
-//! cover, plus the crate names a semver-compatible upgrade could serve
-//! when semantic fallback is on. A unit the map does not cover compiles:
-//! the facade marks it locally built, runs rustc, and reports the
-//! outcome. The mark still lands before rustc starts, so the ordering
-//! cargo's dependency pipeline relies on is intact — what is gone is the
-//! plan round trip the decision used to cost.
+//! `stow build` writes the serve map before cargo starts, so the one
+//! question a rustc invocation can ask — could anything serve this unit
+//! — already has its answer when the facade starts. The map lives in a
+//! per-build file named by `STOW_SERVE_MAP_FILE`: the `(crate, version)`
+//! pairs this build's cached index slice and local artifacts cover,
+//! plus the crate names a semver-compatible upgrade could serve when
+//! semantic fallback is on. The driver atomically replaces it once the
+//! fresh index slice and the exact dependency graph land — work that
+//! now runs while cargo builds rather than before it — so units that
+//! compile after the upgrade see the richer map (stow#347). A unit the
+//! map does not cover compiles: the facade marks it locally built, runs
+//! rustc, and reports the outcome. The mark still lands before rustc
+//! starts, so the ordering cargo's dependency pipeline relies on is
+//! intact — what is gone is the plan round trip the decision used to
+//! cost.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -24,8 +28,9 @@ use crate::rustc_args;
 use crate::supervisor::protocol::{Observed, Request};
 use crate::supervisor::{self, Endpoint};
 
-/// The `stow build` wiring carrying the serve map to every facade.
-pub const STOW_SERVABLE_UNITS_ENV: &str = "STOW_SERVABLE_UNITS_JSON";
+/// The `stow build` wiring carrying the serve-map file path to every
+/// facade.
+pub const STOW_SERVE_MAP_FILE_ENV: &str = "STOW_SERVE_MAP_FILE";
 
 /// The version slot a wildcard entry holds instead of one version.
 const WILDCARD: &str = "*";
@@ -49,23 +54,32 @@ pub struct ServeMap {
 }
 
 impl ServeMap {
-    /// The map this build's driver exported. `None` means the environment
-    /// carries none — analysis never ran — so the facade takes the plan
-    /// path like it always has.
+    /// The map this build's driver wrote. `None` means the environment
+    /// carries no map path — this invocation is not under a supervised
+    /// build — so the facade takes the plan path like it always has. A
+    /// path that names no file yet reads as an empty map: nothing has
+    /// been proven servable, so every unit compiles — the same answer a
+    /// completed map gives on an all-miss build.
     ///
     /// # Errors
     ///
-    /// A present-but-malformed value is a wiring bug and fails loudly.
+    /// A present-but-unreadable or malformed file is a wiring bug and
+    /// fails loudly; the driver writes the file atomically, so a facade
+    /// either sees a whole map or sees none.
     fn from_env() -> stow_types::error::Result<Option<Self>> {
-        let Some(raw) = std::env::var_os(STOW_SERVABLE_UNITS_ENV) else {
+        let Some(path) = std::env::var_os(STOW_SERVE_MAP_FILE_ENV) else {
             return Ok(None);
         };
-        let raw = raw.to_str().ok_or_else(|| {
-            stow_types::stow_error!("{STOW_SERVABLE_UNITS_ENV} is not valid Unicode")
-        })?;
-        serde_json::from_str(raw)
-            .map(Some)
-            .wrap_err_with(|| format!("{STOW_SERVABLE_UNITS_ENV} is not a serve map"))
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .wrap_err_with(|| format!("{} is not a serve map", Path::new(&path).display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(Self::default())),
+            Err(error) => Err(stow_types::stow_error!(
+                "read serve map {}: {error}",
+                Path::new(&path).display()
+            )),
+        }
     }
 
     /// Whether anything in the build could serve `name` at `version` on

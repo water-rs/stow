@@ -460,8 +460,7 @@ async fn finish_rustc_compile(
     let mut artifact = None;
     if success {
         if let Some(base) = local_base {
-            match resolve_local_build_artifact(base, parsed, ctx.expanded_entries.as_deref()).await
-            {
+            match resolve_local_build_artifact(base, parsed, ctx.expanded_entries()).await {
                 Ok(Some(build)) => {
                     log_nonfatal_result(
                         "failed to materialize stable local build aliases after successful rustc build",
@@ -606,14 +605,30 @@ pub(crate) struct BuildContext {
     /// `STOW_DISABLE_PUBLIC_CACHE`, or the rustc-version gate the driver
     /// encodes into it: the public cache is off, local lookups still run.
     pub(crate) public_cache_disabled: bool,
-    /// `STOW_ENABLE_SEMANTIC_FALLBACK`.
+    /// The facts the full graph analysis contributes once it lands. A
+    /// supervised build starts the cell empty — the driver's analysis
+    /// runs while cargo builds and commits it — while the standalone
+    /// wrapper's cell is already filled from the environment that
+    /// invoked it (stow#347). Until it is set, the plan path answers as
+    /// though the build carried no expanded graph and no prefetch
+    /// ledger: semantic fallback off, no candidates.
+    pub(crate) analysis: std::sync::Arc<std::sync::OnceLock<AnalysisFacts>>,
+}
+
+/// What the graph analysis adds to the plan path when it commits: the
+/// resolved per-package feature sets the identity derivation consults,
+/// the prefetch ledger, and whether semantic fallback applies.
+#[derive(Debug)]
+pub(crate) struct AnalysisFacts {
+    /// Whether the expanded graph found a semver-upgrade the plan path
+    /// may serve for — the `STOW_ENABLE_SEMANTIC_FALLBACK` fact.
     pub(crate) semantic_fallback_enabled: bool,
-    /// `STOW_EXPANDED_GRAPH_JSON`, parsed once: the resolved per-package
-    /// feature sets the identity derivation consults. `None` means the
-    /// environment carried no graph at all — the distinction a semantic
-    /// gate needs between "unset" and "empty".
+    /// `STOW_EXPANDED_GRAPH_JSON` parsed: the resolved per-package
+    /// feature sets. `None` means the environment carried no graph at
+    /// all — the distinction a semantic gate needs between "unset" and
+    /// "empty".
     pub(crate) expanded_entries: Option<Vec<DependencyGraphEntry>>,
-    /// `STOW_PREFETCH_ARTIFACTS_JSON`, parsed and indexed once: canonical
+    /// `STOW_PREFETCH_ARTIFACTS_JSON` parsed and indexed: canonical
     /// crate name to the `c_metadata` values the driver already fetched.
     pub(crate) prefetch_candidates: BTreeMap<String, BTreeSet<String>>,
 }
@@ -650,11 +665,33 @@ impl BuildContext {
                 .ok()
                 .filter(|target| !target.trim().is_empty()),
             public_cache_disabled: std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some(),
-            semantic_fallback_enabled: std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV)
-                .is_some_and(|value| value != "0"),
-            expanded_entries,
-            prefetch_candidates,
+            analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
+                semantic_fallback_enabled: std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV)
+                    .is_some_and(|value| value != "0"),
+                expanded_entries,
+                prefetch_candidates,
+            })),
         })
+    }
+
+    /// The resolved per-package feature sets, once analysis committed
+    /// them.
+    pub(crate) fn expanded_entries(&self) -> Option<&[DependencyGraphEntry]> {
+        self.analysis
+            .get()
+            .and_then(|facts| facts.expanded_entries.as_deref())
+    }
+
+    /// Whether semantic fallback may serve an upgrade for this build.
+    pub(crate) fn semantic_fallback_enabled(&self) -> bool {
+        self.analysis
+            .get()
+            .is_some_and(|facts| facts.semantic_fallback_enabled)
+    }
+
+    /// The prefetch ledger keyed by canonical crate name.
+    pub(crate) fn prefetch_candidates(&self) -> Option<&BTreeMap<String, BTreeSet<String>>> {
+        self.analysis.get().map(|facts| &facts.prefetch_candidates)
     }
 }
 
@@ -1433,7 +1470,7 @@ async fn prepare_wrapper_environment<'a>(
         parsed,
         &target,
         &rustc_version,
-        ctx.expanded_entries.as_deref(),
+        ctx.expanded_entries(),
     )
     .await
     {
@@ -1447,13 +1484,13 @@ async fn prepare_wrapper_environment<'a>(
         .as_ref()
         .map_or(c_metadata, |identity| identity.c_metadata.as_str())
         .to_owned();
-    let semantic_request = if ctx.semantic_fallback_enabled {
+    let semantic_request = if ctx.semantic_fallback_enabled() {
         match build_semantic_fetch_request(
             &env_base.config,
             parsed,
             &target,
             &rustc_version,
-            ctx.expanded_entries.as_deref(),
+            ctx.expanded_entries(),
         )
         .await
         {
@@ -1822,7 +1859,7 @@ async fn decide_local_only(
         parsed,
         &target,
         &local_base.rustc_version,
-        ctx.expanded_entries.as_deref(),
+        ctx.expanded_entries(),
     )
     .await
     {
@@ -2061,24 +2098,21 @@ async fn try_serve_local_prefetched_graph_bundle(
     let Some((crate_name, version)) = detect_registry_crate_version(parsed).ok().flatten() else {
         return false;
     };
-    let expected_features_json = match resolve_semantic_features_json(
-        &crate_name,
-        &version,
-        parsed,
-        ctx.expanded_entries.as_deref(),
-    ) {
-        Ok(features_json) => features_json,
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                target,
-                rustc_version,
-                "failed to resolve semantic features for prefetched graph bundle lookup"
-            );
-            return false;
-        }
-    };
+    let expected_features_json =
+        match resolve_semantic_features_json(&crate_name, &version, parsed, ctx.expanded_entries())
+        {
+            Ok(features_json) => features_json,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    target,
+                    rustc_version,
+                    "failed to resolve semantic features for prefetched graph bundle lookup"
+                );
+                return false;
+            }
+        };
     let expected_dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await {
             Ok(Some(value)) => value,
@@ -2098,8 +2132,8 @@ async fn try_serve_local_prefetched_graph_bundle(
     // The driver indexed its prefetch payload by canonical crate name
     // before cargo started; a crate name's candidates are one map lookup.
     let Some(candidate_c_metadatas) = ctx
-        .prefetch_candidates
-        .get(&canonical_crate_name(&parsed.crate_name))
+        .prefetch_candidates()
+        .and_then(|candidates| candidates.get(&canonical_crate_name(&parsed.crate_name)))
     else {
         return false;
     };
@@ -2813,10 +2847,7 @@ async fn try_serve_semantic_downloaded_bundle(
         );
         return false;
     }
-    if !semantic_request_allowed_by_expanded_graph(
-        semantic_request,
-        env.ctx.expanded_entries.as_deref(),
-    ) {
+    if !semantic_request_allowed_by_expanded_graph(semantic_request, env.ctx.expanded_entries()) {
         tracing::warn!(
             crate_name = %parsed.crate_name,
             semantic_crate_name = %semantic_request.crate_name,
