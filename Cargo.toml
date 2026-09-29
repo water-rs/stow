@@ -88,17 +88,23 @@ clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
 inherits = "release"
 lto = "thin"
 
-# heel's write-ahead audit log (lexoliu/heel#39) is not in a release yet; the
-# pin is the exact commit on heel's dev and moves to a crates.io version once
-# one carries it.
+# heel's write-ahead audit log (lexoliu/heel#39) and its Windows grant fix
+# (lexoliu/heel#46: one ACL write per granted tree and no propagation from an
+# ancestor's traverse entry, which cut a Windows build sandbox's creation
+# from minutes to well under a second) are not in a release yet; the pin is
+# the exact commit on heel's dev and moves to a crates.io version once one
+# carries them.
 [patch.crates-io]
 # zenwave's QUIC keep-alive (zen-rs/zenwave#93): without it an HTTP/3 request
 # whose server takes longer than 30 s to answer dies at quinn's idle timeout,
-# which is how stow-admin's long resolve and submit calls failed. Not in a
-# release yet; the pin is the exact commit on zenwave's dev and moves to a
-# crates.io version once one carries it.
-zenwave = { git = "https://github.com/zen-rs/zenwave", rev = "596ffcc7f80e667a785702115c780f65aa7c9136" }
-heel = { git = "https://github.com/lexoliu/heel", rev = "4f1aa99f1f21e28022fd7769ded7400be5488683" }
+# which is how stow-admin's long resolve and submit calls failed. Its h2 pool
+# fix (zen-rs/zenwave#96): a pooled HTTP/2 connection the server sent GOAWAY
+# on was handed out again, so the first GitHub API call after an idle gap
+# failed with `GoAway(NO_ERROR, Remote)`. Neither is in a release yet; the pin
+# is the exact commit on zenwave's dev and moves to a crates.io version once
+# one carries them.
+zenwave = { git = "https://github.com/zen-rs/zenwave", rev = "f2bb056f8a52b746082400a7c4a60ba79c11b38f" }
+heel = { git = "https://github.com/lexoliu/heel", rev = "da72ac1abd8a7de66b7a4540fae9e2979e9b7616" }
 # cargo 0.99 (stow-resolver) pins rusqlite 0.40 → libsqlite3-sys ^0.38;
 # sqlx-sqlite releases cap below it, so two `links = "sqlite3"` crates
 # would conflict. sqlx main at this rev is 0.9.0 and allows
