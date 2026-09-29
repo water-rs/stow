@@ -139,12 +139,9 @@ fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
         .join(format!("probe{}", std::env::consts::EXE_SUFFIX))
 }
 
-fn stow_build_in(
-    dir: &Path,
-    edge_url: &str,
-    cache_dir: &Path,
-    cargo_home: &Path,
-) -> std::process::Output {
+/// `stow-cli setup` in the isolated `CARGO_HOME` — the one-time mold
+/// selection, kept out of every timed build.
+fn stow_setup_in(dir: &Path, cargo_home: &Path) {
     // stow#294: a Linux `stow build` refuses to run without a mold
     // selection — `stow setup` installs mold and writes it. Idempotent.
     // Setup writes the global cargo config; the isolated CARGO_HOME keeps
@@ -160,6 +157,25 @@ fn stow_build_in(
         "stow setup failed:\n{}",
         String::from_utf8_lossy(&setup.stderr)
     );
+}
+
+fn stow_build_in(
+    dir: &Path,
+    edge_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+) -> std::process::Output {
+    stow_setup_in(dir, cargo_home);
+    stow_build_command(dir, edge_url, cache_dir, cargo_home, &dir.join("target"))
+}
+
+fn stow_build_command(
+    dir: &Path,
+    edge_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+    target_dir: &Path,
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("build")
         .current_dir(dir)
@@ -174,6 +190,7 @@ fn stow_build_in(
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_TARGET_DIR", target_dir)
         .env_remove("RUST_LOG")
         .output()
         .expect("run stow-cli build")
@@ -606,6 +623,9 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
     let (endpoint, counts) = spawn_stub_supervisor();
+    let map_path = dir.path().join("serve-map.json");
+    std::fs::write(&map_path, "{\"target\":[],\"host\":[]}").expect("write serve map");
+    let map_path = map_path.to_str().expect("utf8 path");
 
     let output = cargo_build_in(
         dir.path(),
@@ -616,7 +636,7 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
         &[
             ("STOW_SUPERVISOR_ENDPOINT", endpoint.as_str()),
             ("STOW_SUPERVISOR_TOKEN", "test-token"),
-            ("STOW_SERVABLE_UNITS_JSON", "{\"target\":[],\"host\":[]}"),
+            ("STOW_SERVE_MAP_FILE", map_path),
         ],
         cargo_home.path(),
     );
@@ -675,6 +695,13 @@ fn a_covered_unit_still_takes_the_plan_path() {
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
     let (endpoint, counts) = spawn_stub_supervisor();
+    // `cfg-if` compiles unspelled — no `--target` on a native build — so
+    // the host side carries it, at any version. Map entries are
+    // canonical crate names (underscores).
+    let map_path = dir.path().join("serve-map.json");
+    std::fs::write(&map_path, "{\"target\":[],\"host\":[[\"cfg_if\",\"*\"]]}")
+        .expect("write serve map");
+    let map_path = map_path.to_str().expect("utf8 path");
 
     let output = cargo_build_in(
         dir.path(),
@@ -685,13 +712,7 @@ fn a_covered_unit_still_takes_the_plan_path() {
         &[
             ("STOW_SUPERVISOR_ENDPOINT", endpoint.as_str()),
             ("STOW_SUPERVISOR_TOKEN", "test-token"),
-            // `cfg-if` compiles unspelled — no `--target` on a native
-            // build — so the host side carries it, at any version. Map
-            // entries are canonical crate names (underscores).
-            (
-                "STOW_SERVABLE_UNITS_JSON",
-                "{\"target\":[],\"host\":[[\"cfg_if\",\"*\"]]}",
-            ),
+            ("STOW_SERVE_MAP_FILE", map_path),
         ],
         cargo_home.path(),
     );
@@ -796,5 +817,106 @@ fn a_disabled_public_cache_still_serves_local_entries() {
             "SELECT hits FROM crate_stats WHERE crate_name = 'cfg_if'"
         ),
         1
+    );
+}
+
+/// A real multi-package project's manifest: twelve leaf crates from
+/// crates.io — enough rustc invocations for pre-cargo overhead to show on
+/// the wall clock, small enough that the whole suite stays fast.
+fn write_multi_crate(dir: &Path, cargo_home: &Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nbitflags = \"2\"\ncfg-if = \"1\"\nequivalent = \"1\"\nitoa = \"1\"\n\
+         memchr = \"2\"\nonce_cell = \"1\"\npercent-encoding = \"2\"\npin-project-lite = \"0.2\"\n\
+         ryu = \"1\"\nscopeguard = \"1\"\nunicode-ident = \"1\"\nutf8parse = \"0.2\"\n",
+    )
+    .expect("write manifest");
+    std::fs::create_dir_all(dir.join("src")).expect("create src");
+    std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
+    // Resolve now, so the build under test is not also a network test.
+    let fetched = Command::new("cargo")
+        .arg("fetch")
+        .current_dir(dir)
+        .env("CARGO_HOME", cargo_home)
+        .output()
+        .expect("run cargo fetch");
+    assert!(
+        fetched.status.success(),
+        "cargo fetch failed:\n{}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
+}
+
+/// Plain `cargo build` in the same isolated home — no wrapper, no stow
+/// envs: the baseline wall clock.
+fn plain_cargo_build_in(dir: &Path, target_dir: &Path, cargo_home: &Path) -> std::process::Output {
+    Command::new("cargo")
+        .arg("build")
+        .current_dir(dir)
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_INCREMENTAL", "0")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run cargo build")
+}
+
+/// The wall-clock floor the frame census above cannot see: on a cold
+/// cache with the edge unreachable, everything stow pays before cargo
+/// starts — index pulls, `cargo metadata`, the graph analysis — is time
+/// the user feels. stow#347 measured 5% on a 295-package build and its
+/// acceptance criterion is wall time: stow must never be slower than
+/// cargo.
+///
+/// Tolerance: the greater of 20% of cargo's wall clock and three
+/// seconds. The regression this guards was a constant ~3.5s in front of
+/// cargo's exec — cargo's own noise scales with the build while stow's
+/// was fixed, so the bound needs both terms: on this crate graph it is
+/// the 3s half that binds.
+#[test]
+fn an_all_miss_build_is_never_slower_than_cargo() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_multi_crate(dir.path(), cargo_home.path());
+    stow_setup_in(dir.path(), cargo_home.path());
+    let edge_url = unreachable_edge_url();
+
+    // Plain cargo, fresh target: what the user pays without stow.
+    let cargo_target = tempfile::tempdir().expect("cargo target");
+    let started = std::time::Instant::now();
+    let cargo_output = plain_cargo_build_in(dir.path(), cargo_target.path(), cargo_home.path());
+    let cargo_wall = started.elapsed();
+    assert!(
+        cargo_output.status.success(),
+        "plain cargo build failed:\n{}",
+        String::from_utf8_lossy(&cargo_output.stderr)
+    );
+
+    // stow on the same graph: a cold `STOW_CACHE_DIR` and a dead edge —
+    // the all-miss build stow#347 was opened for.
+    let stow_cache = tempfile::tempdir().expect("stow cache");
+    let stow_target = tempfile::tempdir().expect("stow target");
+    let started = std::time::Instant::now();
+    let stow_output = stow_build_command(
+        dir.path(),
+        &edge_url,
+        stow_cache.path(),
+        cargo_home.path(),
+        stow_target.path(),
+    );
+    let stow_wall = started.elapsed();
+    assert!(
+        stow_output.status.success(),
+        "stow build failed:\n{}",
+        String::from_utf8_lossy(&stow_output.stderr)
+    );
+
+    let tolerance = (cargo_wall / 5).max(std::time::Duration::from_secs(3));
+    assert!(
+        stow_wall <= cargo_wall + tolerance,
+        "stow must never be slower than cargo on an all-miss build: \
+         cargo {cargo_wall:?}, stow {stow_wall:?}, tolerance {tolerance:?}"
     );
 }
