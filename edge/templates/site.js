@@ -739,7 +739,21 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
     }
 
     if (byVersion.size === 0) {
-      setNote(note, `not cached on ${targetSelect.value} — request it below`, null);
+      // A prefix is not a lookup: while the text starts cached crates the
+      // verdict stays open — "not cached" needs no exact row and no prefix.
+      let prefixes = 0;
+      for (const name of byCrate.keys()) {
+        if (name.startsWith(crateName)) {
+          prefixes += 1;
+        }
+      }
+      setNote(
+        note,
+        prefixes === 0
+          ? `not cached on ${targetSelect.value} — request it below`
+          : `${prefixes} cached crate${prefixes === 1 ? "" : "s"} start${prefixes === 1 ? "s" : ""} with “${crateName}”`,
+        null,
+      );
       return;
     }
 
