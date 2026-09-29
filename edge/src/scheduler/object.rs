@@ -127,7 +127,7 @@ type EdgeAlerter = crate::email::EdgeAlerter;
 pub struct Scheduler;
 
 impl DurableObject for Scheduler {
-    fn fetch(&mut self) -> Router {
+    fn fetch(&self) -> Router {
         // The Durable Object runs in its own isolate; the exported fetch
         // goes through this method before the router responds, so this is
         // where its logging gets installed.
