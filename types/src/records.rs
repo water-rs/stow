@@ -133,16 +133,29 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> Option<ArtifactIndexRow> 
 /// ordered by `c_metadata` — the shape `index export` writes and the D1
 /// catalog's `SELECT … ORDER BY c_metadata` produces.
 ///
-/// A `c_metadata` carried by more than one records artifact (a re-run
-/// task that rebuilt the same unit) collapses to the record later in
-/// iteration order; feed records in tag order to keep the outcome
-/// deterministic.
+/// A slice's row dedup key — the same physical unit keeps one row per
+/// `unit_shape` it was recorded under; a rebuilt unit at the same shape
+/// collapses to the later record.
+pub type SliceRowKey = (String, Option<crate::public_cache::UnitShape>);
+
+/// The dedup keeps one row per `(c_metadata, unit_shape)`.
+///
+/// A `c_metadata` carried by more than one records artifact at the same
+/// unit shape (a re-run task that rebuilt the same unit) collapses to
+/// the record later in iteration order; feed records in tag order to
+/// keep the outcome deterministic. The same physical unit emitted at a
+/// second shape — a crate a consumer links and a consumer's build
+/// script links compile to the same bytes — must keep one row per
+/// shape: collapsing on `c_metadata` alone silently drops a spelling
+/// and the coverage gate waits on a row that can never arrive.
 #[must_use]
 pub fn records_into_slices(
     records: impl IntoIterator<Item = ArtifactRecord>,
 ) -> BTreeMap<(TargetTriple, WireRustcVersion), Vec<ArtifactIndexRow>> {
-    let mut slices: BTreeMap<(TargetTriple, WireRustcVersion), BTreeMap<String, ArtifactIndexRow>> =
-        BTreeMap::new();
+    let mut slices: BTreeMap<
+        (TargetTriple, WireRustcVersion),
+        BTreeMap<SliceRowKey, ArtifactIndexRow>,
+    > = BTreeMap::new();
     for record in records {
         let Some(row) = record_to_index_row(&record) else {
             continue;
@@ -150,7 +163,7 @@ pub fn records_into_slices(
         slices
             .entry((record.target, record.rustc_version))
             .or_default()
-            .insert(row.c_metadata.as_str().to_owned(), row);
+            .insert((row.c_metadata.as_str().to_owned(), row.unit_shape), row);
     }
     slices
         .into_iter()
@@ -294,5 +307,30 @@ mod tests {
         let rows = slices.values().next().expect("slice");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].bundle_size, 2);
+    }
+
+    /// One physical unit recorded under a second spelling — a crate a
+    /// consumer links and a build script links compile to the same
+    /// bytes — keeps a row per shape, or the coverage gate waits on a
+    /// spelling the fold silently dropped.
+    #[test]
+    fn duplicate_c_metadata_at_different_shapes_keeps_both_rows() {
+        use crate::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+        let mut linked = record("x86_64-unknown-linux-gnu", "1.98.1", "aa11", "sha256:1");
+        linked.unit_shape = Some(UnitShape {
+            side: UnitSide::Target,
+            invocation: UnitInvocation::Native,
+            kind: UnitKind::Linked,
+        });
+        let mut host = record("x86_64-unknown-linux-gnu", "1.98.1", "aa11", "sha256:1");
+        host.unit_shape = Some(UnitShape {
+            side: UnitSide::Host,
+            invocation: UnitInvocation::Target,
+            kind: UnitKind::Linked,
+        });
+        let slices = records_into_slices(vec![linked, host]);
+        let rows = slices.values().next().expect("slice");
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].unit_shape, rows[1].unit_shape);
     }
 }
