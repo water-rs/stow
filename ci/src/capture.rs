@@ -24,6 +24,16 @@ pub const STOW_BUILD_LINK_ARG_ENV: &str = "STOW_BUILD_LINK_ARG";
 /// host/target boundary. A native invocation leaves it unset so host units
 /// (no `--target` of their own) take the pin the way rustflags reach them.
 pub const STOW_BUILD_LINK_ARG_CROSS_ENV: &str = "STOW_BUILD_LINK_ARG_CROSS";
+/// The virtual root the phase's `CARGO_TARGET_DIR` maps to in
+/// `--remap-path-prefix`. The phase's rustflags already carry the flag, but
+/// they stop at cargo's host/target boundary under `--target`: host units —
+/// build scripts, proc macros and their deps — receive no remap, and on
+/// targets whose debug info embeds the object's own output path (MSVC
+/// `CodeView` `S_OBJNAME`) two captures of one unit in different phase dirs
+/// hash differently and `dep_scan`'s same-unit proof aborts the build. The
+/// wrapper argv is the one channel that reaches every unit, so the flag is
+/// appended there; units the rustflags already reached are left alone.
+pub const STOW_BUILD_TARGET_DIR_REMAP_ENV: &str = "STOW_BUILD_TARGET_DIR_REMAP";
 /// Directory holding the verified bundles the host prefetch staged for this
 /// build — compile-key-addressed, mounted read-only into the phase sandbox.
 /// Absent means consumption is disabled and every unit compiles as before.
@@ -44,7 +54,7 @@ pub async fn run_rustc_capture_wrapper(
     let rustc = args.get(2).ok_or_else(|| {
         stow_types::stow_error!("rustc capture mode requires rustc path as argv[2]")
     })?;
-    let args = pinned_link_args(&args[3..]);
+    let args = remapped_target_dir_args(&pinned_link_args(&args[3..]));
     let original_parsed = match ParsedRustcArgs::parse(&args) {
         Ok(mut parsed) => {
             // Cargo exports OUT_DIR on the rustc invocation of a links crate's
@@ -248,6 +258,37 @@ fn unit_targets_linux_gnu(args: &[std::ffi::OsString], cross: bool) -> bool {
         }
     }
     !cross
+}
+
+/// Append the phase target-dir remap to invocations the rustflags never
+/// reached. Under `--target` cargo drops `RUSTFLAGS` for every unit on the
+/// host side of the boundary, so a host unit's debug info — MSVC `CodeView`
+/// `S_OBJNAME` above all, which records the absolute `.obj` output path —
+/// embeds the phase's real `CARGO_TARGET_DIR` instead of the virtual root,
+/// and the same unit compiled into a different phase dir hashes
+/// differently. `--remap-path-prefix` is identity-neutral (it never enters
+/// the compile key), so appending it uniformly is safe; a unit whose argv
+/// already carries the identical flag — anything the rustflags reached —
+/// is not rewritten.
+fn remapped_target_dir_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
+    let (Some(mapped), Some(target_dir)) = (
+        std::env::var_os(STOW_BUILD_TARGET_DIR_REMAP_ENV),
+        std::env::var_os("CARGO_TARGET_DIR"),
+    ) else {
+        return args.to_vec();
+    };
+    let flag = std::ffi::OsString::from(format!(
+        "--remap-path-prefix={}={}",
+        PathBuf::from(target_dir).display(),
+        mapped.to_string_lossy()
+    ));
+    if args.iter().any(|arg| arg == &flag) {
+        return args.to_vec();
+    }
+    let mut remapped = Vec::with_capacity(args.len() + 1);
+    remapped.extend_from_slice(args);
+    remapped.push(flag);
+    remapped
 }
 
 /// Wall-clock milliseconds an `Instant` spans, saturated at `u64::MAX`.
@@ -2145,6 +2186,94 @@ mod tests {
         unsafe {
             std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV);
             std::env::remove_var(super::STOW_BUILD_LINK_ARG_CROSS_ENV);
+        }
+    }
+
+    /// The production shape behind `fix/msvc-host-capture-collision`: under
+    /// `--target`, cargo keeps `RUSTFLAGS` on the target side of the
+    /// boundary, so a host unit's rustc argv carries no
+    /// `--remap-path-prefix` — and MSVC `CodeView` `S_OBJNAME` then embeds the
+    /// phase's real `CARGO_TARGET_DIR`, splitting the same unit's rlib
+    /// digests across phase dirs. The wrapper must supply the flag the
+    /// boundary dropped.
+    #[test]
+    fn remapped_args_append_the_flag_the_rustflag_boundary_drops() {
+        let _env = env_guard();
+        let host_args: Vec<std::ffi::OsString> = [
+            "rustc",
+            "--crate-name",
+            "unicode_ident",
+            "--crate-type",
+            "lib",
+            "src/lib.rs",
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "-C",
+            "debuginfo=2",
+        ]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+        let flag = "--remap-path-prefix=/run/target-check-target=stow-ci://target".to_owned();
+
+        unsafe {
+            std::env::remove_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV);
+            std::env::remove_var("CARGO_TARGET_DIR");
+        }
+        assert_eq!(super::remapped_target_dir_args(&host_args), host_args);
+
+        unsafe {
+            std::env::set_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV, "stow-ci://target");
+            std::env::set_var("CARGO_TARGET_DIR", "/run/target-check-target");
+        }
+        let remapped = super::remapped_target_dir_args(&host_args);
+        assert_eq!(
+            remapped[remapped.len() - 1].to_str().expect("remap arg"),
+            flag,
+            "the phase target dir maps to the virtual root at argv end"
+        );
+        assert_eq!(
+            ParsedRustcArgs::parse(&remapped)
+                .expect("remapped args still parse")
+                .crate_name,
+            "unicode_ident"
+        );
+
+        unsafe {
+            std::env::remove_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV);
+            std::env::remove_var("CARGO_TARGET_DIR");
+        }
+    }
+
+    /// Units the rustflags already reached — target-side units under
+    /// `--target`, everything under a native invocation — carry the flag
+    /// verbatim; the wrapper must not append a second copy.
+    #[test]
+    fn remapped_args_do_not_duplicate_the_rustflags_copy() {
+        let _env = env_guard();
+        let flag = "--remap-path-prefix=/run/target-check-target=stow-ci://target".to_owned();
+        let args: Vec<std::ffi::OsString> = [
+            "rustc",
+            "--crate-name",
+            "unicode_ident",
+            "--crate-type",
+            "lib",
+            "src/lib.rs",
+            flag.as_str(),
+        ]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+
+        unsafe {
+            std::env::set_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV, "stow-ci://target");
+            std::env::set_var("CARGO_TARGET_DIR", "/run/target-check-target");
+        }
+        assert_eq!(super::remapped_target_dir_args(&args), args);
+
+        unsafe {
+            std::env::remove_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV);
+            std::env::remove_var("CARGO_TARGET_DIR");
         }
     }
 }

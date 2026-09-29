@@ -111,11 +111,9 @@ sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c
 sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
 # skyzen dev at this rev moves services to sqlx 0.9 and takes services
 # with default-features off, so only the pinned sqlx 0.9 graph exists.
-skyzen = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
-skyzen-cloudflare = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
+# Only the crates the 0.3 `skyzen` release resolves through are pinned.
 skyzen-core = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
 skyzen-hyper = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
-skyzen-macros = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
 skyzen-manifest = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
 skyzen-services = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
 sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
