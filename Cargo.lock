@@ -10396,18 +10396,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "skyzen"
-version = "0.4.3"
-source = "git+https://github.com/zen-rs/skyzen?rev=ffd2d16eb24de8c7f4f584409831d25f074ce460#ffd2d16eb24de8c7f4f584409831d25f074ce460"
-
-[[patch.unused]]
-name = "skyzen-cloudflare"
-version = "0.4.3"
-source = "git+https://github.com/zen-rs/skyzen?rev=ffd2d16eb24de8c7f4f584409831d25f074ce460#ffd2d16eb24de8c7f4f584409831d25f074ce460"
-
-[[patch.unused]]
-name = "skyzen-macros"
-version = "0.4.3"
-source = "git+https://github.com/zen-rs/skyzen?rev=ffd2d16eb24de8c7f4f584409831d25f074ce460#ffd2d16eb24de8c7f4f584409831d25f074ce460"
