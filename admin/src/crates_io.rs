@@ -21,6 +21,8 @@ use serde::de::DeserializeOwned;
 use stow_types::stow_error;
 use zenwave::{Client, ResponseExt};
 
+use crate::http_retry::{Backoff, is_retryable, retry_after_hint};
+
 /// `GET /api/v1/crates…` — the crates.io JSON API root the lanes read.
 pub const API_BASE: &str = "https://crates.io/api/v1/crates";
 /// The sparse index host — static files, CDN-served, outside the crawler
@@ -44,19 +46,6 @@ const INDEX_TIMEOUT: Duration = Duration::from_secs(30);
 /// request per second, enforced globally so concurrent callers cannot
 /// burst past it. The index host is exempt and skips the gate.
 const MIN_INTERVAL: Duration = Duration::from_secs(1);
-
-/// How many times one request is attempted before the command fails. A
-/// wave walks a few hundred endpoints, so a single transient answer is
-/// likely somewhere in every run — on 2026-09-21 one `Invalid redirect
-/// URL` on `lock_api` ended a whole target's lane.
-const ATTEMPTS: u32 = 4;
-/// Delay before the second attempt; doubles for each one after it, then
-/// lengthens — never shortens — to the `Retry-After` hint when a 429
-/// carries one.
-const RETRY_DELAY: Duration = Duration::from_millis(500);
-/// Ceiling on the backoff a `Retry-After` hint can push to — a bounded
-/// wait that still honors crates.io's real answers (it sends seconds).
-const RETRY_AFTER_MAX: Duration = Duration::from_mins(5);
 
 /// The crates.io client one lane is handed: owns the pace gate's
 /// last-request instant and the run's API request count, so pacing and
@@ -111,27 +100,21 @@ impl CratesIo {
         url: &str,
         timeout: Duration,
     ) -> stow_types::error::Result<zenwave::Response> {
-        let mut delay = RETRY_DELAY;
-        let mut last_error = None;
-        for attempt in 1..=ATTEMPTS {
+        let mut backoff = Backoff::new();
+        loop {
             self.pace().await;
             match fetch_once(url, timeout).await {
                 FetchOutcome::Body(response) => return Ok(response),
                 FetchOutcome::Retryable { error, retry_after } => {
-                    if attempt == ATTEMPTS {
+                    let Some(wait) = backoff.next_wait(retry_after) else {
                         return Err(error);
-                    }
-                    tracing::warn!(url, attempt, %error, "crates.io request failed; retrying");
-                    let wait =
-                        retry_after.map_or(delay, |hint| hint.max(delay).min(RETRY_AFTER_MAX));
+                    };
+                    tracing::warn!(url, %error, "crates.io request failed; retrying");
                     smol::Timer::after(wait).await;
-                    delay = delay.saturating_mul(2);
-                    last_error = Some(error);
                 }
                 FetchOutcome::Fatal(error) => return Err(error),
             }
         }
-        Err(last_error.unwrap_or_else(|| stow_error!("fetch crates.io {url}: attempts exhausted")))
     }
 
     /// `GET` a crates.io JSON endpoint and decode the body.
@@ -157,14 +140,6 @@ enum FetchOutcome {
         retry_after: Option<Duration>,
     },
     Fatal(stow_types::error::Error),
-}
-
-/// Statuses worth a retry: rate limiting, request timeout, and every
-/// server-side failure — the same retryable set the edge client uses.
-fn is_retryable(status: zenwave::StatusCode) -> bool {
-    status == zenwave::StatusCode::REQUEST_TIMEOUT
-        || status == zenwave::StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
 }
 
 /// One paced GET of a `crates.io` URL.
@@ -202,16 +177,6 @@ async fn fetch_once(url: &str, timeout: Duration) -> FetchOutcome {
     } else {
         FetchOutcome::Fatal(error)
     }
-}
-
-/// `Retry-After` as a duration; only the delta-seconds form is honored.
-fn retry_after_hint(response: &zenwave::Response) -> Option<Duration> {
-    response
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
 }
 
 // ===== lane-facing fetchers =====
