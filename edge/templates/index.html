@@ -107,20 +107,22 @@ cargo build</code></pre>
                   </select>
                 </div>
                 <div class="field">
-                  <label for="lookup-crate">crate</label>
-                  <input id="lookup-crate" type="text" autocomplete="off" spellcheck="false" placeholder="serde" aria-describedby="lookup-note">
+                  <label for="lookup-crate">crate <span class="hint">suggestions from the slice</span></label>
+                  <div class="combobox">
+                    <input id="lookup-crate" type="text" autocomplete="off" spellcheck="false" placeholder="serde"
+                           role="combobox" aria-expanded="false" aria-controls="lookup-crate-options" aria-autocomplete="list" aria-describedby="lookup-note">
+                    <ul id="lookup-crate-options" class="combobox-list" role="listbox" aria-label="Cached crates" hidden></ul>
+                  </div>
                 </div>
               </div>
               <p id="lookup-note" class="status" role="status" aria-live="polite"></p>
               <div id="lookup-result" class="result" hidden>
-                <div class="window-body">
-                  <table class="result-table">
-                    <thead>
-                      <tr><th scope="col">version</th><th scope="col">features</th><th scope="col" class="num">bundle</th></tr>
-                    </thead>
-                    <tbody id="lookup-result-body"></tbody>
-                  </table>
-                </div>
+                <table class="result-table">
+                  <thead>
+                    <tr><th scope="col">version</th><th scope="col">features</th><th scope="col" class="num">bundle</th></tr>
+                  </thead>
+                  <tbody id="lookup-result-body"></tbody>
+                </table>
               </div>
             </div>
           </div>

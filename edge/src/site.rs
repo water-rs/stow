@@ -452,8 +452,16 @@ mod tests {
         ));
         // Exactly one option carries `selected`.
         assert_eq!(html.matches(" selected>").count(), 1);
-        // The crate field, the live-region note, and the result table.
+        // The crate field completes from the slice through the same
+        // combobox component the request form points at crates.io —
+        // defined once, instantiated per field.
         assert!(html.contains(r#"<input id="lookup-crate""#));
+        assert!(html.contains(r#"aria-controls="lookup-crate-options""#));
+        assert!(
+            html.contains(r#"<ul id="lookup-crate-options" class="combobox-list" role="listbox""#)
+        );
+        assert_eq!(html.matches("createCombobox({").count(), 2);
+        assert_eq!(html.matches("const createCombobox").count(), 1);
         assert!(
             html.contains(
                 r#"<p id="lookup-note" class="status" role="status" aria-live="polite">"#
