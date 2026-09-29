@@ -149,9 +149,8 @@ struct SubmitArgs {
     #[arg(long, default_value_t = 0)]
     downloads: u64,
     /// When true, the trusted CI runner keeps the bundled `Cargo.lock`
-    /// from the crates.io tarball. Required for the top-binaries
-    /// resolver path: a binary's preheat closure must resolve transitive
-    /// deps the same way `cargo install --locked <bin>` would.
+    /// from the crates.io tarball — an operator escape hatch on
+    /// hand-submitted tasks; every resolver-emitted task carries false.
     #[arg(long, default_value_t = false)]
     preserve_lockfile: bool,
     /// Submit the batch. Without it the command prints the plan and exits

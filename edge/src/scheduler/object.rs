@@ -146,7 +146,6 @@ impl DurableObject for Scheduler {
                 "/promote".post(queue_promote),
                 "/purge".post(queue_purge),
             )),
-            "/complete".post(complete),
             // The GitHub `workflow_run` webhook's completion channel —
             // carries task id + outcome and no attempt, which
             // `queue::complete_run` resolves against the live row.
@@ -246,7 +245,7 @@ async fn submit_tasks(
 }
 
 /// `POST /tasks/submit/trusted` — the same submit minus the
-/// pending-depth cap: callers reached it through the edge's `RepoWriter`
+/// pending-depth cap: callers reached it through the edge's repo-writer
 /// trust check, so a full queue must not turn their work away.
 async fn submit_tasks_trusted(
     env: WasmEnv,
@@ -327,49 +326,15 @@ async fn arm_dispatch_alarm(alarm: &Alarm) -> Result<()> {
     })
 }
 
-async fn complete(
-    env: WasmEnv,
-    db: DurableDb,
-    alarm: Alarm,
-    Json(report): Json<stow_types::api::BuildCompleteReport>,
-) -> Result<Json<OkResponse>> {
-    // A completion for a task the queue never held is a client error —
-    // the report references nothing real — so it answers 404, not 500.
-    // A report whose attempt no longer matches the row's live state is a
-    // conflict: the row moved on (resurrected by a re-request, or the
-    // report is a duplicate), and answering 409 keeps the reporter from
-    // believing it completed the current attempt. The edge forwards
-    // scheduler 4xx bodies, so the reporter sees the mismatch rather than
-    // a bare "internal server error".
-    let freeze = freeze_settings(&env)?;
-    queue::complete(&db, &report, freeze.window_minutes)
-        .await
-        .map_err(|error| {
-            let status = match &error {
-                crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-                crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
-    // A failed attempt may have closed the window's trip condition —
-    // evaluate while this request still holds the outcome row's write
-    // context. The freeze then eats the dispatch the alarm was about
-    // to run.
-    if !report.success {
-        evaluate_dispatch_freeze(&env, &db, &freeze).await?;
-    }
-    // Same handoff as submit: the runner's report is acknowledged as soon
-    // as the queue row lands, and the alarm's dispatch pass — not this
-    // request — runs claim plus the GitHub fan-out.
-    arm_dispatch_alarm(&alarm).await?;
-    Ok(Json(OkResponse { ok: true }))
-}
-
 /// `POST /tasks/complete-run` — the edge's webhook route forwards GitHub's
 /// `workflow_run` event here; the report carries the task id and outcome
 /// but no attempt, which `complete_run` resolves against the live row.
-/// The same 404/409 split as [`complete`] applies.
+///
+/// A completion for a task the queue never held answers 404, not 500 —
+/// the report references nothing real. A row whose live attempt or
+/// status no longer matches what the event describes answers 409 — the
+/// row moved on, and the webhook logs both rather than propagating them:
+/// a retried delivery changes nothing about a row that already moved.
 async fn complete_run(
     env: WasmEnv,
     db: DurableDb,
@@ -387,6 +352,16 @@ async fn complete_run(
             };
             to_error(error).set_status(status)
         })?;
+    // A failed attempt may have closed the window's trip condition —
+    // evaluate while this request still holds the outcome row's write
+    // context. The freeze then eats the dispatch the alarm was about
+    // to run.
+    if !report.success {
+        evaluate_dispatch_freeze(&env, &db, &freeze).await?;
+    }
+    // Same handoff as submit: the run's report is acknowledged as soon
+    // as the queue row lands, and the alarm's dispatch pass — not this
+    // request — runs claim plus the GitHub fan-out.
     arm_dispatch_alarm(&alarm).await?;
     Ok(Json(OkResponse { ok: true }))
 }

@@ -98,12 +98,6 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_written: 200,
     },
     DriveBudget {
-        name: "POST /builds/complete",
-        statements: 8,
-        rows_read: 200,
-        rows_written: 200,
-    },
-    DriveBudget {
         name: "POST /tasks/retry",
         statements: 4,
         rows_read: 200,

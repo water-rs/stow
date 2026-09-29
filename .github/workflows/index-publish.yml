@@ -48,6 +48,11 @@ on:
         required: false
         default: ""
         type: string
+      full:
+        description: "Rebuild the scoped rustc's slices from every records artifact, ignoring the published index/folded pairs — the recovery for a slice in an unreadable format"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -74,18 +79,23 @@ jobs:
         run: |
           echo "::error::index-publish signs under refs/heads/main only; dispatched on ${{ github.ref }}"
           exit 1
+      # A local action resolves from the workspace, so its directory has
+      # to be checked out; nothing else in the tree is needed.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          sparse-checkout: .github/actions
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      # stow-admin is pulled, not compiled: toolchain-publish.yml builds
+      # and cosign-signs it once per platform on main's merge queue, and
+      # this run is on main so its own sha is that artifact's tag — the
+      # same pull deploy-edge.yml and watchdog.yml make. An absent
+      # artifact or a failed verify fails the step; there is no
+      # source-build fallback.
+      - uses: ./.github/actions/stow-toolchain
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: . -> target
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build stow-admin
-        run: cargo build --release -p stow-admin
+          sha: ${{ github.sha }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       # cosign is still what signs — `stow-admin index publish` shells out
       # to it exactly as `stow-build publish` does.
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -122,11 +132,18 @@ jobs:
         env:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_FULL: ${{ inputs.full }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/index-export"
           mkdir -p "$out"
-          ./target/release/stow-admin index export --out-dir "$out" --rustc-version "$RUSTC_VERSION"
+          args=(--out-dir "$out" --rustc-version "$RUSTC_VERSION")
+          # A full pass stays scoped the way the export is: the resolved
+          # rustc's slices and records, no other rustc's tags.
+          if [[ "$INPUT_FULL" == "true" ]]; then
+            args+=(--full)
+          fi
+          stow-admin index export "${args[@]}"
           cp "$out/slices.json" "$RUNNER_TEMP/slices.json"
           cp "$out/new-records.json" "$RUNNER_TEMP/new-records.json"
           echo "export_dir=$out" >> "$GITHUB_ENV"
@@ -157,10 +174,10 @@ jobs:
               print(f"::group::{s['tag']}", flush=True)
               file = os.path.join(out, s["index_file"])
               folded = os.path.join(out, s["folded_file"])
-              steps = [["./target/release/stow-admin", "index", "publish",
+              steps = [["stow-admin", "index", "publish",
                         "--file", file, "--folded", folded]]
               if os.environ.get("STOW_EDGE_URL"):
-                  steps.append(["./target/release/stow-admin", "index", "report", "--file", file])
+                  steps.append(["stow-admin", "index", "report", "--file", file])
               ok = all(subprocess.run(step).returncode == 0 for step in steps)
               print("::endgroup::", flush=True)
               if not ok:
@@ -178,4 +195,4 @@ jobs:
         env:
           STOW_EDGE_URL: ${{ inputs.stow_edge_url }}
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
-        run: ./target/release/stow-admin index sync --file "$export_dir/new-records.json"
+        run: stow-admin index sync --file "$export_dir/new-records.json"

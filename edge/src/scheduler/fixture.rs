@@ -113,11 +113,6 @@ impl FixtureShape {
         self.completed_end() + 1 + k
     }
 
-    /// The one `dispatched` row the completion drive reports.
-    pub const fn dispatched_row(self) -> u32 {
-        self.failed_end() + 2
-    }
-
     /// The one `running` row the run-completion drive reports.
     pub const fn running_row(self) -> u32 {
         self.failed_end() + 3

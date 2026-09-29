@@ -5,10 +5,12 @@
 //! unit split.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use stow_resolver::{ResolveOptions, Resolver, StowSide, StowUnit};
+use stow_types::identity::WireRustcVersion;
 
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -127,6 +129,95 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     cksum
 }
 
+/// The release the test binary's own toolchain reports — the version
+/// the session is asked to pin. rustup resolves `--toolchain <release>`
+/// to the dir named `<release>-<host>` under `RUSTUP_HOME`, so the env
+/// var is pointed at a harness home linking that name to the real
+/// toolchain: the pin works whichever channel cargo ran the tests under
+/// (CI's `stable`, a maintainer's default, an explicit `+1.98.1`).
+fn pinned_rustc_version() -> &'static WireRustcVersion {
+    static PINNED: OnceLock<(WireRustcVersion, tempfile::TempDir)> = OnceLock::new();
+    &PINNED
+        .get_or_init(|| {
+            let rustc = PathBuf::from(
+                String::from_utf8(
+                    std::process::Command::new("rustup")
+                        .args(["which", "rustc"])
+                        .output()
+                        .expect("rustup which rustc")
+                        .stdout,
+                )
+                .expect("rustup which output is utf8")
+                .trim()
+                .to_owned(),
+            );
+            let toolchain_dir = rustc
+                .parent()
+                .and_then(Path::parent)
+                .expect("rustc sits in <toolchain>/bin")
+                .to_path_buf();
+            let verbose = String::from_utf8(
+                std::process::Command::new(&rustc)
+                    .arg("-vV")
+                    .output()
+                    .expect("rustc -vV")
+                    .stdout,
+            )
+            .expect("rustc -vV is utf8");
+            let release = verbose
+                .lines()
+                .find_map(|line| line.strip_prefix("release: "))
+                .map(str::trim)
+                .expect("rustc -vV reports a release");
+            let host = verbose
+                .lines()
+                .find_map(|line| line.strip_prefix("host: "))
+                .map(str::trim)
+                .expect("rustc -vV reports a host");
+
+            let home = tempfile::tempdir().expect("rustup home");
+            let link = home
+                .path()
+                .join("toolchains")
+                .join(format!("{release}-{host}"));
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            link_dir(&toolchain_dir, &link);
+            // SAFETY: inside `OnceLock::get_or_init` this runs exactly
+            // once and strictly before the first `Resolver` exists, so
+            // before any code in this process reads the environment or
+            // inherits it into a spawned rustup/cargo.
+            unsafe { std::env::set_var("RUSTUP_HOME", home.path()) };
+            (
+                WireRustcVersion::parse(release).expect("release is a wire version"),
+                home,
+            )
+        })
+        .0
+}
+
+#[cfg(unix)]
+fn link_dir(toolchain_dir: &Path, link: &Path) {
+    std::os::unix::fs::symlink(toolchain_dir, link).expect("link the toolchain dir");
+}
+
+/// A directory junction needs no privilege on Windows, where a symlink
+/// does.
+#[cfg(windows)]
+fn link_dir(toolchain_dir: &Path, link: &Path) {
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(toolchain_dir)
+        .status()
+        .expect("mklink /J runs");
+    assert!(
+        status.success(),
+        "mklink /J {} -> {}",
+        link.display(),
+        toolchain_dir.display()
+    );
+}
+
 /// A resolver whose isolated `CARGO_HOME` replaces crates.io with `reg`.
 fn resolver_at(reg: &Path) -> (tempfile::TempDir, Resolver) {
     let home = tempfile::tempdir().unwrap();
@@ -142,10 +233,31 @@ fn resolver_at(reg: &Path) -> (tempfile::TempDir, Resolver) {
     .unwrap();
     let resolver = Resolver::with_cargo_home(
         home.path().to_path_buf(),
+        pinned_rustc_version(),
         PathBuf::from(env!("CARGO_BIN_EXE_stow-rustc-shim")),
     )
     .unwrap();
     (home, resolver)
+}
+
+/// Pinning a version rustup has no toolchain for fails naming the
+/// install command — never probing whichever rustc is active instead.
+#[test]
+fn an_uninstalled_rustc_names_its_install_command() {
+    let _pinned = pinned_rustc_version();
+    let home = tempfile::tempdir().unwrap();
+    let requested = WireRustcVersion::parse("9.99.9").expect("wire version");
+    let error = Resolver::with_cargo_home(
+        home.path().to_path_buf(),
+        &requested,
+        PathBuf::from(env!("CARGO_BIN_EXE_stow-rustc-shim")),
+    )
+    .expect_err("9.99.9 has no installed toolchain");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("rustup toolchain install 9.99.9"),
+        "the error names the install command: {message}"
+    );
 }
 
 /// A single-member project tree on disk; returns its manifest path.
@@ -261,6 +373,55 @@ fn newer_release_beats_the_pin() {
             &["x86_64-unknown-linux-gnu".to_owned()],
         )
         .unwrap();
+    assert_eq!(units_named(&out, "dep")[0].version, "1.0.1");
+}
+
+/// The crate lane drops the tarball's bundled `Cargo.lock` like every
+/// other lane — the `dep` pin is admission, never preference, so the
+/// resolve lands on the index's newest compatible `1.0.1`, not the
+/// locked `1.0.0`. (The `.crate` package dir stands in for
+/// `fetch_crate`'s unpacked tree; `resolve_package_dir` is the shared
+/// post-fetch half.)
+#[test]
+fn crate_lane_drops_bundled_lockfile() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    for version in ["1.0.0", "1.0.1"] {
+        publish(
+            &reg,
+            &Fixture {
+                name: "dep",
+                version,
+                deps: vec![],
+                features: &[],
+                yanked: false,
+                proc_macro: false,
+            },
+        );
+    }
+    // An unpacked `.crate` root: manifest, sources, and the bundled
+    // lockfile pinning `dep` a patch behind the index's newest.
+    let package_dir = work.path().join("crate-root-0.0.0");
+    project(&package_dir, &json!({ "dep": "1" }));
+    std::fs::write(
+        package_dir.join("Cargo.lock"),
+        dropped_lockfile(
+            vec![lock_entry("dep", "1.0.0", CRATES_IO)],
+            &["dep 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)"],
+        ),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions::default(),
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+    // (Cargo regenerates a lockfile in the tree after resolving — the
+    // bundled one's pins are what the resolve must not honor.)
     assert_eq!(units_named(&out, "dep")[0].version, "1.0.1");
 }
 

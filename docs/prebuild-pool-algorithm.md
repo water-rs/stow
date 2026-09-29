@@ -153,28 +153,31 @@ into the candidate pool.
 This overlay is allowed to introduce candidates that the base pool would not
 have generated, including:
 
-- older locked versions
-- exact versions pinned by a published `Cargo.lock`
 - feature combinations that are neither plain `default` nor synthetic `full`
 - crate-type combinations observed in the binary's actual build graph
 
 This is critical because real binary workloads often differ from the
-"latest compatible semver" view.
+plain-`default` view.
 
 ### Lockfile Rule
 
-If a binary crate ships a published `Cargo.lock`, that lockfile is treated as
-the authoritative dependency graph for the top-binaries pool.
-
-Stow must not replace that graph with a fresh semver re-resolution.
+A binary crate's bundled `Cargo.lock` is dropped before the resolve — the
+same rule every other source follows. The resolve lands on the latest
+semver-compatible versions; the dropped lockfile's pins survive only as
+admission (a yanked version stays resolvable, a git dep locks to its sha),
+never as preference.
 
 Reason:
 
-- `cargo install --locked` uses the published lockfile
-- a synthetic "latest compatible" graph can drift far away from real install
-  behavior
-- once the graph drifts, artifact keys drift as well, and public cache hit rate
-  collapses
+- every task builds at the identity consumers converge on — latest
+  semver-compatible — so honoring a bundled lock's pins would mint
+  artifacts at versions no consumer's key asks for
+- CI drops the lockfile again at build time (`preserve_lockfile` is always
+  false), so keeping it at resolve time only produces tasks at versions no
+  published node owns
+- `cargo install --locked` reproduction was the old target; the
+  artifact-key contract won out — a binary contributes names and feature
+  sets, never version pins
 
 ## 3. User-Feedback Overlay
 

@@ -5,12 +5,13 @@
 //! `x-stow-register-token`). Both are replaced by GitHub identity on a
 //! single `Authorization: Bearer` header — nothing is stored anywhere:
 //!
-//! - **GitHub Actions OIDC JWT** — the `build-crate.yml` workflow mints a
-//!   token per run (`id-token: write`); the edge verifies the RS256
-//!   signature against GitHub's JWKS and pins `iss`, `aud`, `repository`,
-//!   and the workflow ref. Only dispatched `build-crate.yml` runs can ever
-//!   satisfy the pin — the workflow's only trigger is `workflow_dispatch`
-//!   on `main`, and a fork's runs carry its own `repository` claim.
+//! - **GitHub Actions OIDC JWT** — a repo workflow mints a token per run
+//!   (`id-token: write`); the edge verifies the RS256 signature against
+//!   GitHub's JWKS and pins `iss`, `aud`, `repository`, and the
+//!   `owner/repo/.github/workflows/` prefix on the workflow ref — any
+//!   workflow inside the trusted repo (`preheat-admin.yml` submits
+//!   scheduler tasks this way), never a fork's, whose runs carry their
+//!   own `repository` claim.
 //! - **Repo-push credential** — the admin path and non-OIDC CI calls:
 //!   the edge probes the credential's push capability directly via git
 //!   smart-HTTP (`info/refs?service=git-receive-pack` answers 200 only
@@ -41,9 +42,6 @@ const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 /// GitHub's OIDC signing keys endpoint.
 const OIDC_JWKS_URL: &str = "https://token.actions.githubusercontent.com/.well-known/jwks";
-
-/// The workflow whose runs may drive the CI-write endpoints.
-const BUILD_WORKFLOW_FILE: &str = "build-crate.yml";
 
 /// Clock-skew allowance on `exp`/`nbf` — GitHub's tokens are minted seconds
 /// before use, so a minute is already generous.
@@ -101,22 +99,6 @@ impl std::fmt::Display for TrustedCaller {
     }
 }
 
-/// Which callers a handler accepts. Every policy admits a credential that
-/// proves push access to the repo — the local dev loop and `stow-admin`
-/// both run under the developer's own GitHub identity. The policies differ
-/// in how tightly OIDC callers are pinned.
-#[derive(Debug, Clone, Copy)]
-pub enum Policy {
-    /// OIDC only from `build-crate.yml` on `refs/heads/main` — artifact
-    /// registration and completion reports. The machine path that writes
-    /// `artifacts` rows stays pinned to the exact identity the cosign
-    /// signature asserts.
-    BuildWorkflow,
-    /// OIDC from any workflow inside the trusted repo — scheduler task
-    /// submission (the `preheat-admin.yml` workflow uses this).
-    RepoWriter,
-}
-
 /// Non-secret trust configuration (worker vars).
 #[derive(Debug, Clone)]
 pub struct GitHubTrustConfig {
@@ -165,24 +147,23 @@ pub trait GitHubTrustApi: Sync {
     ) -> impl Future<Output = Result<Option<String>, AuthError>> + Send;
 }
 
-/// Authenticate an `Authorization: Bearer` credential under `policy`.
+/// Authenticate an `Authorization: Bearer` credential.
 ///
 /// JWT-shaped credentials (a `kid`+`alg` header) take the OIDC path; every
-/// other shape is treated as a GitHub user token and — when the policy
-/// allows user callers — checked against the repo's push capability. The
-/// probe's verdict is served from `push_verdicts` when fresh — a cached
-/// hit carries its caller label and makes zero GitHub calls.
+/// other shape is treated as a GitHub user token and checked against the
+/// repo's push capability. The probe's verdict is served from
+/// `push_verdicts` when fresh — a cached hit carries its caller label and
+/// makes zero GitHub calls.
 pub async fn authenticate(
     config: &GitHubTrustConfig,
     api: &impl GitHubTrustApi,
     jwks: &Jwks,
     push_verdicts: &PushVerdicts,
     bearer: &str,
-    policy: Policy,
     now_unix: i64,
 ) -> Result<TrustedCaller, AuthError> {
     if looks_like_jwt(bearer) {
-        return authenticate_oidc(config, api, jwks, bearer, policy, now_unix).await;
+        return authenticate_oidc(config, api, jwks, bearer, now_unix).await;
     }
     if !looks_like_user_token(bearer) {
         return Err(AuthError::Unauthorized);
@@ -206,13 +187,12 @@ pub async fn authenticate(
 /// The OIDC path: resolve the header `kid` against the cached keyset —
 /// fetching the JWKS once on a miss — verify RS256, then check every claim
 /// that pins the token to this deployment — issuer, audience, repo,
-/// expiry — and the policy's workflow pin.
+/// expiry — and that the job's workflow lives in the repo.
 async fn authenticate_oidc(
     config: &GitHubTrustConfig,
     api: &impl GitHubTrustApi,
     jwks: &Jwks,
     token: &str,
-    policy: Policy,
     now_unix: i64,
 ) -> Result<TrustedCaller, AuthError> {
     let (header, signing_input, signature, claims) = decode_jwt(token)?;
@@ -240,12 +220,6 @@ async fn authenticate_oidc(
     }
     let workflow_prefix = format!("{}/.github/workflows/", config.repo);
     if !claims.job_workflow_ref.starts_with(&workflow_prefix) {
-        return Err(AuthError::Unauthorized);
-    }
-    if matches!(policy, Policy::BuildWorkflow)
-        && claims.job_workflow_ref
-            != format!("{workflow_prefix}{BUILD_WORKFLOW_FILE}@refs/heads/main")
-    {
         return Err(AuthError::Unauthorized);
     }
     Ok(TrustedCaller::Actions {
@@ -997,7 +971,7 @@ mod tests {
             "nbf": NOW - 60,
             "repository": "water-rs/stow",
             "job_workflow_ref":
-                "water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main",
+                "water-rs/stow/.github/workflows/preheat-admin.yml@refs/heads/main",
             "run_id": "12345",
         })
     }
@@ -1020,7 +994,6 @@ mod tests {
             &Jwks::default(),
             &PushVerdicts::default(),
             &token,
-            Policy::BuildWorkflow,
             NOW,
         )
         .await
@@ -1032,7 +1005,7 @@ mod tests {
         else {
             panic!("expected Actions caller");
         };
-        assert!(job_workflow_ref.contains("build-crate.yml"));
+        assert!(job_workflow_ref.contains("preheat-admin.yml"));
         assert_eq!(run_id, "12345");
     }
 
@@ -1049,7 +1022,6 @@ mod tests {
                 &Jwks::default(),
                 &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
-                Policy::BuildWorkflow,
                 NOW,
             )
             .await,
@@ -1071,83 +1043,53 @@ mod tests {
                 &Jwks::default(),
                 &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
-                Policy::BuildWorkflow,
                 NOW,
             )
             .await,
         );
     }
 
+    /// The same repo's other workflows submit tasks too — the trust pin
+    /// is `owner/repo/.github/workflows/`, never a particular file.
     #[tokio::test]
-    async fn other_workflow_cannot_write() {
+    async fn other_repo_workflow_is_trusted() {
         let key = test_key();
         let api = StubTrust::for_key(&key);
         let mut claims = actions_claims();
         claims["job_workflow_ref"] =
             serde_json::json!("water-rs/stow/.github/workflows/ci.yml@refs/heads/main");
-        let jwks = Jwks::default();
-        // The same repo's other workflows may submit tasks...
         let caller = authenticate(
             &test_config(),
             &api,
-            &jwks,
+            &Jwks::default(),
             &PushVerdicts::default(),
             &mint_jwt(&key, &claims),
-            Policy::RepoWriter,
             NOW,
         )
         .await;
         assert!(matches!(caller, Ok(TrustedCaller::Actions { .. })));
-        // ...but only build-crate.yml carries the workflow pin.
-        assert_unauthorized(
-            &authenticate(
-                &test_config(),
-                &api,
-                &jwks,
-                &PushVerdicts::default(),
-                &mint_jwt(&key, &claims),
-                Policy::BuildWorkflow,
-                NOW,
-            )
-            .await,
-        );
     }
 
+    /// A workflow on a branch other than `main` is still a repo workflow —
+    /// the pin names the repository, not the ref.
     #[tokio::test]
-    async fn build_workflow_on_other_ref_cannot_write() {
+    async fn repo_workflow_on_other_ref_is_trusted() {
         let key = test_key();
         let api = StubTrust::for_key(&key);
         let mut claims = actions_claims();
         claims["job_workflow_ref"] =
             serde_json::json!("water-rs/stow/.github/workflows/build-crate.yml@refs/heads/topic");
-        let jwks = Jwks::default();
-        // The branch build is still a repo workflow — scheduler ops pass…
         assert!(
             authenticate(
                 &test_config(),
                 &api,
-                &jwks,
+                &Jwks::default(),
                 &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
-                Policy::RepoWriter,
                 NOW,
             )
             .await
             .is_ok()
-        );
-        // …but artifact writes pin the exact `main` ref, matching the
-        // cosign identity clients verify.
-        assert_unauthorized(
-            &authenticate(
-                &test_config(),
-                &api,
-                &jwks,
-                &PushVerdicts::default(),
-                &mint_jwt(&key, &claims),
-                Policy::BuildWorkflow,
-                NOW,
-            )
-            .await,
         );
     }
 
@@ -1164,7 +1106,6 @@ mod tests {
                 &Jwks::default(),
                 &PushVerdicts::default(),
                 "not-a-credential",
-                Policy::RepoWriter,
                 NOW,
             )
             .await,
@@ -1185,7 +1126,6 @@ mod tests {
                 &Jwks::default(),
                 &PushVerdicts::default(),
                 &mint_jwt(&key, &claims),
-                Policy::BuildWorkflow,
                 NOW,
             )
             .await,
@@ -1206,7 +1146,6 @@ mod tests {
                 &Jwks::default(),
                 &PushVerdicts::default(),
                 &token,
-                Policy::BuildWorkflow,
                 NOW,
             )
             .await,
@@ -1224,28 +1163,6 @@ mod tests {
             &Jwks::default(),
             &PushVerdicts::default(),
             "ghp_example-token",
-            Policy::RepoWriter,
-            NOW,
-        )
-        .await
-        .expect("user token");
-        assert!(matches!(caller, TrustedCaller::Push { ref label } if label == "lexoliu"));
-    }
-
-    #[tokio::test]
-    async fn push_user_writes() {
-        // Local dev drives the same write endpoints with the developer's
-        // own GitHub token — push users pass under every policy.
-        let key = test_key();
-        let api = StubTrust::for_key(&key);
-        *api.push_login.lock().expect("lock") = Some("lexoliu".to_owned());
-        let caller = authenticate(
-            &test_config(),
-            &api,
-            &Jwks::default(),
-            &PushVerdicts::default(),
-            "ghp_example-token",
-            Policy::BuildWorkflow,
             NOW,
         )
         .await
@@ -1256,22 +1173,19 @@ mod tests {
     #[tokio::test]
     async fn user_without_push_is_rejected() {
         let key = test_key();
-        for policy in [Policy::RepoWriter, Policy::BuildWorkflow] {
-            let api = StubTrust::for_key(&key);
-            *api.push_login.lock().expect("lock") = None;
-            assert_unauthorized(
-                &authenticate(
-                    &test_config(),
-                    &api,
-                    &Jwks::default(),
-                    &PushVerdicts::default(),
-                    "ghp_example-token",
-                    policy,
-                    NOW,
-                )
-                .await,
-            );
-        }
+        let api = StubTrust::for_key(&key);
+        *api.push_login.lock().expect("lock") = None;
+        assert_unauthorized(
+            &authenticate(
+                &test_config(),
+                &api,
+                &Jwks::default(),
+                &PushVerdicts::default(),
+                "ghp_example-token",
+                NOW,
+            )
+            .await,
+        );
     }
 
     #[test]
@@ -1348,7 +1262,6 @@ mod tests {
                 &jwks,
                 &PushVerdicts::default(),
                 &token,
-                Policy::BuildWorkflow,
                 NOW,
             )
             .await
@@ -1373,7 +1286,6 @@ mod tests {
                 &jwks,
                 &PushVerdicts::default(),
                 &token,
-                Policy::BuildWorkflow,
                 NOW,
             )
             .await,
@@ -1395,7 +1307,6 @@ mod tests {
             &jwks,
             &PushVerdicts::default(),
             &token,
-            Policy::BuildWorkflow,
             NOW,
         )
         .await
@@ -1408,7 +1319,6 @@ mod tests {
             &jwks,
             &PushVerdicts::default(),
             &token,
-            Policy::BuildWorkflow,
             NOW + JWKS_CACHE_TTL_SECS + 1,
         )
         .await
@@ -1429,7 +1339,6 @@ mod tests {
                 &Jwks::default(),
                 &verdicts,
                 "ghp_example-token",
-                Policy::RepoWriter,
                 NOW,
             )
             .await
@@ -1454,7 +1363,6 @@ mod tests {
                 &Jwks::default(),
                 &verdicts,
                 token,
-                Policy::RepoWriter,
                 NOW,
             )
             .await
@@ -1475,7 +1383,6 @@ mod tests {
                 &Jwks::default(),
                 &verdicts,
                 "ghp_example-token",
-                Policy::RepoWriter,
                 NOW,
             )
             .await,
@@ -1490,7 +1397,6 @@ mod tests {
                 &Jwks::default(),
                 &verdicts,
                 "ghp_example-token",
-                Policy::RepoWriter,
                 NOW + PUSH_DENIED_TTL_SECS - 1,
             )
             .await,
@@ -1503,7 +1409,6 @@ mod tests {
                 &Jwks::default(),
                 &verdicts,
                 "ghp_example-token",
-                Policy::RepoWriter,
                 NOW + PUSH_DENIED_TTL_SECS,
             )
             .await,
@@ -1517,7 +1422,6 @@ mod tests {
             &Jwks::default(),
             &verdicts,
             "ghp_other-token",
-            Policy::RepoWriter,
             NOW,
         )
         .await
@@ -1528,7 +1432,6 @@ mod tests {
             &Jwks::default(),
             &verdicts,
             "ghp_other-token",
-            Policy::RepoWriter,
             NOW + PUSH_VERDICT_TTL_SECS - 1,
         )
         .await
@@ -1550,7 +1453,6 @@ mod tests {
             &Jwks::default(),
             &verdicts,
             "ghp_example-token",
-            Policy::RepoWriter,
             NOW,
         )
         .await
@@ -1568,7 +1470,6 @@ mod tests {
             &Jwks::default(),
             &verdicts,
             "ghp_example-token",
-            Policy::RepoWriter,
             NOW,
         )
         .await

@@ -5,9 +5,9 @@
 # because no host-side node had published them):
 #
 #   1. build the four host binaries and generate a P-256 PKCS#8 key pair
-#   2. start stow-mock-registry (40123), the edge under `wrangler dev`
+#   2. start stow-mock-registry (28123), the edge under `wrangler dev`
 #      (workerd, 8788; bundle built by `skyzen build`), and
-#      `stow-build serve` (40124)
+#      `stow-build serve` (28124)
 #   3. `stow-admin preheat plan` snafu-derive@0.9.2 for
 #      wasm32-unknown-unknown — the failing production task — and POST
 #      the expanded task batch to the scheduler. The plan mints
@@ -46,8 +46,13 @@ set -m
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 EDGE_PORT=8788
-REGISTRY_ADDR=127.0.0.1:40123
-LOCAL_CI_ADDR=127.0.0.1:40124
+# Fixed ports sit below every OS's ephemeral range (Linux 32768-60999,
+# macOS and Windows 49152-65535): inside it, any outbound socket on the
+# runner can hold the port, and a loopback connect to a port nobody
+# listens on can self-connect, so the in-use check below fired on a
+# fresh runner.
+REGISTRY_ADDR=127.0.0.1:28123
+LOCAL_CI_ADDR=127.0.0.1:28124
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
 # The trusted edge endpoints authenticate GitHub identity — no shared

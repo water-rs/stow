@@ -146,14 +146,6 @@ pub struct GraphAnalysis {
     pub prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
 
-/// The glibc release this host runs, read through `gnu_get_libc_version`.
-/// `None` on musl and every non-Linux host — there the `min_glibc` field
-/// is not applicable and every row is servable.
-#[must_use]
-pub fn host_glibc() -> Option<GlibcVersion> {
-    host_glibc_impl()
-}
-
 /// Whether `row`'s recorded glibc floor lets this host load it. `None` on
 /// either side means servable: a row with no floor loads anywhere, and a
 /// host whose libc is not glibc makes the field inapplicable rather than
@@ -166,8 +158,10 @@ pub fn row_servable_on_host(row: &ArtifactIndexRow, host_glibc: Option<GlibcVers
     }
 }
 
+/// The glibc release this host runs, read through `gnu_get_libc_version`.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn host_glibc_impl() -> Option<GlibcVersion> {
+#[must_use]
+pub fn host_glibc() -> Option<GlibcVersion> {
     // Safe: glibc returns a pointer into its own static storage, valid
     // for the process's lifetime.
     let raw = unsafe { libc::gnu_get_libc_version() };
@@ -178,8 +172,11 @@ fn host_glibc_impl() -> Option<GlibcVersion> {
     text.parse().ok()
 }
 
+/// `None`: on musl and every non-Linux host the `min_glibc` field is not
+/// applicable and every row is servable.
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn host_glibc_impl() -> Option<GlibcVersion> {
+#[must_use]
+pub const fn host_glibc() -> Option<GlibcVersion> {
     None
 }
 

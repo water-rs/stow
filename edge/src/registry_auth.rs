@@ -419,7 +419,7 @@ mod tests {
     fn cached_token_attaches_without_401() {
         let tokens = RegistryTokens::default();
         let challenge = parse_bearer_challenge(
-            r#"Bearer realm="http://127.0.0.1:40123/token",service="mock-registry",scope="repository:water-rs/stow-cache:pull""#,
+            r#"Bearer realm="http://127.0.0.1:28123/token",service="mock-registry",scope="repository:water-rs/stow-cache:pull""#,
         )
         .expect("challenge");
         tokens.insert(
@@ -447,7 +447,7 @@ mod tests {
         let derived = pull_scope(path);
         tokens.insert(&derived, "stale".to_owned(), 300, 1_000);
         let challenge = parse_bearer_challenge(
-            r#"Bearer realm="http://127.0.0.1:40123/token",service="mock-registry",scope="repository:water-rs/stow-cache:pull""#,
+            r#"Bearer realm="http://127.0.0.1:28123/token",service="mock-registry",scope="repository:water-rs/stow-cache:pull""#,
         )
         .expect("challenge");
 

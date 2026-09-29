@@ -386,7 +386,7 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
         })
         .collect::<stow_types::error::Result<_>>()?;
     let repos = load_projects_file(&args.file)?;
-    let pool = crate::resolve::ResolvePool::new()?;
+    let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let mut plan = ProjectsPlan {
         file: args.file.display().to_string(),
         tasks: Vec::new(),

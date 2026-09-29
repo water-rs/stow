@@ -12,8 +12,8 @@ use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
 use stow_types::api::{
-    AdmissionRequest, ArtifactIndexPage, ArtifactRecord, BuildCompleteReport, CI_TARGET_TRIPLES,
-    CrateRequest, CrateRequestOutcome, EnqueueAdmission, EnqueueTicket,
+    AdmissionRequest, ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, CrateRequest,
+    CrateRequestOutcome, EnqueueAdmission, EnqueueTicket,
 };
 use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
@@ -45,9 +45,9 @@ pub struct OkResponse {
 }
 
 /// Marker that the request's `Authorization: Bearer` credential cleared the
-/// GitHub trust check under [`github_auth::Policy::RepoWriter`]: a GitHub
-/// Actions OIDC token minted inside the trusted repo, or any credential
-/// with push access to it (`stow-admin`, local dev, CI `GITHUB_TOKEN`).
+/// GitHub trust check: a GitHub Actions OIDC token minted inside the
+/// trusted repo, or any credential with push access to it (`stow-admin`,
+/// local dev, CI `GITHUB_TOKEN`).
 ///
 /// Verifying inside the extractor — rather than in the handler body —
 /// rejects unauthorized requests *before* `Json` deserializes a
@@ -59,9 +59,7 @@ impl Extractor for SchedulerCaller {
     type Error = GetArtifactError;
 
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        extract_trusted_caller(request, github_auth::Policy::RepoWriter)
-            .await
-            .map(Self)
+        extract_trusted_caller(request).await.map(Self)
     }
 }
 
@@ -96,29 +94,12 @@ impl Extractor for BundleStreams {
     }
 }
 
-/// Marker that the caller cleared [`github_auth::Policy::BuildWorkflow`] —
-/// the OIDC pin that lets only `build-crate.yml` runs (or a repo-push user
-/// driving the same endpoint in local dev) write completion reports.
-#[derive(Debug, Clone)]
-pub struct ArtifactWriteCaller(pub github_auth::TrustedCaller);
-
-impl Extractor for ArtifactWriteCaller {
-    type Error = GetArtifactError;
-
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        extract_trusted_caller(request, github_auth::Policy::BuildWorkflow)
-            .await
-            .map(Self)
-    }
-}
-
 /// Pull the bearer credential off `Authorization` and authenticate it
-/// against GitHub under `policy`. Upstream failures (JWKS, repo-permission
+/// against GitHub. Upstream failures (JWKS, repo-permission
 /// API) surface as `TrustUpstreamUnavailable` — a 502 the CI retries —
 /// rather than a 401 that would look like a credential problem.
 async fn extract_trusted_caller(
     request: &mut Request,
-    policy: github_auth::Policy,
 ) -> Result<github_auth::TrustedCaller, GetArtifactError> {
     let bearer = request
         .headers()
@@ -148,7 +129,6 @@ async fn extract_trusted_caller(
         &jwks,
         &push_verdicts,
         &bearer,
-        policy,
         now_unix(),
     )
     .await
@@ -386,7 +366,7 @@ const MAX_INDEX_LIMIT: usize = 1000;
 ///
 /// One keyset page of the slice's servable artifact rows — what
 /// `stow-admin index export` pages through to assemble the published
-/// [`stow_types::index::ArtifactIndex`]. `SchedulerCaller` (RepoWriter):
+/// [`stow_types::index::ArtifactIndex`]. `SchedulerCaller` (repo-writer):
 /// the index-publish workflow mints its token inside the trusted repo.
 pub async fn list_artifact_index(
     SchedulerCaller(caller): SchedulerCaller,
@@ -447,7 +427,7 @@ pub async fn list_artifact_index(
 /// The index-publish path's report that this slice went live, carrying
 /// the semantic identities the signed index serves — recorded inside the
 /// scheduler as the membership the dependency gate checks a dependent's
-/// edges against. Same `SchedulerCaller` (`RepoWriter`) trust as the page
+/// edges against. Same `SchedulerCaller` (repo-writer) trust as the page
 /// reads: the index-publish workflow mints its token inside the trusted
 /// repo.
 pub async fn record_published_index(
@@ -864,7 +844,6 @@ fn resolve_response(
     stow_types::api::AdminResolveResponse {
         has_binary: resolved.has_binary,
         has_library: resolved.has_library,
-        ships_lockfile: resolved.ships_lockfile,
         targets: resolved
             .targets
             .into_iter()
@@ -1018,7 +997,7 @@ pub async fn submit_scheduler_tasks(
         settings.batch_fetch_concurrency,
     )
     .await?;
-    // RepoWriter submissions are exempt from the pending-depth cap — the
+    // Repo-writer submissions are exempt from the pending-depth cap — the
     // credential check is the bound on this path.
     let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &requests).await?;
     tracing::info!(tasks = requests.len(), %caller, "submitted scheduler tasks");
@@ -1031,41 +1010,6 @@ pub async fn submit_scheduler_tasks(
             GetArtifactError::TooLarge("dropped request count exceeds u32".to_owned())
         })?,
     }))
-}
-
-/// POST /api/v1/scheduler/complete
-///
-/// CI (or local simulated CI) reports build completion to the scheduler
-/// Durable Object. `ArtifactWriteCaller` — the same `build-crate.yml` OIDC
-/// pin as the record writes — because a completion report is the other half of the
-/// pipeline write: it tells the scheduler the artifacts exist.
-pub async fn complete_build(
-    ArtifactWriteCaller(caller): ArtifactWriteCaller,
-    Json(report): Json<BuildCompleteReport>,
-    State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<OkResponse>, GetArtifactError> {
-    let mut report = report;
-    // The OIDC token's `run_id` claim is the run id's authoritative source —
-    // never a field the request body could write.
-    if let github_auth::TrustedCaller::Actions { run_id, .. } = &caller {
-        report.github_run_id = Some(run_id.clone());
-    }
-    scheduler_client::send_complete(&scheduler, &report)
-        .await
-        .map_err(|error| match error {
-            // The scheduler's 409 says the report's attempt no longer
-            // matches the row's live state — stale or duplicate. It must
-            // reach the reporter as a conflict, not the generic 400 the
-            // shared scheduler-error conversion gives every 4xx.
-            crate::errors::SchedulerClientError::Http {
-                status: 409, body, ..
-            } => GetArtifactError::CompletionConflict(body),
-            other => GetArtifactError::from(other),
-        })
-        .inspect_err(|error| {
-            tracing::error!(%error, %caller, "failed to forward build completion to scheduler");
-        })?;
-    Ok(Json(OkResponse { ok: true }))
 }
 
 /// GET /api/v1/scheduler/status

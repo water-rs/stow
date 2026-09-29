@@ -30,7 +30,7 @@ use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport, P
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
-    content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
+    IndexError, content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
 };
 use stow_types::records::{record_to_index_row, records_tag_rustc};
 use stow_types::registry::{GHCR_BASE, sha256_digest};
@@ -60,7 +60,7 @@ const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 const RECORDS_CERT_URL: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
 /// The `index.*`/`folded.*` pair is signed by the index workflow — the
 /// export verifies previous slices against it before folding on top.
-const INDEX_CERT_URL: &str = stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY;
+pub const INDEX_CERT_URL: &str = stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY;
 
 #[derive(Args)]
 pub struct IndexArgs {
@@ -278,7 +278,7 @@ pub async fn records_trust() -> stow_types::error::Result<stow_oci::verify::Trus
 /// `GHCR_BASE:tag` the publisher signed, so `identity_reference` is
 /// what verification compares — the same split the CLI's bundle and
 /// index verification makes.
-async fn verify_artifact(
+pub async fn verify_artifact(
     session: &stow_oci::RegistrySession,
     trust: &stow_oci::verify::Trust,
     reference: &oci_client::Reference,
@@ -362,34 +362,29 @@ impl PullContext {
                  re-export with --full"
             ));
         };
-        let index_reference = self
-            .base
-            .reference(&index_tag(target.as_str(), rustc_version.as_str()))?;
+        let itag = index_tag(target.as_str(), rustc_version.as_str());
+        let index_reference = self.base.reference(&itag)?;
         verify_artifact(
             &self.session,
             &self.trust,
             &index_reference,
-            &format!(
-                "{GHCR_BASE}:{}",
-                index_tag(target.as_str(), rustc_version.as_str())
-            ),
+            &format!("{GHCR_BASE}:{itag}"),
             &pulled_index.manifest_digest,
             INDEX_CERT_URL,
         )
         .await?;
-        if pulled_index.index.header.target != target
-            || pulled_index.index.header.rustc_version != rustc_version
-        {
+        let index = decode_published_slice(&index_reference, &rustc_version, &pulled_index.bytes)?;
+        if index.header.target != target || index.header.rustc_version != rustc_version {
             return Err(stow_error!(
                 "index.{target}.{rustc_version} carries header {}/{} — re-export with --full",
-                pulled_index.index.header.target,
-                pulled_index.index.header.rustc_version,
+                index.header.target,
+                index.header.rustc_version,
             ));
         }
         Ok(Some((
             (target, rustc_version),
             PrevSlice {
-                index: pulled_index.index,
+                index,
                 folded: pulled_folded.tags.into_iter().collect(),
             },
         )))
@@ -412,6 +407,25 @@ impl PullContext {
         .await?;
         Ok(pulled.records)
     }
+}
+
+/// `decode` a pulled published slice. The decoder stays strict — but a
+/// slice published in a format this reader predates is recoverable
+/// state, not corruption: a `--full` pass refolds every slice of that
+/// rustc from its records artifacts. The callers name that recovery —
+/// the workflow's `full` input plus the rustc the pass must run for.
+pub fn decode_published_slice(
+    reference: &oci_client::Reference,
+    rustc_version: &WireRustcVersion,
+    bytes: &[u8],
+) -> stow_types::error::Result<ArtifactIndex> {
+    decode(bytes).map_err(|error| match error {
+        IndexError::UnsupportedFormatVersion { .. } => stow_error!(
+            "decode index {reference}: {error}; \
+             re-export the slice with index-publish.yml `full: true` for rustc {rustc_version}"
+        ),
+        error => stow_error!("decode index {reference}: {error}"),
+    })
 }
 
 /// One slice's export output.
@@ -444,7 +458,7 @@ type PullFut<'a, T> =
 
 /// The `(target, rustc)` an `index.*` tag names — the same suffix shape
 /// [`folded_tag_parts`] splits, under the other half of the tag pair.
-fn index_tag_parts(tag: &str) -> Option<(&str, &str)> {
+pub fn index_tag_parts(tag: &str) -> Option<(&str, &str)> {
     tag.strip_prefix("index.")?.split_once('.')
 }
 
@@ -1459,7 +1473,7 @@ mod tests {
         // The transport pull reference the signature materials fetch
         // through — the value verification compared before the fix.
         let transport =
-            stow_oci::RegistryBase::parse("http://127.0.0.1:40123/v2/water-rs/stow-cache")
+            stow_oci::RegistryBase::parse("http://127.0.0.1:28123/v2/water-rs/stow-cache")
                 .expect("transport base")
                 .reference(&tag)
                 .expect("transport reference")

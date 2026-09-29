@@ -10,15 +10,13 @@
 //! - the manifest source: the `.crate` tarball from `static.crates.io`,
 //!   or the GitHub repo tree for the projects lane — a codeload tarball
 //!   plus each submodule's own tarball at the commit the parent tree
-//!   pins, unpacked into a [`MemoryVfs`]. A `Cargo.lock` a `.crate` ships
-//!   stays in place, so the resolve lands on the pins `cargo install
-//!   --locked` reproduces — the projects lane drops the committed
-//!   lockfile so its resolve lands on the latest semver-compatible
-//!   versions, as it did when the admin CLI ran `cargo metadata` locally;
-//!   the dropped lockfile travels into the session, where its registry
-//!   pins still admit the yanked versions they name and its git pins
-//!   lock each git dep to the sha they name — cargo's own lockfile
-//!   rules;
+//!   pins, unpacked into a [`MemoryVfs`]. Every lane drops the tree's
+//!   `Cargo.lock` — a `.crate`'s bundled lock and a repo's committed
+//!   one alike — so the resolve lands on the latest semver-compatible
+//!   versions; the dropped lockfile travels into the session, where its
+//!   registry pins still admit the yanked versions they name and its
+//!   git pins lock each git dep to the sha they name — cargo's own
+//!   lockfile rules;
 //! - the registry: cargo's sparse-index machinery over a [`worker::Fetch`]
 //!   transport, with the index `.cache` files persisting under the shared
 //!   in-memory cargo home for the whole request;
@@ -180,13 +178,10 @@ struct SourceWorkspace {
     /// may become tasks; a project checkout's members are sources only
     /// (`StowResolveInput::members_are_crates_io`).
     members_are_crates_io: bool,
-    /// Whether the tree carried a `Cargo.lock` into the resolve.
-    ships_lockfile: bool,
     /// Contents of the workspace root's `Cargo.lock`, dropped from the
     /// tree but carried into the resolve — its registry pins stay
     /// admissible while yanked and each git pin locks that dep's sha,
-    /// cargo's own lockfile rules. `None` for lanes that keep their
-    /// lockfile or never had one.
+    /// cargo's own lockfile rules. `None` when the tree never had one.
     dropped_lockfile: Option<String>,
 }
 
@@ -230,7 +225,7 @@ pub async fn expand_crate_request_on_targets(
     pool: &OutboundPool,
 ) -> Result<Vec<(TargetTriple, CrateRequestPlan)>, ResolverError> {
     let http = fetch_http(pool);
-    let source = crate_workspace(&http, crate_name, version, /* keep lockfile */ true).await?;
+    let source = crate_workspace(&http, crate_name, version).await?;
     // One resolve session for the whole fan-out: version selection and
     // index caches are shared across the per-target projections.
     let outputs = resolve_session_outputs(
@@ -262,19 +257,15 @@ pub struct SourceResolve {
     pub has_binary: bool,
     /// Whether the root package ships a library target.
     pub has_library: bool,
-    /// Whether the source shipped a `Cargo.lock` the resolve honored —
-    /// a `.crate`'s bundled lockfile; a project's committed one is
-    /// dropped before the resolve, so the flag reads `false` there.
-    pub ships_lockfile: bool,
     /// One task batch per requested target, in request order.
     pub targets: Vec<(TargetTriple, Vec<EnqueueRequest>)>,
 }
 
 /// The admin crate lane: resolve one published `.crate` into tasks. The
-/// tarball's bundled `Cargo.lock` stays in place — the `cargo install
-/// --locked` resolve — and the emitted tasks carry
-/// `preserve_lockfile: false` since the flag names the task crate's own
-/// lockfile, not the source's.
+/// tarball's bundled `Cargo.lock` is dropped like every other lane's —
+/// its pins survive only as the `dropped_lockfile` admission — and the
+/// emitted tasks carry `preserve_lockfile: false` since the runner
+/// drops the task crate's lockfile again at build time.
 ///
 /// # Errors
 /// [`ResolverError`] on fetch, parse, or resolution failures.
@@ -294,7 +285,7 @@ pub async fn resolve_crate(
         "resolve: crate lane begin"
     );
     let http = fetch_http(pool);
-    let source = crate_workspace(&http, crate_name, version, true).await?;
+    let source = crate_workspace(&http, crate_name, version).await?;
     source_resolve(
         &http,
         &source,
@@ -389,7 +380,6 @@ async fn source_resolve(
     Ok(SourceResolve {
         has_binary,
         has_library,
-        ships_lockfile: source.ships_lockfile,
         targets: batches,
     })
 }
@@ -401,7 +391,6 @@ async fn crate_workspace(
     http: &ResolveHttp,
     crate_name: &CrateName,
     version: &Version,
-    keep_lockfile: bool,
 ) -> Result<SourceWorkspace, ResolverError> {
     let url = format!("https://static.crates.io/crates/{crate_name}/{crate_name}-{version}.crate");
     tracing::info!(crate = %crate_name, %version, "resolve: source fetch begin");
@@ -417,7 +406,7 @@ async fn crate_workspace(
         ResolverError::Upstream(format!("unpack {crate_name}-{version}.crate: {error}"))
     })?;
     tracing::info!(crate = %crate_name, %version, files = files.len(), "resolve: source workspace built");
-    build_workspace(files, keep_lockfile, true)
+    build_workspace(files, true)
 }
 
 /// Download and unpack one GitHub repo tree — the codeload tarball
@@ -453,14 +442,13 @@ async fn github_workspace(
     for note in &tree.notes {
         tracing::warn!(repo, %note, "github tree fetch note");
     }
-    build_workspace(tree.files, false, false)
+    build_workspace(tree.files, false)
 }
 
 /// Lay the unpacked tree into a fresh [`MemoryVfs`], find the root
 /// manifest, and record the workspace's provenance.
 fn build_workspace(
     files: BTreeMap<PathBuf, Vec<u8>>,
-    keep_lockfile: bool,
     members_are_crates_io: bool,
 ) -> Result<SourceWorkspace, ResolverError> {
     let vfs = MemoryVfs::new();
@@ -476,14 +464,13 @@ fn build_workspace(
     let ws_root = manifest_rel
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
-    let ships_lockfile = keep_lockfile && files.contains_key(&ws_root.join("Cargo.lock"));
     // The workspace root's `Cargo.lock` travels into the resolve as
     // `dropped_lockfile` before it goes: the versions it pins stay
     // admissible even when the index yanked them, and each git dep
     // locks to the sha it names — which is what cargo itself does
     // with a lockfile in hand.
     let dropped_lockfile = match files.get(&ws_root.join("Cargo.lock")) {
-        Some(data) if !keep_lockfile => Some(
+        Some(data) => Some(
             std::str::from_utf8(data)
                 .map_err(|error| {
                     ResolverError::BadRequest(format!("workspace Cargo.lock is not UTF-8: {error}"))
@@ -493,11 +480,10 @@ fn build_workspace(
         _ => None,
     };
     for (path, data) in files {
-        // Every `Cargo.lock` under the selected workspace is dropped
-        // unless the lane asked to keep it — a lockfile nested in a
-        // member dir pins versions just as the root one does.
-        let is_ws_lockfile = !keep_lockfile
-            && path.file_name().and_then(|n| n.to_str()) == Some("Cargo.lock")
+        // Every `Cargo.lock` under the selected workspace is dropped —
+        // a lockfile nested in a member dir pins versions just as the
+        // root one does.
+        let is_ws_lockfile = path.file_name().and_then(|n| n.to_str()) == Some("Cargo.lock")
             && path.starts_with(&ws_root);
         if !is_ws_lockfile {
             vfs.insert(root.join(path), data);
@@ -508,7 +494,6 @@ fn build_workspace(
         manifest_path,
         cargo_home: PathBuf::from(CARGO_HOME_DIR),
         members_are_crates_io,
-        ships_lockfile,
         dropped_lockfile,
     })
 }
@@ -1329,9 +1314,9 @@ mod tests {
         ));
     }
 
-    /// Every `Cargo.lock` under the selected workspace is dropped unless
-    /// the lane asked to keep it — root and member-dir lockfiles alike —
-    /// while non-lock files survive untouched.
+    /// Every `Cargo.lock` under the selected workspace is dropped — root
+    /// and member-dir lockfiles alike — while non-lock files survive
+    /// untouched.
     #[test]
     fn build_workspace_drops_nested_lockfiles() {
         let files: BTreeMap<PathBuf, Vec<u8>> = [
@@ -1347,7 +1332,7 @@ mod tests {
         .into_iter()
         .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
         .collect();
-        let ws = build_workspace(files.clone(), false, false).unwrap();
+        let ws = build_workspace(files, false).unwrap();
         for lock in ["Cargo.lock", "crates/member/Cargo.lock"] {
             assert!(
                 ws.vfs
@@ -1365,21 +1350,11 @@ mod tests {
                 )
                 .is_ok()
         );
-
-        // The request lane's keep flag preserves the workspace root lock.
-        let kept = build_workspace(files, true, false).unwrap();
-        assert!(
-            kept.vfs
-                .read(Path::new(WORKSPACE_DIR).join("Cargo.lock").as_path())
-                .is_ok()
-        );
     }
 
     /// The dropped workspace-root `Cargo.lock` travels into the resolve
-    /// as `dropped_lockfile` contents; a lane that keeps the lockfile
-    /// leaves it in the tree for the previous-resolve path instead, and
-    /// a lockfile nested under a member dir is dropped without being
-    /// carried.
+    /// as `dropped_lockfile` contents; a lockfile nested under a member
+    /// dir is dropped without being carried.
     #[test]
     fn build_workspace_carries_dropped_lockfile() {
         let lockfile = concat!(
@@ -1401,14 +1376,10 @@ mod tests {
         .into_iter()
         .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
         .collect();
-        let ws = build_workspace(files.clone(), false, false).unwrap();
+        let ws = build_workspace(files, false).unwrap();
         let lockfile_path = Path::new(WORKSPACE_DIR).join("Cargo.lock");
         assert_eq!(ws.dropped_lockfile.as_deref(), Some(lockfile));
         assert!(!ws.vfs.exists(&lockfile_path));
-
-        let kept = build_workspace(files, true, false).unwrap();
-        assert!(kept.dropped_lockfile.is_none());
-        assert!(kept.vfs.exists(&lockfile_path));
     }
 
     /// `classify_resolve_failure` splits a resolve error on whether its
@@ -1434,7 +1405,7 @@ mod tests {
                         .into_iter()
                         .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
                         .collect();
-                let source = build_workspace(files, false, false).expect("workspace");
+                let source = build_workspace(files, false).expect("workspace");
                 source_resolve(&http, &source, &targets, &rustc_version, 0, None).await
             }
         };
@@ -1621,7 +1592,7 @@ mod tests {
         .into_iter()
         .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
         .collect();
-        let mut source = build_workspace(files, false, false).expect("workspace");
+        let mut source = build_workspace(files, false).expect("workspace");
         // On host the tarball unpack path is `std::fs` inside
         // `Entry::unpack_in`, so cargo home must be a real directory on a
         // real fs. Overlay it: paths under `cargo_home` route to `OsVfs`,
@@ -1794,7 +1765,7 @@ mod tests {
         .collect();
         let mut next_home = 0_u32;
         let mut make_source = || {
-            let mut source = build_workspace(files.clone(), false, false).expect("workspace");
+            let mut source = build_workspace(files.clone(), false).expect("workspace");
             next_home += 1;
             let cargo_home = std::env::temp_dir().join(format!(
                 "stow-index-share-cargo-home-{}-{next_home}",
@@ -2042,7 +2013,7 @@ mod tests {
         .into_iter()
         .map(|(path, data)| (PathBuf::from(path), data.as_bytes().to_vec()))
         .collect();
-        let mut source = build_workspace(files, false, false).expect("workspace");
+        let mut source = build_workspace(files, false).expect("workspace");
         // As in the host-units test: the unpack path is `std::fs` on host,
         // so cargo home overlays a real directory.
         let cargo_home =

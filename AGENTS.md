@@ -54,7 +54,7 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `inject.rs`: writes cached outputs back into Cargo target dirs.
   - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
 - `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/bundles/{digest}`, Cache API in front of the GHCR blob — no catalog lookup) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
-  - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, trusted admin/scheduler routes, public completion route.
+  - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, trusted admin/scheduler routes.
   - `worker_resolver.rs`: the request lane, preheat lanes and admin enqueue resolve — cargo's resolver (`stow-resolve`) over fetched manifests.
   - `dependency_resolver.rs`: miss derivation for admissions and the shared crates.io record helpers.
   - `db.rs`: D1 schema helpers and artifact-catalog queries.
@@ -275,7 +275,7 @@ claims to list every variable stow reads, so that claim is checkable and has to 
    - rustc_version
 2. Fast-fail on inconsistent cache identity or schema state.
 3. Prefer fixing root-cause identity/schema issues instead of adding fallbacks.
-4. Preserve the trusted CI -> D1 registration path.
+4. Preserve the trusted CI → signed GHCR records path; D1 is a mirror `index sync` fills from verified records.
 
 ## Current implementation notes
 - Scheduler queue identity must include `rustc_version` as well as `(crate, version, features_json, target)`.

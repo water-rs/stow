@@ -126,19 +126,18 @@ where
         None,
     );
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
-    let oci_digest = session
-        .put_manifest(&reference, &manifest_bytes)
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
-        })?;
+    let oci_digest = sign::put_signed_manifest(session, &reference, &manifest_bytes, |digest| {
+        sign(plan.oci_reference.clone(), digest)
+    })
+    .await
+    .map_err(|error| {
+        stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
+    })?;
     tracing::info!(
         oci_reference = %plan.oci_reference,
         digest = %oci_digest,
-        "pushed OCI artifact to GHCR"
+        "pushed and signed OCI artifact on GHCR"
     );
-
-    sign(plan.oci_reference.clone(), oci_digest.clone()).await?;
 
     let signatures = pull_signature_materials(session, &reference, &oci_digest).await?;
 

@@ -58,8 +58,7 @@ pub struct ResolveOptions {
     /// sources only (`members_are_crates_io`).
     pub members_are_crates_io: bool,
     /// Contents of the root `Cargo.lock` the caller dropped — yanked
-    /// admission + git pins. `None` when the tree's lockfile was kept
-    /// (crate lane) or never existed.
+    /// admission + git pins. `None` when the tree never had a lockfile.
     pub dropped_lockfile: Option<String>,
 }
 
@@ -73,10 +72,6 @@ pub struct SourceResolve {
     pub has_binary: bool,
     /// Whether a workspace member publishes a library target.
     pub has_library: bool,
-    /// Whether the source shipped a `Cargo.lock` the resolve honored —
-    /// a `.crate`'s bundled lockfile; a project's committed one is
-    /// dropped before the resolve, so the flag reads `false` there.
-    pub ships_lockfile: bool,
     /// One task batch per requested target, in request order.
     pub targets: Vec<(String, Vec<EnqueueRequest>)>,
 }
@@ -93,7 +88,7 @@ pub struct Resolver {
     /// shared across this session's resolves so index caches live
     /// across projects.
     cargo_home: PathBuf,
-    /// Real rustc binary this machine's toolchain resolves to.
+    /// Real rustc binary of the toolchain the session pins.
     rustc: PathBuf,
     /// The executable copied per family host as `rustc-shim-<host>` —
     /// `stow-admin`'s own binary in production, `stow-rustc-shim` in
@@ -118,17 +113,19 @@ pub struct Resolver {
 impl Resolver {
     /// A session with a fresh, session-owned `CARGO_HOME` — the default
     /// isolation the issue states ("an isolated `CARGO_HOME` per run that
-    /// the process owns"). `shim_source` is the executable copied per
-    /// family host as `rustc-shim-<host>` — it must dispatch a
-    /// `rustc-shim-*` `argv[0]` to [`crate::shim::run`].
+    /// the process owns"). `rustc_version` names the rustup toolchain the
+    /// session probes — the rustc every task the session emits pins —
+    /// and `shim_source` is the executable copied per family host as
+    /// `rustc-shim-<host>`: it must dispatch a `rustc-shim-*` `argv[0]`
+    /// to [`crate::shim::run`].
     ///
     /// # Errors
-    /// No rustc on PATH, or toolchain probing failed.
-    pub fn new(shim_source: PathBuf) -> CargoResult<Self> {
+    /// `rustc_version`'s toolchain is not installed, or probing failed.
+    pub fn new(rustc_version: &WireRustcVersion, shim_source: PathBuf) -> CargoResult<Self> {
         let dir = tempfile::tempdir().context("resolver scratch dir")?;
         let cargo_home = dir.path().join("cargo-home");
         std::fs::create_dir_all(&cargo_home).context("cargo home")?;
-        Self::setup(dir, cargo_home, shim_source)
+        Self::setup(dir, cargo_home, rustc_version, shim_source)
     }
 
     /// A session whose `CARGO_HOME` is a caller-owned directory — still
@@ -137,33 +134,49 @@ impl Resolver {
     /// resolves. The directory is created if absent; the caller owns
     /// its lifecycle (concurrent writers must serialize themselves —
     /// cargo's own file locks arbitrate within the directory).
-    /// `shim_source` is as [`Resolver::new`]'s.
+    /// `rustc_version` and `shim_source` are as [`Resolver::new`]'s.
     ///
     /// # Errors
     /// Directory creation or toolchain probing failures.
-    pub fn with_cargo_home(cargo_home: PathBuf, shim_source: PathBuf) -> CargoResult<Self> {
+    pub fn with_cargo_home(
+        cargo_home: PathBuf,
+        rustc_version: &WireRustcVersion,
+        shim_source: PathBuf,
+    ) -> CargoResult<Self> {
         std::fs::create_dir_all(&cargo_home).context("cargo home")?;
         let dir = tempfile::tempdir().context("resolver scratch dir")?;
-        Self::setup(dir, cargo_home, shim_source)
+        Self::setup(dir, cargo_home, rustc_version, shim_source)
     }
 
     fn setup(
         dir: tempfile::TempDir,
         cargo_home: PathBuf,
+        rustc_version: &WireRustcVersion,
         shim_source: PathBuf,
     ) -> CargoResult<Self> {
-        // `rustup which rustc` resolves the active toolchain's real
-        // binary — the `rustc` on PATH may itself be a rustup proxy,
-        // and `rustc -vV` through the proxy resolves a *default*
-        // toolchain that is not necessarily what `cargo` would see.
-        let rustc = std::process::Command::new("rustup")
-            .args(["which", "rustc"])
+        // The session probes the toolchain its tasks pin, never
+        // whichever rustc happens to be active: `rustup which
+        // --toolchain` resolves that toolchain's real binary, and
+        // `RUSTUP_AUTO_INSTALL=0` keeps an absent toolchain a failure
+        // instead of a download.
+        let requested = rustc_version.as_str();
+        let output = std::process::Command::new("rustup")
+            .args(["which", "--toolchain", requested, "rustc"])
+            .env("RUSTUP_AUTO_INSTALL", "0")
             .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
-            .filter(|path| path.exists())
-            .unwrap_or_else(|| PathBuf::from("rustc"));
+            .with_context(|| format!("run rustup which --toolchain {requested} rustc"))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "rustup has no toolchain for `{requested}` — install it with \
+             `rustup toolchain install {requested}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let rustc = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        anyhow::ensure!(
+            rustc.is_file(),
+            "rustup resolved `{requested}`'s rustc to {}, which is not a file",
+            rustc.display()
+        );
         let output = std::process::Command::new(&rustc)
             .arg("-vV")
             .output()
@@ -185,6 +198,15 @@ impl Resolver {
             .find_map(|line| line.strip_prefix("release: "))
             .map(str::trim)
             .context("rustc -vV reports no release")?;
+        // The toolchain that answered must *be* the pinned release — a
+        // custom-linked toolchain or a stale rustup dir that reports
+        // anything else gives the tasks facts from a different compiler.
+        anyhow::ensure!(
+            release == requested,
+            "rustc `{requested}` resolves to {} reporting release {release} — \
+             the toolchain's release must equal the pinned version",
+            rustc.display()
+        );
         let version = semver::Version::parse(release)
             .with_context(|| format!("rustc release `{release}` is not semver"))?;
         info!(?rustc, %host_triple, %version, ?cargo_home, "resolver session");
@@ -215,8 +237,8 @@ impl Resolver {
         Ok(session)
     }
 
-    /// The toolchain's release version — the `rustc_version` callers
-    /// stamp on tasks.
+    /// The pinned toolchain's release — verified to equal the
+    /// `rustc_version` the session was constructed for.
     #[must_use]
     pub const fn version(&self) -> &semver::Version {
         &self.version
@@ -283,7 +305,13 @@ impl Resolver {
             .to_str()
             .with_context(|| format!("shim path `{}` is not UTF-8", shim.display()))?;
         let mut gctx = GlobalContext::new(Shell::new(), cwd.to_path_buf(), self.cargo_home.clone());
-        let target_dir = Some(self.dir.path().join("target").join(host.replace('/', "_")));
+        // cargo persists the family's rustc probe facts in
+        // `<target dir>/.rustc_info.json`; the dir must exist before
+        // the context is handed it, or every resolve re-probes.
+        let target_dir = self.dir.path().join("target").join(host.replace('/', "_"));
+        std::fs::create_dir_all(&target_dir)
+            .with_context(|| format!("create target dir {}", target_dir.display()))?;
+        let target_dir = Some(target_dir);
         gctx.configure(
             0,
             false,
@@ -405,8 +433,10 @@ impl Resolver {
     }
 
     /// The admin crate lane: resolve one published `.crate` into
-    /// per-target task batches. The tarball's bundled `Cargo.lock`
-    /// stays in place — the `cargo install --locked` resolve.
+    /// per-target task batches. The tarball's bundled `Cargo.lock` is
+    /// dropped like every other lane's — its pins survive only as
+    /// `dropped_lockfile` admission, and the resolve lands on the
+    /// latest semver-compatible versions.
     ///
     /// # Errors
     /// Fetch, manifest, resolve, or emission failures.
@@ -418,15 +448,10 @@ impl Resolver {
         rustc_version: &WireRustcVersion,
         downloads: u64,
     ) -> CargoResult<SourceResolve> {
-        let (outputs, ships_lockfile) = self
+        let outputs = self
             .resolve_crate_units(crate_name, version, &ResolveOptions::default(), targets)
             .await?;
-        Ok(Self::source_resolve(
-            ships_lockfile,
-            &outputs,
-            rustc_version,
-            downloads,
-        ))
+        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
     }
 
     /// Resolve one published `.crate` into its raw per-target unit
@@ -444,21 +469,38 @@ impl Resolver {
         version: &semver::Version,
         opts: &ResolveOptions,
         targets: &[String],
-    ) -> CargoResult<(Vec<(String, StowResolveOutput)>, bool)> {
+    ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
         let dir = self
             .dir
             .path()
             .join(format!("crate-{crate_name}-{version}"));
         std::fs::create_dir_all(&dir).context("crate dir")?;
         let package_dir = crate::fetch::fetch_crate(crate_name, version, &dir).await?;
-        let manifest = package_dir.join("Cargo.toml");
-        let ships_lockfile = package_dir.join("Cargo.lock").exists();
+        self.resolve_package_dir(&package_dir, opts, targets)
+    }
+
+    /// The post-fetch half of [`Resolver::resolve_crate_units`], split
+    /// out so a test can drive it on a fixture package dir: the
+    /// unpacked tree's bundled `Cargo.lock` is dropped exactly like
+    /// [`Resolver::resolve_git`]'s checkout — every lane resolves at
+    /// the latest semver-compatible versions, the lockfile's pins
+    /// surviving only as `dropped_lockfile` admission.
+    ///
+    /// # Errors
+    /// Manifest, resolve, or emission failures.
+    pub fn resolve_package_dir(
+        &self,
+        package_dir: &Path,
+        opts: &ResolveOptions,
+        targets: &[String],
+    ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
+        let tree = crate::fetch::prepare_project_tree(package_dir, true)?;
         let opts = ResolveOptions {
             members_are_crates_io: true,
+            dropped_lockfile: tree.dropped_lockfile,
             ..opts.clone()
         };
-        let outputs = self.resolve(&manifest, &opts, targets)?;
-        Ok((outputs, ships_lockfile))
+        self.resolve(&tree.manifest_path, &opts, targets)
     }
 
     /// The admin projects lane: fetch a git tree (any https host,
@@ -488,18 +530,12 @@ impl Resolver {
             ..ResolveOptions::default()
         };
         let outputs = self.resolve(&tree.manifest_path, &opts, targets)?;
-        Ok(Self::source_resolve(
-            false,
-            &outputs,
-            rustc_version,
-            downloads,
-        ))
+        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
     }
 
     /// `source_resolve` parity: per-target unit outputs → per-target
     /// enqueue batches, plus the lane's publish-shape flags.
     fn source_resolve(
-        ships_lockfile: bool,
         outputs: &[(String, StowResolveOutput)],
         rustc_version: &WireRustcVersion,
         downloads: u64,
@@ -524,7 +560,6 @@ impl Resolver {
         SourceResolve {
             has_binary,
             has_library,
-            ships_lockfile,
             targets: batches,
         }
     }

@@ -107,10 +107,11 @@ impl std::error::Error for GlibcVersionParseError {}
 /// The glibc floor the Linux builder promises every served ELF —
 /// the `manylinux_2_28` / RHEL 8 baseline, `2.28`.
 ///
-/// The publish stage refuses to register an artifact whose measured
-/// floor exceeds it, and `stow-admin index backfill-min-glibc`
-/// enqueues a rebuild for every stored row above it. Named once here
-/// so the two checks can never drift on separate literals.
+/// The publish stage refuses to publish an artifact whose measured
+/// floor exceeds it (`ci/src/main.rs`), and `stow-admin index report`
+/// drops the above-baseline rows a stored slice still carries
+/// (`admin/src/index_cmd.rs`). Named once here so the two checks can
+/// never drift on separate literals.
 pub const GLIBC_BASELINE: GlibcVersion = GlibcVersion {
     major: 2,
     minor: 28,

@@ -5,8 +5,8 @@ use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use stow_types::bundle::sigstore_signature_tag;
 use stow_types::index::{
-    ArtifactIndex, STOW_FOLDED_CONFIG_MEDIA_TYPE, STOW_FOLDED_MEDIA_TYPE,
-    STOW_INDEX_CONFIG_MEDIA_TYPE, STOW_INDEX_MEDIA_TYPE, decode, folded_tag, index_tag,
+    STOW_FOLDED_CONFIG_MEDIA_TYPE, STOW_FOLDED_MEDIA_TYPE, STOW_INDEX_CONFIG_MEDIA_TYPE,
+    STOW_INDEX_MEDIA_TYPE, folded_tag, index_tag,
 };
 use stow_types::registry::{GHCR_BASE, sha256_digest};
 
@@ -247,27 +247,29 @@ pub async fn publish_index(
         .await
         .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
-    let manifest_digest = session
-        .put_manifest(&parsed_reference, &manifest_bytes)
+    let manifest_digest =
+        sign::put_signed_manifest(&session, &parsed_reference, &manifest_bytes, |digest| {
+            let reference = &reference;
+            async move { sign::sign_artifact(reference, &digest, credentials).await }
+        })
         .await
         .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
     tracing::info!(
         %reference,
         digest = %manifest_digest,
-        "pushed artifact index to GHCR"
+        "pushed and signed artifact index on GHCR"
     );
-
-    sign::sign_artifact(&reference, &manifest_digest, credentials).await?;
 
     Ok(IndexPublishOutcome::Published { manifest_digest })
 }
 
-/// A published index slice pulled back: the decoded rows plus the
-/// manifest digest the puller verifies a signature for.
+/// A published index slice pulled back: the raw layer bytes plus the
+/// manifest digest the puller verifies a signature for. Decode is the
+/// caller's — it owns the recovery an unreadable format names.
 #[derive(Debug)]
 pub struct PulledIndex {
-    /// The decoded slice.
-    pub index: ArtifactIndex,
+    /// The slice's encoded body.
+    pub bytes: Vec<u8>,
     /// Digest of the manifest the tag resolved to — the input to
     /// `pull_signature_materials`.
     pub manifest_digest: String,
@@ -279,7 +281,7 @@ pub struct PulledIndex {
 /// # Errors
 ///
 /// Returns an error when the pull fails, the manifest is malformed for an
-/// index artifact, or the layer fails its digest check or decodes wrong.
+/// index artifact, or the layer fails its digest check.
 pub async fn pull_index(
     session: &RegistrySession,
     base: &RegistryBase,
@@ -310,10 +312,8 @@ pub async fn pull_index(
         ));
     }
     let bytes = pull_blob_verified(session, descriptor).await?;
-    let index = decode(&bytes)
-        .map_err(|error| stow_types::stow_error!("decode index layer of {reference}: {error}"))?;
     Ok(Some(PulledIndex {
-        index,
+        bytes,
         manifest_digest,
     }))
 }
@@ -440,17 +440,18 @@ pub async fn publish_folded(
         .push_blob(&sha256_digest(&config.data), &config.data)
         .await
         .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;
-    let manifest_digest = session
-        .put_manifest(&parsed_reference, &manifest_bytes)
+    let manifest_digest =
+        sign::put_signed_manifest(&session, &parsed_reference, &manifest_bytes, |digest| {
+            let reference = &reference;
+            async move { sign::sign_artifact(reference, &digest, credentials).await }
+        })
         .await
         .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;
     tracing::info!(
         %reference,
         digest = %manifest_digest,
-        "pushed folded set to GHCR"
+        "pushed and signed folded set on GHCR"
     );
-
-    sign::sign_artifact(&reference, &manifest_digest, credentials).await?;
 
     Ok(IndexPublishOutcome::Published { manifest_digest })
 }

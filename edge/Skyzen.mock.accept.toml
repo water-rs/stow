@@ -5,7 +5,7 @@ compatibility_date = "2025-02-01"
 workers_dev = false
 
 [cloudflare.vars]
-GHCR_BASE_URL = "http://127.0.0.1:40123/v2/water-rs/stow-cache"
+GHCR_BASE_URL = "http://127.0.0.1:28123/v2/water-rs/stow-cache"
 GITHUB_REPO = "water-rs/stow"
 # Any value works locally — trusted calls use the developer's GitHub
 # user token; the audience pin only binds OIDC credentials.

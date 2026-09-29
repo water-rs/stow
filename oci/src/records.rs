@@ -114,8 +114,10 @@ where
     );
     manifest.artifact_type = Some(RECORDS_ARTIFACT_TYPE.to_owned());
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
-    let manifest_digest = session
-        .put_manifest(&reference, &manifest_bytes)
+    let manifest_digest =
+        sign::put_signed_manifest(session, &reference, &manifest_bytes, |digest| {
+            sign(reference.to_string(), digest)
+        })
         .await
         .map_err(|error| stow_types::stow_error!("push records manifest {reference}: {error}"))?;
     tracing::info!(
@@ -123,9 +125,8 @@ where
         digest = %manifest_digest,
         task_id,
         records = records.len(),
-        "pushed records artifact"
+        "pushed and signed records artifact"
     );
-    sign(reference.to_string(), manifest_digest.clone()).await?;
     Ok(RecordsPublishOutcome {
         tag,
         oci_reference: reference.to_string(),
