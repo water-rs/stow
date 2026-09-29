@@ -817,12 +817,6 @@ struct TopMissedRow {
     top_missed: Vec<String>,
 }
 
-/// The `FORMAT JSON` envelope the SQL API wraps result rows in.
-#[derive(Debug, serde::Deserialize)]
-struct AnalyticsResponse {
-    data: Vec<TopMissedRow>,
-}
-
 /// Run the top-missed query against the Analytics Engine SQL API.
 /// `CF_ACCOUNT_ID` and `CF_ANALYTICS_TOKEN` (an API token with
 /// `Account Analytics: Read`) are both required.
@@ -843,7 +837,7 @@ async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMisse
         .error_for_status()
         .await
         .map_err(|error| stow_error!("query Analytics Engine: {error}"))?;
-    let envelope: AnalyticsResponse = response
+    let envelope: stow_types::analytics::Envelope<TopMissedRow> = response
         .into_json()
         .await
         .map_err(|error| stow_error!("parse Analytics Engine response: {error}"))?;

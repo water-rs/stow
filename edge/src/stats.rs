@@ -12,6 +12,7 @@
 //! extractors and the SQL API calls are wasm-only.
 
 use serde::Deserialize;
+use stow_types::analytics;
 use stow_types::api::{UsageStatEntry, UsageStats};
 
 /// Header the CLI sets on every edge request when `STOW_NO_ANALYTICS=1`.
@@ -67,56 +68,36 @@ const MIN_PUBLISHABLE_INSTALLS: f64 = 20.0;
 /// day's installs distinct, so the average is install-days over days.
 const INSTALL_WINDOW_DAYS: f64 = 7.0;
 
-/// The Analytics Engine `FORMAT JSON` envelope: rows arrive under `data`,
-/// each an object keyed by the query's column aliases.
-#[derive(Debug, Deserialize)]
-struct SqlEnvelope<T> {
-    data: Vec<T>,
-}
-
-/// ClickHouse-style `FORMAT JSON` quotes 64-bit integers, so every numeric
-/// column accepts either a JSON number or its string form.
-fn de_f64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Number {
-        Float(f64),
-        Quoted(String),
-    }
-    match Number::deserialize(deserializer)? {
-        Number::Float(value) => Ok(value),
-        Number::Quoted(text) => text.parse().map_err(serde::de::Error::custom),
-    }
-}
-
-/// One row of [`EVENTS_SQL`].
+/// One row of [`EVENTS_SQL`]. `sumIf` over `double*` is `Float64`.
 #[derive(Debug, Deserialize)]
 struct EventsRow {
-    #[serde(deserialize_with = "de_f64")]
+    #[serde(deserialize_with = "analytics::de_f64")]
     hits_24h: f64,
-    #[serde(deserialize_with = "de_f64")]
+    #[serde(deserialize_with = "analytics::de_f64")]
     hit_compile_millis_30d: f64,
 }
 
-/// One row of [`INSTALLS_SQL`].
+/// One row of [`INSTALLS_SQL`]. `count(DISTINCT …)` is a `UInt64`,
+/// which `FORMAT JSON` quotes.
 #[derive(Debug, Deserialize)]
 struct InstallsRow {
-    #[serde(deserialize_with = "de_f64")]
-    install_days_7d: f64,
+    #[serde(deserialize_with = "analytics::de_u64")]
+    install_days_7d: u64,
 }
 
-/// One row of [`MISSES_SQL`].
+/// One row of [`MISSES_SQL`]. `count()` is a `UInt64`.
 #[derive(Debug, Deserialize)]
 struct MissesRow {
-    #[serde(deserialize_with = "de_f64")]
-    misses_24h: f64,
+    #[serde(deserialize_with = "analytics::de_u64")]
+    misses_24h: u64,
 }
 
-/// One row of a leaderboard query — `(name, scaled hits)`.
+/// One row of a leaderboard query — `(name, scaled hits)`; `sum` over
+/// `double1` is `Float64`.
 #[derive(Debug, Deserialize)]
 struct LeaderboardRow {
     name: String,
-    #[serde(deserialize_with = "de_f64")]
+    #[serde(deserialize_with = "analytics::de_f64")]
     hits: f64,
 }
 
@@ -139,7 +120,7 @@ fn usage_stats_from_rows(
     cli_versions: Vec<LeaderboardRow>,
 ) -> UsageStats {
     let hits_24h = events.hits_24h.round() as u64;
-    let misses_24h = misses.misses_24h.round() as u64;
+    let misses_24h = misses.misses_24h;
     let served_24h = hits_24h + misses_24h;
     let hit_rate_24h = if served_24h == 0 {
         0.0
@@ -147,7 +128,7 @@ fn usage_stats_from_rows(
         hits_24h as f64 / served_24h as f64
     };
     let cpu_hours_saved_30d = events.hit_compile_millis_30d / 3_600_000.0;
-    let daily_installs = installs.install_days_7d / INSTALL_WINDOW_DAYS;
+    let daily_installs = installs.install_days_7d as f64 / INSTALL_WINDOW_DAYS;
     let daily_active_installs_7d =
         (daily_installs >= MIN_PUBLISHABLE_INSTALLS).then(|| daily_installs.round() as u64);
     let entries = |rows: Vec<LeaderboardRow>| {
@@ -255,7 +236,7 @@ mod worker {
                 format!("stats query failed: {status} {body}"),
             ));
         }
-        let envelope: super::SqlEnvelope<T> =
+        let envelope: stow_types::analytics::Envelope<T> =
             response.json().into_send().await.map_err(|error| {
                 crate::errors::GetArtifactError::InternalWithMessage(format!(
                     "decode stats query result: {error}"
@@ -348,9 +329,9 @@ mod tests {
                 hit_compile_millis_30d: 3_600_000.0 * 2.5,
             },
             &InstallsRow {
-                install_days_7d: 19.0 * 7.0,
+                install_days_7d: 19 * 7,
             },
-            &MissesRow { misses_24h: 100.6 },
+            &MissesRow { misses_24h: 101 },
             vec![leaderboard("serde", 99.5)],
             vec![leaderboard("x86_64-unknown-linux-gnu", 1_000.0)],
             vec![leaderboard("0.5.0", 42.0)],
@@ -376,9 +357,9 @@ mod tests {
                 hit_compile_millis_30d: 0.0,
             },
             &InstallsRow {
-                install_days_7d: 20.0 * 7.0,
+                install_days_7d: 20 * 7,
             },
-            &MissesRow { misses_24h: 0.0 },
+            &MissesRow { misses_24h: 0 },
             Vec::new(),
             Vec::new(),
             Vec::new(),
