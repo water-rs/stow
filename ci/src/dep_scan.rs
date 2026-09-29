@@ -1553,6 +1553,87 @@ mod tests {
         assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
 
+    /// The `x86_64-pc-windows-msvc` production collision this fix is scoped
+    /// to: a build-dependency unit captured by `cargo check` and `cargo
+    /// build` under the `--target` spelling — same invocation, same stable
+    /// `c_metadata`, same `["dep-info","link","metadata"]` emit — whose rlib
+    /// digest differed only by a phase-dir path embedded in its COFF
+    /// members' `CodeView` `S_OBJNAME`. That embed is fixed at the source (the
+    /// wrapper now appends the target-dir remap the rustflag boundary
+    /// drops), so genuinely different bytes under one key must still read
+    /// as a forged or colliding record.
+    #[test]
+    fn same_invocation_records_with_different_rlib_bytes_still_fail() {
+        let key = (
+            "unicode_ident".to_owned(),
+            "788c0f768456711f".to_owned(),
+            ArtifactKind::Rlib.as_str().to_owned(),
+            "[\"dep-info\",\"link\",\"metadata\"]".to_owned(),
+            Some(UnitInvocation::Target),
+        );
+        let mut selected = BTreeMap::new();
+        let package = IndexedPackage {
+            name: "unicode_ident".to_owned(),
+            version: semver::Version::parse("1.0.26").expect("version"),
+            lib_target_name: "unicode_ident".to_owned(),
+            crate_types: vec![RustCrateType::Rlib],
+            features: BTreeSet::new(),
+            registry: true,
+        };
+        let mut check_capture = captured(
+            "unicode_ident",
+            "788c0f768456711f",
+            "C:\\run\\target-check-target\\debug\\deps",
+        );
+        check_capture.target = Some("x86_64-pc-windows-msvc".to_owned());
+        check_capture.emit = vec![
+            "dep-info".to_owned(),
+            "link".to_owned(),
+            "metadata".to_owned(),
+        ];
+        check_capture.outputs.push(CapturedRustcOutput {
+            kind: CapturedRustcOutputKind::Rlib,
+            path: PathBuf::from(
+                "C:\\run\\target-check-target\\debug\\deps\\libunicode_ident-788c0f768456711f.rlib",
+            ),
+            snapshot_path: None,
+            sha256: "aa".repeat(32),
+        });
+        let mut build_capture = check_capture.clone();
+        build_capture.out_dir = PathBuf::from("C:\\run\\target-build-target\\debug\\deps");
+        build_capture.target_dir = PathBuf::from("C:\\run\\target-build-target");
+        build_capture.outputs.iter_mut().for_each(|output| {
+            output.path = PathBuf::from(
+                output
+                    .path
+                    .to_string_lossy()
+                    .replace("target-check-target", "target-build-target"),
+            );
+        });
+        // The rlib's .obj members embedded the phase's real CARGO_TARGET_DIR
+        // (S_OBJNAME), so the build phase's rlib hashes differently even
+        // though the unit is identical; the rmeta carried nothing
+        // path-dependent and keeps its digest.
+        build_capture.outputs[1].sha256 = "bb".repeat(32);
+        let first = SelectedCapturedArtifact {
+            package: package.clone(),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: check_capture,
+            dependency_aliases: Vec::new(),
+        };
+        let second = SelectedCapturedArtifact {
+            package,
+            artifact_kind: ArtifactKind::Rlib,
+            captured: build_capture,
+            dependency_aliases: Vec::new(),
+        };
+
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second)
+            .expect_err("different rlib bytes under one key must fail");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
+    }
+
     /// A second record under one key whose compile key differs is a
     /// genuinely different unit, not another capture of the same one.
     #[test]

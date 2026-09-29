@@ -14,7 +14,7 @@ use zenwave::{Client, ResponseExt};
 use crate::capture::{
     CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
     STOW_BUILD_CONSUME_STORE_ENV, STOW_BUILD_LINK_ARG_CROSS_ENV, STOW_BUILD_LINK_ARG_ENV,
-    STOW_BUILD_WRAPPER_CRATE_NAME_ENV, StowCaptureCommand,
+    STOW_BUILD_TARGET_DIR_REMAP_ENV, STOW_BUILD_WRAPPER_CRATE_NAME_ENV, StowCaptureCommand,
 };
 use crate::consume;
 use crate::retry::retry_with_backoff;
@@ -31,6 +31,11 @@ const STOW_PROBE_FORBIDDEN_PATH_ENV: &str = "STOW_PROBE_FORBIDDEN_PATH";
 /// disambiguates its units from any same-named registry dependency at
 /// capture time, so the name itself only needs to be legible.
 pub const WRAPPER_PACKAGE_NAME: &str = "stow-ci-wrapper";
+
+/// The virtual root every phase's `CARGO_TARGET_DIR` remaps to — one value
+/// shared by the rustflags string and the wrapper env so the two can never
+/// drift.
+const TARGET_DIR_VIRTUAL_ROOT: &str = "stow-ci://target";
 
 /// The crates.io registry `source` lockfile entries and dependency
 /// references share.
@@ -801,11 +806,17 @@ async fn run_sandboxed_phase(
     // aborts the build as a forged duplicate. Remapping every phase's
     // target dir to one virtual root makes the outputs byte-identical, the
     // same determinism remap of the workspace root already gives sources.
+    // The rustflags carry the flag only as far as the host/target boundary —
+    // under `--target` host units never see it — so it also travels through
+    // STOW_BUILD_TARGET_DIR_REMAP for the wrapper to append to every rustc
+    // argv the boundary drops it from (MSVC CodeView S_OBJNAME embeds the
+    // object's own absolute output path; without the remap the two phase
+    // dirs hash differently on Windows even though the unit is identical).
     let rustflags = format!(
         "{} --remap-path-prefix={}={}",
         setup.rustflags,
         target_dir.display(),
-        "stow-ci://target"
+        TARGET_DIR_VIRTUAL_ROOT
     );
 
     let mut command = run
@@ -837,6 +848,7 @@ async fn run_sandboxed_phase(
     // records its units as observed so nothing forged under its name slips
     // in, but it is never a publishable artifact.
     command = command.env(STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME);
+    command = command.env(STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT);
     // A linux-gnu task's units link with mold, and the pin is part of what
     // the compile key records, so it is a choice the builder makes — the
     // workflow installs mold — not an observation of whatever linker the
