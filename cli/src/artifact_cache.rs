@@ -1111,6 +1111,25 @@ struct ObservedDepIdentityRow {
     kind_json: String,
 }
 
+/// Every `(crate_name, crate_version, target)` the local artifact cache
+/// holds for this rustc — one query per build so the serve map can name
+/// the pairs a local lookup could answer (stow#347).
+pub async fn locally_covered_units(
+    config: &StowConfig,
+    rustc_version: &str,
+) -> stow_types::error::Result<Vec<(String, String, String)>> {
+    let connection = config.state_db_pool().await?;
+    sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(
+        "SELECT crate_name, crate_version, target \
+         FROM artifact_cache_entries \
+         WHERE rustc_version = ?",
+    ))
+    .bind(rustc_version)
+    .fetch_all(&connection)
+    .await
+    .wrap_err("read locally covered crate units")
+}
+
 pub async fn resolve_dependency_c_metadata_json(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,

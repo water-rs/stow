@@ -31,6 +31,7 @@ mod cli_args;
 mod commands;
 mod config;
 mod edge_client;
+mod facade;
 mod fetch;
 mod index;
 mod inject;
@@ -82,7 +83,7 @@ use stow_types::api::DependencyGraphEntry;
 const STOW_EXPANDED_GRAPH_ENV: &str = "STOW_EXPANDED_GRAPH_JSON";
 pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JSON";
 pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC_FALLBACK";
-const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
+pub(crate) const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
 /// When set to a path, stow writes a Chrome-trace JSON to that file describing
 /// every instrumented span (`stow.startup`, `stow.project.context`,
 /// `stow.edge.graph.query`, `stow.wrapper.invoke`, ...). Open the file with
@@ -111,6 +112,17 @@ struct TracingGuard {
 /// Returns an error when the tokio runtime cannot be built or when the
 /// selected subcommand fails.
 pub fn run() -> stow_types::error::Result<()> {
+    if let Some(status) = delegate_to_capture()? {
+        std::process::exit(status);
+    }
+    // An uncovered rustc invocation needs no runtime: the serve map the
+    // driver built answers the decision, and the compile's bookkeeping is
+    // two one-way frames. Everything the runtime would buy — the provider
+    // install, tracing, the tokio stack — is the per-invocation cost this
+    // build pays hundreds of times.
+    if let facade::FastPath::Handled(status) = facade::try_invocation()? {
+        std::process::exit(status);
+    }
     // `sigstore`'s `sigstore-trust-root` feature pulls `tough`, which depends
     // on `rustls` with default features — that compiles in `aws_lc_rs`
     // alongside the `ring` provider selected by `zenwave`, `sqlx`, and
@@ -121,9 +133,6 @@ pub fn run() -> stow_types::error::Result<()> {
         .install_default()
         .map_err(|_| stow_types::error::Error::msg("install ring CryptoProvider"))?;
     let _tracing_guard = should_install_tracing().then(install_tracing);
-    if let Some(status) = delegate_to_capture()? {
-        std::process::exit(status);
-    }
     let runtime = if is_wrapper_invocation() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -166,7 +175,7 @@ const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// the wrapper names (the shims are this executable, symlinked on Unix and
 /// copied on Windows) parses the `rustc`/`cc` subcommand line that name
 /// stands for.
-fn process_args() -> Vec<OsString> {
+pub(crate) fn process_args() -> Vec<OsString> {
     expand_wrapper_role(strip_cargo_subcommand_word(std::env::args_os().collect()))
 }
 
@@ -342,8 +351,13 @@ async fn run_passthrough_status(
 /// CI's copy of that dependency while cargo passes the local copy, and
 /// rustc rejects the pair outright (E0460/E0463) — the build fails rather
 /// than merely running slower.
-fn must_build_locally(parsed: &rustc_args::ParsedRustcArgs, target: &str) -> bool {
-    let Some(dependency) = provenance::locally_built_dependency(target, &parsed.extern_crates)
+fn must_build_locally(
+    parsed: &rustc_args::ParsedRustcArgs,
+    target: &str,
+    policy_dir: Option<&Path>,
+) -> bool {
+    let Some(dependency) =
+        provenance::locally_built_dependency(policy_dir, target, &parsed.extern_crates)
     else {
         return false;
     };
@@ -397,11 +411,21 @@ impl PostCompile {
 /// metadata, which happens while rustc is still finishing, so a marker
 /// written afterwards arrives too late to stop the consumer from taking a
 /// cached artifact that was compiled against a different copy.
-async fn compile(executable: &OsString, parsed: &rustc_args::ParsedRustcArgs) -> Outcome {
-    if let Some(target) = cache_policy::effective_target(parsed) {
+///
+/// The marker's target key — the unit's own compile target: the spelled
+/// `--target`, else the host triple this build's rustc compiles for. A
+/// dependent checks under its own target the same way, so a host-side
+/// unit on a `--target` build marks and is found under the host triple.
+async fn compile(
+    executable: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+    mark_target: Option<&str>,
+    policy_dir: Option<&Path>,
+) -> Outcome {
+    if let Some(target) = mark_target {
         log_nonfatal_result(
             "failed to record a locally built crate for this build",
-            provenance::record_local_build(&target, &parsed.crate_name).await,
+            provenance::record_local_build(policy_dir, target, &parsed.crate_name).await,
         );
     }
     Outcome::Compile(Box::new(PostCompile {
@@ -419,12 +443,16 @@ async fn compile(executable: &OsString, parsed: &rustc_args::ParsedRustcArgs) ->
 ///
 /// # Errors
 ///
-/// Only the build-script alias materialization, which is load-bearing for
-/// cargo; everything else is best effort and logged.
+/// Only the build-script output check — it cannot write what it checks,
+/// because cargo owns `build-script-build`: stow copying onto a path
+/// cargo may already have hardlinked to the source turns `fs::copy`'s
+/// truncate into a zeroed shared inode (stow#347). Everything else is
+/// best effort and logged.
 async fn finish_rustc_compile(
     post: &PostCompile,
     success: bool,
     local_base: Option<&WrapperEnvBase>,
+    ctx: &BuildContext,
 ) -> stow_types::error::Result<Option<artifact_cache::LocalBuildArtifact>> {
     let Some(parsed) = post.parsed.as_ref() else {
         return Ok(None);
@@ -432,7 +460,8 @@ async fn finish_rustc_compile(
     let mut artifact = None;
     if success {
         if let Some(base) = local_base {
-            match resolve_local_build_artifact(base, parsed).await {
+            match resolve_local_build_artifact(base, parsed, ctx.expanded_entries.as_deref()).await
+            {
                 Ok(Some(build)) => {
                     log_nonfatal_result(
                         "failed to materialize stable local build aliases after successful rustc build",
@@ -472,21 +501,24 @@ async fn finish_rustc_compile(
                 }
             }
         }
-        materialize_build_script_alias(parsed).await?;
+        check_build_script_output(parsed)?;
     }
     Ok(artifact)
 }
 
-async fn materialize_build_script_alias(
+/// A compiled build script must leave its binary behind for cargo's run
+/// phase to link as `build-script-build`. Cargo creates that alias
+/// itself before it execs the script — stow must not write the alias
+/// too: two writers racing a path that may already be hardlinked to the
+/// source turns `fs::copy`'s truncate into a zeroed shared inode
+/// (stow#347).
+fn check_build_script_output(
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<()> {
     let Some(source_path) = parsed.output_binary_path() else {
         return Ok(());
     };
-    let Some(alias_path) = parsed.build_script_alias_path() else {
-        return Ok(());
-    };
-    if alias_path.exists() {
+    if parsed.build_script_alias_path().is_none() {
         return Ok(());
     }
     if !source_path.exists() {
@@ -495,25 +527,6 @@ async fn materialize_build_script_alias(
             source_path.display()
         ));
     }
-
-    let source_for_copy = source_path.clone();
-    let alias_for_copy = alias_path.clone();
-    smol::unblock(move || {
-        reflink::reflink_or_copy(&source_for_copy, &alias_for_copy).wrap_err_with(|| {
-            format!(
-                "materialize cargo build script alias {} from {}",
-                alias_for_copy.display(),
-                source_for_copy.display()
-            )
-        })
-    })
-    .await?;
-
-    tracing::debug!(
-        source = %source_path.display(),
-        alias = %alias_path.display(),
-        "materialized cargo build script alias after rustc passthrough"
-    );
     Ok(())
 }
 
@@ -575,6 +588,92 @@ fn wrapped_crate_name(args: &[OsString]) -> Option<String> {
     None
 }
 
+/// The build-scoped facts a supervisor cannot read from its own
+/// environment: every `STOW_*` variable `run_cargo` sets travels on
+/// cargo's environment to the facades, while the deciding process — the
+/// `stow` that spawned cargo — has only its own. The driver passes them
+/// in by construction; the standalone wrapper rebuilds the same view
+/// from the environment it actually inherits.
+#[derive(Debug, Default)]
+pub(crate) struct BuildContext {
+    /// `STOW_CACHE_POLICY_PATH`: the per-build directory the allow markers
+    /// and the local-build provenance markers live under.
+    pub(crate) policy_dir: Option<PathBuf>,
+    /// `STOW_PUBLIC_CACHE_TARGET`: the consumer target the driver told
+    /// its wrappers they build for — a fallback for invocations that do
+    /// not spell `--target`.
+    pub(crate) public_cache_target: Option<String>,
+    /// `STOW_DISABLE_PUBLIC_CACHE`, or the rustc-version gate the driver
+    /// encodes into it: the public cache is off, local lookups still run.
+    pub(crate) public_cache_disabled: bool,
+    /// `STOW_ENABLE_SEMANTIC_FALLBACK`.
+    pub(crate) semantic_fallback_enabled: bool,
+    /// `STOW_EXPANDED_GRAPH_JSON`, parsed once: the resolved per-package
+    /// feature sets the identity derivation consults. `None` means the
+    /// environment carried no graph at all — the distinction a semantic
+    /// gate needs between "unset" and "empty".
+    pub(crate) expanded_entries: Option<Vec<DependencyGraphEntry>>,
+    /// `STOW_PREFETCH_ARTIFACTS_JSON`, parsed and indexed once: canonical
+    /// crate name to the `c_metadata` values the driver already fetched.
+    pub(crate) prefetch_candidates: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl BuildContext {
+    /// Rebuild the driver's view from this process's own environment —
+    /// the standalone wrapper's shape, where the caller that would set
+    /// the variables is also the process reading them.
+    ///
+    /// # Errors
+    ///
+    /// A present-but-malformed graph payload is a wiring bug and fails
+    /// loudly, as it did when the readers parsed it per invocation.
+    fn from_env() -> stow_types::error::Result<Self> {
+        let expanded_entries = match std::env::var(STOW_EXPANDED_GRAPH_ENV) {
+            Ok(raw) => Some(
+                serde_json::from_str::<Vec<DependencyGraphEntry>>(&raw)
+                    .wrap_err_with(|| format!("parse {STOW_EXPANDED_GRAPH_ENV}"))?,
+            ),
+            Err(_) => None,
+        };
+        let prefetch_candidates = match std::env::var(STOW_PREFETCH_ARTIFACTS_ENV) {
+            Ok(raw) => prefetch_candidate_c_metadatas(
+                serde_json::from_str::<Vec<resolve::PrefetchArtifactRow>>(&raw)
+                    .wrap_err_with(|| format!("parse {STOW_PREFETCH_ARTIFACTS_ENV}"))?
+                    .into_iter()
+                    .map(|row| (row.crate_name.into_inner(), row.c_metadata.into_inner())),
+            ),
+            Err(_) => BTreeMap::new(),
+        };
+        Ok(Self {
+            policy_dir: cache_policy::policy_dir(),
+            public_cache_target: std::env::var(rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV)
+                .ok()
+                .filter(|target| !target.trim().is_empty()),
+            public_cache_disabled: std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some(),
+            semantic_fallback_enabled: std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV)
+                .is_some_and(|value| value != "0"),
+            expanded_entries,
+            prefetch_candidates,
+        })
+    }
+}
+
+/// `STOW_PREFETCH_ARTIFACTS_JSON`, indexed once for the per-invocation
+/// candidate lookups: canonical crate name to the `c_metadata` values the
+/// driver prefetched.
+pub(crate) fn prefetch_candidate_c_metadatas(
+    rows: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut candidates = BTreeMap::<String, BTreeSet<String>>::new();
+    for (crate_name, c_metadata) in rows {
+        candidates
+            .entry(canonical_crate_name(&crate_name))
+            .or_default()
+            .insert(c_metadata);
+    }
+    candidates
+}
+
 /// The build's supervisor: it answers every facade this build spawns.
 ///
 /// It holds no state of its own yet — the decision path reads the config
@@ -591,16 +690,51 @@ pub(crate) struct BuildSupervisor {
     /// The build-scoped wrapper environment memo — one config load,
     /// rustc probe pair and cache lease for the whole build.
     env_cache: WrapperEnvCache,
+    /// The build facts `run_cargo` resolved before cargo started — the
+    /// policy dir, the expanded graph, the prefetch candidates — which
+    /// this process's environment never carried.
+    ctx: BuildContext,
     observations: std::sync::Mutex<Vec<artifact_cache::ObservedUnit>>,
 }
 
 impl BuildSupervisor {
+    /// A supervisor that owns the build's resolved context rather than
+    /// rediscovering it per invocation.
+    pub(crate) fn new(ctx: BuildContext) -> Self {
+        Self {
+            ctx,
+            ..Self::default()
+        }
+    }
+
     /// Every unit this build compiled locally, in compile order.
     pub(crate) fn observations(&self) -> Vec<artifact_cache::ObservedUnit> {
         self.observations
             .lock()
             .expect("observations mutex")
             .clone()
+    }
+
+    /// `compiled` and the observed report finish the same way: resolve the
+    /// build's own outputs, then mint its miss observation.
+    async fn finish_and_observe(
+        &self,
+        post: &PostCompile,
+        success: bool,
+        local_base: Option<&WrapperEnvBase>,
+    ) {
+        if let Ok(Some(build)) = finish_rustc_compile(post, success, local_base, &self.ctx).await
+            && let Some(parsed) = post.parsed.as_ref()
+            && let Some(unit) = miss_journal::observed_unit(parsed, &build)
+        {
+            // The unit compiled locally: it is a cache miss by
+            // definition, so the build records it for the post-build
+            // admissions post (stow#317).
+            self.observations
+                .lock()
+                .expect("observations mutex")
+                .push(unit);
+        }
     }
 }
 
@@ -618,6 +752,7 @@ impl supervisor::server::Handler for BuildSupervisor {
             &args,
             &self.env_cache,
             build_script_out_dir.map(PathBuf::from),
+            &self.ctx,
         )
         .await
         {
@@ -628,19 +763,57 @@ impl supervisor::server::Handler for BuildSupervisor {
 
     async fn compiled(self: &std::sync::Arc<Self>, pending: Self::Pending, success: bool) {
         let local_base = self.env_cache.local_base(&pending.executable).await;
-        if let Ok(Some(build)) =
-            finish_rustc_compile(&pending, success, local_base.as_deref()).await
-            && let Some(parsed) = pending.parsed.as_ref()
-            && let Some(unit) = miss_journal::observed_unit(parsed, &build)
-        {
-            // The unit compiled locally: it is a cache miss by
-            // definition, so the build records it for the post-build
-            // admissions post (stow#317).
-            self.observations
-                .lock()
-                .expect("observations mutex")
-                .push(unit);
+        self.finish_and_observe(&pending, success, local_base.as_deref())
+            .await;
+    }
+
+    async fn observed(self: &std::sync::Arc<Self>, observation: supervisor::server::Observation) {
+        let Ok(parsed) = classify_invocation(
+            &observation.args,
+            observation.build_script_out_dir.map(PathBuf::from),
+        ) else {
+            // The facade only sends invocations it parsed — one that
+            // fails here is a wiring bug, not a compile.
+            tracing::warn!("supervisor observation carried an unparseable invocation; dropped");
+            return;
+        };
+        let Some(local_base) = self.env_cache.local_base(&observation.executable).await else {
+            return;
+        };
+        // The mark's key is the target decide computes: the unit's own
+        // spelled `--target`, else this build's rustc host triple — the
+        // key a dependent's `must_build_locally` checks under.
+        let target = parsed
+            .target
+            .clone()
+            .unwrap_or_else(|| local_base.host_target.clone());
+        let Some(success) = observation.success else {
+            log_nonfatal_result(
+                "failed to record a locally built crate for this build",
+                provenance::record_local_build(
+                    self.ctx.policy_dir.as_deref(),
+                    &target,
+                    &parsed.crate_name,
+                )
+                .await,
+            );
+            return;
+        };
+        if parsed.is_cacheable() {
+            record_miss(
+                &local_base.config,
+                &parsed,
+                &target,
+                &local_base.rustc_version,
+            )
+            .await;
         }
+        let post = PostCompile {
+            executable: observation.executable,
+            parsed: Some(parsed),
+        };
+        self.finish_and_observe(&post, success, Some(&local_base))
+            .await;
     }
 }
 
@@ -720,11 +893,23 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
         miss_journal::drain_finished_builds(out_dir);
     }
     let env_cache = WrapperEnvCache::default();
+    let ctx = match BuildContext::from_env() {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            // Malformed driver wiring must not cost a compile: the same
+            // parse failure used to bypass the identity step per call.
+            tracing::warn!(error = %error, "failed to read the build context, compiling the unit as-is");
+            let status =
+                run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    };
     match decide_rustc_invocation(
         &command.executable,
         &command.wrapped_args,
         &env_cache,
         std::env::var_os("OUT_DIR").map(PathBuf::from),
+        &ctx,
     )
     .await
     {
@@ -734,7 +919,7 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
                 run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
             let local_base = env_cache.local_base(&command.executable).await;
             if let Ok(Some(build)) =
-                finish_rustc_compile(&post, status.success(), local_base.as_deref()).await
+                finish_rustc_compile(&post, status.success(), local_base.as_deref(), &ctx).await
                 && let (Some(parsed), Some(base)) = (post.parsed.as_ref(), local_base.as_deref())
             {
                 miss_journal::record_observation(
@@ -760,6 +945,7 @@ async fn decide_rustc_invocation(
     wrapped_args: &[std::ffi::OsString],
     env_cache: &WrapperEnvCache,
     build_script_out_dir: Option<PathBuf>,
+    ctx: &BuildContext,
 ) -> Outcome {
     let parsed = match classify_invocation(wrapped_args, build_script_out_dir) {
         Ok(parsed) => parsed,
@@ -794,18 +980,22 @@ async fn decide_rustc_invocation(
     );
 
     if !parsed.is_cacheable() {
-        return decide_local_only(rustc, &parsed, env_cache).await;
+        return decide_local_only(rustc, &parsed, env_cache, ctx).await;
     }
 
-    if std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some() {
+    if ctx.public_cache_disabled {
         // The kill switch disables the *public* cache; a self-produced local
         // entry is not public, so lookups still run against it.
         tracing::debug!(
             "public rust cache disabled for this cargo invocation, serving local lookups only"
         );
-        return decide_local_only(rustc, &parsed, env_cache).await;
+        return decide_local_only(rustc, &parsed, env_cache, ctx).await;
     }
-    let exact_public_cache_allowed = match cache_policy::public_cache_allowed(&parsed) {
+    let exact_public_cache_allowed = match cache_policy::public_cache_allowed(
+        ctx.policy_dir.as_deref(),
+        &parsed,
+        ctx.public_cache_target.as_deref(),
+    ) {
         Some(false) => {
             tracing::debug!(
                 crate_name = %parsed.crate_name,
@@ -816,69 +1006,127 @@ async fn decide_rustc_invocation(
         Some(true) | None => true,
     };
 
-    let Some(env) = prepare_wrapper_environment(rustc, &parsed, env_cache).await else {
-        return compile(rustc, &parsed).await;
+    let Some(env) = prepare_wrapper_environment(rustc, &parsed, env_cache, ctx).await else {
+        return compile(
+            rustc,
+            &parsed,
+            parsed
+                .target
+                .as_deref()
+                .or(ctx.public_cache_target.as_deref()),
+            ctx.policy_dir.as_deref(),
+        )
+        .await;
     };
-    if must_build_locally(&parsed, &env.target) {
-        return compile(rustc, &parsed).await;
+    if must_build_locally(&parsed, &env.target, ctx.policy_dir.as_deref()) {
+        return compile(
+            rustc,
+            &parsed,
+            Some(env.target.as_str()),
+            ctx.policy_dir.as_deref(),
+        )
+        .await;
     }
+    serve_or_compile(rustc, &parsed, &env, ctx, exact_public_cache_allowed).await
+}
+
+/// The serve-and-compile tail of the decision: local entries, then the
+/// remote serves a keyed or semantic request could hit, and on a miss
+/// the compile the build records.
+async fn serve_or_compile(
+    rustc: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+    env: &WrapperEnvironment<'_>,
+    ctx: &BuildContext,
+    exact_public_cache_allowed: bool,
+) -> Outcome {
     let request = FetchRequest {
         target: &env.target,
         rustc_version: &env.rustc_version,
         c_metadata: env.request_c_metadata.as_str(),
     };
-    if try_serve_local_cached_bundle(&env.env_base.config, &parsed, &request).await {
+    if try_serve_local_cached_bundle(&env.env_base.config, parsed, &request).await {
         return Outcome::Served;
     }
     if try_serve_local_prefetched_graph_bundle(
         &env.env_base.config,
-        &parsed,
+        parsed,
         &env.target,
         &env.rustc_version,
+        ctx,
     )
     .await
     {
         return Outcome::Served;
     }
     if let Some(semantic_request) = env.semantic_request.as_ref()
-        && try_serve_local_semantic_cached_bundle(&env.env_base.config, &parsed, semantic_request)
+        && try_serve_local_semantic_cached_bundle(&env.env_base.config, parsed, semantic_request)
             .await
     {
         return Outcome::Served;
     }
 
-    match try_remote_serves(&env, &parsed, &request, exact_public_cache_allowed).await {
+    match try_remote_serves(env, parsed, &request, exact_public_cache_allowed).await {
         RemoteServe::Served => return Outcome::Served,
-        RemoteServe::Bypass => return compile(rustc, &parsed).await,
+        RemoteServe::Bypass => {
+            return compile(
+                rustc,
+                parsed,
+                Some(env.target.as_str()),
+                ctx.policy_dir.as_deref(),
+            )
+            .await;
+        }
         RemoteServe::Refused => {
-            record_glibc_refusal(&env.env_base.config, &parsed).await;
-            return compile(rustc, &parsed).await;
+            record_glibc_refusal(&env.env_base.config, parsed).await;
+            return compile(
+                rustc,
+                parsed,
+                Some(env.target.as_str()),
+                ctx.policy_dir.as_deref(),
+            )
+            .await;
         }
         RemoteServe::Miss => {}
     }
 
     record_miss(
         &env.env_base.config,
-        &parsed,
+        parsed,
         &env.target,
         &env.rustc_version,
     )
     .await;
-    compile(rustc, &parsed).await
+    compile(
+        rustc,
+        parsed,
+        Some(env.target.as_str()),
+        ctx.policy_dir.as_deref(),
+    )
+    .await
 }
 
 /// Everything the cache path needs once every bypass-capable preparation
 /// step has succeeded: the loaded config, the circuit state, the resolved
 /// invocation identity, and the lease that keeps this rustc version's local
 /// cache dir alive for the rest of the invocation.
-struct WrapperEnvironment {
+struct WrapperEnvironment<'a> {
     /// The build-scoped base this invocation's identity was resolved over
     /// — carried so the lease and pooled state-db handle stay alive.
     env_base: std::sync::Arc<WrapperEnvBase>,
+    /// The build-scoped memo the slice lookup and the circuit recorders
+    /// share — a state this build loads once, refreshed by its own writes.
+    env_cache: &'a WrapperEnvCache,
+    /// The build's resolved context — the policy dir, the expanded graph,
+    /// the prefetch candidates — carried rather than re-read from an
+    /// environment that may not carry them (the supervisor's own does
+    /// not).
+    ctx: &'a BuildContext,
     /// The breaker guards the *network*: remote fetches stop while tripped,
     /// but a local entry still serves — a self-produced hit never touches
     /// the edge, so it keeps paying off through the very outage that tripped
-    /// the breaker. Read per invocation so the kill switch acts live.
+    /// the breaker. Read once per build and kept in step by this build's
+    /// own recordings (stow#347).
     circuit_tripped: bool,
     target: String,
     rustc_version: String,
@@ -894,6 +1142,37 @@ struct WrapperEnvironment {
     /// no global. `None` on musl and non-Linux hosts, where the index
     /// row's `min_glibc` is not applicable.
     host_glibc: Option<stow_types::glibc::GlibcVersion>,
+}
+
+/// One decoded index slice plus the lookup table the per-invocation
+/// exact match needs — the row scan of every call rebuilt into a map
+/// once, when the driver first reads the slice.
+#[derive(Debug)]
+struct SliceIndex {
+    /// The decoded slice rows.
+    slice: index::IndexSlice,
+    /// `c_metadata` → row position inside `slice.index.rows`.
+    exact: std::collections::HashMap<String, usize>,
+}
+
+impl SliceIndex {
+    fn new(slice: index::IndexSlice) -> Self {
+        let exact = slice
+            .index
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(position, row)| (row.c_metadata.to_string(), position))
+            .collect();
+        Self { slice, exact }
+    }
+
+    /// The row at `c_metadata`, if the slice carries one.
+    fn exact_row(&self, c_metadata: &str) -> Option<&stow_types::index::ArtifactIndexRow> {
+        self.exact
+            .get(c_metadata)
+            .map(|position| &self.slice.index.rows[*position])
+    }
 }
 
 /// The pieces of a wrapper environment that cannot change inside one
@@ -926,7 +1205,24 @@ pub(crate) struct WrapperEnvCache {
     /// The local path's base (`StowConfig::load_local`), shared by
     /// `decide_local_only` and the post-compile finish.
     local_base: tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>,
+    /// The verified index slices this build's lookups read — the driver
+    /// fetched them before cargo started, so each is decoded and keyed
+    /// once per `(target, rustc)` instead of once per rustc invocation
+    /// (stow#347).
+    slices: MemoizedSliceMap,
+    /// The circuit's tripped state, read once for the build and kept in
+    /// step by the build's own recordings.
+    circuit_tripped: tokio::sync::OnceCell<std::sync::Mutex<bool>>,
 }
+
+/// The slice memoization key and cell shape: `(target, rustc)` to a
+/// shared cell each wrapper task awaits.
+type MemoizedSliceMap = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String),
+        std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<SliceIndex>>>>,
+    >,
+>;
 
 impl WrapperEnvCache {
     /// The base `load` prepares for `rustc`, computed once per build. A
@@ -961,6 +1257,77 @@ impl WrapperEnvCache {
 
     pub(crate) async fn local_base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
         Self::base(&self.local_base, rustc, StowConfig::load_local).await
+    }
+
+    /// The decoded index slice for `(target, rustc)` — read, decompressed
+    /// and keyed by `c_metadata` once per build rather than per
+    /// invocation. A missing slice is memoized (the driver fetched what
+    /// the build uses before cargo started); an error is not — it keeps
+    /// today's retry-and-warn semantics for a transient read failure.
+    async fn slice(
+        &self,
+        config: &StowConfig,
+        target: &str,
+        rustc_version: &str,
+    ) -> stow_types::error::Result<Option<std::sync::Arc<SliceIndex>>> {
+        let key = (target.to_owned(), rustc_version.to_owned());
+        let cell = self
+            .slices
+            .lock()
+            .expect("slice cache mutex")
+            .entry(key)
+            .or_default()
+            .clone();
+        cell.get_or_try_init(|| async {
+            let slice = index::cached_slice(config, target, rustc_version).await?;
+            Ok::<_, stow_types::error::Error>(
+                slice.map(|slice| std::sync::Arc::new(SliceIndex::new(slice))),
+            )
+        })
+        .await
+        .cloned()
+    }
+
+    /// The circuit's tripped state for this build, read once — the
+    /// per-invocation state-db query was the supervisor's busiest query,
+    /// and the breaker guards transport that has already been decided
+    /// once the driver laid the build's coverage down (stow#347).
+    async fn circuit_tripped(&self, config: &StowConfig) -> stow_types::error::Result<bool> {
+        let cell = self
+            .circuit_tripped
+            .get_or_try_init(|| async {
+                Ok::<_, stow_types::error::Error>(std::sync::Mutex::new(
+                    circuit::is_tripped(config).await?,
+                ))
+            })
+            .await?;
+        Ok(*cell.lock().expect("circuit memo mutex"))
+    }
+
+    /// Count a remote-cache failure against the circuit breaker, then
+    /// refresh the memo so the rest of the build sees its own recording.
+    async fn record_circuit_failure(&self, config: &StowConfig) {
+        log_nonfatal_result(
+            "failed to record stow circuit failure",
+            circuit::record_failure(config).await,
+        );
+        if let Some(cell) = self.circuit_tripped.get()
+            && let Ok(tripped) = circuit::is_tripped(config).await
+        {
+            *cell.lock().expect("circuit memo mutex") = tripped;
+        }
+    }
+
+    /// Count a remote-cache success toward resetting the circuit breaker;
+    /// a success resets it outright, so the memo just clears.
+    async fn record_circuit_success(&self, config: &StowConfig) {
+        log_nonfatal_result(
+            "failed to record stow circuit success",
+            circuit::record_success(config).await,
+        );
+        if let Some(cell) = self.circuit_tripped.get() {
+            *cell.lock().expect("circuit memo mutex") = false;
+        }
     }
 }
 
@@ -1032,13 +1399,14 @@ enum RemoteServe {
 /// invocation. Every step can legitimately be unavailable — the wrapper
 /// exists to accelerate builds, never to break them — so `None` means "run
 /// the real rustc".
-async fn prepare_wrapper_environment(
+async fn prepare_wrapper_environment<'a>(
     rustc: &OsString,
     parsed: &rustc_args::ParsedRustcArgs,
-    env_cache: &WrapperEnvCache,
-) -> Option<WrapperEnvironment> {
+    env_cache: &'a WrapperEnvCache,
+    ctx: &'a BuildContext,
+) -> Option<WrapperEnvironment<'a>> {
     let env_base = env_cache.env_base(rustc).await?;
-    let circuit_tripped = match circuit::is_tripped(&env_base.config).await {
+    let circuit_tripped = match env_cache.circuit_tripped(&env_base.config).await {
         Ok(tripped) => tripped,
         Err(error) => {
             tracing::warn!(error = %error, "failed to read stow circuit state, bypassing rust cache");
@@ -1065,6 +1433,7 @@ async fn prepare_wrapper_environment(
         parsed,
         &target,
         &rustc_version,
+        ctx.expanded_entries.as_deref(),
     )
     .await
     {
@@ -1078,10 +1447,15 @@ async fn prepare_wrapper_environment(
         .as_ref()
         .map_or(c_metadata, |identity| identity.c_metadata.as_str())
         .to_owned();
-    let semantic_fallback_enabled =
-        std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV).is_some_and(|value| value != "0");
-    let semantic_request = if semantic_fallback_enabled {
-        match build_semantic_fetch_request(&env_base.config, parsed, &target, &rustc_version).await
+    let semantic_request = if ctx.semantic_fallback_enabled {
+        match build_semantic_fetch_request(
+            &env_base.config,
+            parsed,
+            &target,
+            &rustc_version,
+            ctx.expanded_entries.as_deref(),
+        )
+        .await
         {
             Ok(request) => request,
             Err(error) => {
@@ -1094,6 +1468,8 @@ async fn prepare_wrapper_environment(
     };
     Some(WrapperEnvironment {
         env_base,
+        env_cache,
+        ctx,
         circuit_tripped,
         target,
         rustc_version,
@@ -1110,7 +1486,7 @@ async fn prepare_wrapper_environment(
 /// first, then the semantic fallback when it is enabled and the exact path
 /// did not serve or disqualify the cache outright.
 async fn try_remote_serves(
-    env: &WrapperEnvironment,
+    env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     exact_public_cache_allowed: bool,
@@ -1122,27 +1498,30 @@ async fn try_remote_serves(
     // freshness, and a registry round trip on every rustc invocation is
     // exactly the cost the local index exists to remove. Absence is a miss,
     // not an outage.
-    let slice =
-        match index::cached_slice(&env.env_base.config, &env.target, &env.rustc_version).await {
-            Ok(Some(slice)) => slice,
-            Ok(None) => {
-                tracing::debug!(
-                    target = %env.target,
-                    rustc_version = %env.rustc_version,
-                    "no cached index slice, skipping registry serves"
-                );
-                return RemoteServe::Miss;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    target = %env.target,
-                    rustc_version = %env.rustc_version,
-                    "failed to read cached index slice, skipping registry serves"
-                );
-                return RemoteServe::Miss;
-            }
-        };
+    let slice = match env
+        .env_cache
+        .slice(&env.env_base.config, &env.target, &env.rustc_version)
+        .await
+    {
+        Ok(Some(slice)) => slice,
+        Ok(None) => {
+            tracing::debug!(
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                "no cached index slice, skipping registry serves"
+            );
+            return RemoteServe::Miss;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                "failed to read cached index slice, skipping registry serves"
+            );
+            return RemoteServe::Miss;
+        }
+    };
     // A refusal does not end the lookup: the exact row may be unservable
     // while a differently-shaped semantic candidate still loads. Either
     // way, one refusal anywhere means no build should be enqueued —
@@ -1156,7 +1535,7 @@ async fn try_remote_serves(
         }
     }
     if let Some(semantic_request) = env.semantic_request.as_ref() {
-        return match try_remote_semantic_serve(env, parsed, semantic_request, &slice).await {
+        return match try_remote_semantic_serve(env, parsed, semantic_request, &slice.slice).await {
             RemoteServe::Miss | RemoteServe::Refused if refused => RemoteServe::Refused,
             outcome => outcome,
         };
@@ -1173,10 +1552,10 @@ async fn try_remote_serves(
 /// carries no such artifact (or the negative cache already says so);
 /// `Bypass` means the artifact arrived but could not be used.
 async fn try_remote_exact_serve(
-    env: &WrapperEnvironment,
+    env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
-    slice: &index::IndexSlice,
+    slice: &SliceIndex,
 ) -> RemoteServe {
     let negative_cache_hit = match circuit::negative_cache_contains(
         &env.env_base.config,
@@ -1194,7 +1573,7 @@ async fn try_remote_exact_serve(
         tracing::debug!(cache_key = %env.cache_key, "negative cache hit, bypassing exact edge fetch");
         return RemoteServe::Miss;
     }
-    let Some(row) = resolve::find_exact_artifact(&slice.index.rows, request.c_metadata) else {
+    let Some(row) = slice.exact_row(request.c_metadata) else {
         log_nonfatal_result(
             "failed to record stow negative cache entry",
             circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
@@ -1214,7 +1593,7 @@ async fn try_remote_exact_serve(
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
     match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
         Ok(bundle) => {
-            if try_serve_downloaded_bundle(&env.env_base.config, parsed, request, &bundle).await {
+            if try_serve_downloaded_bundle(env, parsed, request, &bundle).await {
                 RemoteServe::Served
             } else {
                 RemoteServe::Bypass
@@ -1231,7 +1610,9 @@ async fn try_remote_exact_serve(
             RemoteServe::Miss
         }
         Err(error) => {
-            record_circuit_failure(&env.env_base.config).await;
+            env.env_cache
+                .record_circuit_failure(&env.env_base.config)
+                .await;
             record_lookup_error(&env.env_base.config, parsed).await;
             tracing::warn!(
                 crate_name = %parsed.crate_name,
@@ -1249,7 +1630,7 @@ async fn try_remote_exact_serve(
 /// Resolve the semantic fallback request against the index slice, stream
 /// the winning bundle through the edge byte path, and serve it.
 async fn try_remote_semantic_serve(
-    env: &WrapperEnvironment,
+    env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
     slice: &index::IndexSlice,
@@ -1293,14 +1674,7 @@ async fn try_remote_semantic_serve(
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
     match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
         Ok(bundle) => {
-            if try_serve_semantic_downloaded_bundle(
-                &env.env_base.config,
-                parsed,
-                semantic_request,
-                &bundle,
-            )
-            .await
-            {
+            if try_serve_semantic_downloaded_bundle(env, parsed, semantic_request, &bundle).await {
                 RemoteServe::Served
             } else {
                 RemoteServe::Bypass
@@ -1308,7 +1682,9 @@ async fn try_remote_semantic_serve(
         }
         Err(fetch::FetchError::NotFound) => RemoteServe::Miss,
         Err(error) => {
-            record_circuit_failure(&env.env_base.config).await;
+            env.env_cache
+                .record_circuit_failure(&env.env_base.config)
+                .await;
             record_lookup_error(&env.env_base.config, parsed).await;
             tracing::warn!(
                 crate_name = %parsed.crate_name,
@@ -1359,23 +1735,6 @@ async fn record_miss(
             "stow cache miss, falling back to rustc"
         );
     }
-}
-
-/// Count a remote-cache failure against the circuit breaker; the record
-/// itself must never fail the invocation.
-async fn record_circuit_failure(config: &StowConfig) {
-    log_nonfatal_result(
-        "failed to record stow circuit failure",
-        circuit::record_failure(config).await,
-    );
-}
-
-/// Count a remote-cache success toward resetting the circuit breaker.
-async fn record_circuit_success(config: &StowConfig) {
-    log_nonfatal_result(
-        "failed to record stow circuit success",
-        circuit::record_success(config).await,
-    );
 }
 
 /// Count a failed rust cache lookup as an error stat without failing the
@@ -1437,12 +1796,22 @@ async fn decide_local_only(
     rustc: &OsString,
     parsed: &rustc_args::ParsedRustcArgs,
     env_cache: &WrapperEnvCache,
+    ctx: &BuildContext,
 ) -> Outcome {
+    // The fallback mark key is the consumer target the driver recorded,
+    // as `compile` resolved it from the environment before the context
+    // existed.
+    let fallback_target = || {
+        parsed
+            .target
+            .as_deref()
+            .or(ctx.public_cache_target.as_deref())
+    };
     if !parsed.is_locally_cacheable() {
-        return compile(rustc, parsed).await;
+        return compile(rustc, parsed, fallback_target(), ctx.policy_dir.as_deref()).await;
     }
     let Some(local_base) = env_cache.local_base(rustc).await else {
-        return compile(rustc, parsed).await;
+        return compile(rustc, parsed, fallback_target(), ctx.policy_dir.as_deref()).await;
     };
     let target = parsed
         .target
@@ -1453,17 +1822,30 @@ async fn decide_local_only(
         parsed,
         &target,
         &local_base.rustc_version,
+        ctx.expanded_entries.as_deref(),
     )
     .await
     {
         Ok(identity) => identity,
         Err(error) => {
             tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing local artifact cache");
-            return compile(rustc, parsed).await;
+            return compile(
+                rustc,
+                parsed,
+                Some(target.as_str()),
+                ctx.policy_dir.as_deref(),
+            )
+            .await;
         }
     };
-    if must_build_locally(parsed, &target) {
-        return compile(rustc, parsed).await;
+    if must_build_locally(parsed, &target, ctx.policy_dir.as_deref()) {
+        return compile(
+            rustc,
+            parsed,
+            Some(target.as_str()),
+            ctx.policy_dir.as_deref(),
+        )
+        .await;
     }
     if let Some(identity) = identity {
         let request = FetchRequest {
@@ -1475,7 +1857,13 @@ async fn decide_local_only(
             return Outcome::Served;
         }
     }
-    compile(rustc, parsed).await
+    compile(
+        rustc,
+        parsed,
+        Some(target.as_str()),
+        ctx.policy_dir.as_deref(),
+    )
+    .await
 }
 
 /// What `stow cc`'s executable argument asks for: an explicitly recorded
@@ -1668,12 +2056,17 @@ async fn try_serve_local_prefetched_graph_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     target: &str,
     rustc_version: &str,
+    ctx: &BuildContext,
 ) -> bool {
     let Some((crate_name, version)) = detect_registry_crate_version(parsed).ok().flatten() else {
         return false;
     };
-    let expected_features_json = match resolve_semantic_features_json(&crate_name, &version, parsed)
-    {
+    let expected_features_json = match resolve_semantic_features_json(
+        &crate_name,
+        &version,
+        parsed,
+        ctx.expanded_entries.as_deref(),
+    ) {
         Ok(features_json) => features_json,
         Err(error) => {
             tracing::warn!(
@@ -1702,20 +2095,14 @@ async fn try_serve_local_prefetched_graph_bundle(
                 return false;
             }
         };
-    let candidate_c_metadatas =
-        match load_prefetched_graph_candidate_c_metadatas(&parsed.crate_name) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    target,
-                    rustc_version,
-                    "failed to parse prefetched graph artifact candidates"
-                );
-                return false;
-            }
-        };
+    // The driver indexed its prefetch payload by canonical crate name
+    // before cargo started; a crate name's candidates are one map lookup.
+    let Some(candidate_c_metadatas) = ctx
+        .prefetch_candidates
+        .get(&canonical_crate_name(&parsed.crate_name))
+    else {
+        return false;
+    };
 
     for c_metadata in candidate_c_metadatas {
         let request = FetchRequest {
@@ -1964,30 +2351,6 @@ async fn finish_local_serve(
     true
 }
 
-fn load_prefetched_graph_candidate_c_metadatas(
-    crate_name: &str,
-) -> stow_types::error::Result<Vec<String>> {
-    Ok(load_prefetched_graph_artifacts()?
-        .into_iter()
-        .filter(|entry| {
-            canonical_crate_name(entry.crate_name.as_str()) == canonical_crate_name(crate_name)
-        })
-        .map(|entry| entry.c_metadata.into_inner())
-        .collect())
-}
-
-fn load_prefetched_graph_artifacts() -> stow_types::error::Result<Vec<resolve::PrefetchArtifactRow>>
-{
-    let Some(raw) = std::env::var_os(STOW_PREFETCH_ARTIFACTS_ENV) else {
-        return Ok(Vec::new());
-    };
-    let raw = raw.into_string().map_err(|_| {
-        stow_types::stow_error!("{STOW_PREFETCH_ARTIFACTS_ENV} must be valid UTF-8")
-    })?;
-    serde_json::from_str::<Vec<resolve::PrefetchArtifactRow>>(&raw)
-        .wrap_err_with(|| format!("parse {STOW_PREFETCH_ARTIFACTS_ENV}"))
-}
-
 async fn prune_materialized_aliases_for_cached_closure(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -2192,11 +2555,12 @@ fn validate_prefetched_graph_bundle(
 }
 
 async fn try_serve_downloaded_bundle(
-    config: &StowConfig,
+    env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     bundle: &fetch::ArtifactBundle,
 ) -> bool {
+    let config = &env.env_base.config;
     if let Err(error) = fetch::validate_bundle_identity(
         bundle,
         &parsed.crate_name,
@@ -2253,7 +2617,7 @@ async fn try_serve_downloaded_bundle(
         );
         return false;
     }
-    try_serve_verified_downloaded_bundle(config, parsed, request, bundle).await
+    try_serve_verified_downloaded_bundle(env, parsed, request, bundle).await
 }
 
 async fn try_serve_local_semantic_cached_bundle(
@@ -2420,11 +2784,12 @@ async fn materialize_semantic_cached_bundle(
 }
 
 async fn try_serve_semantic_downloaded_bundle(
-    config: &StowConfig,
+    env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
     bundle: &fetch::ArtifactBundle,
 ) -> bool {
+    let config = &env.env_base.config;
     if let Err(error) = fetch::validate_semantic_bundle_identity(bundle, semantic_request) {
         tracing::warn!(
             error = %error,
@@ -2448,32 +2813,20 @@ async fn try_serve_semantic_downloaded_bundle(
         );
         return false;
     }
-    match semantic_request_allowed_by_expanded_graph(semantic_request) {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                crate_name = %parsed.crate_name,
-                semantic_crate_name = %semantic_request.crate_name,
-                semantic_version = %semantic_request.version,
-                target = %semantic_request.target,
-                rustc_version = %semantic_request.rustc_version,
-                semantic_c_metadata = %bundle.manifest.config.c_metadata,
-                "rejecting semantic bundle outside expanded dependency graph"
-            );
-            return false;
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                semantic_crate_name = %semantic_request.crate_name,
-                semantic_version = %semantic_request.version,
-                target = %semantic_request.target,
-                rustc_version = %semantic_request.rustc_version,
-                "failed to validate semantic bundle against expanded dependency graph"
-            );
-            return false;
-        }
+    if !semantic_request_allowed_by_expanded_graph(
+        semantic_request,
+        env.ctx.expanded_entries.as_deref(),
+    ) {
+        tracing::warn!(
+            crate_name = %parsed.crate_name,
+            semantic_crate_name = %semantic_request.crate_name,
+            semantic_version = %semantic_request.version,
+            target = %semantic_request.target,
+            rustc_version = %semantic_request.rustc_version,
+            semantic_c_metadata = %bundle.manifest.config.c_metadata,
+            "rejecting semantic bundle outside expanded dependency graph"
+        );
+        return false;
     }
 
     let request = FetchRequest {
@@ -2481,15 +2834,16 @@ async fn try_serve_semantic_downloaded_bundle(
         rustc_version: bundle.manifest.config.rustc_version.as_str(),
         c_metadata: bundle.manifest.config.c_metadata.as_str(),
     };
-    try_serve_verified_downloaded_bundle(config, parsed, &request, bundle).await
+    try_serve_verified_downloaded_bundle(env, parsed, &request, bundle).await
 }
 
 async fn try_serve_verified_downloaded_bundle(
-    config: &StowConfig,
+    env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     bundle: &fetch::ArtifactBundle,
 ) -> bool {
+    let config = &env.env_base.config;
     let cached_bundle = match cache_verified_downloaded_bundle(config, request, bundle).await {
         Ok(cached_bundle) => cached_bundle,
         Err(error) => {
@@ -2500,7 +2854,7 @@ async fn try_serve_verified_downloaded_bundle(
                 rustc_version = %request.rustc_version,
                 "failed to cache verified stow bundle"
             );
-            record_circuit_failure(config).await;
+            env.env_cache.record_circuit_failure(config).await;
             record_lookup_error(config, parsed).await;
             return false;
         }
@@ -2524,26 +2878,27 @@ async fn try_serve_verified_downloaded_bundle(
             "failed to evict downloaded stow bundle with incomplete dependency closure aliases",
         )
         .await;
-        record_circuit_failure(config).await;
+        env.env_cache.record_circuit_failure(config).await;
         record_lookup_error(config, parsed).await;
         return false;
     }
 
-    materialize_downloaded_bundle(config, parsed, request, cached_bundle).await
+    materialize_downloaded_bundle(env, parsed, request, cached_bundle).await
 }
 
 /// Write a verified downloaded bundle's artifacts into the target dir.
 /// `false` means the freshly cached entry could not be materialized — it is
 /// evicted and counted against the circuit breaker.
 async fn materialize_downloaded_bundle(
-    config: &StowConfig,
+    env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
+    let config = &env.env_base.config;
     match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
-        Ok(()) => finish_downloaded_serve(config, parsed, request, cached_bundle).await,
+        Ok(()) => finish_downloaded_serve(env, parsed, request, cached_bundle).await,
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -2560,7 +2915,7 @@ async fn materialize_downloaded_bundle(
                 "failed to evict verified-but-unusable stow cache entry",
             )
             .await;
-            record_circuit_failure(config).await;
+            env.env_cache.record_circuit_failure(config).await;
             record_lookup_error(config, parsed).await;
             false
         }
@@ -2571,11 +2926,12 @@ async fn materialize_downloaded_bundle(
 /// hit: record outputs, replay rustc's artifact notifications, then count
 /// the circuit success and the lookup hit.
 async fn finish_downloaded_serve(
-    config: &StowConfig,
+    env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
 ) -> bool {
+    let config = &env.env_base.config;
     if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
         tracing::warn!(
             error = %error,
@@ -2592,7 +2948,7 @@ async fn finish_downloaded_serve(
             "failed to evict downloaded stow bundle missing materialized output metadata",
         )
         .await;
-        record_circuit_failure(config).await;
+        env.env_cache.record_circuit_failure(config).await;
         record_lookup_error(config, parsed).await;
         return false;
     }
@@ -2612,11 +2968,11 @@ async fn finish_downloaded_serve(
             "failed to evict downloaded stow bundle missing rustc artifact notifications",
         )
         .await;
-        record_circuit_failure(config).await;
+        env.env_cache.record_circuit_failure(config).await;
         record_lookup_error(config, parsed).await;
         return false;
     }
-    record_circuit_success(config).await;
+    env.env_cache.record_circuit_success(config).await;
     record_lookup_hit(config, parsed).await;
     log_nonfatal_result(
         "failed to record local usage statistics",
@@ -2642,6 +2998,7 @@ async fn build_semantic_fetch_request(
     parsed: &rustc_args::ParsedRustcArgs,
     target: &str,
     rustc_version: &str,
+    expanded_entries: Option<&[DependencyGraphEntry]>,
 ) -> stow_types::error::Result<Option<fetch::SemanticFetchRequest>> {
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
         return Ok(None);
@@ -2656,7 +3013,8 @@ async fn build_semantic_fetch_request(
     let profile = semantic_request_profile(parsed)?;
     let kind = parsed_artifact_kind(parsed)?;
     let crate_types = parsed_crate_types(parsed)?;
-    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    let features_json =
+        resolve_semantic_features_json(&crate_name, &version, parsed, expanded_entries)?;
     tracing::debug!(
         crate_name = %crate_name,
         version = %version,
@@ -2689,6 +3047,7 @@ async fn build_stable_exact_identity(
     parsed: &rustc_args::ParsedRustcArgs,
     target: &str,
     rustc_version: &str,
+    expanded_entries: Option<&[DependencyGraphEntry]>,
 ) -> stow_types::error::Result<Option<stow_types::public_cache::StableRegistryArtifactIdentity>> {
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
         trace_identity_inputs(
@@ -2719,7 +3078,8 @@ async fn build_stable_exact_identity(
                 return Ok(None);
             }
         };
-    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    let features_json =
+        resolve_semantic_features_json(&crate_name, &version, parsed, expanded_entries)?;
     let identity = stable_registry_artifact_identity(
         parsed,
         target,
@@ -2817,6 +3177,7 @@ async fn trace_identity_inputs(
 async fn resolve_local_build_artifact(
     base: &WrapperEnvBase,
     parsed: &rustc_args::ParsedRustcArgs,
+    expanded_entries: Option<&[DependencyGraphEntry]>,
 ) -> stow_types::error::Result<Option<artifact_cache::LocalBuildArtifact>> {
     let config = &base.config;
     // The unit's own platform — the compiling rustc's real host triple
@@ -2836,7 +3197,8 @@ async fn resolve_local_build_artifact(
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
         return Ok(None);
     };
-    let features_json = resolve_semantic_features_json(&crate_name, &version, parsed)?;
+    let features_json =
+        resolve_semantic_features_json(&crate_name, &version, parsed, expanded_entries)?;
     let Some(identity) = stable_registry_artifact_identity(
         parsed,
         &target,
@@ -2867,34 +3229,39 @@ fn resolve_semantic_features_json(
     crate_name: &str,
     version: &str,
     parsed: &rustc_args::ParsedRustcArgs,
+    expanded_entries: Option<&[DependencyGraphEntry]>,
 ) -> stow_types::error::Result<String> {
-    if let Some(features_json) =
-        lookup_expanded_graph_features_json(crate_name, version, &parsed.features)?
-    {
+    if let Some(features_json) = lookup_expanded_graph_features_json(
+        crate_name,
+        version,
+        &parsed.features,
+        expanded_entries,
+    )? {
         return Ok(features_json);
     }
     serde_json::to_string(&parsed.features.iter().cloned().collect::<Vec<_>>())
         .wrap_err("serialize semantic rustc features")
 }
 
+/// The resolved feature set for `(crate, version)` out of the expanded
+/// graph the driver computed before cargo started — `Some` only when it
+/// names exactly one set. `None` (no entries, or no match) means the
+/// graph does not pin this crate, and the caller falls back to what argv
+/// spelled.
 fn lookup_expanded_graph_features_json(
     crate_name: &str,
     version: &str,
     parsed_features: &std::collections::BTreeSet<String>,
+    expanded_entries: Option<&[DependencyGraphEntry]>,
 ) -> stow_types::error::Result<Option<String>> {
-    let Some(raw) = std::env::var_os(STOW_EXPANDED_GRAPH_ENV) else {
+    let Some(entries) = expanded_entries else {
         return Ok(None);
     };
-    let raw = raw
-        .into_string()
-        .map_err(|_| stow_types::stow_error!("{STOW_EXPANDED_GRAPH_ENV} must be valid UTF-8"))?;
-    let entries = serde_json::from_str::<Vec<DependencyGraphEntry>>(&raw)
-        .wrap_err_with(|| format!("parse {STOW_EXPANDED_GRAPH_ENV}"))?;
     let requested_version = semver::Version::parse(version)
         .wrap_err_with(|| format!("parse semantic request version `{version}`"))?;
     let canonical_name = canonical_crate_name(crate_name);
     let mut matches = entries
-        .into_iter()
+        .iter()
         .filter(|entry| {
             if canonical_crate_name(entry.crate_name.as_str()) != canonical_name
                 || entry.version != requested_version
@@ -2941,7 +3308,7 @@ fn detect_registry_crate_version(
     shared_detect_registry_crate_version(parsed)
 }
 
-fn canonical_crate_name(name: &str) -> String {
+pub(crate) fn canonical_crate_name(name: &str) -> String {
     stow_types::public_cache::canonical_crate_name(name)
 }
 
@@ -3058,24 +3425,25 @@ fn normalized_requested_profile(
     normalized_cache_profile(parsed)
 }
 
+/// A semantic request is gated by the expanded graph the driver
+/// resolved before cargo started: unset means the gate stays open, set
+/// means a bundle the graph never names is refused — the driver's own
+/// expansion is the boundary inside which a semantic match may stand in
+/// for a unit.
 fn semantic_request_allowed_by_expanded_graph(
     semantic_request: &fetch::SemanticFetchRequest,
-) -> stow_types::error::Result<bool> {
-    let Some(raw) = std::env::var_os(STOW_EXPANDED_GRAPH_ENV) else {
-        return Ok(true);
+    expanded_entries: Option<&[DependencyGraphEntry]>,
+) -> bool {
+    let Some(entries) = expanded_entries else {
+        return true;
     };
-    let raw = raw
-        .into_string()
-        .map_err(|_| stow_types::stow_error!("{STOW_EXPANDED_GRAPH_ENV} must be valid UTF-8"))?;
-    let entries = serde_json::from_str::<Vec<DependencyGraphEntry>>(&raw)
-        .wrap_err_with(|| format!("parse {STOW_EXPANDED_GRAPH_ENV}"))?;
-    Ok(entries.iter().any(|entry| {
+    entries.iter().any(|entry| {
         canonical_crate_name(entry.crate_name.as_str())
             == canonical_crate_name(&semantic_request.crate_name)
             && entry.version.to_string() == semantic_request.version
             && serde_json::to_string(&entry.features)
                 .is_ok_and(|features_json| features_json == semantic_request.features_json)
-    }))
+    })
 }
 
 pub(crate) fn parsed_artifact_kind(

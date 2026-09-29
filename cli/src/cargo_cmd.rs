@@ -327,6 +327,9 @@ async fn run_original_workspace_build(
     let semantic_fallback_enabled = expanded_graph
         .as_ref()
         .is_some_and(|entries| !entries.is_empty());
+    let servable_units = analysis
+        .as_ref()
+        .and_then(|analysis| analysis.servable_units.clone());
     let cache_policy_path = prepare_build_cache_plan(
         config,
         project,
@@ -375,6 +378,7 @@ async fn run_original_workspace_build(
         public_cache_mode,
         expanded_entries,
         prefetch_artifacts,
+        servable_units: servable_units.as_ref(),
         semantic_fallback_enabled,
         extra_rustflags: &[],
         covered_units,
@@ -433,6 +437,9 @@ async fn run_mirrored_upgrade_build(
     let mirror_semantic_fallback = mirror_expanded
         .as_ref()
         .is_some_and(|entries| !entries.is_empty());
+    let mirror_servable = mirror_analysis
+        .as_ref()
+        .and_then(|analysis| analysis.servable_units.clone());
 
     let cache_policy_path = prepare_build_cache_plan(
         config,
@@ -482,6 +489,7 @@ async fn run_mirrored_upgrade_build(
         public_cache_mode,
         expanded_entries: mirror_expanded.as_deref(),
         prefetch_artifacts: mirror_prefetch.as_deref(),
+        servable_units: mirror_servable.as_ref(),
         semantic_fallback_enabled: mirror_semantic_fallback,
         extra_rustflags: &[],
         covered_units: mirror_prefetch.as_ref().map_or(0, Vec::len),
@@ -736,6 +744,9 @@ struct WorkspacePrediction {
     missing_current: Vec<ResolvedDependency>,
     prefetch_artifacts: Vec<PrefetchArtifact>,
     cache_policy_entries: Vec<CachePolicyEntry>,
+    /// The serve map this build's facades answer from — `None` when it
+    /// could not be built and every invocation takes the plan path.
+    servable_units: Option<crate::facade::ServeMap>,
 }
 
 #[derive(Debug, Clone)]
@@ -802,7 +813,28 @@ async fn analyze_workspace_prediction(
 
     // Resolution never leaves the machine: the verified index slice is the
     // only catalog consulted, and the graph walk runs in-process.
-    let slice = ensure_consumer_slices(config, project).await?;
+    let (slice, host_slice) = ensure_consumer_slices(config, project).await?;
+    let local_units =
+        match crate::artifact_cache::locally_covered_units(config, &project.rustc_version).await {
+            Ok(units) => Some(units),
+            // A broken local listing loses the local pairs only — the
+            // index answer still stands, and the facades whose units
+            // nothing covers still skip the plan path (stow#347).
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "could not enumerate local coverage; the serve map carries index units only"
+                );
+                None
+            }
+        };
+    let servable_units = Some(build_serve_map(
+        project,
+        &slice.index.rows,
+        host_slice.as_ref(),
+        &expanded.entries,
+        local_units.as_deref().unwrap_or(&[]),
+    ));
     let analysis = {
         let rows = slice.index.rows;
         let entries = entries.clone();
@@ -831,7 +863,10 @@ async fn analyze_workspace_prediction(
         &project.rustc_version,
         analysis.prefetch_artifacts,
     );
-
+    let servable_units = servable_units.map(|mut map| {
+        prefetch_servable_wildcards(&mut map, &prefetch_artifacts);
+        map
+    });
     Ok(WorkspacePrediction {
         current_cached,
         current_total: entries.len(),
@@ -842,7 +877,198 @@ async fn analyze_workspace_prediction(
         missing_current,
         prefetch_artifacts,
         cache_policy_entries,
+        servable_units,
     })
+}
+
+/// The serve map the facades answer from: the `(crate, version)` pairs
+/// this build could serve at all — the resolved units an index slice
+/// covers plus the ones the local cache holds — per side of the unit
+/// graph (stow#347). Entries whose version is `"*"` are wildcards: the
+/// crate may serve under another version — semantic fallback candidates,
+/// prefetch ledger entries, and name-scoped local hits — so the facade
+/// still asks the plan path for them.
+///
+/// The pair set errs on covering: a unit the map wrongly includes costs a
+/// plan round trip, while a unit it wrongly excludes compiles despite an
+/// artifact being available.
+fn build_serve_map(
+    project: &ProjectContext,
+    consumer_rows: &[stow_types::index::ArtifactIndexRow],
+    host: Option<&index::IndexSlice>,
+    expanded_entries: &[ResolvedDependencyGraphEntry],
+    local_units: &[(String, String, String)],
+) -> crate::facade::ServeMap {
+    let host_glibc = resolve::host_glibc();
+    let unit_pairs = |host_side: bool| -> BTreeSet<(String, String)> {
+        expanded_entries
+            .iter()
+            .filter(|entry| entry.host_side == host_side)
+            .map(|entry| {
+                (
+                    crate::canonical_crate_name(entry.crate_name.as_str()),
+                    entry.version.to_string(),
+                )
+            })
+            .collect()
+    };
+    let index_pairs = |rows: &[stow_types::index::ArtifactIndexRow]| -> BTreeSet<(String, String)> {
+        rows.iter()
+            .filter(|row| resolve::row_servable_on_host(row, host_glibc))
+            .map(|row| {
+                (
+                    crate::canonical_crate_name(row.crate_name.as_str()),
+                    row.version.to_string(),
+                )
+            })
+            .collect()
+    };
+    // The set a facade consults is keyed on whether ITS invocation spells
+    // `--target`, and cargo spells it for consumer units only when the
+    // user asked. On a `--target` build the split is the unit graph's two
+    // sides; on a native build every unit arrives unspelled, so the whole
+    // servable graph sits on the host side — the consumer slice and the
+    // host slice are the same rows there.
+    let consumer_spelled = project.metadata_args.target.is_some();
+    // Unspelled units look up the slice for the build's own host triple:
+    // the consumer slice on a native build, the fetched host slice on a
+    // `--target` build — and none when no host slice was fetched.
+    let host_target = stow_types::api::runner_family(&project.target)
+        .map(|family| family.host_triple().to_owned());
+    let host_rows: &[stow_types::index::ArtifactIndexRow] = match (host_target.as_deref(), host) {
+        (Some(host_target), _) if host_target == project.target => consumer_rows,
+        (_, Some(host_slice)) => &host_slice.index.rows,
+        _ => &[],
+    };
+    let consumer_index_pairs = index_pairs(consumer_rows);
+    let host_index_pairs = index_pairs(host_rows);
+    let consumer_index_names: BTreeSet<&String> =
+        consumer_index_pairs.iter().map(|(name, _)| name).collect();
+    let host_index_names: BTreeSet<&String> =
+        host_index_pairs.iter().map(|(name, _)| name).collect();
+    let consumer_units = unit_pairs(false);
+    let host_units = unit_pairs(true);
+    let consumer_servable: BTreeSet<(String, String)> = consumer_units
+        .intersection(&consumer_index_pairs)
+        .cloned()
+        .collect();
+    let host_servable: BTreeSet<(String, String)> = host_units
+        .intersection(&host_index_pairs)
+        .cloned()
+        .collect();
+    let (mut target, mut host) = if consumer_spelled {
+        (consumer_servable, host_servable)
+    } else {
+        (
+            BTreeSet::new(),
+            consumer_servable.union(&host_servable).cloned().collect(),
+        )
+    };
+    for (crate_name, crate_version, unit_target) in local_units {
+        let pair = (
+            crate::canonical_crate_name(crate_name),
+            crate_version.clone(),
+        );
+        if unit_target == &project.target && consumer_units.contains(&pair) {
+            if consumer_spelled {
+                target.insert(pair.clone());
+            } else {
+                host.insert(pair.clone());
+            }
+        }
+        if Some(unit_target.as_str()) == host_target.as_deref() && host_units.contains(&pair) {
+            host.insert(pair.clone());
+        }
+    }
+    serve_map_wildcards(
+        &mut target,
+        &mut host,
+        consumer_spelled,
+        expanded_entries,
+        local_units,
+        &project.target,
+        host_target.as_deref(),
+        &consumer_index_names,
+        &host_index_names,
+        &consumer_units,
+        &host_units,
+    );
+    crate::facade::ServeMap {
+        target: target.into_iter().collect(),
+        host: host.into_iter().collect(),
+    }
+}
+
+/// The wildcard half of the serve map: a `("name", "*")` entry says this
+/// crate may serve under another version, so the facade still asks the
+/// plan path. Covers the units an exact pair cannot name — semantic
+/// fallback candidates and name-scoped local hits.
+#[allow(clippy::too_many_arguments)]
+fn serve_map_wildcards(
+    target: &mut BTreeSet<(String, String)>,
+    host: &mut BTreeSet<(String, String)>,
+    consumer_spelled: bool,
+    expanded_entries: &[ResolvedDependencyGraphEntry],
+    local_units: &[(String, String, String)],
+    project_target: &str,
+    host_target: Option<&str>,
+    consumer_index_names: &BTreeSet<&String>,
+    host_index_names: &BTreeSet<&String>,
+    consumer_units: &BTreeSet<(String, String)>,
+    host_units: &BTreeSet<(String, String)>,
+) {
+    // The side a unit's invocation arrives on: spelled `--target` units
+    // read `target`, every unspelled unit reads `host` — which is all of
+    // them on a native build.
+    let mut wildcard = |host_side: bool, name: String| {
+        if host_side || !consumer_spelled {
+            host.insert((name, "*".to_owned()));
+        } else {
+            target.insert((name, "*".to_owned()));
+        }
+    };
+    // A non-empty expanded graph is what `semantic_fallback_enabled`
+    // means downstream: a unit the index covers under another compatible
+    // version may still serve, so its name wildcards its side.
+    let semantic_fallback = !expanded_entries.is_empty();
+    for entry in expanded_entries {
+        let name = crate::canonical_crate_name(entry.crate_name.as_str());
+        let index_names = if entry.host_side {
+            host_index_names
+        } else {
+            consumer_index_names
+        };
+        if semantic_fallback && index_names.contains(&name) {
+            wildcard(entry.host_side, name);
+        }
+    }
+    // A local serve answers by name — the store's version key is not
+    // one a facade can reproduce — so every graph unit the local cache
+    // holds at all wildcards the side it would run on.
+    for (crate_name, _, unit_target) in local_units {
+        let name = crate::canonical_crate_name(crate_name);
+        if unit_target == project_target && consumer_units.iter().any(|(n, _)| *n == name) {
+            wildcard(false, name.clone());
+        }
+        if Some(unit_target.as_str()) == host_target && host_units.iter().any(|(n, _)| *n == name) {
+            wildcard(true, name);
+        }
+    }
+}
+
+/// The prefetch ledger's crate names as serve-map wildcards on both
+/// invocation spellings: a prefetched unit serves by content key, which
+/// no facade-side version can reproduce, and the wrong side costs only
+/// a plan round trip.
+fn prefetch_servable_wildcards(
+    servable_units: &mut crate::facade::ServeMap,
+    prefetch_artifacts: &[PrefetchArtifact],
+) {
+    for artifact in prefetch_artifacts {
+        let name = crate::canonical_crate_name(&artifact.crate_name);
+        servable_units.target.push((name.clone(), "*".to_owned()));
+        servable_units.host.push((name, "*".to_owned()));
+    }
 }
 
 /// Fetch the index slices a consumer's lookups read: the project's own
@@ -857,7 +1083,7 @@ async fn analyze_workspace_prediction(
 async fn ensure_consumer_slices(
     config: &StowConfig,
     project: &ProjectContext,
-) -> stow_types::error::Result<index::IndexSlice> {
+) -> stow_types::error::Result<(index::IndexSlice, Option<index::IndexSlice>)> {
     let host_target = stow_types::api::runner_family(&project.target)
         .map(|family| family.host_triple().to_owned())
         .filter(|host| *host != project.target);
@@ -865,21 +1091,25 @@ async fn ensure_consumer_slices(
         match host_target.as_deref() {
             Some(target) => index::ensure_slice(config, target, &project.rustc_version)
                 .await
-                .map(|_| ()),
-            None => Ok(()),
+                .map(Some),
+            None => Ok(None),
         }
     };
     let (slice, host) = tokio::join!(
         index::ensure_slice(config, &project.target, &project.rustc_version),
         host_fetch,
     );
-    if let Err(error) = host {
-        tracing::warn!(
-            error = %error,
-            "could not fetch the host-side index slice; host deps will compile locally"
-        );
-    }
-    slice
+    let host_slice = match host {
+        Ok(host_slice) => host_slice,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not fetch the host-side index slice; host deps will compile locally"
+            );
+            None
+        }
+    };
+    Ok((slice?, host_slice))
 }
 
 /// Ask the scheduler to build the misses this build compiled locally.
@@ -1291,7 +1521,7 @@ async fn synthesize_lockfile(
     if direct.is_empty() {
         return Ok(None);
     }
-    let slice = ensure_consumer_slices(config, project).await?;
+    let (slice, _) = ensure_consumer_slices(config, project).await?;
     let outcome = {
         let rows = slice.index.rows;
         tokio::task::spawn_blocking(move || lockfile_resolver::resolve_lockfile(&rows, &direct))
@@ -1418,6 +1648,7 @@ async fn run_pinned_mirror_build(
 ) -> stow_types::error::Result<bool> {
     let mirror_expanded = mirror_analysis.expanded_entries.clone();
     let mirror_prefetch = mirror_analysis.prefetch_artifacts.clone();
+    let mirror_servable = mirror_analysis.servable_units.clone();
     let mirror_semantic_fallback = !mirror_expanded.is_empty();
 
     // The resolver path builds its own graph analysis for the pinned mirror,
@@ -1472,6 +1703,7 @@ async fn run_pinned_mirror_build(
         public_cache_mode,
         expanded_entries: Some(&mirror_expanded),
         prefetch_artifacts: Some(&mirror_prefetch),
+        servable_units: mirror_servable.as_ref(),
         semantic_fallback_enabled: mirror_semantic_fallback,
         extra_rustflags: &[],
         covered_units: mirror_prefetch.len(),
@@ -1857,6 +2089,7 @@ async fn try_run_top_crate_with_cached_dependencies(
         public_cache_mode: &PublicCacheMode::for_rustc(&project.rustc_version),
         expanded_entries: None,
         prefetch_artifacts: None,
+        servable_units: None,
         semantic_fallback_enabled: false,
         extra_rustflags: &rustflags,
         covered_units: plan.bundles.len(),
@@ -3102,6 +3335,9 @@ struct CargoRunPlan<'a> {
     public_cache_mode: &'a PublicCacheMode,
     expanded_entries: Option<&'a [DependencyGraphEntry]>,
     prefetch_artifacts: Option<&'a [PrefetchArtifact]>,
+    /// The serve map the facades answer their uncovered checks from —
+    /// `None` exports no map and every invocation plans.
+    servable_units: Option<&'a crate::facade::ServeMap>,
     semantic_fallback_enabled: bool,
     extra_rustflags: &'a [String],
     covered_units: usize,
@@ -3113,15 +3349,14 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         config,
         action,
         cargo_args,
-        source_root,
         current_dir,
         cache_policy_path,
         public_cache_mode,
         expanded_entries,
         prefetch_artifacts,
         semantic_fallback_enabled,
-        extra_rustflags,
         covered_units,
+        ..
     } = *plan;
     let wrappers = detect_wrapper_commands()?;
     let mut command = Command::new("cargo");
@@ -3130,6 +3365,81 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         command.arg("--config").arg(config_arg);
     }
     command.args(cargo_args).current_dir(current_dir);
+    export_wrapper_env(&mut command, plan, &wrappers)?;
+
+    // Every rustc invocation this cargo run spawns is a facade that asks
+    // this process what to do, so the whole build shares one transport —
+    // one pooled connection, one QUIC endpoint — instead of opening one
+    // per compile unit. The context travels by construction: the `STOW_*`
+    // variables land on cargo's environment, not this process's, so the
+    // deciding process holds the resolved values itself (stow#347).
+    let handler = std::sync::Arc::new(crate::BuildSupervisor::new(crate::BuildContext {
+        policy_dir: cache_policy_path.map(Path::to_path_buf),
+        public_cache_target: Some(project.target.clone()),
+        public_cache_disabled: public_cache_mode.disable_reason().is_some(),
+        semantic_fallback_enabled,
+        expanded_entries: expanded_entries.map(<[DependencyGraphEntry]>::to_vec),
+        prefetch_candidates: prefetch_artifacts.map_or_else(BTreeMap::new, |artifacts| {
+            crate::prefetch_candidate_c_metadatas(
+                artifacts
+                    .iter()
+                    .map(|artifact| (artifact.crate_name.clone(), artifact.c_metadata.clone())),
+            )
+        }),
+    }));
+    let supervisor = crate::supervisor::server::start(handler.clone())
+        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
+    for (key, value) in supervisor.env() {
+        command.env(key, value);
+    }
+
+    let before = CoverageSnapshot::capture(config).await;
+
+    let status = command
+        .status()
+        .await
+        .wrap_err_with(|| format!("run cargo {action}"))?;
+    drop(supervisor);
+    if let Some(config) = config {
+        if status.success() {
+            report_cache_coverage(config, before, covered_units).await;
+        }
+        // The build's compile observations are its miss list (stow#317)
+        // — a failed build's units are real misses too, whatever its
+        // last unit did. They land in the same journal a plain-cargo
+        // wrapper writes, and a detached drain posts the admission —
+        // this command returns as soon as cargo does.
+        journal_and_drain_misses(project, cargo_args, &handler.observations());
+    }
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// The `STOW_*` contract a cargo run's wrappers read: the toolchain
+/// shims, the resolved config blob, the graph facts and serve map the
+/// facades answer from, and the cache policy — everything a wrapper
+/// would otherwise load itself on every invocation (stow#347).
+fn export_wrapper_env(
+    command: &mut Command,
+    plan: &CargoRunPlan<'_>,
+    wrappers: &crate::commands::WrapperCommands,
+) -> stow_types::error::Result<()> {
+    let CargoRunPlan {
+        project,
+        config,
+        cargo_args,
+        source_root,
+        cache_policy_path,
+        public_cache_mode,
+        expanded_entries,
+        prefetch_artifacts,
+        servable_units,
+        semantic_fallback_enabled,
+        extra_rustflags,
+        ..
+    } = *plan;
     command.env("RUSTC_WRAPPER", &wrappers.rustc);
     // The shims ride the `cc` crate's target-scoped keys for this build's
     // target rather than bare CC/CXX, the same scope `stow setup` writes —
@@ -3175,6 +3485,13 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
             prefetch_artifacts_env_json(prefetch_artifacts)?,
         );
     }
+    if let Some(servable_units) = servable_units {
+        command.env(
+            crate::facade::STOW_SERVABLE_UNITS_ENV,
+            serde_json::to_string(servable_units)
+                .wrap_err("serialize the build's serve map for rustc wrappers")?,
+        );
+    }
     if let Some(path) = cache_policy_path {
         let (key, value) = cache_policy::cache_policy_env(path);
         command.env(key, value);
@@ -3187,39 +3504,6 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
             "CARGO_TARGET_DIR",
             project.workspace_root.join("target").into_os_string(),
         );
-    }
-
-    // Every rustc invocation this cargo run spawns is a facade that asks
-    // this process what to do, so the whole build shares one transport —
-    // one pooled connection, one QUIC endpoint — instead of opening one
-    // per compile unit.
-    let handler = std::sync::Arc::new(crate::BuildSupervisor::default());
-    let supervisor = crate::supervisor::server::start(handler.clone())
-        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
-    for (key, value) in supervisor.env() {
-        command.env(key, value);
-    }
-
-    let before = CoverageSnapshot::capture(config).await;
-
-    let status = command
-        .status()
-        .await
-        .wrap_err_with(|| format!("run cargo {action}"))?;
-    drop(supervisor);
-    if let Some(config) = config {
-        if status.success() {
-            report_cache_coverage(config, before, covered_units).await;
-        }
-        // The build's compile observations are its miss list (stow#317)
-        // — a failed build's units are real misses too, whatever its
-        // last unit did. They land in the same journal a plain-cargo
-        // wrapper writes, and a detached drain posts the admission —
-        // this command returns as soon as cargo does.
-        journal_and_drain_misses(project, cargo_args, &handler.observations());
-    }
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
 }
