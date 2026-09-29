@@ -10,7 +10,9 @@
 //! pulls every published `(target, rustc_version)` index slice and marks
 //! the nodes it already serves, so a re-run computes only the remaining
 //! work. Runs a previous invocation dispatched are adopted by
-//! `display_title` rather than re-dispatched.
+//! `display_title` rather than re-dispatched — except a failure that ran
+//! code `main` no longer carries, which says nothing about the code a
+//! dispatch runs now and is dispatched again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -151,6 +153,21 @@ struct RunState {
     /// The run's `created_at` — adoption pulls the `created>=` window
     /// back to cover the oldest run the wave tracks.
     created_at: Option<time::OffsetDateTime>,
+    /// Whether the run built the code `main` carries now. The local CI
+    /// server always runs the checkout it serves, so its runs are.
+    ran_current_code: bool,
+}
+
+impl RunState {
+    /// A failure on code `main` has since moved past: not this wave's
+    /// result, so the node is dispatched again rather than adopted as
+    /// failed. A success or a run still in flight is adopted whatever it
+    /// ran — the success published, and the in-flight run will.
+    fn stale_failure(&self) -> bool {
+        !self.ran_current_code
+            && self.status == "completed"
+            && self.conclusion.as_deref() != Some("success")
+    }
 }
 
 /// Entry point — registry sessions need a Tokio reactor, so the driver
@@ -749,12 +766,24 @@ async fn drive_layer(
             let Some(node) = nodes.get_mut(&state.task_id) else {
                 continue;
             };
+            if state.stale_failure() {
+                // The run this node was tracking ended as a failure of
+                // older code: drop it, so the node dispatches afresh.
+                if node.run_url.as_deref() == Some(state.url.as_str()) {
+                    node.run_url = None;
+                    node.dispatched = false;
+                }
+                continue;
+            }
             if node.run_url.is_none()
                 && let Some(created) = state.created_at
             {
                 created_since = created_since.min(created);
             }
             node.run_url = Some(state.url);
+            // An adopted run is a dispatch, whichever invocation sent it:
+            // it counts against `in_flight` and is never sent twice.
+            node.dispatched = true;
             match (state.status.as_str(), state.conclusion.as_deref()) {
                 ("completed", Some("success")) => {
                     node.done = true;
@@ -1043,7 +1072,9 @@ impl Dispatch {
     /// is not this wave's, is not one this wave could have dispatched.
     /// `created_since` is the wave's adoption horizon: GitHub filters
     /// `created=>={created_since}` and the pages are walked until
-    /// exhausted — a wave's runs can exceed one page of 100.
+    /// exhausted — a wave's runs can exceed one page of 100. Each run is
+    /// compared against `main`'s head read on the same poll, so a release
+    /// landing mid-wave marks the runs before it as older code.
     async fn list_runs(
         &self,
         open: &BTreeSet<String>,
@@ -1058,6 +1089,8 @@ impl Dispatch {
                 let created = created_since
                     .format(&time::format_description::well_known::Rfc3339)
                     .map_err(|error| stow_error!("format adoption horizon: {error}"))?;
+                let head: GitRef =
+                    crate::github::get(token, &format!("git/ref/heads/{BRANCH}")).await?;
                 let mut rows = Vec::new();
                 let mut page = 1u32;
                 loop {
@@ -1085,6 +1118,7 @@ impl Dispatch {
                                 status: run.status,
                                 conclusion: run.conclusion,
                                 url: run.html_url,
+                                ran_current_code: run.head_sha == head.object.sha,
                                 created_at: run.created_at.as_deref().and_then(|raw| {
                                     time::OffsetDateTime::parse(
                                         raw,
@@ -1119,6 +1153,7 @@ impl Dispatch {
                                 conclusion: run.conclusion,
                                 url: run.html_url,
                                 created_at: None,
+                                ran_current_code: true,
                             }
                         })
                     })
@@ -1137,10 +1172,22 @@ struct WorkflowRunsPage {
 #[derive(serde::Deserialize)]
 struct WorkflowRunRow {
     display_title: String,
+    head_sha: String,
     status: String,
     conclusion: Option<String>,
     html_url: String,
     created_at: Option<String>,
+}
+
+/// `GET /git/ref/heads/{branch}` — the fields the driver needs.
+#[derive(serde::Deserialize)]
+struct GitRef {
+    object: GitRefObject,
+}
+
+#[derive(serde::Deserialize)]
+struct GitRefObject {
+    sha: String,
 }
 
 /// The local CI server's `GET /tasks` shape.
@@ -1160,6 +1207,28 @@ struct LocalTaskRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_state(status: &str, conclusion: Option<&str>, ran_current_code: bool) -> RunState {
+        RunState {
+            task_id: "task".to_owned(),
+            status: status.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+            url: "https://github.com/water-rs/stow/actions/runs/1".to_owned(),
+            created_at: None,
+            ran_current_code,
+        }
+    }
+
+    /// Only a finished, unsuccessful run of older code is dispatched
+    /// again; everything else is adopted as the run says.
+    #[test]
+    fn only_a_failure_on_older_code_is_retried() {
+        assert!(run_state("completed", Some("failure"), false).stale_failure());
+        assert!(run_state("completed", Some("cancelled"), false).stale_failure());
+        assert!(!run_state("completed", Some("failure"), true).stale_failure());
+        assert!(!run_state("completed", Some("success"), false).stale_failure());
+        assert!(!run_state("in_progress", None, false).stale_failure());
+    }
 
     /// The smallest `EnqueueRequest` `build_graph` can fold — the test
     /// graph's task ids come from it.
