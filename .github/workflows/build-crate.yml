@@ -158,8 +158,8 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: ci/glibc-sysroot/wrappers.sh "$HOME/stow-glibc-2.28"
-      # toolchain-publish.yml publishes stow-build, stow-cli and stow-admin
-      # once per main commit per host platform from the merge queue; this
+      # toolchain-publish.yml publishes stow-build and stow-cli (and on
+      # Linux stow-admin) once per main commit per host platform from the merge queue; this
       # job pulls that artifact — digest-pinned, cosign-verified against the
       # merge-queue identity and this commit — instead of compiling
       # (stow#431). An absent artifact fails the step; there is no
