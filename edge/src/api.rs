@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
-use skyzen::runtime::WorkerContext;
 use skyzen::runtime::wasm::from_js_response;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Response, StatusCode};
@@ -18,7 +17,6 @@ use stow_types::api::{
 use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 
-use crate::cache_key::bundle_cache_key;
 use crate::db;
 use crate::errors::GetArtifactError;
 use crate::fetch_guard::OutboundPool;
@@ -26,18 +24,9 @@ use crate::github_auth;
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
-    admission, cache, catalog, crates_io, dependency_resolver, ghcr, index_slice, miss_logger,
+    admission, catalog, crates_io, dependency_resolver, ghcr, index_slice, miss_logger,
     rust_channel, scheduler, scheduler_client, stats, worker_resolver,
 };
-
-/// Header value for `x-stow-cache: hit|miss`.
-const fn cache_status_header(cache_hit: bool) -> HeaderValue {
-    if cache_hit {
-        HeaderValue::from_static("hit")
-    } else {
-        HeaderValue::from_static("miss")
-    }
-}
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct OkResponse {
@@ -60,37 +49,6 @@ impl Extractor for SchedulerCaller {
 
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         extract_trusted_caller(request).await.map(Self)
-    }
-}
-
-/// Everything a bundle-serving handler needs to stream bytes: the Cache
-/// API, the registry coordinates, and the worker context that keeps the
-/// cache tee alive after the response is returned.
-#[derive(Debug, Clone)]
-pub struct BundleStreams {
-    pub context: WorkerContext,
-    pub cache: CfCache,
-    pub ghcr: GhcrConfig,
-}
-
-impl Extractor for BundleStreams {
-    type Error = GetArtifactError;
-
-    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
-        let context = WorkerContext::extract(request)
-            .await
-            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-        let State(cache) = State::<CfCache>::extract(request)
-            .await
-            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-        let State(ghcr) = State::<GhcrConfig>::extract(request)
-            .await
-            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-        Ok(Self {
-            context,
-            cache,
-            ghcr,
-        })
     }
 }
 
@@ -1300,7 +1258,7 @@ async fn submit_and_assemble(
 pub async fn crate_request_status(
     params: Params,
     State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::RequestStatus>, GetArtifactError> {
+) -> Result<Response, GetArtifactError> {
     let task_id = params
         .get("task_id")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -1311,7 +1269,7 @@ pub async fn crate_request_status(
         .ok_or_else(|| GetArtifactError::UnknownTask {
             task_id: task_id.to_owned(),
         })?;
-    Ok(Json(status))
+    cacheable_json(&status, POINT_IN_TIME_NO_STORE)
 }
 
 /// Query parameters for `GET /api/v1/crates/search`.
@@ -1328,6 +1286,10 @@ pub struct CrateSearchQuery {
 /// form issues one lookup per keystroke burst and per version pick.
 const CATALOG_SEARCH_MAX_AGE: &str = "public, max-age=300";
 const CATALOG_VERSIONS_MAX_AGE: &str = "public, max-age=600";
+
+/// `Cache-Control` on every point-in-time answer — the task status lanes
+/// change underneath the caller, so Workers Cache must never store one.
+const POINT_IN_TIME_NO_STORE: &str = "no-store";
 
 /// Serialize `body` as a cacheable JSON response.
 fn cacheable_json<T: serde::Serialize>(
@@ -1415,22 +1377,17 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
 
 /// GET /`api/v1/bundles/{digest}`
 ///
-/// The byte path: this worker is the Cache API in front of the
-/// `<tag>.bundle` blobs under `ghcr.io/water-rs/stow-cache`. The
-/// `sha256:<64 lowercase hex>` path segment is the whole address — it is
-/// validated before any fetch; a cache hit returns; a miss opens the GHCR
-/// blob and tees it into the cache while it streams; a GHCR 404 is a 404.
-/// No catalog row is consulted: the CLI's signed index named these bytes,
-/// and the CLI verifies them against the index before they are used.
+/// The byte path: streams the `<tag>.bundle` blobs under
+/// `ghcr.io/water-rs/stow-cache`. The `sha256:<64 lowercase hex>` path
+/// segment is the whole address — it is validated before any fetch; the
+/// answer's immutable `Cache-Control` is what Workers Cache stores and
+/// replays without this worker running; a GHCR 404 is a 404. No catalog
+/// row is consulted: the CLI's signed index named these bytes, and the
+/// CLI verifies them against the index before they are used.
 pub async fn get_bundle(
     params: Params,
-    streams: BundleStreams,
+    State(ghcr): State<GhcrConfig>,
 ) -> Result<Response, GetArtifactError> {
-    let BundleStreams {
-        context,
-        cache,
-        ghcr,
-    } = streams;
     let digest = params
         .get("digest")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -1439,13 +1396,11 @@ pub async fn get_bundle(
             "malformed bundle digest `{digest}` — expected sha256:<64 lowercase hex>"
         )));
     }
-    let cache_key = bundle_cache_key(digest);
 
-    let (body, content_length, cache_hit) =
-        open_bundle_stream(&context, &cache, &ghcr, &cache_key, digest)
-            .await
-            .map_err(registry_fetch_error)?;
-    Ok(bundle_response(body, content_length, cache_hit))
+    let (body, content_length) = open_bundle_stream(&ghcr, digest)
+        .await
+        .map_err(registry_fetch_error)?;
+    Ok(bundle_response(body, content_length))
 }
 
 /* ---- index slices ---- */
@@ -1702,7 +1657,6 @@ fn slice_response(
     body: Body,
     encoding: index_slice::SliceEncoding,
     content_length: Option<u64>,
-    cache_hit: bool,
 ) -> Response {
     let mut response = Response::new(body);
     let headers = response.headers_mut();
@@ -1727,27 +1681,23 @@ fn slice_response(
     if let Some(length) = content_length {
         headers.insert(skyzen::header::CONTENT_LENGTH, HeaderValue::from(length));
     }
-    headers.insert("x-stow-cache", cache_status_header(cache_hit));
     response
 }
 
 /// `GET /api/v1/index/{target}/{rustc_version}/{digest}` — the index
 /// slice itself: the same blob the CLI's index refresh pulls, served
-/// from this origin through the Cache API so a browser never has to run
-/// GHCR's anonymous bearer exchange. `Accept-Encoding` picks the
+/// from this origin so a browser never has to run GHCR's anonymous
+/// bearer exchange, and cached by Workers Cache on the response's own
+/// immutable `Cache-Control`. `Accept-Encoding` picks the
 /// `Content-Encoding`: `zstd` passes the published blob through
-/// byte-for-byte; anything else gets a gzip transcode cached once per
-/// digest per colo.
+/// byte-for-byte; anything else gets a gzip transcode, cached per
+/// encoding by the `Vary` the answer carries.
 pub async fn get_index_slice(
     params: Params,
     accept: AcceptEncoding,
-    streams: BundleStreams,
+    State(ghcr): State<GhcrConfig>,
+    State(cache): State<CfCache>,
 ) -> Result<Response, GetArtifactError> {
-    let BundleStreams {
-        context,
-        cache,
-        ghcr,
-    } = streams;
     let target = path_target(&params)?;
     let rustc_version = index_rustc_version(
         &cache,
@@ -1765,23 +1715,6 @@ pub async fn get_index_slice(
     .to_owned();
 
     let encoding = index_slice::negotiate_encoding(&accept.0);
-    let cache_key = index_slice::slice_cache_key(&digest, encoding);
-
-    match cache::get_index_slice(&cache, &cache_key).await {
-        Ok(Some(cached)) => {
-            let content_length = worker_content_length(&cached);
-            return Ok(slice_response(
-                body_from_worker_response(cached).map_err(registry_fetch_error)?,
-                encoding,
-                content_length,
-                true,
-            ));
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(key = %cache_key, %error, "cf slice cache read failed");
-        }
-    }
 
     // One bound for the whole request: the manifest read and the blob
     // stream draw from the same invocation's budget.
@@ -1791,53 +1724,26 @@ pub async fn get_index_slice(
 
     match encoding {
         index_slice::SliceEncoding::Zstd => {
-            // The same tee as the bundle path: one branch fills the
-            // Cache API under `waitUntil`, the other is the response
-            // body.
             let content_length = worker_content_length(&upstream);
-            match upstream.cloned() {
-                Ok(for_cache) => {
-                    let cache = cache.clone();
-                    let key = cache_key.clone();
-                    let put = async move {
-                        if let Err(error) =
-                            cache::put_index_slice_stream(&cache, &key, for_cache).await
-                        {
-                            tracing::warn!(key = %key, %error, "cf slice cache put failed");
-                        }
-                    };
-                    if let Err(error) = context.wait_until(put) {
-                        tracing::warn!(key = %cache_key, %error, "cf slice cache put not scheduled");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(key = %cache_key, %error, "slice stream tee failed; serving uncached");
-                }
-            }
             Ok(slice_response(
                 body_from_worker_response(upstream).map_err(registry_fetch_error)?,
                 encoding,
                 content_length,
-                false,
             ))
         }
         index_slice::SliceEncoding::Gzip => {
-            // Buffer and transcode once per digest per colo; later
-            // non-zstd clients hit the cached gzip copy. The manifest's
-            // declared size bounds the read — a blob that grows past it
-            // is an error, not a bigger buffer.
+            // Buffer and transcode on a Workers Cache miss; the response's
+            // `Vary: accept-encoding` caches the gzip copy under its own
+            // variant. The manifest's declared size bounds the read — a
+            // blob that grows past it is an error, not a bigger buffer.
             let zstd = bounded_blob_bytes(&mut upstream, layer.size).await?;
             let gzip = index_slice::zstd_to_gzip(&zstd)
                 .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
             let content_length = gzip.len() as u64;
-            if let Err(error) = cache::put_index_slice_bytes(&cache, &cache_key, &gzip).await {
-                tracing::warn!(key = %cache_key, %error, "cf slice cache put failed");
-            }
             Ok(slice_response(
                 Body::from(gzip),
                 encoding,
                 Some(content_length),
-                false,
             ))
         }
     }
@@ -2063,8 +1969,10 @@ pub async fn enqueue_admitted_task(
 
 /// The streamed bundle response: the body is the published bundle blob
 /// byte-for-byte, so its length is the upstream `content-length` when the
-/// registry or the cache reported one.
-fn bundle_response(body: Body, content_length: Option<u64>, cache_hit: bool) -> Response {
+/// registry reported one. The immutable `Cache-Control` is the whole
+/// caching contract Workers Cache needs to answer later reads without
+/// this worker running.
+fn bundle_response(body: Body, content_length: Option<u64>) -> Response {
     let mut response = Response::new(body);
     let headers = response.headers_mut();
     headers.insert(
@@ -2078,38 +1986,19 @@ fn bundle_response(body: Body, content_length: Option<u64>, cache_hit: bool) -> 
     if let Some(length) = content_length {
         headers.insert(skyzen::header::CONTENT_LENGTH, HeaderValue::from(length));
     }
-    headers.insert("x-stow-cache", cache_status_header(cache_hit));
     response
 }
 
-/// Open the bundle for `digest` as a stream: the Cache API copy when there
-/// is one, otherwise the registry blob, teed into the Cache API while the
-/// client reads it. Nothing on this path buffers the bundle or inspects
-/// it — the publish stage validated the tar before pushing it, GHCR
-/// addresses it by content, and the CLI verifies the digest and the cosign
-/// material inside it.
+/// Open the bundle for `digest` as a stream straight from the registry.
+/// Nothing on this path buffers the bundle or inspects it — the publish
+/// stage validated the tar before pushing it, GHCR addresses it by
+/// content, and the CLI verifies the digest and the cosign material
+/// inside it.
 async fn open_bundle_stream(
-    context: &WorkerContext,
-    cache: &CfCache,
     ghcr: &GhcrConfig,
-    cache_key: &str,
     digest: &str,
-) -> Result<(Body, Option<u64>, bool), ghcr::FetchError> {
-    match cache::get_stream(cache, cache_key).await {
-        Ok(Some(cached)) => {
-            tracing::debug!(key = %cache_key, "cf cache hit");
-            let content_length = worker_content_length(&cached);
-            return Ok((body_from_worker_response(cached)?, content_length, true));
-        }
-        Ok(None) => {
-            tracing::debug!(key = %cache_key, "cf cache miss");
-        }
-        Err(error) => {
-            tracing::warn!(key = %cache_key, error = %error, "cf cache error");
-        }
-    }
-
-    let mut upstream = ghcr::open_blob(
+) -> Result<(Body, Option<u64>), ghcr::FetchError> {
+    let upstream = ghcr::open_blob(
         &ghcr.base_url,
         cache_repository(),
         digest,
@@ -2119,7 +2008,6 @@ async fn open_bundle_stream(
     .await
     .map_err(|error| {
         tracing::error!(
-            cache_key = %cache_key,
             bundle_digest = %digest,
             error = %error,
             "edge failed to open bundle blob from registry"
@@ -2128,31 +2016,7 @@ async fn open_bundle_stream(
     })?;
 
     let content_length = worker_content_length(&upstream);
-    if content_length.is_none_or(cache::fits_cache) {
-        // `cloned` tees the JS stream: one branch feeds the Cache API
-        // under `waitUntil`, the other is the response body. The put
-        // consumes its branch at the client's pace, so no branch buffers
-        // beyond the tee's own backlog.
-        match upstream.cloned() {
-            Ok(for_cache) => {
-                let cache = cache.clone();
-                let key = cache_key.to_owned();
-                let put = async move {
-                    if let Err(error) = cache::put_stream(&cache, &key, for_cache).await {
-                        tracing::warn!(key = %key, error = %error, "cf cache put failed");
-                    }
-                };
-                if let Err(error) = context.wait_until(put) {
-                    tracing::warn!(key = %cache_key, error = %error, "cf cache put not scheduled");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(key = %cache_key, error = %error, "bundle stream tee failed; serving uncached");
-            }
-        }
-    }
-
-    Ok((body_from_worker_response(upstream)?, content_length, false))
+    Ok((body_from_worker_response(upstream)?, content_length))
 }
 
 /// Hand a `worker::Response` body to Skyzen without reading it.
@@ -2171,17 +2035,20 @@ pub struct GhcrConfig {
     pub tokens: RegistryTokens,
 }
 
+/// `Cache-Control` on the public stats answer — the SQL API is billed
+/// per query, so Workers Cache holds the body for the hour the figure
+/// tolerates being stale.
+const USAGE_STATS_MAX_AGE: &str = "public, max-age=3600";
+
 /// GET /api/v1/stats — the public aggregate usage statistics. Anonymous:
 /// the handler reads no request data at all, and the `UsageStats` it
 /// returns is computed from the Analytics Engine SQL API at most once an
-/// hour per colo — the serialized body rides the Cache API between runs.
+/// hour — Workers Cache replays the answer for the rest of the hour.
 pub async fn usage_stats(
     State(stats_ctx): State<stats::StatsContext>,
-    State(cache): State<CfCache>,
-) -> Result<Json<stow_types::api::UsageStats>, GetArtifactError> {
-    stats::cached_usage_stats(&stats_ctx, &cache)
-        .await
-        .map(Json)
+) -> Result<Response, GetArtifactError> {
+    let stats = stats::compute_usage_stats(&stats_ctx).await?;
+    cacheable_json(&stats, USAGE_STATS_MAX_AGE)
 }
 
 impl GetArtifactError {

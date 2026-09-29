@@ -7,3 +7,10 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+  # Cargo dependency updates ride the same merge-queue gate every other
+  # PR does — Dependabot opens one PR per dep (#454; the weekly
+  # cargo-outdated issue lane it replaces is gone).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly

@@ -1,6 +1,8 @@
 //! Privacy-preserving usage statistics: the public `UsageStats`
-//! aggregates are computed from the Analytics Engine SQL API and served
-//! through the Cache API — never D1.
+//! aggregates are computed from the Analytics Engine SQL API — never D1
+//! — and cached at the edge by Workers Cache on the answer's own
+//! `Cache-Control` (the SQL API is billed per query, so the figure
+//! tolerates an hour of staleness).
 //!
 //! `stow_events` holds one point per sampled cache hit from the era when
 //! the byte path resolved catalog rows and knew the artifact's identity;
@@ -259,23 +261,13 @@ mod worker {
         }
     }
 
-    /// The public [`stow_types::api::UsageStats`] — served from the Cache
-    /// API when fresh, else computed from the `stats_*.sql` queries and
-    /// cached for one hour so the SQL API is hit at most hourly per colo.
-    pub async fn cached_usage_stats(
+    /// The public [`stow_types::api::UsageStats`] — computed from the
+    /// `stats_*.sql` queries on a Workers Cache miss; the answer's
+    /// `Cache-Control` holds the result for the staleness the figures
+    /// tolerate.
+    pub async fn compute_usage_stats(
         context: &StatsContext,
-        cache: &skyzen_cloudflare::CfCache,
     ) -> Result<stow_types::api::UsageStats, crate::errors::GetArtifactError> {
-        if let Some(bytes) = crate::cache::get_stats(cache).await.map_err(|error| {
-            crate::errors::GetArtifactError::InternalWithMessage(error.to_string())
-        })? {
-            match serde_json::from_slice(&bytes) {
-                Ok(stats) => return Ok(stats),
-                Err(error) => {
-                    tracing::warn!(%error, "cached stats failed to parse; recomputing");
-                }
-            }
-        }
         let events = first_row(run_sql(context, super::EVENTS_SQL).await?, "stats_events")?;
         let installs = first_row(
             run_sql(context, super::INSTALLS_SQL).await?,
@@ -285,28 +277,19 @@ mod worker {
         let top_crates = run_sql(context, super::TOP_CRATES_SQL).await?;
         let targets = run_sql(context, super::TARGETS_SQL).await?;
         let cli_versions = run_sql(context, super::CLI_VERSIONS_SQL).await?;
-        let stats = super::usage_stats_from_rows(
+        Ok(super::usage_stats_from_rows(
             &events,
             &installs,
             &misses,
             top_crates,
             targets,
             cli_versions,
-        );
-        match serde_json::to_vec(&stats) {
-            Ok(body) => {
-                if let Err(error) = crate::cache::put_stats(cache, &body).await {
-                    tracing::warn!(%error, "failed to cache usage stats");
-                }
-            }
-            Err(error) => tracing::warn!(%error, "failed to serialize usage stats"),
-        }
-        Ok(stats)
+        ))
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use worker::{StatsContext, cached_usage_stats};
+pub use worker::{StatsContext, compute_usage_stats};
 
 #[cfg(test)]
 mod tests {

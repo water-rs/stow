@@ -270,8 +270,10 @@ config, the signature materials, and the layers byte-for-byte, and the CLI
 verifies that material after download. The task's records artifact
 carries the bundle layer's digest and size (`bundle_digest`,
 `bundle_size`), republished verbatim into the index row; the CLI asks the
-edge for `GET /api/v1/bundles/{bundle_digest}`, which serves the blob
-Cache-API-first and tees a GHCR miss into the cache, and the CLI requires
+edge for `GET /api/v1/bundles/{bundle_digest}`, which streams the blob
+from GHCR behind Workers Cache (the answer's immutable `Cache-Control`
+lets the platform serve later reads without the Worker running), and the
+CLI requires
 the bytes to hash to the index row's `bundle_digest` — no intermediary
 ever assembles, buffers or inspects it. The publish stage validated the tar
 (`stow_types::bundle_schema`) before pushing it.
@@ -623,8 +625,8 @@ argument, so the opt-out is honoured by construction).
 `GET /api/v1/stats` answers `UsageStats` by running the
 `edge/src/sql/stats_*.sql` queries against the Analytics Engine SQL API
 (`POST …/accounts/{CF_ACCOUNT_ID}/analytics_engine/sql`, authorized by
-the `CF_ANALYTICS_TOKEN` secret) and caches the response in the Cache
-API for one hour per colo. The hit-side queries read `stow_events`, the
+the `CF_ANALYTICS_TOKEN` secret); the answer's one-hour `Cache-Control`
+lets Workers Cache replay it between runs. The hit-side queries read `stow_events`, the
 retired hit dataset: the digest-addressed byte path carries no artifact
 identity and writes nothing, so its points drain under the 90-day
 retention and the derived figures decay to zero. `GET /stats`
@@ -644,8 +646,8 @@ deserialization.
 |---|---|---|---|---|
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
-| GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Cache-API-cached for one hour |
-| GET `/api/v1/bundles/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Digest-addressed byte fetch — the only artifact-serving route; the `sha256:<64 hex>` path segment is the index row's `bundle_digest`, served Cache-API-first over GHCR |
+| GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Workers-Cached for one hour |
+| GET `/api/v1/bundles/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Digest-addressed byte fetch — the only artifact-serving route; the `sha256:<64 hex>` path segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | POST `/api/v1/admin/artifacts/sync` | Bearer: repo push user | `Vec<ArtifactRecord>` chunk | `OkResponse` | Mirror the GHCR records into the D1 catalog — `stow-admin index sync` inside `index-publish.yml` |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|clear`) |
@@ -678,8 +680,9 @@ per 10 seconds per source IP over the API prefix, not per route. The
 `/api/v1/bundles/` byte path is carved out of it: a warm build streams
 its closure at the CLI's prefetch concurrency and the per-`rustc` wrapper
 fetches on demand under cargo's job parallelism, so one address
-legitimately sends tens of bundle requests a second, and a Cache API hit
-there costs one Worker request and no D1 or Durable Object work. The trusted
+legitimately sends tens of bundle requests a second, and a Workers Cache
+hit there spends only the billed request itself — no Worker CPU,
+subrequests, D1 or Durable Object work. The trusted
 write endpoints (`admin/artifacts/sync`, `scheduler/tasks/submit`,
 `github/workflow-run`) are inside the limited prefix, which is fine at
 their request rate: a wave makes one sync batch per slice and GitHub

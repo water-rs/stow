@@ -587,32 +587,32 @@ echo "[mock-e2e] $TASK_CRATE cache stats: hits=$hits errors=$errors"
 [ "$hits" -ge 1 ] || die "$TASK_CRATE was not served from the cache (hits=$hits)"
 [ "$errors" -eq 0 ] || die "$TASK_CRATE fetch recorded $errors errors"
 
-# --- byte path: bundles served by digest, Cache API in front of GHCR ---
+# --- byte path: bundles served by digest, Workers Cache in front of GHCR ---
 #
 # `stow check` already fetched itoa's bundle through
 # GET /api/v1/bundles/{digest}; the assertions below pin the route's
 # contract directly. The index layer blob lives in the same registry
 # repository but the CLI pulled it straight from the registry, so the
-# edge has never served it: its first fetch here is a miss that tees
-# into the Cache API, and the second is a hit. A digest the registry
-# does not hold is a 404, a malformed digest is a 400 before any fetch,
-# and the retired /api/v1/artifacts/… path is gone.
+# edge has never served it. The route's whole caching contract is the
+# immutable Cache-Control it emits — Workers Cache, enabled only on the
+# deployed manifest, replays repeat reads without the worker running —
+# so the e2e asserts the header rather than a hit/miss, which local dev
+# has no platform cache to produce. A digest the registry does not hold
+# is a 404, a malformed digest is a 400 before any fetch, and the
+# retired /api/v1/artifacts/… path is gone.
 INDEX_SLICE="$WORK_DIR/index-export/index.${HOST_TARGET}.${RUSTC_VERSION}"
 [ -f "$INDEX_SLICE" ] || die "exported index slice missing: $INDEX_SLICE"
 INDEX_DIGEST="sha256:$(sha256sum "$INDEX_SLICE" | awk '{print $1}')"
 [ -f "$WORK_DIR/mock-registry/blobs/${INDEX_DIGEST/:/_}" ] \
     || die "index blob not in the mock registry: $INDEX_DIGEST"
 
-headers="$(curl -fsS -D - -o "$WORK_DIR/bundle-miss.bin" \
+headers="$(curl -fsS -D - -o "$WORK_DIR/bundle.bin" \
     "$EDGE_URL/api/v1/bundles/$INDEX_DIGEST")"
-grep -qi '^x-stow-cache: *miss' <<<"$headers" \
-    || die "first digest fetch was not a cache miss: $headers"
-cmp -s "$WORK_DIR/bundle-miss.bin" "$INDEX_SLICE" \
+grep -qi '^cache-control: *public, max-age=31536000, immutable' <<<"$headers" \
+    || die "digest fetch did not emit the immutable cache contract: $headers"
+cmp -s "$WORK_DIR/bundle.bin" "$INDEX_SLICE" \
     || die "digest fetch served bytes other than the blob"
-headers="$(curl -fsS -D - -o /dev/null "$EDGE_URL/api/v1/bundles/$INDEX_DIGEST")"
-grep -qi '^x-stow-cache: *hit' <<<"$headers" \
-    || die "second digest fetch was not a cache hit: $headers"
-echo "[mock-e2e] digest fetch: miss then hit (expected)"
+echo "[mock-e2e] digest fetch: bytes plus immutable cache contract (expected)"
 
 code="$(curl -s -o /dev/null -w '%{http_code}' \
     "$EDGE_URL/api/v1/bundles/sha256:0000000000000000000000000000000000000000000000000000000000000000")"

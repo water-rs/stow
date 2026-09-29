@@ -28,6 +28,19 @@ const INSTALL_PS1: &str = include_str!("../templates/install.ps1");
 /// The project repository every documentation link points into.
 const REPOSITORY_URL: &str = "https://github.com/water-rs/stow";
 
+/// `Cache-Control` on the rendered pages: semi-static markup Workers
+/// Cache may replay between deploys (a new Worker version keys its own
+/// cache entries, so nothing stale survives a deploy).
+const PAGE_MAX_AGE: &str = "public, max-age=300";
+
+/// `Cache-Control` on the embedded installers — effectively static.
+const SCRIPT_MAX_AGE: &str = "public, max-age=3600";
+
+/// `Cache-Control` on the task-status page: a point-in-time answer that
+/// Workers Cache must never replay — without it the platform's heuristic
+/// would hold even an error answer for minutes.
+const STATUS_NO_STORE: &str = "no-store";
+
 /// The audit the numbers section cites, pinned to `main`.
 const AUDIT_URL: &str = "https://github.com/water-rs/stow/blob/main/docs/acceleration-audit.md";
 
@@ -207,6 +220,10 @@ pub async fn request_status(
         skyzen::header::CONTENT_TYPE,
         skyzen::header::HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    response.headers_mut().insert(
+        skyzen::header::CACHE_CONTROL,
+        skyzen::header::HeaderValue::from_static(STATUS_NO_STORE),
+    );
     Ok(response)
 }
 
@@ -231,6 +248,10 @@ fn script_response(body: &'static str) -> skyzen::Response {
         skyzen::header::CONTENT_TYPE,
         skyzen::header::HeaderValue::from_static("text/plain; charset=utf-8"),
     );
+    response.headers_mut().insert(
+        skyzen::header::CACHE_CONTROL,
+        skyzen::header::HeaderValue::from_static(SCRIPT_MAX_AGE),
+    );
     response
 }
 
@@ -238,11 +259,11 @@ fn script_response(body: &'static str) -> skyzen::Response {
 #[cfg(target_arch = "wasm32")]
 pub async fn index(
     skyzen::utils::State(site): skyzen::utils::State<SiteConfig>,
-) -> Result<skyzen::utils::Html<String>, crate::errors::GetArtifactError> {
-    IndexPage::new(&site)
+) -> Result<skyzen::Response, crate::errors::GetArtifactError> {
+    let html = IndexPage::new(&site)
         .render()
-        .map(skyzen::utils::Html)
-        .map_err(|error| crate::errors::GetArtifactError::InternalWithMessage(error.to_string()))
+        .map_err(|error| crate::errors::GetArtifactError::InternalWithMessage(error.to_string()))?;
+    Ok(html_response(html, PAGE_MAX_AGE))
 }
 
 /// One rendered leaderboard row — the name plus its formatted count.
@@ -327,17 +348,33 @@ impl StatsPage {
 }
 
 /// `GET /stats` — the public usage-statistics page, rendered from the same
-/// cached aggregate `GET /api/v1/stats` serves as JSON.
+/// aggregate `GET /api/v1/stats` serves as JSON, cached by Workers Cache
+/// on the same staleness budget the figures carry.
 #[cfg(target_arch = "wasm32")]
 pub async fn stats_page(
     skyzen::utils::State(stats_ctx): skyzen::utils::State<crate::stats::StatsContext>,
-    skyzen::utils::State(cache): skyzen::utils::State<skyzen_cloudflare::CfCache>,
-) -> Result<skyzen::utils::Html<String>, crate::errors::GetArtifactError> {
-    let usage = crate::stats::cached_usage_stats(&stats_ctx, &cache).await?;
-    StatsPage::new(&usage)
+) -> Result<skyzen::Response, crate::errors::GetArtifactError> {
+    let usage = crate::stats::compute_usage_stats(&stats_ctx).await?;
+    let html = StatsPage::new(&usage)
         .render()
-        .map(skyzen::utils::Html)
-        .map_err(|error| crate::errors::GetArtifactError::InternalWithMessage(error.to_string()))
+        .map_err(|error| crate::errors::GetArtifactError::InternalWithMessage(error.to_string()))?;
+    Ok(html_response(html, PAGE_MAX_AGE))
+}
+
+/// A rendered page as a response body: HTML plus the `Cache-Control`
+/// Workers Cache keys off.
+#[cfg(target_arch = "wasm32")]
+fn html_response(html: String, cache_control: &'static str) -> skyzen::Response {
+    let mut response = skyzen::Response::new(skyzen::Body::from(html));
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        skyzen::header::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        skyzen::header::CACHE_CONTROL,
+        skyzen::header::HeaderValue::from_static(cache_control),
+    );
+    response
 }
 
 #[cfg(test)]
