@@ -224,6 +224,15 @@ project budget is $10/month. See the
 [Cloudflare notifications docs](https://developers.cloudflare.com/notifications/notification-available/)
 for the alert type.
 
+Per-metric alerts lag posted spend — #439 showed usage notifications
+staying at 0% while cost accrued — so they are paired with an
+account-wide budget alert: *Billing → Notifications → Budget Alerts →
+Add budget alert*, a **spend** alert on the account at $8/month (and a
+50% warning at $4). The budget alert meters whole-account invoiced
+usage and catches metrics no per-service alert names. See the
+[Cloudflare budget alerts docs](https://developers.cloudflare.com/billing/manage/budget-alerts/).
+The #450 watchdog remains the outer circuit.
+
 ## Automated deploys
 
 `.github/workflows/deploy-edge.yml` deploys a tested commit only: on a
