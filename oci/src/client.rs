@@ -6,7 +6,8 @@
 //! is a property of the preheat wave — tens of build jobs publishing into the
 //! same namespace — so the wait a refusal names is a floor, not the answer:
 //! retrying exactly at it lands back on the cap. Every request this module
-//! sends, including the bearer-token exchange, retries a `429`/`503` in this
+//! sends, including the bearer-token exchange, retries a transient answer —
+//! a `429`, any `5xx`, a `408`, or a request that never completed — in this
 //! one place with a bounded exponential backoff plus jitter; when the
 //! attempts run out the refusal is passed through with the registry's own
 //! text, never re-worded.
@@ -36,7 +37,7 @@ use crate::registry::{RegistryBase, RegistryCredentials};
 /// can observe it.
 const MAX_ATTEMPTS: u32 = 8;
 
-/// First local backoff after a `429`/`503`; doubles per attempt and is
+/// First local backoff after a transient answer; doubles per attempt and is
 /// jittered by `±50%` so a fleet of jobs never retries in lockstep.
 const BASE_DELAY: Duration = Duration::from_millis(250);
 
@@ -83,7 +84,7 @@ impl Response {
 
 /// Why a registry round trip failed: either the request never completed
 /// (transport), or the registry answered a non-success status (refusal —
-/// including a `429`/`503` that outlived every retry).
+/// including a transient status that outlived every retry).
 #[derive(Debug)]
 pub struct RegistryError {
     what: String,
@@ -603,12 +604,12 @@ impl RegistrySession {
         format!("{}/v2/{}/{}", self.origin, self.repository, path)
     }
 
-    /// Dispatch `request`, retrying a `429`/`503` until the registry accepts
+    /// Dispatch `request`, retrying a transient answer until the registry accepts
     /// or [`MAX_ATTEMPTS`] dispatches have been refused — the only place the
     /// whole push path handles backpressure, the bearer exchange included.
     /// A request that gets a definitive answer — success or any other
-    /// status — comes back as a [`Response`]; only transport failures
-    /// return `Err`, so the caller always sees the refusal GHCR actually
+    /// status — comes back as a [`Response`]; only a transport failure that
+    /// outlived every retry returns `Err`, so the caller always sees the refusal GHCR actually
     /// sent. An `authenticated` request carries the session bearer and may
     /// re-mint it once after a `401`; an unauthenticated one (the challenge
     /// ping, the token exchange) is retried identically but never mints.
@@ -630,17 +631,37 @@ impl RegistrySession {
             if let Some(body) = &request.body {
                 builder = builder.body(body.clone());
             }
-            let response = builder
-                .send()
-                .await
-                .map_err(|error| RegistryError::transport(what, &request.url, error))?;
-            let status = response.status();
-            let headers = response.headers().clone();
-            let body = response
-                .bytes()
-                .await
-                .map_err(|error| RegistryError::transport(what, &request.url, error))?
-                .to_vec();
+            let sent = async {
+                let response = builder.send().await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.bytes().await?.to_vec();
+                Ok::<_, reqwest::Error>((status, headers, body))
+            }
+            .await;
+            // A request that never produced a whole answer — the connection
+            // dropped, the stream reset mid-body — is transient: every
+            // request here is content-addressed or idempotent, so sending
+            // it again is safe.
+            let (status, headers, body) = match sent {
+                Ok(answer) => answer,
+                Err(error) => {
+                    let error = RegistryError::transport(what, &request.url, error);
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+                    let delay = retry_delay(attempt, None);
+                    tracing::warn!(
+                        what,
+                        attempt,
+                        %error,
+                        delay_ms = delay.as_millis(),
+                        "registry request failed in transport; retrying"
+                    );
+                    smol::Timer::after(delay).await;
+                    continue;
+                }
+            };
             if status == StatusCode::UNAUTHORIZED && request.authenticated && !reauthed {
                 // The minted bearer was rejected mid-session — the mock TTL
                 // is minutes, GHCR's is not much longer — mint once more and
@@ -654,8 +675,7 @@ impl RegistrySession {
                 headers,
                 body,
             };
-            if status != StatusCode::TOO_MANY_REQUESTS && status != StatusCode::SERVICE_UNAVAILABLE
-            {
+            if !stow_types::transient::is_transient_status(status.as_u16()) {
                 return Ok(response);
             }
             if attempt >= MAX_ATTEMPTS {
@@ -667,7 +687,7 @@ impl RegistrySession {
                 attempt,
                 %status,
                 delay_ms = delay.as_millis(),
-                "registry asked to wait; retrying"
+                "registry answered a transient status; retrying"
             );
             smol::Timer::after(delay).await;
         }
@@ -846,7 +866,7 @@ fn docker_content_digest(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The wait a `429`/`503` asks for: the larger of the registry's own hint
+/// The wait a transient answer asks for: the larger of the registry's own hint
 /// (`Retry-After` header or the `retry-after:` value in its error body,
 /// whichever is greater) and the jittered local backoff — all bounded by
 /// [`MAX_DELAY`].

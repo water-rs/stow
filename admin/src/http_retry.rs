@@ -47,12 +47,9 @@ impl Backoff {
     }
 }
 
-/// Statuses worth a retry: rate limiting, request timeout, and every
-/// server-side failure — the same retryable set the edge client uses.
-pub fn is_retryable(status: zenwave::StatusCode) -> bool {
-    status == zenwave::StatusCode::REQUEST_TIMEOUT
-        || status == zenwave::StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
+/// Whether `status` is transient — the set every stow client shares.
+pub const fn is_retryable(status: zenwave::StatusCode) -> bool {
+    stow_types::transient::is_transient_status(status.as_u16())
 }
 
 /// `Retry-After` as a duration; only the delta-seconds form is honored.
