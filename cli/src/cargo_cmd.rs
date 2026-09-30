@@ -806,6 +806,7 @@ async fn analyze_workspace_prediction(
         Some(slice),
         host_slice,
         Some(expanded),
+        false,
     )
     .await
 }
@@ -824,9 +825,17 @@ async fn analyze_workspace_prediction_lite(
     config: &StowConfig,
 ) -> stow_types::error::Result<WorkspacePrediction> {
     let expanded = expanded_graph_cached(config, project, manifest_path).await?;
-    let (slice, host_slice) = cached_consumer_slices(config, project).await?;
-    analyze_workspace_prediction_from(project, manifest_path, config, slice, host_slice, expanded)
-        .await
+    let (slice, host_slice, slice_pending) = cached_consumer_slices(config, project).await?;
+    analyze_workspace_prediction_from(
+        project,
+        manifest_path,
+        config,
+        slice,
+        host_slice,
+        expanded,
+        slice_pending,
+    )
+    .await
 }
 
 async fn analyze_workspace_prediction_from(
@@ -836,6 +845,7 @@ async fn analyze_workspace_prediction_from(
     slice: Option<index::IndexSlice>,
     host_slice: Option<index::IndexSlice>,
     expanded: Option<ExpandedDependencyGraph>,
+    slice_pending: bool,
 ) -> stow_types::error::Result<WorkspacePrediction> {
     let lockfile_graph = workspace_deps::resolve_lockfile_graph(
         &project.workspace_root,
@@ -869,13 +879,33 @@ async fn analyze_workspace_prediction_from(
         .map(|expanded| expanded.feature_graphs)
         .unwrap_or_default();
     let rows = slice.map(|slice| slice.index.rows).unwrap_or_default();
-    let servable_units = Some(build_serve_map(
+    let mut map = build_serve_map(
         project,
         &rows,
         host_slice.as_ref(),
         &expanded_in,
         local_units.as_deref().unwrap_or(&[]),
-    ));
+    );
+    map.pending = slice_pending;
+    let servable_units = Some(map);
+    if expanded_in.is_empty() {
+        // No expanded graph on disk — a cold cache cannot have one — so
+        // the lite pass cannot rank semantic upgrades; it answers with
+        // the serve map alone, which needs no expanded entries, and the
+        // in-build enrichment resolves the full analysis (stow#347).
+        return Ok(WorkspacePrediction {
+            current_cached: 0,
+            current_total: entries.len(),
+            expanded_cached: 0,
+            expanded_total: 0,
+            expanded_entries: Vec::new(),
+            candidates: Vec::new(),
+            missing_current: dependencies,
+            prefetch_artifacts: Vec::new(),
+            cache_policy_entries: Vec::new(),
+            servable_units,
+        });
+    }
     let analysis = {
         let entries = entries.clone();
         let expanded_in = expanded_in.clone();
@@ -1035,6 +1065,7 @@ fn build_serve_map(
     crate::facade::ServeMap {
         target: target.into_iter().collect(),
         host: host.into_iter().collect(),
+        pending: false,
     }
 }
 
@@ -1160,10 +1191,11 @@ async fn ensure_consumer_slices(
 async fn cached_consumer_slices(
     config: &StowConfig,
     project: &ProjectContext,
-) -> stow_types::error::Result<(Option<index::IndexSlice>, Option<index::IndexSlice>)> {
+) -> stow_types::error::Result<(Option<index::IndexSlice>, Option<index::IndexSlice>, bool)> {
     let host_target = stow_types::api::runner_family(&project.target)
         .map(|family| family.host_triple().to_owned())
         .filter(|host| *host != project.target);
+    let host_slice_expected = host_target.is_some();
     let host_fetch = async {
         match host_target.as_deref() {
             Some(target) => index::cached_slice(config, target, &project.rustc_version).await,
@@ -1184,7 +1216,12 @@ async fn cached_consumer_slices(
             None
         }
     };
-    Ok((slice?, host_slice))
+    let slice = slice?;
+    // A slice the cache does not hold is one the enrichment's fetch will
+    // land mid-build: the map the lite pass writes stays provisional
+    // until that answer replaces it (stow#347).
+    let pending = slice.is_none() || (host_slice_expected && host_slice.is_none());
+    Ok((slice, host_slice, pending))
 }
 
 /// Ask the scheduler to build the misses this build compiled locally.
@@ -3558,8 +3595,11 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
 
     // The serve map lands as a file — small enough to write atomically
     // and large enough that an env blob on every rustc process's
-    // environment was the wrong transport (stow#347).
-    let serve_map_path = write_initial_serve_map(config, plan.servable_units)?;
+    // environment was the wrong transport (stow#347). A map still
+    // `pending` binds its readiness gate alongside: facades whose units
+    // it cannot cover wait on the gate's close rather than compiling
+    // what the in-flight fetch may cover.
+    let (serve_map_path, serve_gate) = write_initial_serve_map(config, plan.servable_units)?;
     export_wrapper_env(&mut command, plan, &wrappers, serve_map_path.as_deref())?;
 
     // Every rustc invocation this cargo run spawns is a facade that asks
@@ -3613,6 +3653,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
             cell: analysis_cell,
             map_path: serve_map_path.clone(),
             policy_dir: cache_policy_path.map(Path::to_path_buf),
+            readiness: serve_gate,
         });
     }
 
@@ -3732,9 +3773,9 @@ fn export_wrapper_env(
 fn write_initial_serve_map(
     config: Option<&StowConfig>,
     map: Option<&crate::facade::ServeMap>,
-) -> stow_types::error::Result<Option<PathBuf>> {
+) -> stow_types::error::Result<(Option<PathBuf>, Option<crate::facade::ServeMapGate>)> {
     let (Some(config), Some(map)) = (config, map) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     std::fs::create_dir_all(config.graph_plan_dir()).map_err(|error| {
         stow_types::stow_error!(
@@ -3747,8 +3788,15 @@ fn write_initial_serve_map(
         std::process::id(),
         crate::state_db::now_millis()
     ));
+    // Bind the readiness gate before the map that announces it: a facade
+    // that reads `pending` and finds no gate decides on the map it has —
+    // never hangs on a gate that failed to exist (stow#347).
+    let gate = map
+        .pending
+        .then(|| crate::facade::ServeMapGate::bind(&path))
+        .flatten();
     write_serve_map(&path, map)?;
-    Ok(Some(path))
+    Ok((Some(path), gate))
 }
 
 /// Write `map` to `path` through a tmp file + rename — a facade reading
@@ -3776,6 +3824,10 @@ struct BuildEnrichment {
     cell: std::sync::Arc<std::sync::OnceLock<crate::AnalysisFacts>>,
     map_path: Option<PathBuf>,
     policy_dir: Option<PathBuf>,
+    /// The pending serve map's readiness gate: held open until this task
+    /// finishes — its drop is the close that releases the facades
+    /// waiting for the final map (stow#347).
+    readiness: Option<crate::facade::ServeMapGate>,
 }
 
 /// Run the full graph analysis while cargo builds and commit what it
@@ -3784,7 +3836,7 @@ struct BuildEnrichment {
 /// the plan path keeps its conservative defaults.
 fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
-        if let Err(error) = run_build_enrichment(&work).await {
+        if let Err(error) = run_build_enrichment(work).await {
             tracing::warn!(
                 error = %error,
                 "background build analysis failed; the build keeps its filesystem-only plan"
@@ -3793,7 +3845,24 @@ fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> 
     })
 }
 
-async fn run_build_enrichment(work: &BuildEnrichment) -> stow_types::error::Result<()> {
+async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::Result<()> {
+    // A `pending` map's facades are waiting on the gate: answer them as
+    // soon as coverage is knowable — the fresh slice landed, the
+    // filesystem pass rebuilt with it — rather than after the metadata
+    // resolve and the prefetch. The write clears `pending` (the cached
+    // slices now exist) and the gate's drop releases the waiters
+    // (stow#347).
+    if work.readiness.is_some() && let Some(map_path) = &work.map_path {
+        ensure_consumer_slices(&work.config, &work.project).await?;
+        let lite = analyze_workspace_prediction_lite(
+            &work.project,
+            &work.project.manifest_path,
+            &work.config,
+        )
+        .await?;
+        write_serve_map(map_path, &lite.servable_units.unwrap_or_default())?;
+        drop(work.readiness.take());
+    }
     let analysis = analyze_workspace_prediction(
         &work.project,
         work.project.current_dir(),

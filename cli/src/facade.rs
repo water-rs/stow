@@ -16,9 +16,9 @@
 //! intact — what is gone is the plan round trip the decision used to
 //! cost.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
 use stow_types::public_cache::{canonical_crate_name, detect_registry_crate_version};
@@ -34,6 +34,11 @@ pub const STOW_SERVE_MAP_FILE_ENV: &str = "STOW_SERVE_MAP_FILE";
 
 /// The version slot a wildcard entry holds instead of one version.
 const WILDCARD: &str = "*";
+
+/// The bound on a facade's wait for a pending serve map: long enough for
+/// the driver's fresh slice fetch to land, short enough that a stuck
+/// fetch cannot stall the build's unit queue past it (stow#347).
+const SERVE_MAP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The serve decision, distilled to what a facade can look up before its
 /// runtime exists: which `(crate, version)` pairs this build could serve,
@@ -51,6 +56,14 @@ pub struct ServeMap {
     /// Units invoked without one — host dependencies, and every unit on a
     /// native build.
     pub host: Vec<(String, String)>,
+    /// The map may still grow: the driver wrote it from its cached slices
+    /// alone because the fresh index fetch could not finish before cargo
+    /// started (stow#347). A facade the map cannot cover waits on the
+    /// readiness gate this flag announces rather than compiling a unit
+    /// the fetch may be about to cover; the driver's full analysis lands
+    /// by rewriting this file with `pending` cleared.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 impl ServeMap {
@@ -66,18 +79,25 @@ impl ServeMap {
     /// A present-but-unreadable or malformed file is a wiring bug and
     /// fails loudly; the driver writes the file atomically, so a facade
     /// either sees a whole map or sees none.
-    fn from_env() -> stow_types::error::Result<Option<Self>> {
+    fn from_env() -> stow_types::error::Result<Option<(PathBuf, Self)>> {
         let Some(path) = std::env::var_os(STOW_SERVE_MAP_FILE_ENV) else {
             return Ok(None);
         };
-        match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .wrap_err_with(|| format!("{} is not a serve map", Path::new(&path).display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(Self::default())),
+        let path = PathBuf::from(path);
+        Self::read(&path).map(|map| Some((path, map)))
+    }
+
+    /// Read one serve map file; `NotFound` reads as the empty map a cold
+    /// start means, matching `from_env`'s contract.
+    fn read(path: &Path) -> stow_types::error::Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).wrap_err_with(|| {
+                format!("{} is not a serve map", path.display())
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(stow_types::stow_error!(
                 "read serve map {}: {error}",
-                Path::new(&path).display()
+                path.display()
             )),
         }
     }
@@ -129,7 +149,7 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
     let Some(executable) = args.get(2).cloned() else {
         return Ok(FastPath::Defer);
     };
-    let Some(map) = ServeMap::from_env()? else {
+    let Some((map_path, mut map)) = ServeMap::from_env()? else {
         return Ok(FastPath::Defer);
     };
     let (endpoint, token) = match supervisor::from_env() {
@@ -163,12 +183,26 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
     let Ok(version) = semver::Version::parse(&version) else {
         return Ok(FastPath::Defer);
     };
-    if map.covers(
-        parsed.target.is_some(),
-        &canonical_crate_name(&crate_name),
-        version.to_string().as_str(),
-    ) {
+    let invocation_covers = |map: &ServeMap| {
+        map.covers(
+            parsed.target.is_some(),
+            &canonical_crate_name(&crate_name),
+            version.to_string().as_str(),
+        )
+    };
+    if invocation_covers(&map) {
         return Ok(FastPath::Defer);
+    }
+    // A pending map's "not covered" is provisional: the driver's fresh
+    // slice fetch is still in flight and may cover this unit. Wait on
+    // the readiness gate it left, re-read once, then decide — rather
+    // than compile a covered unit (stow#347).
+    if map.pending {
+        wait_for_serve_map(&map_path);
+        map = ServeMap::read(&map_path)?;
+        if invocation_covers(&map) {
+            return Ok(FastPath::Defer);
+        }
     }
     Ok(FastPath::Handled(run_uncovered(
         &endpoint,
@@ -218,6 +252,78 @@ fn run_uncovered(
     )
     .map_err(|error| stow_types::stow_error!("{error}"))?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// The path the driver's readiness gate binds for `map_path`:
+/// `<map>.wait`, the socket whose close tells every waiting facade the
+/// map is final.
+#[cfg(unix)]
+fn wait_socket_path(map_path: &Path) -> PathBuf {
+    let mut name = map_path
+        .file_name()
+        .map(OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".wait");
+    map_path.with_file_name(name)
+}
+
+/// Wait on the gate a `pending` serve map announced: connect to its
+/// socket and block until the driver closes it — the final map has
+/// landed — or the bounded timeout expires. A gate that is absent (the
+/// driver never bound one, or its process already went away) reads as
+/// "decide on the map as it stands". Non-unix platforms have no gate:
+/// they decide on the map immediately (stow#347).
+#[cfg(unix)]
+fn wait_for_serve_map(map_path: &Path) {
+    use std::io::Read as _;
+
+    let Ok(stream) = std::os::unix::net::UnixStream::connect(wait_socket_path(map_path)) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(SERVE_MAP_WAIT_TIMEOUT));
+    let mut byte = [0_u8; 1];
+    let _ = (&stream).read(&mut byte);
+}
+
+/// Non-unix builds have no gate to wait on; a pending map decides as-is.
+#[cfg(not(unix))]
+fn wait_for_serve_map(_map_path: &Path) {}
+
+/// The readiness gate a pending serve map leaves open, on unix the bound
+/// `<map>.wait` listener: every facade blocked on it wakes when this is
+/// dropped — after the driver's final map write, on error, or on process
+/// exit, so a waiter can never hang past the driver's lifetime. Other
+/// platforms carry no gate (stow#347).
+#[cfg(unix)]
+pub struct ServeMapGate {
+    /// Held only to be dropped; closing the socket is the signal, so the
+    /// listener is never read back.
+    #[allow(dead_code)]
+    listener: std::os::unix::net::UnixListener,
+}
+
+#[cfg(unix)]
+impl ServeMapGate {
+    /// Bind `<map>.wait`; `None` when the socket cannot be created — a
+    /// facade then finds no gate and decides on the map it has.
+    pub fn bind(map_path: &Path) -> Option<Self> {
+        std::os::unix::net::UnixListener::bind(wait_socket_path(map_path))
+            .ok()
+            .map(|listener| Self { listener })
+    }
+}
+
+/// The readiness gate a pending serve map leaves open: absent on
+/// non-unix builds, whose facades decide on the map as it stands.
+#[cfg(not(unix))]
+pub struct ServeMapGate;
+
+#[cfg(not(unix))]
+impl ServeMapGate {
+    /// No gate exists to bind on this platform.
+    pub fn bind(_map_path: &Path) -> Option<Self> {
+        None
+    }
 }
 
 /// A blocking connection to the supervisor — two frame writes on the
@@ -275,6 +381,7 @@ mod tests {
                 .iter()
                 .map(|(name, version)| ((*name).to_owned(), (*version).to_owned()))
                 .collect(),
+            pending: false,
         }
     }
 
@@ -320,5 +427,57 @@ mod tests {
         assert!(decoded.covers(true, "libc", "0.2.177"));
         assert!(decoded.covers(false, "log", "0.4.27"));
         assert!(!decoded.covers(true, "log", "0.4.27"));
+    }
+
+    /// A map file written before the field existed — a complete map by
+    /// an older driver — parses as final, not pending (stow#347).
+    #[test]
+    fn a_map_without_the_flag_is_not_pending() {
+        let decoded: ServeMap =
+            serde_json::from_str(r#"{"target":[],"host":[]}"#).expect("parse");
+        assert!(!decoded.pending);
+        let decoded: ServeMap = serde_json::from_str(
+            r#"{"target":[],"host":[],"pending":true}"#,
+        )
+        .expect("parse");
+        assert!(decoded.pending);
+    }
+
+    /// Dropping the gate wakes the facade blocked on it, so a pending
+    /// map's wait ends when the driver's final map lands (stow#347).
+    #[cfg(unix)]
+    #[test]
+    fn the_gate_releases_its_waiters_when_dropped() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("stow-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create gate dir");
+        let map_path = dir.join("serve-map.json");
+        let gate = super::ServeMapGate::bind(&map_path).expect("bind the gate");
+        let waiter = std::thread::spawn(move || {
+            super::wait_for_serve_map(&map_path);
+            Instant::now()
+        });
+        // Give the waiter its moment to block, then close the gate.
+        std::thread::sleep(Duration::from_millis(50));
+        let released = Instant::now();
+        drop(gate);
+        let woke = waiter.join().expect("waiter returns");
+        assert!(woke - released < Duration::from_secs(5));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A facade that finds no gate decides immediately — the driver may
+    /// have finished before this unit ever ran (stow#347).
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_gate_never_blocks() {
+        use std::time::{Duration, Instant};
+
+        let map_path =
+            std::env::temp_dir().join(format!("stow-gate-absent-{}.json", std::process::id()));
+        let started = Instant::now();
+        super::wait_for_serve_map(&map_path);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
