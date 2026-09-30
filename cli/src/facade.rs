@@ -91,9 +91,8 @@ impl ServeMap {
     /// start means, matching `from_env`'s contract.
     fn read(path: &Path) -> stow_types::error::Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).wrap_err_with(|| {
-                format!("{} is not a serve map", path.display())
-            }),
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .wrap_err_with(|| format!("{} is not a serve map", path.display())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(stow_types::stow_error!(
                 "read serve map {}: {error}",
@@ -106,7 +105,7 @@ impl ServeMap {
     /// build that provably has nothing to serve yet — nothing local, no
     /// cached slice — so a `pending` empty map waits on nothing
     /// (stow#347).
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.target.is_empty() && self.host.is_empty()
     }
 
@@ -443,13 +442,10 @@ mod tests {
     /// an older driver — parses as final, not pending (stow#347).
     #[test]
     fn a_map_without_the_flag_is_not_pending() {
-        let decoded: ServeMap =
-            serde_json::from_str(r#"{"target":[],"host":[]}"#).expect("parse");
+        let decoded: ServeMap = serde_json::from_str(r#"{"target":[],"host":[]}"#).expect("parse");
         assert!(!decoded.pending);
-        let decoded: ServeMap = serde_json::from_str(
-            r#"{"target":[],"host":[],"pending":true}"#,
-        )
-        .expect("parse");
+        let decoded: ServeMap =
+            serde_json::from_str(r#"{"target":[],"host":[],"pending":true}"#).expect("parse");
         assert!(decoded.pending);
     }
 
