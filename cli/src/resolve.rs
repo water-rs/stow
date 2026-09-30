@@ -81,14 +81,6 @@ pub struct PackageFeatureGraph {
     pub optional_dependencies: BTreeSet<String>,
 }
 
-/// One artifact the index covers for a requested dependency — the local
-/// equivalent of the edge's `DependencyGraphArtifact`.
-#[derive(Debug, Clone)]
-pub struct CoveredArtifact {
-    /// Exact artifact identity.
-    pub c_metadata: CMetadata,
-}
-
 /// A semver-compatible version with strictly more cached artifacts than
 /// the entry's current pin — the local equivalent of the edge's
 /// `RecommendedDependencyVersion`.
@@ -109,7 +101,7 @@ pub struct AnalysisEntry {
     /// How many exact artifacts cover the requested identity.
     pub current_artifact_count: u32,
     /// The exact artifacts covering it.
-    pub current_artifacts: Vec<CoveredArtifact>,
+    pub current_artifacts: Vec<CMetadata>,
     /// A better-covered semver-compatible version, when one exists.
     pub recommended: Option<RecommendedVersion>,
 }
@@ -953,7 +945,7 @@ fn validate_feature_name(feature: &str) -> stow_types::error::Result<()> {
 /// Exact identity `(crate_name, version, features_json)` used as a catalog key.
 type CatalogKey = (String, Version, String);
 /// Exact artifacts grouped by semantic identity.
-type ExactArtifactCatalog = BTreeMap<CatalogKey, Vec<CoveredArtifact>>;
+type ExactArtifactCatalog = BTreeMap<CatalogKey, Vec<CMetadata>>;
 
 #[derive(Debug, Clone)]
 struct ExactDependencyEntry {
@@ -990,6 +982,7 @@ fn build_semantic_catalog(
 ) -> stow_types::error::Result<SemanticCatalog> {
     let mut artifact_counts = BTreeMap::<(String, Version, String), u32>::new();
     let mut feature_versions = BTreeMap::<(String, String), Vec<CachedVersion>>::new();
+    let mut seen_c_metadatas = BTreeSet::<(CatalogKey, &str)>::new();
 
     for row in sorted_catalog_rows(rows) {
         if !cached_row_has_canonical_metadata(row)? {
@@ -1000,6 +993,12 @@ fn build_semantic_catalog(
             row.version.as_semver(),
             &row.features_json.raw(),
         );
+        // One physical unit can publish a row per unit shape under the same
+        // `c_metadata`; coverage counts distinct unit identities, matching
+        // the exact catalog's dedup so `AnalysisEntry` stays consistent.
+        if !seen_c_metadatas.insert((artifact_key.clone(), row.c_metadata.as_str())) {
+            continue;
+        }
         let artifact_count = artifact_counts.entry(artifact_key).or_insert(0);
         *artifact_count = artifact_count.saturating_add(1);
     }
@@ -1033,6 +1032,7 @@ fn build_exact_artifact_catalog(
     rows: &[&ArtifactIndexRow],
 ) -> stow_types::error::Result<ExactArtifactCatalog> {
     let mut artifacts = ExactArtifactCatalog::new();
+    let mut seen_c_metadatas = BTreeSet::<(CatalogKey, &str)>::new();
 
     for row in sorted_catalog_rows(rows) {
         if !cached_row_has_canonical_metadata(row)? {
@@ -1043,24 +1043,22 @@ fn build_exact_artifact_catalog(
             row.version.as_semver(),
             &row.features_json.raw(),
         );
-        let entry = artifacts.entry(key).or_default();
-        if entry
-            .last()
-            .is_some_and(|last| last.c_metadata == row.c_metadata)
-        {
+        // A row per unit shape can share one `c_metadata`; the catalog keeps
+        // one entry per physical unit identity regardless of row order.
+        if !seen_c_metadatas.insert((key.clone(), row.c_metadata.as_str())) {
             continue;
         }
-        entry.push(CoveredArtifact {
-            c_metadata: row.c_metadata.clone(),
-        });
+        artifacts
+            .entry(key)
+            .or_default()
+            .push(row.c_metadata.clone());
     }
 
     Ok(artifacts)
 }
 
 /// Rows in the order the edge's `ORDER BY crate_name, version,
-/// features_json, compile_key, c_metadata` produced — the exact-catalog
-/// dedup relies on equal `c_metadata` rows landing adjacent.
+/// features_json, compile_key, c_metadata` produced.
 fn sorted_catalog_rows<'a>(rows: &[&'a ArtifactIndexRow]) -> Vec<&'a ArtifactIndexRow> {
     let mut sorted = rows.to_vec();
     sorted.sort_by(|left, right| {
@@ -1605,7 +1603,7 @@ mod tests {
         let exact_catalog = build_exact_artifact_catalog(&catalog_rows).unwrap();
         let artifacts = exact_catalog.get(&semantic_key).unwrap();
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].c_metadata.as_str(), "1234567890abcdef");
+        assert_eq!(artifacts[0].as_str(), "1234567890abcdef");
     }
 
     /// The full analyze path over an in-memory slice: the covered root
