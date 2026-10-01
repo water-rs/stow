@@ -41,6 +41,7 @@ use stow_types::api::{
     AdmissionRequest, DependencyGraphEntry, EnqueueAdmission, ResolvedDependencyGraphEntry,
 };
 use stow_types::versioning::is_semver_compatible_upgrade;
+use tracing::Instrument as _;
 
 #[tracing::instrument(name = "stow.cargo_cmd.run", skip_all, fields(cargo_command = command))]
 pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
@@ -49,7 +50,9 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
 
 async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new(command, args);
-    let mut project = ProjectContext::load(&invocation.cargo_args).await?;
+    let mut project = ProjectContext::load(&invocation.cargo_args)
+        .instrument(tracing::debug_span!("stow.precargo.project_context"))
+        .await?;
     // mold is mandatory on Linux — provision it before any cargo
     // invocation starts, whatever path the build ends up taking through
     // this driver. `check` is gated with `build` and `test`: a check still
@@ -57,35 +60,46 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     // build scripts, and both of those link. When the cargo config does
     // not already select a reachable mold, the managed install is
     // selected for this invocation only — `stow setup` is not required.
-    project.mold_config_args =
-        crate::mold::provision(&project.target, project.current_dir()).await?;
+    project.mold_config_args = crate::mold::provision(&project.target, project.current_dir())
+        .instrument(tracing::debug_span!("stow.precargo.mold_provision"))
+        .await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
     }
 
-    if run_divergent_profile_passthrough(&project, &invocation).await? {
+    if run_divergent_profile_passthrough(&project, &invocation)
+        .instrument(tracing::debug_span!("stow.precargo.profile_guard"))
+        .await?
+    {
         return Ok(());
     }
-    let config = match StowConfig::load() {
-        Ok(config) => Some(config),
-        Err(error) => {
-            tracing::debug!(%error, "stow config unavailable, skipping graph analysis");
-            None
-        }
-    };
+    let config =
+        tracing::debug_span!("stow.precargo.config_load").in_scope(|| match StowConfig::load() {
+            Ok(config) => Some(config),
+            Err(error) => {
+                tracing::debug!(%error, "stow config unavailable, skipping graph analysis");
+                None
+            }
+        });
 
-    if try_resolver_fast_path(config.as_ref(), &project, &invocation, &public_cache_mode).await {
+    if try_resolver_fast_path(config.as_ref(), &project, &invocation, &public_cache_mode)
+        .instrument(tracing::debug_span!("stow.precargo.resolver_fast_path"))
+        .await
+    {
         return Ok(());
     }
 
-    let maybe_analysis = analyze_or_warn(config.as_ref(), &project, &public_cache_mode).await;
+    let maybe_analysis = analyze_or_warn(config.as_ref(), &project, &public_cache_mode)
+        .instrument(tracing::debug_span!("stow.precargo.lite_analysis"))
+        .await;
     if run_uncovered_passthrough(
         config.as_ref(),
         &project,
         &invocation,
         maybe_analysis.as_ref(),
     )
+    .instrument(tracing::debug_span!("stow.precargo.uncovered_check"))
     .await?
     {
         return Ok(());
@@ -104,7 +118,10 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     {
         log_nonfatal_result(
             "failed to load the sigstore trust root before prefetch",
-            crate::verify::resolve_trust(config).await.map(|_| ()),
+            crate::verify::resolve_trust(config)
+                .instrument(tracing::debug_span!("stow.precargo.trust_root"))
+                .await
+                .map(|_| ()),
         );
     }
 
@@ -120,6 +137,7 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
         maybe_analysis.as_ref(),
         invocation.silent_compatible_upgrades,
     )
+    .instrument(tracing::debug_span!("stow.precargo.select_upgrades"))
     .await?;
     if selected.is_empty() {
         run_original_workspace_build(
@@ -324,8 +342,9 @@ async fn run_original_workspace_build(
     let servable_units = analysis
         .as_ref()
         .and_then(|analysis| analysis.servable_units.clone());
-    let cache_policy_path =
-        create_build_policy_dir(config, public_cache_mode, analysis.as_ref()).await?;
+    let cache_policy_path = create_build_policy_dir(config, public_cache_mode, analysis.as_ref())
+        .instrument(tracing::debug_span!("stow.precargo.policy_dir"))
+        .await?;
     let expanded_entries = expanded_graph.as_deref();
     let prefetch_artifacts = prefetch_artifacts.as_deref();
     let covered_units = prefetch_artifacts.map_or(0, <[PrefetchArtifact]>::len);
@@ -609,10 +628,12 @@ impl ProjectContext {
     async fn load(cargo_args: &[OsString]) -> stow_types::error::Result<Self> {
         let invocation_dir = std::env::current_dir().wrap_err("resolve current directory")?;
         let metadata_args = MetadataArgs::parse(&invocation_dir, cargo_args)?;
-        let layout = workspace_deps::resolve_workspace_layout(
-            &invocation_dir,
-            metadata_args.manifest_path.as_deref(),
-        )?;
+        let layout = tracing::debug_span!("stow.precargo.workspace_layout").in_scope(|| {
+            workspace_deps::resolve_workspace_layout(
+                &invocation_dir,
+                metadata_args.manifest_path.as_deref(),
+            )
+        })?;
         let workspace_root = layout.workspace_root;
         let current_dir = if invocation_dir.starts_with(&workspace_root) {
             invocation_dir
@@ -625,10 +646,12 @@ impl ProjectContext {
         let target = match metadata_args.target.clone() {
             Some(target) => target,
             None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
+                .instrument(tracing::debug_span!("stow.precargo.rustc_host_probe"))
                 .await
                 .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?,
         };
         let rustc_version = detect_rustc_version(std::ffi::OsStr::new("rustc"))
+            .instrument(tracing::debug_span!("stow.precargo.rustc_version_probe"))
             .await
             .map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
 
@@ -824,8 +847,12 @@ async fn analyze_workspace_prediction_lite(
     manifest_path: &Path,
     config: &StowConfig,
 ) -> stow_types::error::Result<WorkspacePrediction> {
-    let expanded = expanded_graph_cached(config, project, manifest_path).await?;
-    let (slice, host_slice, slice_pending) = cached_consumer_slices(config, project).await?;
+    let expanded = expanded_graph_cached(config, project, manifest_path)
+        .instrument(tracing::debug_span!("stow.precargo.expanded_graph_load"))
+        .await?;
+    let (slice, host_slice, slice_pending) = cached_consumer_slices(config, project)
+        .instrument(tracing::debug_span!("stow.precargo.cached_slices"))
+        .await?;
     analyze_workspace_prediction_from(
         project,
         manifest_path,
@@ -847,11 +874,13 @@ async fn analyze_workspace_prediction_from(
     expanded: Option<ExpandedDependencyGraph>,
     slice_pending: bool,
 ) -> stow_types::error::Result<WorkspacePrediction> {
-    let lockfile_graph = workspace_deps::resolve_lockfile_graph(
-        &project.workspace_root,
-        manifest_path,
-        &project.metadata_args,
-    )?;
+    let lockfile_graph = tracing::debug_span!("stow.precargo.lockfile_graph").in_scope(|| {
+        workspace_deps::resolve_lockfile_graph(
+            &project.workspace_root,
+            manifest_path,
+            &project.metadata_args,
+        )
+    })?;
     let dependencies = direct_resolved_dependencies(&lockfile_graph);
     let entries = dependencies
         .iter()
@@ -859,7 +888,10 @@ async fn analyze_workspace_prediction_from(
         .map(into_api_dependency)
         .collect::<stow_types::error::Result<Vec<_>>>()?;
     let local_units =
-        match crate::artifact_cache::locally_covered_units(config, &project.rustc_version).await {
+        match crate::artifact_cache::locally_covered_units(config, &project.rustc_version)
+            .instrument(tracing::debug_span!("stow.precargo.local_units"))
+            .await
+        {
             Ok(units) => Some(units),
             // A broken local listing loses the local pairs only — the
             // index answer still stands, and the facades whose units
@@ -879,13 +911,15 @@ async fn analyze_workspace_prediction_from(
         .map(|expanded| expanded.feature_graphs)
         .unwrap_or_default();
     let rows = slice.map(|slice| slice.index.rows).unwrap_or_default();
-    let mut map = build_serve_map(
-        project,
-        &rows,
-        host_slice.as_ref(),
-        &expanded_in,
-        local_units.as_deref().unwrap_or(&[]),
-    );
+    let mut map = tracing::debug_span!("stow.precargo.serve_map_build").in_scope(|| {
+        build_serve_map(
+            project,
+            &rows,
+            host_slice.as_ref(),
+            &expanded_in,
+            local_units.as_deref().unwrap_or(&[]),
+        )
+    });
     map.pending = slice_pending;
     let servable_units = Some(map);
     if expanded_in.is_empty() {
@@ -1677,11 +1711,17 @@ async fn synthesize_lockfile(
     config: &StowConfig,
     project: &ProjectContext,
 ) -> stow_types::error::Result<Option<String>> {
-    let direct = collect_user_direct_dependencies(project).await?;
+    let direct = collect_user_direct_dependencies(project)
+        .instrument(tracing::debug_span!("stow.precargo.direct_deps"))
+        .await?;
     if direct.is_empty() {
         return Ok(None);
     }
-    let Some(slice) = cached_consumer_slices(config, project).await?.0 else {
+    let Some(slice) = cached_consumer_slices(config, project)
+        .instrument(tracing::debug_span!("stow.precargo.cached_slices"))
+        .await?
+        .0
+    else {
         tracing::info!("no cached index slice; nothing for the resolver to pin to");
         return Ok(None);
     };
@@ -3585,7 +3625,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         covered_units,
         ..
     } = *plan;
-    let wrappers = detect_wrapper_commands()?;
+    let wrappers =
+        tracing::debug_span!("stow.precargo.detect_wrappers").in_scope(detect_wrapper_commands)?;
     let mut command = Command::new("cargo");
     command.arg(action);
     for config_arg in &project.mold_config_args {
@@ -3601,9 +3642,11 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     // write lands rather than compiling what the in-flight fetch may
     // cover.
     let serve_map_ready = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
-    let (serve_map_path, serve_waiters) =
-        write_initial_serve_map(config, plan.servable_units, &serve_map_ready)?;
-    export_wrapper_env(&mut command, plan, &wrappers, serve_map_path.as_deref())?;
+    let (serve_map_path, serve_waiters) = tracing::debug_span!("stow.precargo.serve_map_write")
+        .in_scope(|| write_initial_serve_map(config, plan.servable_units, &serve_map_ready))?;
+    tracing::debug_span!("stow.precargo.export_env").in_scope(|| {
+        export_wrapper_env(&mut command, plan, &wrappers, serve_map_path.as_deref())
+    })?;
 
     // Every rustc invocation this cargo run spawns is a facade that asks
     // this process what to do, so the whole build shares one transport —
@@ -3637,13 +3680,16 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         analysis: std::sync::Arc::clone(&analysis_cell),
         serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
     }));
-    let supervisor = crate::supervisor::server::start(handler.clone())
+    let supervisor = tracing::debug_span!("stow.precargo.supervisor_start")
+        .in_scope(|| crate::supervisor::server::start(handler.clone()))
         .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
     for (key, value) in supervisor.env() {
         command.env(key, value);
     }
 
-    let before = CoverageSnapshot::capture(config).await;
+    let before = CoverageSnapshot::capture(config)
+        .instrument(tracing::debug_span!("stow.precargo.coverage_snapshot"))
+        .await;
 
     // The full graph analysis — the verified index fetch and the live
     // `cargo metadata` resolve — runs while cargo builds rather than in
@@ -3666,6 +3712,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         });
     }
 
+    tracing::debug!("stow.precargo.cargo_spawn");
     let status = command
         .status()
         .await
@@ -3995,9 +4042,16 @@ impl CoverageSnapshot {
             };
         };
         Self {
-            stats: stats::read_summary(config).await.unwrap_or_default(),
-            errors: stats::read_error_counts(config).await.unwrap_or_default(),
+            stats: stats::read_summary(config)
+                .instrument(tracing::debug_span!("stow.precargo.stats_summary"))
+                .await
+                .unwrap_or_default(),
+            errors: stats::read_error_counts(config)
+                .instrument(tracing::debug_span!("stow.precargo.stats_errors"))
+                .await
+                .unwrap_or_default(),
             divergence: stats::read_profile_divergence(config)
+                .instrument(tracing::debug_span!("stow.precargo.stats_divergence"))
                 .await
                 .unwrap_or_default(),
         }

@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::Digest as _;
 use stow_types::error::Context;
+use tracing::Instrument as _;
 
 use crate::rustc_args::detect_rustc_host_target;
 
@@ -76,11 +77,21 @@ pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Res
     if !cfg!(target_os = "linux") || !linux_target(target) {
         return Ok(Vec::new());
     }
-    let link = resolve_link(target, cargo_dir, &process_env).await;
-    if link.selects_mold && link.unavailable_reason().await.is_none() {
+    let link = resolve_link(target, cargo_dir, &process_env)
+        .instrument(tracing::debug_span!("stow.precargo.mold_link_resolve"))
+        .await;
+    if link.selects_mold
+        && link
+            .unavailable_reason()
+            .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
+            .await
+            .is_none()
+    {
         return Ok(Vec::new());
     }
-    let bin_dir = ensure_mold_install().await?;
+    let bin_dir = ensure_mold_install()
+        .instrument(tracing::debug_span!("stow.precargo.mold_install"))
+        .await?;
     selection_args(&bin_dir)
 }
 
