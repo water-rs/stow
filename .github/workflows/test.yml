@@ -42,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      launch-load: ${{ steps.filter.outputs.launch-load }}
     steps:
       # The filter diffs against the previous tip (or the merge group's base)
       # with git, so it needs the repository checked out.
@@ -61,6 +62,16 @@ jobs:
           filters: |
             code:
               - '**'
+              - '!**/*.md'
+              - '!LICENSE*'
+              - '!.gitignore'
+            # The load lane's merge-queue trigger (stow#452): edge/
+            # plus the files that define what it measures — the lanes,
+            # the model, the measured table and the harness. The doc
+            # negations repeat because `every` requires each file to
+            # satisfy all rules.
+            launch-load:
+              - '{edge/**,admin/src/launch_*.rs,types/src/launch_model.rs,types/src/do_budgets.rs,scripts/launch-load.sh,launch-model.toml}'
               - '!**/*.md'
               - '!LICENSE*'
               - '!.gitignore'
@@ -271,16 +282,18 @@ jobs:
   # and `scripts/launch-load.sh` fails on any overload signal, error
   # share or row-count regression.
   #
-  # The issue scopes the trigger to PRs touching `edge/`; this job
-  # deliberately keeps the scheduler-budget convention instead —
-  # `changes.outputs.code`, i.e. any non-doc change. The same-run report
-  # also gates types/ and admin/ edits, which reach the object through
-  # the shared wire types; paying the 75-minute lane on every code
-  # change is cheaper than discovering a non-edge change moved the cost
-  # after merge. The weekly cadence lives in launch-load-scheduled.yml.
+  # stow#452 scopes the merge-queue trigger to the surface the lane
+  # measures: `changes.outputs.launch-load` — `edge/` plus the lane,
+  # model, table and harness files — not every code change. A 75-minute
+  # leg on every merge would add half an hour to the queue for changes
+  # that cannot move the projection; anything else skips the job, which
+  # `gate` already counts as passing. The cheap part — the `launch-gate`
+  # step inside scheduler-budget, a projection over that job's own
+  # report — still runs on every code change, and the weekly cadence
+  # (launch-load-scheduled.yml) holds the whole lane unconditionally.
   launch-load:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.launch-load == 'true'
     name: Launch load (workerd)
     runs-on: ubuntu-latest
     timeout-minutes: 75
