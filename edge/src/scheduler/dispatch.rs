@@ -23,18 +23,13 @@ pub enum DispatchCredential {
 /// branch, whose certificate identity no client trusts. The whole task
 /// travels as one JSON input so the publish job receives it from the
 /// scheduler rather than from the build job.
-///
-/// Uses `CfFetch` (Cloudflare Workers' native fetch binding) to POST to the
-/// GitHub API directly. We do not route this through `zenwave` because the
-/// edge worker only ever runs in the Cloudflare runtime and `CfFetch` is the
-/// canonical primitive there.
 pub async fn trigger_build(
     task: &QueuedTask,
     credential: &DispatchCredential,
     repo: &str,
     pool: &OutboundPool,
 ) -> Result<(), DispatchError> {
-    let task_payload = serde_json::json!({
+    let payload = serde_json::json!({
         "task_id": task.task_id,
         "attempt": task.attempt,
         "crate_name": task.crate_name,
@@ -46,27 +41,114 @@ pub async fn trigger_build(
         "preserve_lockfile": task.preserve_lockfile,
         "dep_pins": task.dep_pins,
     });
+    trigger_workflow(
+        stow_types::trusted_builder::WORKFLOW_FILE,
+        "build-crate",
+        "task",
+        &payload,
+        credential,
+        repo,
+        pool,
+    )
+    .await
+    .inspect(|()| {
+        tracing::info!(
+            task_id = %task.task_id,
+            crate_name = %task.crate_name,
+            target = %task.target,
+            rustc_version = %task.rustc_version,
+            "dispatched build"
+        );
+    })
+    .inspect_err(|error| {
+        tracing::error!(task_id = %task.task_id, %error, "GH Actions dispatch failed");
+    })
+}
 
+/// Trigger a `resolve-request.yml` run for an admitted human request
+/// (stow#428) — the request lane's resolve step runs on Actions, not in
+/// the Worker.
+///
+/// Same dispatch mechanics as [`trigger_build`]: the whole
+/// [`stow_types::api::RequestDispatch`] travels as one JSON
+/// `workflow_dispatch` input on the trusted branch, and the record's
+/// run-name (`resolve-a{attempt}-{request_id}`) is what the
+/// `workflow_run` webhook correlates back to the request id.
+pub async fn trigger_resolve(
+    dispatch: &stow_types::api::RequestDispatch,
+    credential: &DispatchCredential,
+    repo: &str,
+    pool: &OutboundPool,
+) -> Result<(), DispatchError> {
+    let input = serde_json::to_value(dispatch)
+        .map_err(|error| DispatchError::Network(error.to_string()))?;
+    trigger_workflow(
+        stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE,
+        "resolve-request",
+        "request",
+        &input,
+        credential,
+        repo,
+        pool,
+    )
+    .await
+    .inspect(|()| {
+        tracing::info!(
+            request_id = %dispatch.request_id,
+            attempt = dispatch.attempt,
+            crate_name = %dispatch.crate_name,
+            rustc_version = %dispatch.rustc_version,
+            "dispatched resolve run"
+        );
+    })
+    .inspect_err(|error| {
+        tracing::error!(
+            request_id = %dispatch.request_id,
+            %error,
+            "GH Actions resolve dispatch failed"
+        );
+    })
+}
+
+/// The shared `workflow_dispatch` fan-out one dispatch hop costs.
+///
+/// `input_name` is the workflow's single input (`task` for
+/// `build-crate.yml`, `request` for `resolve-request.yml`) and `input`
+/// its JSON-encoded content — GitHub wants inputs as strings, while the
+/// local-CI arm posts the payload verbatim as `client_payload`.
+///
+/// Uses `CfFetch` (Cloudflare Workers' native fetch binding) to POST to the
+/// GitHub API directly. We do not route this through `zenwave` because the
+/// edge worker only ever runs in the Cloudflare runtime and `CfFetch` is the
+/// canonical primitive there.
+async fn trigger_workflow(
+    workflow_file: &str,
+    event_type: &str,
+    input_name: &str,
+    input: &serde_json::Value,
+    credential: &DispatchCredential,
+    repo: &str,
+    pool: &OutboundPool,
+) -> Result<(), DispatchError> {
     let (url, request) = match credential {
         DispatchCredential::LocalCi(local_ci_url) => {
             let url = format!("{}/dispatch", local_ci_url.trim_end_matches('/'));
             let payload = serde_json::json!({
-                "event_type": "build-crate",
-                "client_payload": task_payload,
+                "event_type": event_type,
+                "client_payload": input,
             });
             let request = build_local_dispatch_request(&url, &payload)?;
             (url, request)
         }
         DispatchCredential::GitHub(token) => {
             let url = format!(
-                "https://api.github.com/repos/{repo}/actions/workflows/{}/dispatches",
-                stow_types::trusted_builder::WORKFLOW_FILE
+                "https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/dispatches"
             );
-            let task_json = serde_json::to_string(&task_payload)
+            let input_json = serde_json::to_string(input)
                 .map_err(|error| DispatchError::Network(error.to_string()))?;
             let payload = serde_json::json!({
                 "ref": stow_types::trusted_builder::BRANCH,
-                "inputs": { "task": task_json },
+                "inputs": { input_name: input_json },
             });
             let request = build_dispatch_request(&url, &token.token, &payload)?;
             (url, request)
@@ -81,17 +163,9 @@ pub async fn trigger_build(
 
     let status = resp.get_ref().status_code();
     if (200..300).contains(&status) {
-        tracing::info!(
-            task_id = %task.task_id,
-            crate_name = %task.crate_name,
-            target = %task.target,
-            rustc_version = %task.rustc_version,
-            url = %url,
-            "dispatched build"
-        );
+        tracing::info!(url = %url, input = input_name, "dispatched workflow");
         Ok(())
     } else {
-        tracing::error!(task_id = %task.task_id, status, "GH Actions dispatch failed");
         Err(DispatchError::GitHubApi(status))
     }
 }

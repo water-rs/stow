@@ -10,7 +10,7 @@
 //! Turnstile API script.
 
 use askama::Template;
-use stow_types::api::{CI_TARGET_TRIPLES, QueueTaskStatus, RequestStatus};
+use stow_types::api::CI_TARGET_TRIPLES;
 
 /// Page stylesheet, embedded into the template's `<style>` block.
 const SITE_CSS: &str = include_str!("../templates/site.css");
@@ -92,72 +92,133 @@ impl IndexPage {
     }
 }
 
-/// Render context for one row of [`RequestStatusPage`]: the wire
-/// [`RequestStatus`] flattened to the strings the template prints, plus the
-/// two things it decides on — whether to keep refreshing, and the sentence
-/// under the badge.
+/// One row of a [`RequestStatusPage`]'s per-target table: the wire
+/// [`CrateRequestTarget`] flattened to the strings the template prints.
 #[derive(Debug)]
-pub struct TaskView {
-    task_id: String,
-    crate_name: String,
-    version: String,
+pub struct RequestTargetView {
     target: String,
-    rustc_version: String,
-    /// Comma-separated canonical feature list, or `default` shorthand when
-    /// the build takes cargo's defaults with nothing added.
-    features: String,
-    lane: &'static str,
-    status: &'static str,
+    state: &'static str,
     queue_position: Option<u32>,
-    /// Whether the task reached a terminal state — an unsettled page keeps
-    /// refreshing itself, a settled one stops.
+    /// The root task's queue id — the link's `title`, so the full value
+    /// is one hover away.
+    task_id: Option<String>,
+    /// The first 12 hex chars of `task_id`: a full queue id is 64 and
+    /// would carry the table past its panel on every viewport.
+    task_short: String,
+    /// The request's JSON — the public shape the full task id is
+    /// exposed in.
+    task_url: String,
+    /// `false` while the task is still moving — queued or building.
     settled: bool,
-    /// One sentence saying what the state means for the person waiting.
-    summary: &'static str,
 }
 
-impl TaskView {
-    fn new(status: RequestStatus) -> Self {
-        let features = status.features_json.features().join(", ");
+/// How much of a task id the targets table renders.
+const TASK_ID_SHORT: usize = 12;
+
+impl RequestTargetView {
+    fn new(target: &stow_types::api::CrateRequestTarget, request_id: &str) -> Self {
+        let (state, settled) = match target.state {
+            stow_types::api::CrateRequestState::Cached => ("cached", true),
+            stow_types::api::CrateRequestState::Queued => ("queued", false),
+            stow_types::api::CrateRequestState::AlreadyQueued => ("already queued", false),
+            stow_types::api::CrateRequestState::Building => ("building", false),
+            // No library task exists — nothing more can move.
+            stow_types::api::CrateRequestState::ClosureQueued => ("deps queued (no library)", true),
+        };
         Self {
-            task_id: status.task_id,
+            target: target.target.as_str().to_owned(),
+            state,
+            queue_position: target.human_lane_position,
+            task_id: target.task_id.clone(),
+            task_short: target
+                .task_id
+                .as_deref()
+                .map(|id| id.chars().take(TASK_ID_SHORT).collect())
+                .unwrap_or_default(),
+            task_url: format!("/api/v1/requests/{request_id}"),
+            settled,
+        }
+    }
+}
+
+/// Render context for one request record on [`RequestStatusPage`]: the
+/// wire [`CrateRequestStatus`] flattened to what the template prints —
+/// the phase badge, whether the page keeps refreshing, and the sentence
+/// under the badge.
+#[derive(Debug)]
+pub struct RequestView {
+    request_id: String,
+    crate_name: String,
+    version: String,
+    /// Comma-separated canonical feature list, or the
+    /// `--no-default-features` shorthand when the request asked for a
+    /// bare build.
+    features: String,
+    rustc_version: String,
+    status: &'static str,
+    /// Whether the record reached a state nothing moves past — a
+    /// `failed` record, or an `enqueued` one whose every target is
+    /// terminal. An unsettled page refreshes itself.
+    settled: bool,
+    /// One sentence saying what the phase means for the person waiting.
+    summary: &'static str,
+    /// The Actions run's URL once `workflow_run` has reported it —
+    /// linked when present.
+    github_run_url: Option<String>,
+    /// The failure reason on a `failed` record.
+    error: Option<String>,
+    targets: Vec<RequestTargetView>,
+}
+
+impl RequestView {
+    fn new(status: stow_types::api::CrateRequestStatus) -> Self {
+        let features = status.features_json.features().join(", ");
+        let targets: Vec<RequestTargetView> = status
+            .targets
+            .iter()
+            .map(|target| RequestTargetView::new(target, &status.request_id))
+            .collect();
+        let (phase, settled, summary) = match status.status {
+            stow_types::api::CrateRequestPhase::Accepted => (
+                "accepted",
+                false,
+                "Accepted — a CI job is dispatching to resolve its dependency closure; this page refreshes itself.",
+            ),
+            stow_types::api::CrateRequestPhase::Resolving => (
+                "resolving",
+                false,
+                "Resolving the dependency closure on CI now; this page refreshes itself.",
+            ),
+            stow_types::api::CrateRequestPhase::Enqueued => {
+                let settled = targets.iter().all(|target| target.settled);
+                (
+                    "enqueued",
+                    settled,
+                    "Resolved — the tasks are in the human lane, ahead of the miss queue. Each target below lands on its own.",
+                )
+            }
+            stow_types::api::CrateRequestPhase::Failed => (
+                "failed",
+                true,
+                "The resolve failed before any task was queued. Requesting the same crate again re-attempts it.",
+            ),
+        };
+        Self {
+            request_id: status.request_id,
             crate_name: status.crate_name.as_str().to_owned(),
             version: status.version.to_string(),
-            target: status.target.as_str().to_owned(),
-            rustc_version: status.rustc_version.as_str().to_owned(),
             features: if features.is_empty() {
                 "--no-default-features".to_owned()
             } else {
                 features
             },
-            lane: match status.lane {
-                stow_types::api::TaskLane::Human => "human",
-                stow_types::api::TaskLane::Miss => "cache miss",
-            },
-            status: status.status.as_str(),
-            queue_position: status.human_lane_position,
-            settled: matches!(
-                status.status,
-                QueueTaskStatus::Completed | QueueTaskStatus::Failed
-            ),
-            summary: match status.status {
-                QueueTaskStatus::Pending => {
-                    "Queued. It starts as soon as a CI slot frees up; this page refreshes itself."
-                }
-                QueueTaskStatus::Blocked => {
-                    "Waiting on a dependency whose build failed. Once it is rebuilt and the index republished, this resumes; this page refreshes itself."
-                }
-                QueueTaskStatus::Dispatched => {
-                    "Sent to CI, waiting for a runner to pick it up; this page refreshes itself."
-                }
-                QueueTaskStatus::Running => "Building on CI now; this page refreshes itself.",
-                QueueTaskStatus::Completed => {
-                    "Built, signed, and in the cache — `stow build` picks it up on this target."
-                }
-                QueueTaskStatus::Failed => {
-                    "The build failed. Requesting it again re-queues it; a crate that cannot build on this target will keep failing."
-                }
-            },
+            rustc_version: status.rustc_version.as_str().to_owned(),
+            status: phase,
+            settled,
+            summary,
+            github_run_url: status.github_run_url,
+            error: status.error,
+            targets,
         }
     }
 }
@@ -166,20 +227,20 @@ impl TaskView {
 #[derive(Debug, Template)]
 #[template(path = "request.html")]
 pub struct RequestStatusPage {
-    task_id: String,
-    task: Option<TaskView>,
+    request_id: String,
+    request: Option<RequestView>,
     repository_url: &'static str,
     version: &'static str,
     css: &'static str,
 }
 
 impl RequestStatusPage {
-    /// Build the render context; `task` is `None` for an id the scheduler
-    /// does not know.
-    fn new(task_id: String, task: Option<RequestStatus>) -> Self {
+    /// Build the render context; `request` is `None` for an id the
+    /// scheduler has no record of.
+    fn new(request_id: String, request: Option<stow_types::api::CrateRequestStatus>) -> Self {
         Self {
-            task_id,
-            task: task.map(TaskView::new),
+            request_id,
+            request: request.map(RequestView::new),
             repository_url: REPOSITORY_URL,
             version: env!("CARGO_PKG_VERSION"),
             css: SITE_CSS,
@@ -187,10 +248,12 @@ impl RequestStatusPage {
     }
 }
 
-/// `GET /requests/{task_id}` — the human-readable view of one build task.
+/// `GET /requests/{request_id}` — the human-readable view of one human
+/// request's record.
 ///
-/// The same state `GET /api/v1/requests/{task_id}` returns as JSON: that
-/// route is for programs, this one is what the result table links to.
+/// The same state `GET /api/v1/requests/{request_id}` returns as JSON:
+/// that route is for programs, this page is what the request form's
+/// result table links to.
 #[cfg(target_arch = "wasm32")]
 pub async fn request_status(
     params: skyzen::routing::Params,
@@ -198,17 +261,13 @@ pub async fn request_status(
 ) -> Result<skyzen::Response, crate::errors::GetArtifactError> {
     use skyzen::{Body, Response, StatusCode};
 
-    let task_id = params
-        .get("task_id")
+    let request_id = params
+        .get("request_id")
         .map_err(|_| crate::errors::GetArtifactError::BadRequest)?
         .to_owned();
-    let task =
-        crate::scheduler_client::get_tasks_status(&scheduler, std::slice::from_ref(&task_id))
-            .await?
-            .into_iter()
-            .find(|status| status.task_id == task_id);
-    let found = task.is_some();
-    let html = RequestStatusPage::new(task_id, task)
+    let request = crate::scheduler_client::get_request(&scheduler, &request_id).await?;
+    let found = request.is_some();
+    let html = RequestStatusPage::new(request_id, request)
         .render()
         .map_err(|error| crate::errors::GetArtifactError::InternalWithMessage(error.to_string()))?;
 
@@ -431,7 +490,9 @@ mod tests {
     #[test]
     fn index_page_links_results_to_the_status_page_not_the_json_route() {
         let html = render();
-        assert!(html.contains("`/requests/${encodeURIComponent(entry.task_id)}`"));
+        // The result table's request row links to the status page —
+        // request ids, not task ids, are what the route now serves.
+        assert!(html.contains("`/requests/${encodeURIComponent(outcome.request_id)}`"));
         assert!(!html.contains("`/api/v1/requests/${encodeURIComponent(entry.task_id)}`"));
     }
 
@@ -573,13 +634,17 @@ mod stats_page_tests {
 #[cfg(test)]
 mod request_status_tests {
     use askama::Template as _;
-    use stow_types::api::{QueueTaskStatus, RequestStatus, TaskLane};
+    use stow_types::api::{CrateRequestPhase, CrateRequestState, CrateRequestTarget};
 
     use super::RequestStatusPage;
 
-    fn status(state: QueueTaskStatus, features: &[&str]) -> RequestStatus {
-        RequestStatus {
-            task_id: "serde-1.0.219-abc-x86_64-unknown-linux-gnu-1.98.1".to_owned(),
+    fn status(
+        phase: CrateRequestPhase,
+        features: &[&str],
+        targets: Vec<CrateRequestTarget>,
+    ) -> stow_types::api::CrateRequestStatus {
+        stow_types::api::CrateRequestStatus {
+            request_id: "req-serde-1.0.219-ab12-1_98_1".to_owned(),
             crate_name: "serde".parse().expect("crate name"),
             version: "1.0.219".parse().expect("version"),
             features_json: stow_types::identity::FeaturesJson::canonicalize(
@@ -589,57 +654,101 @@ mod request_status_tests {
                     .collect(),
             )
             .expect("features"),
-            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.98.1".parse().expect("rustc version"),
-            lane: TaskLane::Human,
-            status: state,
-            human_lane_position: Some(3),
-            blocked_by: None,
-            preserve_lockfile: false,
+            status: phase,
+            targets,
+            error: None,
+            github_run_id: None,
+            github_run_url: None,
         }
     }
 
-    fn render(state: QueueTaskStatus, features: &[&str]) -> String {
-        RequestStatusPage::new("task-id".to_owned(), Some(status(state, features)))
-            .render()
-            .expect("status page renders")
+    fn target(state: CrateRequestState, position: Option<u32>) -> CrateRequestTarget {
+        CrateRequestTarget {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            state,
+            task_id: Some("serde-1.0.219-abc-x86_64-unknown-linux-gnu-1.98.1".to_owned()),
+            human_lane_position: position,
+        }
+    }
+
+    fn render(
+        phase: CrateRequestPhase,
+        features: &[&str],
+        targets: Vec<CrateRequestTarget>,
+    ) -> String {
+        RequestStatusPage::new(
+            "req-serde-1.0.219-ab12-1_98_1".to_owned(),
+            Some(status(phase, features, targets)),
+        )
+        .render()
+        .expect("status page renders")
     }
 
     #[test]
-    fn a_running_task_renders_its_identity_and_keeps_refreshing() {
-        let html = render(QueueTaskStatus::Running, &["default", "std"]);
+    fn a_resolving_request_renders_its_identity_and_keeps_refreshing() {
+        let html = render(
+            CrateRequestPhase::Resolving,
+            &["default", "std"],
+            Vec::new(),
+        );
         assert!(html.contains(r#"<meta http-equiv="refresh" content="20">"#));
-        assert!(html.contains(r#"<span class="badge" data-state="running">running</span>"#));
-        assert!(html.contains("x86_64-unknown-linux-gnu"));
+        assert!(html.contains(r#"<span class="badge" data-state="resolving">resolving</span>"#));
+        assert!(html.contains("serde"));
         assert!(html.contains("default, std"));
-        assert!(html.contains("#3"));
     }
 
     #[test]
-    fn a_settled_task_stops_refreshing() {
-        for state in [QueueTaskStatus::Completed, QueueTaskStatus::Failed] {
-            let html = render(state, &["default"]);
-            assert!(
-                !html.contains("http-equiv=\"refresh\""),
-                "{} must not reload",
-                state.as_str()
-            );
-        }
+    fn an_enqueued_request_lists_its_targets_and_keeps_refreshing() {
+        let html = render(
+            CrateRequestPhase::Enqueued,
+            &["default"],
+            vec![
+                target(CrateRequestState::Queued, Some(3)),
+                CrateRequestTarget {
+                    state: CrateRequestState::Building,
+                    ..target(CrateRequestState::Queued, None)
+                },
+            ],
+        );
+        assert!(html.contains(r#"<span class="badge" data-state="enqueued">enqueued</span>"#));
+        assert!(html.contains("x86_64-unknown-linux-gnu"));
+        assert!(html.contains("queued"));
+        assert!(html.contains("building"));
+        assert!(html.contains("#3"));
+        assert!(html.contains("http-equiv=\"refresh\""));
+    }
+
+    #[test]
+    fn a_settled_request_stops_refreshing() {
+        let cached = render(
+            CrateRequestPhase::Enqueued,
+            &["default"],
+            vec![CrateRequestTarget {
+                state: CrateRequestState::Cached,
+                task_id: None,
+                ..target(CrateRequestState::Queued, None)
+            }],
+        );
+        assert!(!cached.contains("http-equiv=\"refresh\""));
+        let failed = render(CrateRequestPhase::Failed, &["default"], Vec::new());
+        assert!(!failed.contains("http-equiv=\"refresh\""));
+        assert!(failed.contains(r#"<span class="badge" data-state="failed">failed</span>"#));
     }
 
     #[test]
     fn an_empty_feature_list_reads_as_no_default_features() {
-        let html = render(QueueTaskStatus::Pending, &[]);
+        let html = render(CrateRequestPhase::Accepted, &[], Vec::new());
         assert!(html.contains("--no-default-features"));
     }
 
     #[test]
-    fn an_unknown_task_says_so_instead_of_rendering_a_blank_task() {
-        let html = RequestStatusPage::new("nope".to_owned(), None)
+    fn an_unknown_request_says_so_instead_of_rendering_a_blank_record() {
+        let html = RequestStatusPage::new("req-nope".to_owned(), None)
             .render()
             .expect("status page renders");
         assert!(html.contains("Unknown request"));
-        assert!(html.contains("nope"));
+        assert!(html.contains("req-nope"));
         assert!(!html.contains("http-equiv=\"refresh\""));
     }
 }

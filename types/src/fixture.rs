@@ -155,3 +155,15 @@ fn target_count() -> u32 {
 pub fn task_hex_id(n: u64) -> String {
     format!("{n:064x}")
 }
+
+/// The `enqueued` fixture request record's id.
+///
+/// `seed_requests` writes it and `GET /requests/{id}`-shaped drives name
+/// it. The stored roots in its `outcome_json` point at seeded queue
+/// rows, so the read exercises the live root re-probe at every fixture
+/// size.
+pub const REQUEST_FIXTURE_ENQUEUED: &str = "req-fixture-enqueued";
+
+/// The `failed` fixture request record's id — a static read with no
+/// root re-probe.
+pub const REQUEST_FIXTURE_FAILED: &str = "req-fixture-failed";

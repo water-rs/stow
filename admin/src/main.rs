@@ -25,6 +25,7 @@ mod preheat;
 mod projects;
 mod queue;
 mod render;
+mod request;
 mod resolve;
 mod runs;
 mod rust_channel;
@@ -123,6 +124,9 @@ enum Command {
     /// launch model's peak rates and report per-lane p50/p99, error
     /// and overload signals.
     LaunchLoad(launch_load::LaunchLoadArgs),
+    /// The human request lane's Actions leg: `request resolve` turns an
+    /// admitted request's dispatch input into its outcome report.
+    Request(request::RequestArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
@@ -224,6 +228,7 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         Command::LaunchModel(args) => launch_model::run(args, output).await,
         Command::LaunchGate(args) => launch_gate::run(&args, output).await,
         Command::LaunchLoad(args) => launch_load::run(&Edge::connect().await?, &args, output).await,
+        Command::Request(args) => request::run(args, output).await,
         Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
         Command::Deploy(args) => deploy::run(args, output).await,
     }

@@ -37,6 +37,7 @@
 use skyzen_services::durable::DurableDb;
 use stow_types::api::CI_TARGET_TRIPLES;
 pub use stow_types::fixture::FixtureShape;
+use stow_types::fixture::{REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED};
 
 use crate::errors::QueueError;
 
@@ -327,6 +328,58 @@ pub async fn seed_deps_met_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(),
     Ok(())
 }
 
+/// The `requests` fixture the `/requests` drives read (stow#428): one
+/// `enqueued` record whose stored roots name real queue rows — a pending
+/// human row (the status read's `human_lane_position` probe), a
+/// completed row (`cached` arm) and a no-library root — and one `failed`
+/// record, the backstop's terminal state. Inserted when the `Queue`
+/// phase finishes so the ids it names exist.
+pub async fn seed_requests(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    let pending_root =
+        stow_types::fixture::task_hex_id(u64::from(FixtureShape::HUMAN_LANE_ROWS - 5));
+    // Row 5 stays clear of the purge drive's row-0/1 deletes, which run
+    // before `GET /requests/{id}` re-probes this root.
+    let completed_root = stow_types::fixture::task_hex_id(u64::from(shape.completed_row(5)));
+    let outcome = serde_json::json!([
+        {
+            "target": CI_TARGET_TRIPLES[0],
+            "task_id": pending_root,
+            "cached": false,
+            "was_queued": false,
+        },
+        {
+            "target": CI_TARGET_TRIPLES[1],
+            "task_id": completed_root,
+            "cached": false,
+            "was_queued": true,
+        },
+        {
+            "target": CI_TARGET_TRIPLES[2],
+            "task_id": null,
+            "cached": false,
+            "was_queued": false,
+        },
+    ])
+    .to_string();
+    db.query(
+        "INSERT INTO requests (request_id, attempt, crate_name, version, features_json, \
+         rustc_version, state, dispatched_at, github_run_id, github_run_url, \
+         outcome_json, error) \
+         VALUES (?, 1, 'serde', '1.0.0', '[]', '1.86.0', 'enqueued', 0, \
+                 '42', 'https://github.com/water-rs/stow/actions/runs/42', ?, NULL), \
+                (?, 2, 'clap', '1.0.0', '[]', '1.86.0', 'failed', 0, \
+                 '43', 'https://github.com/water-rs/stow/actions/runs/43', NULL, ?)",
+    )
+    .bind(REQUEST_FIXTURE_ENQUEUED)
+    .bind(outcome)
+    .bind(REQUEST_FIXTURE_FAILED)
+    .bind("resolve run concluded 'failure' (https://github.com/water-rs/stow/actions/runs/43)")
+    .execute()
+    .await
+    .map_err(|error| format!("seed request rows: {error}"))?;
+    Ok(())
+}
+
 /// Seed one `(n, n + batch]` chunk of `phase` and return where the seed
 /// resumes — the next phase (or `None` once `DepsMet` finishes).
 pub async fn seed_batch(
@@ -340,7 +393,12 @@ pub async fn seed_batch(
     let hi = (n + batch).min(phase.range_end(shape));
     if hi > n {
         match phase {
-            SeedPhase::Queue => seed_queue_chunk(db, shape, n, hi, min_age_minutes).await?,
+            SeedPhase::Queue => {
+                seed_queue_chunk(db, shape, n, hi, min_age_minutes).await?;
+                if hi >= phase.range_end(shape) {
+                    seed_requests(db, shape).await?;
+                }
+            }
             SeedPhase::EdgesEvery | SeedPhase::EdgesThirds => {
                 seed_edges_chunk(db, shape, phase, n, hi).await?;
             }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
@@ -13,7 +13,7 @@ use skyzen_services::Db;
 use stow_types::admission;
 use stow_types::api::{
     AdmissionRequest, ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, CrateRequest,
-    CrateRequestOutcome, EnqueueAdmission, EnqueueTicket,
+    EnqueueAdmission, EnqueueTicket,
 };
 use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
 use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
@@ -987,10 +987,13 @@ pub async fn scheduler_status(
 /// Public human lane: a Turnstile-verified request to build one crate (and
 /// its dependency closure) into the public cache for every supported CI
 /// target. Turnstile replaces the miss path's proof-of-work as the
-/// admission check, and accepted tasks enter the scheduler's human lane —
-/// dispatched ahead of queued misses and exempt from the dispatch minimum
-/// age. Re-requesting a queued crate promotes its task into the human
-/// lane; nothing in this path demotes one back.
+/// admission check. The edge itself resolves nothing (stow#428): the
+/// request's record lives in the scheduler, which dispatches a
+/// `resolve-request.yml` run through the GitHub App; the job resolves
+/// with `stow-resolver`, reports the outcome back, and the scheduler
+/// enqueues the covered tasks into the human lane — dispatched ahead of
+/// queued misses and exempt from the dispatch minimum age. Re-requesting
+/// a live request answers its record; a failed one re-attempts.
 pub async fn submit_crate_request(
     CfConnectingIp(remoteip): CfConnectingIp,
     Json(request): Json<CrateRequest>,
@@ -1026,10 +1029,7 @@ pub async fn submit_crate_request(
         return GetArtifactError::TurnstileRejected { error_codes }.rejection_response();
     }
 
-    // One bound for the whole request: the crates.io version lookup
-    // and the resolve expansion below draw from the same budget.
-    let pool = OutboundPool::new();
-    let crates_io = crates_io::CfCratesIo::new(pool.clone());
+    let crates_io = crates_io::CfCratesIo::new(OutboundPool::new());
     // The request's version resolve (db reads) and the stable rustc
     // resolve (a Cache API read) are independent, so they overlap.
     let (version, rustc_version) = futures_util::try_join!(
@@ -1040,65 +1040,79 @@ pub async fn submit_crate_request(
                 .map_err(Into::into)
         },
     )?;
-    let seed_features = request_seed_features(&request)?;
-    let (plans, enqueue) = expand_request_targets(
-        &db,
-        &request,
-        &version,
-        &seed_features,
-        &rustc_version,
-        settings.rustc_data_base_url.as_deref(),
-        &pool,
-    )
-    .await?;
-    // A request enqueues its uncovered closure once per CI target, so the
-    // per-request cap applies to the closure itself — the largest plan —
-    // not the summed task count.
-    let closure_size = plans
-        .iter()
-        .map(|(_, plan, _)| plan.enqueue_requests.len())
-        .max()
-        .unwrap_or(0);
-    if closure_size > settings.human_max_closure {
-        return Err(GetArtifactError::UnprocessableEntity(format!(
-            "dependency closure of {closure_size} crates exceeds the per-request limit of {}",
-            settings.human_max_closure
-        )));
-    }
-    let enqueued = enqueue.len();
-    let targets = match submit_and_assemble(&scheduler, enqueue, &plans).await {
-        Ok(targets) => targets,
+    // `features_json` is already canonical — `FeaturesJson` rejects an
+    // unsorted list at deserialize — so the id hashes the exact string
+    // every other lane recomputes.
+    let admission = stow_types::api::RequestAdmission {
+        request_id: stow_types::api::request_id(
+            request.crate_name.as_str(),
+            &version.to_string(),
+            &request.features_json.raw(),
+            rustc_version.as_str(),
+        ),
+        crate_name: request.crate_name.clone(),
+        version: CrateVersion::new(version),
+        features_json: request.features_json.clone(),
+        rustc_version,
+        // `Settings` carries the cap as usize; the wire type is u32 —
+        // a value past u32::MAX clamps there, still refusing nothing a
+        // site would legitimately request.
+        max_closure: u32::try_from(settings.human_max_closure).unwrap_or(u32::MAX),
+    };
+    let status = match scheduler_client::submit_request(&scheduler, &admission).await {
+        Ok(status) => status,
         // A 429 from the scheduler on this lane is the daily task budget;
         // its counter resets at 00:00 UTC.
-        Err(GetArtifactError::SchedulerBusy(message)) => {
-            return rate_limited_response(
-                &message,
-                scheduler::queue::seconds_until_utc_midnight(now_unix()),
-            );
-        }
-        Err(error) => return Err(error),
+        Err(error) => match GetArtifactError::from(error) {
+            GetArtifactError::SchedulerBusy(message) => {
+                return rate_limited_response(
+                    &message,
+                    scheduler::queue::seconds_until_utc_midnight(now_unix()),
+                );
+            }
+            other => return Err(other),
+        },
     };
     tracing::info!(
+        request_id = %status.request_id,
         crate_name = %request.crate_name,
-        %version,
-        rustc_version = %rustc_version,
-        enqueued,
-        "human request accepted"
+        version = %status.version,
+        rustc_version = %status.rustc_version,
+        phase = ?status.status,
+        "human request admitted"
     );
     let mut response = Response::new(
-        Body::from_json(&CrateRequestOutcome {
-            crate_name: request.crate_name,
-            version: CrateVersion::new(version),
-            rustc_version,
-            targets,
-        })
-        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
+        Body::from_json(&status)
+            .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?,
     );
     response.headers_mut().insert(
         skyzen::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
     Ok(response)
+}
+
+/// `POST /api/v1/scheduler/requests/{request_id}/outcome`
+///
+/// The resolve job's outcome report: `stow-admin request resolve` posts
+/// the tasks it resolved across `CI_TARGET_TRIPLES` (or the failure the
+/// run ended in) and the record settles `enqueued`/`failed`. The tasks
+/// ride the trusted submit path verbatim — the resolver already pinned
+/// each identity, so no canonicalization runs here.
+///
+/// `SchedulerCaller` extracts first and rejects unauthorized requests
+/// before `Json` runs.
+pub async fn scheduler_request_outcome(
+    SchedulerCaller(_caller): SchedulerCaller,
+    params: Params,
+    Json(report): Json<stow_types::api::RequestOutcomeReport>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::CrateRequestStatus>, GetArtifactError> {
+    let request_id = params
+        .get("request_id")
+        .map_err(|_| GetArtifactError::BadRequest)?;
+    let status = scheduler_client::send_request_outcome(&scheduler, request_id, &report).await?;
+    Ok(Json(status))
 }
 
 /// Resolve the requested version — exact-published check when given, else
@@ -1136,142 +1150,23 @@ async fn resolve_request_version(
     })
 }
 
-/// The feature seeds for the closure walk, taken verbatim from the
-/// request.
+/// GET /`api/v1/requests/{request_id}`
 ///
-/// An empty list means exactly that: build with no features at all, which
-/// is `--no-default-features`. It must not be re-seeded with `default` —
-/// the form's only way to ask for a bare build is to untick every box, and
-/// silently turning that into the full default closure builds the thing the
-/// user just declined, under a task identity they did not ask for.
-fn request_seed_features(request: &CrateRequest) -> Result<BTreeSet<String>, GetArtifactError> {
-    dependency_resolver::normalize_feature_set(request.features_json.features().to_vec())
-        .map_err(|_| GetArtifactError::BadRequest)
-}
-
-/// Expand the request's dependency closure once per CI target. Returns the
-/// per-target `(target, plan, root_task_id)` triples and the flat list of
-/// human-lane tasks to submit; a target whose root is already cached
-/// contributes no tasks.
-async fn expand_request_targets(
-    db: &Db,
-    request: &CrateRequest,
-    version: &semver::Version,
-    seed_features: &BTreeSet<String>,
-    rustc_version: &stow_types::identity::WireRustcVersion,
-    rustc_data_base_url: Option<&str>,
-    pool: &OutboundPool,
-) -> Result<
-    (
-        Vec<(TargetTriple, worker_resolver::CrateRequestPlan, String)>,
-        Vec<stow_types::api::EnqueueRequest>,
-    ),
-    GetArtifactError,
-> {
-    let target_list = CI_TARGET_TRIPLES
-        .iter()
-        .map(|triple| {
-            TargetTriple::parse(*triple).map_err(|error| {
-                GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let expansions = worker_resolver::expand_crate_request_on_targets(
-        db,
-        &request.crate_name,
-        version,
-        seed_features,
-        &target_list,
-        rustc_version,
-        rustc_data_base_url,
-        pool,
-    )
-    .into_send()
-    .await?;
-    let mut plans = Vec::with_capacity(CI_TARGET_TRIPLES.len());
-    let mut enqueue = Vec::new();
-    for (target, plan) in expansions {
-        // The root task's id keys on the platform its unit lands on — the
-        // requested target for a normal lib, the runner-family host triple
-        // for a proc-macro root, so the status read finds the task the
-        // resolver actually enqueued.
-        let root_task_id = scheduler::queue::task_id(
-            request.crate_name.as_str(),
-            &version.to_string(),
-            &plan.root_features_json,
-            &plan.root_target,
-            rustc_version.as_str(),
-            plan.root_host_side,
-        );
-        // A cached root means the artifact already exists for this target:
-        // report `Cached` and do not enqueue its closure.
-        if !plan.root_cached {
-            enqueue.extend(plan.enqueue_requests.iter().cloned());
-        }
-        plans.push((target, plan, root_task_id));
-    }
-    Ok((plans, enqueue))
-}
-
-/// Submit the human-lane tasks and assemble the per-target outcomes. The
-/// pre-submit status read distinguishes `AlreadyQueued`/`Building` roots
-/// from the ones this request just queued.
-async fn submit_and_assemble(
-    scheduler: &CfDurableNamespace,
-    enqueue: Vec<stow_types::api::EnqueueRequest>,
-    plans: &[(TargetTriple, worker_resolver::CrateRequestPlan, String)],
-) -> Result<Vec<stow_types::api::CrateRequestTarget>, GetArtifactError> {
-    let root_task_ids = plans
-        .iter()
-        .filter(|(_, plan, _)| !plan.root_cached && plan.root_has_library)
-        .map(|(_, _, task_id)| task_id.clone())
-        .collect::<Vec<_>>();
-    let was_queued: BTreeSet<String> =
-        scheduler_client::get_tasks_status(scheduler, &root_task_ids)
-            .await?
-            .into_iter()
-            .map(|status| status.task_id)
-            .collect();
-    scheduler_client::send_enqueue(scheduler, &enqueue).await?;
-    let statuses: BTreeMap<String, stow_types::api::RequestStatus> =
-        scheduler_client::get_tasks_status(scheduler, &root_task_ids)
-            .await?
-            .into_iter()
-            .map(|status| (status.task_id.clone(), status))
-            .collect();
-    plans
-        .iter()
-        .map(|(target, plan, task_id)| {
-            dependency_resolver::crate_request_target(
-                target,
-                task_id,
-                plan.root_cached,
-                plan.root_has_library,
-                was_queued.contains(task_id),
-                statuses.get(task_id),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(GetArtifactError::from)
-}
-
-/// GET /`api/v1/requests/{task_id}`
-///
-/// Point-in-time view of one scheduler task: lane, queue status, and the
-/// 1-based human-lane position while the task is still pending there.
+/// The request record's live view — `accepted` while the resolve run is
+/// queued or mid-dispatch, `resolving` once GitHub reports the run
+/// `in_progress`, then `enqueued` (per-target states re-probed against
+/// the queue on each read) or `failed`.
 pub async fn crate_request_status(
     params: Params,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Response, GetArtifactError> {
-    let task_id = params
-        .get("task_id")
+    let request_id = params
+        .get("request_id")
         .map_err(|_| GetArtifactError::BadRequest)?;
-    let statuses = scheduler_client::get_tasks_status(&scheduler, &[task_id.to_owned()]).await?;
-    let status = statuses
-        .into_iter()
-        .find(|status| status.task_id == task_id)
-        .ok_or_else(|| GetArtifactError::UnknownTask {
-            task_id: task_id.to_owned(),
+    let status = scheduler_client::get_request(&scheduler, request_id)
+        .await?
+        .ok_or_else(|| GetArtifactError::UnknownRequest {
+            request_id: request_id.to_owned(),
         })?;
     cacheable_json(&status, POINT_IN_TIME_NO_STORE)
 }

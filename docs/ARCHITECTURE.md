@@ -158,13 +158,14 @@ the dropped package, so the request for a binary enqueues exactly what
 `closure_queued` rather than a task state.
 
 Two hard caps bound what one Turnstile token can spend:
-`STOW_HUMAN_MAX_CLOSURE` refuses a request whose dependency closure
-exceeds it (per target) with 422, and `STOW_HUMAN_DAILY_TASK_BUDGET`
-limits human-lane tasks enqueued per UTC day — the scheduler Durable
-Object keeps the counter (`human_daily_task_budget`, one row per UTC
-date, charged atomically in `enqueue`) and refuses an overspending
-submit with 429; the edge answers `Retry-After` in seconds until 00:00
-UTC.
+`STOW_HUMAN_MAX_CLOSURE` caps a request whose largest single-target
+uncovered closure exceeds it — checked in the resolve job, where an
+overspending request lands as a `failed` record naming the limit — and
+`STOW_HUMAN_DAILY_TASK_BUDGET` limits human-lane tasks enqueued per UTC
+day — the scheduler Durable Object keeps the counter
+(`human_daily_task_budget`, one row per UTC date, charged atomically in
+`enqueue`) and refuses an overspending submit with 429; the edge answers
+`Retry-After` in seconds until 00:00 UTC.
 
 Dispatch is additionally capped per GitHub Actions runner family —
 `stow_types::api::runner_family` maps each `CI_TARGET_TRIPLES` member
@@ -180,18 +181,38 @@ stay pending, and the alarm then wakes at the earliest in-flight lease
 expiry rather than re-firing immediately.
 
 The handler resolves the requested version (newest non-prerelease,
-non-yanked release when the body omits it), expands the crate's
-dependency closure over crates.io metadata — normal and build edges,
-optional-dependency feature activation, `cfg(...)` target restrictions —
-and submits every uncovered node as an `EnqueueSource::HumanRequest`
-task for each of `stow_types::api::CI_TARGET_TRIPLES`. `rustc_version`
+non-yanked release when the body omits it) and the current stable rustc,
+then hands the request to the scheduler's `POST /requests` — the
+request record (`requests` table) is born `accepted` and dispatched
+there to `resolve-request.yml` on `main` through the same GitHub App
+`workflow_dispatch` arm `trigger_build` uses for `build-crate.yml`.
+`resolve-request.yml` runs `stow-admin request resolve`: `stow-resolver`
+expands the crate's dependency closure over crates.io metadata — normal
+and build edges, optional-dependency feature activation, `cfg(...)`
+target restrictions — for each of
+`stow_types::api::CI_TARGET_TRIPLES`, prunes it against the published
+`index.<target>.<rustc>` slices (the queue gate's own coverage truth),
+and posts the plan to the trusted
+`POST /api/v1/scheduler/requests/{id}/outcome`, which enqueues every
+uncovered node as an `EnqueueSource::HumanRequest` task in the `human`
+lane and flips the record `enqueued` in the same call. `rustc_version`
 is the current stable channel release, parsed from
 `channel-rust-stable.toml` and cached in the Worker's Cache API for 60
 minutes (`edge/src/rust_channel.rs`), so the lane never wakes the
-scheduler Durable Object to resolve it. `GET
-/api/v1/requests/{task_id}` returns the task's `RequestStatus` — lane,
-queue status, and its 1-based `human_lane_position` while it is still
-pending in the human lane.
+scheduler Durable Object to resolve it.
+
+`GET /api/v1/requests/{request_id}` returns the request's
+`CrateRequestStatus` — `accepted` → `resolving` → `enqueued` /
+`failed`. The platform-native signal drives it: the HMAC-verified
+`workflow_run` webhook at `POST /api/v1/github/workflow-run` matches the
+resolve run by its `resolve-a<attempt>-<request_id>` run name and posts
+`in_progress` (record → `resolving`, run id/url stamped) and `completed`
+(a one-statement conditional `failed` backstop that can never overwrite
+`enqueued`) to `/requests/{id}/run-update` inside the object. An
+`enqueued` record re-reads its stored roots against the queue on each
+fetch, so per-target `state`/`human_lane_position` keep moving until
+every target is cached — task ids on a `queued` row and the request's
+`task_id` link shape are gone: `request_id` is the lookup.
 
 ### Task dependencies and claim-time coverage
 
@@ -662,9 +683,10 @@ deserialization.
 | POST `/api/v1/admin/preheat/plan` | Bearer: repo-workflow OIDC or push user | `PreheatPlanRequest` | `PreheatPlanResponse` | Dry-run closure expansion for a crate request — `preheat plan` |
 | POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for the posted graph's uncovered nodes — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
-| POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
-| GET `/api/v1/requests/{task_id}` | none | — | `RequestStatus` | Task status + human-lane position |
-| GET `/requests/{task_id}` | none | — | HTML | The same `RequestStatus` rendered as a page, the link the request form returns |
+| POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |
+| GET `/api/v1/requests/{request_id}` | none | — | `CrateRequestStatus` | Live request record: `accepted` → `resolving` → `enqueued`/`failed` plus per-target states |
+| GET `/requests/{request_id}` | none | — | HTML | The same `CrateRequestStatus` rendered as a page, the link the request form returns |
+| POST `/api/v1/scheduler/requests/{request_id}/outcome` | Bearer: repo-workflow OIDC or push user | `RequestOutcomeReport` | `CrateRequestStatus` | The `resolve-request.yml` job's submission — enqueues the resolved tasks and settles the request record |
 | GET `/api/v1/crates/search?q=&limit=` | none | — | `CrateSearchResponse` | crates.io search, proxied for the request form's completions; query must be ≥2 chars, limit clamps to 1–25 (default 10), response cached 5 min |
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |

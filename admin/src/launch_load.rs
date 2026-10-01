@@ -33,7 +33,9 @@ use stow_types::api::{
     AdmissionRequest, DependencyGraphEntry, EnqueueRequest, EnqueueSource, EnqueueTicket,
     QueueSelector, ResolvedDependencyGraphEntry,
 };
-use stow_types::fixture::{FixtureShape, task_hex_id};
+use stow_types::fixture::{
+    FixtureShape, REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED, task_hex_id,
+};
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::pow::enqueue_pow_zero_bits;
@@ -118,9 +120,10 @@ enum Fire {
     /// digests; the 404 is the miss the launch fleet sees on an
     /// uncovered unit, and it still costs the full route.
     BundleFetch,
-    /// `GET /api/v1/requests/{task_id}` over seeded pending ids —
-    /// reaches the DO status batch on a real row.
-    StatusRead { queue_rows: u64 },
+    /// `GET /api/v1/requests/{request_id}` over the seeded request
+    /// records — alternates the `enqueued` record (whose read re-probes
+    /// its stored roots into live queue rows) with the `failed` record.
+    StatusRead,
     /// Bearer `GET` on a trusted path.
     TrustedGet(String),
     /// `POST /api/v1/admin/queue/{verb}` over seeded failed ids.
@@ -236,12 +239,6 @@ fn failed_task_id(k: u64, queue_rows: u64) -> String {
         .max(1);
     let index = u32::try_from(k % u64::from(span)).unwrap_or_default();
     task_hex_id(u64::from(shape.failed_row(index)))
-}
-
-/// The k-th pending row — `1..=pending_end`.
-fn pending_task_id(k: u64, queue_rows: u64) -> String {
-    let pending_end = u64::from(shape(queue_rows).pending_end()).max(1);
-    task_hex_id(1 + (k % pending_end))
 }
 
 /// Real crates the submit lane rotates through — each resolves for
@@ -508,14 +505,15 @@ async fn plan(
                 bearer: None,
             })
         }
-        Fire::StatusRead { queue_rows } => {
-            // Alternate the per-task read with the fleet-wide status —
+        Fire::StatusRead => {
+            // Alternate the per-request read with the fleet-wide status —
             // both are DO reads the model's status rate pays for.
             let path = if counter.is_multiple_of(2) {
                 "/api/v1/scheduler/status".to_owned()
+            } else if counter % 4 == 1 {
+                format!("/api/v1/requests/{REQUEST_FIXTURE_ENQUEUED}")
             } else {
-                let id = pending_task_id(counter / 2, *queue_rows);
-                format!("/api/v1/requests/{id}")
+                format!("/api/v1/requests/{REQUEST_FIXTURE_FAILED}")
             };
             Ok(Plan::Get {
                 url: format!("{base}{path}"),
@@ -794,9 +792,7 @@ fn build_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
         Lane {
             name: "status-read",
             eps: eps(EventKind::RequestStatusRead),
-            fire: Fire::StatusRead {
-                queue_rows: args.queue_rows,
-            },
+            fire: Fire::StatusRead,
             expected: ok2xx,
         },
     ];

@@ -190,26 +190,37 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::HumanRequest,
         route: "POST /api/v1/requests",
-        drives: &[("POST /admin/enqueue (trusted)", 1.0)],
+        // The request's whole DO lifecycle per event: the admit call
+        // (dedup + budget probe + resolve dispatch), the run's two
+        // webhook-driven updates, and the outcome post whose
+        // `enqueue_trusted` writes the task rows.
+        drives: &[
+            ("POST /requests", 1.0),
+            ("POST /requests/{id}/run-update (in_progress)", 1.0),
+            ("POST /requests/{id}/outcome", 1.0),
+            ("POST /requests/{id}/run-update (completed)", 1.0),
+        ],
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 50.0,
+        worker_cpu_ms: 15.0,
         subrequests: 3.0,
-        d1_rows_read: 1.0,
-        d1_rows_written: 10.0,
+        d1_rows_read: 0.0,
+        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
         kind: EventKind::RequestStatusRead,
         route: "GET /api/v1/requests/{id}",
-        drives: &[("GET /tasks/status (batch)", 1.0)],
+        // One `crate_request_status` read: the row plus the stored-roots
+        // re-probe against the live queue.
+        drives: &[("GET /requests/{id}", 1.0)],
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
         worker_cpu_ms: 5.0,
         subrequests: 0.0,
-        d1_rows_read: 5.0,
+        d1_rows_read: 0.0,
         d1_rows_written: 0.0,
         r2_ops: 0.0,
     },

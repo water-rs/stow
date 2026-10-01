@@ -3,11 +3,11 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% match task %}{% when Some with (task) %}{{ task.crate_name }} {{ task.version }} · {{ task.status }}{% when None %}unknown request{% endmatch %} — stow</title>
+    <title>{% match request %}{% when Some with (request) %}{{ request.crate_name }} {{ request.version }} · {{ request.status }}{% when None %}unknown request{% endmatch %} — stow</title>
     <meta name="robots" content="noindex">
-    {%- match task %}
-    {%- when Some with (task) %}
-    {%- if !task.settled %}
+    {%- match request %}
+    {%- when Some with (request) %}
+    {%- if !request.settled %}
     <meta http-equiv="refresh" content="20">
     {%- endif %}
     {%- when None %}
@@ -26,32 +26,53 @@
 
     <main class="status-page">
       <div class="frame">
-        {%- match task %}
-        {%- when Some with (task) %}
-        <h1>{{ task.crate_name }} {{ task.version }}</h1>
+        {%- match request %}
+        {%- when Some with (request) %}
+        <h1>{{ request.crate_name }} {{ request.version }}</h1>
         <p class="subline">
-          <span class="badge" data-state="{{ task.status }}">{{ task.status }}</span>
-          {{ task.summary }}
+          <span class="badge" data-state="{{ request.status }}">{{ request.status }}</span>
+          {{ request.summary }}
         </p>
-        <section class="window status-window" aria-label="Build task">
-          <div class="window-title"><span>task</span><span>{{ task.target }}</span></div>
+        <section class="window status-window" aria-label="Crate request">
+          <div class="window-title"><span>request</span><span>{{ request.rustc_version }}</span></div>
           <ul class="window-body leader-list">
-            <li><span>crate</span><span class="leader"></span><span>{{ task.crate_name }} {{ task.version }}</span></li>
-            <li><span>target</span><span class="leader"></span><span>{{ task.target }}</span></li>
-            <li><span>rustc</span><span class="leader"></span><span>{{ task.rustc_version }}</span></li>
-            <li><span>features</span><span class="leader"></span><span>{{ task.features }}</span></li>
-            <li><span>lane</span><span class="leader"></span><span>{{ task.lane }}</span></li>
-            <li><span>state</span><span class="leader"></span><span>{{ task.status }}</span></li>
-            {%- if let Some(position) = task.queue_position %}
-            <li><span>queue position</span><span class="leader"></span><span>#{{ position }}</span></li>
+            <li><span>crate</span><span class="leader"></span><span>{{ request.crate_name }} {{ request.version }}</span></li>
+            <li><span>rustc</span><span class="leader"></span><span>{{ request.rustc_version }}</span></li>
+            <li><span>features</span><span class="leader"></span><span>{{ request.features }}</span></li>
+            <li><span>state</span><span class="leader"></span><span>{{ request.status }}</span></li>
+            {%- if let Some(url) = request.github_run_url %}
+            <li><span>resolve run</span><span class="leader"></span><span><a href="{{ url }}">view on GitHub</a></span></li>
+            {%- endif %}
+            {%- if let Some(error) = request.error %}
+            <li><span>error</span><span class="leader"></span><span>{{ error }}</span></li>
             {%- endif %}
           </ul>
         </section>
-        <p class="status-id">{{ task.task_id }} · <a href="/api/v1/requests/{{ task.task_id }}">JSON</a></p>
+        {%- if !request.targets.is_empty() %}
+        <section class="window status-window" aria-label="Per-target tasks">
+          <div class="window-title"><span>targets</span><span>{{ request.targets.len() }} platforms</span></div>
+          <table class="window-body result-table">
+            <thead>
+              <tr><th scope="col">target</th><th scope="col">state</th><th scope="col" class="num">lane</th><th scope="col" class="task-col">task</th></tr>
+            </thead>
+            <tbody>
+              {%- for target in request.targets %}
+              <tr>
+                <td>{{ target.target }}</td>
+                <td>{{ target.state }}</td>
+                <td class="num">{%- match target.queue_position %}{% when Some with (position) %}#{{ position }}{% when None %}—{% endmatch %}</td>
+                <td class="task-col">{%- match target.task_id %}{% when Some with (task_id) %}<a href="{{ target.task_url }}" title="{{ task_id }}">{{ target.task_short }}</a>{% when None %}—{% endmatch %}</td>
+              </tr>
+              {%- endfor %}
+            </tbody>
+          </table>
+        </section>
+        {%- endif %}
+        <p class="status-id">{{ request.request_id }} · <a href="/api/v1/requests/{{ request.request_id }}">JSON</a></p>
         {%- when None %}
         <h1>Unknown request</h1>
-        <p class="subline">The scheduler has no task with this id. A finished task is kept only while its build record is fresh, so an old link expires; a mistyped one never existed.</p>
-        <p class="status-id">{{ task_id }}</p>
+        <p class="subline">The scheduler has no request record with this id. A mistyped link never existed; one from before a record was reaped has expired.</p>
+        <p class="status-id">{{ request_id }}</p>
         {%- endmatch %}
       </div>
     </main>

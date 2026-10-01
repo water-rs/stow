@@ -294,44 +294,6 @@ pub const DRIVES: &[Drive] = &[
         },
     },
     Drive {
-        // A batch of one human-lane pending row and one completed row.
-        // The human id is a pinned tail row
-        // (`FixtureShape::HUMAN_LANE_ROWS - 5`): its edge always lands
-        // on a completed dep, so `blocked` is size-invariant and its
-        // lane-position probe — bounded by the held lane depth — runs
-        // at every fixture size.
-        name: "GET /tasks/status (batch)",
-        run: |db, shape, _settings, _ctx| {
-            Box::pin(async move {
-                queue::tasks_status(
-                    db,
-                    &[
-                        hex_id(u64::from(FixtureShape::HUMAN_LANE_ROWS - 5)),
-                        hex_id(u64::from(shape.completed_row(0))),
-                    ],
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-            })
-        },
-    },
-    Drive {
-        // A single human-lane pending row — the pinned tail row, for
-        // the same reason as the batch drive: its position probe reads
-        // the lane's full held depth at every size rather than
-        // silently dropping to zero if a fixed row flips `blocked`.
-        name: "GET /tasks/{id}",
-        run: |db, _shape, _settings, _ctx| {
-            Box::pin(async move {
-                queue::tasks_status(db, &[hex_id(u64::from(FixtureShape::HUMAN_LANE_ROWS - 5))])
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            })
-        },
-    },
-    Drive {
         name: "POST /tasks/complete-run",
         run: |db, shape, _settings, _ctx| {
             Box::pin(async move {
@@ -431,6 +393,99 @@ pub const DRIVES: &[Drive] = &[
                 )
                 .await
                 .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+        },
+    },
+    Drive {
+        // A settled `enqueued` record: the row read, the stored-roots
+        // parse and the live `tasks_status` re-probe — a pending human
+        // root pays the lane-position walk, bounded by the held lane
+        // depth.
+        name: "GET /requests/{id}",
+        run: |db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                queue::crate_request_status(db, stow_types::fixture::REQUEST_FIXTURE_ENQUEUED)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        },
+    },
+    Drive {
+        // The request lane's admission end to end — on wasm the real
+        // `admit_request_pass`: the freeze and budget probes, the
+        // deduping insert and the serialized `trigger_resolve` hop to
+        // the local-CI dispatcher (the production GitHub arm's token
+        // read is the same cached row the alarm pass pays). On host the
+        // queue-layer calls only — dedup read, budget probe, insert.
+        name: "POST /requests",
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move { admit_request_drive(db, settings, ctx).await })
+        },
+    },
+    Drive {
+        // `in_progress` on the record the admit drive just inserted:
+        // the row read plus the conditional `accepted -> resolving`
+        // update that stamps the run id.
+        name: "POST /requests/{id}/run-update (in_progress)",
+        run: |db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                queue::record_request_run_update(
+                    db,
+                    DRIVE_REQUEST_ID,
+                    &stow_types::api::RequestRunUpdate {
+                        attempt: 1,
+                        action: stow_types::api::RequestRunAction::InProgress,
+                        conclusion: None,
+                        run_id: Some("43".to_owned()),
+                        run_url: Some(
+                            "https://github.com/water-rs/stow/actions/runs/43".to_owned(),
+                        ),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())
+            })
+        },
+    },
+    Drive {
+        // A `Resolved` report on the live record: the pre/post
+        // `tasks_status` probes, the trusted enqueue of its batch and
+        // the conditional `enqueued` write — the same insert machinery
+        // the submit drives price, at the request batch's size.
+        name: "POST /requests/{id}/outcome",
+        run: |db, shape, settings, _ctx| {
+            Box::pin(async move {
+                queue::apply_request_outcome(db, settings, DRIVE_REQUEST_ID, &request_report(shape))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        },
+    },
+    Drive {
+        // `completed` on the now-`enqueued` record — the single
+        // conditional update keyed on the current state, which is the
+        // overwrite the backstop must never perform (stow#428 review):
+        // the real event costs the row read plus one no-op write.
+        name: "POST /requests/{id}/run-update (completed)",
+        run: |db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                queue::record_request_run_update(
+                    db,
+                    DRIVE_REQUEST_ID,
+                    &stow_types::api::RequestRunUpdate {
+                        attempt: 1,
+                        action: stow_types::api::RequestRunAction::Completed,
+                        conclusion: Some("success".to_owned()),
+                        run_id: Some("43".to_owned()),
+                        run_url: Some(
+                            "https://github.com/water-rs/stow/actions/runs/43".to_owned(),
+                        ),
+                    },
+                )
+                .await
                 .map_err(|error| error.to_string())
             })
         },
@@ -700,22 +755,8 @@ fn submit_batch_named(
     fresh_name: &str,
     human_name: &str,
 ) -> Vec<EnqueueRequest> {
-    let target_of = |n: u32| stow_types::api::CI_TARGET_TRIPLES[usize::try_from(n).unwrap() % 9];
-    let dep = |n: u32| {
-        let (crate_name, version) = crate_identity(n);
-        EnqueueDependency {
-            crate_name: crate_name.parse().expect("dep crate"),
-            version: version.parse().expect("dep version"),
-            features_json: FeaturesJson::default(),
-            target: target_of(n).parse().expect("dep target"),
-            rustc_version: if n % 3 < 2 {
-                "1.85.0".parse().expect("dep rustc")
-            } else {
-                "1.86.0".parse().expect("dep rustc")
-            },
-            host_side: n.is_multiple_of(10),
-        }
-    };
+    let target_of = dep_target;
+    let dep = dep_request;
     let (_resync_crate, resync_version) = crate_identity(101);
     let resync = EnqueueRequest {
         crate_name: resync_name.parse().expect("resync crate"),
@@ -737,6 +778,120 @@ fn submit_batch_named(
     human.source = EnqueueSource::HumanRequest;
     human.depends_on = Vec::new();
     vec![resync, fresh, human]
+}
+
+/// The request record the drives admit and settle — a `req-drive`
+/// id `rearm_fixture` deletes between runs, so every probe measures the
+/// fresh-admission path rather than a dedup hit.
+const DRIVE_REQUEST_ID: &str = "req-costgate-drive";
+
+/// The drive's admission — a fresh `req-` record per probe run.
+fn drive_admission() -> stow_types::api::RequestAdmission {
+    stow_types::api::RequestAdmission {
+        request_id: DRIVE_REQUEST_ID.to_owned(),
+        crate_name: "costgate-request".parse().expect("request crate"),
+        version: "1.0.0".parse().expect("request version"),
+        features_json: FeaturesJson::default(),
+        rustc_version: "1.86.0".parse().expect("request rustc"),
+        max_closure: 500,
+    }
+}
+
+/// The `POST /requests` drive: the full pass on wasm (credential arm +
+/// the dispatch hop), the queue-layer calls on host.
+async fn admit_request_drive(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let env = ctx
+            .env
+            .as_ref()
+            .ok_or_else(|| "requests drive needs a Worker env".to_owned())?;
+        super::object::admit_request_pass(env, db, settings, &drive_admission(), 0)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = ctx;
+        queue::admit_request(db, &drive_admission(), 0, settings)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The outcome report the outcome drive applies — a one-dep
+/// `HumanRequest` batch whose root is its own fresh task plus a root
+/// that names an existing completed row (the `was_queued` arm).
+fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport {
+    let crate_name = "costgate-request-root";
+    let version = "1.0.0";
+    let target = stow_types::api::CI_TARGET_TRIPLES[0];
+    let rustc = "1.86.0";
+    let root_task = EnqueueRequest {
+        crate_name: crate_name.parse().expect("request crate"),
+        version: version.parse().expect("request version"),
+        features_json: FeaturesJson::default(),
+        target: target.parse().expect("request target"),
+        rustc_version: rustc.parse().expect("request rustc"),
+        downloads: 1,
+        source: EnqueueSource::HumanRequest,
+        depends_on: vec![dep_request(shape.dep_row(2))],
+        preserve_lockfile: false,
+        host_side: false,
+    };
+    let root_id = queue::task_id(crate_name, version, "[]", target, rustc, false);
+    stow_types::api::RequestOutcomeReport {
+        attempt: 1,
+        outcome: stow_types::api::RequestOutcome::Resolved {
+            tasks: vec![root_task],
+            roots: vec![
+                stow_types::api::RequestRootOutcome {
+                    target: target.parse().expect("root target"),
+                    task_id: Some(root_id),
+                    cached: false,
+                },
+                stow_types::api::RequestRootOutcome {
+                    target: stow_types::api::CI_TARGET_TRIPLES[1]
+                        .parse()
+                        .expect("second target"),
+                    // An existing completed row — the `was_queued` arm.
+                    // Row 3 stays clear of the purge drive's row-0/1
+                    // deletes, which run earlier in this list.
+                    task_id: Some(hex_id(u64::from(shape.completed_row(3)))),
+                    cached: false,
+                },
+            ],
+        },
+    }
+}
+
+/// The fixture-row target the dep identities spread over.
+fn dep_target(n: u32) -> &'static str {
+    stow_types::api::CI_TARGET_TRIPLES[usize::try_from(n).unwrap() % 9]
+}
+
+/// One dependency edge on fixture row `n` — the same identity formulas
+/// the queue seed wrote, so the edge resolves.
+fn dep_request(n: u32) -> EnqueueDependency {
+    let (crate_name, version) = crate_identity(n);
+    EnqueueDependency {
+        crate_name: crate_name.parse().expect("dep crate"),
+        version: version.parse().expect("dep version"),
+        features_json: FeaturesJson::default(),
+        target: dep_target(n).parse().expect("dep target"),
+        rustc_version: if n % 3 < 2 {
+            "1.85.0".parse().expect("dep rustc")
+        } else {
+            "1.86.0".parse().expect("dep rustc")
+        },
+        host_side: n.is_multiple_of(10),
+    }
 }
 
 /// The report's unit shape — every published row serves the target-side

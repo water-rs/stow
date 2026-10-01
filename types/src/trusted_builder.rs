@@ -22,6 +22,11 @@ macro_rules! index_workflow_file {
         "index-publish.yml"
     };
 }
+macro_rules! resolve_workflow_file {
+    () => {
+        "resolve-request.yml"
+    };
+}
 macro_rules! branch {
     () => {
         "main"
@@ -50,6 +55,13 @@ pub const CERTIFICATE_ISSUER: &str = "https://token.actions.githubusercontent.co
 /// Workflow file under `.github/workflows/` that publishes and signs the
 /// artifact indexes.
 pub const INDEX_WORKFLOW_FILE: &str = index_workflow_file!();
+/// Workflow file under `.github/workflows/` that resolves an admitted
+/// human request and submits its outcome (stow#428).
+///
+/// The scheduler dispatches request resolutions to exactly this
+/// workflow on exactly [`BRANCH`] — the same arm [`WORKFLOW_FILE`] has
+/// for build tasks.
+pub const RESOLVE_WORKFLOW_FILE: &str = resolve_workflow_file!();
 /// Subject Alternative Name Fulcio issues to the index-publish workflow.
 ///
 /// The certificate identity under which published artifact indexes are
