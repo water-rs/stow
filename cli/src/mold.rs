@@ -31,7 +31,7 @@
 //! consult it for `ld.mold`, so only `COMPILER_PATH` survives both shapes.
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use sha2::Digest as _;
@@ -76,7 +76,7 @@ pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Res
     if !cfg!(target_os = "linux") || !linux_target(target) {
         return Ok(Vec::new());
     }
-    let link = resolve_link(target, cargo_dir).await;
+    let link = resolve_link(target, cargo_dir, &process_env).await;
     if link.selects_mold && link.unavailable_reason().await.is_none() {
         return Ok(Vec::new());
     }
@@ -150,11 +150,15 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
     let host = detect_rustc_host_target(OsStr::new("rustc"))
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
-    let (config, cfgs) =
-        futures_util::future::join(CargoConfig::load_global(), rustc_target_cfgs(&host)).await;
+    let (config, cfgs) = futures_util::future::join(
+        CargoConfig::load_global(&process_env),
+        rustc_target_cfgs(&host),
+    )
+    .await;
     let tables = config.matching_target_tables(&host, cfgs.as_ref());
-    let rustflags = effective_rustflags(&config, &tables);
-    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(&host, &tables));
+    let rustflags = effective_rustflags(&config, &tables, &process_env);
+    let linker =
+        rustflags_linker(&rustflags).or_else(|| effective_linker(&host, &tables, &process_env));
     let selects_mold = linker
         .as_deref()
         .is_some_and(|linker| linker.contains("mold"))
@@ -163,7 +167,7 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
         linker,
         rustflags,
         selects_mold,
-        compiler_path: effective_compiler_path(&config),
+        compiler_path: effective_compiler_path(&config, &process_env),
     };
     if link.selects_mold && link.unavailable_reason().await.is_none() {
         return Ok(None);
@@ -287,15 +291,26 @@ struct LinkResolution {
     compiler_path: Option<std::ffi::OsString>,
 }
 
+/// The environment a link resolution reads — `std::env::var_os` on a
+/// real build, a fixture's map in tests, so a test never mutates the
+/// process's shared environment.
+type EnvLookup<'a> = &'a (dyn Fn(&str) -> Option<OsString> + Sync);
+
+/// The process's environment — the [`EnvLookup`] real code reads.
+fn process_env(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
+}
+
 /// Resolve `target`'s link configuration: the config chain walk and the
 /// `rustc --print cfg` probe are independent — file I/O and a process
 /// spawn — so they run at the same time instead of one after the other.
-async fn resolve_link(target: &str, cargo_dir: &Path) -> LinkResolution {
+async fn resolve_link(target: &str, cargo_dir: &Path, env: EnvLookup<'_>) -> LinkResolution {
     let (config, cfgs) =
-        futures_util::future::join(CargoConfig::load(cargo_dir), rustc_target_cfgs(target)).await;
+        futures_util::future::join(CargoConfig::load(cargo_dir, env), rustc_target_cfgs(target))
+            .await;
     let tables = config.matching_target_tables(target, cfgs.as_ref());
-    let rustflags = effective_rustflags(&config, &tables);
-    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(target, &tables));
+    let rustflags = effective_rustflags(&config, &tables, env);
+    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(target, &tables, env));
     let selects_mold = linker
         .as_deref()
         .is_some_and(|linker| linker.contains("mold"))
@@ -304,15 +319,15 @@ async fn resolve_link(target: &str, cargo_dir: &Path) -> LinkResolution {
         linker,
         rustflags,
         selects_mold,
-        compiler_path: effective_compiler_path(&config),
+        compiler_path: effective_compiler_path(&config, env),
     }
 }
 
 /// The `COMPILER_PATH` a build at this config would run under, per
 /// cargo's `env` precedence: `force` entries beat the ambient variable,
 /// plain entries lose to it and apply only when it is unset.
-fn effective_compiler_path(config: &CargoConfig) -> Option<std::ffi::OsString> {
-    let ambient = std::env::var_os("COMPILER_PATH");
+fn effective_compiler_path(config: &CargoConfig, env: EnvLookup<'_>) -> Option<OsString> {
+    let ambient = env("COMPILER_PATH");
     match config.env_setting("COMPILER_PATH") {
         Some((value, true)) => Some(value.into()),
         Some((value, false)) => ambient.or_else(|| Some(value.into())),
@@ -402,8 +417,8 @@ fn path_contains(name: &str) -> bool {
 /// effective rustflags. The gate reads the fuller [`resolve_link`] answer
 /// itself; this stays the question the tests ask.
 #[cfg(test)]
-async fn uses_mold(target: &str, cargo_dir: &Path) -> bool {
-    resolve_link(target, cargo_dir).await.selects_mold
+async fn uses_mold(target: &str, cargo_dir: &Path, env: EnvLookup<'_>) -> bool {
+    resolve_link(target, cargo_dir, env).await.selects_mold
 }
 
 /// A rustflag selects mold when a `-C` link option's value names it —
@@ -487,8 +502,9 @@ fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
 fn effective_rustflags(
     config: &CargoConfig,
     tables: &[(String, &toml_edit::Table)],
+    env: EnvLookup<'_>,
 ) -> Vec<String> {
-    if let Some(encoded) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
+    if let Some(encoded) = env("CARGO_ENCODED_RUSTFLAGS") {
         return encoded
             .to_string_lossy()
             .split('\x1f')
@@ -496,7 +512,7 @@ fn effective_rustflags(
             .map(str::to_owned)
             .collect();
     }
-    if let Ok(flags) = std::env::var("RUSTFLAGS") {
+    if let Some(flags) = env("RUSTFLAGS").and_then(|flags| flags.into_string().ok()) {
         return shell_words::split(&flags).unwrap_or_default();
     }
     config.rustflags(tables)
@@ -504,12 +520,16 @@ fn effective_rustflags(
 
 /// The linker cargo selects for `target`: `CARGO_TARGET_<TRIPLE>_LINKER`,
 /// then `target.<triple>.linker`, then a matching `target.<cfg>.linker`.
-fn effective_linker(target: &str, tables: &[(String, &toml_edit::Table)]) -> Option<String> {
+fn effective_linker(
+    target: &str,
+    tables: &[(String, &toml_edit::Table)],
+    env: EnvLookup<'_>,
+) -> Option<String> {
     let env_key = format!(
         "CARGO_TARGET_{}_LINKER",
         target.to_uppercase().replace('-', "_")
     );
-    if let Some(linker) = std::env::var_os(&env_key) {
+    if let Some(linker) = env(&env_key) {
         return Some(linker.to_string_lossy().into_owned());
     }
     let mut cfg_linker = None;
@@ -543,9 +563,9 @@ fn is_executable(path: &Path) -> bool {
 /// ordered lowest → highest precedence: `$CARGO_HOME/config.toml` first,
 /// then every `.cargo/config` and `.cargo/config.toml` from the filesystem
 /// root down to `cargo_dir` (the same walk cargo performs).
-fn cargo_config_paths(cargo_dir: &Path) -> Vec<PathBuf> {
+fn cargo_config_paths(cargo_dir: &Path, env: EnvLookup<'_>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(cargo_home) = crate::config::cargo_home() {
+    if let Some(cargo_home) = crate::config::cargo_home_with(env) {
         paths.push(cargo_home.join("config.toml"));
     }
     let ancestors: Vec<PathBuf> = cargo_dir.ancestors().map(Path::to_path_buf).collect();
@@ -565,8 +585,8 @@ struct CargoConfig {
 impl CargoConfig {
     /// Only the global `$CARGO_HOME/config.toml` — the read a global
     /// `stow setup` makes, where project-level files must not answer.
-    async fn load_global() -> Self {
-        let config = match crate::config::cargo_home() {
+    async fn load_global(env: EnvLookup<'_>) -> Self {
+        let config = match crate::config::cargo_home_with(env) {
             Some(cargo_home) => {
                 let path = cargo_home.join("config.toml");
                 async_fs::read_to_string(&path)
@@ -581,8 +601,8 @@ impl CargoConfig {
         }
     }
 
-    async fn load(cargo_dir: &Path) -> Self {
-        let paths = cargo_config_paths(cargo_dir);
+    async fn load(cargo_dir: &Path, env: EnvLookup<'_>) -> Self {
+        let paths = cargo_config_paths(cargo_dir, env);
         // Most of these paths do not exist, and none of the reads depends on
         // another, so the whole chain is read in one round rather than one
         // `await` per directory up the tree. `join_all` keeps the results in
@@ -989,29 +1009,44 @@ mod tests {
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 
     /// A project directory whose cargo config chain is exactly `config`:
-    /// `CARGO_HOME` points at an empty directory and every env source cargo
-    /// would consult ahead of the config files is cleared, so the walk under
-    /// test is the only thing that can answer.
-    fn isolated_project(config: &str) -> tempfile::TempDir {
+    /// the fixture's own environment answers `CARGO_HOME` with an empty
+    /// directory and nothing else — injected into the walk under test, so
+    /// no test ever touches the process environment its siblings share.
+    struct IsolatedProject {
+        _tempdir: tempfile::TempDir,
+        project: PathBuf,
+        env: std::collections::HashMap<String, OsString>,
+    }
+
+    impl IsolatedProject {
+        /// The injected environment: `CARGO_HOME` alone.
+        fn env(&self) -> impl Fn(&str) -> Option<OsString> + '_ {
+            |key| self.env.get(key).cloned()
+        }
+    }
+
+    fn isolated_project(config: &str) -> IsolatedProject {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let project = tempdir.path().join("project");
         std::fs::create_dir_all(project.join(".cargo")).expect("project .cargo");
         std::fs::write(project.join(".cargo").join("config.toml"), config).expect("write config");
         let cargo_home = tempdir.path().join("cargo-home");
         std::fs::create_dir_all(&cargo_home).expect("cargo home");
-        // Safe here because nextest runs each test in its own process.
-        unsafe {
-            std::env::set_var("CARGO_HOME", &cargo_home);
-            std::env::remove_var("RUSTFLAGS");
-            std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
-            std::env::remove_var("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER");
+        let env = std::collections::HashMap::from([(
+            "CARGO_HOME".to_owned(),
+            cargo_home.into_os_string(),
+        )]);
+        IsolatedProject {
+            _tempdir: tempdir,
+            project,
+            env,
         }
-        tempdir
     }
 
     fn detects_mold(config: &str) -> bool {
-        let tempdir = isolated_project(config);
-        smol::block_on(uses_mold(LINUX_TARGET, &tempdir.path().join("project")))
+        let fixture = isolated_project(config);
+        let env = fixture.env();
+        smol::block_on(uses_mold(LINUX_TARGET, &fixture.project, &env))
     }
 
     fn written_rustflags(config: &str, bin_dir: &str) -> Vec<String> {
@@ -1130,14 +1165,10 @@ mod tests {
     }
 
     /// The rustflags a config produces for `target`, resolved the way the
-    /// model resolves them — the piece under test is `CargoConfig::
-    /// rustflags`, so env sources must not answer.
+    /// model resolves them — the pieces under test are `CargoConfig::
+    /// matching_target_tables` and `CargoConfig::rustflags`, which answer
+    /// from the parsed documents alone and never consult an environment.
     fn config_rustflags(config: &str, target: &str, cfgs: Option<&HashSet<String>>) -> Vec<String> {
-        // Safe here because nextest runs each test in its own process.
-        unsafe {
-            std::env::remove_var("RUSTFLAGS");
-            std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
-        }
         let chain = CargoConfig {
             files: vec![
                 config
@@ -1217,10 +1248,11 @@ mod tests {
     /// not leak into `prepare_global`'s read.
     #[test]
     fn global_load_ignores_project_config_files() {
-        let _tempdir = isolated_project(
+        let fixture = isolated_project(
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
         );
-        let global = smol::block_on(CargoConfig::load_global());
+        let env = fixture.env();
+        let global = smol::block_on(CargoConfig::load_global(&env));
         let cfgs: HashSet<String> = std::iter::once("target_os=\"linux\"".to_owned()).collect();
         assert!(
             global
@@ -1236,9 +1268,10 @@ mod tests {
 
     #[test]
     fn env_settings_resolve_both_shapes_and_force() {
-        let tempdir =
+        let fixture =
             isolated_project("[env.A]\nvalue = \"table\"\nforce = true\n\n[env]\nB = \"string\"\n");
-        let config = smol::block_on(CargoConfig::load(&tempdir.path().join("project")));
+        let env = fixture.env();
+        let config = smol::block_on(CargoConfig::load(&fixture.project, &env));
         assert_eq!(config.env_setting("A"), Some(("table".to_owned(), true)));
         assert_eq!(config.env_setting("B"), Some(("string".to_owned(), false)));
         assert_eq!(config.env_setting("MISSING"), None);
