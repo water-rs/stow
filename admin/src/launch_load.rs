@@ -686,16 +686,13 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
         let fired = Instant::now();
         // A response the edge never sends cannot stall the run: the
         // deadline check happens between fires, so bound each one.
-        let outcome = smol::future::or(
-            fire_once(&lane.fire, edge, &mut client, counter),
-            async {
-                smol::Timer::after(REQUEST_TIMEOUT).await;
-                Ok(Outcome::Transport(format!(
-                    "lane request exceeded {}s",
-                    REQUEST_TIMEOUT.as_secs()
-                )))
-            },
-        )
+        let outcome = smol::future::or(fire_once(&lane.fire, edge, &mut client, counter), async {
+            smol::Timer::after(REQUEST_TIMEOUT).await;
+            Ok(Outcome::Transport(format!(
+                "lane request exceeded {}s",
+                REQUEST_TIMEOUT.as_secs()
+            )))
+        })
         .await;
         match outcome {
             Ok(Outcome::Response { status, overloaded }) => {
