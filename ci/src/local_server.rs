@@ -301,8 +301,14 @@ async fn run_dispatched_task(
     // afford. The run still completes through the same signed
     // `workflow_run` webhook, so `complete_run` lands and `GET /tasks`
     // reports a finished run — the dispatch shape is unchanged, only the
-    // post-dispatch build work is stubbed.
+    // post-dispatch build work is stubbed. The webhook verifies the
+    // task's records artifact before applying a success, so the stub
+    // pushes the empty set first — the same object production writes
+    // for an artifact-less task — or the edge would record the run as a
+    // failure it never was.
     if std::env::var_os("STOW_LOCAL_CI_STUB").is_some() {
+        let layout = DispatchLayout::create(&task.task_id)?;
+        push_records(&state, &task, &layout.records_path, &std::env::current_exe()?).await?;
         state.mark_run(&task, "completed", Some("success"));
         return post_workflow_run(&state, &task, "success", None).await;
     }
