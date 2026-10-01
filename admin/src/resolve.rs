@@ -29,9 +29,12 @@ use stow_types::identity::{TargetTriple, WireRustcVersion};
 pub const RESOLVE_CONCURRENCY: usize = 4;
 
 /// The resolver one lane run holds: a session-owned `CARGO_HOME` in a
-/// temp dir shared by every worker's resolves.
+/// temp dir shared by every worker's resolves, plus the runtime handle
+/// workers drive the fetch half of a crates.io resolve through — a
+/// pool thread carries no executor context of its own.
 pub struct ResolvePool {
     resolver: Arc<stow_resolver::Resolver>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl ResolvePool {
@@ -47,7 +50,14 @@ impl ResolvePool {
             .wrap_err(format!("resolver session for rustc {rustc_version}"))?;
         Ok(Self {
             resolver: Arc::new(resolver),
+            runtime: tokio::runtime::Handle::current(),
         })
+    }
+
+    /// The runtime handle workers hand to [`resolve_crate`]'s fetch
+    /// half — pool threads have no executor context of their own.
+    pub(crate) const fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.runtime
     }
 
     /// The session's `Resolver`, for lanes that resolve on the calling
@@ -72,7 +82,9 @@ impl ResolvePool {
     where
         T: Send + Sync,
         R: Send,
-        F: Fn(&stow_resolver::Resolver, &T) -> Result<R, String> + Send + Sync,
+        F: Fn(&stow_resolver::Resolver, &tokio::runtime::Handle, &T) -> Result<R, String>
+            + Send
+            + Sync,
         G: FnMut(usize, &T, Result<R, String>),
     {
         if items.is_empty() {
@@ -87,6 +99,7 @@ impl ResolvePool {
                 let tx = tx.clone();
                 let next = &next;
                 let resolver = self.resolver.clone();
+                let runtime = &self.runtime;
                 scope.spawn(move || {
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
@@ -95,7 +108,7 @@ impl ResolvePool {
                         }
                         // A panic is a bug, not an item failure:
                         // `thread::scope` re-raises it at the join.
-                        let result = work(&resolver, &items[index]);
+                        let result = work(&resolver, runtime, &items[index]);
                         if tx.send((index, result)).is_err() {
                             break;
                         }
@@ -124,9 +137,11 @@ pub fn target_strings(targets: &[TargetTriple]) -> Vec<String> {
 /// flags — the edge's `resolve_crate` contract. The tarball's bundled
 /// `Cargo.lock` is dropped like every other lane's — the resolve lands
 /// on the latest semver-compatible versions.
-/// Sync: callers run it on a pool worker or inside `smol::unblock`.
+/// Sync: callers run it on a pool worker, which carries no executor
+/// context — `runtime` drives the tarball fetch half.
 pub fn resolve_crate(
     resolver: &stow_resolver::Resolver,
+    runtime: &tokio::runtime::Handle,
     crate_name: &str,
     version: &semver::Version,
     targets: &[TargetTriple],
@@ -137,12 +152,13 @@ pub fn resolve_crate(
     let rustc_version = rustc_version.clone();
     let crate_name = crate_name.to_owned();
     let version = version.clone();
-    smol::block_on(resolver.resolve_crate(
-        &crate_name,
-        &version,
-        &targets,
-        &rustc_version,
-        downloads,
-    ))
-    .map_err(|error| format!("resolve {crate_name} {version}: {error:#}"))
+    runtime
+        .block_on(resolver.resolve_crate(
+            &crate_name,
+            &version,
+            &targets,
+            &rustc_version,
+            downloads,
+        ))
+        .map_err(|error| format!("resolve {crate_name} {version}: {error:#}"))
 }

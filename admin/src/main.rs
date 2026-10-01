@@ -192,80 +192,42 @@ fn main() -> stow_types::error::Result<()> {
         stow_resolver::shim::run();
     }
     install_tracing();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| stow_error!("install ring CryptoProvider"))?;
     let cli = Cli::parse();
     let output = if cli.json {
         Output::Json
     } else {
         Output::Table
     };
-    match cli.command {
-        Command::Status => with_edge(|edge| async move { status(&edge, output).await }),
-        Command::Queue(args) => {
-            with_edge(|edge| async move { queue::run(&edge, args, output).await })
-        }
-        Command::Scheduler(args) => {
-            with_edge(|edge| async move { scheduler::run(&edge, args, output).await })
-        }
-        Command::Coverage(args) => {
-            with_edge(|edge| async move { coverage::run(&edge, args, output).await })
-        }
-        // `preheat` picks its own executor like `index` does: the
-        // projects lane needs GitHub for `generate` and the edge for
-        // `submit`; the other lanes run against the edge.
-        Command::Preheat(args) => preheat::run(args, output),
-        Command::Runs(args) => {
-            with_github(|token| async move { runs::run(&token, args, output).await })
-        }
-        Command::Artifacts(args) => {
-            with_edge(|edge| async move { artifacts::run(&edge, args, output).await })
-        }
-        Command::Cache(args) => {
-            with_github(|token| async move { cache::run(&token, args, output).await })
-        }
-        Command::Maintenance(args) => smol::block_on(maintenance::run(args, output)),
-        Command::Watchdog(args) => {
-            with_edge(|edge| async move { watchdog::run(&edge, args, output).await })
-        }
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| stow_error!("build tokio runtime: {error}"))?;
+    runtime.block_on(dispatch(cli.command, output))
+}
+
+async fn dispatch(command: Command, output: Output) -> stow_types::error::Result<()> {
+    match command {
+        Command::Status => status(&Edge::connect().await?, output).await,
+        Command::Queue(args) => queue::run(&Edge::connect().await?, args, output).await,
+        Command::Scheduler(args) => scheduler::run(&Edge::connect().await?, args, output).await,
+        Command::Coverage(args) => coverage::run(&Edge::connect().await?, args, output).await,
+        Command::Preheat(args) => preheat::run(args, output).await,
+        Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
+        Command::Artifacts(args) => artifacts::run(&Edge::connect().await?, args, output).await,
+        Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
+        Command::Maintenance(args) => maintenance::run(args, output).await,
+        Command::Watchdog(args) => watchdog::run(&Edge::connect().await?, args, output).await,
         Command::DispatchFreeze(args) => {
-            with_edge(|edge| async move { dispatch_freeze_switch(&edge, args, output).await })
+            dispatch_freeze_switch(&Edge::connect().await?, args, output).await
         }
-        // The index commands pick their own executor: `publish` drives
-        // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
-        // the rest run on smol like every other command.
-        Command::Index(args) => index_cmd::run(args),
-        Command::LaunchModel(args) => smol::block_on(launch_model::run(args, output)),
-        Command::LaunchGate(args) => launch_gate::run(&args, output),
-        Command::LaunchLoad(args) => {
-            with_edge(|edge| async move { launch_load::run(&edge, &args, output).await })
-        }
-        Command::Submit(args) => {
-            with_edge(|edge| async move { submit_command(&edge, args, output).await })
-        }
-        // The verdict reads Cloudflare's GraphQL API, not the edge and not
-        // GitHub — its credential is CLOUDFLARE_API_TOKEN, so it runs its
-        // own executor like `preheat` and `index` do.
-        Command::Deploy(args) => smol::block_on(deploy::run(args, output)),
+        Command::Index(args) => index_cmd::run(args).await,
+        Command::LaunchModel(args) => launch_model::run(args, output).await,
+        Command::LaunchGate(args) => launch_gate::run(&args, output).await,
+        Command::LaunchLoad(args) => launch_load::run(&Edge::connect().await?, &args, output).await,
+        Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
+        Command::Deploy(args) => deploy::run(args, output).await,
     }
-}
-
-/// Run one edge-backed command on the smol executor: connect, then hand
-/// the connection to the command.
-fn with_edge<F, Fut>(command: F) -> stow_types::error::Result<()>
-where
-    F: FnOnce(Edge) -> Fut,
-    Fut: std::future::Future<Output = stow_types::error::Result<()>>,
-{
-    smol::block_on(async move { command(Edge::connect().await?).await })
-}
-
-/// Run one GitHub-backed command on the smol executor with the operator
-/// token.
-fn with_github<F, Fut>(command: F) -> stow_types::error::Result<()>
-where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = stow_types::error::Result<()>>,
-{
-    smol::block_on(async move { command(github_token().await?).await })
 }
 
 /// Authenticated access to the edge's `/api/v1/admin/*` and
@@ -755,7 +717,7 @@ pub(crate) async fn github_token() -> stow_types::error::Result<String> {
             return Ok(token);
         }
     }
-    let output = smol::process::Command::new("gh")
+    let output = tokio::process::Command::new("gh")
         .args(["auth", "token"])
         .output()
         .await

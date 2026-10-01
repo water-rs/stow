@@ -85,7 +85,7 @@ impl CratesIo {
         if let Some(previous) = self.last_request {
             let wait = MIN_INTERVAL.saturating_sub(previous.elapsed());
             if !wait.is_zero() {
-                smol::Timer::after(wait).await;
+                tokio::time::sleep(wait).await;
             }
         }
         self.last_request = Some(Instant::now());
@@ -110,7 +110,7 @@ impl CratesIo {
                         return Err(error);
                     };
                     tracing::warn!(url, %error, "crates.io request failed; retrying");
-                    smol::Timer::after(wait).await;
+                    tokio::time::sleep(wait).await;
                 }
                 FetchOutcome::Fatal(error) => return Err(error),
             }

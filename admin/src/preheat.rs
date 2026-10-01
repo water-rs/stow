@@ -171,24 +171,16 @@ pub struct PlanArgs {
     rustc_version: Option<String>,
 }
 
-/// Command entry point — sync like `index::run` because the executor is
-/// per-lane: `projects generate` runs against GitHub only, and every
-/// lane that posts to the scheduler connects the edge itself.
-pub fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result<()> {
-    // The manual driver owns a Tokio runtime — dispatch it before the
-    // smol executor spins up.
-    if let PreheatCommand::Manual(manual) = args.command {
-        return crate::manual::run(manual, output);
-    }
-    smol::block_on(async move {
-        match args.command {
-            PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
-            command => {
-                let edge = crate::Edge::connect().await?;
-                run_on_edge(&edge, command, output).await
-            }
+/// Command entry point.
+pub async fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result<()> {
+    match args.command {
+        PreheatCommand::Manual(manual) => crate::manual::run(manual, output).await,
+        PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
+        command => {
+            let edge = crate::Edge::connect().await?;
+            run_on_edge(&edge, command, output).await
         }
-    })
+    }
 }
 
 async fn run_on_edge(
@@ -341,23 +333,30 @@ async fn top(
     // Every job resolves in-process on the pool's workers; results
     // drain back in submission order so the batch reads exactly like
     // today's sequential loop.
-    let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
-    let mut slots: Vec<Option<Result<stow_resolver::SourceResolve, String>>> =
-        jobs.iter().map(|_| None).collect();
-    pool.run(
-        &jobs,
-        |resolver, job| {
-            crate::resolve::resolve_crate(
-                resolver,
-                &job.name,
-                &job.version,
-                &targets,
-                &rustc_version,
-                job.downloads,
-            )
-        },
-        |index, _job, result| slots[index] = Some(result),
-    );
+    let targets_for_pool = targets.clone();
+    let (jobs, slots) = tokio::task::spawn_blocking(move || {
+        let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
+        let mut slots: Vec<Option<Result<stow_resolver::SourceResolve, String>>> =
+            jobs.iter().map(|_| None).collect();
+        pool.run(
+            &jobs,
+            |resolver, runtime, job| {
+                crate::resolve::resolve_crate(
+                    resolver,
+                    runtime,
+                    &job.name,
+                    &job.version,
+                    &targets_for_pool,
+                    &rustc_version,
+                    job.downloads,
+                )
+            },
+            |index, _job, result| slots[index] = Some(result),
+        );
+        Ok::<_, stow_types::error::Error>((jobs, slots))
+    })
+    .await
+    .expect("resolve pool panicked")?;
     let mut requests = Vec::new();
     for (job, slot) in jobs.iter().zip(slots) {
         let resolved = slot
@@ -440,15 +439,26 @@ async fn binary(
         None => crate::rust_channel::stable_rustc_version().await?,
     };
 
-    let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
-    let resolved = resolve_binary_crate(
-        pool.resolver(),
-        crate_name.as_str(),
-        release.version.as_semver(),
-        release.downloads,
-        &targets,
-        &rustc_version,
-    );
+    let version = release.version.as_semver().clone();
+    let resolved = tokio::task::spawn_blocking({
+        let crate_name = crate_name.clone();
+        let targets = targets.clone();
+        let rustc_version = rustc_version.clone();
+        move || {
+            let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
+            Ok::<_, stow_types::error::Error>(resolve_binary_crate(
+                pool.resolver(),
+                pool.runtime(),
+                crate_name.as_str(),
+                &version,
+                release.downloads,
+                &targets,
+                &rustc_version,
+            ))
+        }
+    })
+    .await
+    .expect("resolve pool panicked")?;
     let requests = match resolved.map_err(|error| stow_error!("{error}"))? {
         BinaryResolve::Tasks { tasks } => {
             tracing::info!(
@@ -512,6 +522,7 @@ enum BinaryResolve {
 /// binary's.
 fn resolve_binary_crate(
     resolver: &stow_resolver::Resolver,
+    runtime: &tokio::runtime::Handle,
     crate_name: &str,
     version: &semver::Version,
     downloads: u64,
@@ -520,6 +531,7 @@ fn resolve_binary_crate(
 ) -> Result<BinaryResolve, String> {
     let source = crate::resolve::resolve_crate(
         resolver,
+        runtime,
         crate_name,
         version,
         targets,
@@ -600,7 +612,13 @@ async fn top_binaries(
         ));
     }
 
-    let plan = resolve_binaries(&candidates, &targets, &rustc_version)?;
+    let plan = tokio::task::spawn_blocking({
+        let targets = targets.clone();
+        let rustc_version = rustc_version.clone();
+        move || resolve_binaries(&candidates, &targets, &rustc_version)
+    })
+    .await
+    .expect("resolve pool panicked")?;
     tracing::info!(
         binaries = plan.per_binary.len(),
         tasks = plan.tasks.len(),
@@ -682,9 +700,10 @@ fn resolve_binaries(
     let mut slots: Vec<Option<Result<BinaryResolve, String>>> = jobs.iter().map(|_| None).collect();
     pool.run(
         &jobs,
-        |resolver, job| {
+        |resolver, runtime, job| {
             resolve_binary_crate(
                 resolver,
+                runtime,
                 &job.name,
                 &job.version,
                 job.downloads,
@@ -960,21 +979,31 @@ async fn plan(
         None => CI_TARGET_TRIPLES.iter().map(|t| (*t).to_owned()).collect(),
     };
     let seed = features_json.features().to_vec();
-    let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
-    let resolver = pool.shared();
     let version = release.version.as_semver().clone();
     let crate_name_string = crate_name.to_string();
-    let outputs = smol::block_on(resolver.resolve_crate_units(
-        &crate_name_string,
-        &version,
-        &stow_resolver::ResolveOptions {
-            features: seed.clone(),
-            no_default_features: !seed.iter().any(|feature| feature == "default"),
-            ..stow_resolver::ResolveOptions::default()
-        },
-        &targets,
-    ))
-    .map_err(|error| stow_error!("resolve {crate_name} {version}: {error:#}"))?;
+    let outputs = tokio::task::spawn_blocking({
+        let rustc_version = rustc_version.clone();
+        let version = version.clone();
+        move || {
+            let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
+            let resolver = pool.shared();
+            let no_default_features = !seed.iter().any(|feature| feature == "default");
+            pool.runtime()
+                .block_on(resolver.resolve_crate_units(
+                    &crate_name_string,
+                    &version,
+                    &stow_resolver::ResolveOptions {
+                        features: seed,
+                        no_default_features,
+                        ..stow_resolver::ResolveOptions::default()
+                    },
+                    &targets,
+                ))
+                .map_err(|error| stow_error!("resolve {crate_name_string} {version}: {error:#}"))
+        }
+    })
+    .await
+    .expect("resolve pool panicked")?;
 
     let mut parts = Vec::with_capacity(outputs.len());
     let mut all_nodes = std::collections::BTreeSet::new();

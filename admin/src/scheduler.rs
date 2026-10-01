@@ -117,9 +117,7 @@ async fn budget(
                 Err(error) if attempts < 3 => {
                     attempts += 1;
                     eprintln!("[budget] seed call failed, retrying: {error}");
-                    // The CLI executor is smol, not tokio — a tokio
-                    // timer has no reactor to arm on here.
-                    smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
                 }
                 Err(error) => return Err(error),

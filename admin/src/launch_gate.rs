@@ -804,12 +804,14 @@ fn render_evaluation(evaluation: &GateEvaluation) -> String {
 }
 
 /// `stow-admin launch-gate` — evaluate and exit nonzero on a breach.
-pub fn run(args: &LaunchGateArgs, output: Output) -> stow_types::error::Result<()> {
-    let report_text = std::fs::read_to_string(&args.report)
+pub async fn run(args: &LaunchGateArgs, output: Output) -> stow_types::error::Result<()> {
+    let report_text = tokio::fs::read_to_string(&args.report)
+        .await
         .map_err(|error| stow_error!("read budget report {}: {error}", args.report.display()))?;
     let report: SchedulerBudgetReport = serde_json::from_str(&report_text)
         .map_err(|error| stow_error!("parse budget report {}: {error}", args.report.display()))?;
-    let model_text = std::fs::read_to_string(&args.model)
+    let model_text = tokio::fs::read_to_string(&args.model)
+        .await
         .map_err(|error| stow_error!("read launch model {}: {error}", args.model.display()))?;
     let model = LaunchModel::from_toml(&model_text)
         .map_err(|error| stow_error!("load launch model {}: {error}", args.model.display()))?;

@@ -8758,7 +8758,6 @@ dependencies = [
  "serde_html_form",
  "serde_json",
  "sha2 0.11.0",
- "smol",
  "stow-oci",
  "stow-resolver",
  "stow-types",
