@@ -21,7 +21,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
@@ -280,7 +279,9 @@ pub async fn run(args: ProjectsArgs, output: Output) -> stow_types::error::Resul
         }
         ProjectsCommand::Submit(args) => {
             let edge = crate::Edge::connect().await?;
-            submit(&edge, &args, output)
+            tokio::task::spawn_blocking(move || submit(&edge, &args, output))
+                .await
+                .expect("projects submit panicked")
         }
     }
 }
@@ -306,8 +307,8 @@ async fn generate(
     // run and starts empty, while one that fails to parse is an error,
     // not an empty list. `submit` reads it through the same loader, so
     // the two agree on what a repository URL is.
-    let existing = if args.output.exists() {
-        load_projects_file(&args.output)?
+    let existing = if tokio::fs::try_exists(&args.output).await.unwrap_or(false) {
+        load_projects_file(&args.output).await?
     } else {
         Vec::new()
     };
@@ -321,10 +322,12 @@ async fn generate(
     if let Some(parent) = args.output.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .map_err(|error| stow_error!("create {}: {error}", parent.display()))?;
     }
-    fs::write(&args.output, render_projects_file(&merged))
+    tokio::fs::write(&args.output, render_projects_file(&merged))
+        .await
         .map_err(|error| stow_error!("write {}: {error}", args.output.display()))?;
     let report = GenerateReport {
         file: args.output.display().to_string(),
@@ -385,7 +388,7 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
                 .map_err(|error| stow_error!("--targets `{raw}`: {error}"))
         })
         .collect::<stow_types::error::Result<_>>()?;
-    let repos = load_projects_file(&args.file)?;
+    let repos = tokio::runtime::Handle::current().block_on(load_projects_file(&args.file))?;
     let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let mut plan = ProjectsPlan {
         file: args.file.display().to_string(),
@@ -402,18 +405,15 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
     };
     // Results stream out of the pool in completion order: a repo's
     // batch submits the moment its resolve returns — the crash-safety
-    // property the sequential loop had. The submit is async; the
-    // resolve side is threaded, so the drain drives it with a nested
-    // `block_on` on this thread (the executor has nothing else in
-    // flight while the lane drains).
+    // property the sequential loop had.
     pool.run(
         &repos,
-        |resolver, repo| resolve_repository(resolver, repo, &targets, &rustc_version),
+        |resolver, _runtime, repo| resolve_repository(resolver, repo, &targets, &rustc_version),
         |_index, repo, result| match result {
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
                 if args.yes && !tasks.is_empty() {
-                    match smol::block_on(submit_chunked(edge, &tasks)) {
+                    match tokio::runtime::Handle::current().block_on(submit_chunked(edge, &tasks)) {
                         Ok(chunk_outcome) => {
                             outcome.batches += chunk_outcome.batches;
                             outcome.submitted += chunk_outcome.submitted;
@@ -806,8 +806,10 @@ fn render_projects_file(repos: &[String]) -> String {
 }
 
 /// Read and validate `preheat/projects.toml` into its repository URLs.
-pub fn load_projects_file(path: &Path) -> stow_types::error::Result<Vec<String>> {
-    let raw = fs::read(path).map_err(|error| stow_error!("read {}: {error}", path.display()))?;
+pub async fn load_projects_file(path: &Path) -> stow_types::error::Result<Vec<String>> {
+    let raw = tokio::fs::read(path)
+        .await
+        .map_err(|error| stow_error!("read {}: {error}", path.display()))?;
     let file: ProjectsFile =
         toml::from_slice(&raw).map_err(|error| stow_error!("parse {}: {error}", path.display()))?;
     if file.project.is_empty() {

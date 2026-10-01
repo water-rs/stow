@@ -239,7 +239,8 @@ async fn export(
 ) -> stow_types::error::Result<()> {
     let snapshot = match from_snapshot {
         Some(path) => {
-            let text = std::fs::read_to_string(&path)
+            let text = tokio::fs::read_to_string(&path)
+                .await
                 .map_err(|error| stow_error!("read snapshot {}: {error}", path.display()))?;
             serde_json::from_str::<WindowSnapshot>(&text)
                 .map_err(|error| stow_error!("parse snapshot {}: {error}", path.display()))?
@@ -248,12 +249,14 @@ async fn export(
     };
     let model = derive_model(&snapshot)?;
     let document = render_toml(&model)?;
-    std::fs::write(&out, &document)
+    tokio::fs::write(&out, &document)
+        .await
         .map_err(|error| stow_error!("write {}: {error}", out.display()))?;
     if let Some(path) = write_snapshot {
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|error| stow_error!("serialize snapshot: {error}"))?;
-        std::fs::write(&path, format!("{json}\n"))
+        tokio::fs::write(&path, format!("{json}\n"))
+            .await
             .map_err(|error| stow_error!("write {}: {error}", path.display()))?;
     }
     render::emit(output, &model, render_model)

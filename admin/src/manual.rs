@@ -176,20 +176,8 @@ impl RunState {
     }
 }
 
-/// Entry point — registry sessions need a Tokio reactor, so the driver
-/// runs on its own current-thread runtime like `index` does.
-pub fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| stow_error!("install ring CryptoProvider"))?;
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| stow_error!("build tokio runtime: {error}"))?
-        .block_on(run_inner(args))
-}
-
-async fn run_inner(args: ManualArgs) -> stow_types::error::Result<()> {
+/// Entry point — `stow-admin preheat manual`.
+pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result<()> {
     if args.in_flight == 0 {
         return Err(stow_error!("--in-flight must be at least 1"));
     }
@@ -438,28 +426,38 @@ async fn resolve_sources(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<Vec<EnqueueRequest>> {
-    let pool = crate::resolve::ResolvePool::new(rustc_version)?;
-    let mut requests = Vec::new();
+    // Version lookup runs sequentially (crates.io's pace gate); the
+    // resolves then fan out on the pool.
+    let mut jobs: Vec<(String, semver::Version)> = Vec::new();
     let mut failures = Vec::new();
     if let Some(path) = &args.crates {
-        let entries = load_crate_list(path)?;
-        // Version lookup runs sequentially (crates.io's pace gate); the
-        // resolves then fan out on the pool.
-        let mut jobs: Vec<(String, semver::Version)> = Vec::with_capacity(entries.len());
-        for (name, pinned) in entries {
-            let release = match resolve_named_release(name.as_str(), pinned).await {
-                Ok(release) => release,
-                Err(error) => {
-                    failures.push(format!("{name}: {error}"));
-                    continue;
-                }
-            };
-            jobs.push((name.as_str().to_owned(), release));
+        for (name, pinned) in load_crate_list(path).await? {
+            match resolve_named_release(name.as_str(), pinned).await {
+                Ok(release) => jobs.push((name.as_str().to_owned(), release)),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
         }
-        pool.run(
-            &jobs,
-            |resolver, (name, version)| {
-                crate::resolve::resolve_crate(resolver, name, version, targets, rustc_version, 0)
+    }
+    let targets = targets.to_vec();
+    let rustc_version = rustc_version.clone();
+    let projects = args.projects.clone();
+    let dirs = args.dirs.clone();
+    let (requests, failures) = tokio::task::spawn_blocking(move || {
+        let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
+        let mut requests = Vec::new();
+        if !jobs.is_empty() {
+            pool.run(
+                &jobs,
+                |resolver, runtime, (name, version)| {
+                    crate::resolve::resolve_crate(
+                        resolver,
+                        runtime,
+                        name,
+                        version,
+                        &targets,
+                        &rustc_version,
+                        0,
+                    )
                     .map(|source| {
                         source
                             .targets
@@ -467,38 +465,43 @@ async fn resolve_sources(
                             .flat_map(|(_target, tasks)| tasks)
                             .collect::<Vec<EnqueueRequest>>()
                     })
-            },
-            |_, (name, version), result| match result {
-                Ok(tasks) => requests.extend(tasks),
-                Err(error) => failures.push(format!("{name}@{version}: {error}")),
-            },
-        );
-    }
-    if let Some(path) = &args.projects {
-        let repos = crate::projects::load_projects_file(path)?;
-        pool.run(
-            &repos,
-            |resolver, repo| {
-                crate::projects::resolve_repository(resolver, repo, targets, rustc_version)
-            },
-            |_, repo, result| match result {
-                Ok(tasks) => requests.extend(tasks),
-                Err(error) => failures.push(format!("{repo}: {error}")),
-            },
-        );
-    }
-    if let Some(dirs) = &args.dirs {
-        pool.run(
-            dirs,
-            |resolver, dir| {
-                crate::projects::resolve_project_dir(resolver, dir, targets, rustc_version)
-            },
-            |_, dir, result| match result {
-                Ok(tasks) => requests.extend(tasks),
-                Err(error) => failures.push(format!("{}: {error}", dir.display())),
-            },
-        );
-    }
+                },
+                |_, (name, version), result| match result {
+                    Ok(tasks) => requests.extend(tasks),
+                    Err(error) => failures.push(format!("{name}@{version}: {error}")),
+                },
+            );
+        }
+        if let Some(path) = &projects {
+            let repos = tokio::runtime::Handle::current()
+                .block_on(crate::projects::load_projects_file(path))?;
+            pool.run(
+                &repos,
+                |resolver, _runtime, repo| {
+                    crate::projects::resolve_repository(resolver, repo, &targets, &rustc_version)
+                },
+                |_, repo, result| match result {
+                    Ok(tasks) => requests.extend(tasks),
+                    Err(error) => failures.push(format!("{repo}: {error}")),
+                },
+            );
+        }
+        if let Some(dirs) = &dirs {
+            pool.run(
+                dirs,
+                |resolver, _runtime, dir| {
+                    crate::projects::resolve_project_dir(resolver, dir, &targets, &rustc_version)
+                },
+                |_, dir, result| match result {
+                    Ok(tasks) => requests.extend(tasks),
+                    Err(error) => failures.push(format!("{}: {error}", dir.display())),
+                },
+            );
+        }
+        Ok::<_, stow_types::error::Error>((requests, failures))
+    })
+    .await
+    .expect("resolve pool panicked")?;
     if !failures.is_empty() {
         return Err(stow_error!(
             "resolve failed for {} source(s):\n{}",
@@ -534,11 +537,12 @@ async fn resolve_named_release(
 
 /// Parse a crate list file: `name` or `name@version` per line, `#`
 /// comments and blanks ignored.
-fn load_crate_list(
+async fn load_crate_list(
     path: &Path,
 ) -> stow_types::error::Result<Vec<(CrateName, Option<CrateVersion>)>> {
-    let raw =
-        std::fs::read(path).map_err(|error| stow_error!("read {}: {error}", path.display()))?;
+    let raw = tokio::fs::read(path)
+        .await
+        .map_err(|error| stow_error!("read {}: {error}", path.display()))?;
     let text = String::from_utf8(raw)
         .map_err(|error| stow_error!("{} is not UTF-8: {error}", path.display()))?;
     let mut entries = Vec::new();
@@ -1022,7 +1026,7 @@ async fn local_index_publish(rustc_version: &WireRustcVersion) -> stow_types::er
         return Err(stow_error!("stow-admin index export exited {status}"));
     }
     let slices: Vec<SliceFile> = serde_json::from_slice(
-        &smol::fs::read(out_dir.join("slices.json"))
+        &tokio::fs::read(out_dir.join("slices.json"))
             .await
             .map_err(|error| stow_error!("read slices.json: {error}"))?,
     )

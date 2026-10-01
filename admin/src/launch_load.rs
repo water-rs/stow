@@ -686,14 +686,17 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
         let fired = Instant::now();
         // A response the edge never sends cannot stall the run: the
         // deadline check happens between fires, so bound each one.
-        let outcome = smol::future::or(fire_once(&lane.fire, edge, &mut client, counter), async {
-            smol::Timer::after(REQUEST_TIMEOUT).await;
+        let outcome = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            fire_once(&lane.fire, edge, &mut client, counter),
+        )
+        .await
+        .unwrap_or_else(|_| {
             Ok(Outcome::Transport(format!(
                 "lane request exceeded {}s",
                 REQUEST_TIMEOUT.as_secs()
             )))
-        })
-        .await;
+        });
         match outcome {
             Ok(Outcome::Response { status, overloaded }) => {
                 *stats.statuses.entry(status).or_default() += 1;
@@ -727,7 +730,7 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
         }
         let wait = interval.saturating_sub(elapsed);
         if !wait.is_zero() {
-            smol::Timer::after(wait).await;
+            tokio::time::sleep(wait).await;
         }
         if Instant::now() >= deadline {
             break;
@@ -890,7 +893,8 @@ pub async fn run(
     args: &LaunchLoadArgs,
     output: Output,
 ) -> stow_types::error::Result<()> {
-    let model_text = std::fs::read_to_string(&args.model)
+    let model_text = tokio::fs::read_to_string(&args.model)
+        .await
         .map_err(|error| stow_error!("read launch model {}: {error}", args.model.display()))?;
     let model = LaunchModel::from_toml(&model_text)
         .map_err(|error| stow_error!("load launch model {}: {error}", args.model.display()))?;

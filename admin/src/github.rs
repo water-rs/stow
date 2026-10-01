@@ -88,7 +88,7 @@ async fn send_get(
             return Err(error);
         };
         tracing::warn!(url, %error, "GitHub request failed; retrying");
-        smol::Timer::after(wait).await;
+        tokio::time::sleep(wait).await;
     }
 }
 
