@@ -289,6 +289,16 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &["idx_queue_shape_requeue"],
         ddl_permitted: false,
     },
+    RouteBudget {
+        // The pass's fixed floor under paused dispatch: recovery probes
+        // and the re-arm only — no claim work.
+        name: "alarm pass (idle)",
+        statements: 12,
+        rows_read: 80,
+        rows_written: 4,
+        scan_allowlist: &["idx_queue_shape_requeue"],
+        ddl_permitted: false,
+    },
 ];
 
 /// One measured route run.

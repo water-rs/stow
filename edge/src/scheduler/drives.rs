@@ -471,6 +471,28 @@ pub const DRIVES: &[Drive] = &[
             })
         },
     },
+    Drive {
+        // The same pass with dispatch paused: the claim returns early,
+        // so this measures the per-invocation floor — stale-recovery
+        // probes and the wake-time re-arm — every alarm wake pays
+        // regardless of what it claims. The launch gate (stow#452)
+        // prices an invocation from this row and the claims inside a
+        // pass as the marginal cost between it and the hot pass above.
+        name: "alarm pass (idle)",
+        run: |db, _shape, settings| {
+            let mut paused = *settings;
+            paused.dispatch = queue::Dispatch::Paused;
+            Box::pin(async move {
+                queue::claim_dispatchable_tasks(db, &paused, &NoCoverage)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                queue::next_alarm(db, 0, &paused)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+        },
+    },
 ];
 
 /// Slice rows a delta report moves — retired from the live set plus the

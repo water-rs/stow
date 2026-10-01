@@ -247,6 +247,14 @@ jobs:
         env:
           STOW_BUDGET_WORK_DIR: ${{ runner.temp }}/stow-budget
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # stow#452's launch-cost gate: the production-shape report the
+      # harness just measured is the per-event cost vector, and the
+      # checked-in `launch-model.toml` supplies the event counts. The
+      # step fails the job when a projected monthly usage crosses half
+      # the product's included allowance, and prints the per-route
+      # projection table either way.
+      - name: Launch-cost gate
+        run: ./target/debug/stow-admin launch-gate --report "${{ runner.temp }}/stow-budget/budget-report-100000.json" --model launch-model.toml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
@@ -255,6 +263,7 @@ jobs:
             ${{ runner.temp }}/stow-budget/logs
             ${{ runner.temp }}/stow-budget/budget-report.json
           if-no-files-found: ignore
+
 
   # The resolver is cargo's own code carried into `stow-resolve`; this job
   # proves it: for every corpus entry and target it diffs the stow-resolve

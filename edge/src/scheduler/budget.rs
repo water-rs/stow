@@ -336,9 +336,14 @@ pub async fn run(
     let mut over_budget = false;
     for drive in drives::DRIVES {
         log.lock().expect("statement log").clear();
+        let started_ms = js_sys::Date::now();
         (drive.run)(&metered, shape, settings)
             .await
             .map_err(|error| QueueError::Sql(format!("drive {}: {error}", drive.name)))?;
+        // `Date::now()` is milliseconds well below 2^53; the delta is
+        // exactly representable and non-negative.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let wall_ms = (js_sys::Date::now() - started_ms).max(0.0) as u64;
         let statements = std::mem::take(&mut *log.lock().expect("statement log"));
         let totals = (
             statements.len() as u64,
@@ -348,16 +353,19 @@ pub async fn run(
         let budget = budget_of(drive.name)?;
         let over = totals.0 > budget.statements
             || totals.1 > budget.rows_read
-            || totals.2 > budget.rows_written;
+            || totals.2 > budget.rows_written
+            || wall_ms > budget.wall_ms;
         over_budget |= over;
         rows.push(SchedulerBudgetRow {
             name: drive.name.to_owned(),
             statements: totals.0,
             rows_read: totals.1,
             rows_written: totals.2,
+            wall_ms,
             statement_budget: budget.statements,
             read_budget: budget.rows_read,
             write_budget: budget.rows_written,
+            wall_budget: budget.wall_ms,
             over_budget: over,
             log: statements
                 .into_iter()

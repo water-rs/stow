@@ -212,7 +212,7 @@ echo "[budget] $migrate_out"
 print_table() {
     jq -r '
         "scheduler budget (queue rows \(.queue_rows), schema v\(.schema_version)):",
-        (.rows[] | "  \(.name | . + " " * (34 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget)\(if .over_budget then " OVER" else "" end)")
+        (.rows[] | "  \(.name | . + " " * (34 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget) wall_ms=\(.wall_ms)/\(.wall_budget)\(if .over_budget then " OVER" else "" end)")
     ' "$1"
 }
 

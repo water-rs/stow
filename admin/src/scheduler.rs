@@ -140,7 +140,7 @@ async fn budget(
 }
 
 /// The budget table as a terminal row set — one line per drive with its
-/// three measurements against budget, and the over-budget marker.
+/// four measurements against budget, and the over-budget marker.
 fn render_budget_table(report: &SchedulerBudgetReport) -> String {
     let mut out = format!(
         "scheduler budget (queue rows {}, schema v{}):\n",
@@ -151,7 +151,7 @@ fn render_budget_table(report: &SchedulerBudgetReport) -> String {
         let _ = std::fmt::Write::write_fmt(
             &mut out,
             format_args!(
-                "  {:<34} stmts={:<3}/{:<3} rows_read={:<7}/{:<7} rows_written={:<6}/{:<6}{}\n",
+                "  {:<34} stmts={:<3}/{:<3} rows_read={:<7}/{:<7} rows_written={:<6}/{:<6} wall_ms={:<5}/{:<5}{}\n",
                 row.name,
                 row.statements,
                 row.statement_budget,
@@ -159,6 +159,8 @@ fn render_budget_table(report: &SchedulerBudgetReport) -> String {
                 row.read_budget,
                 row.rows_written,
                 row.write_budget,
+                row.wall_ms,
+                row.wall_budget,
                 marker,
             ),
         );

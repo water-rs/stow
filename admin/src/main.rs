@@ -17,6 +17,7 @@ mod deploy;
 mod github;
 mod http_retry;
 mod index_cmd;
+mod launch_gate;
 mod launch_model;
 mod maintenance;
 mod manual;
@@ -114,6 +115,10 @@ enum Command {
     /// Regenerate the checked-in launch traffic model from production
     /// analytics (stow#452).
     LaunchModel(launch_model::LaunchModelArgs),
+    /// The launch-cost gate: project the measured scheduler-budget
+    /// report against the launch model and fail on an over-allowance
+    /// dimension (stow#452).
+    LaunchGate(launch_gate::LaunchGateArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
@@ -224,6 +229,7 @@ fn main() -> stow_types::error::Result<()> {
         // the rest run on smol like every other command.
         Command::Index(args) => index_cmd::run(args),
         Command::LaunchModel(args) => smol::block_on(launch_model::run(args, output)),
+        Command::LaunchGate(args) => launch_gate::run(&args, output),
         Command::Submit(args) => {
             with_edge(|edge| async move { submit_command(&edge, args, output).await })
         }

@@ -1288,13 +1288,18 @@ pub struct SchedulerBudgetRow {
     pub rows_read: u64,
     /// Σ `rowsWritten` over the drive's statements.
     pub rows_written: u64,
+    /// Wall-clock milliseconds the drive's queue calls took — the
+    /// serialized-Duration number the launch gate projects (stow#452).
+    pub wall_ms: u64,
     /// Budgeted statement count.
     pub statement_budget: u64,
     /// Budgeted `rowsRead` total.
     pub read_budget: u64,
     /// Budgeted `rowsWritten` total.
     pub write_budget: u64,
-    /// `true` when any of the three budgets is exceeded.
+    /// Budgeted wall milliseconds.
+    pub wall_budget: u64,
+    /// `true` when any of the four budgets is exceeded.
     pub over_budget: bool,
     /// The per-statement log the totals are summed over.
     pub log: Vec<SchedulerBudgetStatement>,
