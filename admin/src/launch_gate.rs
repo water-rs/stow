@@ -496,6 +496,15 @@ fn fold_kind(
     // The route's heaviest dimension decides its allowance share — the
     // number the top-N table ranks.
     let shares = [
+        (
+            "do_requests",
+            monthly * cost.do_requests / DO_REQUESTS_MONTHLY,
+        ),
+        (
+            "do_duration_gb_s",
+            monthly * (kind_wall_ms / 1000.0) * DO_DURATION_GB_PER_WALL_S
+                / DO_DURATION_GB_S_MONTHLY,
+        ),
         ("do_rows_read", monthly * kind_read / DO_ROWS_READ_MONTHLY),
         (
             "do_rows_written",
@@ -774,7 +783,7 @@ fn render_evaluation(evaluation: &GateEvaluation) -> String {
         ]);
     }
     let _ = writeln!(out, "\n{}", top.render());
-    let mut diag = Table::new(&["diagnostics (unbilled)", "projected/mo"]);
+    let mut diag = Table::new(&["diagnostics (unmeasured)", "projected/mo"]);
     for line in &evaluation.diagnostics {
         diag.push([line.dimension.to_owned(), format!("{:.3e}", line.projected)]);
     }
