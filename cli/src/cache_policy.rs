@@ -11,9 +11,15 @@ pub struct CachePolicyEntry {
     pub crate_name: String,
 }
 
-pub async fn write_policy(
+/// The per-build policy directory a build's allow markers and local-build
+/// provenance markers live under. Created empty and handed to cargo
+/// immediately: the supervisor writes provenance markers into it during
+/// the build, and the graph analysis's allow entries are committed into
+/// the same directory as the build's background enrichment lands — the
+/// checks that consult them read the directory per plan call, so a
+/// late-arriving marker still gates the unit it names (stow#347).
+pub async fn create_policy_dir(
     config: &crate::config::StowConfig,
-    entries: &[CachePolicyEntry],
 ) -> stow_types::error::Result<PathBuf> {
     async_fs::create_dir_all(config.graph_plan_dir())
         .await
@@ -33,8 +39,17 @@ pub async fn write_policy(
         stow_types::stow_error!("create cache policy dir {}: {error}", dir.display())
     })?;
 
+    Ok(dir)
+}
+
+/// Write `entries`' allow markers into the policy directory
+/// [`create_policy_dir`] made.
+pub async fn write_policy_entries(
+    dir: &Path,
+    entries: &[CachePolicyEntry],
+) -> stow_types::error::Result<()> {
     for entry in entries {
-        let file_path = allow_marker_path(&dir, entry.target.as_str(), entry.crate_name.as_str());
+        let file_path = allow_marker_path(dir, entry.target.as_str(), entry.crate_name.as_str());
         if let Some(parent) = file_path.parent() {
             async_fs::create_dir_all(parent).await.map_err(|error| {
                 stow_types::stow_error!(
@@ -48,7 +63,7 @@ pub async fn write_policy(
         })?;
     }
 
-    Ok(dir)
+    Ok(())
 }
 
 /// Cheap pre-identity gate: with a policy dir present, only crates the graph
