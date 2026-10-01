@@ -53,16 +53,25 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     let mut project = ProjectContext::load(&invocation.cargo_args)
         .instrument(tracing::debug_span!("stow.precargo.project_context"))
         .await?;
-    // mold is mandatory on Linux — provision it before any cargo
-    // invocation starts, whatever path the build ends up taking through
-    // this driver. `check` is gated with `build` and `test`: a check still
-    // compiles proc-macro dependencies in full and compiles and runs
-    // build scripts, and both of those link. When the cargo config does
-    // not already select a reachable mold, the managed install is
-    // selected for this invocation only — `stow setup` is not required.
-    project.mold_config_args = crate::mold::provision(&project.target, project.current_dir())
-        .instrument(tracing::debug_span!("stow.precargo.mold_provision"))
-        .await?;
+    // mold is mandatory on Linux — provisioning starts the moment the
+    // project's target is known and its linker probes run alongside the
+    // graph analysis below rather than in front of it (stow#347). The
+    // task joins before any cargo invocation, whatever path the build
+    // ends up taking through this driver. `check` is gated with `build`
+    // and `test`: a check still compiles proc-macro dependencies in full
+    // and compiles and runs build scripts, and both of those link. When
+    // the cargo config does not already select a reachable mold, the
+    // managed install is selected for this invocation only — `stow
+    // setup` is not required.
+    let mold = tokio::spawn({
+        let target = project.target.clone();
+        let dir = project.current_dir().to_path_buf();
+        async move {
+            crate::mold::provision(&target, &dir)
+                .instrument(tracing::debug_span!("stow.precargo.mold_provision"))
+                .await
+        }
+    });
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -133,6 +142,9 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
             .map_or(0, |analysis| analysis.prefetch_artifacts.len()),
     );
 
+    project.mold_config_args = mold
+        .await
+        .map_err(|error| stow_types::stow_error!("join mold provisioning task: {error}"))??;
     let selected = select_upgrades(
         maybe_analysis.as_ref(),
         invocation.silent_compatible_upgrades,
@@ -643,16 +655,20 @@ impl ProjectContext {
         let manifest_path = layout.manifest_path;
         let current_dir_relative =
             pathdiff::diff_paths(&current_dir, &workspace_root).unwrap_or_else(PathBuf::new);
-        let target = match metadata_args.target.clone() {
-            Some(target) => target,
-            None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
-                .instrument(tracing::debug_span!("stow.precargo.rustc_host_probe"))
-                .await
-                .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?,
+        let host_probe = async {
+            match metadata_args.target.clone() {
+                Some(target) => Ok(target),
+                None => detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
+                    .instrument(tracing::debug_span!("stow.precargo.rustc_host_probe"))
+                    .await
+                    .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}")),
+            }
         };
-        let rustc_version = detect_rustc_version(std::ffi::OsStr::new("rustc"))
-            .instrument(tracing::debug_span!("stow.precargo.rustc_version_probe"))
-            .await
+        let version_probe = detect_rustc_version(std::ffi::OsStr::new("rustc"))
+            .instrument(tracing::debug_span!("stow.precargo.rustc_version_probe"));
+        let (target, rustc_version) = tokio::join!(host_probe, version_probe);
+        let target = target?;
+        let rustc_version = rustc_version
             .map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
 
         Ok(Self {

@@ -77,17 +77,63 @@ pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Res
     if !cfg!(target_os = "linux") || !linux_target(target) {
         return Ok(Vec::new());
     }
-    let link = resolve_link(target, cargo_dir, &process_env)
-        .instrument(tracing::debug_span!("stow.precargo.mold_link_resolve"))
-        .await;
-    if link.selects_mold
-        && link
-            .unavailable_reason()
-            .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
-            .await
-            .is_none()
-    {
-        return Ok(Vec::new());
+    // The cfg probe and the availability probe are both process spawns,
+    // and they are independent unless a `cfg()` target table changes the
+    // probe's inputs: the conservative read — every cfg table a
+    // candidate, the same read `matching_target_tables` gives an
+    // unanswered cfg probe — launches the probe the config asks for while
+    // rustc is still answering. When the answered cfgs leave the probe
+    // inputs untouched the speculative answer stands; when they change
+    // it the probe reruns on the real inputs.
+    let cfgs = tokio::spawn({
+        let target = target.to_owned();
+        async move {
+            rustc_target_cfgs(&target)
+                .instrument(tracing::debug_span!("stow.precargo.mold_cfg_probe"))
+                .await
+        }
+    });
+    let config = CargoConfig::load(cargo_dir, &process_env).await;
+    let candidate = resolve_link_from(&config, target, None, &process_env);
+    let speculative = match (candidate.selects_mold, candidate.probe()) {
+        (true, probe @ MoldProbe::Driver { .. }) => {
+            let task = tokio::spawn({
+                let probe = probe.clone();
+                async move {
+                    probe_unavailable_reason(&probe)
+                        .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
+                        .await
+                }
+            });
+            Some((probe, task))
+        }
+        _ => None,
+    };
+    let cfgs = cfgs.await.unwrap_or_default();
+    let link = resolve_link_from(&config, target, cfgs.as_ref(), &process_env);
+    if link.selects_mold {
+        let real = link.probe();
+        let reason = match speculative {
+            Some((probe, task)) if probe == real => task
+                .await
+                .map_err(|error| stow_types::stow_error!("join mold probe task: {error}"))?,
+            Some((_, task)) => {
+                task.abort();
+                probe_unavailable_reason(&real)
+                    .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
+                    .await
+            }
+            None => {
+                probe_unavailable_reason(&real)
+                    .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
+                    .await
+            }
+        };
+        if reason.is_none() {
+            return Ok(Vec::new());
+        }
+    } else if let Some((_, task)) = speculative {
+        task.abort();
     }
     let bin_dir = ensure_mold_install()
         .instrument(tracing::debug_span!("stow.precargo.mold_install"))
@@ -139,7 +185,7 @@ fn compiler_path_value(bin_dir: &Path) -> stow_types::error::Result<&str> {
 /// global setup must read it, from `$CARGO_HOME/config.toml` plus the
 /// environment, so the answer never depends on the directory setup ran
 /// in. The project-level walk belongs to `stow` builds, which run inside
-/// a project and resolve through [`resolve_link`] instead.
+/// a project and resolve through [`resolve_link_from`] instead.
 ///
 /// `None` means the config needs no linker selection written — not a
 /// Linux host, or the configuration already selects mold *and can reach a
@@ -166,20 +212,7 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
         rustc_target_cfgs(&host),
     )
     .await;
-    let tables = config.matching_target_tables(&host, cfgs.as_ref());
-    let rustflags = effective_rustflags(&config, &tables, &process_env);
-    let linker =
-        rustflags_linker(&rustflags).or_else(|| effective_linker(&host, &tables, &process_env));
-    let selects_mold = linker
-        .as_deref()
-        .is_some_and(|linker| linker.contains("mold"))
-        || rustflags.iter().any(|flag| flag_mentions_mold(flag));
-    let link = LinkResolution {
-        linker,
-        rustflags,
-        selects_mold,
-        compiler_path: effective_compiler_path(&config, &process_env),
-    };
+    let link = resolve_link_from(&config, &host, cfgs.as_ref(), &process_env);
     if link.selects_mold && link.unavailable_reason().await.is_none() {
         return Ok(None);
     }
@@ -312,15 +345,18 @@ fn process_env(key: &str) -> Option<OsString> {
     std::env::var_os(key)
 }
 
-/// Resolve `target`'s link configuration: the config chain walk and the
-/// `rustc --print cfg` probe are independent — file I/O and a process
-/// spawn — so they run at the same time instead of one after the other.
-async fn resolve_link(target: &str, cargo_dir: &Path, env: EnvLookup<'_>) -> LinkResolution {
-    let (config, cfgs) =
-        futures_util::future::join(CargoConfig::load(cargo_dir, env), rustc_target_cfgs(target))
-            .await;
-    let tables = config.matching_target_tables(target, cfgs.as_ref());
-    let rustflags = effective_rustflags(&config, &tables, env);
+/// Resolve `target`'s link configuration over an already-loaded config
+/// chain: which `target.*` tables match (cfg tables only when `cfgs` was
+/// answered — `None` keeps them all candidates), the effective rustflags
+/// and linker they resolve to, and whether the selection picks mold.
+fn resolve_link_from(
+    config: &CargoConfig,
+    target: &str,
+    cfgs: Option<&HashSet<String>>,
+    env: EnvLookup<'_>,
+) -> LinkResolution {
+    let tables = config.matching_target_tables(target, cfgs);
+    let rustflags = effective_rustflags(config, &tables, env);
     let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(target, &tables, env));
     let selects_mold = linker
         .as_deref()
@@ -330,7 +366,7 @@ async fn resolve_link(target: &str, cargo_dir: &Path, env: EnvLookup<'_>) -> Lin
         linker,
         rustflags,
         selects_mold,
-        compiler_path: effective_compiler_path(&config, env),
+        compiler_path: effective_compiler_path(config, env),
     }
 }
 
@@ -346,27 +382,61 @@ fn effective_compiler_path(config: &CargoConfig, env: EnvLookup<'_>) -> Option<O
     }
 }
 
+/// What asking the machine "is this link's mold reachable" looks like:
+/// a configured `linker` naming mold must itself resolve to an
+/// executable, while `-fuse-ld=mold` asks the compiler driver to find an
+/// `ld.mold`. The value is everything the probe reads — driver, `-B`
+/// prefixes, `COMPILER_PATH` — so two resolutions with the same probe
+/// answer the same question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MoldProbe {
+    /// The configured linker resolves to an executable itself.
+    Linker(String),
+    /// A `-fuse-ld=mold` link probe through a compiler driver.
+    Driver {
+        driver: String,
+        b_dirs: Vec<PathBuf>,
+        compiler_path: Option<OsString>,
+    },
+}
+
 impl LinkResolution {
-    /// Why mold cannot run for this link, or `None` when it can. Both
-    /// selection shapes are checked against the machine: a `linker` naming
-    /// mold must itself resolve to an executable, while `-fuse-ld=mold`
-    /// asks the compiler driver to find an `ld.mold`.
-    async fn unavailable_reason(&self) -> Option<String> {
-        if let Some(linker) = self.linker.as_deref()
-            && linker.contains("mold")
-        {
-            return (!program_resolves(linker)).then(|| {
-                format!("the configured linker `{linker}` does not resolve to an executable")
-            });
+    /// The probe this resolution's availability answer depends on.
+    fn probe(&self) -> MoldProbe {
+        match self.linker.as_deref() {
+            Some(linker) if linker.contains("mold") => MoldProbe::Linker(linker.to_owned()),
+            // With no mold-naming linker configured the link goes through
+            // a compiler driver; probe `cc`, the platform's C driver.
+            other => MoldProbe::Driver {
+                driver: other.unwrap_or("cc").to_owned(),
+                b_dirs: b_dirs(&self.rustflags),
+                compiler_path: self.compiler_path.clone(),
+            },
         }
-        // With no linker configured the link goes through a compiler
-        // driver; probe `cc`, the platform's C driver.
-        let driver = self.linker.as_deref().unwrap_or("cc");
-        (!ld_mold_resolves(driver, &self.rustflags, self.compiler_path.as_deref()).await).then(|| {
+    }
+
+    /// Why mold cannot run for this link, or `None` when it can.
+    async fn unavailable_reason(&self) -> Option<String> {
+        probe_unavailable_reason(&self.probe()).await
+    }
+}
+
+/// Runs `probe` against the machine and reports why mold cannot run for
+/// it, or `None` when it can.
+async fn probe_unavailable_reason(probe: &MoldProbe) -> Option<String> {
+    match probe {
+        MoldProbe::Linker(linker) => (!program_resolves(linker)).then(|| {
+            format!("the configured linker `{linker}` does not resolve to an executable")
+        }),
+        MoldProbe::Driver {
+            driver,
+            b_dirs,
+            compiler_path,
+        } => (!ld_mold_resolves(driver, b_dirs, compiler_path.as_deref()).await).then(|| {
             format!(
                 "`{driver}` finds no `ld.mold` for `-fuse-ld=mold` — run `stow setup` to install mold"
             )
-        })
+        }),
     }
 }
 
@@ -378,13 +448,9 @@ impl LinkResolution {
 /// exercises exactly the lookup and nothing else. The configured `-B`
 /// prefixes and the effective `COMPILER_PATH` are passed through so the
 /// probe sees the environment the build would.
-async fn ld_mold_resolves(
-    driver: &str,
-    rustflags: &[String],
-    compiler_path: Option<&OsStr>,
-) -> bool {
+async fn ld_mold_resolves(driver: &str, b_dirs: &[PathBuf], compiler_path: Option<&OsStr>) -> bool {
     let mut probe = async_process::Command::new(driver);
-    for dir in b_dirs(rustflags) {
+    for dir in b_dirs {
         probe.arg(format!("-B{}", dir.display()));
     }
     probe.args([
@@ -425,11 +491,14 @@ fn path_contains(name: &str) -> bool {
 
 /// Whether `target`'s effective linker configuration selects mold: the
 /// linker cargo selects for the triple, or any `-C` link option in the
-/// effective rustflags. The gate reads the fuller [`resolve_link`] answer
-/// itself; this stays the question the tests ask.
+/// effective rustflags. The gate reads the fuller [`resolve_link_from`]
+/// answer itself; this stays the question the tests ask.
 #[cfg(test)]
 async fn uses_mold(target: &str, cargo_dir: &Path, env: EnvLookup<'_>) -> bool {
-    resolve_link(target, cargo_dir, env).await.selects_mold
+    let (config, cfgs) =
+        futures_util::future::join(CargoConfig::load(cargo_dir, env), rustc_target_cfgs(target))
+            .await;
+    resolve_link_from(&config, target, cfgs.as_ref(), env).selects_mold
 }
 
 /// A rustflag selects mold when a `-C` link option's value names it —
