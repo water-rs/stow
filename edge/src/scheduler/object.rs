@@ -46,6 +46,18 @@ const STOW_FREEZE_FAIL_PERCENT_BINDING: &str = "STOW_FREEZE_FAIL_PERCENT";
 const STOW_COST_BUDGET_MULTIPLIER_BINDING: &str = "STOW_COST_BUDGET_MULTIPLIER";
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
+    // The local-CI dispatcher only exists beside the budget probe: a
+    // deploy carrying `STOW_LOCAL_CI_URL` without the probe marker is
+    // misconfigured — every scheduler route fails on it here rather
+    // than let one pass reach the unauthenticated credential arm.
+    if read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING).is_some()
+        && !budget_probe_enabled(env)
+    {
+        return Err(Error::msg(
+            "STOW_LOCAL_CI_URL is set without STOW_SCHEDULER_BUDGET — \
+             local-CI dispatch exists only on the mock budget-probe deploy",
+        ));
+    }
     let defaults = SchedulerSettings::default();
     Ok(SchedulerSettings {
         dispatch: read_optional_u32_binding(env, STOW_MAX_CONCURRENT_JOBS_BINDING)?
@@ -738,6 +750,29 @@ enum CredentialSource {
     GitHub(github_app::AppConfig),
 }
 
+/// Validate a `STOW_LOCAL_CI_URL` value: the local dispatcher only ever
+/// lives on the same host, so the credential arm is pinned to loopback
+/// and can never redirect dispatch to a remote endpoint. Rejected URLs
+/// fail the pass before a claim is made.
+fn local_ci_url(url: &str) -> Result<String> {
+    let authority = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|authority| authority.rsplit('@').next())
+        .unwrap_or_default();
+    let host = authority.strip_prefix('[').map_or_else(
+        || authority.split(':').next().unwrap_or_default(),
+        |v6| v6.split(']').next().unwrap_or_default(),
+    );
+    match host {
+        "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" => Ok(url.to_owned()),
+        _ => Err(Error::msg(format!(
+            "STOW_LOCAL_CI_URL must name a loopback host, got {url:?}"
+        ))),
+    }
+}
+
 /// The artifact catalog in D1, asked at claim time which pending tasks an
 /// already-landed publish covered.
 pub(super) struct CatalogCoverage {
@@ -795,7 +830,7 @@ pub(super) async fn dispatch_pass(
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
     let credential_source = match read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING) {
-        Some(url) => CredentialSource::LocalCi(url),
+        Some(url) => CredentialSource::LocalCi(local_ci_url(&url)?),
         None => CredentialSource::GitHub(github_app::AppConfig {
             app_id: read_string_binding(env, GITHUB_APP_ID_BINDING)?,
             installation_id: read_string_binding(env, GITHUB_APP_INSTALLATION_ID_BINDING)?,

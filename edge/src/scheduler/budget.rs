@@ -475,13 +475,29 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    /// The budget probe binding must never ship in the production
+    /// Mock-only deploy variables must never ship in the production
     /// manifest — `edge/Skyzen.toml`'s `[cloudflare.vars]` are the only
-    /// reach the deploy has, and `STOW_SCHEDULER_BUDGET` there would
-    /// answer the probe routes in production. The mock manifest
-    /// (`Skyzen.mock.toml`) is the one place it may be set.
+    /// reach the deploy has. `STOW_SCHEDULER_BUDGET` there would answer
+    /// the probe routes, `STOW_LOCAL_CI_URL` would redirect every
+    /// dispatch pass to a loopback dispatcher that does not exist, and
+    /// `STOW_COST_BUDGET_MULTIPLIER` would inflate the self-meter the
+    /// dispatch freeze reads. The `*_SECRET`/`CF_ANALYTICS_TOKEN` names
+    /// are `[[secret]]` bindings in production; a plaintext var of the
+    /// same name is the secret checked into the manifest. The mock
+    /// manifest (`Skyzen.mock.toml`) is the one place any of these may
+    /// be set.
+    const MOCK_ONLY_VARS: &[&str] = &[
+        "STOW_SCHEDULER_BUDGET",
+        "STOW_LOCAL_CI_URL",
+        "STOW_COST_BUDGET_MULTIPLIER",
+        "STOW_POW_CHALLENGE_SECRET",
+        "STOW_GITHUB_WEBHOOK_SECRET",
+        "TURNSTILE_SECRET_KEY",
+        "CF_ANALYTICS_TOKEN",
+    ];
+
     #[test]
-    fn production_manifest_carries_no_budget_probe() {
+    fn production_manifest_carries_no_mock_only_vars() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Skyzen.toml");
         let doc: toml::Value = std::fs::read_to_string(&manifest)
             .expect("read edge/Skyzen.toml")
@@ -492,10 +508,11 @@ mod tests {
             .and_then(|cloudflare| cloudflare.get("vars"))
             .and_then(|vars| vars.as_table())
             .expect("edge/Skyzen.toml has a [cloudflare.vars] table");
-        assert!(
-            !vars.contains_key(super::BUDGET_PROBE_BINDING),
-            "edge/Skyzen.toml must not set {} — the budget probe is mock-only",
-            super::BUDGET_PROBE_BINDING,
-        );
+        for name in MOCK_ONLY_VARS {
+            assert!(
+                !vars.contains_key(name),
+                "edge/Skyzen.toml must not set {name} — it is mock-only",
+            );
+        }
     }
 }
