@@ -241,9 +241,12 @@ fn failed_task_id(k: u64, queue_rows: u64) -> String {
     task_hex_id(u64::from(shape.failed_row(index)))
 }
 
-/// Real crates the submit lane rotates through — each resolves for
-/// real through the canonicalize step so the enqueue is the genuine
-/// trusted path. The pool is fixed, so every submission dedupes onto
+/// Real crates the submit lane rotates through — each posts a pinned
+/// `(crate, version)` that lands verbatim through the trusted submit
+/// path. The pool is fixed, so every submission dedupes onto
+/// the same eight task ids — the lane exercises the resubmit path;
+/// the fresh-row inserts come from the miss lanes' per-counter
+/// features.
 /// the same eight task ids — the lane exercises the resubmit path;
 /// the fresh-row inserts come from the miss lanes' per-counter
 /// features.
