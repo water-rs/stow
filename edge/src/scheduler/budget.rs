@@ -442,13 +442,15 @@ pub async fn run(
     // any of them the moment they complete. Re-arm the drive's target
     // before any measured window so `POST /tasks/complete-run` always
     // measures a real completion, never a stale one.
-    db.query("UPDATE queue \
+    db.query(
+        "UPDATE queue \
               SET status = 'running', attempt = attempt + 1, updated_at = datetime('now') \
-              WHERE task_id = printf('%064x', ?)")
-        .bind(i64::from(shape.running_row()))
-        .execute()
-        .await
-        .map_err(|error| QueueError::Sql(format!("re-arm complete-run target: {error}")))?;
+              WHERE task_id = printf('%064x', ?)",
+    )
+    .bind(i64::from(shape.running_row()))
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("re-arm complete-run target: {error}")))?;
     let log = Arc::new(Mutex::new(Vec::new()));
     let metered = DurableDb::new(MeteredBackend {
         inner: db.clone(),

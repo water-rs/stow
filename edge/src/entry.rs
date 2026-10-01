@@ -70,7 +70,8 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
             || {
                 format!(
                     "{}/{}/analytics_engine/sql",
-                    crate::stats::SQL_API_URL, account_id
+                    crate::stats::SQL_API_URL,
+                    account_id
                 )
             },
             |url| {
