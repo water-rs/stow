@@ -59,24 +59,23 @@ pub async fn write_policy(
 /// one 404; a deny costs nothing.
 ///
 /// `None` means "no policy configured" (standalone wrapper use) and the
-/// caller treats it as allowed.
-pub fn public_cache_allowed(parsed: &ParsedRustcArgs) -> Option<bool> {
-    let dir = policy_dir()?;
-    let target = effective_target(parsed)?;
-
-    let marker = allow_marker_path(&dir, &target, &parsed.crate_name);
-    Some(marker.exists())
-}
-
-/// The target this invocation builds for, without spawning rustc: the
-/// explicit `--target`, else the triple `stow check` put in the
-/// environment for its wrapper processes.
-pub fn effective_target(parsed: &ParsedRustcArgs) -> Option<String> {
-    parsed
+/// caller treats it as allowed. `fallback_target` covers an invocation
+/// that does not spell `--target`: the consumer target the driver
+/// resolved for this build.
+pub fn public_cache_allowed(
+    policy_dir: Option<&Path>,
+    parsed: &ParsedRustcArgs,
+    fallback_target: Option<&str>,
+) -> Option<bool> {
+    let dir = policy_dir?;
+    let target = parsed
         .target
         .clone()
-        .or_else(|| std::env::var(crate::rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV).ok())
-        .filter(|target| !target.trim().is_empty())
+        .or_else(|| fallback_target.map(str::to_owned))
+        .filter(|target| !target.trim().is_empty())?;
+
+    let marker = allow_marker_path(dir, target.as_str(), &parsed.crate_name);
+    Some(marker.exists())
 }
 
 /// The per-build policy directory this invocation was handed, when it is

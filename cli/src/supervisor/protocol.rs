@@ -25,6 +25,10 @@ pub enum Request {
     Plan(Plan),
     /// The result of a compile the supervisor asked for.
     Compiled(Compiled),
+    /// A compile the facade already decided on its own — the local-build
+    /// mark before rustc starts and the report after it ends. One-way:
+    /// the supervisor never answers it.
+    Observed(Observed),
 }
 
 /// One rustc invocation as the facade received it.
@@ -51,6 +55,78 @@ pub struct Compiled {
     pub ticket: u64,
     /// Whether rustc exited successfully.
     pub success: bool,
+}
+
+/// The facade telling the supervisor about a compile it ran without
+/// asking first: a unit the build's serve map already ruled out needs no
+/// plan round trip, but the build still has to mark it as locally built
+/// before rustc starts and observe how it ended afterwards.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Observed {
+    pub token: String,
+    /// The real rustc cargo asked for.
+    pub executable: Vec<u8>,
+    /// Everything after the executable, in order.
+    pub args: Vec<Vec<u8>>,
+    /// The `OUT_DIR` cargo exported on this invocation's environment, for
+    /// a crate with a build script.
+    pub build_script_out_dir: Option<Vec<u8>>,
+    /// `None` marks the unit as compiling locally — the bookkeeping
+    /// [`crate::provenance::record_local_build`] does inside a `Compile`
+    /// decision, carried as a frame because this unit never asked for a
+    /// decision. `Some` reports the finished compile's exit status.
+    pub success: Option<bool>,
+}
+
+impl Observed {
+    /// Build an observation for this invocation.
+    #[must_use]
+    pub fn new(
+        token: String,
+        executable: &std::ffi::OsStr,
+        args: &[OsString],
+        build_script_out_dir: Option<&std::ffi::OsStr>,
+        success: Option<bool>,
+    ) -> Self {
+        Self {
+            token,
+            executable: os_bytes::encode(executable),
+            args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
+            build_script_out_dir: build_script_out_dir.map(os_bytes::encode),
+            success,
+        }
+    }
+
+    /// The real rustc this invocation wrapped.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn executable(&self) -> Result<OsString, String> {
+        os_bytes::decode(&self.executable)
+    }
+
+    /// The wrapped arguments, in order.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn args(&self) -> Result<Vec<OsString>, String> {
+        self.args.iter().map(|arg| os_bytes::decode(arg)).collect()
+    }
+
+    /// The `OUT_DIR` this invocation's environment carried, when cargo
+    /// exported one.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn build_script_out_dir(&self) -> Result<Option<OsString>, String> {
+        self.build_script_out_dir
+            .as_ref()
+            .map(|encoded| os_bytes::decode(encoded))
+            .transpose()
+    }
 }
 
 /// What the supervisor answers.

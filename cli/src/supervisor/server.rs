@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
-use super::protocol::{Answer, Compiled, Plan, Request, read_frame, write_frame};
+use super::protocol::{Answer, Compiled, Observed, Plan, Request, read_frame, write_frame};
 use super::{ENDPOINT_ENV, Endpoint, TOKEN_ENV};
 
 /// What a supervisor does with the invocations its facades send.
@@ -42,9 +42,30 @@ pub trait Handler: Send + Sync + 'static {
         success: bool,
     ) -> impl Future<Output = ()> + Send;
 
+    /// The bookkeeping a facade-owned compile still needs: the mark before
+    /// rustc starts (`observation.success` is `None`) and the observation
+    /// after it ends (`Some`). One-way — nothing comes back.
+    fn observed(self: &Arc<Self>, observation: Observation) -> impl Future<Output = ()> + Send;
+
     /// What the handler needs to remember between asking for a compile and
     /// hearing that it finished.
     type Pending: Send + 'static;
+}
+
+/// A compile the facade already ran — or is about to — without a plan
+/// round trip: the mark and the report a unit the serve map ruled out
+/// still owes the build.
+#[derive(Debug)]
+pub struct Observation {
+    /// The real rustc the facade ran.
+    pub executable: std::ffi::OsString,
+    /// Everything after the executable, in order.
+    pub args: Vec<std::ffi::OsString>,
+    /// The `OUT_DIR` the facade's invocation environment carried.
+    pub build_script_out_dir: Option<std::ffi::OsString>,
+    /// `None` marks the unit as compiling locally; `Some` reports how the
+    /// finished compile exited.
+    pub success: Option<bool>,
 }
 
 /// A handler's decision about one invocation.
@@ -302,23 +323,31 @@ async fn serve_connection<S, H>(
                 return;
             }
         };
-        let answer = answer_request(&handler, &tickets, &token, request).await;
-        if let Err(error) = write_frame(&mut stream, &answer).await {
+        if let Some(answer) = answer_request(&handler, &tickets, &token, request).await
+            && let Err(error) = write_frame(&mut stream, &answer).await
+        {
             tracing::warn!(%error, "supervisor could not answer a facade");
             return;
         }
     }
 }
 
+/// Answer the request, or `None` when the request is one-way — an
+/// observation carries no reply because the facade that sent it is not
+/// waiting on one.
 async fn answer_request<H: Handler>(
     handler: &Arc<H>,
     tickets: &mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: &str,
     request: Request,
-) -> Answer {
+) -> Option<Answer> {
     match request {
-        Request::Plan(plan) => answer_plan(handler, tickets, token, plan).await,
-        Request::Compiled(report) => answer_report(handler, tickets, token, report).await,
+        Request::Plan(plan) => Some(answer_plan(handler, tickets, token, plan).await),
+        Request::Compiled(report) => Some(answer_report(handler, tickets, token, report).await),
+        Request::Observed(observed) => {
+            answer_observation(handler, token, observed).await;
+            None
+        }
     }
 }
 
@@ -357,6 +386,29 @@ async fn answer_plan<H: Handler>(
             )
         }
     }
+}
+
+async fn answer_observation<H: Handler>(handler: &Arc<H>, token: &str, observed: Observed) {
+    if observed.token != token {
+        tracing::warn!("supervisor observation with the wrong token dropped");
+        return;
+    }
+    let (Ok(executable), Ok(args), Ok(build_script_out_dir)) = (
+        observed.executable(),
+        observed.args(),
+        observed.build_script_out_dir(),
+    ) else {
+        tracing::warn!("supervisor observation could not be decoded; dropped");
+        return;
+    };
+    handler
+        .observed(Observation {
+            executable,
+            args,
+            build_script_out_dir,
+            success: observed.success,
+        })
+        .await;
 }
 
 async fn answer_report<H: Handler>(
@@ -429,6 +481,13 @@ mod tests {
             if success {
                 self.reports.fetch_add(1, Ordering::SeqCst);
             }
+            std::future::ready(())
+        }
+
+        fn observed(
+            self: &Arc<Self>,
+            _observation: super::Observation,
+        ) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
         }
     }
