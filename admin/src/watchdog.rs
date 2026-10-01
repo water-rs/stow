@@ -2568,7 +2568,7 @@ mod tests {
         let decision = decide(&readings, &[]);
         assert!(decision.incident);
         assert_eq!(decision.tripped.len(), 1);
-        assert!(decision.alerting.is_empty());
+        assert_eq!(decision.alerting, [] as [usize; 0]);
     }
 
     /// Below threshold → clear, no incident.
@@ -2606,7 +2606,7 @@ mod tests {
         ];
         let decision = decide(&readings, &[]);
         assert!(decision.incident);
-        assert!(decision.tripped.is_empty());
+        assert_eq!(decision.tripped, [] as [usize; 0]);
         assert_eq!(decision.alerting.len(), 2);
     }
 
@@ -2618,7 +2618,7 @@ mod tests {
         let readings = vec![reading("edge.dispatch_frozen", 1, 1.0)];
         let decision = decide(&readings, &[]);
         assert!(decision.incident);
-        assert!(decision.tripped.is_empty());
+        assert_eq!(decision.tripped, [] as [usize; 0]);
         assert_eq!(decision.alerting.len(), 1);
         // And cleared dispatch stays clear.
         let cleared = decide(&[reading("edge.dispatch_frozen", 1, 0.0)], &[]);
@@ -2636,7 +2636,7 @@ mod tests {
             }],
         );
         assert!(decision.incident);
-        assert!(decision.tripped.is_empty());
+        assert_eq!(decision.tripped, [] as [usize; 0]);
     }
 
     /// Fixture: the GraphQL response decodes into a snapshot — trip

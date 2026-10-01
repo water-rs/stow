@@ -1323,7 +1323,10 @@ mod tests {
         // A node that already ran is never re-marked.
         nodes.get_mut(&other).expect("other").done = true;
         let blocked = mark_blocked(std::slice::from_ref(&other), &mut nodes, &edges);
-        assert!(blocked.is_empty());
+        assert_eq!(
+            blocked,
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// One published row for `request` at `shape`.

@@ -1365,7 +1365,7 @@ mod tests {
                 assert_eq!(slice.folded.len(), 1);
             } else {
                 assert_eq!(slice.index.rows.len(), 0);
-                assert!(slice.folded.is_empty());
+                assert_eq!(slice.folded, [] as [std::string::String; 0]);
             }
         }
 
