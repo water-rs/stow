@@ -750,11 +750,13 @@ enum CredentialSource {
     GitHub(github_app::AppConfig),
 }
 
-/// Validate a `STOW_LOCAL_CI_URL` value: the local dispatcher only ever
-/// lives on the same host, so the credential arm is pinned to loopback
-/// and can never redirect dispatch to a remote endpoint. Rejected URLs
-/// fail the pass before a claim is made.
-fn local_ci_url(url: &str) -> Result<String> {
+/// Validate an endpoint override the mock harness sets: `STOW_LOCAL_CI_URL`
+/// (the dispatcher the credential arm posts builds to) and
+/// `STOW_STATS_SQL_URL` (the Analytics Engine stub the stats route posts
+/// its API token to) only ever live on the same host, so both are pinned
+/// to loopback and can never redirect traffic — or the token — to a
+/// remote endpoint. Rejected URLs fail before any request uses them.
+pub(crate) fn loopback_url(binding: &str, url: &str) -> Result<String> {
     let authority = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -768,7 +770,7 @@ fn local_ci_url(url: &str) -> Result<String> {
     match host {
         "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" => Ok(url.to_owned()),
         _ => Err(Error::msg(format!(
-            "STOW_LOCAL_CI_URL must name a loopback host, got {url:?}"
+            "{binding} must name a loopback host, got {url:?}"
         ))),
     }
 }
@@ -830,7 +832,7 @@ pub(super) async fn dispatch_pass(
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
     let credential_source = match read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING) {
-        Some(url) => CredentialSource::LocalCi(local_ci_url(&url)?),
+        Some(url) => CredentialSource::LocalCi(loopback_url("STOW_LOCAL_CI_URL", &url)?),
         None => CredentialSource::GitHub(github_app::AppConfig {
             app_id: read_string_binding(env, GITHUB_APP_ID_BINDING)?,
             installation_id: read_string_binding(env, GITHUB_APP_INSTALLATION_ID_BINDING)?,

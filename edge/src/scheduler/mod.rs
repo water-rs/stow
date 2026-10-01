@@ -34,4 +34,4 @@ pub mod budget;
 #[cfg(target_arch = "wasm32")]
 pub mod dispatch;
 #[cfg(target_arch = "wasm32")]
-mod object;
+pub(crate) mod object;

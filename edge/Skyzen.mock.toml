@@ -37,10 +37,15 @@ TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
 TURNSTILE_SECRET_KEY = "1x0000000000000000000000000000000AA"
 # Cloudflare's test keys always report this hostname.
 TURNSTILE_HOSTNAME = "example.com"
-# The worker never reaches the Analytics Engine SQL API under the mock, so
-# the account id and token only have to be present.
+# The account id and token only have to be present: the public stats
+# route queries the Analytics Engine SQL API through the override below,
+# which the mock registry stubs.
 CF_ACCOUNT_ID = "00000000000000000000000000000000"
 CF_ANALYTICS_TOKEN = "mock-analytics-token"
+# `stow-mock-registry serve` answers POST /analytics_engine/sql with one
+# union row every stats_*.sql query decodes. Loopback-only by the same
+# rule as STOW_LOCAL_CI_URL — the token rides in Authorization.
+STOW_STATS_SQL_URL = "http://127.0.0.1:28123/analytics_engine/sql"
 
 [[cloudflare.d1_databases]]
 binding = "STOW_DB"

@@ -62,6 +62,10 @@ const TARGETS_SQL: &str = include_str!("sql/stats_targets.sql");
 /// `stats_cli_versions.sql` — hits per `stow-cli` version over 30 days.
 const CLI_VERSIONS_SQL: &str = include_str!("sql/stats_cli_versions.sql");
 
+/// The Analytics Engine SQL API prefix `run_sql` posts under when no
+/// `STOW_STATS_SQL_URL` override points the route at a stub.
+pub(crate) const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
+
 /// Below this many distinct installs per day the figure is suppressed —
 /// stow publishes no small counts that could single out a user.
 const MIN_PUBLISHABLE_INSTALLS: f64 = 20.0;
@@ -180,15 +184,14 @@ mod worker {
     /// Analytics Engine SQL API.
     #[derive(Debug, Clone)]
     pub struct StatsContext {
-        /// `CF_ACCOUNT_ID` — the account the SQL API is queried under.
-        pub account_id: String,
         /// `CF_ANALYTICS_TOKEN` — an API token with Analytics Engine read
         /// on the account. A credential: never logged, never in a response.
         pub analytics_token: String,
+        /// The full SQL API URL `run_sql` posts to — the account's real
+        /// endpoint under `CF_ACCOUNT_ID`, or the harness stub
+        /// `STOW_STATS_SQL_URL` names.
+        pub sql_url: String,
     }
-
-    /// The Analytics Engine SQL API endpoint `run_sql` posts to.
-    const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
 
     /// Run one `stats_*.sql` query through the Analytics Engine SQL API
     /// and decode the `FORMAT JSON` `data` rows it returns.
@@ -201,15 +204,12 @@ mod worker {
     {
         use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
 
-        let url = format!(
-            "{}/{}/analytics_engine/sql",
-            SQL_API_URL, context.account_id
-        );
+        let url = context.sql_url.as_str();
         let authorization = format!("Bearer {}", context.analytics_token);
         let request = SendWrapper::new(
             crate::cf_http::bare_request(
                 skyzen_cloudflare::worker::Method::Post,
-                &url,
+                url,
                 &[("Authorization", authorization.as_str())],
                 Some(sql.as_bytes()),
             )

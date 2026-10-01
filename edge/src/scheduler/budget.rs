@@ -503,6 +503,7 @@ mod tests {
     const MOCK_ONLY_VARS: &[&str] = &[
         "STOW_SCHEDULER_BUDGET",
         "STOW_LOCAL_CI_URL",
+        "STOW_STATS_SQL_URL",
         "STOW_COST_BUDGET_MULTIPLIER",
         "STOW_POW_CHALLENGE_SECRET",
         "STOW_GITHUB_WEBHOOK_SECRET",
