@@ -481,6 +481,30 @@ pub async fn admin_scheduler_budget(
     ))
 }
 
+/// `POST /api/v1/admin/scheduler/reconcile`
+///
+/// The in-flight↔GitHub reconciliation (stow#526): the object lists the
+/// recent `build-crate.yml` runs, classifies every in-flight row
+/// (running / completed-but-unreported / missing), applies the
+/// webhook's own completion transition to the unreported and the
+/// stale-reclaim to the stale missing, and answers the report. The
+/// watchdog posts it every run as its `edge.reconcile_drift` reading —
+/// the report's drift count is the breach — and `stow-admin scheduler
+/// reconcile` is the manual path.
+pub async fn admin_scheduler_reconcile(
+    SchedulerCaller(caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::ReconcileReport>, GetArtifactError> {
+    let report = scheduler_client::reconcile_scheduler(&scheduler).await?;
+    tracing::info!(
+        %caller,
+        in_flight = report.in_flight,
+        drift = report.drift,
+        "scheduler reconcile pass via admin endpoint"
+    );
+    Ok(Json(report))
+}
+
 /// `GET /api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=`
 ///
 /// Queue rows matching the selector, newest transition first — the

@@ -17,6 +17,7 @@ const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_MIGRATE_URL: &str = "https://scheduler.internal/migrate";
 const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
 const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
+const SCHEDULER_RECONCILE_URL: &str = "https://scheduler.internal/reconcile";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -199,6 +200,15 @@ pub async fn scheduler_budget(
     request: &stow_types::api::SchedulerBudgetRequest,
 ) -> Result<stow_types::api::SchedulerBudgetReport, SchedulerClientError> {
     post_json(namespace, SCHEDULER_BUDGET_URL, request).await
+}
+
+/// The in-flight↔GitHub reconcile pass — the report the cron-driven
+/// `POST /api/v1/admin/scheduler/reconcile` (and `stow-admin scheduler
+/// reconcile`) returns (stow#526).
+pub async fn reconcile_scheduler(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::ReconcileReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_RECONCILE_URL, &serde_json::json!({})).await
 }
 
 /// Admin queue listing behind `stow-admin queue list` and the mutation

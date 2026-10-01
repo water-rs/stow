@@ -189,6 +189,143 @@ fn build_dispatch_request(
     .map_err(|error| DispatchError::Network(error.to_string()))
 }
 
+/// The `build-crate.yml` runs a reconcile pass lists — one paginated
+/// call bounded by the in-flight set's age (stow#526).
+///
+/// Production pages the workflow's runs endpoint with
+/// `created=>={since}`, `event=workflow_dispatch` on `main`; the
+/// local-CI dispatcher answers its current run set at `GET /tasks`
+/// instead. `created_since` is the oldest in-flight row's `updated_at`
+/// (`YYYY-MM-DD HH:MM:SS` UTC), rewritten to RFC 3339 for GitHub.
+pub async fn list_build_runs(
+    credential: &DispatchCredential,
+    repo: &str,
+    created_since: Option<&str>,
+    pool: &OutboundPool,
+) -> Result<Vec<stow_types::api::ReconcileRun>, DispatchError> {
+    use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
+
+    match credential {
+        DispatchCredential::LocalCi(local_ci_url) => {
+            let url = format!("{}/tasks", local_ci_url.trim_end_matches('/'));
+            let request = cf_http::bare_request(worker::Method::Get, &url, &[], None)
+                .map_err(|error| DispatchError::Network(error.to_string()))?;
+            let _slot = pool.slot().await;
+            let response = CfFetch
+                .request(&request)
+                .await
+                .map(GuardedResponse::new)
+                .map_err(|error| DispatchError::Network(error.to_string()))?;
+            let status = response.get_ref().status_code();
+            if !(200..300).contains(&status) {
+                return Err(DispatchError::GitHubApi(status));
+            }
+            let mut body = SendWrapper::new(response.into_inner());
+            let page: LocalTasksPage = body
+                .json()
+                .into_send()
+                .await
+                .map_err(|error| DispatchError::Network(format!("decode {url}: {error}")))?;
+            Ok(page
+                .tasks
+                .into_iter()
+                .map(|task| stow_types::api::ReconcileRun {
+                    display_title: task.display_title,
+                    status: task.status,
+                    conclusion: task.conclusion,
+                    run_id: None,
+                    html_url: task.html_url,
+                })
+                .collect())
+        }
+        DispatchCredential::GitHub(token) => {
+            let since = created_since
+                .map(|ts| format!("&created=>={}Z", ts.replacen(' ', "T", 1)))
+                .unwrap_or_default();
+            let bearer = format!("Bearer {}", token.token);
+            let mut runs = Vec::new();
+            for page in 1_u32.. {
+                let url = format!(
+                    "https://api.github.com/repos/{repo}/actions/workflows/{}/runs\
+                     ?event=workflow_dispatch&branch={}&per_page=100&page={page}{since}",
+                    stow_types::trusted_builder::WORKFLOW_FILE,
+                    stow_types::trusted_builder::BRANCH,
+                );
+                let request = cf_http::bare_request(
+                    worker::Method::Get,
+                    &url,
+                    &[
+                        ("Accept", "application/vnd.github+json"),
+                        ("User-Agent", "stow-scheduler"),
+                        ("Authorization", &bearer),
+                    ],
+                    None,
+                )
+                .map_err(|error| DispatchError::Network(error.to_string()))?;
+                let _slot = pool.slot().await;
+                let response = CfFetch
+                    .request(&request)
+                    .await
+                    .map(GuardedResponse::new)
+                    .map_err(|error| DispatchError::Network(error.to_string()))?;
+                let status = response.get_ref().status_code();
+                if !(200..300).contains(&status) {
+                    return Err(DispatchError::GitHubApi(status));
+                }
+                let mut body = SendWrapper::new(response.into_inner());
+                let page_body: WorkflowRunsPage =
+                    body.json().into_send().await.map_err(|error| {
+                        DispatchError::Network(format!("decode {url}: {error}"))
+                    })?;
+                let full_page = page_body.workflow_runs.len() == 100;
+                runs.extend(page_body.workflow_runs.into_iter().map(|run| {
+                    stow_types::api::ReconcileRun {
+                        display_title: run.display_title,
+                        status: run.status,
+                        conclusion: run.conclusion,
+                        run_id: Some(run.id),
+                        html_url: run.html_url,
+                    }
+                }));
+                if !full_page {
+                    return Ok(runs);
+                }
+            }
+            unreachable!("pagination returns on the first short page")
+        }
+    }
+}
+
+/// One `GET /tasks` answer from the local-CI dispatcher — the runs it
+/// currently tracks, newest dispatch first.
+#[derive(serde::Deserialize)]
+struct LocalTasksPage {
+    tasks: Vec<LocalTaskRun>,
+}
+
+#[derive(serde::Deserialize)]
+struct LocalTaskRun {
+    display_title: String,
+    status: String,
+    conclusion: Option<String>,
+    html_url: Option<String>,
+}
+
+/// One page of the GitHub Actions runs list.
+#[derive(serde::Deserialize)]
+struct WorkflowRunsPage {
+    workflow_runs: Vec<WorkflowRunRow>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkflowRunRow {
+    id: u64,
+    display_title: String,
+    status: String,
+    conclusion: Option<String>,
+    html_url: Option<String>,
+}
+
 fn build_local_dispatch_request(
     url: &str,
     payload: &serde_json::Value,

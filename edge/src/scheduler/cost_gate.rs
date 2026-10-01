@@ -319,6 +319,18 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
+    // The in-flight↔GitHub reconcile pass (stow#526): the in-flight
+    // scan is bounded by the dispatch cap, per-completion applies are
+    // the `complete-run` work above, and the stale reclaim is the same
+    // whole-table UPDATE the alarm owes.
+    RouteBudget {
+        name: "POST /reconcile",
+        statements: 20,
+        rows_read: 150,
+        rows_written: 12,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
     // The alarm's dispatch pass on a warm queue: the claim pages at
     // `2 × open slots` candidate rows and claims them, so the pass's
     // read is bounded by the dispatch cap plus the fixed probes,

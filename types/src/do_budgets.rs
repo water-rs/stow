@@ -255,6 +255,18 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
+        // The in-flight↔GitHub reconcile pass (stow#526): in-flight scan
+        // bounded by the dispatch cap, one paginated runs GET, a records
+        // check per completed match, `complete_run` applies and the
+        // whole-table stale reclaim — wall includes the serialized
+        // fetches and the drift notify.
+        name: "POST /reconcile",
+        statements: 40,
+        rows_read: 800,
+        rows_written: 80,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
         // The full dispatch pass: binding reads, the claim paged at
         // `2 × open slots`, the per-page catalog coverage lookup (a
         // counted-D1 read, not object rows), the per-claim UPDATE and

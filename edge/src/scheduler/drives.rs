@@ -630,6 +630,20 @@ pub const DRIVES: &[Drive] = &[
         },
     },
     Drive {
+        // The in-flight↔GitHub reconcile pass (stow#526): the in-flight
+        // scan is bounded by the dispatch cap, not by the queue — the
+        // run list arrives as data (one paginated fetch the wall meter
+        // prices), and each row's apply is the per-completion
+        // `complete_run` plus the whole-table stale reclaim. On wasm the
+        // real `reconcile::pass` (local-CI task listing, records
+        // checks); on host the queue layer with a fabricated run list
+        // covering all three classifications.
+        name: "POST /reconcile",
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move { reconcile_drive(db, settings, ctx).await })
+        },
+    },
+    Drive {
         // One dispatch pass end to end — on wasm the real
         // `dispatch_pass` (`object.rs`): binding resolution, the claim
         // paged at `2 × open slots` rows with its per-page catalog
@@ -657,6 +671,84 @@ pub const DRIVES: &[Drive] = &[
         },
     },
 ];
+
+/// The reconcile pass exactly as `POST /reconcile` runs it. The host
+/// gate fabricates the run list the wasm side fetches live — one
+/// completed match, one stale missing row, `in_progress` runs for the
+/// rest — so the queue layer's classify/apply/reclaim all run.
+async fn reconcile_drive(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let env = ctx
+            .env
+            .as_ref()
+            .ok_or_else(|| "reconcile drive needs a Worker env".to_owned())?;
+        super::reconcile::pass(env, db, settings, 60)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = ctx;
+        let rows = queue::reconcile_in_flight_rows(db, settings)
+            .await
+            .map_err(|error| error.to_string())?;
+        if rows.len() < 2 {
+            return Err("reconcile drive needs ≥2 in-flight fixture rows".to_owned());
+        }
+        // `complete_id` matches a completed run; `stale_id` gets no run
+        // and sits past the reclaim lease; the rest get `in_progress`
+        // runs. The re-read reorders `updated_at`-oldest first, so the
+        // picks stay by task id rather than position.
+        let complete_id = rows[0].task_id.clone();
+        let stale_id = rows[1].task_id.clone();
+        db.query("UPDATE queue SET updated_at = datetime('now', '-2 hours') WHERE task_id = ?")
+            .bind(stale_id.clone())
+            .execute()
+            .await
+            .map_err(|error| error.to_string())?;
+        let rows = queue::reconcile_in_flight_rows(db, settings)
+            .await
+            .map_err(|error| error.to_string())?;
+        let runs: Vec<stow_types::api::ReconcileRun> = rows
+            .iter()
+            .filter(|row| row.task_id != stale_id)
+            .map(|row| stow_types::api::ReconcileRun {
+                display_title: stow_types::records::run_title(&row.rustc_version, &row.task_id),
+                status: if row.task_id == complete_id {
+                    "completed".to_owned()
+                } else {
+                    "in_progress".to_owned()
+                },
+                conclusion: (row.task_id == complete_id).then(|| "success".to_owned()),
+                run_id: Some(10000),
+                html_url: None,
+            })
+            .collect();
+        let completions = vec![queue::ReconcileCompletion {
+            task_id: complete_id.clone(),
+            completion: Ok(stow_types::api::WorkflowRunComplete {
+                task_id: complete_id,
+                success: true,
+                error: None,
+                github_run_id: Some("10000".to_owned()),
+            }),
+        }];
+        let report = queue::reconcile_in_flight(db, settings, &rows, &runs, &completions, 60)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !(report.completions_applied == 1 && report.reclaimed == 1) {
+            return Err(format!(
+                "reconcile drive expected 1 completion + 1 reclaim, got {report:?}"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// One dispatch pass exactly as `run_alarm` runs it, minus the metering
 /// tail. `idle` pauses dispatch inside the pass — the claim early-outs

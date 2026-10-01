@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 use skyzen_cloudflare::CfD1;
 use skyzen_services::Db;
-use stow_types::api::SchemaMigrationReport;
+use stow_types::api::{ReconcileReport, SchemaMigrationReport};
 
 use crate::db;
 use crate::errors::QueueError;
@@ -24,7 +24,7 @@ use crate::github_app;
 use crate::scheduler::budget;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
-use crate::scheduler::{dispatch, queue};
+use crate::scheduler::{dispatch, queue, reconcile};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 /// The catalog D1 binding — `pub(super)` so the budget probe's counted
@@ -39,7 +39,9 @@ const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
-const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
+/// `pub(super)` so the reconcile pass's run listing reads the same
+/// repository binding the dispatch pass dispatches into.
+pub(super) const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 const STOW_FREEZE_WINDOW_MINUTES_BINDING: &str = "STOW_FREEZE_WINDOW_MINUTES";
 const STOW_FREEZE_MIN_OUTCOMES_BINDING: &str = "STOW_FREEZE_MIN_OUTCOMES";
 const STOW_FREEZE_FAIL_PERCENT_BINDING: &str = "STOW_FREEZE_FAIL_PERCENT";
@@ -184,6 +186,11 @@ impl DurableObject for Scheduler {
             // carry; production requests hit the guard and 404.
             "/budget".post(scheduler_budget),
             "/budget/seed".post(scheduler_budget_seed),
+            // The in-flight↔GitHub reconciliation report (stow#526) —
+            // the scheduled operator pass that repairs a lost
+            // `workflow_run` delivery without waiting for the stale
+            // lease.
+            "/reconcile".post(reconcile),
             // A nested Route under the root — the outer tuple caps at
             // 15 nodes.
             Route::new(("/dispatch-freeze"
@@ -210,6 +217,22 @@ async fn migrate_scheduler(env: WasmEnv, db: DurableDb) -> Result<Json<SchemaMig
         after = report.after,
         "scheduler schema migrated"
     );
+    Ok(Json(report))
+}
+
+/// `POST /reconcile` — list the recent `build-crate.yml` runs, classify
+/// every in-flight row against them (running / completed-but-unreported
+/// / missing), apply the webhook's own completion transition to the
+/// unreported and the stale-reclaim to the stale missing, and answer
+/// the report. Reached from `POST /api/v1/admin/scheduler/reconcile`,
+/// which the watchdog posts every run as its `edge.reconcile_drift`
+/// reading (stow#526).
+async fn reconcile(env: WasmEnv, db: DurableDb) -> Result<Json<ReconcileReport>> {
+    let settings = scheduler_settings(&env)?;
+    let freeze = freeze_settings(&env)?;
+    let report = reconcile::pass(&env, &db, &settings, freeze.window_minutes)
+        .await
+        .map_err(to_error)?;
     Ok(Json(report))
 }
 
@@ -941,7 +964,7 @@ async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static
 
 /// Where a dispatch pass sends claimed tasks, resolved from the Worker's
 /// bindings before anything is claimed.
-enum CredentialSource {
+pub(super) enum CredentialSource {
     /// `STOW_LOCAL_CI_URL` — posts to the local dispatcher, which needs
     /// none of the GitHub App bindings.
     LocalCi(String),
@@ -1018,7 +1041,7 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
 /// The credential arm a dispatch resolves — `STOW_LOCAL_CI_URL` for the
 /// mock stack, the GitHub App bindings otherwise. Shared by the alarm's
 /// dispatch pass and the request lane's inline admit dispatch.
-fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
+pub(super) fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
     Ok(
         match read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING) {
             Some(url) => CredentialSource::LocalCi(loopback_url("STOW_LOCAL_CI_URL", &url)?),
@@ -1133,7 +1156,7 @@ async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<
     Ok(())
 }
 
-fn read_string_binding(env: &WasmEnv, binding_name: &str) -> Result<String> {
+pub(super) fn read_string_binding(env: &WasmEnv, binding_name: &str) -> Result<String> {
     let value = Reflect::get(env.as_js(), &JsValue::from_str(binding_name))
         .map_err(|error| Error::msg(format!("{error:?}")))?;
     value.as_string().ok_or_else(|| {

@@ -353,47 +353,22 @@ async fn complete_build_task(
     rustc_version: &str,
     task_id: &str,
 ) -> Result<(), GetArtifactError> {
-    let mut success = run.conclusion.as_deref() == Some("success");
-    let mut error = None;
-    if success {
-        match records_artifact_exists(ghcr, rustc_version, task_id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                success = false;
-                error = Some(format!(
-                    "GitHub reports success but the records artifact for task {task_id} is not in GHCR"
-                ));
-                tracing::error!(task_id, "successful run produced no records artifact");
-            }
-            Err(fetch_error) => {
-                // A registry hiccup is transient: answer 500 so GitHub's
-                // redelivery retries the completion instead of dropping it.
-                tracing::warn!(task_id, %fetch_error, "records artifact check failed");
-                return Err(GetArtifactError::InternalWithMessage(format!(
-                    "verify records artifact for {task_id}: {fetch_error}"
-                )));
-            }
-        }
-    } else {
-        error = Some(format!(
-            "workflow run concluded `{}`{}",
-            run.conclusion.as_deref().unwrap_or("<none>"),
-            run.html_url
-                .as_deref()
-                .map(|url| format!(" ({url})"))
-                .unwrap_or_default()
-        ));
-    }
-
-    let completion = WorkflowRunComplete {
-        task_id: task_id.to_owned(),
-        success,
-        error,
-        github_run_id: Some(run.id.to_string()),
-    };
+    let completion = build_run_completion(
+        ghcr,
+        rustc_version,
+        task_id,
+        run.conclusion.as_deref(),
+        Some(run.id),
+        run.html_url.as_deref(),
+    )
+    .await?;
     match scheduler_client::send_run_complete(scheduler, &completion).await {
         Ok(()) => {
-            tracing::info!(task_id, success, "workflow_run completion applied");
+            tracing::info!(
+                task_id,
+                completion.success,
+                "workflow_run completion applied"
+            );
         }
         // The queue's 404/409 mean the task is not live for this event —
         // consumed, never an error back to GitHub.
@@ -411,6 +386,59 @@ async fn complete_build_task(
         }
     }
     Ok(())
+}
+
+/// The `WorkflowRunComplete` a finished `build-crate.yml` run becomes —
+/// the verdict `complete_build_task` forwards and the reconcile pass
+/// builds for completed-but-unreported rows (stow#526), kept in one
+/// place so both apply the identical success rule: `conclusion` must be
+/// `success` *and* the task's records artifact must exist in GHCR,
+/// while a registry fetch error aborts rather than guessing.
+#[cfg(target_arch = "wasm32")]
+pub async fn build_run_completion(
+    ghcr: &GhcrConfig,
+    rustc_version: &str,
+    task_id: &str,
+    conclusion: Option<&str>,
+    run_id: Option<u64>,
+    html_url: Option<&str>,
+) -> Result<WorkflowRunComplete, GetArtifactError> {
+    let mut success = conclusion == Some("success");
+    let mut error = None;
+    if success {
+        match records_artifact_exists(ghcr, rustc_version, task_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                success = false;
+                error = Some(format!(
+                    "GitHub reports success but the records artifact for task {task_id} is not in GHCR"
+                ));
+                tracing::error!(task_id, "successful run produced no records artifact");
+            }
+            Err(fetch_error) => {
+                // A registry hiccup is transient: the caller retries —
+                // the webhook answers 500 so GitHub redelivers, and
+                // reconcile reports the row unapplied.
+                tracing::warn!(task_id, %fetch_error, "records artifact check failed");
+                return Err(GetArtifactError::InternalWithMessage(format!(
+                    "verify records artifact for {task_id}: {fetch_error}"
+                )));
+            }
+        }
+    } else {
+        error = Some(format!(
+            "workflow run concluded `{}`{}",
+            conclusion.unwrap_or("<none>"),
+            html_url.map(|url| format!(" ({url})")).unwrap_or_default()
+        ));
+    }
+
+    Ok(WorkflowRunComplete {
+        task_id: task_id.to_owned(),
+        success,
+        error,
+        github_run_id: run_id.map(|id| id.to_string()),
+    })
 }
 
 /// `resolve-request.yml` `in_progress`/`completed` — the request

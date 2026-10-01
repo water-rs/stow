@@ -7,6 +7,11 @@
 pub mod meter;
 pub mod queue;
 
+/// `POST /reconcile` — the in-flight↔GitHub drift report (stow#526).
+/// The alert rendering compiles on every target like `queue`; the
+/// fetch-and-apply orchestration inside is wasm-gated.
+pub mod reconcile;
+
 /// The production-shaped fixture: host tests and the workerd budget
 /// probe both seed it, so the module builds on both targets.
 #[cfg(any(test, target_arch = "wasm32"))]

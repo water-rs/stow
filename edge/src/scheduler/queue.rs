@@ -6,8 +6,9 @@ use skyzen_services::durable::{DbValue, DurableDb};
 pub use stow_types::api::task_id;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
-    QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus,
-    SchemaMigrationReport, TaskLane, runner_family,
+    QueueSelector, QueueTask, QueueTaskStatus, ReconcileApplied, ReconcileClass, ReconcileReport,
+    ReconcileRowReport, ReconcileRun, ReconcileRunMatch, RequestStatus, RunnerFamily,
+    SchedulerStatus, SchemaMigrationReport, TaskLane, WorkflowRunComplete, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -3371,6 +3372,386 @@ impl AdminInFlightRow {
     }
 }
 
+/// One in-flight queue row as the reconcile pass reads it — the
+/// `run-name` match fields plus `stale`, stamped by the same
+/// `updated_at <= now - STOW_STALE_DISPATCH_MINUTES` predicate
+/// [`recover_stale_active_tasks`] reclaims on, so the row's flag and
+/// the reclaim's WHERE never disagree.
+#[derive(Debug, Clone)]
+pub struct ReconcileInFlight {
+    /// Scheduler task identifier.
+    pub task_id: String,
+    /// Crate name to build.
+    pub crate_name: String,
+    /// Crate version to build.
+    pub version: String,
+    /// Compilation target.
+    pub target: String,
+    /// Rustc version the row builds for.
+    pub rustc_version: String,
+    /// Lifecycle status the row held when read (`dispatched`/`running`).
+    pub status: String,
+    /// Last state-transition timestamp — the lease clock.
+    pub updated_at: String,
+    /// Whether the row was past the stale-dispatch lease when read.
+    pub stale: bool,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct ReconcileInFlightRow {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    target: String,
+    rustc_version: String,
+    status: String,
+    updated_at: String,
+    stale: i64,
+}
+
+/// The in-flight set the reconcile pass works over — `dispatched` and
+/// `running` rows, oldest transition first so `rows[0].updated_at` is
+/// the `created>=` bound the caller's run listing takes. Bounded by the
+/// dispatch cap, not by queue size.
+pub async fn reconcile_in_flight_rows(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Vec<ReconcileInFlight>, QueueError> {
+    let rows = db
+        .query(
+            "SELECT task_id, crate_name, version, target, rustc_version, status, \
+             updated_at, (updated_at <= datetime('now', ?)) AS stale \
+             FROM queue WHERE status IN ('dispatched', 'running') \
+             ORDER BY updated_at",
+        )
+        .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
+        .fetch_all::<ReconcileInFlightRow>()
+        .await
+        .map_err(|error| format!("list in-flight tasks for reconcile: {error}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ReconcileInFlight {
+            task_id: row.task_id,
+            crate_name: row.crate_name,
+            version: row.version,
+            target: row.target,
+            rustc_version: row.rustc_version,
+            status: row.status,
+            updated_at: row.updated_at,
+            stale: row.stale != 0,
+        })
+        .collect())
+}
+
+/// The newest listed run whose `display_title` parses to `row`'s
+/// `<rustc>-<task_id>` — a redispatched task produces several runs on
+/// the same name, and the highest run id is the current attempt.
+fn match_run<'a>(row: &ReconcileInFlight, runs: &'a [ReconcileRun]) -> Option<&'a ReconcileRun> {
+    runs.iter()
+        .filter(|run| {
+            stow_types::records::parse_run_title(&run.display_title).is_some_and(
+                |(rustc, task_id)| task_id == row.task_id && rustc == row.rustc_version,
+            )
+        })
+        .max_by_key(|run| run.run_id.unwrap_or(0))
+}
+
+/// An in-flight row whose newest matching run is `completed` — owed the
+/// [`WorkflowRunComplete`] verdict the webhook would have posted. The
+/// caller resolves each into a [`ReconcileCompletion`] for
+/// [`reconcile_in_flight`]. Fields are owned (the set is bounded by the
+/// dispatch cap): the resolve runs as a concurrent stream, and futures
+/// may not borrow the rows or run list.
+pub struct ReconcilePending {
+    /// The queue row's task id.
+    pub task_id: String,
+    /// The queue row's rustc — the records check's `records-<rustc>-…` leg.
+    pub rustc_version: String,
+    /// The newest matching run.
+    pub run: ReconcileRun,
+}
+
+/// Every in-flight row whose newest matching run already finished —
+/// the completed-but-unreported candidates the caller resolves
+/// verdicts for.
+pub fn reconcile_pending(
+    rows: &[ReconcileInFlight],
+    runs: &[ReconcileRun],
+) -> Vec<ReconcilePending> {
+    rows.iter()
+        .filter_map(|row| {
+            let run = match_run(row, runs)?;
+            (run.status == "completed").then(|| ReconcilePending {
+                task_id: row.task_id.clone(),
+                rustc_version: row.rustc_version.clone(),
+                run: run.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The caller-resolved verdict for one [`ReconcilePending`] row:
+/// `Ok` carries the `WorkflowRunComplete` the webhook would have
+/// posted; `Err` carries the reason the verdict could not be built
+/// (the records check failed) and the row reports unapplied with it.
+pub struct ReconcileCompletion {
+    /// The queue row's task id.
+    pub task_id: String,
+    /// The resolved verdict, or the resolution's failure text.
+    pub completion: Result<WorkflowRunComplete, String>,
+}
+
+/// One row's classified outcome — the report fields plus the truth the
+/// reclaim marking needs (`remained_in_flight` is whether the row was
+/// still `dispatched`/`running` once its apply finished) and the two
+/// counters the report folds up.
+struct RowVerdict {
+    classification: ReconcileClass,
+    applied: ReconcileApplied,
+    detail: Option<String>,
+    /// The row was still in flight when its classification work ended —
+    /// the flag that decides which stale rows the whole-table reclaim
+    /// UPDATE actually flipped.
+    remained_in_flight: bool,
+    /// `complete_run` landed on this row.
+    completed: bool,
+    /// The apply could not land (records check, or a raced row).
+    failed: bool,
+}
+
+impl RowVerdict {
+    /// No matching run — the stale lease decides whether the reclaim
+    /// moves it.
+    const fn missing() -> Self {
+        Self {
+            classification: ReconcileClass::Missing,
+            applied: ReconcileApplied::Unchanged,
+            detail: None,
+            remained_in_flight: true,
+            completed: false,
+            failed: false,
+        }
+    }
+
+    /// The newest matching run is still executing.
+    const fn running() -> Self {
+        Self {
+            classification: ReconcileClass::Running,
+            applied: ReconcileApplied::Unchanged,
+            detail: None,
+            remained_in_flight: true,
+            completed: false,
+            failed: false,
+        }
+    }
+
+    /// A completed match's outcome shape — the caller fills `applied`,
+    /// `detail` and `remained_in_flight` per apply result.
+    const fn completed_unreported(
+        applied: ReconcileApplied,
+        detail: Option<String>,
+        remained_in_flight: bool,
+        completed: bool,
+        failed: bool,
+    ) -> Self {
+        Self {
+            classification: ReconcileClass::CompletedUnreported,
+            applied,
+            detail,
+            remained_in_flight,
+            completed,
+            failed,
+        }
+    }
+}
+
+/// The completed-run branch: apply the webhook's own [`complete_run`]
+/// transition to `row`'s resolved verdict. The races the webhook meets
+/// report as unapplied detail rather than errors — a concurrent
+/// delivery landing first is the row converging, not a failure.
+async fn apply_completed_verdict(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    row: &ReconcileInFlight,
+    completions: &[ReconcileCompletion],
+    window_minutes: u32,
+) -> Result<RowVerdict, QueueError> {
+    let verdict = completions
+        .iter()
+        .find(|completion| completion.task_id == row.task_id)
+        .ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "reconcile missing resolved completion for task {}",
+                row.task_id
+            ))
+        })?;
+    match &verdict.completion {
+        Err(verdict_error) => Ok(RowVerdict::completed_unreported(
+            ReconcileApplied::Unchanged,
+            Some(format!("records check failed: {verdict_error}")),
+            true,
+            false,
+            true,
+        )),
+        Ok(report) => match complete_run(db, settings, report, window_minutes).await {
+            Ok(()) => Ok(RowVerdict::completed_unreported(
+                ReconcileApplied::Completed,
+                None,
+                false,
+                true,
+                false,
+            )),
+            // The row moved between the scan and the apply — a
+            // concurrent webhook delivery landed first, so nothing is
+            // owed anymore.
+            Err(QueueError::UnknownTask(task_id)) => Ok(RowVerdict::completed_unreported(
+                ReconcileApplied::Unchanged,
+                Some(format!(
+                    "row moved before the apply: task {task_id} is gone"
+                )),
+                false,
+                false,
+                true,
+            )),
+            Err(QueueError::StaleCompletion { ref row_status, .. }) => {
+                Ok(RowVerdict::completed_unreported(
+                    ReconcileApplied::Unchanged,
+                    Some("row moved before the apply".to_owned()),
+                    row_status.as_str() == "dispatched" || row_status.as_str() == "running",
+                    false,
+                    true,
+                ))
+            }
+            Err(error) => Err(error),
+        },
+    }
+}
+
+/// The row's report record — the stored identity strings reparsed into
+/// the wire types; a queue row that does not parse is an invariant
+/// breach, not data to report around.
+fn reconcile_row_report(
+    row: &ReconcileInFlight,
+    matched: Option<&ReconcileRun>,
+    verdict: &RowVerdict,
+) -> Result<ReconcileRowReport, QueueError> {
+    Ok(ReconcileRowReport {
+        task_id: row.task_id.clone(),
+        crate_name: CrateName::parse(row.crate_name.clone()).map_err(|error| {
+            QueueError::Invariant(format!("task {} stored crate_name: {error}", row.task_id))
+        })?,
+        version: CrateVersion::new(semver::Version::parse(&row.version).map_err(|error| {
+            QueueError::Invariant(format!(
+                "task {} stored version `{}`: {error}",
+                row.task_id, row.version
+            ))
+        })?),
+        target: TargetTriple::parse(row.target.clone()).map_err(|error| {
+            QueueError::Invariant(format!("task {} stored target: {error}", row.task_id))
+        })?,
+        rustc_version: WireRustcVersion::parse(row.rustc_version.clone()).map_err(|error| {
+            QueueError::Invariant(format!(
+                "task {} stored rustc_version: {error}",
+                row.task_id
+            ))
+        })?,
+        status: QueueTaskStatus::parse(&row.status).ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "task {} stored unknown status `{}`",
+                row.task_id, row.status
+            ))
+        })?,
+        stale: row.stale,
+        classification: verdict.classification,
+        run: matched.map(|run| ReconcileRunMatch {
+            run_id: run.run_id,
+            status: run.status.clone(),
+            conclusion: run.conclusion.clone(),
+            url: run.html_url.clone(),
+        }),
+        applied: verdict.applied,
+        detail: verdict.detail.clone(),
+    })
+}
+
+/// The reconcile pass (stow#526): classify every in-flight row against
+/// the listed `build-crate.yml` runs, apply the webhook's own
+/// completion transition ([`complete_run`]) to completed-but-unreported
+/// rows, send stale missing rows through the existing stale-reclaim
+/// path, and return the per-row report.
+///
+/// `completions` must cover every [`reconcile_pending`] entry — an
+/// absent verdict for a completed match is [`QueueError::Invariant`],
+/// never a silent skip.
+pub async fn reconcile_in_flight(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    rows: &[ReconcileInFlight],
+    runs: &[ReconcileRun],
+    completions: &[ReconcileCompletion],
+    window_minutes: u32,
+) -> Result<ReconcileReport, QueueError> {
+    let mut report_rows = Vec::with_capacity(rows.len());
+    let mut remained_in_flight = Vec::with_capacity(rows.len());
+    let mut running = 0_u32;
+    let mut completed_unreported = 0_u32;
+    let mut missing = 0_u32;
+    let mut completions_applied = 0_u32;
+    let mut completion_failures = 0_u32;
+    for row in rows {
+        let matched = match_run(row, runs);
+        let verdict = match matched {
+            None => {
+                missing += 1;
+                RowVerdict::missing()
+            }
+            Some(run) if run.status == "completed" => {
+                completed_unreported += 1;
+                apply_completed_verdict(db, settings, row, completions, window_minutes).await?
+            }
+            Some(_) => {
+                running += 1;
+                RowVerdict::running()
+            }
+        };
+        completions_applied += u32::from(verdict.completed);
+        completion_failures += u32::from(verdict.failed);
+        remained_in_flight.push(verdict.remained_in_flight);
+        report_rows.push(reconcile_row_report(row, matched, &verdict)?);
+    }
+    // Missing rows past the stale lease go through the same
+    // whole-table reclaim the alarm runs — its WHERE is the `stale`
+    // flag each row already carries, and a running row past the same
+    // lease rides along exactly as it would on an alarm wake.
+    let mut reclaimed = 0_u32;
+    if report_rows
+        .iter()
+        .any(|report| report.classification == ReconcileClass::Missing && report.stale)
+    {
+        recover_stale_active_tasks(db, settings).await?;
+        for (report, remained) in report_rows.iter_mut().zip(&remained_in_flight) {
+            if report.stale && *remained {
+                report.applied = ReconcileApplied::Reclaimed;
+                reclaimed += 1;
+            }
+        }
+    }
+    let created_since = rows.first().map(|row| row.updated_at.clone());
+    Ok(ReconcileReport {
+        in_flight: u64_to_u32(rows.len() as u64, "in-flight count")?,
+        runs_listed: u64_to_u32(runs.len() as u64, "listed run count")?,
+        created_since,
+        running,
+        completed_unreported,
+        missing,
+        completions_applied,
+        completion_failures,
+        reclaimed,
+        drift: completed_unreported > 0 || missing > 0,
+        rows: report_rows,
+    })
+}
+
 /// One `GROUP BY target, status` outcome row for [`admin_status`].
 #[derive(Debug, skyzen::FromRow)]
 struct TargetOutcomeRow {
@@ -5300,12 +5681,13 @@ mod sqlite_tests {
     use stow_types::identity::FeaturesJson;
 
     use super::{
-        AlarmPlan, CoverageOracle, Dispatch, SchedulerSettings, SemanticTaskIdentity, next_alarm,
-        task_id,
+        AlarmPlan, CoverageOracle, Dispatch, ReconcileCompletion, SchedulerSettings,
+        SemanticTaskIdentity, next_alarm, task_id,
     };
     use crate::errors::QueueError;
     use crate::scheduler::test_db::{counting_memory_db, memory_db, memory_db_raw};
     use skyzen_services::durable::DurableDb;
+    use stow_types::api::{ReconcileApplied, ReconcileClass, ReconcileRun, WorkflowRunComplete};
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
     const fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
@@ -9652,5 +10034,308 @@ mod sqlite_tests {
         .await
         .expect_err("attempt 2 is stale");
         assert!(matches!(error, QueueError::RequestAttemptSuperseded { .. }));
+    }
+
+    // --- reconcile (stow#526) -----------------------------------------
+
+    fn reconcile_run(task_id: &str, status: &str, run_id: u64) -> ReconcileRun {
+        ReconcileRun {
+            display_title: stow_types::records::run_title(RUSTC, task_id),
+            status: status.to_owned(),
+            conclusion: (status == "completed").then(|| "success".to_owned()),
+            run_id: Some(run_id),
+            html_url: Some(format!("https://github.com/x/runs/{run_id}")),
+        }
+    }
+
+    fn ok_completion(task_id: &str, run_id: &str) -> ReconcileCompletion {
+        ReconcileCompletion {
+            task_id: task_id.to_owned(),
+            completion: Ok(WorkflowRunComplete {
+                task_id: task_id.to_owned(),
+                success: true,
+                error: None,
+                github_run_id: Some(run_id.to_owned()),
+            }),
+        }
+    }
+
+    async fn queue_status(db: &DurableDb, task_id: &str) -> String {
+        db.query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(task_id.to_owned())
+            .fetch_scalar::<String>()
+            .await
+            .expect("queue status")
+    }
+
+    /// `mark_active` stamps a fixed past `updated_at`, which makes the
+    /// row stale — a non-stale in-flight row needs a live timestamp.
+    async fn mark_fresh(db: &DurableDb, crate_name: &str, status: &str) {
+        db.query("UPDATE queue SET status = ?, updated_at = datetime('now') WHERE task_id = ?")
+            .bind(status.to_owned())
+            .bind(task_id_on(crate_name, TARGET))
+            .execute()
+            .await
+            .expect("mark task fresh");
+    }
+
+    #[tokio::test]
+    async fn reconcile_running_run_reports_running() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_fresh(&db, "alpha", "dispatched").await;
+        let task_id = task_id_on("alpha", TARGET);
+        let rows = super::reconcile_in_flight_rows(&db, &settings())
+            .await
+            .expect("rows");
+        let runs = vec![reconcile_run(&task_id, "in_progress", 7)];
+        let report =
+            super::reconcile_in_flight(&db, &settings(), &rows, &runs, &[], TEST_WINDOW_MINUTES)
+                .await
+                .expect("reconcile");
+        assert_eq!(report.in_flight, 1);
+        assert_eq!(report.running, 1);
+        assert_eq!(report.completed_unreported, 0);
+        assert_eq!(report.missing, 0);
+        assert!(!report.drift);
+        assert_eq!(report.rows[0].classification, ReconcileClass::Running);
+        assert_eq!(report.rows[0].applied, ReconcileApplied::Unchanged);
+        assert_eq!(
+            report.rows[0].run.as_ref().map(|run| run.run_id),
+            Some(Some(7))
+        );
+        assert_eq!(queue_status(&db, &task_id).await, "dispatched");
+    }
+
+    #[tokio::test]
+    async fn reconcile_completed_run_applies_webhook_transition() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("beta", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_fresh(&db, "beta", "running").await;
+        let task_id = task_id_on("beta", TARGET);
+        let rows = super::reconcile_in_flight_rows(&db, &settings())
+            .await
+            .expect("rows");
+        let runs = vec![reconcile_run(&task_id, "completed", 42)];
+        let completions = vec![ok_completion(&task_id, "42")];
+        let report = super::reconcile_in_flight(
+            &db,
+            &settings(),
+            &rows,
+            &runs,
+            &completions,
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("reconcile");
+        assert_eq!(report.completed_unreported, 1);
+        assert_eq!(report.completions_applied, 1);
+        assert!(report.drift);
+        assert_eq!(
+            report.rows[0].classification,
+            ReconcileClass::CompletedUnreported
+        );
+        assert_eq!(report.rows[0].applied, ReconcileApplied::Completed);
+        // The row completed exactly as if the webhook had delivered.
+        assert_eq!(queue_status(&db, &task_id).await, "completed");
+    }
+
+    #[tokio::test]
+    async fn reconcile_completed_run_with_failed_verdict_retries_row() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("gamma", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_fresh(&db, "gamma", "dispatched").await;
+        let task_id = task_id_on("gamma", TARGET);
+        let rows = super::reconcile_in_flight_rows(&db, &settings())
+            .await
+            .expect("rows");
+        let runs = vec![reconcile_run(&task_id, "completed", 9)];
+        let completions = vec![ReconcileCompletion {
+            task_id: task_id.clone(),
+            completion: Ok(WorkflowRunComplete {
+                task_id: task_id.clone(),
+                success: false,
+                error: Some("workflow run concluded `failure`".to_owned()),
+                github_run_id: Some("9".to_owned()),
+            }),
+        }];
+        let report = super::reconcile_in_flight(
+            &db,
+            &settings(),
+            &rows,
+            &runs,
+            &completions,
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("reconcile");
+        assert_eq!(report.completions_applied, 1);
+        assert_eq!(report.rows[0].applied, ReconcileApplied::Completed);
+        // The failed verdict lands the same transition the webhook
+        // would have: under the failure lifecycle the first failure
+        // re-queues `pending` for the retry, below the attempt cap.
+        assert_eq!(queue_status(&db, &task_id).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_check_failure_leaves_row_unapplied() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("delta", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_fresh(&db, "delta", "dispatched").await;
+        let task_id = task_id_on("delta", TARGET);
+        let rows = super::reconcile_in_flight_rows(&db, &settings())
+            .await
+            .expect("rows");
+        let runs = vec![reconcile_run(&task_id, "completed", 11)];
+        // The caller could not build a verdict — the row stays
+        // in flight and the report carries the reason.
+        let completions = vec![ReconcileCompletion {
+            task_id: task_id.clone(),
+            completion: Err("registry unreachable".to_owned()),
+        }];
+        let report = super::reconcile_in_flight(
+            &db,
+            &settings(),
+            &rows,
+            &runs,
+            &completions,
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("reconcile");
+        assert_eq!(report.completions_applied, 0);
+        assert_eq!(report.completion_failures, 1);
+        assert_eq!(report.rows[0].applied, ReconcileApplied::Unchanged);
+        assert!(
+            report.rows[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("registry unreachable"))
+        );
+        assert_eq!(queue_status(&db, &task_id).await, "dispatched");
+    }
+
+    #[tokio::test]
+    async fn reconcile_missing_fresh_row_reports_missing_without_reclaim() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("epsilon", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_fresh(&db, "epsilon", "dispatched").await;
+        let task_id = task_id_on("epsilon", TARGET);
+        let rows = super::reconcile_in_flight_rows(&db, &settings())
+            .await
+            .expect("rows");
+        let report =
+            super::reconcile_in_flight(&db, &settings(), &rows, &[], &[], TEST_WINDOW_MINUTES)
+                .await
+                .expect("reconcile");
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.reclaimed, 0);
+        assert!(report.drift);
+        assert!(!report.rows[0].stale);
+        assert_eq!(report.rows[0].classification, ReconcileClass::Missing);
+        assert_eq!(report.rows[0].applied, ReconcileApplied::Unchanged);
+        assert_eq!(queue_status(&db, &task_id).await, "dispatched");
+    }
+
+    #[tokio::test]
+    async fn reconcile_missing_stale_row_goes_through_stale_reclaim() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("zeta", Vec::new())])
+            .await
+            .expect("enqueue");
+        // mark_active stamps the fixed past ROW_TS — stale under the
+        // 60-minute test lease.
+        mark_active(&db, "zeta", TARGET, "dispatched").await;
+        let task_id = task_id_on("zeta", TARGET);
+        let rows = super::reconcile_in_flight_rows(&db, &settings())
+            .await
+            .expect("rows");
+        assert!(rows[0].stale);
+        let report =
+            super::reconcile_in_flight(&db, &settings(), &rows, &[], &[], TEST_WINDOW_MINUTES)
+                .await
+                .expect("reconcile");
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.reclaimed, 1);
+        assert_eq!(report.rows[0].applied, ReconcileApplied::Reclaimed);
+        // The row re-entered `pending` via the shared reclaim function.
+        assert_eq!(queue_status(&db, &task_id).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn reconcile_matches_the_newest_run_for_a_task() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("eta", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_fresh(&db, "eta", "dispatched").await;
+        let task_id = task_id_on("eta", TARGET);
+        let rows = super::reconcile_in_flight_rows(&db, &settings())
+            .await
+            .expect("rows");
+        // A redispatch leaves an older completed run on the same name —
+        // the highest run id is the live attempt, so the row is running.
+        let runs = vec![
+            reconcile_run(&task_id, "completed", 10),
+            reconcile_run(&task_id, "in_progress", 20),
+        ];
+        let report =
+            super::reconcile_in_flight(&db, &settings(), &rows, &runs, &[], TEST_WINDOW_MINUTES)
+                .await
+                .expect("reconcile");
+        assert_eq!(report.running, 1);
+        assert_eq!(report.completed_unreported, 0);
+        assert_eq!(report.rows[0].classification, ReconcileClass::Running);
+        assert_eq!(
+            report.rows[0].run.as_ref().map(|run| run.run_id),
+            Some(Some(20))
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_ignores_runs_that_do_not_belong_to_the_row() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("theta", Vec::new())])
+            .await
+            .expect("enqueue");
+        mark_fresh(&db, "theta", "dispatched").await;
+        let task_id = task_id_on("theta", TARGET);
+        let rows = super::reconcile_in_flight_rows(&db, &settings())
+            .await
+            .expect("rows");
+        // Another task's run at a different rustc, plus one unparsable
+        // title — neither may match this row.
+        let runs = vec![
+            ReconcileRun {
+                display_title: format!("1.90.0-{task_id}"),
+                status: "completed".to_owned(),
+                conclusion: Some("success".to_owned()),
+                run_id: Some(5),
+                html_url: None,
+            },
+            ReconcileRun {
+                display_title: "not-a-task-run".to_owned(),
+                status: "completed".to_owned(),
+                conclusion: Some("success".to_owned()),
+                run_id: Some(6),
+                html_url: None,
+            },
+        ];
+        let report =
+            super::reconcile_in_flight(&db, &settings(), &rows, &runs, &[], TEST_WINDOW_MINUTES)
+                .await
+                .expect("reconcile");
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.rows[0].classification, ReconcileClass::Missing);
     }
 }

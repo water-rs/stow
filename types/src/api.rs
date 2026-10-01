@@ -1626,6 +1626,164 @@ pub struct AdminInFlight {
     pub github_run_id: Option<String>,
 }
 
+/// One `build-crate.yml` run as the scheduler's reconcile pass consumes
+/// it — the fields the GitHub Actions runs list and the local-CI
+/// dispatcher's `GET /tasks` answer share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReconcileRun {
+    /// The run's `display_title` — `<rustc>-<task_id>` for a run the
+    /// scheduler dispatched.
+    pub display_title: String,
+    /// GitHub's run status (`queued`, `in_progress`, `completed`, …).
+    pub status: String,
+    /// GitHub's run conclusion, set when `status` is `completed`.
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    /// The Actions run id, when the source reports one (the local
+    /// dispatcher does not).
+    #[serde(default)]
+    pub run_id: Option<u64>,
+    /// The run's page URL, when the source reports one.
+    #[serde(default)]
+    pub html_url: Option<String>,
+}
+
+/// The run-list state one in-flight row matched in
+/// [`ReconcileRowReport`] — enough to open the run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReconcileRunMatch {
+    /// The Actions run id.
+    #[serde(default)]
+    pub run_id: Option<u64>,
+    /// GitHub's run status.
+    pub status: String,
+    /// GitHub's run conclusion, set when `status` is `completed`.
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    /// The run's page URL.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// How the reconcile pass classified one in-flight row against the
+/// listed runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileClass {
+    /// A matching run exists and has not finished.
+    Running,
+    /// The newest matching run completed but the completion never
+    /// reached the scheduler — the lost-webhook case the pass exists
+    /// for.
+    CompletedUnreported,
+    /// No listed run's `run-name` matches the row.
+    Missing,
+}
+
+impl ReconcileClass {
+    /// The label reports and alerts render — the serde wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::CompletedUnreported => "completed_unreported",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// What the reconcile pass did about one in-flight row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileApplied {
+    /// No queue mutation applied to the row.
+    Unchanged,
+    /// The webhook's completion transition applied — the row moved to
+    /// `completed` or `failed`.
+    Completed,
+    /// The stale-reclaim pass moved the row back to `pending`.
+    Reclaimed,
+}
+
+impl ReconcileApplied {
+    /// The label reports and alerts render — the serde wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::Completed => "completed",
+            Self::Reclaimed => "reclaimed",
+        }
+    }
+}
+
+/// One in-flight row's verdict inside [`ReconcileReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReconcileRowReport {
+    /// Scheduler task identifier.
+    pub task_id: String,
+    /// Crate name to build.
+    pub crate_name: CrateName,
+    /// Crate version to build.
+    pub version: CrateVersion,
+    /// Compilation target.
+    pub target: TargetTriple,
+    /// Rustc version the row builds for.
+    pub rustc_version: WireRustcVersion,
+    /// Lifecycle status the row held when the pass read it
+    /// (`dispatched` or `running`).
+    pub status: QueueTaskStatus,
+    /// Whether the row was past `STOW_STALE_DISPATCH_MINUTES` when read.
+    pub stale: bool,
+    /// The row's classification against the run list.
+    pub classification: ReconcileClass,
+    /// The newest matching run's state, when one matched.
+    #[serde(default)]
+    pub run: Option<ReconcileRunMatch>,
+    /// What the pass did about the row.
+    pub applied: ReconcileApplied,
+    /// Why a completion could not be applied, when it could not — the
+    /// records-check failure or the stale-completion race text.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// Response of `POST /reconcile` on the scheduler Durable Object —
+/// the in-flight↔GitHub drift report (stow#526).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReconcileReport {
+    /// In-flight rows the pass classified (`dispatched`/`running` —
+    /// bounded by the dispatch cap `STOW_MAX_CONCURRENT_JOBS`).
+    pub in_flight: u32,
+    /// `build-crate.yml` runs the listing returned.
+    pub runs_listed: u32,
+    /// The `created>=` bound the listing used — the oldest in-flight
+    /// row's `updated_at`. `None` when the set was empty.
+    #[serde(default)]
+    pub created_since: Option<String>,
+    /// Rows whose newest matching run is still executing.
+    pub running: u32,
+    /// Rows whose run completed without the completion reaching the
+    /// scheduler.
+    pub completed_unreported: u32,
+    /// Rows no run-name matched.
+    pub missing: u32,
+    /// `completed-but-unreported` rows the webhook's transition landed
+    /// on this pass.
+    pub completions_applied: u32,
+    /// `completed-but-unreported` rows whose completion could not be
+    /// applied (records check failure or a row that moved first).
+    pub completion_failures: u32,
+    /// Stale rows the stale-reclaim pass moved back to `pending`.
+    pub reclaimed: u32,
+    /// Whether the pass saw drift (`completed_unreported` or `missing`
+    /// nonzero) — the reading the watchdog's `edge.reconcile_drift`
+    /// signal breaches on.
+    pub drift: bool,
+    /// Per-row detail, in `updated_at` order.
+    pub rows: Vec<ReconcileRowReport>,
+}
+
 /// Per-target completion tallies over the trailing 24 hours.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AdminTargetStats {

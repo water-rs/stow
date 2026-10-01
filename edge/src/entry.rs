@@ -17,7 +17,9 @@ const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 const STOW_OIDC_AUDIENCE_BINDING: &str = "STOW_OIDC_AUDIENCE";
-const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
+/// `pub` so the scheduler's reconcile pass builds the records check's
+/// `GhcrConfig` off the same binding the entry state reads.
+pub const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
@@ -175,6 +177,7 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
                 "/scheduler/migrate".post(api::admin_scheduler_migrate),
                 "/scheduler/budget".post(api::admin_scheduler_budget),
                 "/scheduler/budget/seed".post(api::admin_scheduler_budget_seed),
+                "/scheduler/reconcile".post(api::admin_scheduler_reconcile),
                 "/status".at(api::admin_status),
             ))
             .with(gate.clone()),
