@@ -8,18 +8,56 @@ name: Regenerate rustc data
 # `resolve/rustc-data/`, regenerates the `rustc_data.rs` table, and opens
 # the bump as a pull request when the channel moved. The edge reads this
 # tree from `dev` through `STOW_RUSTC_DATA_BASE_URL`, so a stable release
-# reaches the worker without a code change.
+# reaches the worker without a code change. The job runs daily; a cheap
+# first job compares the channel's stable version against the vendored
+# `resolve/rustc-data/` tree and skips the three-OS matrix unless stable
+# moved past it, so a release lands on its release day.
 on:
   schedule:
-    - cron: "0 4 * * 1"
+    - cron: "17 4 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  check:
+    name: Check stable version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      needed: ${{ steps.gate.outputs.needed }}
+      version: ${{ steps.gate.outputs.version }}
+    steps:
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(curl --fail --silent --show-error --retry 3 \
+            https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | sed -n '/^\[pkg\.rustc\]/,/^\[/s/^version = "\([^ ]*\).*/\1/p')
+          : "${version:?no [pkg.rustc] version in the stable channel manifest}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A manual run always regenerates, as it did before the gate.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if result=$(gh api "repos/$GITHUB_REPOSITORY/contents/resolve/rustc-data/$version?ref=dev" 2>&1); then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          elif grep -q "HTTP 404" <<<"$result"; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$result" >&2
+            exit 1
+          fi
+
   generate:
     name: Generate (${{ matrix.os }})
+    needs: check
+    if: needs.check.outputs.needed == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
