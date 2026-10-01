@@ -3852,7 +3852,9 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // resolve and the prefetch. The write clears `pending` (the cached
     // slices now exist) and the gate's drop releases the waiters
     // (stow#347).
-    if work.readiness.is_some() && let Some(map_path) = &work.map_path {
+    if work.readiness.is_some()
+        && let Some(map_path) = &work.map_path
+    {
         ensure_consumer_slices(&work.config, &work.project).await?;
         let lite = analyze_workspace_prediction_lite(
             &work.project,
