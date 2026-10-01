@@ -7,7 +7,7 @@
 //! prefetch used to fail the build outright, which is not "slower than cargo",
 //! it is broken.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
@@ -440,6 +440,286 @@ fn a_tripped_circuit_still_serves_local_entries() {
             "SELECT errors FROM crate_stats WHERE crate_name = 'cfg_if'"
         ),
         0
+    );
+}
+
+/// The frames a stub supervisor collected, bucketed by the crate each
+/// frame's argv compiled (`--crate-name`). The empty key carries rustc
+/// probes like `-vV`, which name no crate at all.
+#[derive(Debug, Default)]
+struct StubSupervision {
+    plans: std::collections::BTreeMap<String, usize>,
+    compiled: std::collections::BTreeMap<String, usize>,
+    observed_marks: std::collections::BTreeMap<String, usize>,
+    observed_reports: std::collections::BTreeMap<String, usize>,
+}
+
+/// The crate a supervisor frame compiled, from its argv. A `Request` on
+/// the wire is `{"Plan": {...}}`, `{"Compiled": {...}}` or
+/// `{"Observed": {...}}`; `args` is a list of byte strings.
+fn frame_crate_name(request: &serde_json::Value) -> String {
+    let args = request
+        .get("Plan")
+        .or_else(|| request.get("Observed"))
+        .and_then(|body| body.get("args"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|arg| {
+            arg.as_array()
+                .map(|bytes| {
+                    bytes
+                        .iter()
+                        .filter_map(serde_json::Value::as_u64)
+                        .filter_map(|byte| u8::try_from(byte).ok())
+                        .collect::<Vec<u8>>()
+                })
+                .unwrap_or_default()
+        })
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .collect::<Vec<String>>();
+    args.iter()
+        .position(|arg| arg == "--crate-name")
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One stub-supervisor connection: plans are told to compile, reports are
+/// acknowledged, observations need no answer. Every frame is counted.
+fn serve_stub_connection(
+    mut stream: std::net::TcpStream,
+    counts: &std::sync::Mutex<StubSupervision>,
+) {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
+    let mut ticket = 0u64;
+    loop {
+        let mut length = [0u8; 4];
+        if stream.read_exact(&mut length).is_err() {
+            return;
+        }
+        let mut body = vec![0u8; u32::from_le_bytes(length) as usize];
+        if stream.read_exact(&mut body).is_err() {
+            return;
+        }
+        let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return;
+        };
+        let crate_name = frame_crate_name(&request);
+        let answer = if request.get("Plan").is_some() {
+            counts
+                .lock()
+                .expect("frame counts")
+                .plans
+                .entry(crate_name)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            ticket += 1;
+            Some(serde_json::json!({"Compile": {"ticket": ticket}}))
+        } else if request.get("Compiled").is_some() {
+            counts
+                .lock()
+                .expect("frame counts")
+                .compiled
+                .entry(crate_name)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            Some(serde_json::json!("Recorded"))
+        } else if request.get("Observed").is_some() {
+            let mut counts = counts.lock().expect("frame counts");
+            let is_report = request
+                .get("Observed")
+                .and_then(|body| body.get("success"))
+                .is_some_and(|success| !success.is_null());
+            let bucket = if is_report {
+                &mut counts.observed_reports
+            } else {
+                &mut counts.observed_marks
+            };
+            bucket
+                .entry(crate_name)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            None
+        } else {
+            None
+        };
+        let Some(answer) = answer else { continue };
+        let body = serde_json::to_vec(&answer).expect("encode answer");
+        let length = u32::try_from(body.len()).expect("frame body under the wire limit");
+        if stream
+            .write_all(&length.to_le_bytes())
+            .and_then(|()| stream.write_all(&body))
+            .and_then(|()| stream.flush())
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// A supervisor that answers every plan with `Compile` and every report
+/// with `Recorded`, while counting which frames each crate produced.
+/// Returns the loopback endpoint pieces and the shared count map.
+fn spawn_stub_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<StubSupervision>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub supervisor");
+    let port = listener.local_addr().expect("local addr").port();
+    let counts = std::sync::Arc::new(std::sync::Mutex::new(StubSupervision::default()));
+    let accept_counts = std::sync::Arc::clone(&counts);
+    std::thread::spawn(move || {
+        let mut connections = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            connections.push(std::thread::spawn({
+                let counts = std::sync::Arc::clone(&accept_counts);
+                move || serve_stub_connection(stream, &counts)
+            }));
+        }
+        for connection in connections {
+            let _ = connection.join();
+        }
+    });
+    (format!("tcp:{port}"), counts)
+}
+
+/// A port nothing listens on, for the edge URL: every remote lookup is a
+/// fast refused connect, which is the all-miss shape the issue profiles.
+fn unreachable_edge_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind to pick a port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// The all-miss case issue stow#347 measured: the serve map is present
+/// and covers nothing, so every registry compile still needs its mark and
+/// report — but none of them may wait on a plan round trip. The frame
+/// census is the regression signal a wall clock cannot catch: an
+/// uncovered unit planning again is the per-invocation overhead the issue
+/// traced, multiplied across every compile the build runs.
+#[test]
+fn an_all_miss_build_never_waits_on_the_supervisor() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
+    let wrapper = write_rustc_wrapper_shim(dir.path());
+    let (endpoint, counts) = spawn_stub_supervisor();
+
+    let output = cargo_build_in(
+        dir.path(),
+        &unreachable_edge_url(),
+        cache.path(),
+        &wrapper,
+        &dir.path().join("target"),
+        &[
+            ("STOW_SUPERVISOR_ENDPOINT", endpoint.as_str()),
+            ("STOW_SUPERVISOR_TOKEN", "test-token"),
+            ("STOW_SERVABLE_UNITS_JSON", "{\"target\":[],\"host\":[]}"),
+        ],
+        cargo_home.path(),
+    );
+    assert!(
+        output.status.success(),
+        "stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        probe_binary(&dir.path().join("target")).exists(),
+        "build produced no binary"
+    );
+
+    // Connection threads finish the instant each facade closes its
+    // stream; the build's exit guarantees all frames were sent, and the
+    // lock sees them once the stub has drained them.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let (cfg_if_plans, cfg_if_marks, cfg_if_reports, probe_plans, debug) = {
+        let counts = counts.lock().expect("frame counts");
+        let values = (
+            counts.plans.get("cfg_if").copied().unwrap_or(0),
+            counts.observed_marks.get("cfg_if").copied().unwrap_or(0),
+            counts.observed_reports.get("cfg_if").copied().unwrap_or(0),
+            counts.plans.get("probe").copied().unwrap_or(0),
+            format!("{counts:?}"),
+        );
+        drop(counts);
+        values
+    };
+    assert_eq!(
+        cfg_if_plans, 0,
+        "an uncovered unit must never send a plan frame: {debug}"
+    );
+    assert_eq!(
+        cfg_if_marks, 1,
+        "the uncovered compile must still mark before rustc runs: {debug}"
+    );
+    assert_eq!(
+        cfg_if_reports, 1,
+        "the uncovered compile must still report afterwards: {debug}"
+    );
+    assert!(
+        probe_plans >= 1,
+        "the workspace crate, which the map cannot model, still plans: {debug}"
+    );
+}
+
+/// The serve map's other half: a unit it covers still takes the plan
+/// path, because only the supervisor can actually serve it. The map
+/// answers "could anything serve this", not "compile".
+#[test]
+fn a_covered_unit_still_takes_the_plan_path() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
+    let wrapper = write_rustc_wrapper_shim(dir.path());
+    let (endpoint, counts) = spawn_stub_supervisor();
+
+    let output = cargo_build_in(
+        dir.path(),
+        &unreachable_edge_url(),
+        cache.path(),
+        &wrapper,
+        &dir.path().join("target"),
+        &[
+            ("STOW_SUPERVISOR_ENDPOINT", endpoint.as_str()),
+            ("STOW_SUPERVISOR_TOKEN", "test-token"),
+            // `cfg-if` compiles unspelled — no `--target` on a native
+            // build — so the host side carries it, at any version. Map
+            // entries are canonical crate names (underscores).
+            (
+                "STOW_SERVABLE_UNITS_JSON",
+                "{\"target\":[],\"host\":[[\"cfg_if\",\"*\"]]}",
+            ),
+        ],
+        cargo_home.path(),
+    );
+    assert!(
+        output.status.success(),
+        "stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let (cfg_if_plans, cfg_if_observed, debug) = {
+        let counts = counts.lock().expect("frame counts");
+        let values = (
+            counts.plans.get("cfg_if").copied().unwrap_or(0),
+            counts.observed_marks.get("cfg_if").copied().unwrap_or(0)
+                + counts.observed_reports.get("cfg_if").copied().unwrap_or(0),
+            format!("{counts:?}"),
+        );
+        drop(counts);
+        values
+    };
+    assert_eq!(
+        cfg_if_plans, 1,
+        "a covered unit must keep the plan round trip: {debug}"
+    );
+    assert_eq!(
+        cfg_if_observed, 0,
+        "a covered unit emits no observations: {debug}"
     );
 }
 
