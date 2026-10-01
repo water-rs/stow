@@ -9082,6 +9082,7 @@ dependencies = [
  "blake3",
  "hex",
  "hmac 0.13.0",
+ "http",
  "object 0.39.1",
  "semver",
  "serde",

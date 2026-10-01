@@ -876,24 +876,86 @@ async fn ensure_mold_install() -> stow_types::error::Result<PathBuf> {
     Ok(bin_dir)
 }
 
+/// What one download attempt produced: the archive bytes, or a failure
+/// classified the way the shared retry policy classifies it — retried
+/// with any `Retry-After` hint it carried, or returned to the caller.
+enum DownloadOutcome {
+    Bytes(Vec<u8>),
+    Retryable {
+        error: stow_types::error::Error,
+        retry_after: Option<std::time::Duration>,
+    },
+    Fatal(stow_types::error::Error),
+}
+
 /// Download `url`, following redirects, into memory — the pinned sha256 is
-/// checked before a byte reaches disk.
+/// checked before a byte reaches disk. A transient failure — a request
+/// that never completed or a [`stow_types::transient::is_transient_status`]
+/// answer — is retried under the shared [`stow_types::transient::Backoff`]
+/// budget: the release fetch crosses two hosts (github.com's 302 to the
+/// release-assets CDN), and one transport error failing a user's `stow
+/// setup` is the failure this retry exists to prevent.
 async fn download(url: &str) -> stow_types::error::Result<Vec<u8>> {
+    let mut backoff = stow_types::transient::Backoff::new();
+    loop {
+        let wait = match download_once(url).await {
+            DownloadOutcome::Bytes(bytes) => return Ok(bytes),
+            DownloadOutcome::Retryable { error, retry_after } => {
+                let Some(wait) = backoff.next_wait(retry_after) else {
+                    return Err(error);
+                };
+                tracing::warn!(url, %error, "mold download failed; retrying");
+                wait
+            }
+            DownloadOutcome::Fatal(error) => return Err(error),
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// One attempt at [`download`]: build the request, send it, and read the
+/// whole body — a connection lost mid-body leaves nothing usable, so a
+/// transport error at any stage retries the whole GET. The GET is a plain
+/// read with no side effects, so replaying it is safe.
+async fn download_once(url: &str) -> DownloadOutcome {
     use zenwave::Client as _;
     let mut client = zenwave::client()
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
         .follow_redirect();
-    let response = client
-        .get(url)
-        .map_err(|error| stow_types::stow_error!("build mold download request: {error}"))?
-        .await
-        .map_err(|error| stow_types::stow_error!("download {url}: {error}"))?;
-    let bytes = response
-        .into_body()
-        .into_bytes()
-        .await
-        .map_err(|error| stow_types::stow_error!("read {url} body: {error}"))?;
-    Ok(bytes.to_vec())
+    let request = match client.get(url) {
+        Ok(request) => request,
+        Err(error) => {
+            return DownloadOutcome::Fatal(stow_types::stow_error!(
+                "build mold download request: {error}"
+            ));
+        }
+    };
+    let response = match request.await {
+        Ok(response) => response,
+        Err(error) => {
+            return DownloadOutcome::Retryable {
+                error: stow_types::stow_error!("download {url}: {error}"),
+                retry_after: None,
+            };
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = stow_types::transient::retry_after_hint(response.headers());
+        let error = stow_types::stow_error!("download {url}: HTTP {status}");
+        return if stow_types::transient::is_transient_status(status.as_u16()) {
+            DownloadOutcome::Retryable { error, retry_after }
+        } else {
+            DownloadOutcome::Fatal(error)
+        };
+    }
+    match response.into_body().into_bytes().await {
+        Ok(bytes) => DownloadOutcome::Bytes(bytes.to_vec()),
+        Err(error) => DownloadOutcome::Retryable {
+            error: stow_types::stow_error!("read {url} body: {error}"),
+            retry_after: None,
+        },
+    }
 }
 
 /// Extract `bin/mold` and `bin/ld.mold` from a release tarball into
@@ -1365,5 +1427,93 @@ mod tests {
             parts,
             vec!["target_os=\"linux\"", "any(unix, target_family=\"gnu\")"]
         );
+    }
+
+    /// A stub release server: `refusal` decides the first connection's
+    /// fate — `None` drops it unanswered (a transport failure),
+    /// `Some(status)` answers that status; every later connection gets a
+    /// `200 OK` carrying `body`. Returns the URL and a count of how many
+    /// requests the server has seen.
+    fn serve_fail_then_ok(
+        refusal: Option<&'static str>,
+        body: &[u8],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<usize>>) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let seen = std::sync::Arc::clone(&requests);
+        let refused = refusal.map(|status| {
+            format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        });
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let body = body.to_vec();
+        std::thread::spawn(move || {
+            for (index, accepted) in listener.incoming().enumerate() {
+                let Ok(mut stream) = accepted else {
+                    return;
+                };
+                *seen.lock().expect("request count") = index + 1;
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).expect("read request") == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                if index == 0 {
+                    // `None` leaves the stream to drop unanswered — the
+                    // client sees a transport failure, not a response.
+                    let Some(ref answer) = refused else {
+                        continue;
+                    };
+                    stream.write_all(answer.as_bytes()).expect("write refusal");
+                } else {
+                    stream.write_all(ok.as_bytes()).expect("write head");
+                    stream.write_all(&body).expect("write body");
+                }
+                stream.flush().expect("flush");
+            }
+        });
+        (url, requests)
+    }
+
+    /// The release fetch crossing a transport failure: the first
+    /// connection is closed unanswered — the failure the merge queue hit
+    /// — and the shared policy's retry is what serves the archive.
+    #[test]
+    fn a_transport_failure_on_the_download_is_retried() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let body = b"the tarball bytes the server serves second";
+            let (url, requests) = serve_fail_then_ok(None, body);
+            let bytes = download(&url).await.expect("the retried download succeeds");
+            assert_eq!(bytes, body);
+            assert_eq!(*requests.lock().expect("request count"), 2);
+        });
+    }
+
+    /// A transient status answer — the other half of the shared policy —
+    /// is retried the same way.
+    #[test]
+    fn a_transient_status_on_the_download_is_retried() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let body = b"the tarball bytes the server serves second";
+            let (url, requests) = serve_fail_then_ok(Some("503 Service Unavailable"), body);
+            let bytes = download(&url).await.expect("the retried download succeeds");
+            assert_eq!(bytes, body);
+            assert_eq!(*requests.lock().expect("request count"), 2);
+        });
     }
 }

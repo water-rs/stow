@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use stow_types::stow_error;
 use zenwave::{Client, ResponseExt};
 
-use crate::http_retry::{Backoff, is_retryable, retry_after_hint};
+use stow_types::transient::{Backoff, is_transient_status, retry_after_hint};
 
 /// `GET /api/v1/crates…` — the crates.io JSON API root the lanes read.
 pub const API_BASE: &str = "https://crates.io/api/v1/crates";
@@ -170,9 +170,9 @@ async fn fetch_once(url: &str, timeout: Duration) -> FetchOutcome {
     if status.is_success() {
         return FetchOutcome::Body(response);
     }
-    let retry_after = retry_after_hint(&response);
+    let retry_after = retry_after_hint(response.headers());
     let error = stow_error!("crates.io {url} returned HTTP {status}");
-    if is_retryable(status) {
+    if is_transient_status(status.as_u16()) {
         FetchOutcome::Retryable { error, retry_after }
     } else {
         FetchOutcome::Fatal(error)
