@@ -1299,10 +1299,31 @@ pub struct SchedulerBudgetRow {
     pub write_budget: u64,
     /// Budgeted wall milliseconds.
     pub wall_budget: u64,
+    /// Σ D1 `meta.rowsRead` over statements the drive issued through
+    /// the counted catalog backend — the coverage lookups a claim pays
+    /// per page, carried separately because D1 bills a different
+    /// product than the object's own rows.
+    pub d1_rows_read: u64,
+    /// Σ D1 `meta.rowsWritten` over the same statements.
+    pub d1_rows_written: u64,
     /// `true` when any of the four budgets is exceeded.
     pub over_budget: bool,
     /// The per-statement log the totals are summed over.
     pub log: Vec<SchedulerBudgetStatement>,
+}
+
+/// `POST /api/v1/admin/scheduler/budget` request — the knobs the
+/// probe's own pass needs that the deploy's bindings do not already
+/// set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerBudgetRequest {
+    /// The dispatch cap the pass drives claim against, overriding the
+    /// deploy's `STOW_MAX_CONCURRENT_JOBS`. The mock deploys a tiny cap
+    /// for its own stability, so the harness passes the production cap
+    /// here — a pass that cannot claim measures nothing the gate can
+    /// price. `0` pauses dispatch; absent uses the deploy's setting.
+    #[serde(default)]
+    pub dispatch_limit: Option<u32>,
 }
 
 /// What `POST /api/v1/admin/scheduler/budget` returns: every route and
@@ -1314,6 +1335,16 @@ pub struct SchedulerBudgetReport {
     pub queue_rows: u64,
     /// The schema version the queue reports.
     pub schema_version: i64,
+    /// The dispatch cap the pass ran under — the run's own setting
+    /// after any request override, so the per-claim marginal price
+    /// divides by what the pass could actually claim.
+    pub dispatch_limit: u64,
+    /// Tasks the pass drives claimed (the hot pass under the dispatch
+    /// cap; the idle pass claims none). The launch gate divides the
+    /// hot-minus-idle marginal cost by this — never by a checked-in
+    /// assumption — and refuses a report that claims nothing while
+    /// build traffic is nonzero.
+    pub claimed_tasks: u64,
     /// Per-drive measurements, in drive order.
     pub rows: Vec<SchedulerBudgetRow>,
     /// `true` when any row is over budget — `stow-admin scheduler

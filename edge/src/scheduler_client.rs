@@ -138,11 +138,14 @@ pub async fn seed_budget_fixture(
 
 /// Run the workerd budget pass: every scheduler route and the alarm
 /// measured with the real `rowsRead`/`rowsWritten` cursor counters —
-/// the units Cloudflare bills on.
+/// the units Cloudflare bills on. `request.dispatch_limit` overrides
+/// the deploy's dispatch cap for the pass — the mock's tiny cap would
+/// otherwise leave the claim unmeasured.
 pub async fn scheduler_budget(
     namespace: &CfDurableNamespace,
+    request: &stow_types::api::SchedulerBudgetRequest,
 ) -> Result<stow_types::api::SchedulerBudgetReport, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_BUDGET_URL, &serde_json::json!({})).await
+    post_json(namespace, SCHEDULER_BUDGET_URL, request).await
 }
 
 /// Admin queue listing behind `stow-admin queue list` and the mutation

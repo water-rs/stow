@@ -14,11 +14,12 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use skyzen_cloudflare::CfD1;
 use skyzen_services::durable::{DurableDb, DurableDbBackend, DurableDbError};
-use skyzen_services::sql::{DbExecResult, DbValue, QuerySource};
+use skyzen_services::sql::{DbBackend, DbDialect, DbError, DbExecResult, DbValue, QuerySource};
 use stow_types::api::{
-    SchedulerBudgetReport, SchedulerBudgetRow, SchedulerBudgetStatement, SchedulerSeedReport,
-    SchedulerSeedRequest,
+    SchedulerBudgetReport, SchedulerBudgetRequest, SchedulerBudgetRow, SchedulerBudgetStatement,
+    SchedulerSeedReport, SchedulerSeedRequest,
 };
 
 use super::do_budgets::{DO_BUDGETS, DriveBudget};
@@ -103,6 +104,73 @@ impl DurableDbBackend for MeteredBackend {
         let inner = self.inner.clone();
         async move { inner.database_size().await }
     }
+}
+
+/// A `DbBackend` that forwards to another and accumulates each
+/// statement's `DbExecResult` counters — D1's `meta.rowsRead` /
+/// `rowsWritten` — into a shared pair the report reads back per drive.
+/// The `DurableDb` meter can't see these: the coverage lookups a claim
+/// pays are ordinary Worker D1 traffic, billed as D1 rows, not object
+/// rows.
+#[derive(Clone)]
+pub struct CountedBackend<B> {
+    inner: B,
+    rows: Arc<Mutex<(u64, u64)>>,
+}
+
+impl<B: DbBackend> CountedBackend<B> {
+    fn record(result: &Result<DbExecResult, DbError>, rows: &Arc<Mutex<(u64, u64)>>) {
+        if let Ok(result) = result {
+            let mut counts = rows.lock().expect("d1 counter");
+            counts.0 += result.rows_read;
+            counts.1 += result.rows_written;
+        }
+    }
+}
+
+impl<B: DbBackend> DbBackend for CountedBackend<B> {
+    fn dialect(&self) -> DbDialect {
+        self.inner.dialect()
+    }
+
+    fn query(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + Send {
+        let inner = self.inner.clone();
+        let rows = self.rows.clone();
+        async move {
+            let result = inner.query(query, params).await;
+            Self::record(&result, &rows);
+            result
+        }
+    }
+
+    fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> impl Future<Output = Result<DbExecResult, DbError>> + Send {
+        let inner = self.inner.clone();
+        let rows = self.rows.clone();
+        async move {
+            let result = inner.execute(query, params).await;
+            Self::record(&result, &rows);
+            result
+        }
+    }
+}
+
+/// Build the catalog `Db` the probe's `CatalogCoverage` consumes: the
+/// `STOW_DB` binding wrapped so every statement's rows land in `rows`.
+pub fn counted_d1(
+    env: &skyzen::runtime::wasm::WasmEnv,
+    rows: Arc<Mutex<(u64, u64)>>,
+) -> Result<skyzen_services::Db, String> {
+    let inner = CfD1::from_env(env.as_js(), super::object::STOW_DB_BINDING)
+        .map_err(|error| format!("load D1 binding: {error}"))?;
+    Ok(skyzen_services::Db::new(CountedBackend { inner, rows }))
 }
 
 fn budget_of(name: &str) -> Result<&'static DriveBudget, QueueError> {
@@ -313,11 +381,24 @@ async fn count_rows(db: &DurableDb, table: &str) -> Result<u64, QueueError> {
 /// `POST /budget` — replay every drive under the metering backend and
 /// return the per-route totals against [`DO_BUDGETS`]. The drive list is
 /// the host gate's own, so the two harnesses measure the same request
-/// surface.
+/// surface. `request.dispatch_limit` overrides the deploy's dispatch cap
+/// for the pass: the mock carries a tiny cap for its own stability, and
+/// a pass that cannot claim measures nothing the gate can price.
 pub async fn run(
     db: &DurableDb,
     settings: &queue::SchedulerSettings,
+    env: &skyzen::runtime::wasm::WasmEnv,
+    request: &SchedulerBudgetRequest,
 ) -> Result<SchedulerBudgetReport, QueueError> {
+    let mut settings = *settings;
+    if let Some(limit) = request.dispatch_limit {
+        settings.dispatch = queue::Dispatch::from_max_concurrent_jobs(limit);
+    }
+    let dispatch_limit = match settings.dispatch {
+        queue::Dispatch::Limited(limit) => u64::from(limit.get()),
+        queue::Dispatch::Paused => 0,
+    };
+    let ctx = drives::DriveContext::worker(env).map_err(QueueError::Sql)?;
     let queue_rows = count_rows(db, "queue").await?;
     let schema_version: i64 = db
         .query("SELECT version FROM scheduler_schema_version WHERE id = 1")
@@ -336,14 +417,16 @@ pub async fn run(
     let mut over_budget = false;
     for drive in drives::DRIVES {
         log.lock().expect("statement log").clear();
+        let d1_before = ctx.d1_counts();
         let started_ms = js_sys::Date::now();
-        (drive.run)(&metered, shape, settings)
+        (drive.run)(&metered, shape, &settings, &ctx)
             .await
             .map_err(|error| QueueError::Sql(format!("drive {}: {error}", drive.name)))?;
         // `Date::now()` is milliseconds well below 2^53; the delta is
         // exactly representable and non-negative.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let wall_ms = (js_sys::Date::now() - started_ms).max(0.0) as u64;
+        let (d1_rows_read, d1_rows_written) = ctx.d1_counts();
         let statements = std::mem::take(&mut *log.lock().expect("statement log"));
         let totals = (
             statements.len() as u64,
@@ -366,6 +449,8 @@ pub async fn run(
             read_budget: budget.rows_read,
             write_budget: budget.rows_written,
             wall_budget: budget.wall_ms,
+            d1_rows_read: d1_rows_read.saturating_sub(d1_before.0),
+            d1_rows_written: d1_rows_written.saturating_sub(d1_before.1),
             over_budget: over,
             log: statements
                 .into_iter()
@@ -381,6 +466,8 @@ pub async fn run(
     Ok(SchedulerBudgetReport {
         queue_rows,
         schema_version,
+        dispatch_limit,
+        claimed_tasks: ctx.claims(),
         rows,
         over_budget,
     })

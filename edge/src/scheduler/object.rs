@@ -27,7 +27,9 @@ use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
-const STOW_DB_BINDING: &str = "STOW_DB";
+/// The catalog D1 binding — `pub(super)` so the budget probe's counted
+/// backend wraps the same binding the dispatch path reads.
+pub(super) const STOW_DB_BINDING: &str = "STOW_DB";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_MACOS_JOBS";
@@ -216,6 +218,7 @@ async fn scheduler_budget_seed(
 async fn scheduler_budget(
     env: WasmEnv,
     db: DurableDb,
+    Json(request): Json<stow_types::api::SchedulerBudgetRequest>,
 ) -> Result<Json<stow_types::api::SchedulerBudgetReport>> {
     if !budget_probe_enabled(&env) {
         return Err(
@@ -224,7 +227,11 @@ async fn scheduler_budget(
         );
     }
     let settings = scheduler_settings(&env)?;
-    Ok(Json(budget::run(&db, &settings).await.map_err(to_error)?))
+    Ok(Json(
+        budget::run(&db, &settings, &env, &request)
+            .await
+            .map_err(to_error)?,
+    ))
 }
 
 fn budget_probe_enabled(env: &WasmEnv) -> bool {
@@ -733,8 +740,10 @@ enum CredentialSource {
 
 /// The artifact catalog in D1, asked at claim time which pending tasks an
 /// already-landed publish covered.
-struct CatalogCoverage {
-    db: Db,
+pub(super) struct CatalogCoverage {
+    /// The catalog handle — plain `CfD1` on a real pass, the counted
+    /// backend under the budget probe so the lookup's rows are priced.
+    pub(super) db: Db,
 }
 
 impl queue::CoverageOracle for CatalogCoverage {
@@ -758,8 +767,30 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         tracing::info!("dispatch frozen — skipping dispatch pass");
         return Ok(());
     }
-    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let settings = scheduler_settings(env)?;
+    let coverage = CatalogCoverage {
+        db: Db::new(
+            CfD1::from_env(env.as_js(), STOW_DB_BINDING)
+                .map_err(|error| Error::msg(format!("load D1 binding: {error}")))?,
+        ),
+    };
+    dispatch_pass(env, db, &settings, &coverage)
+        .await
+        .map(|_| ())
+}
+
+/// The claim-plus-fan-out half of a dispatch pass, shared with the
+/// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
+/// `wall_ms` covers the serialized `trigger_build` hop and the
+/// counted-D1 coverage lookups a real wake pays. Returns the claimed
+/// task count.
+pub(super) async fn dispatch_pass(
+    env: &WasmEnv,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    coverage: &impl queue::CoverageOracle,
+) -> Result<usize> {
+    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
@@ -771,13 +802,7 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
             private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
         }),
     };
-    let coverage = CatalogCoverage {
-        db: Db::new(
-            CfD1::from_env(env.as_js(), STOW_DB_BINDING)
-                .map_err(|error| Error::msg(format!("load D1 binding: {error}")))?,
-        ),
-    };
-    let tasks = queue::claim_dispatchable_tasks(db, &settings, &coverage)
+    let tasks = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
         .map_err(to_error)?;
     tracing::info!(
@@ -785,8 +810,9 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         "scheduler dispatch_pending selected tasks"
     );
     if tasks.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let claimed = tasks.len();
 
     // The credential resolves once per pass, only when tasks exist: the
     // local-CI branch carries no Authorization; the GitHub branch reuses
@@ -807,7 +833,7 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
                     for task in &tasks {
                         queue::mark_dispatch_failed(
                             db,
-                            &settings,
+                            settings,
                             &task.task_id,
                             &error.to_string(),
                         )
@@ -815,7 +841,7 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
                         .map_err(to_error)?;
                         tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
                     }
-                    return Ok(());
+                    return Ok(claimed);
                 }
             }
         }
@@ -827,14 +853,14 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
     let pool = crate::fetch_guard::OutboundPool::new();
     for task in tasks {
         if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo, &pool).await {
-            queue::mark_dispatch_failed(db, &settings, &task.task_id, &error.to_string())
+            queue::mark_dispatch_failed(db, settings, &task.task_id, &error.to_string())
                 .await
                 .map_err(to_error)?;
             tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
         }
     }
 
-    Ok(())
+    Ok(claimed)
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {

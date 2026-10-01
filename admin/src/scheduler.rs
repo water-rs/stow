@@ -5,7 +5,9 @@
 //! that may issue DDL on the queue database.
 
 use clap::{Args, Subcommand};
-use stow_types::api::{SchedulerBudgetReport, SchedulerSeedReport, SchemaMigrationReport};
+use stow_types::api::{
+    SchedulerBudgetReport, SchedulerBudgetRequest, SchedulerSeedReport, SchemaMigrationReport,
+};
 
 use crate::Edge;
 use crate::render::{self, Output};
@@ -45,6 +47,13 @@ pub enum SchedulerCommand {
         /// Do not seed; measure against the queue as it stands.
         #[arg(long)]
         no_seed: bool,
+        /// Override the deploy's dispatch cap for the alarm-pass drives.
+        /// The mock deploys a tiny cap (`STOW_MAX_CONCURRENT_JOBS=3`)
+        /// for its own stability — a pass run under it claims nothing
+        /// and prices a claim at zero, so the harness passes the
+        /// production cap from `edge/Skyzen.toml` here.
+        #[arg(long)]
+        dispatch_limit: Option<u32>,
     },
 }
 
@@ -60,7 +69,8 @@ pub async fn run(
             queue_rows,
             reset,
             no_seed,
-        } => budget(edge, queue_rows, reset, no_seed, output).await,
+            dispatch_limit,
+        } => budget(edge, queue_rows, reset, no_seed, dispatch_limit, output).await,
     }
 }
 
@@ -78,6 +88,7 @@ async fn budget(
     queue_rows: Option<u32>,
     reset: bool,
     no_seed: bool,
+    dispatch_limit: Option<u32>,
     output: Output,
 ) -> stow_types::error::Result<()> {
     if !no_seed {
@@ -127,7 +138,7 @@ async fn budget(
     let report: SchedulerBudgetReport = edge
         .post_json_with_timeout(
             "/api/v1/admin/scheduler/budget",
-            &serde_json::json!({}),
+            &SchedulerBudgetRequest { dispatch_limit },
             BUDGET_PROBE_TIMEOUT,
         )
         .await?;

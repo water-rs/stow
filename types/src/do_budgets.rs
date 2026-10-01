@@ -164,6 +164,17 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 300,
     },
     DriveBudget {
+        // The accept half of the untrusted route — the cap is lifted so
+        // the drive measures the insert: the pending-count read, the
+        // human-lane budget charge and position walk (bounded by the
+        // lane's held depth), the task + edge writes.
+        name: "POST /enqueue (untrusted accept)",
+        statements: 20,
+        rows_read: 2_500,
+        rows_written: 600,
+        wall_ms: 600,
+    },
+    DriveBudget {
         name: "POST /admin/enqueue (trusted)",
         statements: 16,
         rows_read: 300,
@@ -192,26 +203,28 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
-        // The claim pages at `2 × open slots` and the coverage oracle
-        // sees one lookup per page: the pass's read is bounded by the
-        // dispatch cap plus the fixed probes, never by the frontier.
+        // The full dispatch pass: binding reads, the claim paged at
+        // `2 × open slots`, the per-page catalog coverage lookup (a
+        // counted-D1 read, not object rows), the per-claim UPDATE and
+        // the sequential `trigger_build` hop — wall includes the
+        // serialized HTTP fan-out.
         name: "alarm pass",
-        statements: 90,
-        rows_read: 800,
+        statements: 120,
+        rows_read: 1_000,
         rows_written: 700,
-        wall_ms: 1_000,
+        wall_ms: 3_000,
     },
     DriveBudget {
         // The same pass with dispatch paused: the claim returns early,
         // so the row measures the per-invocation floor — stale-recovery
-        // probes, wake-time re-arm, the metering tail — that every
-        // alarm wake pays regardless of what it claims. The launch gate
-        // (stow#452) separates alarm invocations from the claims they
-        // make through this row.
+        // probes, the freeze and binding reads, the wake-time re-arm —
+        // that every alarm wake pays regardless of what it claims. The
+        // launch gate (stow#452) separates alarm invocations from the
+        // claims they make through this row.
         name: "alarm pass (idle)",
-        statements: 14,
+        statements: 20,
         rows_read: 300,
         rows_written: 8,
-        wall_ms: 80,
+        wall_ms: 300,
     },
 ];
