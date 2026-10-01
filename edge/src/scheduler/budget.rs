@@ -435,6 +435,20 @@ pub async fn run(
                 u32::try_from(queue_rows.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
             }),
     };
+    // A run-completion report lands only on a live in-flight row, and
+    // the fixture's is spent: an earlier probe on this queue already
+    // completed it, or the drive's churn did — the seeded dep graph
+    // also names in-flight rows, so the pass's shape repair resurrects
+    // any of them the moment they complete. Re-arm the drive's target
+    // before any measured window so `POST /tasks/complete-run` always
+    // measures a real completion, never a stale one.
+    db.query("UPDATE queue \
+              SET status = 'running', attempt = attempt + 1, updated_at = datetime('now') \
+              WHERE task_id = printf('%064x', ?)")
+        .bind(i64::from(shape.running_row()))
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("re-arm complete-run target: {error}")))?;
     let log = Arc::new(Mutex::new(Vec::new()));
     let metered = DurableDb::new(MeteredBackend {
         inner: db.clone(),
