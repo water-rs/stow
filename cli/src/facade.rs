@@ -711,21 +711,23 @@ mod tests {
     /// A supervisor that is not there at all is a driver gone before
     /// the wait even began — the same defect, failing loudly with its
     /// endpoint named (stow#347).
+    ///
+    /// The test asserts the loud named failure and nothing about wall
+    /// clock: a connect to a closed loopback port fails in one syscall
+    /// on Unix, but Windows retries it at the OS level for about two
+    /// seconds before reporting `WSAECONNREFUSED`, so no bound a unit
+    /// test could state would describe both platforms.
     #[test]
     fn a_dead_endpoint_fails_the_wait_loudly() {
-        use std::time::{Duration, Instant};
-
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         drop(listener);
-        let started = Instant::now();
         let error = super::await_serve_map(&Endpoint::Loopback(port), "the-token")
             .expect_err("a refused connect must fail the build");
         assert!(
             error.to_string().contains(&port.to_string()),
             "the error must name the endpoint: {error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// A driver that is alive but never answers — the one quiet ending:
