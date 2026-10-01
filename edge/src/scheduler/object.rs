@@ -356,16 +356,21 @@ async fn complete_run(
     Json(report): Json<stow_types::api::WorkflowRunComplete>,
 ) -> Result<Json<OkResponse>> {
     let freeze = freeze_settings(&env)?;
-    queue::complete_run(&db, &report, freeze.window_minutes)
-        .await
-        .map_err(|error| {
-            let status = match &error {
-                crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-                crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
+    queue::complete_run(
+        &db,
+        &scheduler_settings(&env)?,
+        &report,
+        freeze.window_minutes,
+    )
+    .await
+    .map_err(|error| {
+        let status = match &error {
+            crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
+            crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        to_error(error).set_status(status)
+    })?;
     // A failed attempt may have closed the window's trip condition —
     // evaluate while this request still holds the outcome row's write
     // context. The freeze then eats the dispatch the alarm was about

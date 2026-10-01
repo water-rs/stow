@@ -46,6 +46,9 @@ pub struct SelectorArgs {
     /// Compilation target to match.
     #[arg(long)]
     target: Option<String>,
+    /// Rustc version to match (e.g. `1.99.0`).
+    #[arg(long)]
+    rustc: Option<String>,
     /// Crate name to match.
     #[arg(long = "crate")]
     crate_name: Option<String>,
@@ -105,6 +108,14 @@ impl SelectorArgs {
                 .map(|raw| {
                     stow_types::identity::CrateName::parse(raw)
                         .map_err(|error| stow_error!("--crate: {error}"))
+                })
+                .transpose()?,
+            rustc_version: self
+                .rustc
+                .as_deref()
+                .map(|raw| {
+                    stow_types::identity::WireRustcVersion::parse(raw.to_owned())
+                        .map_err(|error| stow_error!("--rustc: {error}"))
                 })
                 .transpose()?,
             older_than_secs: self.older_than,
