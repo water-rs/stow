@@ -378,6 +378,27 @@ async fn count_rows(db: &DurableDb, table: &str) -> Result<u64, QueueError> {
         .map_err(|error| QueueError::Sql(format!("count {table}: {error}")))
 }
 
+/// Re-marks the `POST /tasks/complete-run` drive's target in-flight —
+/// a run-completion report lands only on a live in-flight row, and the
+/// fixture's is spent: an earlier probe on this queue already completed
+/// it, or the drive's churn did — the seeded dep graph also names
+/// in-flight rows, so the pass's shape repair resurrects any of them
+/// the moment they complete. Re-arming outside the measured window —
+/// the same precedent as the installation-token seed — leaves the
+/// drive measuring a real completion on every probe, not a stale one.
+async fn rearm_complete_run_target(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    db.query(
+        "UPDATE queue \
+         SET status = 'running', attempt = attempt + 1, updated_at = datetime('now') \
+         WHERE task_id = printf('%064x', ?)",
+    )
+    .bind(i64::from(shape.running_row()))
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("re-arm complete-run target: {error}")))?;
+    Ok(())
+}
+
 /// `POST /budget` — replay every drive under the metering backend and
 /// return the per-route totals against [`DO_BUDGETS`]. The drive list is
 /// the host gate's own, so the two harnesses measure the same request
@@ -435,22 +456,7 @@ pub async fn run(
                 u32::try_from(queue_rows.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
             }),
     };
-    // A run-completion report lands only on a live in-flight row, and
-    // the fixture's is spent: an earlier probe on this queue already
-    // completed it, or the drive's churn did — the seeded dep graph
-    // also names in-flight rows, so the pass's shape repair resurrects
-    // any of them the moment they complete. Re-arm the drive's target
-    // before any measured window so `POST /tasks/complete-run` always
-    // measures a real completion, never a stale one.
-    db.query(
-        "UPDATE queue \
-              SET status = 'running', attempt = attempt + 1, updated_at = datetime('now') \
-              WHERE task_id = printf('%064x', ?)",
-    )
-    .bind(i64::from(shape.running_row()))
-    .execute()
-    .await
-    .map_err(|error| QueueError::Sql(format!("re-arm complete-run target: {error}")))?;
+    rearm_complete_run_target(db, shape).await?;
     let log = Arc::new(Mutex::new(Vec::new()));
     let metered = DurableDb::new(MeteredBackend {
         inner: db.clone(),

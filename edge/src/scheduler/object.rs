@@ -756,7 +756,7 @@ enum CredentialSource {
 /// its API token to) only ever live on the same host, so both are pinned
 /// to loopback and can never redirect traffic — or the token — to a
 /// remote endpoint. Rejected URLs fail before any request uses them.
-pub(crate) fn loopback_url(binding: &str, url: &str) -> Result<String> {
+pub fn loopback_url(binding: &str, url: &str) -> Result<String> {
     let authority = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))

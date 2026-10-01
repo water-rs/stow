@@ -64,7 +64,7 @@ const CLI_VERSIONS_SQL: &str = include_str!("sql/stats_cli_versions.sql");
 
 /// The Analytics Engine SQL API prefix `run_sql` posts under when no
 /// `STOW_STATS_SQL_URL` override points the route at a stub.
-pub(crate) const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
+pub const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
 
 /// Below this many distinct installs per day the figure is suppressed —
 /// stow publishes no small counts that could single out a user.
