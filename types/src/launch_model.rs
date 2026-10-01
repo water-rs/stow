@@ -1,8 +1,8 @@
 //! The checked-in launch traffic model (`launch-model.toml`) — stow#452.
 //!
 //! `stow-admin launch-model export` regenerates the file from production's
-//! own events; the launch gate (stow-edge's `launch_gate` test) and the
-//! mock load test read it back through this module. Every rate is events
+//! own events; `stow-admin launch-gate` and `stow-admin launch-load`
+//! read it back through this module. Every rate is events
 //! per active install per day over the measurement window, or an explicit
 //! flat daily cadence for the lanes that do not scale with installs
 //! (operator work and index publishes). The file is reviewed like code:
@@ -210,11 +210,13 @@ impl LaunchModel {
                 self.daily_events(EventKind::Build) * self.ratios.callbacks_per_build
             }
             EventKind::AlarmPass => {
-                // One arming event causes one pass: enqueues, human
+                // One arming event causes one pass: enqueues (redemption
+                // plus the miss drain every admission runs), human
                 // submits and completions arm the dispatch alarm, and
                 // an index publish schedules one. Passes that coalesce
                 // inside an already-armed alarm only lower this.
-                self.daily_events(EventKind::EnqueueRedemption)
+                self.daily_events(EventKind::Admission)
+                    + self.daily_events(EventKind::EnqueueRedemption)
                     + self.daily_events(EventKind::HumanRequest)
                     + self.daily_events(EventKind::BuildCallback)
                     + self.daily_events(EventKind::IndexPublish)

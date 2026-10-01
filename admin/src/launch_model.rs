@@ -47,20 +47,31 @@ const ANALYTICS_SQL: &[&str] = &[
     // Distinct installs over the window: `stow_events.index1` is the
     // daily-salted install hash, so distinct values over the window
     // count install-days.
-    "SELECT count(DISTINCT index1) AS install_days FROM stow_events \
+    "SELECT count(DISTINCT index1) AS value FROM stow_events \
      WHERE blob1 = 'hit' AND timestamp >= toDateTime('$since 00:00:00') \
      AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
     // Byte-path fetches: hit points are 1/10-sampled, `double1` carries
     // the weight — `sum` restores the true count.
-    "SELECT sum(double1) AS cli_fetches FROM stow_events \
+    "SELECT sum(double1) AS value FROM stow_events \
      WHERE blob1 = 'hit' AND timestamp >= toDateTime('$since 00:00:00') \
      AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
     // Miss nodes: `stow_cache_misses` points are unsampled — one per
     // uncovered node the admissions lane minted a ticket for.
-    "SELECT count() AS miss_nodes FROM stow_cache_misses \
+    "SELECT count() AS value FROM stow_cache_misses \
      WHERE blob1 = 'miss' AND timestamp >= toDateTime('$since 00:00:00') \
      AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
 ];
+
+/// One `count()`/`sum()` row an [`ANALYTICS_SQL`] query returns —
+/// `FORMAT JSON` quotes 64-bit integers, so the shared Analytics
+/// Engine deserializer decodes it.
+#[derive(Debug, Deserialize)]
+struct AeCountRow {
+    /// The queried aggregate — each `ANALYTICS_SQL` selects it as
+    /// `value`.
+    #[serde(deserialize_with = "stow_types::analytics::de_u64")]
+    value: u64,
+}
 
 /// `launch-model.graphql` — the zone's HTTP request counts by method
 /// and path over the window.
@@ -73,8 +84,6 @@ const PATH_COUNTS_QUERY: &str = include_str!("../queries/launch-model.graphql");
 enum RouteKind {
     /// `GET /api/v1/index/…` — pointer and slice fetches (a pull is two).
     IndexRequest,
-    /// `GET /api/v1/bundles/…` — sanity-checks the AE fetch count.
-    BytePathFetch,
     /// `POST /api/v1/admissions`.
     Admission,
     /// `POST /api/v1/enqueue`.
@@ -104,7 +113,6 @@ impl RouteKind {
     const fn key(self) -> &'static str {
         match self {
             Self::IndexRequest => "GET /api/v1/index/*",
-            Self::BytePathFetch => "GET /api/v1/bundles/*",
             Self::Admission => "POST /api/v1/admissions",
             Self::EnqueueRedemption => "POST /api/v1/enqueue",
             Self::HumanRequest => "POST /api/v1/requests",
@@ -133,7 +141,6 @@ fn classify_path(method: &str, path: &str) -> Option<RouteKind> {
         ("POST", p) if p.starts_with("/api/v1/admin/index/") => Some(RouteKind::IndexPublish),
         ("GET", p) if p.starts_with("/api/v1/requests/") => Some(RouteKind::RequestStatusRead),
         ("GET", p) if p.starts_with("/api/v1/index/") => Some(RouteKind::IndexRequest),
-        ("GET", p) if p.starts_with("/api/v1/bundles/") => Some(RouteKind::BytePathFetch),
         ("GET", p) if p.starts_with("/requests/") => Some(RouteKind::SiteView),
         (_, p) if p.starts_with("/api/v1/admin/") || p.starts_with("/api/v1/scheduler/") => {
             Some(RouteKind::AdminOperation)
@@ -204,8 +211,9 @@ const DAYS_PER_MONTH: u32 = 30;
 
 /// Tasks a human request enqueues — the request's uncovered closure.
 /// Not measurable from HTTP or AE (the batch rides inside one submit
-/// call), so it is a stated constant: the observed callbacks-to-request
-/// ratio in the window, rounded down.
+/// call), so it is a stated constant: the window's callbacks minus its
+/// redeemed-miss builds, divided by its human requests — the extra
+/// builds a request wave caused beyond the misses it redeemed.
 const TASKS_PER_HUMAN_REQUEST: f64 = 5.0;
 
 /// Run one `launch-model` subcommand.
@@ -271,25 +279,22 @@ async fn gather_snapshot(
             .replace("$since", &since)
             .replace("$until", &window_end);
         ae_rows.push(
-            cloudflare::analytics_engine_sql(&token, &account, &sql)
+            cloudflare::analytics_engine_sql::<AeCountRow>(&token, &account, &sql)
                 .await
                 .map_err(|error| stow_error!("analytics engine: {error}"))?,
         );
     }
     let install_days = ae_rows[0]
         .first()
-        .and_then(|row| row.get("install_days"))
-        .copied()
+        .map(|row| row.value)
         .ok_or_else(|| stow_error!("install-days query returned no row"))?;
     let cli_fetches = ae_rows[1]
         .first()
-        .and_then(|row| row.get("cli_fetches"))
-        .copied()
+        .map(|row| row.value)
         .ok_or_else(|| stow_error!("fetch query returned no row"))?;
     let miss_nodes = ae_rows[2]
         .first()
-        .and_then(|row| row.get("miss_nodes"))
-        .copied()
+        .map(|row| row.value)
         .ok_or_else(|| stow_error!("miss query returned no row"))?;
     let requests = zone_path_counts(&token, &zone, &since, &window_end).await?;
     Ok(WindowSnapshot {
@@ -372,10 +377,10 @@ fn render_toml(model: &LaunchModel) -> stow_types::error::Result<String> {
     let body = model.to_toml().map_err(stow_types::error::Error::msg)?;
     Ok(format!(
         "# Regenerated by `stow-admin launch-model export` — hand edits\n\
-         # are lost. The launch gate (stow-edge's `launch_gate` test) and\n\
-         # `stow-admin launch-load` read this file; every rate is events\n\
-         # per active install per day in `window`, or a flat daily cadence\n\
-         # where the lane does not scale with installs.\n\n{body}"
+         # are lost. `stow-admin launch-gate` and `stow-admin launch-load`\n\
+         # read this file; every rate is events per active install per\n\
+         # day in `window`, or a flat daily cadence where the lane does\n\
+         # not scale with installs.\n\n{body}"
     ))
 }
 

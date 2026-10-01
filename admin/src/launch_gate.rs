@@ -10,11 +10,18 @@
 //! `watchdog`'s single allowance table.
 //!
 //! The Durable-Object numbers decompose per event kind rather than per
-//! route: an alarm invocation is billed duration and rows but no
-//! request, so the alarm lane is priced as `alarm pass (idle)`
-//! invocations plus one claim's marginal cost per dispatched build —
-//! the difference between the hot and idle pass rows, spread over the
-//! claims the fixture fills.
+//! route: the alarm lane is priced as `alarm pass (idle)` invocations
+//! plus one claim's marginal cost per dispatched build — the difference
+//! between the hot and idle pass rows, spread over the claims the run
+//! actually made (`report.claimed_tasks`, never a checked-in slots
+//! assumption). A report whose pass claimed nothing while the model
+//! projects builds is refused rather than priced at zero.
+//!
+//! Only the measured dimensions gate: worker requests, DO requests/rows
+//! /duration, and the claim lane's counted-D1 coverage reads. Worker CPU
+//! ms, subrequests, worker-side D1 and R2 ops carry per-event constants
+//! and print as diagnostics only — the probe does not measure them
+//! (stow#452 F3).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,7 +34,7 @@ use stow_types::stow_error;
 use crate::render::{Output, Table, emit};
 use crate::watchdog::{
     D1_ROWS_READ_MONTHLY, D1_ROWS_WRITTEN_MONTHLY, DO_DURATION_GB_S_MONTHLY, DO_REQUESTS_MONTHLY,
-    DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY, WORKER_CPU_MS_MONTHLY, WORKER_REQUESTS_MONTHLY,
+    DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY, WORKER_REQUESTS_MONTHLY,
 };
 
 /// The launch gate — `stow-admin launch-gate --report
@@ -46,27 +53,19 @@ pub struct LaunchGateArgs {
 /// fraction of its included allowance — stow#452 fixes half.
 const ALLOWANCE_FRACTION: f64 = 0.5;
 
-/// GB-s each serialized DO wall second is priced at. Cloudflare bills
-/// Durable Object duration in GB-seconds of the isolate's memory
-/// footprint; a single-object isolate is priced here at 0.25 GB — a
-/// deliberate over-read of the ~128 MB a hot isolate measures, so the
-/// projection errs on the bill's side.
+/// GB-s each serialized DO wall second is priced at. Cloudflare's
+/// billing rule is fixed — 128 MB of memory per Durable Object
+/// instance, so 0.125 GB-s per wall second — and 0.25 deliberately
+/// over-reads it by 2×, so the projection errs on the bill's side.
 const DO_DURATION_GB_PER_WALL_S: f64 = 0.25;
-
-/// Claims the fixture's hot `"alarm pass"` row makes per pass —
-/// `STOW_MAX_CONCURRENT_JOBS` (45) minus `FixtureShape::IN_FLIGHT_ROWS`
-/// (30) open dispatch slots. The marginal claim price is `(hot − idle)
-/// / HOT_PASS_CLAIMS` for each measured column.
-const HOT_PASS_CLAIMS: f64 = 15.0;
 
 /// The issue's peak requirement: a peak-second's serialized Durable
 /// Object wall must stay under half a second.
 const PEAK_SERIALIZED_S_PER_S: f64 = 0.5;
 
-/// The edge's per-request CPU ceiling — a per-request sanity bound, not
-/// a monthly projection (stow#452: "no route's per-request CPU may
-/// approach its limit").
-const REQUEST_CPU_LIMIT_MS: f64 = 15_000.0;
+/// Tasks the enqueue drives' `submit_batch` carries — the denominator
+/// a single-task insert prices against.
+const SUBMIT_BATCH_TASKS: f64 = 3.0;
 
 /// The measured cost of one scheduler drive call, looked up in the
 /// harness report by row name.
@@ -78,12 +77,21 @@ struct DriveCost {
     rows_written: f64,
     /// Serialized wall milliseconds.
     wall_ms: f64,
+    /// Σ D1 `meta.rowsRead` on the counted catalog backend — the
+    /// per-page coverage lookups a claim pays.
+    d1_rows_read: f64,
+    /// Σ D1 `meta.rowsWritten` on the same backend.
+    d1_rows_written: f64,
 }
 
-/// One traffic kind's fixed cost vector. `drives` names the report rows
-/// the event invokes; `claims` the dispatches inside the pass lane it
-/// causes (only [`EventKind::Build`] — one claim each). Everything else
-/// is a per-event constant measured from the route itself.
+/// One traffic kind's cost vector. `drives` names the report rows the
+/// event invokes; `claims` the dispatches inside the pass lane it
+/// causes (only [`EventKind::Build`] — one claim each). The gated
+/// fields are structural counts (`do_requests`, `worker_requests`) or
+/// measured report reads; the `*_cpu_ms`/`subrequests`/`d1_rows_*`/
+/// `r2_ops` constants describe the handler's shape and print as
+/// diagnostics only — the probe does not measure them, so they can
+/// never trip the gate (stow#452 F3).
 #[derive(Debug, Clone, Copy)]
 struct EventCost {
     /// The traffic kind this prices.
@@ -92,24 +100,23 @@ struct EventCost {
     route: &'static str,
     /// (report row, calls per event).
     drives: &'static [(&'static str, f64)],
-    /// Billed DO requests the drive calls count as — alarm invocations
-    /// are not requests, so `false` for the alarm lane.
+    /// Billed DO invocations per event — Cloudflare's request billing
+    /// counts alarm invocations too, so the alarm lane carries 1.0.
     do_requests: f64,
     /// Dispatches the event causes inside a scheduler pass.
     claims: f64,
     /// Billed worker requests per event (index pulls are two).
     worker_requests: f64,
-    /// Worker CPU milliseconds per event.
+    /// Worker CPU milliseconds per event — diagnostic only.
     worker_cpu_ms: f64,
-    /// Subrequests per event — collected, never gated (Workers Paid
-    /// bills no subrequest dimension).
+    /// Subrequests per event — diagnostic only.
     subrequests: f64,
-    /// D1 `rows_read` per event.
+    /// Worker-side D1 `rows_read` per event — diagnostic only; the
+    /// measured D1 line is the claim lane's counted coverage reads.
     d1_rows_read: f64,
-    /// D1 `rows_written` per event.
+    /// Worker-side D1 `rows_written` per event — diagnostic only.
     d1_rows_written: f64,
-    /// R2 ops per event — zero today; the dimension stays in the
-    /// report so a route that adds one is visible.
+    /// R2 ops per event — diagnostic only (zero today).
     r2_ops: f64,
 }
 
@@ -148,7 +155,10 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::Admission,
         route: "POST /api/v1/admissions (+miss drain)",
-        drives: &[("POST /enqueue (untrusted)", 1.0)],
+        // The drain is one `send_enqueue` DO call per request; the
+        // insert it carries scales with misses, so its rows are
+        // priced on `EventKind::MissNode` where the model counts them.
+        drives: &[],
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
@@ -161,7 +171,13 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::EnqueueRedemption,
         route: "POST /api/v1/enqueue",
-        drives: &[("GET /status", 1.0), ("POST /enqueue (untrusted)", 1.0)],
+        // A redemption forwards a single request: its insert is one
+        // third of the accept drive's three-task batch, priced on the
+        // accept path — an accepted redemption pays the insert.
+        drives: &[
+            ("GET /status", 1.0),
+            ("POST /enqueue (untrusted accept)", 1.0 / SUBMIT_BATCH_TASKS),
+        ],
         do_requests: 2.0,
         claims: 0.0,
         worker_requests: 1.0,
@@ -225,8 +241,11 @@ const EVENT_COSTS: &[EventCost] = &[
     },
     EventCost {
         kind: EventKind::MissNode,
-        route: "miss nodes (AE — no route)",
-        drives: &[],
+        route: "miss nodes (drained insert)",
+        // Every miss node is one task in an admission's drain batch —
+        // one third of the accept drive's three-task enqueue, priced
+        // on the accept path so a growing miss volume grows the bill.
+        drives: &[("POST /enqueue (untrusted accept)", 1.0 / SUBMIT_BATCH_TASKS)],
         do_requests: 0.0,
         claims: 0.0,
         worker_requests: 0.0,
@@ -305,7 +324,10 @@ const EVENT_COSTS: &[EventCost] = &[
         kind: EventKind::AlarmPass,
         route: "scheduler alarm pass",
         drives: &[("alarm pass (idle)", 1.0)],
-        do_requests: 0.0,
+        // Cloudflare's DO request billing explicitly includes alarm
+        // invocations (HTTP requests, RPC sessions, WebSocket messages,
+        // alarm invocations) — the pass is a billed request.
+        do_requests: 1.0,
         claims: 0.0,
         worker_requests: 0.0,
         worker_cpu_ms: 0.0,
@@ -386,13 +408,11 @@ impl GateEvaluation {
 /// Σ over every event kind: projected monthly usage per product
 /// dimension, the DO wall seconds that price duration, and the
 /// peak-hour serialized wall — plus the per-route shares for the
-/// report's top-N table.
+/// report's top-N table and the unmeasured diagnostics.
 #[derive(Debug, Default)]
 struct Projection {
     /// Projected monthly worker requests.
     worker_requests: f64,
-    /// Projected monthly worker CPU milliseconds.
-    worker_cpu_ms: f64,
     /// Projected monthly DO invocations.
     do_requests: f64,
     /// Projected monthly DO rows read.
@@ -401,14 +421,22 @@ struct Projection {
     do_rows_written: f64,
     /// Projected monthly DO wall seconds — duration is billed on this.
     do_wall_s: f64,
-    /// Projected monthly D1 rows read.
+    /// Projected monthly D1 rows read — the measured side only: the
+    /// claim lane's counted catalog-coverage lookups.
     d1_read: f64,
-    /// Projected monthly D1 rows written.
+    /// Projected monthly D1 rows written — measured, as above.
     d1_written: f64,
+    /// Projected monthly worker CPU milliseconds — diagnostic constant,
+    /// not gated (the probe does not measure it).
+    diag_worker_cpu_ms: f64,
     /// Projected monthly subrequests — diagnostic, not gated.
-    subrequests: f64,
+    diag_subrequests: f64,
+    /// Projected monthly worker-side D1 reads — diagnostic, not gated.
+    diag_d1_read: f64,
+    /// Projected monthly worker-side D1 writes — diagnostic, not gated.
+    diag_d1_written: f64,
     /// Projected monthly R2 ops — diagnostic, not gated.
-    r2_ops: f64,
+    diag_r2_ops: f64,
     /// Serialized scheduler wall milliseconds per second at peak —
     /// the stow#452 serialization bound's numerator.
     peak_serialized_ms: f64,
@@ -428,36 +456,43 @@ fn fold_kind(
     let monthly = model.monthly_events(cost.kind);
     let peak_per_s = model.peak_events_per_second(cost.kind);
     projection.worker_requests = monthly.mul_add(cost.worker_requests, projection.worker_requests);
-    projection.worker_cpu_ms = monthly.mul_add(cost.worker_cpu_ms, projection.worker_cpu_ms);
     projection.do_requests = monthly.mul_add(cost.do_requests, projection.do_requests);
-    projection.subrequests = monthly.mul_add(cost.subrequests, projection.subrequests);
-    projection.r2_ops = monthly.mul_add(cost.r2_ops, projection.r2_ops);
-    projection.d1_read = monthly.mul_add(cost.d1_rows_read, projection.d1_read);
-    projection.d1_written = monthly.mul_add(cost.d1_rows_written, projection.d1_written);
+    projection.diag_worker_cpu_ms =
+        monthly.mul_add(cost.worker_cpu_ms, projection.diag_worker_cpu_ms);
+    projection.diag_subrequests = monthly.mul_add(cost.subrequests, projection.diag_subrequests);
+    projection.diag_d1_read = monthly.mul_add(cost.d1_rows_read, projection.diag_d1_read);
+    projection.diag_d1_written = monthly.mul_add(cost.d1_rows_written, projection.diag_d1_written);
+    projection.diag_r2_ops = monthly.mul_add(cost.r2_ops, projection.diag_r2_ops);
     let mut kind_read = 0.0;
     let mut kind_written = 0.0;
     let mut kind_wall_ms = 0.0;
+    let mut kind_d1_read = 0.0;
+    let mut kind_d1_written = 0.0;
     for (name, calls) in cost.drives {
         let row = drive(name)?;
         kind_read = calls.mul_add(row.rows_read, kind_read);
         kind_written = calls.mul_add(row.rows_written, kind_written);
         kind_wall_ms = calls.mul_add(row.wall_ms, kind_wall_ms);
+        kind_d1_read = calls.mul_add(row.d1_rows_read, kind_d1_read);
+        kind_d1_written = calls.mul_add(row.d1_rows_written, kind_d1_written);
     }
     kind_read = cost.claims.mul_add(claim_marginal.rows_read, kind_read);
     kind_written = cost
         .claims
         .mul_add(claim_marginal.rows_written, kind_written);
     kind_wall_ms = cost.claims.mul_add(claim_marginal.wall_ms, kind_wall_ms);
+    kind_d1_read = cost
+        .claims
+        .mul_add(claim_marginal.d1_rows_read, kind_d1_read);
+    kind_d1_written = cost
+        .claims
+        .mul_add(claim_marginal.d1_rows_written, kind_d1_written);
     projection.do_rows_read = monthly.mul_add(kind_read, projection.do_rows_read);
     projection.do_rows_written = monthly.mul_add(kind_written, projection.do_rows_written);
     projection.do_wall_s += monthly * kind_wall_ms / 1000.0;
+    projection.d1_read = monthly.mul_add(kind_d1_read, projection.d1_read);
+    projection.d1_written = monthly.mul_add(kind_d1_written, projection.d1_written);
     projection.peak_serialized_ms = peak_per_s.mul_add(kind_wall_ms, projection.peak_serialized_ms);
-    if cost.worker_cpu_ms >= REQUEST_CPU_LIMIT_MS {
-        return Err(format!(
-            "route `{}` projects {:.0}ms worker CPU per request — over the {REQUEST_CPU_LIMIT_MS:.0}ms request limit",
-            cost.route, cost.worker_cpu_ms
-        ));
-    }
     // The route's heaviest dimension decides its allowance share — the
     // number the top-N table ranks.
     let shares = [
@@ -471,16 +506,12 @@ fn fold_kind(
             monthly * cost.worker_requests / WORKER_REQUESTS_MONTHLY,
         ),
         (
-            "worker_cpu_ms",
-            monthly * cost.worker_cpu_ms / WORKER_CPU_MS_MONTHLY,
-        ),
-        (
             "d1_rows_read",
-            monthly * cost.d1_rows_read / D1_ROWS_READ_MONTHLY,
+            monthly * kind_d1_read / D1_ROWS_READ_MONTHLY,
         ),
         (
             "d1_rows_written",
-            monthly * cost.d1_rows_written / D1_ROWS_WRITTEN_MONTHLY,
+            monthly * kind_d1_written / D1_ROWS_WRITTEN_MONTHLY,
         ),
     ];
     let (dimension, share) = shares
@@ -497,7 +528,9 @@ fn fold_kind(
     Ok(())
 }
 
-/// The product/dimension rows the gate bounds, projected by `fold`.
+/// The product/dimension rows the gate bounds, projected by `fold` —
+/// every line a measured quantity or a structural count; the unmeasured
+/// constants print separately as diagnostics (stow#452 F3).
 fn usage_lines(projection: &Projection) -> Vec<UsageLine> {
     vec![
         UsageLine {
@@ -505,12 +538,6 @@ fn usage_lines(projection: &Projection) -> Vec<UsageLine> {
             dimension: "requests",
             projected: projection.worker_requests,
             allowance: WORKER_REQUESTS_MONTHLY,
-        },
-        UsageLine {
-            product: "workers",
-            dimension: "cpu_ms",
-            projected: projection.worker_cpu_ms,
-            allowance: WORKER_CPU_MS_MONTHLY,
         },
         UsageLine {
             product: "durable_objects",
@@ -551,20 +578,41 @@ fn usage_lines(projection: &Projection) -> Vec<UsageLine> {
     ]
 }
 
-/// Ungated dimensions printed for context only — the issue's
-/// allowances do not cover them, but the table does.
+/// Ungated dimensions printed for context only — per-event constants
+/// the probe does not measure, kept visible so a growing one is seen.
+/// The per-request CPU ceiling itself is a deploy invariant
+/// (`edge/Skyzen.toml` `cpu_ms = 15000`), enforced by workerd, not a
+/// projection this gate can observe (stow#452 F8).
 fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
     vec![
         UsageLine {
             product: "workers",
+            dimension: "cpu_ms",
+            projected: projection.diag_worker_cpu_ms,
+            allowance: f64::INFINITY,
+        },
+        UsageLine {
+            product: "workers",
             dimension: "subrequests",
-            projected: projection.subrequests,
+            projected: projection.diag_subrequests,
+            allowance: f64::INFINITY,
+        },
+        UsageLine {
+            product: "d1 (worker-side, unmeasured)",
+            dimension: "rows_read",
+            projected: projection.diag_d1_read,
+            allowance: f64::INFINITY,
+        },
+        UsageLine {
+            product: "d1 (worker-side, unmeasured)",
+            dimension: "rows_written",
+            projected: projection.diag_d1_written,
             allowance: f64::INFINITY,
         },
         UsageLine {
             product: "r2",
             dimension: "ops",
-            projected: projection.r2_ops,
+            projected: projection.diag_r2_ops,
             allowance: f64::INFINITY,
         },
     ]
@@ -587,6 +635,8 @@ fn evaluate(model: &LaunchModel, report: &SchedulerBudgetReport) -> Result<GateE
                     rows_read: row.rows_read as f64,
                     rows_written: row.rows_written as f64,
                     wall_ms: row.wall_ms as f64,
+                    d1_rows_read: row.d1_rows_read as f64,
+                    d1_rows_written: row.d1_rows_written as f64,
                 },
             )
         })
@@ -599,12 +649,28 @@ fn evaluate(model: &LaunchModel, report: &SchedulerBudgetReport) -> Result<GateE
     };
     let hot = drive("alarm pass")?;
     let idle = drive("alarm pass (idle)")?;
+    // A report whose pass claimed nothing measures no claim price —
+    // with nonzero build traffic the projection would silently
+    // underprice the Durable Object, so the gate refuses the report
+    // rather than project zero (a zero-claims pass means the probe ran
+    // under a dispatch cap the fixture's in-flight rows already fill).
+    let builds = model.monthly_events(EventKind::Build);
+    if report.claimed_tasks == 0 && builds > 0.0 {
+        return Err(format!(
+            "budget report claims 0 tasks (dispatch_limit {}) while the model projects \
+             {builds:.0} builds/mo — a pass that cannot claim measured no claim price",
+            report.dispatch_limit
+        ));
+    }
     // The claims inside a hot pass are what the hot row buys over the
-    // idle floor, spread over the slots the fixture fills.
+    // idle floor, spread over the claims the run actually made.
+    let claimed = report.claimed_tasks.max(1) as f64;
     let claim_marginal = DriveCost {
-        rows_read: (hot.rows_read - idle.rows_read).max(0.0) / HOT_PASS_CLAIMS,
-        rows_written: (hot.rows_written - idle.rows_written).max(0.0) / HOT_PASS_CLAIMS,
-        wall_ms: (hot.wall_ms - idle.wall_ms).max(0.0) / HOT_PASS_CLAIMS,
+        rows_read: (hot.rows_read - idle.rows_read).max(0.0) / claimed,
+        rows_written: (hot.rows_written - idle.rows_written).max(0.0) / claimed,
+        wall_ms: (hot.wall_ms - idle.wall_ms).max(0.0) / claimed,
+        d1_rows_read: (hot.d1_rows_read - idle.d1_rows_read).max(0.0) / claimed,
+        d1_rows_written: (hot.d1_rows_written - idle.d1_rows_written).max(0.0) / claimed,
     };
 
     let mut projection = Projection::default();
@@ -772,6 +838,10 @@ mod tests {
         SchedulerBudgetReport {
             queue_rows: 100_000,
             schema_version: 5,
+            // The production dispatch cap (45) minus the fixture's 30
+            // in-flight rows: the slots the hot pass claims.
+            dispatch_limit: 45,
+            claimed_tasks: 15,
             over_budget: false,
             rows: DO_BUDGETS
                 .iter()
@@ -783,6 +853,8 @@ mod tests {
                         rows_read: (budget.rows_read as f64 * factor) as u64,
                         rows_written: (budget.rows_written as f64 * factor) as u64,
                         wall_ms: (budget.wall_ms as f64 * factor) as u64,
+                        d1_rows_read: 0,
+                        d1_rows_written: 0,
                         statement_budget: budget.statements,
                         read_budget: budget.rows_read,
                         write_budget: budget.rows_written,
@@ -823,6 +895,18 @@ mod tests {
             rendered.contains("durable_objects rows_written"),
             "{rendered}"
         );
+    }
+
+    /// A pass that claimed nothing measures no claim price; with the
+    /// model's nonzero build traffic the gate must refuse the report
+    /// rather than project a zero claim cost (stow#452 F1).
+    #[test]
+    fn a_zero_claim_report_is_refused() {
+        let model = LaunchModel::from_toml(MODEL_TOML).expect("model");
+        let mut report = fixture_report(|_| 0.5);
+        report.claimed_tasks = 0;
+        let error = evaluate(&model, &report).expect_err("zero-claims must refuse");
+        assert!(error.contains("claims 0 tasks"), "{error}");
     }
 
     #[test]

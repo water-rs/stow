@@ -176,32 +176,32 @@ async fn graphql<V: Serialize + Sync, T: DeserializeOwned>(
         .map_err(|error| format!("decode {url}: {error}"))
 }
 
-/// The Analytics Engine `FORMAT JSON` envelope — rows under `data`,
-/// errors under `errors`.
+/// The Analytics Engine `FORMAT JSON` envelope — typed rows under
+/// `data`, errors under `errors`. `stow_types::analytics` owns the row
+/// shape; this envelope adds the `errors` arm an operator command
+/// cannot afford to lose (a failed query beside empty data must be a
+/// hard error, not zero rows).
 #[derive(Debug, Deserialize)]
-struct SqlEnvelope {
-    /// Queried rows.
-    data: Vec<std::collections::BTreeMap<String, serde_json::Value>>,
+struct SqlEnvelope<T> {
+    /// Queried rows — decode each numeric column with
+    /// `stow_types::analytics::de_u64` / `de_f64` to match its type;
+    /// `FORMAT JSON` quotes 64-bit integers.
+    data: Vec<T>,
     /// Present on failure.
     errors: Option<Vec<GraphqlError>>,
 }
 
-/// Run `sql` against the account's Analytics Engine datasets and return
-/// the rows as `(column → u64)` maps — 64-bit integers arrive quoted,
-/// so numeric-looking strings coerce back.
+/// Run `sql` against the account's Analytics Engine datasets and decode
+/// the rows as `T` — a struct whose numeric fields carry the
+/// `stow_types::analytics` deserializers.
 ///
 /// # Errors
 /// Transport, HTTP status, decode and API errors, as text.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "Analytics Engine counts are non-negative and far inside u64"
-)]
-pub async fn analytics_engine_sql(
+pub async fn analytics_engine_sql<T: DeserializeOwned>(
     token: &str,
     account_id: &str,
     sql: &str,
-) -> Result<Vec<std::collections::BTreeMap<String, u64>>, String> {
+) -> Result<Vec<T>, String> {
     let url = format!("{API_BASE}/accounts/{account_id}/analytics_engine/sql");
     let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
     let request = client
@@ -213,7 +213,7 @@ pub async fn analytics_engine_sql(
                 .map(|request| request.bytes_body(sql.as_bytes().to_vec()))
         })
         .map_err(|error| format!("POST {url}: {error}"))?;
-    let envelope: SqlEnvelope = request
+    let envelope: SqlEnvelope<T> = request
         .await
         .map_err(|error| format!("POST {url}: {error}"))?
         .error_for_status()
@@ -230,26 +230,5 @@ pub async fn analytics_engine_sql(
             .join("; ");
         return Err(format!("Analytics Engine SQL errors: {messages}"));
     }
-    envelope
-        .data
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|(key, value)| {
-                    let parsed = match value {
-                        serde_json::Value::Number(number) => number
-                            .as_u64()
-                            .or_else(|| number.as_f64().map(|float| float.round() as u64))
-                            .ok_or_else(|| format!("column {key}: {value} is not a count")),
-                        serde_json::Value::String(text) => text
-                            .parse::<u64>()
-                            .or_else(|_| text.parse::<f64>().map(|f| f.round() as u64))
-                            .map_err(|error| format!("column {key}: {text:?}: {error}")),
-                        other => Err(format!("column {key}: {other} is not a count")),
-                    }?;
-                    Ok((key.clone(), parsed))
-                })
-                .collect()
-        })
-        .collect()
+    Ok(envelope.data)
 }
