@@ -310,15 +310,27 @@ pub async fn seed_slice_headers(db: &DurableDb) -> Result<(), QueueError> {
     Ok(())
 }
 
-/// Recompute `deps_met` on the pending rows `(lo, hi]` — the flag the
-/// claim walk and the alarm's probes read, seeded once the edges and
-/// the published membership both exist.
+/// Recompute the persisted gate answers on the pending rows `(lo, hi]`
+/// — the flags the claim walk and the alarm's probes read, seeded once
+/// the edges and the published membership both exist. The edges'
+/// `dep_met` goes first: the owner counters count those flags.
 pub async fn seed_deps_met_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), QueueError> {
     db.query(&format!(
-        "UPDATE queue SET deps_met = {expr}, blocked = {blocked} \
+        "UPDATE queue_dependencies SET dep_met = CASE WHEN {unpub} THEN 0 ELSE 1 END \
          WHERE task_id >= printf('%064x', {lo} + 1) \
            AND task_id <= printf('%064x', {hi}) \
-           AND (deps_met != {expr} OR blocked != {blocked})",
+           AND dep_met != (CASE WHEN {unpub} THEN 0 ELSE 1 END)",
+        unpub = crate::scheduler::queue::dep_edge_unpublished_sql("queue_dependencies"),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("seed edge dep_met: {error}"))?;
+    db.query(&format!(
+        "UPDATE queue SET unpublished_deps = {unpublished}, deps_met = {expr}, blocked = {blocked} \
+         WHERE task_id >= printf('%064x', {lo} + 1) \
+           AND task_id <= printf('%064x', {hi}) \
+           AND (unpublished_deps != {unpublished} OR deps_met != {expr} OR blocked != {blocked})",
+        unpublished = crate::scheduler::queue::unpublished_deps_sql("queue.task_id"),
         expr = crate::scheduler::queue::deps_met_sql("queue.task_id"),
         blocked = crate::scheduler::queue::blocked_sql("queue.task_id"),
     ))

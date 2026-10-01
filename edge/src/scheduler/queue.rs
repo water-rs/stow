@@ -406,14 +406,15 @@ async fn apply_batched_inserts(
         let result = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at, deps_met, blocked, wake_at, dispatch_family, dispatch_key) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, dispatch_key) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
                         e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
-                        1, datetime('now'), {deps_met}, {blocked}, {wake}, {family}, {key} \
+                        1, datetime('now'), {unpublished}, {deps_met}, {blocked}, {wake}, {family}, {key} \
                  FROM (SELECT value AS e FROM json_each(?)) \
                  WHERE TRUE \
                  ON CONFLICT DO NOTHING",
+                unpublished = unpublished_deps_sql("e ->> 'task_id'"),
                 deps_met = deps_met_sql("e ->> 'task_id'"),
                 blocked = blocked_sql("e ->> 'task_id'"),
                 // `not_before` takes its epoch default, so the wake is
@@ -499,23 +500,7 @@ async fn apply_batched_dependency_sync(
         .await
         .map_err(|error| format!("clear dropped task dependencies: {error}"))?;
     }
-    for chunk in edges.chunks(ENQUEUE_JSON_BATCH_ROWS) {
-        db.query(
-            "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
-             SELECT e ->> 'task_id', e ->> 'depends_on_task_id', e ->> 'dep_crate_name', \
-                    e ->> 'dep_version', e ->> 'dep_features_json', e ->> 'dep_target', \
-                    e ->> 'dep_rustc_version', e ->> 'dep_host_side', e ->> 'dep_invocations', \
-                    e ->> 'dep_shapes', 1 \
-             FROM (SELECT value AS e FROM json_each(?)) \
-             WHERE TRUE \
-             ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
-        )
-        .bind(enqueue_json(chunk)?)
-        .execute()
-        .await
-        .map_err(|error| format!("insert task dependencies: {error}"))?;
-    }
+    insert_dep_edges(db, edges).await?;
     // Requeueing a failed dependency for a waiting parent revives the
     // row only behind the same backoff a fresh enqueue applies, with
     // `attempt` bumped for the same reason resurrection bumps it. The
@@ -567,6 +552,43 @@ async fn apply_batched_dependency_sync(
             &[DbValue::Text(enqueue_json(requeues)?)],
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// Insert the resync's surviving edges, each carrying its `dep_met` —
+/// the slice answer at insert time, the same EXISTS the gate used to
+/// evaluate — so the owner's `unpublished_deps` count and every later
+/// slice-delta flip read a stored flag instead of re-joining the
+/// published rows per edge.
+async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<(), QueueError> {
+    for chunk in edges.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        db.query(&format!(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_met, dep_side_known) \
+             SELECT d.task_id, d.depends_on_task_id, d.dep_crate_name, \
+                    d.dep_version, d.dep_features_json, d.dep_target, \
+                    d.dep_rustc_version, d.dep_host_side, d.dep_invocations, \
+                    d.dep_shapes, CASE WHEN {unpub} THEN 0 ELSE 1 END, 1 \
+             FROM (SELECT e ->> 'task_id' AS task_id, \
+                         e ->> 'depends_on_task_id' AS depends_on_task_id, \
+                         e ->> 'dep_crate_name' AS dep_crate_name, \
+                         e ->> 'dep_version' AS dep_version, \
+                         e ->> 'dep_features_json' AS dep_features_json, \
+                         e ->> 'dep_target' AS dep_target, \
+                         e ->> 'dep_rustc_version' AS dep_rustc_version, \
+                         e ->> 'dep_host_side' AS dep_host_side, \
+                         e ->> 'dep_invocations' AS dep_invocations, \
+                         e ->> 'dep_shapes' AS dep_shapes \
+                   FROM (SELECT value AS e FROM json_each(?))) AS d \
+             WHERE TRUE \
+             ON CONFLICT(task_id, depends_on_task_id) DO NOTHING",
+            unpub = dep_edge_unpublished_sql("d"),
+        ))
+        .bind(enqueue_json(chunk)?)
+        .execute()
+        .await
+        .map_err(|error| format!("insert task dependencies: {error}"))?;
     }
     Ok(())
 }
@@ -1937,7 +1959,7 @@ async fn request_record_status(
 /// columns existed carry `-1` legs: they match no clause, so a
 /// shapeless dep stays gated until the node republishes — legacy rows
 /// are unreachable under this lookup, never migrated into it.
-fn dep_edge_unpublished_sql(dep: &str) -> String {
+pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
     format!(
         "({dep}.dep_shapes = 0 \
          OR (SELECT count(DISTINCT p.unit_invocation * 2 + p.unit_linked) \
@@ -1957,10 +1979,6 @@ fn dep_edge_unpublished_sql(dep: &str) -> String {
     )
 }
 
-/// The dependency gate's EXISTS half — one task's unmet-edge check,
-/// aliased for reuse: `deps_met` stores its negation, so the persisted
-/// flag can never drift from the predicate it replaces.
-///
 /// The gate itself: a task is dispatchable only when every dependency
 /// edge resolves to a row the latest published index slice serves for
 /// the dependency's own `(target, rustc_version)` — the host slice for a
@@ -1975,27 +1993,30 @@ fn dep_edge_unpublished_sql(dep: &str) -> String {
 /// with the existing backoff; a dependency that fails for good leaves
 /// them settled behind it undispatched, released only when it is later
 /// built and published.
-fn unmet_dep_edge_exists_sql(dep: &str, owner_task: &str) -> String {
+///
+/// `unpublished_deps` as a SQL expression over the owner's row: the
+/// count of its unmet edges. Each edge's `dep_met` flag is written at
+/// insert and flipped by slice deltas, so the count is a keyed probe of
+/// the owner's own edges — never a slice join (stow#521).
+pub(super) fn unpublished_deps_sql(owner_task: &str) -> String {
     format!(
-        "EXISTS ( \
-            SELECT 1 FROM queue_dependencies {dep} \
-            WHERE {dep}.task_id = {owner_task} \
-              AND {} \
-        )",
-        dep_edge_unpublished_sql(dep)
+        "(SELECT count(*) FROM queue_dependencies d \
+            WHERE d.task_id = {owner_task} AND d.dep_met = 0)"
     )
 }
 
 /// `deps_met` as a SQL expression over the owner's row: `1` while every
-/// edge resolves to units the live published slice serves. Written at
-/// edge sync, refreshed by slice publish and the schema migration — the
-/// three places an edge's answer can change — so the claim walk and the
+/// edge resolves to units the live published slice serves — the
+/// `unpublished_deps = 0` derivation, evaluated as a count of unmet
+/// edges rather than a slice EXISTS per edge. Written at edge sync,
+/// refreshed by slice publish and the schema migration — the three
+/// places an edge's answer can change — so the claim walk and the
 /// alarm's wake probes read the flag instead of re-evaluating the gate
 /// per pending row.
 pub(super) fn deps_met_sql(owner_task: &str) -> String {
     format!(
-        "CASE WHEN {} THEN 0 ELSE 1 END",
-        unmet_dep_edge_exists_sql("d", owner_task)
+        "CASE WHEN {} = 0 THEN 1 ELSE 0 END",
+        unpublished_deps_sql(owner_task)
     )
 }
 
@@ -2016,9 +2037,8 @@ pub(super) fn blocked_sql(owner_task: &str) -> String {
             WHERE bd.task_id = {owner_task} \
               AND (bdep.status = 'failed' OR bd.dep_crate_name = '' \
                    OR bd.dep_host_side < 0) \
-              AND {} \
-        ) THEN 1 ELSE 0 END",
-        dep_edge_unpublished_sql("bd")
+              AND bd.dep_met = 0 \
+        ) THEN 1 ELSE 0 END"
     )
 }
 
@@ -2120,59 +2140,61 @@ pub(super) fn dispatch_key_row_sql() -> String {
     )
 }
 
-/// Recompute `deps_met` for a task-id set — the only places an edge's
-/// answer changes are edge writes (here, after the batch's resync) and
-/// slice writes ([`record_published_slice`]). `deps_met` is maintained
-/// only for `pending` rows — the claim reads it there alone, and every
-/// transition into `pending` recomputes it in the same statement — so
-/// the refresh touches nothing else: a stale value on a non-pending row
-/// is never observed. The `deps_met !=` guard keeps `changes()` honest:
-/// an unchanged row does not count as written.
+/// Recount `unpublished_deps` for a task-id set — the only places an
+/// edge's answer changes are edge writes (here, after the batch's
+/// resync) and slice writes ([`record_published_slice`], which moves the
+/// counter by ±1 per flipped edge). The recount is unconditional: the
+/// counter stays live on every status — a resynced non-pending row's
+/// stale count would otherwise corrupt the ±1 arithmetic the next
+/// slice delta applies. `deps_met` re-derives alongside the count;
+/// `blocked` recomputes on pending rows alone — a stale value on
+/// another status is never observed. The `!=` guards keep `changes()`
+/// honest: an unchanged row does not count as written.
 ///
-/// The `task_id IN` drives the update — the `status = 'pending'`
-/// restriction is folded inside the subquery, so the planner cannot
-/// prefer a status-index scan over the id list: the statement visits
-/// exactly the named pending rows, never the pending group.
+/// The `task_id IN` drives the update — the statement visits exactly
+/// the named rows, never the pending group.
 async fn refresh_deps_met_tasks(db: &DurableDb, task_ids: &[String]) -> Result<(), QueueError> {
     for chunk in task_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(&format!(
-            "UPDATE queue SET deps_met = {dexpr}, blocked = {bexpr} \
-             WHERE task_id IN ( \
-                 SELECT q.task_id FROM json_each(?) AS j \
-                 CROSS JOIN queue q ON q.task_id = j.value \
-                   AND q.status = 'pending') \
-               AND (deps_met != {dexpr} OR blocked != {bexpr})",
+            "UPDATE queue \
+             SET unpublished_deps = {uexpr}, deps_met = {dexpr}, \
+                 blocked = CASE WHEN status = 'pending' THEN {bexpr} ELSE blocked END \
+             WHERE task_id IN (SELECT value FROM json_each(?)) \
+               AND (unpublished_deps != {uexpr} OR deps_met != {dexpr} \
+                    OR (status = 'pending' AND blocked != {bexpr}))",
+            uexpr = unpublished_deps_sql("queue.task_id"),
             dexpr = deps_met_sql("queue.task_id"),
             bexpr = blocked_sql("queue.task_id"),
         ))
         .bind(enqueue_json(chunk)?)
         .execute()
         .await
-        .map_err(|error| format!("refresh deps_met for enqueued tasks: {error}"))?;
+        .map_err(|error| format!("refresh gate counters for enqueued tasks: {error}"))?;
     }
     Ok(())
 }
 
-/// Recompute `deps_met`/`blocked` on the pending dependents of a set of
-/// dep tasks — the refresh a dep's own status change owes them. `dep_set`
-/// is a SELECT yielding the dep task ids (a `json_each` arm, a queue
-/// subquery re-running a mutation's selector, or a single `SELECT ?`):
-/// it drives `idx_queue_dependencies_dep` in pinned `CROSS JOIN` order,
-/// then the owners' id list drives the UPDATE, so the pass reads in
-/// proportion to the dep set's dependents — never the queue.
+/// Recompute `blocked` on the pending dependents of a set of dep tasks —
+/// the refresh a dep's own status change owes them (`unpublished_deps`
+/// never moves on a status flip: the counter counts slice answers, not
+/// dep statuses). `dep_set` is a SELECT yielding the dep task ids (a
+/// `json_each` arm, a queue subquery re-running a mutation's selector,
+/// or a single `SELECT ?`): it drives `idx_queue_dependencies_dep` in
+/// pinned `CROSS JOIN` order, then the owners' id list drives the
+/// UPDATE, so the pass reads in proportion to the dep set's dependents
+/// — never the queue.
 async fn refresh_dependents(
     db: &DurableDb,
     dep_set_sql: &str,
     binds: &[DbValue],
 ) -> Result<(), QueueError> {
     let sql = format!(
-        "UPDATE queue SET deps_met = {dexpr}, blocked = {bexpr} \
+        "UPDATE queue SET blocked = {bexpr} \
          WHERE task_id IN ( \
              SELECT o.task_id FROM ({dep_set_sql}) AS s \
              CROSS JOIN queue_dependencies d ON d.depends_on_task_id = s.task_id \
              CROSS JOIN queue o ON o.task_id = d.task_id AND o.status = 'pending') \
-           AND (deps_met != {dexpr} OR blocked != {bexpr})",
-        dexpr = deps_met_sql("queue.task_id"),
+           AND blocked != {bexpr}",
         bexpr = blocked_sql("queue.task_id"),
     );
     let mut query = db.query(&sql);
@@ -2226,19 +2248,17 @@ fn effective_status_sql() -> String {
 /// its task id; an edge whose identity was never resolved reports
 /// `unknown dependency identity`, since no task names it.
 fn blocked_by_sql() -> String {
-    format!(
-        "CASE WHEN queue.status = 'pending' AND queue.blocked != 0 THEN ( \
-            SELECT CASE WHEN bd.dep_crate_name = '' THEN 'unknown dependency identity' \
-                        ELSE bd.depends_on_task_id END \
-                FROM queue_dependencies bd \
-                LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
-                WHERE bd.task_id = queue.task_id \
-                  AND (bdep.status = 'failed' OR bd.dep_crate_name = '' OR bd.dep_host_side < 0) \
-                  AND {} \
-                ORDER BY bd.depends_on_task_id LIMIT 1 \
-        ) END",
-        dep_edge_unpublished_sql("bd")
-    )
+    "CASE WHEN queue.status = 'pending' AND queue.blocked != 0 THEN ( \
+        SELECT CASE WHEN bd.dep_crate_name = '' THEN 'unknown dependency identity' \
+                    ELSE bd.depends_on_task_id END \
+            FROM queue_dependencies bd \
+            LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            WHERE bd.task_id = queue.task_id \
+              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' OR bd.dep_host_side < 0) \
+              AND bd.dep_met = 0 \
+            ORDER BY bd.depends_on_task_id LIMIT 1 \
+    ) END"
+        .to_owned()
 }
 
 pub async fn claim_dispatchable_tasks(
@@ -2594,11 +2614,12 @@ pub async fn mark_dispatch_failed(
         .map_err(|db_error| format!("load dispatch attempts for {task_id}: {db_error}"))?
         .ok_or_else(|| QueueError::UnknownTask(task_id.to_owned()))?;
     let backoff_minutes = dispatch_backoff_minutes(dispatch_attempts);
-    // The row re-enters `pending`: `deps_met`/`blocked` are maintained
-    // only for pending rows, so their answers may have gone stale while it
-    // was in-flight — recompute both in the same statement. `wake_at`
-    // is the later of the age gate and the backoff this statement writes
-    // (the SET operand is spelled out again — SET terms see the old row);
+    // The row re-enters `pending`: `unpublished_deps`/`deps_met` stay
+    // live on every status, so the recompute is a cheap count-derived
+    // re-derivation — and `blocked`, maintained for pending rows only,
+    // may have gone stale while it was in-flight. `wake_at` is the
+    // later of the age gate and the backoff this statement writes (the
+    // SET operand is spelled out again — SET terms see the old row);
     // the human lane ignores the age gate.
     let next_not_before = "datetime('now', ?)";
     db.query(&format!(
@@ -3231,11 +3252,11 @@ pub async fn apply_mutation(
     };
     let sql = match mutation {
         QueueMutation::Retry => format!(
-            // Rows re-enter `pending`: `deps_met`/`blocked` are
-            // maintained only for pending rows, so a failed row's
-            // answers may be stale — recompute them in the same
-            // statement. `not_before` resets to epoch, so `wake_at` is
-            // the age gate (miss lane) or epoch (human).
+            // Rows re-enter `pending`: `deps_met` re-derives from the
+            // live counter, and `blocked` — maintained for pending
+            // rows only — may be stale on a failed row; both recompute
+            // in the same statement. `not_before` resets to epoch, so
+            // `wake_at` is the age gate (miss lane) or epoch (human).
             "UPDATE queue SET status = 'pending', error_msg = '', \
              not_before = '1970-01-01 00:00:00', deps_met = {deps_met}, \
              blocked = {blocked}, wake_at = {wake}, \
@@ -4026,14 +4047,15 @@ async fn apply_slice_row_delta(
 /// generation's marker row (advancing `applied_generation`, the token
 /// the next delta report bases on), retire rows a crashed earlier
 /// report left at never-published generations — full reports only; a
-/// delta report never writes outside the live generation — then refresh
-/// `deps_met` — but only on the dependents whose answer can have
-/// changed. `changed_json` is the exact set of slice rows this report
-/// added or retired, so the refresh probes the dependents of those rows
-/// through `idx_queue_dependencies_dep_match` rather than re-evaluating
-/// every task with any edge on the slice. `deps_met` is maintained only
-/// for `pending` rows — every transition into `pending` recomputes it —
-/// so the refresh touches nothing else.
+/// delta report never writes outside the live generation — then flip
+/// the persisted `dep_met` on exactly the edges a changed row matched,
+/// moving each owner's `unpublished_deps` counter by the flip delta
+/// (stow#521). `changed_json` is the exact set of slice rows this
+/// report added or retired, so the pass probes edges through
+/// `idx_queue_dependencies_dep_match` — one index walk per changed row
+/// — and touches the owners of flipped edges alone. Every statement is
+/// one batched write: a publish costs 1 + the delta's dependents, never
+/// the queue or the edge graph.
 async fn commit_published_slice(
     db: &DurableDb,
     target: &str,
@@ -4092,19 +4114,86 @@ async fn commit_published_slice(
     let Some(changed_json) = changed_json else {
         return Ok(());
     };
-    // Membership changed for exactly the `changed_json` rows: refresh
-    // the persisted gate answers on the pending dependents of those rows
-    // alone. `json_each` drives the probe — one `dep_match` index walk
-    // per changed row, then a PK seek into each dependent — so the pass
-    // reads in proportion to the delta's dependents, not the slice's
-    // edge graph. The `status = 'pending'` restriction lives inside the
-    // subquery join: as an outer literal it makes the planner prefer the
-    // status index and walk the whole pending group (measured 60k
-    // reads on the 100k fixture).
+    apply_slice_gate_delta(db, target, rustc_version, changed_json).await
+}
+
+/// The gate half of a slice commit: membership changed for exactly the
+/// `changed_json` rows, so flip the persisted `dep_met` on the edges
+/// they match and move each owner's `unpublished_deps` counter by the
+/// flip delta — a publish touches 1 + the delta's direct dependents,
+/// never the queue or the graph (stow#521). The matched-edge set —
+/// edges whose dep identity a changed row can flip — is the same in
+/// all three statements: `json_each` drives one `dep_match` index walk
+/// per changed row, `DISTINCT rowid` dedupes (several changed rows may
+/// satisfy one edge), and the PK seek back to the edge keeps reads
+/// proportional to the delta's dependents.
+async fn apply_slice_gate_delta(
+    db: &DurableDb,
+    target: &str,
+    rustc_version: &str,
+    changed_json: String,
+) -> Result<(), QueueError> {
+    let matched_edges = "SELECT DISTINCT d.rowid AS rid \
+         FROM (SELECT value AS c FROM json_each(?)) AS j \
+         CROSS JOIN queue_dependencies d \
+           ON d.dep_target = ? AND d.dep_rustc_version = ? \
+          AND d.dep_crate_name = j.c ->> 'crate_name' \
+          AND d.dep_version = j.c ->> 'version' \
+          AND d.dep_features_json = j.c ->> 'features_json' \
+          AND d.dep_host_side = j.c ->> 'unit_side' \
+          AND (d.dep_host_side = 0 OR (j.c ->> 'unit_linked') = 1) \
+          AND (d.dep_invocations & ((j.c ->> 'unit_invocation') + 1)) != 0";
+    // 1. Move each owner's counter by the sum of its matched edges'
+    //    flips — `dep_met - new` is +1 on a met→unmet flip, −1 on
+    //    unmet→met, 0 when the delta did not move the edge — so owners
+    //    whose edges all stayed put write nothing. `deps_met` re-derives
+    //    from the post-flip count in the same statement. Runs before the
+    //    edge flip: the delta reads the pre-flip `dep_met`.
     db.query(&format!(
-        "UPDATE queue SET deps_met = {deps_met}, blocked = {blocked} \
-         WHERE task_id IN ( \
-               SELECT DISTINCT o.task_id \
+        "UPDATE queue \
+         SET unpublished_deps = unpublished_deps + f.delta, \
+             deps_met = CASE WHEN unpublished_deps + f.delta = 0 THEN 1 ELSE 0 END \
+         FROM (SELECT d.task_id AS owner, \
+                      SUM(d.dep_met - CASE WHEN {unpub} THEN 0 ELSE 1 END) AS delta \
+               FROM queue_dependencies d \
+               WHERE d.rowid IN ({matched_edges}) \
+               GROUP BY d.task_id) AS f \
+         WHERE queue.task_id = f.owner AND f.delta != 0",
+        unpub = dep_edge_unpublished_sql("d"),
+    ))
+    .bind(changed_json.clone())
+    .bind(target.to_owned())
+    .bind(rustc_version.to_owned())
+    .execute()
+    .await
+    .map_err(|error| {
+        format!("adjust unpublished-deps counters for slice {target}/{rustc_version}: {error}")
+    })?;
+    // 2. Persist the flips on the matched edges themselves.
+    db.query(&format!(
+        "UPDATE queue_dependencies \
+         SET dep_met = CASE WHEN {unpub} THEN 0 ELSE 1 END \
+         WHERE dep_met != (CASE WHEN {unpub} THEN 0 ELSE 1 END) \
+           AND rowid IN ({matched_edges})",
+        unpub = dep_edge_unpublished_sql("queue_dependencies"),
+    ))
+    .bind(changed_json.clone())
+    .bind(target.to_owned())
+    .bind(rustc_version.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("flip dep_met for slice {target}/{rustc_version}: {error}"))?;
+    // 3. `blocked` on the pending owners of matched edges: a flip can
+    //    move it, so those owners recompute — now that the edges carry
+    //    the new `dep_met`. Owners whose edges did not flip recompute
+    //    to their current flag and the `blocked !=` guard writes
+    //    nothing; the read stays proportional to the delta's
+    //    dependents.
+    db.query(&format!(
+        "UPDATE queue SET blocked = {blocked} \
+         WHERE status = 'pending' AND blocked != {blocked} \
+           AND task_id IN ( \
+               SELECT DISTINCT d.task_id \
                FROM (SELECT value AS c FROM json_each(?)) AS j \
                CROSS JOIN queue_dependencies d \
                  ON d.dep_target = ? AND d.dep_rustc_version = ? \
@@ -4113,11 +4202,7 @@ async fn commit_published_slice(
                 AND d.dep_features_json = j.c ->> 'features_json' \
                 AND d.dep_host_side = j.c ->> 'unit_side' \
                 AND (d.dep_host_side = 0 OR (j.c ->> 'unit_linked') = 1) \
-                AND (d.dep_invocations & ((j.c ->> 'unit_invocation') + 1)) != 0 \
-               CROSS JOIN queue o \
-                 ON o.task_id = d.task_id AND o.status = 'pending') \
-           AND (deps_met != {deps_met} OR blocked != {blocked})",
-        deps_met = deps_met_sql("queue.task_id"),
+                AND (d.dep_invocations & ((j.c ->> 'unit_invocation') + 1)) != 0)",
         blocked = blocked_sql("queue.task_id"),
     ))
     .bind(changed_json)
@@ -4125,7 +4210,7 @@ async fn commit_published_slice(
     .bind(rustc_version.to_owned())
     .execute()
     .await
-    .map_err(|error| format!("refresh deps_met for slice {target}/{rustc_version}: {error}"))?;
+    .map_err(|error| format!("refresh blocked for slice {target}/{rustc_version}: {error}"))?;
     Ok(())
 }
 
@@ -4140,7 +4225,7 @@ async fn commit_published_slice(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -4185,12 +4270,14 @@ async fn migrate_dispatch_gate(
         }
         migrate_schema(db).await?;
     }
-    // The claim-order tuple is derived from columns every row carries;
-    // `deps_met`/`blocked` replay the gate's EXISTS per row and
-    // `wake_at` the lane-aware wake expression. Queue-wide passes are
-    // legal here and only here — this is operations code. The `!=`
-    // guards recompute any row whose persisted form drifted — a key
-    // written under an older format rebuilds under the current one.
+    // The claim-order tuple is derived from columns every row carries.
+    // `dep_met` replays each edge's slice EXISTS once — the seed for the
+    // per-owner counter — then `unpublished_deps` counts those flags,
+    // `deps_met` is the `= 0` derivation, and `blocked`/`wake_at` carry
+    // their stored expressions. Queue-wide passes are legal here and
+    // only here — this is operations code. The `!=` guards recompute
+    // any row whose persisted form drifted — a key written under an
+    // older format rebuilds under the current one.
     db.query(&format!(
         "UPDATE queue \
          SET dispatch_family = {family}, dispatch_key = {key} \
@@ -4201,6 +4288,18 @@ async fn migrate_dispatch_gate(
     .execute()
     .await
     .map_err(|error| format!("backfill dispatch keys: {error}"))?;
+    // Backfill the edge flags first: the counter recount below reads
+    // `dep_met`, so edges must carry real answers before it runs.
+    db.query(&format!(
+        "UPDATE queue_dependencies \
+         SET dep_met = CASE WHEN {unpub} THEN 0 ELSE 1 END \
+         WHERE dep_met != (CASE WHEN {unpub} THEN 0 ELSE 1 END)",
+        unpub = dep_edge_unpublished_sql("queue_dependencies"),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("backfill edge dep_met flags: {error}"))?;
+    let unpublished = unpublished_deps_sql("queue.task_id");
     let deps_met = deps_met_sql("queue.task_id");
     let blocked = blocked_sql("queue.task_id");
     let wake = wake_at_sql(
@@ -4210,8 +4309,8 @@ async fn migrate_dispatch_gate(
         settings.dispatch_min_age_minutes,
     );
     db.query(&format!(
-        "UPDATE queue SET deps_met = {deps_met}, blocked = {blocked}, wake_at = {wake} \
-         WHERE deps_met != {deps_met} OR blocked != {blocked} OR wake_at != {wake}",
+        "UPDATE queue SET unpublished_deps = {unpublished}, deps_met = {deps_met}, blocked = {blocked}, wake_at = {wake} \
+         WHERE unpublished_deps != {unpublished} OR deps_met != {deps_met} OR blocked != {blocked} OR wake_at != {wake}",
     ))
     .execute()
     .await
@@ -4420,6 +4519,10 @@ async fn migrate_queue_columns(
             "ALTER TABLE queue ADD COLUMN shape_requeue INTEGER NOT NULL DEFAULT 0",
         ),
         (
+            "unpublished_deps",
+            "ALTER TABLE queue ADD COLUMN unpublished_deps INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
             "deps_met",
             "ALTER TABLE queue ADD COLUMN deps_met INTEGER NOT NULL DEFAULT 0",
         ),
@@ -4555,6 +4658,12 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
         .execute()
         .await
         .map_err(|error| format!("add queue_dependencies.dep_side_known column: {error}"))?;
+    }
+    if !columns.contains("dep_met") {
+        db.query("ALTER TABLE queue_dependencies ADD COLUMN dep_met INTEGER NOT NULL DEFAULT 0")
+            .execute()
+            .await
+            .map_err(|error| format!("add queue_dependencies.dep_met column: {error}"))?;
     }
     migrate_queue_dependencies_indexes(db).await?;
     derive_dev_era_edge_sides(db).await?;
@@ -4873,10 +4982,11 @@ async fn recover_stale_active_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<(), QueueError> {
-    // Rows re-enter `pending`: `deps_met`/`blocked` are maintained only
-    // for pending rows, so a stale in-flight row's answers may be stale —
-    // recompute them in the same statement. `not_before` is untouched, so
-    // `wake_at` re-derives from the live columns.
+    // Rows re-enter `pending`: `deps_met` re-derives from the live
+    // counter, and `blocked` — maintained for pending rows only — may
+    // be stale on a stale in-flight row; both recompute in the same
+    // statement. `not_before` is untouched, so `wake_at` re-derives
+    // from the live columns.
     db.query(&format!(
         "UPDATE queue \
          SET status = 'pending', error_msg = '', deps_met = {deps_met}, \
@@ -4926,10 +5036,10 @@ async fn requeue_incomplete_shape_deps(
     // `INDEXED BY` the partial index: left as a flat `status =
     // 'completed'` predicate, the planner prefers the plain status index
     // and walks every completed row each pass.
-    // Rows re-enter `pending`: `deps_met`/`blocked` are maintained only
-    // for pending rows, so a completed row's answers are stale —
-    // recompute them in the same statement, alongside the `not_before`
-    // bump's `wake_at`.
+    // Rows re-enter `pending`: `deps_met` re-derives from the live
+    // counter, and `blocked` — maintained for pending rows only — is
+    // stale on a completed row; both recompute in the same statement,
+    // alongside the `not_before` bump's `wake_at`.
     let next_not_before = "MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes'))";
     db.query(&format!(
         "UPDATE queue \
@@ -4950,7 +5060,7 @@ async fn requeue_incomplete_shape_deps(
                SELECT 1 FROM queue_dependencies d \
                WHERE d.depends_on_task_id = queue.task_id \
                  AND d.dep_crate_name != '' AND d.dep_host_side >= 0 \
-                 AND {unpublished} \
+                 AND d.dep_met = 0 \
            )",
         deps_met = deps_met_sql("queue.task_id"),
         blocked = blocked_sql("queue.task_id"),
@@ -4960,7 +5070,6 @@ async fn requeue_incomplete_shape_deps(
             next_not_before,
             settings.dispatch_min_age_minutes,
         ),
-        unpublished = dep_edge_unpublished_sql("d")
     ))
     .execute()
     .await
@@ -6808,6 +6917,235 @@ mod sqlite_tests {
             .expect("parent row");
         assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Pending);
         assert_eq!(parent.blocked_by, None);
+    }
+
+    /// The owner's persisted gate counters — `(unpublished_deps,
+    /// deps_met)` as stored, not the status derivation.
+    async fn gate_counters(db: &DurableDb, crate_name: &str) -> (i64, i64) {
+        #[derive(skyzen::FromRow)]
+        struct GateCounters {
+            unpublished_deps: i64,
+            deps_met: i64,
+        }
+        let counters = db
+            .query("SELECT unpublished_deps, deps_met FROM queue WHERE task_id = ?")
+            .bind(task_id_on(crate_name, TARGET))
+            .fetch_one::<GateCounters>()
+            .await
+            .expect("read gate counters");
+        (counters.unpublished_deps, counters.deps_met)
+    }
+
+    /// Each edge's stored `dep_met` flag, keyed by dep crate.
+    async fn edge_flags(db: &DurableDb) -> Vec<(String, i64)> {
+        #[derive(skyzen::FromRow)]
+        struct EdgeFlag {
+            dep_crate_name: String,
+            dep_met: i64,
+        }
+        let mut flags: Vec<(String, i64)> = db
+            .query(
+                "SELECT dep_crate_name, dep_met FROM queue_dependencies \
+                 ORDER BY dep_crate_name",
+            )
+            .fetch_all::<EdgeFlag>()
+            .await
+            .expect("edge flags")
+            .into_iter()
+            .map(|edge| (edge.dep_crate_name, edge.dep_met))
+            .collect();
+        flags.sort();
+        flags
+    }
+
+    /// The `PublishedSliceRow` set `publish` registers for a crate —
+    /// both kinds under the target side's native invocation — so a
+    /// delta report can add or retire exactly those rows.
+    fn dep_slice_rows(crate_name: &str) -> Vec<stow_types::api::PublishedSliceRow> {
+        [UnitKind::Linked, UnitKind::Unlinked]
+            .iter()
+            .map(|kind| stow_types::api::PublishedSliceRow {
+                crate_name: crate_name.parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+                unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            })
+            .collect()
+    }
+
+    /// A mixed dep set lands the slice answer per edge — the same
+    /// EXISTS the gate used to replay per evaluation, run once at
+    /// insert — and the owner counts its unmet edges, so `deps_met` is
+    /// the counter's zero (stow#521).
+    #[tokio::test]
+    async fn enqueue_writes_each_edge_s_answer_and_counts_unpublished_deps() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("served-dep", Vec::new()),
+                request("absent-dep", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue deps");
+        publish(&db, "served-dep").await;
+
+        enqueue(
+            &db,
+            &[request(
+                "parent",
+                vec![dependency("served-dep"), dependency("absent-dep")],
+            )],
+        )
+        .await
+        .expect("enqueue parent");
+
+        assert_eq!(
+            edge_flags(&db).await,
+            vec![("absent-dep".to_owned(), 0), ("served-dep".to_owned(), 1),],
+            "dep_met is the slice answer at edge-write time"
+        );
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+        assert_eq!(gate_counters(&db, "absent-dep").await, (0, 1));
+    }
+
+    /// A publish delta flips exactly the edges its rows match — the
+    /// already-met edge does not move — and each owner's counter tracks
+    /// the flips, so reaching zero releases the pending row to claim.
+    #[tokio::test]
+    async fn a_slice_delta_flips_the_matched_edges_and_moves_the_counter() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("first-dep", Vec::new()),
+                request("second-dep", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue deps");
+        publish(&db, "first-dep").await;
+        enqueue(
+            &db,
+            &[request(
+                "parent",
+                vec![dependency("first-dep"), dependency("second-dep")],
+            )],
+        )
+        .await
+        .expect("enqueue parent");
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+
+        // A delta report on the live generation adds only second-dep's
+        // rows: the first-dep edge is already met and must not flip.
+        super::record_published_slice(
+            &db,
+            TARGET,
+            RUSTC,
+            Some(1),
+            None,
+            &dep_slice_rows("second-dep"),
+            &[],
+        )
+        .await
+        .expect("delta publish second-dep");
+
+        assert_eq!(
+            edge_flags(&db).await,
+            vec![("first-dep".to_owned(), 1), ("second-dep".to_owned(), 1),]
+        );
+        assert_eq!(gate_counters(&db, "parent").await, (0, 1));
+        let claimed = super::claim_dispatchable_tasks(
+            &db,
+            &SchedulerSettings {
+                dispatch: Dispatch::from_max_concurrent_jobs(8),
+                ..claim_settings()
+            },
+            &NoCoverage,
+        )
+        .await
+        .expect("claim after delta");
+        assert!(
+            claimed.iter().any(|task| task.crate_name == "parent"),
+            "an owner whose counter reaches 0 dispatches"
+        );
+    }
+
+    /// Membership removal is a delta like any other: retiring a dep's
+    /// rows flips its matched edges back to unmet and the owner's
+    /// counter increments — the publish path stays symmetric.
+    #[tokio::test]
+    async fn a_slice_delta_retire_flips_the_edges_back_and_increments_the_counter() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        publish(&db, "dep").await;
+        assert_eq!(gate_counters(&db, "parent").await, (0, 1));
+
+        // applied_generation is 1 after the first publish; the retire
+        // delta reports against it.
+        super::record_published_slice(
+            &db,
+            TARGET,
+            RUSTC,
+            Some(1),
+            None,
+            &[],
+            &dep_slice_rows("dep"),
+        )
+        .await
+        .expect("delta retire dep");
+
+        assert_eq!(
+            edge_flags(&db).await,
+            vec![("dep".to_owned(), 0)],
+            "a retire flips the matched edge back to unmet"
+        );
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+        let claimed = super::claim_dispatchable_tasks(
+            &db,
+            &SchedulerSettings {
+                dispatch: Dispatch::from_max_concurrent_jobs(8),
+                ..claim_settings()
+            },
+            &NoCoverage,
+        )
+        .await
+        .expect("claim after retire");
+        assert!(
+            claimed.iter().all(|task| task.crate_name != "parent"),
+            "an owner whose counter returns above 0 stops dispatching"
+        );
+    }
+
+    /// The counter stays live on non-pending rows: an edge flip against
+    /// a claimed owner still moves `unpublished_deps`, so the pending
+    /// transition's cheap re-derivation can never disagree with the
+    /// stored count.
+    #[tokio::test]
+    async fn the_counter_tracks_flips_on_a_claimed_owner_too() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        enqueue(&db, &[request("parent", vec![dependency("dep")])])
+            .await
+            .expect("enqueue parent");
+        mark_active(&db, "parent", TARGET, "dispatched").await;
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+
+        publish(&db, "dep").await;
+
+        assert_eq!(
+            gate_counters(&db, "parent").await,
+            (0, 1),
+            "a dispatched owner's counter still moves with the delta"
+        );
     }
 
     /// A failed dependency whose identity the published slice already
