@@ -27,7 +27,9 @@ use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
-const STOW_DB_BINDING: &str = "STOW_DB";
+/// The catalog D1 binding — `pub(super)` so the budget probe's counted
+/// backend wraps the same binding the dispatch path reads.
+pub(super) const STOW_DB_BINDING: &str = "STOW_DB";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_MACOS_JOBS";
@@ -44,6 +46,18 @@ const STOW_FREEZE_FAIL_PERCENT_BINDING: &str = "STOW_FREEZE_FAIL_PERCENT";
 const STOW_COST_BUDGET_MULTIPLIER_BINDING: &str = "STOW_COST_BUDGET_MULTIPLIER";
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
+    // The local-CI dispatcher only exists beside the budget probe: a
+    // deploy carrying `STOW_LOCAL_CI_URL` without the probe marker is
+    // misconfigured — every scheduler route fails on it here rather
+    // than let one pass reach the unauthenticated credential arm.
+    if read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING).is_some()
+        && !budget_probe_enabled(env)
+    {
+        return Err(Error::msg(
+            "STOW_LOCAL_CI_URL is set without STOW_SCHEDULER_BUDGET — \
+             local-CI dispatch exists only on the mock budget-probe deploy",
+        ));
+    }
     let defaults = SchedulerSettings::default();
     Ok(SchedulerSettings {
         dispatch: read_optional_u32_binding(env, STOW_MAX_CONCURRENT_JOBS_BINDING)?
@@ -216,6 +230,7 @@ async fn scheduler_budget_seed(
 async fn scheduler_budget(
     env: WasmEnv,
     db: DurableDb,
+    Json(request): Json<stow_types::api::SchedulerBudgetRequest>,
 ) -> Result<Json<stow_types::api::SchedulerBudgetReport>> {
     if !budget_probe_enabled(&env) {
         return Err(
@@ -224,7 +239,11 @@ async fn scheduler_budget(
         );
     }
     let settings = scheduler_settings(&env)?;
-    Ok(Json(budget::run(&db, &settings).await.map_err(to_error)?))
+    Ok(Json(
+        budget::run(&db, &settings, &env, &request)
+            .await
+            .map_err(to_error)?,
+    ))
 }
 
 fn budget_probe_enabled(env: &WasmEnv) -> bool {
@@ -731,10 +750,37 @@ enum CredentialSource {
     GitHub(github_app::AppConfig),
 }
 
+/// Validate an endpoint override the mock harness sets: `STOW_LOCAL_CI_URL`
+/// (the dispatcher the credential arm posts builds to) and
+/// `STOW_STATS_SQL_URL` (the Analytics Engine stub the stats route posts
+/// its API token to) only ever live on the same host, so both are pinned
+/// to loopback and can never redirect traffic — or the token — to a
+/// remote endpoint. Rejected URLs fail before any request uses them.
+pub fn loopback_url(binding: &str, url: &str) -> Result<String> {
+    let authority = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|authority| authority.rsplit('@').next())
+        .unwrap_or_default();
+    let host = authority.strip_prefix('[').map_or_else(
+        || authority.split(':').next().unwrap_or_default(),
+        |v6| v6.split(']').next().unwrap_or_default(),
+    );
+    match host {
+        "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" => Ok(url.to_owned()),
+        _ => Err(Error::msg(format!(
+            "{binding} must name a loopback host, got {url:?}"
+        ))),
+    }
+}
+
 /// The artifact catalog in D1, asked at claim time which pending tasks an
 /// already-landed publish covered.
-struct CatalogCoverage {
-    db: Db,
+pub(super) struct CatalogCoverage {
+    /// The catalog handle — plain `CfD1` on a real pass, the counted
+    /// backend under the budget probe so the lookup's rows are priced.
+    pub(super) db: Db,
 }
 
 impl queue::CoverageOracle for CatalogCoverage {
@@ -758,26 +804,42 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         tracing::info!("dispatch frozen — skipping dispatch pass");
         return Ok(());
     }
-    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let settings = scheduler_settings(env)?;
-    // Binding resolution precedes claiming: a misconfigured binding fails
-    // the pass with every row still `pending` instead of burned as a
-    // dispatch attempt.
-    let credential_source = match read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING) {
-        Some(url) => CredentialSource::LocalCi(url),
-        None => CredentialSource::GitHub(github_app::AppConfig {
-            app_id: read_string_binding(env, GITHUB_APP_ID_BINDING)?,
-            installation_id: read_string_binding(env, GITHUB_APP_INSTALLATION_ID_BINDING)?,
-            private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
-        }),
-    };
     let coverage = CatalogCoverage {
         db: Db::new(
             CfD1::from_env(env.as_js(), STOW_DB_BINDING)
                 .map_err(|error| Error::msg(format!("load D1 binding: {error}")))?,
         ),
     };
-    let tasks = queue::claim_dispatchable_tasks(db, &settings, &coverage)
+    dispatch_pass(env, db, &settings, &coverage)
+        .await
+        .map(|_| ())
+}
+
+/// The claim-plus-fan-out half of a dispatch pass, shared with the
+/// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
+/// `wall_ms` covers the serialized `trigger_build` hop and the
+/// counted-D1 coverage lookups a real wake pays. Returns the claimed
+/// task count.
+pub(super) async fn dispatch_pass(
+    env: &WasmEnv,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    coverage: &impl queue::CoverageOracle,
+) -> Result<usize> {
+    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+    // Binding resolution precedes claiming: a misconfigured binding fails
+    // the pass with every row still `pending` instead of burned as a
+    // dispatch attempt.
+    let credential_source = match read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING) {
+        Some(url) => CredentialSource::LocalCi(loopback_url("STOW_LOCAL_CI_URL", &url)?),
+        None => CredentialSource::GitHub(github_app::AppConfig {
+            app_id: read_string_binding(env, GITHUB_APP_ID_BINDING)?,
+            installation_id: read_string_binding(env, GITHUB_APP_INSTALLATION_ID_BINDING)?,
+            private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
+        }),
+    };
+    let tasks = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
         .map_err(to_error)?;
     tracing::info!(
@@ -785,8 +847,9 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         "scheduler dispatch_pending selected tasks"
     );
     if tasks.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let claimed = tasks.len();
 
     // The credential resolves once per pass, only when tasks exist: the
     // local-CI branch carries no Authorization; the GitHub branch reuses
@@ -807,7 +870,7 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
                     for task in &tasks {
                         queue::mark_dispatch_failed(
                             db,
-                            &settings,
+                            settings,
                             &task.task_id,
                             &error.to_string(),
                         )
@@ -815,7 +878,7 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
                         .map_err(to_error)?;
                         tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
                     }
-                    return Ok(());
+                    return Ok(claimed);
                 }
             }
         }
@@ -827,14 +890,14 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
     let pool = crate::fetch_guard::OutboundPool::new();
     for task in tasks {
         if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo, &pool).await {
-            queue::mark_dispatch_failed(db, &settings, &task.task_id, &error.to_string())
+            queue::mark_dispatch_failed(db, settings, &task.task_id, &error.to_string())
                 .await
                 .map_err(to_error)?;
             tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
         }
     }
 
-    Ok(())
+    Ok(claimed)
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {

@@ -32,7 +32,7 @@ use skyzen::FromRow;
 use skyzen_services::durable::DurableDb;
 
 use super::drives;
-use super::fixture::{self, FixtureShape};
+use super::fixture;
 use super::queue::{self, SchedulerSettings};
 use super::test_db::{LoggedStatement, counting_memory_db, counting_memory_db_raw};
 
@@ -221,14 +221,25 @@ const BUDGETS: &[RouteBudget] = &[
         ddl_permitted: false,
     },
     // Submit paths: a batch of three requests (one resync, one fresh,
-    // one human). The untrusted route hits the pending cap on the
-    // fixture — that is the refusal path; the trusted route runs the
-    // full write path including edge resync.
+    // one human). The untrusted route refuses on a pinned-zero pending
+    // cap — that is the refusal path; the accept drive lifts the cap
+    // and measures the insert; the trusted route runs the full write
+    // path including edge resync.
     RouteBudget {
         name: "POST /enqueue (untrusted)",
         statements: 8,
         rows_read: 40,
         rows_written: 4,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // The same batch past the cap: pending-count read, the
+        // human-lane budget charge and position walk, the insert.
+        name: "POST /enqueue (untrusted accept)",
+        statements: 20,
+        rows_read: 300,
+        rows_written: 100,
         scan_allowlist: &[],
         ddl_permitted: false,
     },
@@ -286,6 +297,16 @@ const BUDGETS: &[RouteBudget] = &[
         // status='completed' AND shape_requeue=0` — so EXPLAIN calls the
         // walk a SCAN but it covers only completed rows a prior pass
         // already flagged for repair: a ~0-entry set on a warm queue.
+        scan_allowlist: &["idx_queue_shape_requeue"],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // The pass's fixed floor under paused dispatch: recovery probes
+        // and the re-arm only — no claim work.
+        name: "alarm pass (idle)",
+        statements: 12,
+        rows_read: 80,
+        rows_written: 4,
         scan_allowlist: &["idx_queue_shape_requeue"],
         ddl_permitted: false,
     },
@@ -630,7 +651,7 @@ async fn per_request_cost_gate() {
     let settings = SchedulerSettings::default();
     let (db, log) = counting_memory_db().await.expect("counting db");
     let seed_base = log.lock().expect("log").len();
-    fixture::seed_production_shape(&db, &FixtureShape::GATE, settings.dispatch_min_age_minutes)
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
         .await
         .expect("seed fixture");
     // The fixture itself must obey the gate — it is seeded with DML only,
@@ -642,10 +663,11 @@ async fn per_request_cost_gate() {
             statement.sql
         );
     }
-    let shape = FixtureShape::GATE;
+    let shape = fixture::GATE;
+    let ctx = drives::DriveContext::host();
     for drive in drives::DRIVES {
         let base = log.lock().expect("statement log").len();
-        (drive.run)(&db, shape, &settings)
+        (drive.run)(&db, shape, &settings, &ctx)
             .await
             .unwrap_or_else(|error| panic!("{} failed: {error}", drive.name));
         let statements = log.lock().expect("statement log")[base..].to_vec();
@@ -656,13 +678,9 @@ async fn per_request_cost_gate() {
     // The migrate route is the only DDL path — it runs on the same seeded
     // fixture under the raw (permit-open) counting backend.
     let (raw_db, raw_log) = counting_memory_db_raw().await.expect("raw counting db");
-    fixture::seed_production_shape(
-        &raw_db,
-        &FixtureShape::GATE,
-        settings.dispatch_min_age_minutes,
-    )
-    .await
-    .expect("seed fixture");
+    fixture::seed_production_shape(&raw_db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
     let base = raw_log.lock().expect("statement log").len();
     queue::migrate(&raw_db, &SchedulerSettings::default())
         .await

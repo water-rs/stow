@@ -10,6 +10,7 @@ use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 use skyzen_services::Db;
+use stow_types::admission;
 use stow_types::api::{
     AdmissionRequest, ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, CrateRequest,
     CrateRequestOutcome, EnqueueAdmission, EnqueueTicket,
@@ -24,8 +25,8 @@ use crate::github_auth;
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
-    admission, catalog, crates_io, dependency_resolver, ghcr, index_slice, miss_logger,
-    rust_channel, scheduler, scheduler_client, stats, worker_resolver,
+    catalog, crates_io, dependency_resolver, ghcr, index_slice, miss_logger, rust_channel,
+    scheduler, scheduler_client, stats, worker_resolver,
 };
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -488,8 +489,11 @@ pub async fn admin_scheduler_budget_seed(
 pub async fn admin_scheduler_budget(
     SchedulerCaller(_caller): SchedulerCaller,
     State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::SchedulerBudgetRequest>,
 ) -> Result<Json<stow_types::api::SchedulerBudgetReport>, GetArtifactError> {
-    Ok(Json(scheduler_client::scheduler_budget(&scheduler).await?))
+    Ok(Json(
+        scheduler_client::scheduler_budget(&scheduler, &request).await?,
+    ))
 }
 
 /// `GET /api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=`

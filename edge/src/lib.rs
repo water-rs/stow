@@ -11,8 +11,6 @@
 // runtime caller lives behind the wasm gate below, so dead-code analysis is
 // only meaningful for the wasm target.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod admission;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod crates_io_fetch;

@@ -22,6 +22,17 @@
 # completions in the last 24 h, blocked rows per page, the slice delta —
 # are pinned by the fixture across sizes, so only the stored bulk grows.
 #
+# The dispatch pass drives the mock stack it would drive in
+# production: `stow-mock-registry` on 28123 (the edge's GHCR_BASE_URL —
+# the webhook's records check), `stow-build serve` on 28124 under
+# STOW_LOCAL_CI_STUB (the edge's STOW_LOCAL_CI_URL — a real dispatch
+# POST per claimed task, the pass's serialized fan-out, then the
+# signed workflow_run callback; only the cargo build is stubbed), and
+# the production dispatch cap carried to the probe via
+# `--dispatch-limit` — the mock deploy pins STOW_MAX_CONCURRENT_JOBS=3,
+# below the fixture's 30 in-flight rows, which would price a pass that
+# claims nothing.
+#
 # Tunables (env):
 #   STOW_BUDGET_WORK_DIR       work dir instead of a fresh mktemp
 #   STOW_E2E_TOOLCHAIN         rustup toolchain for the run (default: stable)
@@ -39,6 +50,8 @@ set -m
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 EDGE_PORT=8788
+REGISTRY_ADDR=127.0.0.1:28123
+LOCAL_CI_ADDR=127.0.0.1:28124
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
 EDGE_BEARER="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
@@ -51,6 +64,16 @@ READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
 QUEUE_ROWS="${STOW_BUDGET_QUEUE_ROWS:-}"
 SIZES="${STOW_BUDGET_SIZES:-20000 100000}"
 RESEED="${STOW_BUDGET_RESEED:-}"
+# The production dispatch cap (`STOW_MAX_CONCURRENT_JOBS` in
+# edge/Skyzen.toml): the probe runs the claim walk under the real cap
+# so the report's claimed_tasks/dispatch_limit reflect production, not
+# the mock deploy's pinned-down value.
+DISPATCH_LIMIT="$(sed -n 's/^STOW_MAX_CONCURRENT_JOBS *= *"\([0-9]*\)".*/\1/p' \
+    "$REPO_ROOT/edge/Skyzen.toml")"
+[ -n "$DISPATCH_LIMIT" ] || {
+    echo "[budget] ERROR: STOW_MAX_CONCURRENT_JOBS not found in edge/Skyzen.toml" >&2
+    exit 1
+}
 
 export RUSTUP_TOOLCHAIN="${STOW_E2E_TOOLCHAIN:-stable}"
 
@@ -157,6 +180,7 @@ require_command cargo
 require_command rustup
 require_command curl
 require_command jq
+require_command openssl
 require_command skyzen
 require_command wrangler
 
@@ -172,14 +196,37 @@ if ! rustup target list --installed --toolchain "$RUSTUP_TOOLCHAIN" \
 fi
 
 cd "$REPO_ROOT"
-echo "[budget] building stow-admin"
-cargo build -p stow-admin >"$LOG_DIR/cargo-build.log" 2>&1 \
+echo "[budget] building stow-admin, stow-mock-registry and stow-build"
+cargo build -p stow-admin -p stow-mock-registry -p stow-build \
+    >"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build failed — see $LOG_DIR/cargo-build.log"
 BIN="$REPO_ROOT/target/debug"
 
-if (exec 3<>"/dev/tcp/127.0.0.1/$EDGE_PORT") 2>/dev/null; then
-    die "port $EDGE_PORT is already in use — refusing to probe a foreign service"
-fi
+# P-256 PKCS#8 key pair — the format sigstore accepts (the same block
+# scripts/mock-e2e.sh runs; docs/MOCK.md).
+mkdir -p "$WORK_DIR/keys"
+openssl ecparam -name prime256v1 -genkey -noout -out "$WORK_DIR/keys/private.pem"
+openssl pkcs8 -topk8 -nocrypt -in "$WORK_DIR/keys/private.pem" -out "$WORK_DIR/keys/private.pkcs8.pem"
+mv "$WORK_DIR/keys/private.pkcs8.pem" "$WORK_DIR/keys/private.pem"
+openssl ec -in "$WORK_DIR/keys/private.pem" -pubout -out "$WORK_DIR/keys/public.pem"
+
+for port in "$EDGE_PORT" "${REGISTRY_ADDR##*:}" "${LOCAL_CI_ADDR##*:}"; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+        die "port $port is already in use — refusing to probe a foreign service"
+    fi
+done
+
+# The mock GHCR the edge's GHCR_BASE_URL points at — the stub builds'
+# signed workflow_run callbacks check the records artifact there.
+mkdir -p "$WORK_DIR/mock-registry"
+"$BIN/stow-mock-registry" serve --registry-root "$WORK_DIR/mock-registry" \
+    --listen "$REGISTRY_ADDR" >"$LOG_DIR/mock-registry.log" 2>&1 &
+SERVICE_PID=$!
+CHILD_PIDS+=("$SERVICE_PID")
+CHILD_NAMES+=(mock-registry)
+echo "[budget] started mock registry (pid $SERVICE_PID), log: $LOG_DIR/mock-registry.log"
+wait_for "mock registry listener" "$READY_DEADLINE" "$SERVICE_PID" \
+    http_listening "http://$REGISTRY_ADDR/v2/"
 
 (
     cd "$REPO_ROOT/edge"
@@ -202,6 +249,30 @@ echo "[budget] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
 wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
     http_listening "$SCHEDULER_URL/status"
 
+# The local dispatch endpoint the edge's STOW_LOCAL_CI_URL points at —
+# STOW_LOCAL_CI_STUB short-circuits run_dispatched_task to the signed
+# workflow_run webhook, so each claimed task's sequential
+# trigger_build hop is a real HTTP round-trip in the pass's wall_ms
+# without a cargo build behind it.
+mkdir -p "$WORK_DIR/local-ci"
+(
+    cd "$WORK_DIR/local-ci"
+    exec env \
+        STOW_EDGE_URL="$EDGE_URL" \
+        STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
+        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+        STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+        STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+        STOW_LOCAL_CI_STUB=1 \
+        "$BIN/stow-build" serve --listen "$LOCAL_CI_ADDR"
+) >"$LOG_DIR/local-ci.log" 2>&1 &
+SERVICE_PID=$!
+CHILD_PIDS+=("$SERVICE_PID")
+CHILD_NAMES+=(local-ci)
+echo "[budget] started local-ci stub (pid $SERVICE_PID), log: $LOG_DIR/local-ci.log"
+wait_for "local CI dispatch endpoint" 60 "$SERVICE_PID" \
+    http_listening "http://${LOCAL_CI_ADDR}/dispatch"
+
 # Same deploy order as deploy-edge.yml: the operator migration runs
 # before the scheduler takes traffic.
 migrate_out="$(env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
@@ -212,7 +283,7 @@ echo "[budget] $migrate_out"
 print_table() {
     jq -r '
         "scheduler budget (queue rows \(.queue_rows), schema v\(.schema_version)):",
-        (.rows[] | "  \(.name | . + " " * (34 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget)\(if .over_budget then " OVER" else "" end)")
+        (.rows[] | "  \(.name | . + " " * (34 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget) wall_ms=\(.wall_ms)/\(.wall_budget)\(if .over_budget then " OVER" else "" end)")
     ' "$1"
 }
 
@@ -225,6 +296,7 @@ run_pass() {
     echo "[budget] seeding $rows queue rows and running the budget pass"
     env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
         "$BIN/stow-admin" --json scheduler budget --queue-rows "$rows" --reset \
+        --dispatch-limit "$DISPATCH_LIMIT" \
         >"$report" 2>"$LOG_DIR/budget-stderr-$rows.log" \
         || { cat "$LOG_DIR/budget-stderr-$rows.log" >&2; \
              die "scheduler budget exceeded — see $report"; }
@@ -244,6 +316,7 @@ if [ -n "$QUEUE_ROWS" ]; then
     esac
     env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
         "$BIN/stow-admin" --json scheduler budget "${seed_args[@]}" \
+        --dispatch-limit "$DISPATCH_LIMIT" \
         >"$WORK_DIR/budget-report.json" 2>"$LOG_DIR/budget-stderr.log" \
         || { cat "$LOG_DIR/budget-stderr.log" >&2; die "scheduler budget exceeded — see $WORK_DIR/budget-report.json"; }
     cat "$LOG_DIR/budget-stderr.log"

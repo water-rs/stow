@@ -127,14 +127,14 @@ const HOURS_PER_MONTH: f64 = 720.0;
 //   <https://developers.cloudflare.com/durable-objects/platform/pricing/>
 // - D1 Paid — 25G rows read/mo, 50M rows written/mo.
 //   <https://developers.cloudflare.com/d1/platform/pricing/>
-const DO_ROWS_READ_MONTHLY: f64 = 25e9;
-const DO_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
-const DO_REQUESTS_MONTHLY: f64 = 1e6;
-const DO_DURATION_GB_S_MONTHLY: f64 = 400e3;
-const WORKER_REQUESTS_MONTHLY: f64 = 10e6;
-const WORKER_CPU_MS_MONTHLY: f64 = 30e6;
-const D1_ROWS_READ_MONTHLY: f64 = 25e9;
-const D1_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
+pub const DO_ROWS_READ_MONTHLY: f64 = 25e9;
+pub const DO_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
+pub const DO_REQUESTS_MONTHLY: f64 = 1e6;
+pub const DO_DURATION_GB_S_MONTHLY: f64 = 400e3;
+pub const WORKER_REQUESTS_MONTHLY: f64 = 10e6;
+pub const WORKER_CPU_MS_MONTHLY: f64 = 30e6;
+pub const D1_ROWS_READ_MONTHLY: f64 = 25e9;
+pub const D1_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
 
 /// One hour — the usage window. An hourly window trips a sustained burn
 /// to the monthly allowance's hourly share within an hour instead of

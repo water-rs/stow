@@ -36,116 +36,15 @@
 
 use skyzen_services::durable::DurableDb;
 use stow_types::api::CI_TARGET_TRIPLES;
+pub use stow_types::fixture::FixtureShape;
 
 use crate::errors::QueueError;
 
-/// The row-count shape the seeded database takes. Every split below is
-/// derived from `queue_rows`, so the host gate and the workerd harness
-/// share one shape at two scales: the workerd pass runs it at 20k and
-/// 100k (`STOW_BUDGET_SIZES` in `scripts/scheduler-budget.sh`) and a
-/// drive whose counters grow with the stored bulk fails — only
-/// `queue_rows` moves, so every quantity a route may legitimately be
-/// bounded by is held constant across the two shapes.
-#[derive(Debug, Clone, Copy)]
-pub struct FixtureShape {
-    /// Total `queue` rows to seed.
-    pub queue_rows: u32,
-}
-
-impl FixtureShape {
-    /// The production shape — 100k rows — the workerd harness seeds by
-    /// default (`STOW_BUDGET_SIZES` adds the 20k shape to the pair).
-    pub const PRODUCTION: Self = Self {
-        queue_rows: 100_000,
-    };
-    /// The host-gate shape — 10k rows — small enough that `cargo test`
-    /// stays fast. Only the host pre-check uses it; the workerd harness
-    /// seeds `PRODUCTION` and the 20k shape `STOW_BUDGET_SIZES` carries.
-    #[cfg(test)]
-    pub const GATE: Self = Self { queue_rows: 10_000 };
-    /// The in-flight set — `dispatched`/`running` rows — capped so the
-    /// dispatch limit still leaves slots for the claim pass to fill.
-    /// Held constant across fixture sizes: the alarm's claim is bounded
-    /// by this plus the dispatch cap, not by the queue.
-    const IN_FLIGHT_ROWS: u32 = 30;
-    /// Pending rows on the human lane — held constant so a lane-position
-    /// probe reads the same depth at every fixture size.
-    pub const HUMAN_LANE_ROWS: u32 = 2_000;
-    /// The human lane's tail rows pin their single edge at a completed
-    /// row, so they are unblocked at every fixture size — a lane-status
-    /// drive can name a fixed id whose lane-position probe always runs
-    /// instead of silently skipping when a size-dependent edge set
-    /// flips `blocked`.
-    pub const HUMAN_PROBE_ROWS: u32 = 16;
-    /// Rows `updated_at` inside the last 24 h — held constant: an
-    /// `/admin/status` outcome count is legitimately bounded by 24 h
-    /// throughput, which the scale check must not let grow with the
-    /// stored bulk.
-    const LAST_24H_ROWS: u32 = 3_000;
-
-    /// Rows `1..=pending_end` are `pending` — 60% of the queue.
-    pub const fn pending_end(self) -> u32 {
-        self.queue_rows / 10 * 6
-    }
-
-    /// Rows `pending_end < n <= completed_end` are `completed` — 35%.
-    pub const fn completed_end(self) -> u32 {
-        self.queue_rows / 20 * 19
-    }
-
-    /// Rows `completed_end < n <= failed_end` are `failed` — 2.5%.
-    pub const fn failed_end(self) -> u32 {
-        self.queue_rows / 40 * 39
-    }
-
-    /// A `pending` row id — `n` indexes the pending group.
-    pub const fn pending_row(n: u32) -> u32 {
-        n
-    }
-
-    /// A `completed` row id — `k` indexes the completed group.
-    pub const fn completed_row(self, k: u32) -> u32 {
-        self.pending_end() + 1 + k
-    }
-
-    /// A `failed` row id — `k` indexes the failed group.
-    pub const fn failed_row(self, k: u32) -> u32 {
-        self.completed_end() + 1 + k
-    }
-
-    /// The one `running` row the run-completion drive reports.
-    pub const fn running_row(self) -> u32 {
-        self.failed_end() + 3
-    }
-
-    /// A `completed` dep for the submit batch's `depends_on` — `k` picks
-    /// inside the completed group so the dep's node is real and
-    /// published.
-    pub const fn dep_row(self, k: u32) -> u32 {
-        self.pending_end() + 1 + k % (self.completed_end() - self.pending_end())
-    }
-
-    /// The first `n % TARGETS == target_index` row inside the completed
-    /// group — where the slice's live members start. Strictly greater
-    /// than `pending_end`: the boundary row itself is still `pending`.
-    pub fn slice_first_row(self, target_index: u32) -> u32 {
-        let targets = target_count();
-        let offset = (targets + target_index - self.pending_end() % targets) % targets;
-        self.pending_end() + if offset == 0 { targets } else { offset }
-    }
-
-    /// How many live members the `(CI_TARGET_TRIPLES[target_index],
-    /// '1.85.0')` slice carries — the completed rows whose `n` lands on
-    /// the target index (and `n % 9 == 0` implies `n % 3 == 0`, the
-    /// 1.85.0 rustc arm).
-    pub fn slice_live_rows(self, target_index: u32) -> u32 {
-        let first = self.slice_first_row(target_index);
-        if first > self.completed_end() {
-            return 0;
-        }
-        (self.completed_end() - first) / target_count() + 1
-    }
-}
+/// The host-gate shape — 10k rows — small enough that `cargo test`
+/// stays fast. Only the host pre-check uses it; the workerd harness
+/// seeds `PRODUCTION` and the 20k shape `STOW_BUDGET_SIZES` carries.
+#[cfg(test)]
+pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
 
 /// How the fixture's `n % len` target spread maps onto
 /// [`CI_TARGET_TRIPLES`].
@@ -251,10 +150,18 @@ pub async fn seed_queue_chunk(
     let not_before = "CASE WHEN n % 20 = 1 THEN datetime('now', '+30 minutes') \
                       ELSE '1970-01-01 00:00:00' END";
     let last_24h = FixtureShape::LAST_24H_ROWS;
+    // In-flight rows model attempts with a live heartbeat: stamped ahead
+    // of any lease horizon so the stale-dispatch recovery never reclaims
+    // them, however long the drive runs — a fixed past offset ages out
+    // mid-drive and the reclaim flips them out from under the lanes and
+    // probes that measure on them. A future stamp is still a normal
+    // `updated_at` write to everything else that reads it.
     // Exactly `LAST_24H_ROWS` rows inside the outcome window; the rest
     // spread 1–28 days back so the window count never tracks queue size.
     let updated_at = &format!(
-        "CASE WHEN n <= {last_24h} THEN datetime('now', '-' || (n % 1440) || ' minutes') \
+        "CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
+              THEN datetime('now', '+1 day') \
+              WHEN n <= {last_24h} THEN datetime('now', '-' || (n % 1440) || ' minutes') \
               ELSE datetime('now', '-' || (1440 + n % 38880) || ' minutes') END"
     );
     let task_id = "printf('%064x', n)";

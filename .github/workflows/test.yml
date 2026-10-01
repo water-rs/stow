@@ -42,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      launch-load: ${{ steps.filter.outputs.launch-load }}
     steps:
       # The filter diffs against the previous tip (or the merge group's base)
       # with git, so it needs the repository checked out.
@@ -61,6 +62,17 @@ jobs:
           filters: |
             code:
               - '**'
+              - '!**/*.md'
+              - '!LICENSE*'
+              - '!.gitignore'
+            # The load lane's merge-queue trigger (stow#452): edge/
+            # plus the files that define what it measures — the lanes,
+            # the model, the fixture/admission protocol, the wire types,
+            # the local-CI stub, the measured table, and both harness
+            # scripts. The doc negations repeat because `every` requires
+            # each file to satisfy all rules.
+            launch-load:
+              - '{edge/**,admin/src/launch_*.rs,admin/src/scheduler.rs,ci/src/local_server.rs,types/src/launch_model.rs,types/src/do_budgets.rs,types/src/fixture.rs,types/src/admission.rs,types/src/api.rs,scripts/launch-load.sh,scripts/scheduler-budget.sh,launch-model.toml}'
               - '!**/*.md'
               - '!LICENSE*'
               - '!.gitignore'
@@ -247,6 +259,14 @@ jobs:
         env:
           STOW_BUDGET_WORK_DIR: ${{ runner.temp }}/stow-budget
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # stow#452's launch-cost gate: the production-shape report the
+      # harness just measured is the per-event cost vector, and the
+      # checked-in `launch-model.toml` supplies the event counts. The
+      # step fails the job when a projected monthly usage crosses half
+      # the product's included allowance, and prints the per-route
+      # projection table either way.
+      - name: Launch-cost gate
+        run: ./target/debug/stow-admin launch-gate --report "${{ runner.temp }}/stow-budget/budget-report-100000.json" --model launch-model.toml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
@@ -254,6 +274,63 @@ jobs:
           path: |
             ${{ runner.temp }}/stow-budget/logs
             ${{ runner.temp }}/stow-budget/budget-report.json
+          if-no-files-found: ignore
+
+
+  # stow#452's load test: the mock stack on the 100k fixture, driven at
+  # the launch model's peak rates for thirty minutes between two budget
+  # probes — the after report doubles as the launch-cost gate's input,
+  # and `scripts/launch-load.sh` fails on any overload signal, error
+  # share or row-count regression.
+  #
+  # stow#452 scopes the merge-queue trigger to the surface the lane
+  # measures: `changes.outputs.launch-load` — `edge/` plus the lane,
+  # model, table and harness files — not every code change. A 75-minute
+  # leg on every merge would add half an hour to the queue for changes
+  # that cannot move the projection; anything else skips the job, which
+  # `gate` already counts as passing. The cheap part — the `launch-gate`
+  # step inside scheduler-budget, a projection over that job's own
+  # report — still runs on every code change, and the weekly cadence
+  # (launch-load-scheduled.yml) holds the whole lane unconditionally.
+  launch-load:
+    needs: changes
+    if: needs.changes.outputs.launch-load == 'true'
+    name: Launch load (workerd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      # Same operator auth as scheduler-budget: the load's scheduler
+      # lanes ride the trusted endpoints, which authenticate the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`).
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: cargo build -p stow-admin
+      - run: scripts/launch-load.sh
+        env:
+          STOW_LOAD_WORK_DIR: ${{ runner.temp }}/stow-load
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: launch-load-logs
+          path: |
+            ${{ runner.temp }}/stow-load/logs
+            ${{ runner.temp }}/stow-load/budget-report-*.json
+            ${{ runner.temp }}/stow-load/launch-load-report-seg*.json
           if-no-files-found: ignore
 
   # The resolver is cargo's own code carried into `stow-resolve`; this job
@@ -334,6 +411,7 @@ jobs:
       - publish-dry-run
       - mock-e2e
       - scheduler-budget
+      - launch-load
       - resolve-diff
       - resolve-diff-macos
       - resolve-diff-windows
