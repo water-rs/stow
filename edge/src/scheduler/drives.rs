@@ -405,7 +405,7 @@ pub const DRIVES: &[Drive] = &[
         name: "GET /requests/{id}",
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
-                queue::crate_request_status(db, super::fixture::REQUEST_FIXTURE_ENQUEUED)
+                queue::crate_request_status(db, stow_types::fixture::REQUEST_FIXTURE_ENQUEUED)
                     .await
                     .map(|_| ())
                     .map_err(|error| error.to_string())

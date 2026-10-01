@@ -516,7 +516,7 @@ mod tests {
             150,
         )
         .expect("plan");
-        assert!(plan.tasks.is_empty());
+        assert_eq!(plan.tasks, []);
         assert_eq!(
             plan.counts,
             vec![(

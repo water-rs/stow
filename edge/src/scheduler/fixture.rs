@@ -37,6 +37,7 @@
 use skyzen_services::durable::DurableDb;
 use stow_types::api::CI_TARGET_TRIPLES;
 pub use stow_types::fixture::FixtureShape;
+use stow_types::fixture::{REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED};
 
 use crate::errors::QueueError;
 
@@ -378,12 +379,6 @@ pub async fn seed_requests(db: &DurableDb, shape: FixtureShape) -> Result<(), Qu
     .map_err(|error| format!("seed request rows: {error}"))?;
     Ok(())
 }
-
-/// The `enqueued` fixture record's id — `GET /requests/{id}`'s drive
-/// names it.
-pub const REQUEST_FIXTURE_ENQUEUED: &str = "req-fixture-enqueued";
-/// The `failed` fixture record's id.
-pub const REQUEST_FIXTURE_FAILED: &str = "req-fixture-failed";
 
 /// Seed one `(n, n + batch]` chunk of `phase` and return where the seed
 /// resumes — the next phase (or `None` once `DepsMet` finishes).
