@@ -469,7 +469,7 @@ pub const DRIVES: &[Drive] = &[
             let mut lifted = *settings;
             lifted.max_queue_pending = u32::MAX;
             Box::pin(async move {
-                queue::enqueue(db, &submit_batch(shape), &lifted)
+                queue::enqueue(db, &submit_accept_batch(shape), &lifted)
                     .await
                     .map(|_| ())
                     .map_err(|error| error.to_string())
@@ -672,6 +672,34 @@ fn crate_identity(n: u32) -> (String, String) {
 /// human-lane request — the request mix the enqueue path sees in
 /// production. Deps name completed fixture rows, so the edges resolve.
 fn submit_batch(shape: FixtureShape) -> Vec<EnqueueRequest> {
+    submit_batch_named(
+        shape,
+        &crate_identity(101).0,
+        "costgate-fresh",
+        "costgate-human",
+    )
+}
+
+/// The accept half's batch names its own tasks: an accepted submit
+/// leaves rows and edges behind, so reusing the trusted pair's task
+/// identities would move the later drives from the insert path they
+/// measure onto a resync one (stow#452 — the merge-queue probe caught
+/// the trusted drive resyncing the accept drive's task set).
+fn submit_accept_batch(shape: FixtureShape) -> Vec<EnqueueRequest> {
+    submit_batch_named(
+        shape,
+        "costgate-accept",
+        "costgate-accept-fresh",
+        "costgate-accept-human",
+    )
+}
+
+fn submit_batch_named(
+    shape: FixtureShape,
+    resync_name: &str,
+    fresh_name: &str,
+    human_name: &str,
+) -> Vec<EnqueueRequest> {
     let target_of = |n: u32| stow_types::api::CI_TARGET_TRIPLES[usize::try_from(n).unwrap() % 9];
     let dep = |n: u32| {
         let (crate_name, version) = crate_identity(n);
@@ -688,9 +716,9 @@ fn submit_batch(shape: FixtureShape) -> Vec<EnqueueRequest> {
             host_side: n.is_multiple_of(10),
         }
     };
-    let (resync_crate, resync_version) = crate_identity(101);
+    let (_resync_crate, resync_version) = crate_identity(101);
     let resync = EnqueueRequest {
-        crate_name: resync_crate.parse().expect("resync crate"),
+        crate_name: resync_name.parse().expect("resync crate"),
         version: resync_version.parse().expect("resync version"),
         features_json: FeaturesJson::default(),
         target: target_of(101).parse().expect("resync target"),
@@ -702,10 +730,10 @@ fn submit_batch(shape: FixtureShape) -> Vec<EnqueueRequest> {
         host_side: false,
     };
     let mut fresh = resync.clone();
-    fresh.crate_name = "costgate-fresh".parse().expect("fresh crate");
+    fresh.crate_name = fresh_name.parse().expect("fresh crate");
     fresh.depends_on = vec![dep(shape.dep_row(31))];
     let mut human = resync.clone();
-    human.crate_name = "costgate-human".parse().expect("human crate");
+    human.crate_name = human_name.parse().expect("human crate");
     human.source = EnqueueSource::HumanRequest;
     human.depends_on = Vec::new();
     vec![resync, fresh, human]
