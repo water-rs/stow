@@ -321,6 +321,29 @@ env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
          die "baseline budget probe exceeded — see $WORK_DIR/budget-report-before.json"; }
 echo "[load] baseline report: $WORK_DIR/budget-report-before.json"
 
+# The webhook-callback lane completes the fixture's `dispatched` rows —
+# the even half of the in-flight range (`dispatched_row(0..14)`, the
+# ids `launch_load.rs` cycles). In production a run's records artifact
+# reaches GHCR before its `workflow_run` event does, so the edge's
+# records check must find it here too; without these the lane's
+# "completions" land as failures and flip the rows to `failed`, a
+# fixture state the launch shape never intended to measure.
+FAILED_END=$((QUEUE_ROWS / 40 * 39))
+FIRST_DISPATCHED=2
+[ $((FAILED_END % 2)) -eq 0 ] || FIRST_DISPATCHED=1
+printf '[]' >"$WORK_DIR/dispatched-records.json"
+for k in $(seq 0 14); do
+    task_id="$(printf '%064x' $((FAILED_END + FIRST_DISPATCHED + k * 2)))"
+    "$BIN/stow-mock-registry" push-records \
+        --records "$WORK_DIR/dispatched-records.json" \
+        --task-id "$task_id" \
+        --rustc-version "$RUSTC_VERSION" \
+        --registry-root "$WORK_DIR/mock-registry" \
+        --private-key "$WORK_DIR/keys/private.pem" \
+        || die "records artifact for $task_id failed"
+done
+echo "[load] published records artifacts for the 15 dispatched fixture rows"
+
 # The load: every lane at the launch model's peak rate for the
 # duration.
 echo "[load] driving ${DURATION_SECS}s at rate scale $RATE_SCALE"
