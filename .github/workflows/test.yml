@@ -67,11 +67,12 @@ jobs:
               - '!.gitignore'
             # The load lane's merge-queue trigger (stow#452): edge/
             # plus the files that define what it measures — the lanes,
-            # the model, the measured table and the harness. The doc
-            # negations repeat because `every` requires each file to
-            # satisfy all rules.
+            # the model, the fixture/admission protocol, the wire types,
+            # the local-CI stub, the measured table, and both harness
+            # scripts. The doc negations repeat because `every` requires
+            # each file to satisfy all rules.
             launch-load:
-              - '{edge/**,admin/src/launch_*.rs,types/src/launch_model.rs,types/src/do_budgets.rs,scripts/launch-load.sh,launch-model.toml}'
+              - '{edge/**,admin/src/launch_*.rs,admin/src/scheduler.rs,ci/src/local_server.rs,types/src/launch_model.rs,types/src/do_budgets.rs,types/src/fixture.rs,types/src/admission.rs,types/src/api.rs,scripts/launch-load.sh,scripts/scheduler-budget.sh,launch-model.toml}'
               - '!**/*.md'
               - '!LICENSE*'
               - '!.gitignore'
