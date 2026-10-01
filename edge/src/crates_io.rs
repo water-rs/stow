@@ -165,7 +165,7 @@ async fn fetch_once(
     missing: &(impl Fn() -> ResolverError + Sync),
     attempt: u32,
 ) -> FetchOutcome {
-    // The slot bounds the fan-out `fetch_releases_by_name` drives
+    // The slot bounds the fetch fan-out a caller may drive
     // against the invocation's connection budget; `decide` releases it
     // once the body reaches its terminal state.
     let _slot = pool.slot().await;

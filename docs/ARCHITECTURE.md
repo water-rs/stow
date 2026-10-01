@@ -427,6 +427,13 @@ What each hop is allowed to do:
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>` artifacts); sigstore signatures |
 | `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
 
+The edge's remaining crates.io reads are the request route's version and
+rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,
+`crates/{name}/{version}/features`), and the admissions coverage diff —
+none of them resolves a dependency graph: every lane that posts tasks
+(preheat via `stow-resolver`, the request lane via its outcome route)
+submits resolver-canonical requests, which land verbatim.
+
 The build and publish jobs never share a process or an environment. The build job's
 `GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a
 malicious `build.rs` or proc-macro can neither push to GHCR nor mint an OIDC
@@ -594,8 +601,8 @@ Four workflows keep it warm:
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
   the top-N library crates and `preheat top-binaries` for the top-N
-  binaries — each `.crate` tarball fetched by the edge and resolved by
-  cargo's own resolver (`stow-resolve`) into ordinary crate tasks
+  binaries — each `.crate` tarball resolved in-process by
+  `stow-resolver` into ordinary crate tasks
   carrying `depends_on` edges, exactly the way the projects lane
   resolves a repository's codeload tarball — plus the projects lane
   itself: `preheat projects submit` resolves every repository the
@@ -680,7 +687,6 @@ deserialization.
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
 | POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows; GHCR tags are not deleted — `artifacts prune` |
-| POST `/api/v1/admin/preheat/plan` | Bearer: repo-workflow OIDC or push user | `PreheatPlanRequest` | `PreheatPlanResponse` | Dry-run closure expansion for a crate request — `preheat plan` |
 | POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for the posted graph's uncovered nodes — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |
@@ -752,7 +758,7 @@ object writes a `dispatch_freeze` record into `settings` — a different
 flag, storage key, and purpose from the WAF maintenance rules — and `dispatch_pending`
 gates on it, so the queue keeps accepting misses while nothing more is
 handed to runners. While frozen, the work-submitting routes
-(`tasks/submit/trusted`, `admin/preheat`, `admin/resolve/*`) answer 503
+(`scheduler/tasks/submit`, `scheduler/requests/{id}/outcome`) answer 503
 naming the trigger; the `tasks/complete-run` webhook stays open so
 in-flight builds still land. Recovery is manual only:
 `POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
@@ -782,7 +788,6 @@ is unset or malformed.
 
 | Binding | Default | Purpose |
 |---|---|---|
-| `STOW_BATCH_FETCH_CONCURRENCY` | 32 | Concurrent crates.io metadata fetches while `/api/v1/admissions` resolves a graph's cold direct entries |
 | `STOW_MAX_EXPANDED_TASKS` | 4096 | Cap on the size of an expanded transitive graph |
 | `STOW_DB` (D1 binding) | required | Artifact catalog database |
 | `SCHEDULER` (Durable Object binding) | required | Build scheduler |

@@ -16,7 +16,6 @@ skyzen-cloudflare = "0.4.3"
 skyzen-services = { version = "0.2.1", default-features = false }
 stow-types.workspace = true
 stow-shim.workspace = true
-stow-resolve.workspace = true
 http = "1"
 anyhow = "1"
 thiserror.workspace = true

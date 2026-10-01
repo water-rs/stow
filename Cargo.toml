@@ -14,7 +14,6 @@ members = [
     "edge",
     "mock-registry",
     "oci",
-    "resolve",
     "resolver",
     "shim",
     "types",
@@ -51,7 +50,6 @@ stow-types = { path = "types", version = "0.6.0" }
 stow-shim = { path = "shim", version = "0.6.0" }
 stow-oci = { path = "oci", version = "0.6.0" }
 stow-cli = { path = "cli", version = "0.6.0" }
-stow-resolve = { path = "resolve" }
 stow-resolver = { path = "resolver", version = "0.6.0" }
 anyhow = "1.0.102"
 toml = "0.9"

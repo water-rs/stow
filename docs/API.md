@@ -211,9 +211,8 @@ hides the implicit one. `implies` is empty for such an implicit feature.
 transitively, and is what lets a client show them as already on.
 
 A `features_json` that omits `default` is what makes the build
-`--no-default-features`; the features it implies need not be listed, as
-the edge expands the selection into its closure when it canonicalizes
-the task.
+`--no-default-features`; the features it implies need not be listed —
+cargo derives the enabled closure when it builds.
 
 `400` when `{crate_name}` is not a legal crate name or `{version}` is
 not semver; `404` when crates.io does not publish the crate.
