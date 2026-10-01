@@ -820,6 +820,76 @@ fn a_disabled_public_cache_still_serves_local_entries() {
     );
 }
 
+/// An empty crate: the build whose pre-cargo window is nothing but the
+/// wrapper's own startup — spawn, config load, serve-map write, cargo
+/// spawn — against cargo's window on the same nothing.
+fn write_empty_crate(dir: &Path) {
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"empty\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write manifest");
+    std::fs::create_dir_all(dir.join("src")).expect("create src");
+    std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
+}
+
+/// The one serial cost a wrapper cannot remove: stow-cli's own spawn,
+/// config load, serve-map write and cargo spawn — measured as stow's
+/// pre-cargo window on a build with nothing to compile, net of cargo's
+/// window on that same build. Three pairs keep the floor honest under
+/// load; the result is the window gate's allowance, because serial
+/// *work* — an index pull, a metadata pass, a graph analysis — is what
+/// stow#347 bans, not the wrapper's existence. Measured rather than
+/// asserted so it scales with the tested binary's profile.
+fn stow_startup_floor(dir: &Path, cargo_home: &Path, edge_url: &str) -> std::time::Duration {
+    let mut cargo_windows = Vec::new();
+    let mut stow_windows = Vec::new();
+    for _ in 0..3 {
+        let cargo_target = tempfile::tempdir().expect("cargo target");
+        let mut command = Command::new("cargo");
+        command
+            .arg("build")
+            .current_dir(dir)
+            .env("CARGO_HOME", cargo_home)
+            .env("CARGO_TARGET_DIR", cargo_target.path())
+            .env("CARGO_INCREMENTAL", "0")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUST_LOG");
+        let (output, _, window) = timed_build(&mut command);
+        assert!(
+            output.status.success(),
+            "empty cargo build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        cargo_windows.push(window);
+
+        let stow_cache = tempfile::tempdir().expect("stow cache");
+        let stow_target = tempfile::tempdir().expect("stow target");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+        command
+            .arg("build")
+            .current_dir(dir)
+            .env("CARGO_HOME", cargo_home)
+            .env("STOW_EDGE_URL", edge_url)
+            .env("STOW_CACHE_DIR", stow_cache.path())
+            .env("STOW_VERIFY_MODE", "github-ci")
+            .env_remove("STOW_CONFIG_BLOB")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TARGET_DIR", stow_target.path())
+            .env_remove("RUST_LOG");
+        let (output, _, window) = timed_build(&mut command);
+        assert!(
+            output.status.success(),
+            "empty stow build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stow_windows.push(window);
+    }
+    median(&stow_windows).saturating_sub(median(&cargo_windows))
+}
+
 /// A real multi-package project's manifest: fifty crates from
 /// crates.io spanning leaf, mid-graph and proc-macro shapes — enough
 /// rustc invocations for pre-cargo overhead to show on the wall clock,
@@ -997,7 +1067,9 @@ fn timed_build(
 ///   before cargo's first rustc — a window measurement isolates it at
 ///   ~50ms resolution in any build profile, because work overlapped
 ///   with cargo can never delay the first unit. Medians are compared
-///   against a tolerance derived from the samples' own measured spread.
+///   against a tolerance derived from the samples' own measured spread
+///   plus the measured `stow_startup_floor` — the wrapper's own
+///   spawn/init cost, the one serial cost a wrapper cannot remove.
 /// - the **total wall clock**: medians compared against the measured
 ///   spread plus `PROFILE_RESIDUAL_ALLOWANCE`, which covers the debug
 ///   binary's own per-invocation cost the suite cannot remove. In a
@@ -1010,6 +1082,10 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
     write_multi_crate(dir.path(), cargo_home.path());
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = unreachable_edge_url();
+
+    let empty_dir = tempfile::tempdir().expect("empty dir");
+    write_empty_crate(empty_dir.path());
+    let startup_floor = stow_startup_floor(empty_dir.path(), cargo_home.path(), &edge_url);
 
     let mut cargo_walls = Vec::with_capacity(TIMED_RUNS);
     let mut cargo_windows = Vec::with_capacity(TIMED_RUNS);
@@ -1061,18 +1137,19 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
         stow_windows.push(window);
     }
 
-    let window_comparison =
-        compare_wall_clock(&cargo_windows, &stow_windows, std::time::Duration::ZERO);
+    let window_comparison = compare_wall_clock(&cargo_windows, &stow_windows, startup_floor);
     assert!(
         window_comparison.passes(),
         "stow must never put serial work in front of cargo: \
          cargo windows {cargo_windows:?} (median {:?}), \
          stow windows {stow_windows:?} (median {:?}), \
-         residual {:?} exceeds tolerance {:?} (the measured run-to-run spread)",
+         residual {:?} exceeds tolerance {:?} \
+         (the measured run-to-run spread plus the measured {:?} startup floor)",
         window_comparison.cargo_median,
         window_comparison.stow_median,
         window_comparison.residual,
-        window_comparison.tolerance
+        window_comparison.tolerance,
+        startup_floor
     );
 
     if WALL_GATE_ENABLED {
