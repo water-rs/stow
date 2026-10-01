@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/water-rs/stow/compare/stow-shim-v0.6.0...stow-shim-v0.7.0) - 2026-10-01
+
+### Other
+
+- *(cli)* take the state DB open, rustc probes and Windows shim compare off cargo's critical path ([#518](https://github.com/water-rs/stow/pull/518))
+
 ## [0.6.0](https://github.com/water-rs/stow/compare/stow-shim-v0.5.0...stow-shim-v0.6.0) - 2026-09-24
 
 ### Added
