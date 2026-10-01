@@ -6,7 +6,8 @@
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
-    SchedulerBudgetReport, SchedulerBudgetRequest, SchedulerSeedReport, SchemaMigrationReport,
+    ReconcileReport, SchedulerBudgetReport, SchedulerBudgetRequest, SchedulerSeedReport,
+    SchemaMigrationReport,
 };
 
 use crate::Edge;
@@ -55,6 +56,14 @@ pub enum SchedulerCommand {
         #[arg(long)]
         dispatch_limit: Option<u32>,
     },
+    /// Reconcile the scheduler's in-flight set against GitHub Actions
+    /// (stow#526): classify every in-flight row (running /
+    /// completed-but-unreported / missing), apply the webhook's own
+    /// completion transition to the unreported and the stale-reclaim to
+    /// the stale missing, and print the drift report. The watchdog
+    /// runs the same pass every 15 minutes as its
+    /// `edge.reconcile_drift` reading.
+    Reconcile,
 }
 
 /// Dispatch one `scheduler` subcommand against the edge connection.
@@ -71,7 +80,15 @@ pub async fn run(
             no_seed,
             dispatch_limit,
         } => budget(edge, queue_rows, reset, no_seed, dispatch_limit, output).await,
+        SchedulerCommand::Reconcile => reconcile(edge, output).await,
     }
+}
+
+async fn reconcile(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
+    let report: ReconcileReport = edge
+        .post_json("/api/v1/admin/scheduler/reconcile", &serde_json::json!({}))
+        .await?;
+    render::emit(output, &report, render_reconcile_report)
 }
 
 async fn migrate(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
@@ -146,6 +163,42 @@ async fn budget(
         return Err(stow_types::error::Error::msg("scheduler budget exceeded"));
     }
     Ok(())
+}
+
+/// The reconcile report as terminal lines — the counts, then each
+/// drift row with what the pass did about it.
+fn render_reconcile_report(report: &ReconcileReport) -> String {
+    let mut out = format!(
+        "reconcile: {} in flight ({} running, {} completed-unreported, {} missing), \
+         {} runs listed — {} completions applied, {} reclaimed{}",
+        report.in_flight,
+        report.running,
+        report.completed_unreported,
+        report.missing,
+        report.runs_listed,
+        report.completions_applied,
+        report.reclaimed,
+        if report.drift { " — DRIFT" } else { "" },
+    );
+    for row in &report.rows {
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "\n  {} {}@{} {} — {} → {}{}",
+                &row.task_id[..row.task_id.len().min(12)],
+                row.crate_name.as_str(),
+                row.version,
+                row.target.as_str(),
+                row.classification.as_str(),
+                row.applied.as_str(),
+                row.detail
+                    .as_ref()
+                    .map(|detail| format!(" ({detail})"))
+                    .unwrap_or_default(),
+            ),
+        );
+    }
+    out
 }
 
 /// The budget table as a terminal row set — one line per drive with its
