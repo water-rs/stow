@@ -1372,7 +1372,10 @@ mod tests {
             &rustc_version,
         )
         .expect("edge-less entry maps");
-        assert!(request.depends_on.is_empty());
+        assert_eq!(
+            request.depends_on,
+            [] as [stow_types::api::EnqueueDependency; 0]
+        );
     }
 
     /// A malformed element fails loudly rather than submitting a

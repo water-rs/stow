@@ -690,7 +690,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&claim, "{}\n").expect("write claim");
-        assert!(finished_journals(dir.path()).is_empty());
+        assert_eq!(finished_journals(dir.path()), [] as [std::path::PathBuf; 0]);
     }
 
     /// The recorded build host comes from the build's host units, with

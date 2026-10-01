@@ -2020,7 +2020,10 @@ mod observed_miss_tests {
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.features, vec!["std"]);
-        assert!(serde.dependencies.is_empty());
+        assert_eq!(
+            serde.dependencies,
+            [] as [stow_types::api::ResolvedDependencyGraphDependency; 0]
+        );
         // The dep was served, not compiled — it is not a miss root.
         assert_eq!(graph.roots.len(), 1);
         assert_eq!(graph.roots[0].crate_name.as_str(), "app");
@@ -2049,8 +2052,14 @@ mod observed_miss_tests {
         )]);
         let graph = observed_miss_graph(&observations, &dep_identities, false);
 
-        assert!(graph.roots.is_empty());
-        assert!(graph.expanded.is_empty());
+        assert_eq!(
+            graph.roots,
+            [] as [stow_types::api::DependencyGraphEntry; 0]
+        );
+        assert_eq!(
+            graph.expanded,
+            [] as [stow_types::api::ResolvedDependencyGraphEntry; 0]
+        );
     }
 
     /// A unit whose `--extern` does not resolve to a recorded identity is

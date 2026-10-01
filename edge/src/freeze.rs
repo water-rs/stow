@@ -969,7 +969,7 @@ mod tests {
                 draft.html
             );
         }
-        assert!(!draft.html.is_empty());
+        assert_ne!(draft.html, "");
     }
 
     #[test]
