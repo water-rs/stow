@@ -12,6 +12,8 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 
+use stow_cli::protocol::{Answer, Request};
+
 /// An edge that answers the miss-admissions mint with an empty list and
 /// then fails every other call with a 500.
 ///
@@ -461,8 +463,9 @@ fn a_tripped_circuit_still_serves_local_entries() {
 }
 
 /// The frames a stub supervisor collected, bucketed by the crate each
-/// frame's argv compiled (`--crate-name`). The empty key carries rustc
-/// probes like `-vV`, which name no crate at all.
+/// frame's argv compiled (`--crate-name`). The empty key carries frames
+/// with no argv — `Compiled` reports — and rustc probes like `-vV`,
+/// which name no crate at all.
 #[derive(Debug, Default)]
 struct StubSupervision {
     plans: std::collections::BTreeMap<String, usize>,
@@ -471,35 +474,20 @@ struct StubSupervision {
     observed_reports: std::collections::BTreeMap<String, usize>,
 }
 
-/// The crate a supervisor frame compiled, from its argv. A `Request` on
-/// the wire is `{"Plan": {...}}`, `{"Compiled": {...}}` or
-/// `{"Observed": {...}}`; `args` is a list of byte strings.
-fn frame_crate_name(request: &serde_json::Value) -> String {
-    let args = request
-        .get("Plan")
-        .or_else(|| request.get("Observed"))
-        .and_then(|body| body.get("args"))
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|arg| {
-            arg.as_array()
-                .map(|bytes| {
-                    bytes
-                        .iter()
-                        .filter_map(serde_json::Value::as_u64)
-                        .filter_map(|byte| u8::try_from(byte).ok())
-                        .collect::<Vec<u8>>()
-                })
-                .unwrap_or_default()
-        })
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .collect::<Vec<String>>();
+/// The crate a supervisor frame compiled: `--crate-name`'s value in the
+/// decoded argv. Frames with no argv — `Compiled`, `AwaitServeMap` —
+/// name no crate.
+fn frame_crate_name(request: &Request) -> String {
+    let args = match request {
+        Request::Plan(plan) => plan.args(),
+        Request::Observed(observed) => observed.args(),
+        _ => return String::new(),
+    }
+    .expect("the facade's args decode on this platform");
     args.iter()
         .position(|arg| arg == "--crate-name")
         .and_then(|index| args.get(index + 1))
-        .cloned()
+        .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
@@ -520,47 +508,46 @@ fn serve_stub_connection(
         if stream.read_exact(&mut body).is_err() {
             return;
         }
-        let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        let Ok(request) = Request::from_frame_body(&body) else {
             return;
         };
         let crate_name = frame_crate_name(&request);
-        let answer = if request.get("Plan").is_some() {
-            counts
-                .lock()
-                .expect("frame counts")
-                .plans
-                .entry(crate_name)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            ticket += 1;
-            Some(serde_json::json!({"Compile": {"ticket": ticket}}))
-        } else if request.get("Compiled").is_some() {
-            counts
-                .lock()
-                .expect("frame counts")
-                .compiled
-                .entry(crate_name)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            Some(serde_json::json!("Recorded"))
-        } else if request.get("Observed").is_some() {
-            let mut counts = counts.lock().expect("frame counts");
-            let is_report = request
-                .get("Observed")
-                .and_then(|body| body.get("success"))
-                .is_some_and(|success| !success.is_null());
-            let bucket = if is_report {
-                &mut counts.observed_reports
-            } else {
-                &mut counts.observed_marks
-            };
-            bucket
-                .entry(crate_name)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
-            None
-        } else {
-            None
+        let answer = match &request {
+            Request::Plan(_) => {
+                counts
+                    .lock()
+                    .expect("frame counts")
+                    .plans
+                    .entry(crate_name)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                ticket += 1;
+                Some(Answer::Compile { ticket })
+            }
+            Request::Compiled(_) => {
+                counts
+                    .lock()
+                    .expect("frame counts")
+                    .compiled
+                    .entry(crate_name)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                Some(Answer::Recorded)
+            }
+            Request::Observed(observed) => {
+                let mut counts = counts.lock().expect("frame counts");
+                let bucket = if observed.success.is_some() {
+                    &mut counts.observed_reports
+                } else {
+                    &mut counts.observed_marks
+                };
+                bucket
+                    .entry(crate_name)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                None
+            }
+            Request::AwaitServeMap(_) => None,
         };
         let Some(answer) = answer else { continue };
         let body = serde_json::to_vec(&answer).expect("encode answer");

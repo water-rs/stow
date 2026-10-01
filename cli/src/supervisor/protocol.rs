@@ -37,6 +37,19 @@ pub enum Request {
     AwaitServeMap(AwaitServeMap),
 }
 
+impl Request {
+    /// Parse the JSON body of one request frame — the deserialize half
+    /// of [`read_frame`], for a peer reading frames on a blocking
+    /// transport.
+    ///
+    /// # Errors
+    ///
+    /// Malformed JSON.
+    pub fn from_frame_body(body: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(body).map_err(|error| format!("decode frame: {error}"))
+    }
+}
+
 /// One rustc invocation as the facade received it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Plan {
@@ -56,6 +69,7 @@ pub struct Plan {
 /// The facade reporting the compile the supervisor asked for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Compiled {
+    /// Proves the sender is part of this build; checked on every frame.
     pub token: String,
     /// The ticket the [`Answer::Compile`] carried.
     pub ticket: u64,
@@ -64,11 +78,14 @@ pub struct Compiled {
 }
 
 /// The facade telling the supervisor about a compile it ran without
-/// asking first: a unit the build's serve map already ruled out needs no
-/// plan round trip, but the build still has to mark it as locally built
-/// before rustc starts and observe how it ended afterwards.
+/// asking first.
+///
+/// A unit the build's serve map already ruled out needs no plan round
+/// trip, but the build still has to mark it as locally built before
+/// rustc starts and observe how it ended afterwards.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Observed {
+    /// Proves the sender is part of this build; checked on every frame.
     pub token: String,
     /// The real rustc cargo asked for.
     pub executable: Vec<u8>,
@@ -139,6 +156,7 @@ impl Observed {
 /// payload, since the answer's timing, not its contents, is the signal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AwaitServeMap {
+    /// Proves the sender is part of this build; checked on every frame.
     pub token: String,
 }
 
@@ -150,7 +168,10 @@ pub enum Answer {
     Served,
     /// Nothing serves this unit. The facade runs the real rustc and then
     /// sends [`Compiled`] carrying `ticket`.
-    Compile { ticket: u64 },
+    Compile {
+        /// The ticket the [`Compiled`] report carries back.
+        ticket: u64,
+    },
     /// The report was applied; the facade exits with the compile's own
     /// status.
     Recorded,
@@ -159,7 +180,10 @@ pub enum Answer {
     ServeMapReady,
     /// The supervisor could not answer. The facade fails the build with
     /// this message rather than quietly compiling without the cache.
-    Failed { message: String },
+    Failed {
+        /// Why the supervisor could not answer.
+        message: String,
+    },
 }
 
 impl Plan {

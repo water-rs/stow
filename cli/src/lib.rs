@@ -51,6 +51,11 @@ mod verify;
 mod workspace_deps;
 use stow_shim as wrapper_shim;
 
+/// The supervisor wire protocol, so a peer decoding frames — a stub
+/// supervisor standing in for the real one in integration tests — uses
+/// the product's own types instead of reimplementing the format.
+pub use supervisor::protocol;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
