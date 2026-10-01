@@ -10,6 +10,7 @@ use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::bundle::{STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE};
 use stow_types::error::Context;
 use stow_types::platform::{PanicStrategy, Profile};
+use stow_types::public_cache::UnitShape;
 use tempfile::TempDir;
 use zenwave::{Client, ResponseExt};
 
@@ -1242,15 +1243,34 @@ pub async fn admit_observed_misses(
     .await?;
     // A dep node's side comes from the dep's own published shape when
     // the index carries one — stamped off the consumer and host slices
-    // (the dep's recorded target keys into one of them).
-    let mut published_shapes = BTreeMap::new();
+    // (the dep's recorded target keys into one of them). One physical
+    // unit may publish rows on both sides — a crate a consumer links
+    // and a build script links share their bytes — and such a dep's
+    // edge has to fall back to the invocation's own semantics, so only
+    // rows that agree on a single side pin it.
+    let mut published_shapes: BTreeMap<String, (Option<UnitShape>, bool)> = BTreeMap::new();
     for slice_target in [consumer_target, build_host] {
         if let Some(slice) = index::cached_slice(config, slice_target, rustc_version).await? {
             for row in slice.index.rows {
-                published_shapes.insert(row.c_metadata.as_str().to_owned(), row.unit_shape);
+                published_shapes
+                    .entry(row.c_metadata.as_str().to_owned())
+                    .and_modify(|(shape, consistent)| match (*shape, row.unit_shape) {
+                        (Some(seen), Some(current)) if seen.side != current.side => {
+                            *consistent = false;
+                        }
+                        (None, current) => *shape = current,
+                        _ => {}
+                    })
+                    .or_insert((row.unit_shape, true));
             }
         }
     }
+    let published_shapes: BTreeMap<String, Option<UnitShape>> = published_shapes
+        .into_iter()
+        .map(|(c_metadata, (shape, consistent))| {
+            (c_metadata, consistent.then_some(shape).flatten())
+        })
+        .collect();
     for (c_metadata, dep) in &mut dep_identities {
         dep.unit_shape = published_shapes.get(c_metadata).copied().flatten();
     }
