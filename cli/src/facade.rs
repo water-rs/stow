@@ -102,6 +102,14 @@ impl ServeMap {
         }
     }
 
+    /// Any coverage at all, exact or wildcard: the empty map is the
+    /// build that provably has nothing to serve yet — nothing local, no
+    /// cached slice — so a `pending` empty map waits on nothing
+    /// (stow#347).
+    pub fn is_empty(&self) -> bool {
+        self.target.is_empty() && self.host.is_empty()
+    }
+
     /// Whether anything in the build could serve `name` at `version` on
     /// this side of the graph: an exact pair, or a wildcard when the
     /// build's semantic fallback is on.
@@ -193,11 +201,13 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
     if invocation_covers(&map) {
         return Ok(FastPath::Defer);
     }
-    // A pending map's "not covered" is provisional: the driver's fresh
-    // slice fetch is still in flight and may cover this unit. Wait on
-    // the readiness gate it left, re-read once, then decide — rather
-    // than compile a covered unit (stow#347).
-    if map.pending {
+    // A pending map's "not covered" is provisional — but only when the
+    // build provably has coverage the fetch may add to. An empty map
+    // means nothing local and no cached slice: the fetch is a lottery,
+    // and stalling every unit on it is exactly the slowdown the map
+    // exists to remove, so the facade compiles and units arriving after
+    // the final write still defer on it (stow#347).
+    if map.pending && !map.is_empty() {
         wait_for_serve_map(&map_path);
         map = ServeMap::read(&map_path)?;
         if invocation_covers(&map) {

@@ -3790,9 +3790,9 @@ fn write_initial_serve_map(
     ));
     // Bind the readiness gate before the map that announces it: a facade
     // that reads `pending` and finds no gate decides on the map it has —
-    // never hangs on a gate that failed to exist (stow#347).
-    let gate = map
-        .pending
+    // never hangs on a gate that failed to exist. An empty pending map
+    // waits on nothing (stow#347).
+    let gate = (map.pending && !map.is_empty())
         .then(|| crate::facade::ServeMapGate::bind(&path))
         .flatten();
     write_serve_map(&path, map)?;
