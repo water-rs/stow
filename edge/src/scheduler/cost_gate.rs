@@ -159,22 +159,6 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
-    RouteBudget {
-        name: "GET /tasks/status (batch)",
-        statements: 4,
-        rows_read: 40,
-        rows_written: 0,
-        scan_allowlist: &[],
-        ddl_permitted: false,
-    },
-    RouteBudget {
-        name: "GET /tasks/{id}",
-        statements: 6,
-        rows_read: 60,
-        rows_written: 0,
-        scan_allowlist: &[],
-        ddl_permitted: false,
-    },
     // Mutation routes — one keyed statement each against a bounded
     // selector.
     RouteBudget {

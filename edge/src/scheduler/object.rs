@@ -154,7 +154,6 @@ impl DurableObject for Scheduler {
                 "".at(list_tasks),
                 "/submit".post(submit_tasks),
                 "/submit/trusted".post(submit_tasks_trusted),
-                "/status".post(tasks_status),
                 "/retry".post(queue_retry),
                 "/cancel".post(queue_cancel),
                 "/promote".post(queue_promote),
@@ -487,16 +486,6 @@ async fn queue_purge(
     apply_queue_mutation(env, db, alarm, queue::QueueMutation::Purge, selector).await
 }
 
-async fn tasks_status(
-    db: DurableDb,
-    Json(task_ids): Json<Vec<String>>,
-) -> Result<Json<Vec<stow_types::api::RequestStatus>>> {
-    let statuses = queue::tasks_status(&db, &task_ids)
-        .await
-        .map_err(to_error)?;
-    Ok(Json(statuses))
-}
-
 /// `POST /requests` — the human request lane's admission, reached from
 /// the edge's `POST /api/v1/requests` after Turnstile. The work itself
 /// is [`admit_request_pass`], shared with the budget probe's drive.
@@ -643,8 +632,8 @@ async fn apply_request_outcome(
         .await
         .map_err(|error| {
             let status = match &error {
-                QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-                QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
+                QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
+                QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
                 QueueError::HumanDailyBudgetExhausted { .. } => StatusCode::TOO_MANY_REQUESTS,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
@@ -673,8 +662,8 @@ async fn apply_request_run_update(
         .await
         .map_err(|error| {
             let status = match &error {
-                QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-                QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
+                QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
+                QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             to_error(error).set_status(status)

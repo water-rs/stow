@@ -1613,8 +1613,9 @@ pub async fn fail_request_dispatch(
 /// probe, stores the per-target roots, and flips the record `enqueued`
 /// in one conditional write. A `Failed` report — or the trusted
 /// enqueue's own refusal — flips it `failed` with the reason. Reports
-/// naming a superseded attempt answer `StaleCompletion`; a report on an
-/// already-settled record is a no-op that re-answers the stored state.
+/// naming a superseded attempt answer `RequestAttemptSuperseded`; a
+/// report on an already-settled record is a no-op that re-answers the
+/// stored state.
 pub async fn apply_request_outcome(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -1623,16 +1624,15 @@ pub async fn apply_request_outcome(
 ) -> Result<stow_types::api::CrateRequestStatus, QueueError> {
     let mut record = load_request(db, request_id)
         .await?
-        .ok_or_else(|| QueueError::UnknownTask(request_id.to_owned()))?;
+        .ok_or_else(|| QueueError::UnknownRequest(request_id.to_owned()))?;
     if record.attempt != i64::from(report.attempt) {
-        return Err(QueueError::StaleCompletion {
-            task_id: request_id.to_owned(),
-            attempt: report.attempt,
-            row_attempt: u64_to_u32(
+        return Err(QueueError::RequestAttemptSuperseded {
+            request_id: request_id.to_owned(),
+            live: u64_to_u32(
                 u64::try_from(record.attempt).unwrap_or_default(),
                 "request attempt",
             )?,
-            row_status: record.state.clone(),
+            reported: report.attempt,
         });
     }
     if matches!(record.state.as_str(), "enqueued" | "failed") {
@@ -1777,16 +1777,15 @@ pub async fn record_request_run_update(
 ) -> Result<(), QueueError> {
     let record = load_request(db, request_id)
         .await?
-        .ok_or_else(|| QueueError::UnknownTask(request_id.to_owned()))?;
+        .ok_or_else(|| QueueError::UnknownRequest(request_id.to_owned()))?;
     if record.attempt != i64::from(update.attempt) {
-        return Err(QueueError::StaleCompletion {
-            task_id: request_id.to_owned(),
-            attempt: update.attempt,
-            row_attempt: u64_to_u32(
+        return Err(QueueError::RequestAttemptSuperseded {
+            request_id: request_id.to_owned(),
+            live: u64_to_u32(
                 u64::try_from(record.attempt).unwrap_or_default(),
                 "request attempt",
             )?,
-            row_status: record.state.clone(),
+            reported: update.attempt,
         });
     }
     match update.action {
@@ -9050,7 +9049,7 @@ mod sqlite_tests {
         )
         .await
         .expect_err("attempt 9 is stale");
-        assert!(matches!(error, QueueError::StaleCompletion { .. }));
+        assert!(matches!(error, QueueError::RequestAttemptSuperseded { .. }));
     }
 
     #[tokio::test]
@@ -9171,6 +9170,6 @@ mod sqlite_tests {
         )
         .await
         .expect_err("attempt 2 is stale");
-        assert!(matches!(error, QueueError::StaleCompletion { .. }));
+        assert!(matches!(error, QueueError::RequestAttemptSuperseded { .. }));
     }
 }

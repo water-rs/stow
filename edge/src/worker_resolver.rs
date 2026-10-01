@@ -128,25 +128,13 @@ struct TaskNode {
     host_side: bool,
 }
 
-/// What one target's resolve produced for the request lane: the enqueue
-/// batch plus the root's outcome inputs. Shape matches the old
-/// `CrateRequestPlan` so `api.rs` call sites keep their fields.
+/// What one target's resolve produced for the admin resolve route: the
+/// uncovered closure's enqueue batch plus the root's cached flag.
 pub struct CrateRequestPlan {
     /// One task per uncovered node in the resolved closure.
     pub enqueue_requests: Vec<EnqueueRequest>,
     /// Whether the root's artifact already exists in the catalog.
     pub root_cached: bool,
-    /// Whether the requested package publishes a library target.
-    pub root_has_library: bool,
-    /// The root task's canonical features JSON.
-    pub root_features_json: String,
-    /// The triple the root task keys on — the requested target for a
-    /// normal lib root, the runner-family host triple for a proc-macro
-    /// root, whose lib compiles on the host.
-    pub root_target: String,
-    /// Whether the root task is a host-side node — true exactly when
-    /// `root_target` is the host triple because the root is a proc-macro.
-    pub root_host_side: bool,
 }
 
 /// `no_default_features` from a request's complete feature set:
@@ -509,7 +497,7 @@ async fn plan_from_output(
     rustc_version: &WireRustcVersion,
 ) -> Result<CrateRequestPlan, ResolverError> {
     tracing::info!(crate = %crate_name, %version, target = %target, "resolve: plan begin");
-    let parts = request_plan_parts(&output.units, &output.roots, crate_name, version, target)?;
+    let parts = request_plan_parts(&output.units, &output.roots, crate_name, version)?;
     let covered = covered_nodes(db, &parts.nodes, rustc_version).await?;
     tracing::info!(
         crate = %crate_name,
@@ -533,13 +521,6 @@ async fn plan_from_output(
     Ok(CrateRequestPlan {
         enqueue_requests,
         root_cached,
-        root_has_library: parts.root_key.is_some(),
-        root_features_json: parts
-            .root_key
-            .as_ref()
-            .map_or_else(|| "[]".to_owned(), |key| key.features_json.clone()),
-        root_target: parts.root_target,
-        root_host_side: parts.root_host_side,
     })
 }
 
@@ -553,14 +534,10 @@ struct RequestPlanParts {
     /// Task-level dependency edges between nodes.
     edges: BTreeMap<TaskNode, BTreeSet<TaskNode>>,
     /// The requested crate's lib-unit task key, at the platform its
-    /// `roots` entry carries.
+    /// `roots` entry carries — the requested target for a normal lib
+    /// root, the runner-family host triple for a proc-macro root (its
+    /// lib unit lives on the host side of its own resolve).
     root_key: Option<TaskNode>,
-    /// `root_key`'s triple, or the requested target when there is no lib
-    /// root.
-    root_target: String,
-    /// `root_key`'s cargo side — true only for a proc-macro root, whose
-    /// lib unit lives on the host side of its own resolve.
-    root_host_side: bool,
 }
 
 fn request_plan_parts(
@@ -568,7 +545,6 @@ fn request_plan_parts(
     roots: &[StowUnitKey],
     crate_name: &CrateName,
     version: &Version,
-    target: &TargetTriple,
 ) -> Result<RequestPlanParts, ResolverError> {
     let (nodes, edges) = task_graph(units)?;
     let root_key = roots
@@ -581,16 +557,10 @@ fn request_plan_parts(
             target: key.platform.clone(),
             host_side: key.side == stow_resolve::api::StowSide::Host,
         });
-    let (root_target, root_host_side) = root_key.as_ref().map_or_else(
-        || (target.as_str().to_owned(), false),
-        |key| (key.target.clone(), key.host_side),
-    );
     Ok(RequestPlanParts {
         nodes,
         edges,
         root_key,
-        root_target,
-        root_host_side,
     })
 }
 
@@ -1967,9 +1937,7 @@ mod tests {
         let roots = vec![proc.key.clone()];
         let crate_name = CrateName::parse("my-proc".to_owned()).unwrap();
         let version = semver::Version::parse("1.0.0").unwrap();
-        let target = TargetTriple::parse("wasm32-unknown-unknown").unwrap();
-        let parts = request_plan_parts(&[proc], &roots, &crate_name, &version, &target).unwrap();
-        assert_eq!(parts.root_target, "x86_64-unknown-linux-gnu");
+        let parts = request_plan_parts(&[proc], &roots, &crate_name, &version).unwrap();
         let root_key = parts.root_key.expect("lib root");
         assert_eq!(root_key.target, "x86_64-unknown-linux-gnu");
     }

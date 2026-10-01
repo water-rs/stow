@@ -978,7 +978,7 @@ pub enum CrateRequestState {
     ClosureQueued,
 }
 
-/// Per-target outcome inside a [`CrateRequestOutcome`].
+/// Per-target outcome inside a [`CrateRequestStatus`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CrateRequestTarget {
     /// Compilation target triple — one of [`CI_TARGET_TRIPLES`].
@@ -993,21 +993,6 @@ pub struct CrateRequestTarget {
     /// `None` unless the task is still pending in the human lane.
     #[serde(default)]
     pub human_lane_position: Option<u32>,
-}
-
-/// Response of `POST /api/v1/requests`: what the edge resolved and where
-/// each supported target stands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct CrateRequestOutcome {
-    /// Echoed crate name.
-    pub crate_name: CrateName,
-    /// The resolved version — the requested one, or the newest
-    /// non-prerelease, non-yanked crates.io release.
-    pub version: CrateVersion,
-    /// Current stable rustc version the enqueued tasks target.
-    pub rustc_version: WireRustcVersion,
-    /// Per-target outcomes in [`CI_TARGET_TRIPLES`] order.
-    pub targets: Vec<CrateRequestTarget>,
 }
 
 /// Deterministic human-request id — `req-<crate>-<version>-<blake3
@@ -1217,8 +1202,9 @@ pub struct RequestRunUpdate {
     pub run_url: Option<String>,
 }
 
-/// Point-in-time view of one scheduler task, returned by
-/// `GET /api/v1/requests/{task_id}`.
+/// Point-in-time view of one scheduler task — what the DO's `tasks_status`
+/// query returns for a request record's re-probe and for task-row
+/// inspection inside the object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RequestStatus {
     /// Canonical scheduler task id (blake3-derived identity string).
@@ -2009,10 +1995,10 @@ pub mod scheduler_lanes {
     pub const ENQUEUE: &str = "/api/v1/enqueue";
     /// `POST /api/v1/requests` — the human request lane submits to the DO.
     pub const REQUESTS: &str = "/api/v1/requests";
-    /// `GET /api/v1/requests/{task_id}` — the JSON status read hits the DO.
-    pub const REQUEST: &str = "/api/v1/requests/{task_id}";
-    /// `GET /requests/{task_id}` — the request-status page reads the DO.
-    pub const REQUEST_PAGE: &str = "/requests/{task_id}";
+    /// `GET /api/v1/requests/{request_id}` — the JSON status read hits the DO.
+    pub const REQUEST: &str = "/api/v1/requests/{request_id}";
+    /// `GET /requests/{request_id}` — the request-status page reads the DO.
+    pub const REQUEST_PAGE: &str = "/requests/{request_id}";
 
     /// Every scheduler-lane path — the router's mount list and the WAF
     /// rule's block list are both built from this.

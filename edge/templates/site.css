@@ -349,7 +349,7 @@ code { font-family: var(--mono); }
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
-.badge[data-state="completed"] { background: var(--accent); color: var(--on-accent); }
+.badge[data-state="completed"], .badge[data-state="enqueued"] { background: var(--accent); color: var(--on-accent); }
 .badge[data-state="failed"] { background: var(--error); color: var(--paper); border-color: var(--error); }
 .status-id { margin: 20px 0 0; font-size: 12px; word-break: break-all; opacity: 0.75; }
 

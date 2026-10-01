@@ -104,20 +104,6 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 100,
     },
     DriveBudget {
-        name: "GET /tasks/status (batch)",
-        statements: 4,
-        rows_read: 2_500,
-        rows_written: 0,
-        wall_ms: 150,
-    },
-    DriveBudget {
-        name: "GET /tasks/{id}",
-        statements: 6,
-        rows_read: 2_500,
-        rows_written: 0,
-        wall_ms: 150,
-    },
-    DriveBudget {
         name: "POST /tasks/complete-run",
         statements: 10,
         rows_read: 200,
@@ -156,7 +142,7 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // An `enqueued` record's read: the row select, the stored-roots
         // parse and the live `tasks_status` re-probe — the pending human
         // root's lane-position walk dominates, bounded by the held lane
-        // depth like `GET /tasks/{id}`.
+        // depth.
         name: "GET /requests/{id}",
         statements: 8,
         rows_read: 2_600,

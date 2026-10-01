@@ -386,7 +386,7 @@ CREATE TABLE IF NOT EXISTS requests (
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
     rustc_version TEXT NOT NULL,
-    state TEXT NOT NULL, -- 'accepted' | 'resolving' | 'enqueued' | 'failed'
+    state TEXT NOT NULL CHECK (state IN ('accepted', 'resolving', 'enqueued', 'failed')),
     dispatched_at INTEGER, -- unixepoch seconds of the dispatch POST
     github_run_id TEXT,
     github_run_url TEXT,

@@ -7,8 +7,8 @@ use crate::errors::SchedulerClientError;
 const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
-const SCHEDULER_TASKS_STATUS_URL: &str = "https://scheduler.internal/tasks/status";
 const SCHEDULER_RUN_COMPLETE_URL: &str = "https://scheduler.internal/tasks/complete-run";
+const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
@@ -63,14 +63,67 @@ pub async fn get_status(
     get_json(namespace, SCHEDULER_STATUS_URL).await
 }
 
-/// Per-task status for a set of scheduler task ids — drives both the
-/// `POST /api/v1/requests` outcome assembly and
-/// `GET /api/v1/requests/{task_id}`.
-pub async fn get_tasks_status(
+/// Admit a human request: the object dedupes on the deterministic
+/// request id, probes the human daily budget, dispatches
+/// `resolve-request.yml` through the GitHub App, and answers the
+/// record's live status.
+pub async fn submit_request(
     namespace: &CfDurableNamespace,
-    task_ids: &[String],
-) -> Result<Vec<stow_types::api::RequestStatus>, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_TASKS_STATUS_URL, task_ids).await
+    admission: &stow_types::api::RequestAdmission,
+) -> Result<stow_types::api::CrateRequestStatus, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_REQUESTS_URL, admission).await
+}
+
+/// One request record's live status — `None` when the id names no
+/// record, so an expired link is an unknown id, not a scheduler
+/// failure.
+pub async fn get_request(
+    namespace: &CfDurableNamespace,
+    request_id: &str,
+) -> Result<Option<stow_types::api::CrateRequestStatus>, SchedulerClientError> {
+    match get_json::<stow_types::api::CrateRequestStatus>(
+        namespace,
+        &format!("{SCHEDULER_REQUESTS_URL}/{request_id}"),
+    )
+    .await
+    {
+        Ok(status) => Ok(Some(status)),
+        Err(SchedulerClientError::Http { status: 404, .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The resolve job's outcome report — the caller is trusted (the
+/// job's OIDC identity rides the `/api/v1/scheduler` gate), so the
+/// report's tasks enqueue verbatim.
+pub async fn send_request_outcome(
+    namespace: &CfDurableNamespace,
+    request_id: &str,
+    report: &stow_types::api::RequestOutcomeReport,
+) -> Result<stow_types::api::CrateRequestStatus, SchedulerClientError> {
+    post_json(
+        namespace,
+        &format!("{SCHEDULER_REQUESTS_URL}/{request_id}/outcome"),
+        report,
+    )
+    .await
+}
+
+/// The `workflow_run` webhook's lifecycle channel for a
+/// `resolve-request.yml` run: `in_progress` marks the record
+/// `resolving`; `completed` is the failure backstop for a run that
+/// never reported an outcome.
+pub async fn send_request_run_update(
+    namespace: &CfDurableNamespace,
+    request_id: &str,
+    update: &stow_types::api::RequestRunUpdate,
+) -> Result<(), SchedulerClientError> {
+    send_json(
+        namespace,
+        &format!("{SCHEDULER_REQUESTS_URL}/{request_id}/run-update"),
+        update,
+    )
+    .await
 }
 
 /// The index-publish path's report that a `(target, rustc_version)`

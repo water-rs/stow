@@ -41,7 +41,7 @@ identity. The build order is the edges. The unit rule is what may be a node.
 ## Trust model
 - Trust GitHub-hosted CI as the builder.
 - Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
-- Trusted CI never calls the edge: `build-crate.yml` stamps its `run-name` `<rustc>-<task_id>` and pushes each task's bundle and `Vec<ArtifactRecord>` to GHCR as one cosign-signed `records-<rustc>-<task_id hash>` artifact under the pinned builder identity, and GitHub's `workflow_run` webhook (HMAC-verified at `POST /api/v1/github/workflow-run`) reports completion. GHCR plus cosign is the only record store; the edge's D1 `artifacts` table is a mirror `index sync` fills from those verified records.
+- Trusted CI never calls the edge: `build-crate.yml` stamps its `run-name` `<rustc>-<task_id>` and pushes each task's bundle and `Vec<ArtifactRecord>` to GHCR as one cosign-signed `records-<rustc>-<task_id hash>` artifact under the pinned builder identity, and GitHub's `workflow_run` webhook (HMAC-verified at `POST /api/v1/github/workflow-run`) reports completion; the same webhook drives request-lane run updates — `resolve-request.yml` stamps `run-name` `resolve-a<attempt>-<request_id>` and its `in_progress`/`completed` deliveries advance the request record. GHCR plus cosign is the only record store; the edge's D1 `artifacts` table is a mirror `index sync` fills from those verified records.
 - Edge workers are untrusted-by-default serving infrastructure: index exports and webhook completion both verify the records artifact's cosign signature against the `build-crate.yml` identity before trusting a row, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the consumer sees a 404 or a digest failure and compiles locally).
 
 ## Architecture map
@@ -54,11 +54,11 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `inject.rs`: writes cached outputs back into Cargo target dirs.
   - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
 - `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/bundles/{digest}`, Workers Cache in front of the GHCR blob — no catalog lookup) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
-  - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, trusted admin/scheduler routes.
-  - `worker_resolver.rs`: the request lane, preheat lanes and admin enqueue resolve — cargo's resolver (`stow-resolve`) over fetched manifests.
+  - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, `/api/v1/requests` Turnstile admission (hands the request to the scheduler, which dispatches `resolve-request.yml` — the edge resolves nothing), trusted admin/scheduler routes.
+  - `worker_resolver.rs`: the admin resolve routes' expansion — cargo's resolver (`stow-resolve`) over fetched manifests (removal is #429).
   - `dependency_resolver.rs`: miss derivation for admissions and the shared crates.io record helpers.
   - `db.rs`: D1 schema helpers and artifact-catalog queries.
-  - `scheduler/`: Durable Object queue, dispatch, and miss draining.
+  - `scheduler/`: Durable Object queue, dispatch, miss draining, and request records (`requests` table — admit + `resolve-request.yml` dispatch on `POST /requests`, task submit on `/requests/{id}/outcome`, webhook-driven `run-update`).
 - `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.
   - `stow-build build` (untrusted job, `contents: read`, no secrets/OIDC): builds the crate, scans artifacts, writes task + plan + content-addressed blobs to an output directory (`stage.rs`).
   - `stow-build publish` (trusted job): re-hashes the blobs, validates the plan against the dispatched task and a self-resolved dependency closure (`closure.rs`, `validate.rs`), then pushes the bundle and the signed records artifact to GHCR. GitHub's `workflow_run` webhook — not the runner — reports completion to the edge.
@@ -67,7 +67,7 @@ identity. The build order is the edges. The unit rule is what may be a node.
 - `mock-registry/`: local mock OCI registry for simulation and tests (`populate`, `publish-index`, `index-from-records`, `serve`; speaks GHCR's anonymous bearer exchange).
 - `types/`: shared API and artifact key types (`index.rs` carries the signed `ArtifactIndex` wire format).
 - `resolver/`: native graph resolver (`stow-resolver`) on the published `cargo` crate — materializes a fetched source (project tree or `.crate`), runs cargo's own `resolve_ws_with_opts`/`FeatureResolver` per CI target with the toolchain's real rustc facts, and emits the per-target unit set (package, feature set, dependency edges, host/target side) plus the `EnqueueRequest` conversion the lanes share.
-- `admin/`: operations CLI for preheating the cache and publishing index slices (`index export|publish|sync`). Every lane resolves in-process with `stow-resolver` (`resolve::RESOLVE_CONCURRENCY` worker threads); `preheat manual` drives a whole wave with no edge at all — in-process resolve, topological layering, `workflow_dispatch` through the operator's GitHub token, index-rooted resume.
+- `admin/`: operations CLI for preheating the cache and publishing index slices (`index export|publish|sync`). Every lane resolves in-process with `stow-resolver` (`resolve::RESOLVE_CONCURRENCY` worker threads); `preheat manual` drives a whole wave with no edge at all — in-process resolve, topological layering, `workflow_dispatch` through the operator's GitHub token, index-rooted resume. `request resolve` is the request lane's Actions half (`resolve-request.yml` runs it): resolves the dispatched request across `CI_TARGET_TRIPLES`, prunes against the published index slices, and posts the outcome to the scheduler.
 
 ## Important repo assumptions
 - water-rs Actions capacity is 60 concurrent runners (20 on macOS) — a full `CI_TARGET_TRIPLES` request wave dispatches in one window; wall clock is set by the slowest (Windows) leg.

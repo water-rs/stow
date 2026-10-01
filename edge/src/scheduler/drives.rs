@@ -294,44 +294,6 @@ pub const DRIVES: &[Drive] = &[
         },
     },
     Drive {
-        // A batch of one human-lane pending row and one completed row.
-        // The human id is a pinned tail row
-        // (`FixtureShape::HUMAN_LANE_ROWS - 5`): its edge always lands
-        // on a completed dep, so `blocked` is size-invariant and its
-        // lane-position probe — bounded by the held lane depth — runs
-        // at every fixture size.
-        name: "GET /tasks/status (batch)",
-        run: |db, shape, _settings, _ctx| {
-            Box::pin(async move {
-                queue::tasks_status(
-                    db,
-                    &[
-                        hex_id(u64::from(FixtureShape::HUMAN_LANE_ROWS - 5)),
-                        hex_id(u64::from(shape.completed_row(0))),
-                    ],
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-            })
-        },
-    },
-    Drive {
-        // A single human-lane pending row — the pinned tail row, for
-        // the same reason as the batch drive: its position probe reads
-        // the lane's full held depth at every size rather than
-        // silently dropping to zero if a fixed row flips `blocked`.
-        name: "GET /tasks/{id}",
-        run: |db, _shape, _settings, _ctx| {
-            Box::pin(async move {
-                queue::tasks_status(db, &[hex_id(u64::from(FixtureShape::HUMAN_LANE_ROWS - 5))])
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            })
-        },
-    },
-    Drive {
         name: "POST /tasks/complete-run",
         run: |db, shape, _settings, _ctx| {
             Box::pin(async move {
@@ -437,9 +399,9 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         // A settled `enqueued` record: the row read, the stored-roots
-        // parse and the live `tasks_status` re-probe — the pending human
-        // root pays the lane-position walk the `GET /tasks/{id}` drives
-        // price, bounded by the held lane depth.
+        // parse and the live `tasks_status` re-probe — a pending human
+        // root pays the lane-position walk, bounded by the held lane
+        // depth.
         name: "GET /requests/{id}",
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {

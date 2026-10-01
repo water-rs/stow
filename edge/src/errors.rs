@@ -168,6 +168,24 @@ pub enum QueueError {
         /// The row's current status.
         row_status: String,
     },
+    /// A request-lane report or update named a request id the scheduler
+    /// has no record for.
+    #[error("request report for unknown request `{0}`")]
+    UnknownRequest(String),
+    /// A request-lane report claimed an attempt that is not the record's
+    /// live one — a stale report from a superseded run. Handlers map
+    /// this to `409 Conflict`: retrying it unchanged can never apply.
+    #[error(
+        "report for request `{request_id}` names attempt {reported}; the record's live attempt is {live}"
+    )]
+    RequestAttemptSuperseded {
+        /// The request id the report named.
+        request_id: String,
+        /// The attempt the record is currently on.
+        live: u32,
+        /// The attempt the report claimed.
+        reported: u32,
+    },
     /// The `STOW_MAX_QUEUE_PENDING` gate refused a miss-lane submit: the
     /// queue already holds `cap` pending tasks.
     #[error("scheduler queue is full: {pending} pending tasks >= cap {cap}")]
@@ -364,12 +382,12 @@ pub enum GetArtifactError {
         /// `version X.Y.Z` when one was asked for, else `stable release`.
         requested: String,
     },
-    /// `GET /api/v1/requests/{task_id}` for a task the scheduler does not
-    /// know: never enqueued, or already reaped.
-    #[error("unknown request task id `{task_id}`", status = NOT_FOUND)]
-    UnknownTask {
+    /// `GET /api/v1/requests/{request_id}` for a request the scheduler
+    /// has no record for: never admitted, or a mistyped id.
+    #[error("unknown request id `{request_id}`", status = NOT_FOUND)]
+    UnknownRequest {
         /// The id from the request path.
-        task_id: String,
+        request_id: String,
     },
     /// The repository or ref a projects-lane request named does not
     /// exist — the anonymous GitHub tree fetch answered 404. The body

@@ -33,22 +33,39 @@ Body: `CrateRequest`.
 }
 ```
 
-Response `200`: `CrateRequestOutcome` — the resolved version, the stable
-rustc the tasks target, and one `CrateRequestTarget` per entry of
-`CI_TARGET_TRIPLES` (`aarch64-apple-darwin`, `aarch64-apple-ios`,
-`aarch64-apple-ios-sim`, `aarch64-linux-android`,
-`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`,
-`wasm32-unknown-unknown`, in that order).
+Response `200`: `CrateRequestStatus` — the request record as it stands
+at the moment of admission. The edge resolves nothing itself: a request
+the scheduler accepts is dispatched to `resolve-request.yml` on GitHub
+Actions, which resolves the closure and submits the tasks; `status`
+walks `accepted` → `resolving` → `enqueued` (or `failed`) over the
+record's lifetime.
 
 | Field | Type | Notes |
 |---|---|---|
-| `crate_name` | `CrateName` | Echoed |
-| `version` | `CrateVersion` | The resolved version |
-| `rustc_version` | `WireRustcVersion` | Current stable channel release (cached 60 min in the scheduler DO) |
-| `targets` | `CrateRequestTarget[]` | Per-target outcome, `CI_TARGET_TRIPLES` order |
+| `request_id` | `string` | Stable id `req-<crate>-<version>-<features-hash>-<rustc>`; resubmitting an identical request re-answers the live record |
+| `crate_name`, `version`, `features_json`, `rustc_version` | identity newtypes | The request's identity — version and rustc resolved to concrete values at admission |
+| `status` | `CrateRequestPhase` | `accepted` \| `resolving` \| `enqueued` \| `failed` |
+| `targets` | `CrateRequestTarget[]` | Per-target outcome, `CI_TARGET_TRIPLES` order (`aarch64-apple-darwin`, `aarch64-apple-ios`, `aarch64-apple-ios-sim`, `aarch64-linux-android`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `wasm32-unknown-unknown`); empty until `status` reaches `enqueued` |
+| `error` | `string?` | Why the record failed; `null` otherwise |
+| `github_run_id`, `github_run_url` | `string?` | The Actions resolve run once it starts (`resolving` onward); `null` before |
 
-`CrateRequestTarget`:
+```json
+{
+  "request_id": "req-serde_json-1.0.149-4f0a1b2c-1_98_1",
+  "crate_name": "serde_json",
+  "version": "1.0.149",
+  "features_json": "[\"preserve_order\"]",
+  "rustc_version": "1.98.1",
+  "status": "accepted",
+  "targets": [],
+  "error": null,
+  "github_run_id": null,
+  "github_run_url": null
+}
+```
+
+`CrateRequestTarget` (populated at `enqueued`; states then keep moving
+on each read until the target is cached):
 
 | Field | Type | Notes |
 |---|---|---|
@@ -62,24 +79,9 @@ rustc the tasks target, and one `CrateRequestTarget` per entry of
 the crate itself is never a task and what enqueued was its dependency
 closure — exactly what `cargo install <crate>` would otherwise compile.
 
-```json
-{
-  "crate_name": "serde_json",
-  "version": "1.0.149",
-  "rustc_version": "1.98.1",
-  "targets": [
-    { "target": "aarch64-apple-darwin", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_darwin-1.98.1", "human_lane_position": 1 },
-    { "target": "aarch64-apple-ios", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios-1.98.1", "human_lane_position": 2 },
-    { "target": "aarch64-apple-ios-sim", "state": "building", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios_sim-1.98.1", "human_lane_position": null },
-    { "target": "aarch64-linux-android", "state": "already_queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_linux_android-1.98.1", "human_lane_position": 3 },
-    { "target": "x86_64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1", "human_lane_position": 4 },
-    { "target": "aarch64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_unknown_linux_gnu-1.98.1", "human_lane_position": 5 },
-    { "target": "x86_64-pc-windows-msvc", "state": "cached", "task_id": null, "human_lane_position": null },
-    { "target": "aarch64-pc-windows-msvc", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_pc_windows_msvc-1.98.1", "human_lane_position": 6 },
-    { "target": "wasm32-unknown-unknown", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-wasm32_unknown_unknown-1.98.1", "human_lane_position": 7 }
-  ]
-}
-```
+A record ends `failed` when the resolve job cannot complete it — the
+closure exceeding `STOW_HUMAN_MAX_CLOSURE` crates (150 in the production
+manifest) is one such failure; `error` names the reason.
 
 Errors:
 
@@ -93,42 +95,46 @@ Errors:
   site that minted them.
 - `404` — the crate (or the requested exact version) is not published on
   crates.io.
-- `422` — the request's dependency closure exceeds
-  `STOW_HUMAN_MAX_CLOSURE` crates (150 in the production manifest).
 - `429` — the human lane has spent its `STOW_HUMAN_DAILY_TASK_BUDGET` for
   today (2000 tasks in production); `Retry-After` counts the seconds to
   00:00 UTC, when the counter resets.
 
-## `GET /api/v1/requests/{task_id}`
+## `GET /api/v1/requests/{request_id}`
 
-`{task_id}` is a value returned in `task_id` above. Response `200`:
-`RequestStatus`.
-
-| Field | Type | Notes |
-|---|---|---|
-| `task_id` | `string` | The task's canonical id |
-| `crate_name`, `version`, `features_json`, `target`, `rustc_version` | identity newtypes | The task's queue identity |
-| `lane` | `TaskLane` | `miss` \| `human` |
-| `status` | `QueueTaskStatus` | `pending` \| `dispatched` \| `running` \| `completed` \| `failed` |
-| `human_lane_position` | `u32?` | 1-based position among pending human-lane tasks; `null` otherwise |
-| `preserve_lockfile` | `bool` | The task resolves its crate's bundled `Cargo.lock` rather than the resolver's synthesis |
+`{request_id}` is the `request_id` returned above. Response `200`: the
+same `CrateRequestStatus` shape, live — `status` advances as the resolve
+run reports in (`accepted` → `resolving`) and as its outcome lands
+(`enqueued` with `targets` populated, or `failed` with `error`). An
+`enqueued` record's targets are re-read against the queue on every
+request, so `state`/`human_lane_position` stay truthful until every
+target is `cached`.
 
 ```json
 {
-  "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1",
+  "request_id": "req-serde_json-1.0.149-4f0a1b2c-1_98_1",
   "crate_name": "serde_json",
   "version": "1.0.149",
   "features_json": "[\"preserve_order\"]",
-  "target": "x86_64-unknown-linux-gnu",
   "rustc_version": "1.98.1",
-  "lane": "human",
-  "status": "pending",
-  "human_lane_position": 1,
-  "preserve_lockfile": false
+  "status": "enqueued",
+  "targets": [
+    { "target": "aarch64-apple-darwin", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_darwin-1.98.1", "human_lane_position": 1 },
+    { "target": "aarch64-apple-ios", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios-1.98.1", "human_lane_position": 2 },
+    { "target": "aarch64-apple-ios-sim", "state": "building", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios_sim-1.98.1", "human_lane_position": null },
+    { "target": "aarch64-linux-android", "state": "already_queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_linux_android-1.98.1", "human_lane_position": 3 },
+    { "target": "x86_64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1", "human_lane_position": 4 },
+    { "target": "aarch64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_unknown_linux_gnu-1.98.1", "human_lane_position": 5 },
+    { "target": "x86_64-pc-windows-msvc", "state": "cached", "task_id": null, "human_lane_position": null },
+    { "target": "aarch64-pc-windows-msvc", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_pc_windows_msvc-1.98.1", "human_lane_position": 6 },
+    { "target": "wasm32-unknown-unknown", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-wasm32_unknown_unknown-1.98.1", "human_lane_position": 7 }
+  ],
+  "error": null,
+  "github_run_id": "123456789",
+  "github_run_url": "https://github.com/water-rs/stow/actions/runs/123456789"
 }
 ```
 
-`404` when the id is not in the scheduler queue.
+`404` when the id is not a live request record.
 
 ## Crate catalog
 

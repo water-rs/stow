@@ -399,9 +399,30 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
     return td;
   };
 
+  const PHASE_LABELS = {
+    accepted: "accepted — resolve dispatched",
+    resolving: "resolving on CI",
+    enqueued: "enqueued",
+    failed: "failed",
+  };
+
   const showOutcome = (outcome) => {
     resultTitle.textContent = `${outcome.crate_name} ${outcome.version} · rustc ${outcome.rustc_version}`;
     resultBody.replaceChildren();
+    // The request row always comes first: its phase is the
+    // whole-request answer and its link is the live status page. While
+    // the record is still `accepted`/`resolving` it is the only row —
+    // `targets` lands when the resolve job reports its outcome.
+    const track = document.createElement("tr");
+    cell(track, "request");
+    cell(track, PHASE_LABELS[outcome.status] ?? String(outcome.status));
+    cell(track, "—", "num");
+    const trackCell = cell(track, "");
+    const trackLink = document.createElement("a");
+    trackLink.href = `/requests/${encodeURIComponent(outcome.request_id)}`;
+    trackLink.textContent = "track";
+    trackCell.appendChild(trackLink);
+    resultBody.appendChild(track);
     for (const entry of outcome.targets) {
       const row = document.createElement("tr");
       cell(row, entry.target);
@@ -411,16 +432,11 @@ const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
         typeof entry.human_lane_position === "number" ? `#${entry.human_lane_position}` : "—",
         "num",
       );
-      const taskCell = cell(row, "");
-      if (entry.task_id) {
-        const link = document.createElement("a");
-        link.href = `/requests/${encodeURIComponent(entry.task_id)}`;
-        link.textContent = "status";
-        taskCell.appendChild(link);
-      } else {
-        taskCell.textContent = "—";
-      }
+      cell(row, entry.task_id ?? "—");
       resultBody.appendChild(row);
+    }
+    if (outcome.error) {
+      setStatus(outcome.error, "error");
     }
     result.hidden = false;
     result.scrollIntoView({ block: "nearest" });
