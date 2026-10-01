@@ -4347,10 +4347,11 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::{
         CachedDependencyPlan, MetadataArgs, ProjectContext, cached_dependency_profile,
-        create_workspace_mirror, feature_references_dependency, native_requires_link_replay,
-        rewrite_args_for_root, strip_selected_manifest_dependencies,
+        feature_references_dependency, native_requires_link_replay, rewrite_args_for_root,
         validate_top_crate_cached_native_support,
     };
+    #[cfg(unix)]
+    use super::{create_workspace_mirror, strip_selected_manifest_dependencies};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};

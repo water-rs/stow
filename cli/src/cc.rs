@@ -101,10 +101,10 @@ fn platform_driver(kind: CcKind) -> ResolvedCompiler {
 /// invokes by hand.
 #[cfg(windows)]
 fn target_for_resolution(target: Option<&str>) -> Option<String> {
-    match target {
-        Some(triple) => triple.contains("msvc").then(|| triple.to_owned()),
-        None => Some(format!("{}-pc-windows-msvc", std::env::consts::ARCH)),
-    }
+    target.map_or_else(
+        || Some(format!("{}-pc-windows-msvc", std::env::consts::ARCH)),
+        |triple| triple.contains("msvc").then(|| triple.to_owned()),
+    )
 }
 
 const PROBE_FLAGS: &[&str] = &[
@@ -579,9 +579,13 @@ pub enum CcOutcome {
 mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::Duration;
 
-    use super::{CcOutcome, DepfileMode, DepfileTarget, ParsedCcInvocation};
+    #[cfg(unix)]
+    use super::CcOutcome;
+    use super::{DepfileMode, DepfileTarget, ParsedCcInvocation};
+    #[cfg(unix)]
     use crate::config::{StowConfig, VerifyMode};
 
     fn args(values: &[&str]) -> Vec<std::ffi::OsString> {
