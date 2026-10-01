@@ -17,6 +17,7 @@ mod deploy;
 mod github;
 mod http_retry;
 mod index_cmd;
+mod launch_model;
 mod maintenance;
 mod manual;
 mod preheat;
@@ -110,6 +111,9 @@ enum Command {
     DispatchFreeze(DispatchFreezeArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
+    /// Regenerate the checked-in launch traffic model from production
+    /// analytics (stow#452).
+    LaunchModel(launch_model::LaunchModelArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
@@ -219,6 +223,7 @@ fn main() -> stow_types::error::Result<()> {
         // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
         // the rest run on smol like every other command.
         Command::Index(args) => index_cmd::run(args),
+        Command::LaunchModel(args) => smol::block_on(launch_model::run(args, output)),
         Command::Submit(args) => {
             with_edge(|edge| async move { submit_command(&edge, args, output).await })
         }

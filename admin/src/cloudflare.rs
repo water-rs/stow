@@ -92,10 +92,76 @@ pub async fn query_account<V: Serialize + Sync, T: DeserializeOwned>(
     query: &str,
     variables: &V,
 ) -> Result<T, String> {
+    let envelope: Envelope<T> = graphql(token, query, variables).await?;
+    envelope.into_account()
+}
+
+/// A `{"data": …, "errors": …}` answer to a `viewer { zones(…) { <T> } }`
+/// query — the zone sibling of [`Envelope`].
+#[derive(Debug, Deserialize)]
+pub struct ZoneEnvelope<T> {
+    /// Present on success.
+    data: Option<ZoneViewer<T>>,
+    /// Present on failure.
+    errors: Option<Vec<GraphqlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ZoneViewer<T> {
+    viewer: Zones<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Zones<T> {
+    /// One entry per zone the filter matched — the tag names exactly one.
+    zones: Vec<T>,
+}
+
+impl<T> ZoneEnvelope<T> {
+    /// `data.viewer.zones[0]` with the same hard-error rule as
+    /// [`Envelope::into_account`].
+    ///
+    /// # Errors
+    /// GraphQL errors, or an answer that carries no zone.
+    pub fn into_zone(self) -> Result<T, String> {
+        if let Some(errors) = self.errors.filter(|errors| !errors.is_empty()) {
+            let messages = errors
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!("Cloudflare GraphQL errors: {messages}"));
+        }
+        self.data
+            .and_then(|data| data.viewer.zones.into_iter().next())
+            .ok_or_else(|| "Cloudflare GraphQL answer carried no zone data".to_owned())
+    }
+}
+
+/// POST `query` with `variables` to the GraphQL Analytics API and decode
+/// the one zone it filters on.
+///
+/// # Errors
+/// Transport, HTTP status, decode and GraphQL errors, as text.
+pub async fn query_zone<V: Serialize + Sync, T: DeserializeOwned>(
+    token: &str,
+    query: &str,
+    variables: &V,
+) -> Result<T, String> {
+    let envelope: ZoneEnvelope<T> = graphql(token, query, variables).await?;
+    envelope.into_zone()
+}
+
+/// The shared GraphQL POST both envelope kinds decode.
+async fn graphql<V: Serialize + Sync, T: DeserializeOwned>(
+    token: &str,
+    query: &str,
+    variables: &V,
+) -> Result<T, String> {
     let url = format!("{API_BASE}/graphql");
     let body = Request { query, variables };
     let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
-    let envelope: Envelope<T> = client
+    client
         .post(&url)
         .and_then(|request| request.header("Authorization", format!("Bearer {token}")))
         .and_then(|request| request.json_body(&body))
@@ -107,6 +173,83 @@ pub async fn query_account<V: Serialize + Sync, T: DeserializeOwned>(
         .map_err(|error| format!("POST {url}: {error}"))?
         .into_json()
         .await
+        .map_err(|error| format!("decode {url}: {error}"))
+}
+
+/// The Analytics Engine `FORMAT JSON` envelope — rows under `data`,
+/// errors under `errors`.
+#[derive(Debug, Deserialize)]
+struct SqlEnvelope {
+    /// Queried rows.
+    data: Vec<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Present on failure.
+    errors: Option<Vec<GraphqlError>>,
+}
+
+/// Run `sql` against the account's Analytics Engine datasets and return
+/// the rows as `(column → u64)` maps — 64-bit integers arrive quoted,
+/// so numeric-looking strings coerce back.
+///
+/// # Errors
+/// Transport, HTTP status, decode and API errors, as text.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Analytics Engine counts are non-negative and far inside u64"
+)]
+pub async fn analytics_engine_sql(
+    token: &str,
+    account_id: &str,
+    sql: &str,
+) -> Result<Vec<std::collections::BTreeMap<String, u64>>, String> {
+    let url = format!("{API_BASE}/accounts/{account_id}/analytics_engine/sql");
+    let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
+    let request = client
+        .post(&url)
+        .and_then(|request| request.header("Authorization", format!("Bearer {token}")))
+        .and_then(|request| {
+            request
+                .header("Content-Type", "text/plain")
+                .map(|request| request.bytes_body(sql.as_bytes().to_vec()))
+        })
+        .map_err(|error| format!("POST {url}: {error}"))?;
+    let envelope: SqlEnvelope = request
+        .await
+        .map_err(|error| format!("POST {url}: {error}"))?
+        .error_for_status()
+        .await
+        .map_err(|error| format!("POST {url}: {error}"))?
+        .into_json()
+        .await
         .map_err(|error| format!("decode {url}: {error}"))?;
-    envelope.into_account()
+    if let Some(errors) = envelope.errors.filter(|errors| !errors.is_empty()) {
+        let messages = errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("Analytics Engine SQL errors: {messages}"));
+    }
+    envelope
+        .data
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|(key, value)| {
+                    let parsed = match value {
+                        serde_json::Value::Number(number) => number
+                            .as_u64()
+                            .or_else(|| number.as_f64().map(|float| float.round() as u64))
+                            .ok_or_else(|| format!("column {key}: {value} is not a count")),
+                        serde_json::Value::String(text) => text
+                            .parse::<u64>()
+                            .or_else(|_| text.parse::<f64>().map(|f| f.round() as u64))
+                            .map_err(|error| format!("column {key}: {text:?}: {error}")),
+                        other => Err(format!("column {key}: {other} is not a count")),
+                    }?;
+                    Ok((key.clone(), parsed))
+                })
+                .collect()
+        })
+        .collect()
 }

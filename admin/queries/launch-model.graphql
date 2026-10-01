@@ -1,0 +1,16 @@
+query LaunchModel($zoneTag: String!, $since: Time!, $until: Time!) {
+  viewer {
+    zones(filter: {zoneTag: $zoneTag}) {
+      groups: httpRequestsAdaptiveGroups(
+        filter: {datetime_geq: $since, datetime_leq: $until}
+        limit: 10000
+      ) {
+        count
+        dimensions {
+          clientRequestHTTPMethodName
+          clientRequestPath
+        }
+      }
+    }
+  }
+}

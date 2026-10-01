@@ -18,6 +18,7 @@ pub mod glibc;
 pub mod hash;
 pub mod identity;
 pub mod index;
+pub mod launch_model;
 pub mod native_capture;
 pub mod platform;
 pub mod pow;
