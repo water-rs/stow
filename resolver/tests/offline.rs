@@ -549,3 +549,131 @@ fn normal_and_proc_macro_sides_split() {
     assert_eq!(target.key.platform, "aarch64-unknown-linux-gnu");
     assert_eq!(target.features, ["a"]);
 }
+
+/// `leaf` is a normal dep of the root and a normal dep of the proc-macro
+/// `pm`, at the same features: a native `cargo build` dedups it into one
+/// unit — the normal one — and `pm`'s extern resolves to that artifact.
+/// The emitted edge mirrors cargo: `pm`'s host unit names `leaf` at both
+/// sides — the host unit for the `--target` spelling under which the
+/// split stands, and the deduped normal unit the native spelling links
+/// (stow#506).
+#[test]
+fn a_host_dep_shared_with_a_normal_one_emits_the_deduped_edge() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "leaf",
+            version: "1.0.0",
+            deps: vec![],
+            features: &[("a", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "pm",
+            version: "1.0.0",
+            deps: vec![("leaf", "1", &["a"])],
+            features: &[],
+            yanked: false,
+            proc_macro: true,
+        },
+    );
+    let manifest = project(
+        &work.path().join("root"),
+        &json!({ "leaf": { "version": "1", "features": ["a"] }, "pm": "1" }),
+    );
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve(
+            &manifest,
+            &ResolveOptions::default(),
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+
+    let pm = units_named(&out, "pm")
+        .into_iter()
+        .find(|unit| unit.unit_kind == stow_resolver::StowUnitKind::Lib)
+        .expect("pm's host lib unit");
+    assert_eq!(pm.key.side, StowSide::Host);
+    let leaf_sides: Vec<StowSide> = pm
+        .deps
+        .iter()
+        .filter(|dep| dep.name == "leaf")
+        .map(|dep| dep.key.side)
+        .collect();
+    assert!(
+        leaf_sides.contains(&StowSide::Target),
+        "the native spelling dedups `leaf` to the normal unit: {leaf_sides:?}"
+    );
+    assert!(
+        leaf_sides.contains(&StowSide::Host),
+        "the `--target` spelling keeps the host unit's edge: {leaf_sides:?}"
+    );
+}
+
+/// The dedup is exact: `leaf`'s host and normal feature sets differ, so
+/// the pair compiles as two units under every spelling and the host
+/// unit's edge stays host-only.
+#[test]
+fn a_host_dep_with_different_features_keeps_its_own_edge() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "leaf",
+            version: "1.0.0",
+            deps: vec![],
+            features: &[("a", &[]), ("b", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "pm",
+            version: "1.0.0",
+            deps: vec![("leaf", "1", &["b"])],
+            features: &[],
+            yanked: false,
+            proc_macro: true,
+        },
+    );
+    let manifest = project(
+        &work.path().join("root"),
+        &json!({ "leaf": { "version": "1", "features": ["a"] }, "pm": "1" }),
+    );
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve(
+            &manifest,
+            &ResolveOptions::default(),
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+
+    let pm = units_named(&out, "pm")
+        .into_iter()
+        .find(|unit| unit.unit_kind == stow_resolver::StowUnitKind::Lib)
+        .expect("pm's host lib unit");
+    let leaf_sides: Vec<StowSide> = pm
+        .deps
+        .iter()
+        .filter(|dep| dep.name == "leaf")
+        .map(|dep| dep.key.side)
+        .collect();
+    assert_eq!(
+        leaf_sides,
+        vec![StowSide::Host],
+        "feature sets differ — no dedup, the edge stays host-only"
+    );
+}
