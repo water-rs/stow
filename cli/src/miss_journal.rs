@@ -285,7 +285,10 @@ pub fn spawn_drain(target_dir: &Path) {
         .arg(target_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr);
+        .stderr(stderr)
+        // The chrome trace file is one process's: a second writer
+        // truncates it on open and the parent's spans are lost.
+        .env_remove(crate::STOW_TRACE_FILE_ENV);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
