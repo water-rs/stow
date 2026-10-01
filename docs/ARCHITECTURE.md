@@ -683,6 +683,7 @@ deserialization.
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|clear`) |
 | GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
+| POST `/api/v1/admin/scheduler/reconcile` | Bearer: repo-workflow OIDC or push user | — | `ReconcileReport` | The in-flight↔GitHub reconcile pass — the watchdog's `edge.reconcile_drift` reading every 15 min, `stow-admin scheduler reconcile` by hand |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: repo-workflow OIDC or push user | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
@@ -767,6 +768,31 @@ in-flight builds still land. Recovery is manual only:
 --yes`) lifts the freeze and immediately resumes dispatch, while
 `dispatch-freeze status` shows the trigger, the alert outcome, and the
 transition log (engaged/cleared events with their triggers).
+
+In-flight bookkeeping self-repairs on a schedule too. The `workflow_run`
+webhook is the only completion signal, so a lost delivery leaves a row
+`dispatched`/`running` until the `STOW_STALE_DISPATCH_MINUTES` lease
+reclaims it as stale — correct but slow: the build's outcome sits
+unreported for the whole lease, and a run that actually finished failed
+gets re-built. `POST /api/v1/admin/scheduler/reconcile`
+(posted by the watchdog every 15-minute run as its `edge.reconcile_drift`
+reading — the reconcile pass is that signal's collector, not a second
+scheduling mechanism) closes that gap: the object reads its in-flight rows — a set already bounded by
+the dispatch caps — pages `build-crate.yml`'s recent `workflow_dispatch`
+runs once (bounded to the oldest in-flight row's age), matches each row
+to the newest run whose `run-name` is `<rustc>-<task_id>`, and classifies
+every row `running`, `completed` (finished but unreported — the pass
+applies the same `complete_run` transition and records-artifact verdict
+the webhook would have, so reconcile and webhook never disagree on what
+a completion means), or `missing` (no matching run). A missing row past
+the stale lease goes through the same reclaim the alarm applies; a
+missing row inside it just reports. Any drift — completed-but-unreported
+or missing — breaches the watchdog's `edge.reconcile_drift` signal
+(`Effect::Alert`), so the drifting rows ride the `incident` issue as
+evidence lines and the mail-on-open / mail-on-clear / hourly-digest
+cadence comes from the same lifecycle every other alert uses; a clean
+pass reads `clear`. The route answers the full `ReconcileReport`;
+`stow-admin scheduler reconcile` runs it by hand.
 
 Alerting is split by who owns the fact. The edge sends **email only** —
 one transition mail per change through the `send_email` binding

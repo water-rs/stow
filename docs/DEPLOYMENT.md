@@ -505,7 +505,9 @@ scheduler dispatches them to GitHub Actions in parallel (subject to
 `STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
 `STOW_DISPATCH_MIN_AGE_MINUTES`; failed dispatches retry with
 exponential backoff and tasks stuck in `dispatched` for
-`STOW_STALE_DISPATCH_MINUTES`, default 60, are re-queued).
+`STOW_STALE_DISPATCH_MINUTES`, default 60, are re-queued — the hourly
+reconcile pass below also repairs lost `workflow_run` deliveries inside
+that window rather than waiting the lease out).
 
 For first-time bring-up, also run `preheat top` for the library base
 pool. The library pool and the binary pool are independent.
@@ -513,6 +515,15 @@ pool. The library pool and the binary pool are independent.
 ## Operating
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
+- **In-flight drift:** the watchdog posts
+  `POST /api/v1/admin/scheduler/reconcile` every run (15 min) as its
+  `edge.reconcile_drift` reading — the scheduler matches its in-flight
+  rows against recent `build-crate.yml` runs, applies the webhook's own
+  completion transition to runs that finished unreported, reclaims
+  stale missing rows, and the drift count breaches the signal, so the
+  drifting rows land on the `incident` issue and the alert channel
+  mails on open and clear. `stow-admin scheduler reconcile` is the
+  manual path (same auth as `scheduler migrate`).
 - **Under attack:** `stow-admin maintenance on --scope anonymous`, watch
   the request graph, `stow-admin maintenance off --scope anonymous`. The
   rule lives on the `waterui.dev` zone's `http_request_firewall_custom`
