@@ -22,6 +22,10 @@
 #   STOW_E2E_TOOLCHAIN        rustup toolchain for the run (default: stable)
 #   STOW_LOAD_DURATION_SECS   seconds of load (default 1800 — the issue's
 #                           30 minutes)
+#   STOW_LOAD_SEGMENTS        drive segments; the edge restarts between
+#                           them (default 4 — bounds the dev runtime's
+#                           per-request native retention; see the note
+#                           above the edge lifecycle)
 #   STOW_LOAD_RATE_SCALE      multiplier over the model's peak rates
 #                           (default 1.0)
 #   STOW_LOAD_QUEUE_ROWS      seeded fixture size (default 100000)
@@ -267,17 +271,68 @@ wrangler d1 migrations apply stow-mock --local \
     --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
     --persist-to "$WORK_DIR/edge-state" >>"$LOG_DIR/edge-migrate.log" 2>&1 \
     || die "edge D1 migrations failed — see $LOG_DIR/edge-migrate.log"
-(
-    cd "$REPO_ROOT/edge"
-    exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
-        --port "$EDGE_PORT" --persist-to "$WORK_DIR/edge-state"
-) >"$LOG_DIR/edge.log" 2>&1 &
-SERVICE_PID=$!
-CHILD_PIDS+=("$SERVICE_PID")
-CHILD_NAMES+=(edge)
-echo "[load] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
-wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
-    http_listening "$SCHEDULER_URL/status"
+# The edge runs under `wrangler dev`, whose miniflare service graph
+# (the ProxyWorker in front of every request plus the dev-time
+# tail/live-reload plumbing) retains native memory per request —
+# ~50-190KB on this stack's lanes, linear and never released on idle
+# (upstream: cloudflare/workers-sdk#14701; reproduced on wrangler
+# 4.100.0 and 4.145.0 — no released version fixes it). The worker
+# isolates' own JS heaps stay flat under the inspector, so no repo
+# code is implicated; what dies is the dev process around ~1.4GB.
+# The script therefore bounds each dev process's lifetime: the load
+# drive runs in LOAD_SEGMENTS fixed segments and the edge restarts
+# between them, persisting D1/Durable-Object state on disk. Lane mix,
+# rate scale and total request volume are unchanged.
+EDGE_IDX=-1
+EDGE_PID=
+
+start_edge() {
+    (
+        cd "$REPO_ROOT/edge"
+        exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
+            --port "$EDGE_PORT" --persist-to "$WORK_DIR/edge-state"
+    ) >>"$LOG_DIR/edge.log" 2>&1 &
+    EDGE_PID=$!
+    if [ "$EDGE_IDX" -lt 0 ]; then
+        EDGE_IDX=${#CHILD_PIDS[@]}
+        CHILD_PIDS+=("$EDGE_PID")
+        CHILD_NAMES+=(edge)
+    else
+        CHILD_PIDS[EDGE_IDX]=$EDGE_PID
+    fi
+    echo "[load] started edge (pid $EDGE_PID), log: $LOG_DIR/edge.log"
+    wait_for "edge listener" "$READY_DEADLINE" "$EDGE_PID" \
+        http_listening "$SCHEDULER_URL/status"
+}
+
+stop_edge() {
+    kill -- "-$EDGE_PID" 2>/dev/null || true
+    kill "$EDGE_PID" 2>/dev/null || true
+    local deadline=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        http_listening "$SCHEDULER_URL/status" || break
+        sleep 1
+    done
+    if http_listening "$SCHEDULER_URL/status"; then
+        kill -9 -- "-$EDGE_PID" 2>/dev/null || true
+    fi
+    wait "$EDGE_PID" 2>/dev/null || true
+}
+
+# Resident set size of the edge process tree (wrangler node plus its
+# workerd children), logged at segment boundaries — the evidence that
+# the dev-runtime retainer stays bounded, not the metric the gate
+# asserts.
+edge_rss_kb() {
+    local pid rss total=0
+    for pid in $(descendants "$EDGE_PID"); do
+        rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
+        [ -n "$rss" ] && total=$((total + rss))
+    done
+    echo "$total"
+}
+
+start_edge
 
 # Same deploy order as deploy-edge.yml: the operator migration runs
 # before the scheduler takes traffic.
@@ -345,21 +400,39 @@ done
 echo "[load] published records artifacts for the 15 dispatched fixture rows"
 
 # The load: every lane at the launch model's peak rate for the
-# duration.
-echo "[load] driving ${DURATION_SECS}s at rate scale $RATE_SCALE"
-env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" --json launch-load \
-    --model "$REPO_ROOT/launch-model.toml" \
-    --duration-secs "$DURATION_SECS" \
-    --rate-scale "$RATE_SCALE" \
-    --queue-rows "$QUEUE_ROWS" \
-    --rustc "$RUSTC_VERSION" \
-    --scheduler --webhook-secret "$WEBHOOK_SECRET" \
-    --pow-secret "$POW_SECRET" \
-    >"$WORK_DIR/launch-load-report.json" 2>"$LOG_DIR/launch-load-stderr.log" \
-    || { cat "$LOG_DIR/launch-load-stderr.log" >&2; \
-         die "launch-load breached — see $WORK_DIR/launch-load-report.json"; }
-echo "[load] load report: $WORK_DIR/launch-load-report.json"
+# duration, in LOAD_SEGMENTS contiguous segments (see the note above
+# the edge lifecycle). DURATION_SECS stays the total; a remainder goes
+# to the last segment.
+LOAD_SEGMENTS="${STOW_LOAD_SEGMENTS:-4}"
+SEG_SECS=$((DURATION_SECS / LOAD_SEGMENTS))
+[ "$SEG_SECS" -ge 60 ] || die "DURATION_SECS=$DURATION_SECS too small for LOAD_SEGMENTS=$LOAD_SEGMENTS"
+echo "[load] driving ${DURATION_SECS}s at rate scale $RATE_SCALE in $LOAD_SEGMENTS segments"
+for ((seg = 1; seg <= LOAD_SEGMENTS; seg++)); do
+    seg_secs=$SEG_SECS
+    [ "$seg" -eq "$LOAD_SEGMENTS" ] && \
+        seg_secs=$((DURATION_SECS - SEG_SECS * (LOAD_SEGMENTS - 1)))
+    if [ "$seg" -gt 1 ]; then
+        echo "[load] edge tree rss before segment $seg restart: $(edge_rss_kb) KB"
+        stop_edge
+        start_edge
+    fi
+    echo "[load] driving segment $seg/$LOAD_SEGMENTS: ${seg_secs}s at rate scale $RATE_SCALE"
+    env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+        "$BIN/stow-admin" --json launch-load \
+        --model "$REPO_ROOT/launch-model.toml" \
+        --duration-secs "$seg_secs" \
+        --rate-scale "$RATE_SCALE" \
+        --queue-rows "$QUEUE_ROWS" \
+        --rustc "$RUSTC_VERSION" \
+        --scheduler --webhook-secret "$WEBHOOK_SECRET" \
+        --pow-secret "$POW_SECRET" \
+        >"$WORK_DIR/launch-load-report-seg${seg}.json" \
+        2>"$LOG_DIR/launch-load-seg${seg}-stderr.log" \
+        || { cat "$LOG_DIR/launch-load-seg${seg}-stderr.log" >&2; \
+             die "launch-load segment $seg breached — see $WORK_DIR/launch-load-report-seg${seg}.json"; }
+    echo "[load] segment $seg report: $WORK_DIR/launch-load-report-seg${seg}.json"
+done
+echo "[load] edge tree rss after segment $LOAD_SEGMENTS: $(edge_rss_kb) KB"
 
 # The after probe: counted rows per route against the #433 budgets,
 # measured after thirty minutes of launch-rate traffic — and the input

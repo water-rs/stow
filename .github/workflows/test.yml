@@ -330,7 +330,7 @@ jobs:
           path: |
             ${{ runner.temp }}/stow-load/logs
             ${{ runner.temp }}/stow-load/budget-report-*.json
-            ${{ runner.temp }}/stow-load/launch-load-report.json
+            ${{ runner.temp }}/stow-load/launch-load-report-seg*.json
           if-no-files-found: ignore
 
   # The resolver is cargo's own code carried into `stow-resolve`; this job
