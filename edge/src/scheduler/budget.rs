@@ -399,6 +399,20 @@ pub async fn run(
         queue::Dispatch::Paused => 0,
     };
     let ctx = drives::DriveContext::worker(env).map_err(QueueError::Sql)?;
+    // Seed the cached installation token once, outside any measured
+    // window: the probe dispatches to the local-CI endpoint, so no real
+    // credential exists — without this row the pass drive's credential
+    // step would try a GitHub mint instead of the production
+    // cached-token read it is meant to price.
+    #[cfg(target_arch = "wasm32")]
+    queue::store_github_app_token(
+        db,
+        &crate::github_app::InstallationToken {
+            token: "stow-budget-probe".to_owned(),
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await?;
     let queue_rows = count_rows(db, "queue").await?;
     let schema_version: i64 = db
         .query("SELECT version FROM scheduler_schema_version WHERE id = 1")

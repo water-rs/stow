@@ -606,6 +606,22 @@ async fn dispatch_pass_drive(
             .await
             .map_err(|error| error.to_string())?;
         ctx.add_claims(claimed);
+        if !idle {
+            // Under `LocalCi` `dispatch_pass` resolves no credential,
+            // but a production claiming pass pays
+            // `github_app::installation_token` — the cached-token
+            // storage read, with a mint only on expiry. The probe seeds
+            // the cache row (`budget::run`), so this call returns on the
+            // read and the drive prices the step the GitHub arm pays.
+            let config = crate::github_app::AppConfig {
+                app_id: "stow-budget-probe".to_owned(),
+                installation_id: "0".to_owned(),
+                private_key_pem: String::new(),
+            };
+            let _ = crate::github_app::installation_token(db, &config)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
