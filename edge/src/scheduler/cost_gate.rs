@@ -170,6 +170,14 @@ const BUDGETS: &[RouteBudget] = &[
         ddl_permitted: false,
     },
     RouteBudget {
+        name: "POST /tasks/complete-run (failure)",
+        statements: 9,
+        rows_read: 80,
+        rows_written: 20,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
         name: "POST /tasks/retry",
         statements: 3,
         rows_read: 10,

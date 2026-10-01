@@ -80,6 +80,11 @@ const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
 // Exponential dispatch-failure backoff cap.
 const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 
+/// Failed-build retry cap: a failure reported before `attempt` reaches
+/// this re-queues the row under `not_before` backoff; a failure at the
+/// cap parks it `failed` for an operator `retry`.
+const MAX_BUILD_ATTEMPTS: u32 = 4;
+
 /// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
 /// miss-lane submits start being refused. The edge handler reads the same
 /// binding for its pre-forward check, so this constant is the shared
@@ -210,20 +215,15 @@ const fn request_lane(source: EnqueueSource) -> TaskLane {
 
 /// Whether a re-request puts a terminal row back in the queue.
 ///
-/// A failed row always goes back: that is how a wave converges on the
-/// coverage it asked for, and the exponential backoff in the batched
-/// `UPDATE queue` keeps the retry rate sane. A completed row is
-/// different — its artifacts are in the catalog, and the unattended
-/// preheat lane re-submits the whole top-N list on every wave, so
-/// resurrecting completions would rebuild the entire pool on a timer.
-/// Only the human lane, where someone asked for this exact crate again,
-/// rebuilds something already served.
+/// A completed row revives only through the human lane, where someone
+/// asked for this exact crate again — the unattended preheat lanes
+/// re-submit the whole top-N list on every wave, so resurrecting
+/// completions there would rebuild the entire pool on a timer.
+/// `failed` never revives: a failed build re-queues itself inside
+/// `complete` under `not_before` backoff until the attempt cap lands
+/// it on `failed`, which only the operator's `retry` clears.
 const fn resurrects(status: &str, lane: TaskLane) -> bool {
-    match status.as_bytes() {
-        b"failed" => true,
-        b"completed" => matches!(lane, TaskLane::Human),
-        _ => false,
-    }
+    matches!(status.as_bytes(), b"completed") && matches!(lane, TaskLane::Human)
 }
 
 /// Entries per `json_each`-fed statement in the batched enqueue. One bound
@@ -269,21 +269,6 @@ struct BatchedInsert {
     lane: &'static str,
 }
 
-/// The failed-dependency requeue applied to one dep task id: the
-/// in-memory replay of the old per-edge `UPDATE … WHERE status =
-/// 'failed'` emits at most one entry per dep (a 'failed' row flips to
-/// 'pending' in the status map, so later parents in the chunk no-op
-/// exactly as the sequential statements did). The deltas and `revived`
-/// flag travel per row so the statement is a keyed UPDATE, not a
-/// count(*) fold.
-#[derive(serde::Serialize)]
-struct BatchedRequeue {
-    task_id: String,
-    attempt_delta: u32,
-    request_count_delta: u32,
-    revived: u8,
-}
-
 /// One dependency edge, fully resolved for the bulk insert: the dep's
 /// task id and the gate's invocation-mask / shape-count pair are
 /// computed in Rust so the statement only has to write them.
@@ -313,22 +298,17 @@ fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
 /// grows by the occurrence count, priority recomputes from downloads and
 /// `miss_count` (`first_requested_at` untouched — re-requesting never
 /// jumps the queue), resurrection bumps `attempt` so a completion report
-/// in flight for the superseded attempt cannot land on the new one, a
-/// failed row's resurrection re-arms the same exponential backoff a
-/// dispatch failure would apply, and the lane only ever moves toward
-/// 'human'.
+/// in flight for the superseded attempt cannot land on the new one, and
+/// the lane only ever moves toward 'human'.
 async fn apply_batched_updates(
     db: &DurableDb,
     settings: &SchedulerSettings,
     updates: &[BatchedUpdate],
 ) -> Result<(), QueueError> {
-    // `wake_at` recomputes on a redispatch (status/backoff move) or a
-    // lane move to `human` — both change the wake expression's
-    // operands. The CASE'd `not_before`/`lane` the same statement
-    // assigns must re-appear inside it: SET terms see the old row.
-    let next_not_before = "CASE WHEN e ->> 'redispatch' = 1 AND status = 'failed' \
-         THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
-         ELSE not_before END";
+    // `wake_at` recomputes on a redispatch or a lane move to `human` —
+    // both change the wake expression's operands. The CASE'd `lane` the
+    // same statement assigns must re-appear inside it: SET terms see
+    // the old row.
     let next_lane = "CASE WHEN e ->> 'human' = 1 THEN 'human' ELSE lane END";
     for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(&format!(
@@ -343,7 +323,6 @@ async fn apply_batched_updates(
                      THEN {deps_met} ELSE deps_met END, \
                  blocked = CASE WHEN e ->> 'redispatch' = 1 \
                      THEN {blocked} ELSE blocked END, \
-                 not_before = {next_not_before}, \
                  wake_at = CASE WHEN (e ->> 'redispatch' = 1 OR e ->> 'human' = 1) \
                      THEN {wake} ELSE wake_at END, \
                  updated_at = datetime('now'), \
@@ -355,7 +334,7 @@ async fn apply_batched_updates(
             wake = wake_at_sql(
                 next_lane,
                 "first_requested_at",
-                next_not_before,
+                "not_before",
                 settings.dispatch_min_age_minutes,
             ),
         ))
@@ -459,15 +438,11 @@ async fn apply_batched_inserts(
 /// source. A content-changed edge counts as dropped and the INSERT
 /// re-adds it with the new columns; a legacy `dep_side_known = 0` row
 /// never matches a resolver-written report, so it is deleted and
-/// reinserted as known rather than left failing closed. The requeue of
-/// failed deps applies the per-dep deltas the in-memory replay computed
-/// — one keyed UPDATE, same columns as the old per-edge statement.
+/// reinserted as known rather than left failing closed.
 async fn apply_batched_dependency_sync(
     db: &DurableDb,
-    settings: &SchedulerSettings,
     resync_ids: &[String],
     edges: &[BatchedDepEdge],
-    requeues: &[BatchedRequeue],
 ) -> Result<(), QueueError> {
     for chunk in resync_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         // The reported edge set is scoped to the tasks in this chunk so
@@ -501,58 +476,6 @@ async fn apply_batched_dependency_sync(
         .map_err(|error| format!("clear dropped task dependencies: {error}"))?;
     }
     insert_dep_edges(db, edges).await?;
-    // Requeueing a failed dependency for a waiting parent revives the
-    // row only behind the same backoff a fresh enqueue applies, with
-    // `attempt` bumped for the same reason resurrection bumps it. The
-    // replay already resolved which deps revive and by how much, so the
-    // statement only applies the per-row deltas. Revived rows re-enter
-    // `pending`, where `deps_met` must be current — it is recomputed in
-    // the same statement for exactly the rows that revive.
-    let next_not_before = "CASE WHEN e ->> 'revived' = 1 \
-         THEN MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')) \
-         ELSE not_before END";
-    for chunk in requeues.chunks(ENQUEUE_JSON_BATCH_ROWS) {
-        db.query(&format!(
-            "UPDATE queue \
-             SET status = CASE WHEN e ->> 'revived' = 1 THEN 'pending' ELSE status END, \
-                 attempt = attempt + (e ->> 'attempt_delta'), \
-                 error_msg = CASE WHEN e ->> 'revived' = 1 THEN '' ELSE error_msg END, \
-                 deps_met = CASE WHEN e ->> 'revived' = 1 \
-                     THEN {deps_met} ELSE deps_met END, \
-                 blocked = CASE WHEN e ->> 'revived' = 1 \
-                     THEN {blocked} ELSE blocked END, \
-                 request_count = request_count + (e ->> 'request_count_delta'), \
-                 not_before = {next_not_before}, \
-                 wake_at = CASE WHEN e ->> 'revived' = 1 \
-                     THEN {wake} ELSE wake_at END, \
-                 updated_at = datetime('now') \
-             FROM (SELECT value AS e FROM json_each(?)) AS j \
-             WHERE queue.task_id = j.e ->> 'task_id' AND queue.status = 'failed'",
-            deps_met = deps_met_sql("queue.task_id"),
-            blocked = blocked_sql("queue.task_id"),
-            wake = wake_at_sql(
-                "lane",
-                "first_requested_at",
-                next_not_before,
-                settings.dispatch_min_age_minutes,
-            ),
-        ))
-        .bind(enqueue_json(chunk)?)
-        .execute()
-        .await
-        .map_err(|error| format!("requeue failed dependencies: {error}"))?;
-    }
-    // A revived dep leaves `failed` — the transition that can unblock a
-    // dependent still parked on it. Refresh exactly their gate answers.
-    if requeues.iter().any(|requeue| requeue.revived != 0) {
-        refresh_dependents(
-            db,
-            "SELECT value ->> 'task_id' AS task_id FROM json_each(?) \
-             WHERE value ->> 'revived' = 1",
-            &[DbValue::Text(enqueue_json(requeues)?)],
-        )
-        .await?;
-    }
     Ok(())
 }
 
@@ -739,9 +662,8 @@ async fn enqueue_inner(
             );
             continue;
         }
-        // Each named dep's task id is resolved here too: the failed-dep
-        // requeue must see the deps' live statuses, so they join the
-        // chunk's existence probe.
+        // Each named dep's task id resolves here once — the edge rows
+        // `dep_edges` builds key on them.
         let dep_task_ids = request
             .depends_on
             .iter()
@@ -793,7 +715,7 @@ async fn enqueue_inner(
     // through `update_existing_task`.
     let resync_ids: Vec<String> = plan.resync.keys().cloned().collect();
     let edges: Vec<BatchedDepEdge> = plan.resync.into_values().flatten().collect();
-    apply_batched_dependency_sync(db, settings, &resync_ids, &edges, &plan.requeues).await?;
+    apply_batched_dependency_sync(db, &resync_ids, &edges).await?;
     let inserted = apply_batched_inserts(db, settings, &plan.inserts).await?;
     apply_batched_updates(db, settings, &plan.updates).await?;
 
@@ -824,27 +746,19 @@ struct EnqueuePlan {
     /// Task ids whose edge set is rewritten this chunk — the key set
     /// feeds the bulk DELETE, the rows the bulk INSERT.
     resync: BTreeMap<String, Vec<BatchedDepEdge>>,
-    /// Failed deps the chunk revived, one entry per dep task id.
-    requeues: Vec<BatchedRequeue>,
 }
 
 /// One existence probe for the chunk, over every task id it can
-/// touch — the requests' own plus every dep they name. `task_id` is
-/// the queue's primary key, so this answers every existence check the
-/// row-at-a-time loop ran, including each `WHERE status = 'failed'`
-/// the per-edge requeue issued.
+/// touch. `task_id` is the queue's primary key, so this answers every
+/// existence check the row-at-a-time loop ran.
 async fn probe_task_statuses(
     db: &DurableDb,
     prepared: &[Prepared<'_>],
 ) -> Result<BTreeMap<String, String>, QueueError> {
-    let probe_ids: BTreeSet<&str> = prepared
+    let probe_ids: Vec<&str> = prepared
         .iter()
-        .flat_map(|entry| {
-            std::iter::once(entry.task_id.as_str())
-                .chain(entry.dep_task_ids.iter().map(String::as_str))
-        })
+        .map(|entry| entry.task_id.as_str())
         .collect();
-    let probe_ids: Vec<&str> = probe_ids.into_iter().collect();
     let mut statuses: BTreeMap<String, String> = BTreeMap::new();
     for chunk in probe_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         let rows = db
@@ -909,30 +823,23 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
 }
 
 /// Replay the per-request loop's state machine in memory, in request
-/// order: each request's own insert/update, then its dep sync, then the
-/// requeue of every dep that is 'failed' at that point — the same
-/// interleaving the row-at-a-time loop ran, so a failed dep is revived
-/// by the first parent to name it (+1 `attempt` / +1 `request_count`,
-/// the old per-edge `UPDATE … WHERE status = 'failed'`), flips to
-/// 'pending' in the map, and every later occurrence is a no-op. A task
-/// appearing twice in one chunk likewise sees what its earlier
-/// occurrence left (a fresh insert reads as 'pending', a resurrected
-/// row as 'pending'), so duplicates land identically to the
-/// row-at-a-time loop. `resync` keeps the last occurrence's dependency
-/// list per task — the old loop's per-occurrence DELETE+INSERT made
-/// the last sync the surviving one. `statuses` carries the existence
-/// probe in and is advanced to the row each occurrence leaves.
+/// order: each request's own insert/update, then its dep sync. A task
+/// appearing twice in one chunk sees what its earlier occurrence left
+/// (a fresh insert reads as 'pending', a resurrected row as 'pending'),
+/// so duplicates land identically to the row-at-a-time loop. `resync`
+/// keeps the last occurrence's dependency list per task — the old
+/// loop's per-occurrence DELETE+INSERT made the last sync the
+/// surviving one. `statuses` carries the existence probe in and is
+/// advanced to the row each occurrence leaves.
 fn plan_enqueue(
     prepared: &[Prepared<'_>],
     statuses: &mut BTreeMap<String, String>,
 ) -> Result<EnqueuePlan, QueueError> {
     let mut updates: BTreeMap<String, BatchedUpdate> = BTreeMap::new();
-    let mut requeues: BTreeMap<String, BatchedRequeue> = BTreeMap::new();
     let mut plan = EnqueuePlan {
         updates: Vec::new(),
         inserts: Vec::new(),
         resync: BTreeMap::new(),
-        requeues: Vec::new(),
     };
     for entry in prepared {
         let lane = request_lane(entry.request.source);
@@ -978,33 +885,9 @@ fn plan_enqueue(
             continue;
         }
         let edges = dep_edges(entry)?;
-        // The old loop ran the revival `UPDATE … WHERE status =
-        // 'failed'` per edge in request order; replayed in memory,
-        // the first parent to name a still-'failed' dep flips it
-        // 'pending' so its revival happens exactly once, and any
-        // later request for that dep in the chunk meets the
-        // 'pending' row — the same reads the sequential
-        // statements produced.
-        for dep_task_id in &entry.dep_task_ids {
-            if statuses
-                .get(dep_task_id.as_str())
-                .is_some_and(|status| status == "failed")
-            {
-                statuses.insert(dep_task_id.clone(), "pending".to_owned());
-                requeues
-                    .entry(dep_task_id.clone())
-                    .or_insert_with(|| BatchedRequeue {
-                        task_id: dep_task_id.clone(),
-                        attempt_delta: 1,
-                        request_count_delta: 1,
-                        revived: 1,
-                    });
-            }
-        }
         plan.resync.insert(entry.task_id.clone(), edges);
     }
     plan.updates = updates.into_values().collect();
-    plan.requeues = requeues.into_values().collect();
     Ok(plan)
 }
 
@@ -1027,6 +910,7 @@ struct BuildCompleteReport {
 /// insert drop exactly what the trip check can no longer read.
 async fn complete(
     db: &DurableDb,
+    settings: &SchedulerSettings,
     report: &BuildCompleteReport,
     window_minutes: u32,
 ) -> Result<(), QueueError> {
@@ -1036,25 +920,57 @@ async fn complete(
     struct UpdatedTarget {
         target: String,
     }
-    let status = if report.success {
-        "completed"
-    } else {
-        "failed"
-    };
 
     // The report must name the row's live attempt in an in-flight status:
     // without that predicate a late or duplicate report for a superseded
     // attempt would overwrite the state of the attempt the row has since
-    // been resurrected into (enqueue bumps `attempt` on resurrection).
-    let updated = db
-        .query(
+    // been resurrected into (resurrection bumps `attempt`).
+    //
+    // A failure under `MAX_BUILD_ATTEMPTS` re-queues the row behind the
+    // same exponential backoff a dispatch failure applies — 2^attempt
+    // minutes, capped — with `attempt` bumped so the next dispatch's
+    // fencing holds; at the cap the row parks `failed` until an
+    // operator `retry` returns it to `pending`. SET terms see the old
+    // row, so `attempt` in each CASE is the attempt that just failed.
+    let retry = format!("attempt < {MAX_BUILD_ATTEMPTS}");
+    let next_not_before = format!(
+        "datetime('now', '+' || MIN(1 << MIN(attempt, 6), {MAX_DISPATCH_BACKOFF_MINUTES}) || ' minutes')"
+    );
+    let statement = if report.success {
+        "UPDATE queue \
+         SET status = 'completed', error_msg = ?, github_run_id = COALESCE(?, github_run_id), \
+             updated_at = datetime('now') \
+         WHERE task_id = ? AND attempt = ? AND status IN ('dispatched', 'running') \
+         RETURNING target"
+            .to_owned()
+    } else {
+        format!(
             "UPDATE queue \
-             SET status = ?, error_msg = ?, github_run_id = COALESCE(?, github_run_id), \
+             SET status = CASE WHEN {retry} THEN 'pending' ELSE 'failed' END, \
+                 attempt = attempt + CASE WHEN {retry} THEN 1 ELSE 0 END, \
+                 error_msg = ?, \
+                 github_run_id = COALESCE(?, github_run_id), \
+                 not_before = CASE WHEN {retry} THEN {next_not_before} ELSE not_before END, \
+                 deps_met = CASE WHEN {retry} THEN {deps_met} ELSE deps_met END, \
+                 blocked = CASE WHEN {retry} THEN {blocked} ELSE blocked END, \
+                 wake_at = CASE WHEN {retry} THEN {wake} ELSE wake_at END, \
+                 dispatch_key = CASE WHEN {retry} THEN {key} ELSE dispatch_key END, \
                  updated_at = datetime('now') \
              WHERE task_id = ? AND attempt = ? AND status IN ('dispatched', 'running') \
              RETURNING target",
+            deps_met = deps_met_sql("queue.task_id"),
+            blocked = blocked_sql("queue.task_id"),
+            key = dispatch_key_row_sql(),
+            wake = wake_at_sql(
+                "lane",
+                "first_requested_at",
+                &next_not_before,
+                settings.dispatch_min_age_minutes,
+            ),
         )
-        .bind(status)
+    };
+    let updated = db
+        .query(&statement)
         .bind(report.error.clone().unwrap_or_default())
         .bind(report.github_run_id.clone())
         .bind(report.task_id.clone())
@@ -1096,9 +1012,9 @@ async fn complete(
             row_status: row.status,
         });
     }
-    // A dep that just entered `failed` is the one outside-the-row event
-    // that flips a pending dependent's `blocked` flag — refresh exactly
-    // its dependents.
+    // A dep whose attempt just exhausted is the one outside-the-row
+    // event that flips a pending dependent's `blocked` flag — refresh
+    // exactly its dependents.
     if !report.success {
         refresh_dependents(
             db,
@@ -1220,6 +1136,7 @@ fn failure_class(report: &BuildCompleteReport) -> Option<String> {
 /// has moved past what the event describes.
 pub async fn complete_run(
     db: &DurableDb,
+    settings: &SchedulerSettings,
     report: &stow_types::api::WorkflowRunComplete,
     window_minutes: u32,
 ) -> Result<(), QueueError> {
@@ -1234,6 +1151,7 @@ pub async fn complete_run(
     };
     complete(
         db,
+        settings,
         &BuildCompleteReport {
             task_id: report.task_id.clone(),
             attempt: row.attempt,
@@ -1989,10 +1907,10 @@ pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
 /// Ordering is correctness, not a cache-locality optimization: a
 /// dependent dispatched before its dependency is servable compiles the
 /// dependency itself instead of being served it from the signed slice.
-/// A dependency that fails keeps its dependents waiting while it retries
-/// with the existing backoff; a dependency that fails for good leaves
-/// them settled behind it undispatched, released only when it is later
-/// built and published.
+/// A dependency that fails keeps its dependents waiting through its
+/// retries' backoffs; a dependency that exhausts them leaves the
+/// dependents settled behind it undispatched, released only when it
+/// is later built and published.
 ///
 /// `unpublished_deps` as a SQL expression over the owner's row: the
 /// count of its unmet edges. Each edge's `dep_met` flag is written at
@@ -2229,14 +2147,14 @@ async fn refresh_dispatch_keys(db: &DurableDb, task_ids: &[String]) -> Result<()
 
 /// Status projection read paths use so a dependent parked behind a
 /// terminally failed dependency surfaces as `blocked` instead of
-/// `pending`: a `failed` dependency is done until an operator
-/// retries it or a fresh request requeues it, and "waiting for that" is
-/// a different thing to see than "waiting for a publish". The answer is
-/// the persisted `blocked` flag — `blocked_sql` is its definition —
-/// written alongside `deps_met` and on the dependents of a dep whose
-/// status flips, so reads are a column lookup rather than an EXISTS per
-/// row. The stored status stays `pending`, so retrying the dependency
-/// returns the dependent to `pending` with nothing to reconcile.
+/// `pending`: a `failed` dependency is done until it
+/// publishes, and "waiting for that" is a different thing to see than
+/// "waiting for a publish". The answer is the persisted `blocked` flag
+/// — `blocked_sql` is its definition — written alongside `deps_met`
+/// and on the dependents of a dep whose status flips, so reads are a
+/// column lookup rather than an EXISTS per row. The stored status
+/// stays `pending`, so the dependency eventually publishing returns
+/// the dependent to `pending` with nothing to reconcile.
 fn effective_status_sql() -> String {
     "CASE WHEN queue.status = 'pending' AND queue.blocked != 0 \
          THEN 'blocked' ELSE queue.status END"
@@ -3132,6 +3050,10 @@ fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>)
             predicates.push("target = ?".to_owned());
             values.push(target.as_str().into());
         }
+        if let Some(rustc_version) = &selector.rustc_version {
+            predicates.push("rustc_version = ?".to_owned());
+            values.push(rustc_version.as_str().into());
+        }
         if let Some(crate_name) = &selector.crate_name {
             predicates.push("crate_name = ?".to_owned());
             values.push(crate_name.as_str().into());
@@ -3256,8 +3178,10 @@ pub async fn apply_mutation(
             // live counter, and `blocked` — maintained for pending
             // rows only — may be stale on a failed row; both recompute
             // in the same statement. `not_before` resets to epoch, so
-            // `wake_at` is the age gate (miss lane) or epoch (human).
-            "UPDATE queue SET status = 'pending', error_msg = '', \
+            // `wake_at` is the age gate (miss lane) or epoch (human);
+            // `attempt` resets too, so a retried row gets a fresh retry
+            // budget.
+            "UPDATE queue SET status = 'pending', attempt = 1, error_msg = '', \
              not_before = '1970-01-01 00:00:00', deps_met = {deps_met}, \
              blocked = {blocked}, wake_at = {wake}, \
              updated_at = datetime('now') \
@@ -6017,8 +5941,12 @@ mod sqlite_tests {
         assert_eq!(super::status(&db).await.expect("status").pending, 1);
     }
 
+    /// A failed build under the attempt cap re-queues itself: the
+    /// failure report writes `pending` with the exponential
+    /// `not_before` backoff and the attempt bumped — the next dispatch
+    /// it earns is a retry of attempt 2, gated by the backoff.
     #[tokio::test]
-    async fn failed_task_re_request_respects_backoff_window() {
+    async fn failed_build_retries_behind_its_backoff() {
         let db = memory_db().await.expect("memory db");
         enqueue(&db, &[request("flaky", Vec::new())])
             .await
@@ -6031,6 +5959,7 @@ mod sqlite_tests {
         assert_eq!(claimed.len(), 1);
         super::complete(
             &db,
+            &claim_settings(),
             &super::BuildCompleteReport {
                 task_id: claimed[0].task_id.clone(),
                 attempt: claimed[0].attempt,
@@ -6043,9 +5972,24 @@ mod sqlite_tests {
         .await
         .expect("complete");
 
-        // The re-request resurrects the row to pending, but gated by the
-        // same exponential backoff a dispatch failure applies — it must not
-        // be claimable immediately.
+        assert_eq!(row_column(&db, "flaky", "status").await, "pending");
+        assert_eq!(row_column(&db, "flaky", "CAST(attempt AS TEXT)").await, "2");
+        // attempt 1 fails → 2^1 minutes of `not_before` backoff, and the
+        // alarm's `wake_at` follows it.
+        let gated = db
+            .query(
+                "SELECT CASE WHEN not_before > datetime('now') \
+                 AND wake_at >= not_before THEN 1 ELSE 0 END AS gated \
+                 FROM queue WHERE task_id = ?",
+            )
+            .bind(claimed[0].task_id.clone())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("read not_before gate");
+        assert_eq!(gated, 1);
+
+        // The backoff gates the retry — nothing claims it now — and a
+        // re-request neither resurrects nor clears the gate.
         enqueue(&db, &[request("flaky", Vec::new())])
             .await
             .expect("re-request");
@@ -6053,19 +5997,54 @@ mod sqlite_tests {
             .await
             .expect("claim");
         assert!(claimed.is_empty());
+        assert_eq!(row_column(&db, "flaky", "status").await, "pending");
+        assert_eq!(row_column(&db, "flaky", "CAST(attempt AS TEXT)").await, "2");
+    }
 
-        let gated = db
-            .query(
-                "SELECT CASE WHEN not_before > datetime('now') THEN 1 ELSE 0 END AS gated \
-                 FROM queue WHERE task_id = ?",
-            )
-            .bind(super::task_id(
-                "flaky", VERSION, FEATURES, TARGET, RUSTC, false,
-            ))
-            .fetch_scalar::<i64>()
+    /// A failure at the attempt cap parks the row `failed` — no
+    /// resurrection, no backoff, no claim; only the operator's
+    /// `retry` returns it to `pending`.
+    #[tokio::test]
+    async fn failed_build_at_the_attempt_cap_parks_failed() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("flaky", Vec::new())])
             .await
-            .expect("read not_before gate");
-        assert_eq!(gated, 1);
+            .expect("enqueue");
+        set_first_requested_at(&db, "flaky", PAST_TS).await;
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        db.query("UPDATE queue SET attempt = ? WHERE task_id = ?")
+            .bind(i64::from(super::MAX_BUILD_ATTEMPTS))
+            .bind(claimed[0].task_id.clone())
+            .execute()
+            .await
+            .expect("set attempt to the cap");
+        super::complete(
+            &db,
+            &claim_settings(),
+            &report(&claimed[0].task_id, super::MAX_BUILD_ATTEMPTS, false),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete");
+        assert_eq!(row_column(&db, "flaky", "status").await, "failed");
+        assert_eq!(
+            row_column(&db, "flaky", "CAST(attempt AS TEXT)").await,
+            super::MAX_BUILD_ATTEMPTS.to_string()
+        );
+
+        // A re-request is a no-op: `failed` never resurrects.
+        enqueue(&db, &[request("flaky", Vec::new())])
+            .await
+            .expect("re-request");
+        assert_eq!(row_column(&db, "flaky", "status").await, "failed");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(claimed.is_empty());
     }
 
     /// The lane an operator's rebuild submit takes: a completed
@@ -6088,6 +6067,7 @@ mod sqlite_tests {
         assert_eq!(claimed.len(), 1);
         super::complete(
             &db,
+            &claim_settings(),
             &super::BuildCompleteReport {
                 task_id: claimed[0].task_id.clone(),
                 attempt: claimed[0].attempt,
@@ -6218,9 +6198,14 @@ mod sqlite_tests {
             .await
             .expect("claim");
         let id = claimed[0].task_id.clone();
-        super::complete(&db, &report(&id, 1, true), TEST_WINDOW_MINUTES)
-            .await
-            .expect("complete");
+        super::complete(
+            &db,
+            &claim_settings(),
+            &report(&id, 1, true),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete");
 
         enqueue(
             &db,
@@ -6250,10 +6235,11 @@ mod sqlite_tests {
         );
     }
 
-    /// Convergence is the other half: a wave that re-submits an identity
-    /// whose build failed puts it back in the queue, so the coverage the
-    /// preheat lane asked for is eventually reached without anyone
-    /// dispatching by hand.
+    /// Convergence is the other half: an identity whose build failed
+    /// stays in the queue — the failure report re-queues it behind its
+    /// backoff — so the coverage the preheat lane asked for is
+    /// eventually reached without anyone dispatching by hand. The
+    /// wave's re-submit leaves the retry untouched.
     #[tokio::test]
     async fn a_preheat_re_request_retries_a_failed_task() {
         let db = memory_db().await.expect("memory db");
@@ -6264,9 +6250,14 @@ mod sqlite_tests {
             .await
             .expect("claim");
         let id = claimed[0].task_id.clone();
-        super::complete(&db, &report(&id, 1, false), TEST_WINDOW_MINUTES)
-            .await
-            .expect("fail the build");
+        super::complete(
+            &db,
+            &claim_settings(),
+            &report(&id, 1, false),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("fail the build");
 
         enqueue(
             &db,
@@ -6583,6 +6574,7 @@ mod sqlite_tests {
 
         super::complete(
             &db,
+            &claim_settings(),
             &super::BuildCompleteReport {
                 task_id: id.clone(),
                 attempt: claimed[0].attempt,
@@ -6606,6 +6598,7 @@ mod sqlite_tests {
         // queue never held is a client error, not a server failure.
         let error = super::complete(
             &db,
+            &claim_settings(),
             &super::BuildCompleteReport {
                 task_id: "never-enqueued".to_owned(),
                 attempt: 1,
@@ -6640,9 +6633,14 @@ mod sqlite_tests {
         assert_eq!(claimed.len(), 1);
         let id = claimed[0].task_id.clone();
 
-        super::complete(&db, &report(&id, 1, true), TEST_WINDOW_MINUTES)
-            .await
-            .expect("complete attempt 1");
+        super::complete(
+            &db,
+            &claim_settings(),
+            &report(&id, 1, true),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete attempt 1");
         // A human re-request resurrects the completed row as attempt 2,
         // and the resurrected row dispatches again.
         enqueue(&db, &[human_request("alpha")])
@@ -6654,9 +6652,14 @@ mod sqlite_tests {
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].attempt, 2);
 
-        let error = super::complete(&db, &report(&id, 1, true), TEST_WINDOW_MINUTES)
-            .await
-            .expect_err("a report for attempt 1 must not apply to attempt 2");
+        let error = super::complete(
+            &db,
+            &claim_settings(),
+            &report(&id, 1, true),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("a report for attempt 1 must not apply to attempt 2");
         assert!(matches!(
             error,
             crate::errors::QueueError::StaleCompletion { .. }
@@ -6673,9 +6676,14 @@ mod sqlite_tests {
         assert_eq!(row.status, "dispatched");
 
         // And the report for the live attempt still completes normally.
-        super::complete(&db, &report(&id, 2, true), TEST_WINDOW_MINUTES)
-            .await
-            .expect("complete attempt 2");
+        super::complete(
+            &db,
+            &claim_settings(),
+            &report(&id, 2, true),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete attempt 2");
         let status = db
             .query("SELECT status FROM queue WHERE task_id = ?")
             .bind(id)
@@ -6699,12 +6707,22 @@ mod sqlite_tests {
             .expect("claim");
         let id = claimed[0].task_id.clone();
 
-        super::complete(&db, &report(&id, 1, true), TEST_WINDOW_MINUTES)
-            .await
-            .expect("complete");
-        let error = super::complete(&db, &report(&id, 1, true), TEST_WINDOW_MINUTES)
-            .await
-            .expect_err("a duplicate report must conflict");
+        super::complete(
+            &db,
+            &claim_settings(),
+            &report(&id, 1, true),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete");
+        let error = super::complete(
+            &db,
+            &claim_settings(),
+            &report(&id, 1, true),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("a duplicate report must conflict");
         assert!(matches!(
             error,
             crate::errors::QueueError::StaleCompletion { .. }
@@ -6773,6 +6791,7 @@ mod sqlite_tests {
         assert_eq!(claimed.len(), 1);
         super::complete(
             &db,
+            &claim_settings(),
             &report(&claimed[0].task_id, claimed[0].attempt, true),
             TEST_WINDOW_MINUTES,
         )
@@ -6800,8 +6819,9 @@ mod sqlite_tests {
     }
 
     /// A failed dependency on its retry backoff keeps its dependents
-    /// waiting: the requeue revival puts it pending, not published, so
-    /// the gate holds the parent until a build and a publish land.
+    /// waiting: the failure report re-queues it `pending`, not
+    /// published, so the gate holds the parent until a build and a
+    /// publish land.
     #[tokio::test]
     async fn dependent_waits_while_a_failed_dependency_retries() {
         let db = memory_db().await.expect("memory db");
@@ -6813,14 +6833,16 @@ mod sqlite_tests {
             .expect("claim dep");
         super::complete(
             &db,
+            &claim_settings(),
             &report(&claimed[0].task_id, claimed[0].attempt, false),
             TEST_WINDOW_MINUTES,
         )
         .await
         .expect("fail dep");
 
-        // The parent's submit requeues the failed dependency behind the
-        // existing backoff — retrying, not terminal.
+        // The dep is already `pending` behind its retry backoff —
+        // retrying, not terminal — and the parent's submit is a no-op
+        // against it.
         enqueue(&db, &[request("parent", vec![dependency("dep")])])
             .await
             .expect("enqueue parent");
@@ -6835,10 +6857,11 @@ mod sqlite_tests {
     }
 
     /// A dependency that fails for good leaves its dependents settled
-    /// behind it: reporting `blocked`, naming the failed dependency, and
-    /// never dispatched — no dispatching the dependent to compile the
-    /// dependency itself. Retrying the dependency returns the dependent
-    /// to `pending`, since `blocked` is derived, never stored.
+    /// behind it: reporting `blocked`, naming the failed dependency,
+    /// and never dispatched — no dispatching the dependent to compile
+    /// the dependency itself. Retrying the dependency returns the
+    /// dependent to `pending`, since the dependent's `blocked` is a
+    /// flag the dep's status flips maintain, not its own verdict.
     #[tokio::test]
     async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
         let db = memory_db().await.expect("memory db");
@@ -6853,14 +6876,23 @@ mod sqlite_tests {
             .expect("claim dep");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].crate_name, "dep");
+        // The terminal failure: the last permitted attempt fails and
+        // the row parks `failed`.
+        db.query("UPDATE queue SET attempt = ? WHERE task_id = ?")
+            .bind(i64::from(super::MAX_BUILD_ATTEMPTS))
+            .bind(claimed[0].task_id.clone())
+            .execute()
+            .await
+            .expect("set attempt to the cap");
         super::complete(
             &db,
-            &report(&claimed[0].task_id, claimed[0].attempt, false),
+            &claim_settings(),
+            &report(&claimed[0].task_id, super::MAX_BUILD_ATTEMPTS, false),
             TEST_WINDOW_MINUTES,
         )
         .await
         .expect("fail dep");
-
+        assert_eq!(row_column(&db, "dep", "status").await, "failed");
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim after terminal failure");
@@ -6898,9 +6930,9 @@ mod sqlite_tests {
         );
         assert_eq!(super::status(&db).await.expect("status").blocked, 1);
 
-        // Retrying the dependency returns the dependent to `pending` —
-        // nothing to reconcile, the derivation just stops firing.
-        super::apply_mutation(
+        // Retrying the dependency returns the dependent to `pending`
+        // — nothing to reconcile, the flag refresh just stops firing.
+        let affected = super::apply_mutation(
             &db,
             &settings(),
             super::QueueMutation::Retry,
@@ -6911,6 +6943,9 @@ mod sqlite_tests {
         )
         .await
         .expect("retry dep");
+        assert_eq!(affected, 1, "only the failed dep moves");
+        assert_eq!(row_column(&db, "dep", "status").await, "pending");
+        assert_eq!(row_column(&db, "dep", "CAST(attempt AS TEXT)").await, "1");
         let parent = super::task_status(&db, &task_id_on("parent", TARGET))
             .await
             .expect("read parent status after retry")
@@ -7195,25 +7230,23 @@ mod sqlite_tests {
             .expect("claim dep");
         super::complete(
             &db,
+            &claim_settings(),
             &report(&claimed[0].task_id, claimed[0].attempt, false),
             TEST_WINDOW_MINUTES,
         )
         .await
         .expect("fail dep");
 
-        // The dependency is retried and this time succeeds — but the
-        // dependent still waits for the slice that serves it.
-        super::apply_mutation(
-            &db,
-            &settings(),
-            super::QueueMutation::Retry,
-            &filter_selector(stow_types::api::QueueSelector {
-                status: Some(stow_types::api::QueueTaskStatus::Failed),
-                ..Default::default()
-            }),
+        // The dependency's retry backoff lapses and its retry succeeds
+        // — but the dependent still waits for the slice that serves it.
+        db.query(
+            "UPDATE queue SET not_before = '1970-01-01 00:00:00', \
+             wake_at = '1970-01-01 00:00:00' WHERE task_id = ?",
         )
+        .bind(claimed[0].task_id.clone())
+        .execute()
         .await
-        .expect("retry dep");
+        .expect("lapse the retry backoff");
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim dep retry");
@@ -7221,6 +7254,7 @@ mod sqlite_tests {
         assert_eq!(claimed[0].crate_name, "dep");
         super::complete(
             &db,
+            &claim_settings(),
             &report(&claimed[0].task_id, claimed[0].attempt, true),
             TEST_WINDOW_MINUTES,
         )
@@ -7816,6 +7850,112 @@ mod sqlite_tests {
         assert_eq!(row_column(&db, "alpha", "error_msg").await, "");
         // The pending sibling is untouched — retry's domain is failed rows.
         assert_eq!(row_column(&db, "beta", "status").await, "pending");
+    }
+
+    /// A retried row re-enters `pending` with its retry budget back at
+    /// the start: `attempt` resets to 1 alongside the backoff and the
+    /// error.
+    #[tokio::test]
+    async fn retry_returns_failed_rows_to_pending_with_a_fresh_attempt() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("alpha", Vec::new()),
+                request("beta", Vec::new()),
+                request("gamma", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "alpha", TARGET, "failed").await;
+        mark_active(&db, "beta", TARGET, "failed").await;
+        db.query(
+            "UPDATE queue SET attempt = 4, error_msg = 'boom', \
+                  not_before = '2999-01-01 00:00:00' WHERE task_id = ?",
+        )
+        .bind(task_id_on("alpha", TARGET))
+        .execute()
+        .await
+        .expect("seed terminal state");
+
+        let affected = super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Retry,
+            &ids_selector(&[task_id_on("alpha", TARGET), task_id_on("gamma", TARGET)]),
+        )
+        .await
+        .expect("retry");
+        // `gamma` is pending, not failed — outside retry's domain.
+        assert_eq!(affected, 1);
+        assert_eq!(row_column(&db, "alpha", "status").await, "pending");
+        assert_eq!(row_column(&db, "alpha", "CAST(attempt AS TEXT)").await, "1");
+        assert_eq!(row_column(&db, "alpha", "error_msg").await, "");
+        assert_eq!(
+            row_column(&db, "alpha", "not_before").await,
+            "1970-01-01 00:00:00"
+        );
+        assert_eq!(row_column(&db, "beta", "status").await, "failed");
+        assert_eq!(row_column(&db, "gamma", "status").await, "pending");
+    }
+
+    /// `retry` carries the same selector predicates as the other verbs:
+    /// `status` plus `rustc`/`target` scope the release to one build
+    /// line.
+    #[tokio::test]
+    async fn retry_selects_by_rustc_and_target() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("alpha", Vec::new()), request("beta", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "alpha", TARGET, "failed").await;
+        mark_active(&db, "beta", TARGET, "failed").await;
+        // A failed row at a different rustc — the selector must not
+        // reach it.
+        let other_rustc = task_id("other-rustc", VERSION, FEATURES, TARGET, "1.86.0", false);
+        enqueue(
+            &db,
+            &[EnqueueRequest {
+                rustc_version: "1.86.0".parse().expect("rustc"),
+                ..request("other-rustc", Vec::new())
+            }],
+        )
+        .await
+        .expect("enqueue other-rustc");
+        db.query("UPDATE queue SET status = 'failed' WHERE task_id = ?")
+            .bind(other_rustc.clone())
+            .execute()
+            .await
+            .expect("fail other-rustc");
+
+        let affected = super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Retry,
+            &filter_selector(stow_types::api::QueueSelector {
+                status: Some(stow_types::api::QueueTaskStatus::Failed),
+                rustc_version: Some(RUSTC.parse().expect("rustc")),
+                target: Some(TARGET.parse().expect("target")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("retry by rustc + target");
+        assert_eq!(affected, 2);
+        assert_eq!(row_column(&db, "alpha", "status").await, "pending");
+        assert_eq!(row_column(&db, "beta", "status").await, "pending");
+        assert_eq!(row_column(&db, "alpha", "CAST(attempt AS TEXT)").await, "1");
+        let other_status = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(other_rustc)
+            .fetch_scalar::<String>()
+            .await
+            .expect("other-rustc status");
+        assert_eq!(other_status, "failed");
     }
 
     #[tokio::test]
@@ -8662,6 +8802,7 @@ mod sqlite_tests {
         assert_eq!(claimed[0].crate_name, "dep");
         super::complete(
             &db,
+            &claim_settings(),
             &report(&claimed[0].task_id, claimed[0].attempt, true),
             TEST_WINDOW_MINUTES,
         )
@@ -8734,6 +8875,7 @@ mod sqlite_tests {
         assert_eq!(claimed[0].crate_name, "dep");
         super::complete(
             &db,
+            &claim_settings(),
             &report(&claimed[0].task_id, claimed[0].attempt, true),
             TEST_WINDOW_MINUTES,
         )
@@ -8791,14 +8933,13 @@ mod sqlite_tests {
         .expect("seed failed row");
     }
 
-    /// Several parents in one chunk all name the same failed dep. The
-    /// pre-batch loop issued the revival `UPDATE … WHERE status =
-    /// 'failed'` once per edge: the first parent's statement flipped the
-    /// row to 'pending' and every later parent's matched nothing, so the
-    /// net was +1 `attempt` / +1 `request_count` however many parents
-    /// named it. The batched requeue must land the same.
+    /// Several parents in one chunk all name the same failed dep.
+    /// Requesting a task no longer revives a terminal row from any
+    /// lane: the dep's status, attempt and counters are untouched
+    /// however many parents name it, and every parent parks `blocked`
+    /// behind it.
     #[tokio::test]
-    async fn a_chunk_revives_a_failed_dependency_once_for_many_parents() {
+    async fn a_chunk_never_revives_a_failed_dependency() {
         let db = memory_db().await.expect("memory db");
         seed_failed(&db, "dep", 7, 5).await;
 
@@ -8816,18 +8957,20 @@ mod sqlite_tests {
         let row = queue_counters(&db, "dep").await;
         assert_eq!(
             (row.status.as_str(), row.attempt, row.request_count),
-            ("pending", 8, 6),
-            "exactly one revival: +1 attempt, +1 request_count"
+            ("failed", 7, 5),
+            "a request never revives a terminal row"
         );
+        for parent in ["p1", "p2", "p3"] {
+            assert_eq!(row_column(&db, parent, "CAST(blocked AS TEXT)").await, "1");
+        }
     }
 
-    /// Order matters inside a chunk. Dep first: its own request runs
-    /// the old loop's `update_existing_task` resurrection (+1 `attempt`,
-    /// +1 `request_count`, status 'pending', error cleared) and the
-    /// parent's later per-edge `WHERE status = 'failed'` then matches
-    /// nothing — net +1/+1, the row pending.
+    /// The dep's own request is no different from its dependents':
+    /// re-requesting a `failed` row counts the request —
+    /// `request_count` +1 — and changes nothing else. `blocked` rows
+    /// behave identically (`resurrects` names neither).
     #[tokio::test]
-    async fn dep_request_before_its_parent_in_one_chunk() {
+    async fn dep_request_never_revives_a_failed_dep_in_one_chunk() {
         let db = memory_db().await.expect("memory db");
         seed_failed(&db, "dep", 7, 5).await;
 
@@ -8844,18 +8987,18 @@ mod sqlite_tests {
         let dep = queue_counters(&db, "dep").await;
         assert_eq!(
             (dep.status.as_str(), dep.attempt, dep.request_count),
-            ("pending", 8, 6),
-            "dep resurrected by its own request; the parent's requeue is a no-op"
+            ("failed", 7, 6),
+            "request counted, status untouched"
         );
-        assert_eq!(row_column(&db, "parent", "status").await, "pending");
+        assert_eq!(
+            row_column(&db, "parent", "CAST(blocked AS TEXT)").await,
+            "1"
+        );
     }
 
-    /// Parent first: its dep-sync revival flips the failed row pending
-    /// with +1 `attempt` / +1 `request_count`, and the dep's own request
-    /// afterwards meets a 'pending' row — `update_existing_task` runs
-    /// the non-resurrection update, `request_count` +1 and no `attempt`
-    /// bump. Net +1 `attempt` / +2 `request_count` (the reverse order
-    /// differs — see `dep_request_before_its_parent_in_one_chunk`).
+    /// Order inside the chunk is irrelevant — parent first lands the
+    /// same as dep first: the failed row counts one request and keeps
+    /// its terminal status.
     #[tokio::test]
     async fn parent_request_before_its_failed_dep_in_one_chunk() {
         let db = memory_db().await.expect("memory db");
@@ -8874,8 +9017,8 @@ mod sqlite_tests {
         let dep = queue_counters(&db, "dep").await;
         assert_eq!(
             (dep.status.as_str(), dep.attempt, dep.request_count),
-            ("pending", 8, 7),
-            "the requeue's +1/+1 then the dep's own non-resurrection request_count +1"
+            ("failed", 7, 6),
+            "same outcome either order: no resurrection"
         );
     }
 
@@ -8907,14 +9050,13 @@ mod sqlite_tests {
             .expect("enqueue chunk");
 
         let issued = log.lock().expect("log").len() - base;
-        // Seven: edge delete + edge insert + task insert + task update
-        // + dep-requeue + `deps_met` refresh + `dispatch_key` refresh,
-        // each a single statement over the whole chunk regardless of
-        // request count.
+        // Six: edge delete + edge insert + task insert + task update
+        // + `deps_met` refresh + `dispatch_key` refresh, each a single
+        // statement over the whole chunk regardless of request count.
         assert!(
-            issued <= 7,
+            issued <= 6,
             "a 1000-request chunk must stay a constant statement count \
-             (measured 7), got {issued}"
+             (measured 6), got {issued}"
         );
     }
 
@@ -8941,9 +9083,9 @@ mod sqlite_tests {
         target: &str,
         failure: Option<(&str, &str)>,
     ) {
-        // Names carry the batch: a repeat name re-requests the failed
-        // task, which re-arms the not_before backoff and hides the row
-        // from the claim this seeding is about to run.
+        // Names carry the batch: a repeat name re-requests a task whose
+        // own retry backoff already hides it from the claim this
+        // seeding is about to run.
         let requests: Vec<EnqueueRequest> = (0..count)
             .map(|i| request_on(&format!("outcome-{batch}-{i}"), target, Vec::new()))
             .collect();
@@ -8960,7 +9102,7 @@ mod sqlite_tests {
                 report.error = Some(error.to_owned());
                 report.github_run_id = Some(run_id.to_owned());
             }
-            super::complete(db, &report, TEST_WINDOW_MINUTES)
+            super::complete(db, &wide_claim_settings(), &report, TEST_WINDOW_MINUTES)
                 .await
                 .expect("seed complete");
         }
@@ -9186,6 +9328,7 @@ mod sqlite_tests {
             let base = log.lock().expect("log").len();
             super::complete(
                 &db,
+                &claim_settings(),
                 &super::BuildCompleteReport {
                     task_id: claimed[0].task_id.clone(),
                     attempt: claimed[0].attempt,

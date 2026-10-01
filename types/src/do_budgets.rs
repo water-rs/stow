@@ -111,6 +111,16 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 300,
     },
     DriveBudget {
+        // The failure arm: same report resolution plus the dependents'
+        // `blocked`-flag refresh — bounded by the failed row's
+        // dependents, never the queue.
+        name: "POST /tasks/complete-run (failure)",
+        statements: 12,
+        rows_read: 400,
+        rows_written: 200,
+        wall_ms: 300,
+    },
+    DriveBudget {
         name: "POST /tasks/retry",
         statements: 4,
         rows_read: 200,

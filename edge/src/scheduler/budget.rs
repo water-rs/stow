@@ -397,7 +397,8 @@ async fn count_rows(db: &DurableDb, table: &str) -> Result<u64, QueueError> {
 ///   completed it, or the drive's churn did — the seeded dep graph also
 ///   names in-flight rows, so the pass's shape repair resurrects any of
 ///   them the moment they complete. The target is re-marked `running`
-///   with a fresh attempt so every probe measures a real completion.
+///   with a fresh attempt so every probe measures a real completion;
+///   the failure variant's row re-arms the same way.
 async fn rearm_fixture(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
     for statement in [
         "DELETE FROM queue_dependencies WHERE task_id LIKE '%-%'",
@@ -422,6 +423,19 @@ async fn rearm_fixture(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueE
     .execute()
     .await
     .map_err(|error| QueueError::Sql(format!("re-arm complete-run target: {error}")))?;
+    // The failure drive's row re-arms with `attempt` reset, not bumped:
+    // a bumped attempt crosses `MAX_BUILD_ATTEMPTS` after a few probes
+    // and the drive would start measuring the `failed` park instead of
+    // the retry arm it is calibrated on.
+    db.query(
+        "UPDATE queue \
+         SET status = 'running', attempt = 1, updated_at = datetime('now') \
+         WHERE task_id = printf('%064x', ?)",
+    )
+    .bind(i64::from(shape.dispatched_row(0)))
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("re-arm failure-run target: {error}")))?;
     Ok(())
 }
 
