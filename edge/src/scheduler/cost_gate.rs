@@ -220,6 +220,48 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
+    // The request lane — point reads and writes on `requests`, a table
+    // that never grows past the live request set.
+    RouteBudget {
+        name: "GET /requests/{id}",
+        statements: 4,
+        rows_read: 40,
+        rows_written: 0,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /requests",
+        statements: 4,
+        rows_read: 20,
+        rows_written: 6,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /requests/{id}/run-update (in_progress)",
+        statements: 3,
+        rows_read: 10,
+        rows_written: 4,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /requests/{id}/outcome",
+        statements: 14,
+        rows_read: 60,
+        rows_written: 40,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /requests/{id}/run-update (completed)",
+        statements: 3,
+        rows_read: 10,
+        rows_written: 4,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
     // Submit paths: a batch of three requests (one resync, one fresh,
     // one human). The untrusted route refuses on a pinned-zero pending
     // cap — that is the refusal path; the accept drive lifts the cap

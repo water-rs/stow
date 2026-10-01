@@ -1,8 +1,9 @@
 //! Dev-only local CI dispatch server.
 //!
 //! Activated via `stow-build serve`. Implements `POST /dispatch` so a
-//! locally-running edge worker can dispatch a `BuildTaskPayload` for an
-//! end-to-end test run without touching real GitHub Actions — and
+//! locally-running edge worker can dispatch `build-crate` runs (a
+//! `BuildTaskPayload`) and `resolve-request` runs (a `RequestDispatch`)
+//! for end-to-end tests without touching real GitHub Actions — and
 //! `GET /tasks`, the run-state list `stow-admin preheat manual` polls in
 //! its `--dispatch-url` mode.
 //!
@@ -30,7 +31,7 @@ use skyzen::Server;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
-use stow_types::api::BuildTaskPayload;
+use stow_types::api::{BuildTaskPayload, RequestDispatch};
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
 
@@ -106,16 +107,18 @@ impl LocalServerState {
         }
     }
 
+    /// Record a dispatched run — `run_key` is the id `GET /tasks`
+    /// indexes by (the task id for builds, the request id for resolves)
+    /// and `display_title` the run-name its workflow stamps.
     fn mark_run(
         &self,
-        task: &BuildTaskPayload,
+        run_key: &str,
+        display_title: &str,
         status: &'static str,
         conclusion: Option<&'static str>,
     ) {
-        let display_title =
-            stow_types::records::run_title(task.rustc_version.as_str(), &task.task_id);
         let entry = MockTaskRun {
-            display_title: display_title.clone(),
+            display_title: display_title.to_string(),
             status,
             conclusion,
             html_url: format!("http://{}/tasks/{display_title}", self.listen),
@@ -123,13 +126,40 @@ impl LocalServerState {
         self.runs
             .lock()
             .expect("runs mutex poisoned")
-            .insert(task.task_id.clone(), entry);
+            .insert(run_key.to_owned(), entry);
+    }
+
+    /// `run_title` under `build-crate.yml`'s convention for a task —
+    /// the display title `mark_run` and the `workflow_run` webhook
+    /// share.
+    fn build_run_title(task: &BuildTaskPayload) -> String {
+        stow_types::records::run_title(task.rustc_version.as_str(), &task.task_id)
+    }
+
+    /// Record a build task's run under its task id.
+    fn mark_build_run(
+        &self,
+        task: &BuildTaskPayload,
+        status: &'static str,
+        conclusion: Option<&'static str>,
+    ) {
+        self.mark_run(
+            &task.task_id,
+            &Self::build_run_title(task),
+            status,
+            conclusion,
+        );
     }
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 struct RepositoryDispatchEvent {
-    client_payload: BuildTaskPayload,
+    /// The scheduler's `trigger_workflow` discriminator — `build-crate`
+    /// or `resolve-request`.
+    event_type: String,
+    /// The event's payload: a [`BuildTaskPayload`] for `build-crate`,
+    /// a `stow_types::api::RequestDispatch` for `resolve-request`.
+    client_payload: serde_json::Value,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -192,17 +222,48 @@ async fn list_tasks(State(state): State<LocalServerState>) -> Response {
     json_response(&TasksResponse { tasks }, StatusCode::OK)
 }
 
+/// `POST /dispatch` — the scheduler's one local fan-out: `build-crate`
+/// events run the full simulated build, `resolve-request` events are
+/// the request lane's resolve-job dispatch (stow#428).
 async fn dispatch(
     State(state): State<LocalServerState>,
     Json(event): Json<RepositoryDispatchEvent>,
 ) -> Response {
-    let task = event.client_payload;
-    state.mark_run(&task, "in_progress", None);
+    match event.event_type.as_str() {
+        "build-crate" => match serde_json::from_value::<BuildTaskPayload>(event.client_payload) {
+            Ok(task) => dispatch_build(state, task),
+            Err(error) => json_response(
+                &bad_request(&format!("build-crate payload: {error}")),
+                StatusCode::BAD_REQUEST,
+            ),
+        },
+        "resolve-request" => {
+            match serde_json::from_value::<RequestDispatch>(event.client_payload) {
+                Ok(dispatch) => dispatch_resolve(state, dispatch),
+                Err(error) => json_response(
+                    &bad_request(&format!("resolve-request payload: {error}")),
+                    StatusCode::BAD_REQUEST,
+                ),
+            }
+        }
+        other => json_response(
+            &bad_request(&format!("unknown event_type `{other}`")),
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
+fn bad_request(error: &str) -> serde_json::Value {
+    serde_json::json!({ "error": error })
+}
+
+fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
+    state.mark_build_run(&task, "in_progress", None);
     tokio::spawn(async move {
         let state_for_task = state.clone();
         if let Err(error) = run_dispatched_task(state_for_task.clone(), task.clone()).await {
             tracing::error!(task_id = %task.task_id, %error, "local CI dispatched task failed");
-            state_for_task.mark_run(&task, "completed", Some("failure"));
+            state_for_task.mark_build_run(&task, "completed", Some("failure"));
             if let Err(report_error) = report_failed_task(
                 &state_for_task,
                 &task,
@@ -216,6 +277,38 @@ async fn dispatch(
                     "failed to report local CI task failure via webhook"
                 );
             }
+        }
+    });
+    json_response(&DispatchResponse { ok: true }, StatusCode::ACCEPTED)
+}
+
+/// A `resolve-request` dispatch (stow#428): the stub absorbs the hop
+/// the admit pass pays, records the run and reports `in_progress`
+/// through the same signed `workflow_run` webhook a real Actions job
+/// emits when its job starts. The resolve itself — `stow-admin request
+/// resolve`, its outcome report, run completion — is not simulated:
+/// the record the admit pass wrote stays `resolving` here until the
+/// operator drives the resolve for real.
+fn dispatch_resolve(state: LocalServerState, dispatch: RequestDispatch) -> Response {
+    let display_title =
+        stow_types::records::resolve_run_title(dispatch.attempt, &dispatch.request_id);
+    state.mark_run(&dispatch.request_id, &display_title, "in_progress", None);
+    let report = WorkflowRunReport {
+        run_key: dispatch.request_id.clone(),
+        workflow_file: stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE,
+        display_title,
+        action: "in_progress",
+        conclusion: None,
+        html_url: format!("http://{}/tasks/{}", state.listen, dispatch.request_id),
+        error: None,
+    };
+    tokio::spawn(async move {
+        if let Err(error) = post_workflow_run(&state, &report).await {
+            tracing::error!(
+                request_id = %dispatch.request_id,
+                %error,
+                "failed to report resolve run in_progress via webhook"
+            );
         }
     });
     json_response(&DispatchResponse { ok: true }, StatusCode::ACCEPTED)
@@ -237,7 +330,11 @@ async fn report_failed_task(
     task: &BuildTaskPayload,
     error: String,
 ) -> stow_types::error::Result<()> {
-    post_workflow_run(state, task, "failure", Some(error)).await
+    post_workflow_run(
+        state,
+        &task_workflow_run(state, task, Some("failure"), Some(error)),
+    )
+    .await
 }
 
 /// The task id names a directory under the dispatch root, so it must be a
@@ -315,8 +412,12 @@ async fn run_dispatched_task(
             &std::env::current_exe()?,
         )
         .await?;
-        state.mark_run(&task, "completed", Some("success"));
-        return post_workflow_run(&state, &task, "success", None).await;
+        state.mark_build_run(&task, "completed", Some("success"));
+        return post_workflow_run(
+            &state,
+            &task_workflow_run(&state, &task, Some("success"), None),
+        )
+        .await;
     }
     let task_json = serde_json::to_string(&task)?;
     let exe = std::env::current_exe()?;
@@ -327,8 +428,12 @@ async fn run_dispatched_task(
     let status = run_build_stage(&exe, &task_json, &layout).await?;
     if !status.success() {
         let error = format!("stow-build exited with status {status}");
-        state.mark_run(&task, "completed", Some("failure"));
-        post_workflow_run(&state, &task, "failure", Some(error.clone())).await?;
+        state.mark_build_run(&task, "completed", Some("failure"));
+        post_workflow_run(
+            &state,
+            &task_workflow_run(&state, &task, Some("failure"), Some(error.clone())),
+        )
+        .await?;
         return Err(stow_types::stow_error!("{error}"));
     }
 
@@ -339,14 +444,22 @@ async fn run_dispatched_task(
         // Even an artifact-less task publishes its (empty) records
         // artifact — the webhook's existence check must find it.
         push_records(&state, &task, &layout.records_path, exe.as_path()).await?;
-        state.mark_run(&task, "completed", Some("success"));
-        return post_workflow_run(&state, &task, "success", None).await;
+        state.mark_build_run(&task, "completed", Some("success"));
+        return post_workflow_run(
+            &state,
+            &task_workflow_run(&state, &task, Some("success"), None),
+        )
+        .await;
     }
 
     populate_mock_registry(&exe, &state, &task, &layout).await?;
     push_records(&state, &task, &layout.records_path, exe.as_path()).await?;
-    state.mark_run(&task, "completed", Some("success"));
-    post_workflow_run(&state, &task, "success", None).await
+    state.mark_build_run(&task, "completed", Some("success"));
+    post_workflow_run(
+        &state,
+        &task_workflow_run(&state, &task, Some("success"), None),
+    )
+    .await
 }
 
 /// Spawn the untrusted `stow-build build` stage. It receives only the task
@@ -431,8 +544,12 @@ async fn populate_mock_registry(
         return Ok(());
     }
     let error = format!("mock registry populate exited with status {populate_status}");
-    state.mark_run(task, "completed", Some("failure"));
-    post_workflow_run(state, task, "failure", Some(error.clone())).await?;
+    state.mark_build_run(task, "completed", Some("failure"));
+    post_workflow_run(
+        state,
+        &task_workflow_run(state, task, Some("failure"), Some(error.clone())),
+    )
+    .await?;
     Err(stow_types::stow_error!("{error}"))
 }
 
@@ -481,36 +598,72 @@ async fn push_records(
     ))
 }
 
-/// POST a synthetic `workflow_run` `completed` webhook to the edge — the
-/// exact event shape and signature header GitHub delivers, so the mock
-/// edge verifies the same HMAC the production one does.
-async fn post_workflow_run(
+/// The `workflow_run` event a mock run reports — the fields GitHub's
+/// payload carries that the edge's signature check, authority boundary
+/// and title correlation consume. `run_key` (task id or request id)
+/// seeds the synthetic run id; `display_title` is the run-name the
+/// workflow stamps and the edge parses back.
+struct WorkflowRunReport {
+    run_key: String,
+    /// The workflow file — `build-crate.yml` or `resolve-request.yml`.
+    workflow_file: &'static str,
+    display_title: String,
+    /// `in_progress` or `completed` — GitHub's `action` field.
+    action: &'static str,
+    /// `success`/`failure` — present on `completed` deliveries only.
+    conclusion: Option<&'static str>,
+    /// The run's link — the mock's own `GET /tasks` page.
+    html_url: String,
+    /// Failure detail worth logging alongside the report.
+    error: Option<String>,
+}
+
+/// A dispatched build task's `completed` report under
+/// `build-crate.yml`'s run-name.
+fn task_workflow_run(
     state: &LocalServerState,
     task: &BuildTaskPayload,
-    conclusion: &str,
+    conclusion: Option<&'static str>,
     error: Option<String>,
+) -> WorkflowRunReport {
+    WorkflowRunReport {
+        run_key: task.task_id.clone(),
+        workflow_file: stow_types::trusted_builder::WORKFLOW_FILE,
+        display_title: LocalServerState::build_run_title(task),
+        action: "completed",
+        conclusion,
+        html_url: format!("http://{}/tasks/{}", state.listen, task.task_id),
+        error,
+    }
+}
+
+/// POST a synthetic `workflow_run` webhook to the edge — the exact
+/// event shape and signature header GitHub delivers, so the mock edge
+/// verifies the same HMAC the production one does.
+async fn post_workflow_run(
+    state: &LocalServerState,
+    run: &WorkflowRunReport,
 ) -> stow_types::error::Result<()> {
     const MAX_ATTEMPTS: u32 = 5;
-    let task_id = task.task_id.as_str();
-    if let Some(error) = &error {
-        tracing::warn!(task_id, %error, "workflow_run reports {conclusion}");
+    if let Some(error) = &run.error {
+        tracing::warn!(run_key = %run.run_key, %error, "workflow_run reports {:?}", run.conclusion);
     }
     // The production pin: same path/branch/event/repository fields the
-    // webhook requires, with the run title `build-crate.yml` would stamp.
+    // webhook requires, with the run title the workflow stamps.
     let payload = serde_json::json!({
-        "action": "completed",
+        "action": run.action,
         "repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
         "workflow_run": {
-            "id": blake3::hash(task_id.as_bytes()).as_bytes()[..8]
+            "id": blake3::hash(run.run_key.as_bytes()).as_bytes()[..8]
                 .iter()
                 .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte)),
-            "name": "build-crate.yml",
-            "path": format!(".github/workflows/{}", stow_types::trusted_builder::WORKFLOW_FILE),
+            "name": run.workflow_file,
+            "path": format!(".github/workflows/{}", run.workflow_file),
             "event": "workflow_dispatch",
-            "display_title": stow_types::records::run_title(task.rustc_version.as_str(), task_id),
+            "display_title": run.display_title,
             "head_branch": stow_types::trusted_builder::BRANCH,
-            "conclusion": conclusion,
-            "html_url": format!("http://{}/tasks/{task_id}", state.listen),
+            "conclusion": run.conclusion,
+            "html_url": run.html_url,
             "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
         },
     });

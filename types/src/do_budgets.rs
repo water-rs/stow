@@ -153,6 +153,56 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 200,
     },
     DriveBudget {
+        // An `enqueued` record's read: the row select, the stored-roots
+        // parse and the live `tasks_status` re-probe — the pending human
+        // root's lane-position walk dominates, bounded by the held lane
+        // depth like `GET /tasks/{id}`.
+        name: "GET /requests/{id}",
+        statements: 8,
+        rows_read: 2_600,
+        rows_written: 0,
+        wall_ms: 200,
+    },
+    DriveBudget {
+        // The request lane's admission: the freeze and human-budget
+        // probes, the deduping insert, the credential read and the one
+        // serialized `workflow_dispatch` hop — wall carries the HTTP.
+        name: "POST /requests",
+        statements: 10,
+        rows_read: 100,
+        rows_written: 10,
+        wall_ms: 600,
+    },
+    DriveBudget {
+        // The row read plus the conditional `accepted -> resolving`
+        // update that stamps the run identity.
+        name: "POST /requests/{id}/run-update (in_progress)",
+        statements: 3,
+        rows_read: 20,
+        rows_written: 4,
+        wall_ms: 150,
+    },
+    DriveBudget {
+        // A `Resolved` report on a live record: the pre/post status
+        // probes, the trusted enqueue of a one-dep batch and the
+        // conditional `enqueued` write — the same insert machinery the
+        // submit drives price, at this batch's size.
+        name: "POST /requests/{id}/outcome",
+        statements: 18,
+        rows_read: 2_600,
+        rows_written: 200,
+        wall_ms: 600,
+    },
+    DriveBudget {
+        // `completed` on an already-`enqueued` record — the row read plus
+        // the one conditional update that correctly writes nothing.
+        name: "POST /requests/{id}/run-update (completed)",
+        statements: 3,
+        rows_read: 20,
+        rows_written: 4,
+        wall_ms: 150,
+    },
+    DriveBudget {
         // The pending-depth check reads the trigger-maintained
         // `queue_status_counts` row — a handful of rows at any queue
         // size. The human-lane position walk is bounded by the lane's

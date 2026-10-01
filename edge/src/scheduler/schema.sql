@@ -372,3 +372,25 @@ CREATE TABLE IF NOT EXISTS do_meter (
     rows_read INTEGER NOT NULL,
     rows_written INTEGER NOT NULL
 );
+
+-- The human request lane's records (stow#428): one row per admitted
+-- `POST /api/v1/requests`, moved `accepted` -> `resolving` ->
+-- `enqueued` | `failed` by the resolve run's outcome report and the
+-- workflow_run backstop. `outcome_json` holds the per-target stored
+-- roots the status read re-probes against the live queue; `dispatched_at`
+-- is the resolve job's dispatch-to-submit timing baseline.
+CREATE TABLE IF NOT EXISTS requests (
+    request_id TEXT PRIMARY KEY,
+    attempt INTEGER NOT NULL,
+    crate_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    rustc_version TEXT NOT NULL,
+    state TEXT NOT NULL, -- 'accepted' | 'resolving' | 'enqueued' | 'failed'
+    dispatched_at INTEGER, -- unixepoch seconds of the dispatch POST
+    github_run_id TEXT,
+    github_run_url TEXT,
+    outcome_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);

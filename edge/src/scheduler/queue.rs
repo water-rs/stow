@@ -1425,6 +1425,492 @@ async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u
     u64_to_u32(ahead + 1, "human lane position")
 }
 
+// --------------------------------------------------------------------
+// Human request records (`requests` table, stow#428)
+//
+// One row per admitted request id. The edge's admission writes it and
+// the same call dispatches the resolve run; the `workflow_run`
+// `in_progress` event flips it to `resolving`; the job's outcome report
+// lands the tasks and flips `enqueued` — or `failed` — and the
+// `completed` event is the backstop for a run that dies mid-flight.
+// The stored `outcome_json` roots are re-probed against the live queue
+// on every status read, so a `queued` report keeps answering where the
+// row actually is rather than where it was at submit time.
+
+/// A `requests` row as stored — `state` holds a [`CrateRequestPhase`]'s
+/// `snake_case` name and `outcome_json` the settled attempt's stored roots.
+#[derive(Debug, skyzen::FromRow)]
+struct RequestRecord {
+    request_id: String,
+    attempt: i64,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    rustc_version: String,
+    state: String,
+    github_run_id: Option<String>,
+    github_run_url: Option<String>,
+    outcome_json: Option<String>,
+    error: Option<String>,
+}
+
+/// The per-target root `outcome_json` stores: the resolve job's
+/// [`RequestRootOutcome`] plus whether the root's queue row already
+/// existed when the outcome's enqueue ran — the fact a status read
+/// needs to tell `queued` (the request's own work) from
+/// `already_queued` (a row the request found).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RequestStoredRoot {
+    /// The CI target this root serves.
+    target: String,
+    /// The lib-root task id — `None` for a crate with no library.
+    task_id: Option<String>,
+    /// The published slice already served the root at resolve time.
+    cached: bool,
+    /// The root's queue row existed before the outcome's enqueue.
+    was_queued: bool,
+}
+
+/// The dedup decision `admit_request` hands back.
+#[derive(Debug)]
+pub enum RequestAdmissionStep {
+    /// The record inserted (or a `failed` one re-attempted): dispatch the
+    /// resolve run for this attempt.
+    Dispatch {
+        /// The record's live attempt — stamps the run name and payload.
+        attempt: u32,
+    },
+    /// A live record already serves this request id — answer it as-is.
+    Existing,
+}
+
+/// The `requests` table's `state` strings ↔ [`CrateRequestPhase`].
+fn request_phase(state: &str) -> Result<stow_types::api::CrateRequestPhase, QueueError> {
+    use stow_types::api::CrateRequestPhase as Phase;
+    match state {
+        "accepted" => Ok(Phase::Accepted),
+        "resolving" => Ok(Phase::Resolving),
+        "enqueued" => Ok(Phase::Enqueued),
+        "failed" => Ok(Phase::Failed),
+        other => Err(QueueError::Invariant(format!(
+            "stored request state `{other}`"
+        ))),
+    }
+}
+
+/// Read one request record, or `None` when the id is unknown.
+async fn load_request(
+    db: &DurableDb,
+    request_id: &str,
+) -> Result<Option<RequestRecord>, QueueError> {
+    db.query(
+        "SELECT request_id, attempt, crate_name, version, features_json, \
+         rustc_version, state, github_run_id, github_run_url, \
+         outcome_json, error FROM requests WHERE request_id = ?",
+    )
+    .bind(request_id.to_owned())
+    .fetch_optional::<RequestRecord>()
+    .await
+    .map_err(|error| format!("load request {request_id}: {error}").into())
+}
+
+/// `POST /requests` admission. A live record answers as found (the
+/// request deduplicates on its deterministic id); a `failed` one
+/// re-attempts — `attempt + 1` in the same conditional write, so the
+/// run-name's `a{attempt}` leg keeps a stale run's webhook events off
+/// the live attempt. Both spend a resolve run, so the insertion is
+/// gated on today's human-lane budget having any room at all — the
+/// enqueue's own charge still applies at outcome time; this probe only
+/// refuses a dispatch whose tasks can never land.
+pub async fn admit_request(
+    db: &DurableDb,
+    admission: &stow_types::api::RequestAdmission,
+    dispatched_at: i64,
+    settings: &SchedulerSettings,
+) -> Result<RequestAdmissionStep, QueueError> {
+    if let Some(record) = load_request(db, &admission.request_id).await?
+        && record.state != "failed"
+    {
+        return Ok(RequestAdmissionStep::Existing);
+    }
+    let spent = db
+        .query("SELECT task_count FROM human_daily_task_budget WHERE day = date('now')")
+        .fetch_scalar_optional::<i64>()
+        .await
+        .map_err(|error| format!("probe human daily task budget: {error}"))?
+        .unwrap_or(0);
+    if spent >= i64::from(settings.human_daily_task_budget) {
+        return Err(QueueError::HumanDailyBudgetExhausted {
+            attempted: 1,
+            budget: u64::from(settings.human_daily_task_budget),
+        });
+    }
+    // One conditional write: a fresh id inserts at attempt 1; the
+    // conflict arm only fires for a `failed` row, re-attempting it.
+    let attempt = db
+        .query(
+            "INSERT INTO requests (request_id, attempt, crate_name, version, \
+             features_json, rustc_version, state, dispatched_at) \
+             VALUES (?, 1, ?, ?, ?, ?, 'accepted', ?) \
+             ON CONFLICT(request_id) DO UPDATE SET \
+             attempt = attempt + 1, state = 'accepted', \
+             dispatched_at = excluded.dispatched_at, github_run_id = NULL, \
+             github_run_url = NULL, outcome_json = NULL, error = NULL \
+             WHERE requests.state = 'failed' \
+             RETURNING attempt",
+        )
+        .bind(admission.request_id.clone())
+        .bind(admission.crate_name.as_str().to_owned())
+        .bind(admission.version.to_string())
+        .bind(admission.features_json.raw().clone())
+        .bind(admission.rustc_version.as_str().to_owned())
+        .bind(dispatched_at)
+        .fetch_scalar_optional::<i64>()
+        .await
+        .map_err(|error| format!("admit request {}: {error}", admission.request_id))?;
+    match attempt {
+        Some(attempt) => Ok(RequestAdmissionStep::Dispatch {
+            attempt: u64_to_u32(
+                u64::try_from(attempt).unwrap_or_default(),
+                "request attempt",
+            )?,
+        }),
+        // The conflict arm's `state = 'failed'` guard rejected the
+        // update: a live record exists — answer it rather than
+        // dispatching a second run.
+        None => Ok(RequestAdmissionStep::Existing),
+    }
+}
+
+/// The dispatch-failure write — flips the live attempt `failed` naming
+/// the dispatch error, so a later re-request's re-attempt (which keys on
+/// `failed`) can retry.
+pub async fn fail_request_dispatch(
+    db: &DurableDb,
+    request_id: &str,
+    attempt: u32,
+    error: &str,
+) -> Result<(), QueueError> {
+    db.query(
+        "UPDATE requests SET state = 'failed', error = ? \
+         WHERE request_id = ? AND attempt = ? AND state = 'accepted'",
+    )
+    .bind(error.to_owned())
+    .bind(request_id.to_owned())
+    .bind(i64::from(attempt))
+    .execute()
+    .await
+    .map_err(|error| format!("mark request {request_id} dispatch-failed: {error}"))?;
+    Ok(())
+}
+
+/// `POST /requests/{id}/outcome` — apply the resolve job's report.
+///
+/// A `Resolved` report enqueues its batch through the trusted lane
+/// (verbatim — the resolver already pinned each identity, so the
+/// canonicalization the admin submit route applies would only rewrite
+/// the ids the report names), computes `was_queued` from a pre-enqueue
+/// probe, stores the per-target roots, and flips the record `enqueued`
+/// in one conditional write. A `Failed` report — or the trusted
+/// enqueue's own refusal — flips it `failed` with the reason. Reports
+/// naming a superseded attempt answer `StaleCompletion`; a report on an
+/// already-settled record is a no-op that re-answers the stored state.
+pub async fn apply_request_outcome(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    request_id: &str,
+    report: &stow_types::api::RequestOutcomeReport,
+) -> Result<stow_types::api::CrateRequestStatus, QueueError> {
+    let mut record = load_request(db, request_id)
+        .await?
+        .ok_or_else(|| QueueError::UnknownTask(request_id.to_owned()))?;
+    if record.attempt != i64::from(report.attempt) {
+        return Err(QueueError::StaleCompletion {
+            task_id: request_id.to_owned(),
+            attempt: report.attempt,
+            row_attempt: u64_to_u32(
+                u64::try_from(record.attempt).unwrap_or_default(),
+                "request attempt",
+            )?,
+            row_status: record.state.clone(),
+        });
+    }
+    if matches!(record.state.as_str(), "enqueued" | "failed") {
+        return request_record_status(db, &record).await;
+    }
+    match &report.outcome {
+        stow_types::api::RequestOutcome::Failed { error } => {
+            fail_request(db, request_id, report.attempt, error).await?;
+            record.state.clone_from(&"failed".to_owned());
+            record.error = Some(error.clone());
+            request_record_status(db, &record).await
+        }
+        stow_types::api::RequestOutcome::Resolved { tasks, roots } => {
+            resolve_request_record(db, settings, &mut record, report.attempt, tasks, roots).await
+        }
+    }
+}
+
+/// The `Resolved` arm of [`apply_request_outcome`]: probe the roots for
+/// `was_queued` before the enqueue, run the batch through the trusted
+/// insert path, then settle the record `enqueued` with its stored roots
+/// in one conditional write — the `state IN ('accepted', 'resolving')`
+/// guard keeps a `completed` webhook racing the other way from erasing
+/// the outcome.
+async fn resolve_request_record(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    record: &mut RequestRecord,
+    attempt: u32,
+    tasks: &[EnqueueRequest],
+    roots: &[stow_types::api::RequestRootOutcome],
+) -> Result<stow_types::api::CrateRequestStatus, QueueError> {
+    // `was_queued` distinguishes the request's own enqueue from a
+    // row it found — probe before the insert, assemble after it.
+    let root_ids: Vec<String> = roots
+        .iter()
+        .filter_map(|root| root.task_id.clone())
+        .collect();
+    let queued_before: BTreeSet<String> = tasks_status(db, &root_ids)
+        .await?
+        .into_iter()
+        .map(|status| status.task_id)
+        .collect();
+    if let Err(error) = enqueue_trusted(db, tasks, settings).await {
+        fail_request(db, &record.request_id, attempt, &error.to_string()).await?;
+        return Err(error);
+    }
+    let by_id: BTreeMap<String, RequestStatus> = tasks_status(db, &root_ids)
+        .await?
+        .into_iter()
+        .map(|status| (status.task_id.clone(), status))
+        .collect();
+    let mut stored = Vec::with_capacity(roots.len());
+    let mut targets = Vec::with_capacity(roots.len());
+    for root in roots {
+        let root_id = root.task_id.as_deref().unwrap_or_default();
+        let outcome = crate::dependency_resolver::crate_request_target(
+            &root.target,
+            root_id,
+            root.cached,
+            root.task_id.is_some(),
+            queued_before.contains(root_id),
+            by_id.get(root_id),
+        )
+        .map_err(|error| QueueError::Invariant(format!("request root {}: {error}", root.target)))?;
+        targets.push(outcome);
+        stored.push(RequestStoredRoot {
+            target: root.target.as_str().to_owned(),
+            task_id: root.task_id.clone(),
+            cached: root.cached,
+            was_queued: queued_before.contains(root_id),
+        });
+    }
+    let outcome_json = serde_json::to_string(&stored)
+        .map_err(|error| QueueError::Invariant(format!("encode request roots: {error}")))?;
+    db.query(
+        "UPDATE requests SET state = 'enqueued', outcome_json = ? \
+         WHERE request_id = ? AND attempt = ? AND state IN ('accepted', 'resolving')",
+    )
+    .bind(outcome_json)
+    .bind(record.request_id.clone())
+    .bind(i64::from(attempt))
+    .execute()
+    .await
+    .map_err(|error| format!("settle request {} outcome: {error}", record.request_id))?;
+    record.state.clone_from(&"enqueued".to_owned());
+    record.error = None;
+    Ok(stow_types::api::CrateRequestStatus {
+        request_id: record.request_id.clone(),
+        crate_name: CrateName::parse(record.crate_name.clone())?,
+        version: CrateVersion::new(semver::Version::parse(&record.version).map_err(|error| {
+            QueueError::Invariant(format!("stored version `{}`: {error}", record.version))
+        })?),
+        features_json: FeaturesJson::from_sorted(
+            serde_json::from_str(&record.features_json)
+                .map_err(|error| QueueError::Invariant(format!("stored features_json: {error}")))?,
+        )?,
+        rustc_version: WireRustcVersion::parse(record.rustc_version.clone())?,
+        status: stow_types::api::CrateRequestPhase::Enqueued,
+        targets,
+        error: None,
+        github_run_id: record.github_run_id.clone(),
+        github_run_url: record.github_run_url.clone(),
+    })
+}
+
+/// The `failed` transition the outcome route shares — one conditional
+/// write so the report and the run-update backstop can never disagree
+/// about which settled a live attempt first.
+async fn fail_request(
+    db: &DurableDb,
+    request_id: &str,
+    attempt: u32,
+    error: &str,
+) -> Result<(), QueueError> {
+    db.query(
+        "UPDATE requests SET state = 'failed', error = ? \
+         WHERE request_id = ? AND attempt = ? AND state IN ('accepted', 'resolving')",
+    )
+    .bind(error.to_owned())
+    .bind(request_id.to_owned())
+    .bind(i64::from(attempt))
+    .execute()
+    .await
+    .map_err(|error| format!("fail request {request_id}: {error}"))?;
+    Ok(())
+}
+
+/// `POST /requests/{id}/run-update` — the `workflow_run` webhook's
+/// resolve-run lifecycle signal.
+///
+/// `in_progress` flips `accepted` → `resolving` and records the run id.
+/// `completed` is the backstop: one conditional `UPDATE` flips a
+/// still-live attempt to `failed`, so a record already `enqueued`
+/// through its outcome route is never overwritten — a successful run's
+/// outcome report lands before its `completed` event almost always, and
+/// when it doesn't the record fails as "completed without an outcome".
+pub async fn record_request_run_update(
+    db: &DurableDb,
+    request_id: &str,
+    update: &stow_types::api::RequestRunUpdate,
+) -> Result<(), QueueError> {
+    let record = load_request(db, request_id)
+        .await?
+        .ok_or_else(|| QueueError::UnknownTask(request_id.to_owned()))?;
+    if record.attempt != i64::from(update.attempt) {
+        return Err(QueueError::StaleCompletion {
+            task_id: request_id.to_owned(),
+            attempt: update.attempt,
+            row_attempt: u64_to_u32(
+                u64::try_from(record.attempt).unwrap_or_default(),
+                "request attempt",
+            )?,
+            row_status: record.state.clone(),
+        });
+    }
+    match update.action {
+        stow_types::api::RequestRunAction::InProgress => {
+            db.query(
+                "UPDATE requests SET state = 'resolving', \
+                 github_run_id = ?, github_run_url = ? \
+                 WHERE request_id = ? AND attempt = ? AND state = 'accepted'",
+            )
+            .bind(update.run_id.clone())
+            .bind(update.run_url.clone())
+            .bind(request_id.to_owned())
+            .bind(i64::from(update.attempt))
+            .execute()
+            .await
+            .map_err(|error| format!("mark request {request_id} resolving: {error}"))?;
+        }
+        stow_types::api::RequestRunAction::Completed => {
+            let error = match update.conclusion.as_deref() {
+                Some("success") => "resolve run completed without an outcome report".to_owned(),
+                conclusion => {
+                    let url = update
+                        .run_url
+                        .as_deref()
+                        .map_or_else(String::new, |url| format!(" ({url})"));
+                    format!(
+                        "resolve run concluded '{}'{url}",
+                        conclusion.unwrap_or("unknown")
+                    )
+                }
+            };
+            db.query(
+                "UPDATE requests SET state = 'failed', error = ?, \
+                 github_run_id = ?, github_run_url = ? \
+                 WHERE request_id = ? AND attempt = ? \
+                 AND state IN ('accepted', 'resolving')",
+            )
+            .bind(error)
+            .bind(update.run_id.clone())
+            .bind(update.run_url.clone())
+            .bind(request_id.to_owned())
+            .bind(i64::from(update.attempt))
+            .execute()
+            .await
+            .map_err(|error| format!("mark request {request_id} run-failed: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// `GET /requests/{id}` — the request record's live status, or `None`
+/// when the id is unknown. An `enqueued` record's stored roots re-probe
+/// the live queue on every read, so the per-target states keep moving
+/// (`queued` → `building` → `cached`) after the outcome landed.
+pub async fn crate_request_status(
+    db: &DurableDb,
+    request_id: &str,
+) -> Result<Option<stow_types::api::CrateRequestStatus>, QueueError> {
+    match load_request(db, request_id).await? {
+        Some(record) => Ok(Some(request_record_status(db, &record).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Assemble the wire status for a record — re-probing stored roots
+/// against the live queue when the record settled `enqueued`.
+async fn request_record_status(
+    db: &DurableDb,
+    record: &RequestRecord,
+) -> Result<stow_types::api::CrateRequestStatus, QueueError> {
+    let phase = request_phase(&record.state)?;
+    let targets = if phase == stow_types::api::CrateRequestPhase::Enqueued {
+        let roots: Vec<RequestStoredRoot> = serde_json::from_str(
+            record.outcome_json.as_deref().unwrap_or("[]"),
+        )
+        .map_err(|error| QueueError::Invariant(format!("stored request outcome_json: {error}")))?;
+        let ids: Vec<String> = roots
+            .iter()
+            .filter_map(|root| root.task_id.clone())
+            .collect();
+        let by_id: BTreeMap<String, RequestStatus> = tasks_status(db, &ids)
+            .await?
+            .into_iter()
+            .map(|status| (status.task_id.clone(), status))
+            .collect();
+        roots
+            .iter()
+            .map(|root| {
+                let root_id = root.task_id.as_deref().unwrap_or_default();
+                crate::dependency_resolver::crate_request_target(
+                    &TargetTriple::parse(root.target.clone())?,
+                    root_id,
+                    root.cached,
+                    root.task_id.is_some(),
+                    root.was_queued,
+                    by_id.get(root_id),
+                )
+                .map_err(|error| {
+                    QueueError::Invariant(format!("stored request root {}: {error}", root.target))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    Ok(stow_types::api::CrateRequestStatus {
+        request_id: record.request_id.clone(),
+        crate_name: CrateName::parse(record.crate_name.clone())?,
+        version: CrateVersion::new(semver::Version::parse(&record.version).map_err(|error| {
+            QueueError::Invariant(format!("stored version `{}`: {error}", record.version))
+        })?),
+        features_json: FeaturesJson::from_sorted(
+            serde_json::from_str(&record.features_json)
+                .map_err(|error| QueueError::Invariant(format!("stored features_json: {error}")))?,
+        )?,
+        rustc_version: WireRustcVersion::parse(record.rustc_version.clone())?,
+        status: phase,
+        targets,
+        error: record.error.clone(),
+        github_run_id: record.github_run_id.clone(),
+        github_run_url: record.github_run_url.clone(),
+    })
+}
+
 /// The dependency edge's unsatisfied half: the live published generation
 /// for the dependency's own `(target, rustc_version)` slice does not
 /// serve every unit shape the dependent's build looks the dep up under.
@@ -3655,7 +4141,7 @@ async fn commit_published_slice(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -8390,5 +8876,301 @@ mod sqlite_tests {
              bounded",
             reads[0], reads[1]
         );
+    }
+    /// `POST /requests` input for `crate_name` — mirrors the edge's
+    /// admission after version/rustc resolution.
+    fn admission(crate_name: &str) -> stow_types::api::RequestAdmission {
+        stow_types::api::RequestAdmission {
+            request_id: stow_types::api::request_id(crate_name, VERSION, FEATURES, RUSTC),
+            crate_name: crate_name.parse().expect("request crate"),
+            version: VERSION.parse().expect("request version"),
+            features_json: FeaturesJson::default(),
+            rustc_version: RUSTC.parse().expect("request rustc"),
+            max_closure: 500,
+        }
+    }
+
+    fn resolved_report(attempt: u32, crate_name: &str) -> stow_types::api::RequestOutcomeReport {
+        use stow_types::api::{RequestOutcome, RequestOutcomeReport, RequestRootOutcome};
+        let task = EnqueueRequest {
+            source: EnqueueSource::HumanRequest,
+            ..request(crate_name, vec![dependency("dep")])
+        };
+        RequestOutcomeReport {
+            attempt,
+            outcome: RequestOutcome::Resolved {
+                tasks: vec![task],
+                roots: vec![RequestRootOutcome {
+                    target: TARGET.parse().expect("target"),
+                    task_id: Some(task_id_on(crate_name, TARGET)),
+                    cached: false,
+                }],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn request_admission_dedups_and_re_attempts_a_failed_record() {
+        let db = memory_db().await.expect("memory db");
+        let admission = admission("req-crate");
+
+        let step = super::admit_request(&db, &admission, 1_000, &settings())
+            .await
+            .expect("first admit");
+        assert!(matches!(
+            step,
+            super::RequestAdmissionStep::Dispatch { attempt: 1 }
+        ));
+        let status = super::crate_request_status(&db, &admission.request_id)
+            .await
+            .expect("status")
+            .expect("record");
+        assert_eq!(status.status, stow_types::api::CrateRequestPhase::Accepted);
+
+        // Same request id again — the live record answers, no re-dispatch.
+        let step = super::admit_request(&db, &admission, 2_000, &settings())
+            .await
+            .expect("second admit");
+        assert!(matches!(step, super::RequestAdmissionStep::Existing));
+
+        // A `failed` record re-attempts at `attempt + 1` in one write.
+        super::fail_request_dispatch(&db, &admission.request_id, 1, "dispatch refused")
+            .await
+            .expect("fail");
+        let step = super::admit_request(&db, &admission, 3_000, &settings())
+            .await
+            .expect("re-attempt admit");
+        assert!(matches!(
+            step,
+            super::RequestAdmissionStep::Dispatch { attempt: 2 }
+        ));
+        let status = super::crate_request_status(&db, &admission.request_id)
+            .await
+            .expect("status")
+            .expect("record");
+        assert_eq!(status.status, stow_types::api::CrateRequestPhase::Accepted);
+        assert_eq!(status.error, None);
+    }
+
+    #[tokio::test]
+    async fn request_admission_refuses_when_the_day_is_spent() {
+        let db = memory_db().await.expect("memory db");
+        db.query(
+            "INSERT INTO human_daily_task_budget (day, task_count) \
+             VALUES (date('now'), ?)",
+        )
+        .bind(i64::from(settings().human_daily_task_budget))
+        .execute()
+        .await
+        .expect("seed spent day");
+        let error = super::admit_request(&db, &admission("req-crate"), 1_000, &settings())
+            .await
+            .expect_err("spent day refuses admission");
+        assert!(matches!(
+            error,
+            QueueError::HumanDailyBudgetExhausted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_run_updates_drive_the_lifecycle() {
+        let db = memory_db().await.expect("memory db");
+        let admission = admission("req-crate");
+        super::admit_request(&db, &admission, 1_000, &settings())
+            .await
+            .expect("admit");
+
+        super::record_request_run_update(
+            &db,
+            &admission.request_id,
+            &stow_types::api::RequestRunUpdate {
+                attempt: 1,
+                action: stow_types::api::RequestRunAction::InProgress,
+                conclusion: None,
+                run_id: Some("9".to_owned()),
+                run_url: Some("https://example/run/9".to_owned()),
+            },
+        )
+        .await
+        .expect("in_progress");
+        let status = super::crate_request_status(&db, &admission.request_id)
+            .await
+            .expect("status")
+            .expect("record");
+        assert_eq!(status.status, stow_types::api::CrateRequestPhase::Resolving);
+        assert_eq!(status.github_run_id.as_deref(), Some("9"));
+
+        // A `completed` delivery on a live record is the failure
+        // backstop: the resolve reported no outcome.
+        super::record_request_run_update(
+            &db,
+            &admission.request_id,
+            &stow_types::api::RequestRunUpdate {
+                attempt: 1,
+                action: stow_types::api::RequestRunAction::Completed,
+                conclusion: Some("success".to_owned()),
+                run_id: Some("9".to_owned()),
+                run_url: Some("https://example/run/9".to_owned()),
+            },
+        )
+        .await
+        .expect("completed");
+        let status = super::crate_request_status(&db, &admission.request_id)
+            .await
+            .expect("status")
+            .expect("record");
+        assert_eq!(status.status, stow_types::api::CrateRequestPhase::Failed);
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("outcome report")),
+            "the backstop names why the record failed: {:?}",
+            status.error
+        );
+    }
+
+    #[tokio::test]
+    async fn request_run_update_refuses_a_stale_attempt() {
+        let db = memory_db().await.expect("memory db");
+        let admission = admission("req-crate");
+        super::admit_request(&db, &admission, 1_000, &settings())
+            .await
+            .expect("admit");
+        let error = super::record_request_run_update(
+            &db,
+            &admission.request_id,
+            &stow_types::api::RequestRunUpdate {
+                attempt: 9,
+                action: stow_types::api::RequestRunAction::InProgress,
+                conclusion: None,
+                run_id: None,
+                run_url: None,
+            },
+        )
+        .await
+        .expect_err("attempt 9 is stale");
+        assert!(matches!(error, QueueError::StaleCompletion { .. }));
+    }
+
+    #[tokio::test]
+    async fn request_outcome_enqueues_and_settles_the_record() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("dep", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        let admission = admission("req-crate");
+        super::admit_request(&db, &admission, 1_000, &settings())
+            .await
+            .expect("admit");
+
+        let status = super::apply_request_outcome(
+            &db,
+            &settings(),
+            &admission.request_id,
+            &resolved_report(1, "req-crate"),
+        )
+        .await
+        .expect("outcome");
+        assert_eq!(status.status, stow_types::api::CrateRequestPhase::Enqueued);
+        assert_eq!(status.targets.len(), 1);
+        assert_eq!(
+            status.targets[0].state,
+            stow_types::api::CrateRequestState::Queued
+        );
+
+        // The root task landed as a pending human-lane row.
+        let lane: String = db
+            .query("SELECT lane FROM queue WHERE task_id = ?")
+            .bind(task_id_on("req-crate", TARGET))
+            .fetch_scalar::<String>()
+            .await
+            .expect("read task lane");
+        let status_row: String = db
+            .query("SELECT status FROM queue WHERE task_id = ?")
+            .bind(task_id_on("req-crate", TARGET))
+            .fetch_scalar::<String>()
+            .await
+            .expect("read task status");
+        assert_eq!((lane.as_str(), status_row.as_str()), ("human", "pending"));
+
+        // A second identical report is a no-op read of the settled
+        // record — not a re-enqueue.
+        let again = super::apply_request_outcome(
+            &db,
+            &settings(),
+            &admission.request_id,
+            &resolved_report(1, "req-crate"),
+        )
+        .await
+        .expect("replay");
+        assert_eq!(again.status, stow_types::api::CrateRequestPhase::Enqueued);
+
+        // And a `completed` webhook delivery afterward must not claw the
+        // settled record back to `failed` — the conditional write's
+        // whole point (stow#428 review).
+        super::record_request_run_update(
+            &db,
+            &admission.request_id,
+            &stow_types::api::RequestRunUpdate {
+                attempt: 1,
+                action: stow_types::api::RequestRunAction::Completed,
+                conclusion: Some("failure".to_owned()),
+                run_id: None,
+                run_url: None,
+            },
+        )
+        .await
+        .expect("completed after settle");
+        let status = super::crate_request_status(&db, &admission.request_id)
+            .await
+            .expect("status")
+            .expect("record");
+        assert_eq!(status.status, stow_types::api::CrateRequestPhase::Enqueued);
+    }
+
+    #[tokio::test]
+    async fn request_outcome_failed_marks_the_record() {
+        let db = memory_db().await.expect("memory db");
+        let admission = admission("req-crate");
+        super::admit_request(&db, &admission, 1_000, &settings())
+            .await
+            .expect("admit");
+        let status = super::apply_request_outcome(
+            &db,
+            &settings(),
+            &admission.request_id,
+            &stow_types::api::RequestOutcomeReport {
+                attempt: 1,
+                outcome: stow_types::api::RequestOutcome::Failed {
+                    error: "resolve: no semver-compatible version".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("failed outcome");
+        assert_eq!(status.status, stow_types::api::CrateRequestPhase::Failed);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("resolve: no semver-compatible version")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_outcome_refuses_a_stale_attempt() {
+        let db = memory_db().await.expect("memory db");
+        let admission = admission("req-crate");
+        super::admit_request(&db, &admission, 1_000, &settings())
+            .await
+            .expect("admit");
+        let error = super::apply_request_outcome(
+            &db,
+            &settings(),
+            &admission.request_id,
+            &resolved_report(2, "req-crate"),
+        )
+        .await
+        .expect_err("attempt 2 is stale");
+        assert!(matches!(error, QueueError::StaleCompletion { .. }));
     }
 }

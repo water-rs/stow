@@ -1078,12 +1078,16 @@ pub struct CrateRequestStatus {
     /// run's `workflow_run` event has reported it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_run_id: Option<String>,
+    /// The run's URL, reported on the same event — the status page
+    /// links it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_run_url: Option<String>,
 }
 
 /// The edge's admission → the scheduler Durable Object's `POST /requests`
 /// route, which checks the human budget, deduplicates and dispatches the
 /// resolve run in one call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestAdmission {
     /// Deterministic request id ([`request_id`]).
     pub request_id: String,
@@ -1102,7 +1106,7 @@ pub struct RequestAdmission {
 
 /// The `request` `workflow_dispatch` input `resolve-request.yml` reads
 /// (`stow-admin request resolve --request` parses it verbatim).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestDispatch {
     /// The request record's id — also the webhook's run correlation.
     pub request_id: String,
@@ -1130,7 +1134,7 @@ pub struct RequestDispatch {
 }
 
 /// One CI target's root facts in the resolve job's outcome report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestRootOutcome {
     /// The CI target the entry describes.
     pub target: TargetTriple,
@@ -1151,7 +1155,7 @@ pub struct RequestRootOutcome {
 /// outcome table is assembled from, or the failure it hit — exclusive
 /// by type: a failed resolve submits no tasks, and a resolve that
 /// produced tasks is not a failure.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestOutcomeReport {
     /// The record attempt this report serves — the DO refuses reports
     /// naming a superseded attempt.
@@ -1161,7 +1165,7 @@ pub struct RequestOutcomeReport {
 }
 
 /// One arm of a [`RequestOutcomeReport`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RequestOutcome {
     /// The resolve completed: the batch of uncovered tasks across every
@@ -1183,7 +1187,7 @@ pub enum RequestOutcome {
 
 /// The `workflow_run` lifecycle event the webhook forwards to the DO's
 /// `/requests/{id}/run-update` route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestRunAction {
     /// `in_progress` — the resolve run started.
@@ -1196,7 +1200,7 @@ pub enum RequestRunAction {
 /// The `workflow_run` webhook's delivery for a `resolve-request.yml` run
 /// → the DO's `/requests/{id}/run-update` route, correlated by
 /// `request_id` + `attempt` parsed from the run-name.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestRunUpdate {
     /// The attempt the run serves, from the `a{attempt}` run-name leg.
     pub attempt: u32,

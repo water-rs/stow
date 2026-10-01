@@ -196,6 +196,7 @@ const SEED_TABLES: &[&str] = &[
     "queue_dependencies",
     "published_slice_rows",
     "published_slices",
+    "requests",
     "queue",
 ];
 
@@ -401,6 +402,11 @@ async fn rearm_fixture(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueE
     for statement in [
         "DELETE FROM queue_dependencies WHERE task_id LIKE '%-%'",
         "DELETE FROM queue WHERE task_id LIKE '%-%'",
+        // The request drives' artifacts: the admit drive's record and
+        // whatever state its outcome left. The two fixture records
+        // survive — `GET /requests/{id}` reads the `enqueued` one.
+        "DELETE FROM requests WHERE request_id NOT IN \
+         ('req-fixture-enqueued', 'req-fixture-failed')",
     ] {
         db.query(statement)
             .execute()
