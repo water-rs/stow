@@ -1,0 +1,95 @@
+name: Resolve a crate request
+
+# The request lane's completion signal parses `display_title` back into
+# the record's attempt and request id
+# (`stow_types::records::resolve_run_title`) — the edge passes the
+# precomputed title so a re-request's run can never land on a stale
+# attempt's name.
+run-name: ${{ fromJSON(inputs.request).run_title }}
+
+# The scheduler dispatches this workflow on `main` through the GitHub App
+# with the whole admission as one JSON input (`RequestDispatch`), exactly
+# the arm `build-crate.yml` already rides. The job resolves the request
+# with `stow-resolver` across `stow_types::CI_TARGET_TRIPLES` and reports
+# the outcome — `tasks` for the uncovered closures plus the per-target
+# roots — back through the edge's trusted submit surface under this
+# job's OIDC identity, the credential every submit lane shares
+# (stow#428). It never talks to the queue directly: `POST
+# /api/v1/scheduler/requests/{id}/outcome` enqueues and writes the
+# record's state in one call, and the `workflow_run` webhook reports the
+# run's progress.
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: JSON-encoded RequestDispatch
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: resolve-request-${{ fromJSON(inputs.request).request_id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The resolve's own CARGO_HOME — one directory, cached whole below, so
+  # the sparse crates.io index and fetched manifests stay warm between
+  # dispatches.
+  REQUEST_CARGO_HOME: ${{ github.workspace }}/.stow-request-cargo
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read # pull the pinned stow toolchain from GHCR
+      # Mints the run's OIDC token — the edge accepts any workflow OIDC
+      # minted inside water-rs/stow for the scheduler endpoints, and
+      # stow-admin refreshes it per request.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The resolver probes `rustc -vV` and `--print cfg`, so the
+      # toolchain is the request's rustc — and nothing more: no extra
+      # components, no cross targets, the minimal profile those two
+      # probes need.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ fromJSON(inputs.request).rustc_version }}
+      # stow-admin comes from the signed toolchain artifact the merge
+      # queue publishes per commit, never compiled in this job — the
+      # cold start is a verified pull, not a `cargo build`.
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # One cache entry per UTC day per rustc: the key lands once a day,
+      # `actions/cache` skips the save on an exact-key hit, and the
+      # restore-key prefixes hand every run the most recent index — the
+      # repo's 10 GB Actions allowance is not spent on per-request saves.
+      - name: Cache stamp
+        id: cache-stamp
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.REQUEST_CARGO_HOME }}
+          key: resolve-request-cargo-${{ runner.os }}-${{ fromJSON(inputs.request).rustc_version }}-${{ steps.cache-stamp.outputs.day }}
+          restore-keys: |
+            resolve-request-cargo-${{ runner.os }}-${{ fromJSON(inputs.request).rustc_version }}-
+            resolve-request-cargo-${{ runner.os }}-
+      - name: Resolve the request and submit its outcome
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+          REQUEST: ${{ inputs.request }}
+        # One cold-start line is logged from the payload's dispatch
+        # timestamp: `dispatch_to_submit_ms=<n>` when the outcome lands.
+        run: |
+          set -euo pipefail
+          stow-admin request resolve --request "$REQUEST" \
+            --cargo-home "$REQUEST_CARGO_HOME" --yes

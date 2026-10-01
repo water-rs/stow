@@ -51,6 +51,30 @@ pub fn parse_run_title(title: &str) -> Option<(&str, &str)> {
     (!rustc_version.is_empty() && !task_id.is_empty()).then_some((rustc_version, task_id))
 }
 
+/// The `run-name` `resolve-request.yml` stamps on its run —
+/// `resolve-a<attempt>-<request_id>`.
+///
+/// The `a<attempt>` leg pins the record's dispatch epoch so a stale
+/// run's `workflow_run` events cannot land on a re-request's live
+/// attempt, and the `resolve-` leg keeps the title's first-dash split
+/// disjoint from `build-crate.yml`'s `<rustc>-<task_id>`.
+#[must_use]
+pub fn resolve_run_title(attempt: u32, request_id: &str) -> String {
+    format!("resolve-a{attempt}-{request_id}")
+}
+
+/// The `(attempt, request_id)` a resolve run title names — the inverse
+/// of [`resolve_run_title`].
+///
+/// `None` when the title is not `resolve-a<attempt>-<request_id>`: not
+/// one of our resolve runs, or its name was hand-edited.
+#[must_use]
+pub fn parse_resolve_run_title(title: &str) -> Option<(u32, &str)> {
+    let (attempt, request_id) = title.strip_prefix("resolve-")?.split_once('-')?;
+    let attempt = attempt.strip_prefix('a')?.parse().ok()?;
+    (!request_id.is_empty()).then_some((attempt, request_id))
+}
+
 /// Tag prefix a records artifact publishes under: `records-<rustc>-<task_id hash>`.
 ///
 /// The leading `records-` keeps the tag namespace disjoint from bundle

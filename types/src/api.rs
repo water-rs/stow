@@ -1010,6 +1010,209 @@ pub struct CrateRequestOutcome {
     pub targets: Vec<CrateRequestTarget>,
 }
 
+/// Deterministic human-request id — `req-<crate>-<version>-<blake3
+/// (features_json)>-<rustc>`.
+///
+/// The request record's primary key and the `resolve-request.yml`
+/// run-name's correlation tail. Unlike a task id it carries no target:
+/// a request asks for every CI target's outcome and dedupes by
+/// identity alone.
+#[must_use]
+pub fn request_id(
+    crate_name: &str,
+    version: &str,
+    features_json: &str,
+    rustc_version: &str,
+) -> String {
+    let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
+    format!(
+        "req-{}-{}-{}-{}",
+        crate_name,
+        version,
+        features_hash,
+        rustc_version.replace('-', "_")
+    )
+}
+
+/// The request record's lifecycle — `POST /api/v1/requests` returns it
+/// `accepted`, and `GET /api/v1/requests/{request_id}` tracks it to
+/// `enqueued` or `failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CrateRequestPhase {
+    /// Turnstile admission and the daily-budget probe passed and the
+    /// `resolve-request.yml` run was dispatched.
+    Accepted,
+    /// The run reported `in_progress` — the resolve is executing.
+    Resolving,
+    /// The job's outcome report landed: `targets` carries the per-target
+    /// outcome the request lane used to answer inline.
+    Enqueued,
+    /// Dispatch, resolve or submission failed — `error` says which.
+    Failed,
+}
+
+/// `POST /api/v1/requests` response and `GET /api/v1/requests/{id}` for a
+/// `req-` id — the request record's point-in-time state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateRequestStatus {
+    /// The request's deterministic id ([`request_id`]).
+    pub request_id: String,
+    /// Echoed crate name.
+    pub crate_name: CrateName,
+    /// The resolved version.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Stable rustc the resolve targets.
+    pub rustc_version: WireRustcVersion,
+    /// Where the request stands.
+    pub status: CrateRequestPhase,
+    /// Per-target outcomes in [`CI_TARGET_TRIPLES`] order — populated
+    /// once `status` is [`CrateRequestPhase::Enqueued`].
+    pub targets: Vec<CrateRequestTarget>,
+    /// What failed when `status` is [`CrateRequestPhase::Failed`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The Actions run id serving the record's live attempt, once the
+    /// run's `workflow_run` event has reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_run_id: Option<String>,
+}
+
+/// The edge's admission → the scheduler Durable Object's `POST /requests`
+/// route, which checks the human budget, deduplicates and dispatches the
+/// resolve run in one call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestAdmission {
+    /// Deterministic request id ([`request_id`]).
+    pub request_id: String,
+    /// The requested crate.
+    pub crate_name: CrateName,
+    /// The resolved version.
+    pub version: CrateVersion,
+    /// Canonical features JSON.
+    pub features_json: FeaturesJson,
+    /// Stable rustc the resolve targets.
+    pub rustc_version: WireRustcVersion,
+    /// The `STOW_HUMAN_MAX_CLOSURE` the edge admitted under — the job's
+    /// closure cap.
+    pub max_closure: u32,
+}
+
+/// The `request` `workflow_dispatch` input `resolve-request.yml` reads
+/// (`stow-admin request resolve --request` parses it verbatim).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestDispatch {
+    /// The request record's id — also the webhook's run correlation.
+    pub request_id: String,
+    /// The record's dispatch epoch — a failed record's re-request bumps
+    /// it, and the run-name carries it so a stale run's webhook events
+    /// cannot land on the live attempt.
+    pub attempt: u32,
+    /// The GitHub run-name to stamp — `resolve-a{attempt}-{request_id}`,
+    /// built here so the title format has a single owner (the webhook
+    /// parses it back).
+    pub run_title: String,
+    /// The requested crate.
+    pub crate_name: CrateName,
+    /// The resolved version.
+    pub version: CrateVersion,
+    /// Canonical features JSON the seed set resolves from.
+    pub features_json: FeaturesJson,
+    /// Stable rustc the resolve targets.
+    pub rustc_version: WireRustcVersion,
+    /// The closure cap the edge admitted under.
+    pub max_closure: u32,
+    /// Unix seconds at which the edge dispatched the run — the job's
+    /// dispatch-to-submit timing baseline.
+    pub dispatched_at: i64,
+}
+
+/// One CI target's root facts in the resolve job's outcome report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestRootOutcome {
+    /// The CI target the entry describes.
+    pub target: TargetTriple,
+    /// The lib-root task id; `None` when the crate publishes no library —
+    /// the target's outcome then reads
+    /// [`CrateRequestState::ClosureQueued`].
+    pub task_id: Option<String>,
+    /// The published `index.<target>.<rustc>` slice already serves the
+    /// lib root — the target reads [`CrateRequestState::Cached`] and its
+    /// closure was not enqueued.
+    pub cached: bool,
+}
+
+/// `POST /api/v1/scheduler/requests/{request_id}/outcome` — the resolve
+/// job's report.
+///
+/// Either the resolved batch plus the per-target roots the record's
+/// outcome table is assembled from, or the failure it hit — exclusive
+/// by type: a failed resolve submits no tasks, and a resolve that
+/// produced tasks is not a failure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestOutcomeReport {
+    /// The record attempt this report serves — the DO refuses reports
+    /// naming a superseded attempt.
+    pub attempt: u32,
+    /// What the resolve produced.
+    pub outcome: RequestOutcome,
+}
+
+/// One arm of a [`RequestOutcomeReport`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RequestOutcome {
+    /// The resolve completed: the batch of uncovered tasks across every
+    /// target's closure — forwarded to the trusted enqueue verbatim —
+    /// plus the per-target root facts in [`CI_TARGET_TRIPLES`] order.
+    Resolved {
+        /// The uncovered human-lane tasks across every target's closure.
+        tasks: Vec<EnqueueRequest>,
+        /// Per-target root facts in [`CI_TARGET_TRIPLES`] order.
+        roots: Vec<RequestRootOutcome>,
+    },
+    /// The resolve failed — `error` names the step, and the record is
+    /// marked `failed` with it.
+    Failed {
+        /// What the resolve died on.
+        error: String,
+    },
+}
+
+/// The `workflow_run` lifecycle event the webhook forwards to the DO's
+/// `/requests/{id}/run-update` route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestRunAction {
+    /// `in_progress` — the resolve run started.
+    InProgress,
+    /// `completed` — the run finished; the record fails unless the job's
+    /// outcome report already marked it `enqueued`.
+    Completed,
+}
+
+/// The `workflow_run` webhook's delivery for a `resolve-request.yml` run
+/// → the DO's `/requests/{id}/run-update` route, correlated by
+/// `request_id` + `attempt` parsed from the run-name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestRunUpdate {
+    /// The attempt the run serves, from the `a{attempt}` run-name leg.
+    pub attempt: u32,
+    /// Which lifecycle event the delivery carries.
+    pub action: RequestRunAction,
+    /// `workflow_run.conclusion` on a `completed` delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<String>,
+    /// The Actions run id — recorded on the record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The run's `html_url` — carried into `error` on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_url: Option<String>,
+}
+
 /// Point-in-time view of one scheduler task, returned by
 /// `GET /api/v1/requests/{task_id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

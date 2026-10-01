@@ -598,8 +598,9 @@ fn host_triple(target: &TargetTriple) -> String {
 /// The set of task ids the published slices already serve — semantic
 /// identity coverage per the queue gate's shape rules: a host-side node
 /// needs both invocation spellings' linked rows; a target-side node the
-/// linked+unlinked pair of its own spelling.
-async fn covered_nodes(
+/// linked+unlinked pair of its own spelling. `pub` for the request
+/// lane, which reports its `cached` roots off this set.
+pub async fn covered_nodes(
     index: &Index<'_>,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
@@ -670,17 +671,18 @@ async fn covered_nodes(
     Ok(covered)
 }
 
-/// The three handles the index-slice pulls share.
-struct Index<'a> {
-    session: &'a stow_oci::RegistrySession,
-    base: &'a stow_oci::RegistryBase,
-    trust: &'a stow_oci::verify::Trust,
+/// The three handles the index-slice pulls share — `pub` so the
+/// request lane pulls the same verified slices.
+pub struct Index<'a> {
+    pub session: &'a stow_oci::RegistrySession,
+    pub base: &'a stow_oci::RegistryBase,
+    pub trust: &'a stow_oci::verify::Trust,
 }
 
 /// Pull and verify the published `index.<target>.<rustc>` slice —
 /// `None` when the tag does not exist (a fresh registry serves an empty
 /// catalog, not an error).
-async fn published_slice_rows(
+pub async fn published_slice_rows(
     index: &Index<'_>,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
