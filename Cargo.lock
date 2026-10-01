@@ -9071,6 +9071,7 @@ name = "stow-shim"
 version = "0.6.0"
 dependencies = [
  "dirs 7.0.0",
+ "same-file",
  "stow-types",
  "zstd",
 ]
