@@ -29,6 +29,12 @@ pub enum Request {
     /// mark before rustc starts and the report after it ends. One-way:
     /// the supervisor never answers it.
     Observed(Observed),
+    /// A facade whose unit a `pending` serve map does not cover asks the
+    /// supervisor to answer only once the build's final map has landed —
+    /// or at once when it already has. The wait moves off the file
+    /// system so every platform speaks it over the transport it already
+    /// carries (stow#347).
+    AwaitServeMap(AwaitServeMap),
 }
 
 /// One rustc invocation as the facade received it.
@@ -129,6 +135,13 @@ impl Observed {
     }
 }
 
+/// The serve-map wait is the whole request — the token is its only
+/// payload, since the answer's timing, not its contents, is the signal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AwaitServeMap {
+    pub token: String,
+}
+
 /// What the supervisor answers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Answer {
@@ -141,6 +154,9 @@ pub enum Answer {
     /// The report was applied; the facade exits with the compile's own
     /// status.
     Recorded,
+    /// The build's serve map is final: the facade re-reads the map file
+    /// and decides on what it finds (stow#347).
+    ServeMapReady,
     /// The supervisor could not answer. The facade fails the build with
     /// this message rather than quietly compiling without the cache.
     Failed { message: String },

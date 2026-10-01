@@ -613,6 +613,11 @@ pub(crate) struct BuildContext {
     /// though the build carried no expanded graph and no prefetch
     /// ledger: semantic fallback off, no candidates.
     pub(crate) analysis: std::sync::Arc<std::sync::OnceLock<AnalysisFacts>>,
+    /// The "the serve map is final" signal `AwaitServeMap` frames wait
+    /// on: `run_cargo` shares the enrichment's with the supervisor, the
+    /// standalone wrapper's settles by construction — a driver with no
+    /// pending map answers at once (stow#347).
+    pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
 }
 
 /// What the graph analysis adds to the plan path when it commits: the
@@ -671,6 +676,7 @@ impl BuildContext {
                 expanded_entries,
                 prefetch_candidates,
             })),
+            serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
         })
     }
 
@@ -802,6 +808,10 @@ impl supervisor::server::Handler for BuildSupervisor {
         let local_base = self.env_cache.local_base(&pending.executable).await;
         self.finish_and_observe(&pending, success, local_base.as_deref())
             .await;
+    }
+
+    async fn await_serve_map(self: &std::sync::Arc<Self>) {
+        self.ctx.serve_map_ready.wait().await;
     }
 
     async fn observed(self: &std::sync::Arc<Self>, observation: supervisor::server::Observation) {

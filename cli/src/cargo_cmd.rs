@@ -3596,10 +3596,13 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     // The serve map lands as a file — small enough to write atomically
     // and large enough that an env blob on every rustc process's
     // environment was the wrong transport (stow#347). A map still
-    // `pending` binds its readiness gate alongside: facades whose units
-    // it cannot cover wait on the gate's close rather than compiling
-    // what the in-flight fetch may cover.
-    let (serve_map_path, serve_gate) = write_initial_serve_map(config, plan.servable_units)?;
+    // `pending` arms the waiters' signal alongside: facades whose units
+    // it cannot cover ask the supervisor to hold them until the final
+    // write lands rather than compiling what the in-flight fetch may
+    // cover.
+    let serve_map_ready = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
+    let (serve_map_path, serve_waiters) =
+        write_initial_serve_map(config, plan.servable_units, &serve_map_ready)?;
     export_wrapper_env(&mut command, plan, &wrappers, serve_map_path.as_deref())?;
 
     // Every rustc invocation this cargo run spawns is a facade that asks
@@ -3610,23 +3613,29 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     // deciding process holds the resolved values itself (stow#347).
     let analysis_cell = std::sync::Arc::new(std::sync::OnceLock::new());
     if !plan.defer_analysis {
-        let _ = analysis_cell.set(crate::AnalysisFacts {
-            semantic_fallback_enabled,
-            expanded_entries: expanded_entries.map(<[DependencyGraphEntry]>::to_vec),
-            prefetch_candidates: prefetch_artifacts.map_or_else(BTreeMap::new, |artifacts| {
-                crate::prefetch_candidate_c_metadatas(
-                    artifacts
-                        .iter()
-                        .map(|artifact| (artifact.crate_name.clone(), artifact.c_metadata.clone())),
-                )
-            }),
-        });
+        analysis_cell
+            .set(crate::AnalysisFacts {
+                semantic_fallback_enabled,
+                expanded_entries: expanded_entries.map(<[DependencyGraphEntry]>::to_vec),
+                prefetch_candidates: prefetch_artifacts.map_or_else(BTreeMap::new, |artifacts| {
+                    crate::prefetch_candidate_c_metadatas(
+                        artifacts.iter().map(|artifact| {
+                            (artifact.crate_name.clone(), artifact.c_metadata.clone())
+                        }),
+                    )
+                }),
+            })
+            .expect(
+                "the analysis cell is written once per build; the pre-cargo fill is its only \
+                 writer when the analysis is not deferred",
+            );
     }
     let handler = std::sync::Arc::new(crate::BuildSupervisor::new(crate::BuildContext {
         policy_dir: cache_policy_path.map(Path::to_path_buf),
         public_cache_target: Some(project.target.clone()),
         public_cache_disabled: public_cache_mode.disable_reason().is_some(),
         analysis: std::sync::Arc::clone(&analysis_cell),
+        serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
     }));
     let supervisor = crate::supervisor::server::start(handler.clone())
         .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
@@ -3653,7 +3662,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
             cell: analysis_cell,
             map_path: serve_map_path.clone(),
             policy_dir: cache_policy_path.map(Path::to_path_buf),
-            readiness: serve_gate,
+            readiness: serve_waiters,
         });
     }
 
@@ -3773,7 +3782,8 @@ fn export_wrapper_env(
 fn write_initial_serve_map(
     config: Option<&StowConfig>,
     map: Option<&crate::facade::ServeMap>,
-) -> stow_types::error::Result<(Option<PathBuf>, Option<crate::facade::ServeMapGate>)> {
+    serve_map_ready: &std::sync::Arc<crate::facade::ServeMapSignal>,
+) -> stow_types::error::Result<(Option<PathBuf>, Option<crate::facade::ServeMapWaiters>)> {
     let (Some(config), Some(map)) = (config, map) else {
         return Ok((None, None));
     };
@@ -3788,15 +3798,14 @@ fn write_initial_serve_map(
         std::process::id(),
         crate::state_db::now_millis()
     ));
-    // Bind the readiness gate before the map that announces it: a facade
-    // that reads `pending` and finds no gate decides on the map it has —
-    // never hangs on a gate that failed to exist. An empty pending map
-    // waits on nothing (stow#347).
-    let gate = (map.pending && !map.is_empty())
-        .then(|| crate::facade::ServeMapGate::bind(&path))
-        .flatten();
+    // Arm the waiters' guard before the map that announces it: a facade
+    // that reads `pending` asks the supervisor to hold it — the signal
+    // exists by construction, so there is no bind to fail here. An
+    // empty pending map waits on nothing (stow#347).
+    let waiters = (map.pending && !map.is_empty())
+        .then(|| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(serve_map_ready)));
     write_serve_map(&path, map)?;
-    Ok((Some(path), gate))
+    Ok((Some(path), waiters))
 }
 
 /// Write `map` to `path` through a tmp file + rename — a facade reading
@@ -3824,10 +3833,11 @@ struct BuildEnrichment {
     cell: std::sync::Arc<std::sync::OnceLock<crate::AnalysisFacts>>,
     map_path: Option<PathBuf>,
     policy_dir: Option<PathBuf>,
-    /// The pending serve map's readiness gate: held open until this task
-    /// finishes — its drop is the close that releases the facades
-    /// waiting for the final map (stow#347).
-    readiness: Option<crate::facade::ServeMapGate>,
+    /// The pending serve map's completion guard: held until this task
+    /// has written the final map — and its drop releases the facades
+    /// waiting on `AwaitServeMap` whichever way the analysis ends
+    /// (stow#347).
+    readiness: Option<crate::facade::ServeMapWaiters>,
 }
 
 /// Run the full graph analysis while cargo builds and commit what it
@@ -3846,12 +3856,13 @@ fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> 
 }
 
 async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::Result<()> {
-    // A `pending` map's facades are waiting on the gate: answer them as
-    // soon as coverage is knowable — the fresh slice landed, the
-    // filesystem pass rebuilt with it — rather than after the metadata
-    // resolve and the prefetch. The write clears `pending` (the cached
-    // slices now exist) and the gate's drop releases the waiters
-    // (stow#347).
+    // A `pending` map's facades are waiting on the supervisor for the
+    // final map: answer them as soon as coverage is knowable — the
+    // fresh slice landed, the filesystem pass rebuilt with it — rather
+    // than after the metadata resolve and the prefetch. The write
+    // clears `pending` (the cached slices now exist) and the guard's
+    // drop releases the waiters; an early return releases them the
+    // same way (stow#347).
     if work.readiness.is_some()
         && let Some(map_path) = &work.map_path
     {
@@ -3879,16 +3890,21 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     if let Some(policy_dir) = &work.policy_dir {
         cache_policy::write_policy_entries(policy_dir, &analysis.cache_policy_entries).await?;
     }
-    let _ = work.cell.set(crate::AnalysisFacts {
-        semantic_fallback_enabled: !analysis.expanded_entries.is_empty(),
-        expanded_entries: Some(analysis.expanded_entries.clone()),
-        prefetch_candidates: crate::prefetch_candidate_c_metadatas(
-            analysis
-                .prefetch_artifacts
-                .iter()
-                .map(|artifact| (artifact.crate_name.clone(), artifact.c_metadata.clone())),
-        ),
-    });
+    work.cell
+        .set(crate::AnalysisFacts {
+            semantic_fallback_enabled: !analysis.expanded_entries.is_empty(),
+            expanded_entries: Some(analysis.expanded_entries.clone()),
+            prefetch_candidates: crate::prefetch_candidate_c_metadatas(
+                analysis
+                    .prefetch_artifacts
+                    .iter()
+                    .map(|artifact| (artifact.crate_name.clone(), artifact.c_metadata.clone())),
+            ),
+        })
+        .expect(
+            "the analysis cell is written once per build; a deferred build's enrichment is its \
+             only writer",
+        );
     // The prefetch is the last step and best-effort: the artifacts it
     // warms are what the plan path serves, and a unit reached before its
     // artifact lands still fetches on demand.

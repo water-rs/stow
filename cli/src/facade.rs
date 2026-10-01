@@ -16,8 +16,8 @@
 //! intact — what is gone is the plan round trip the decision used to
 //! cost.
 
-use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
@@ -25,7 +25,7 @@ use stow_types::public_cache::{canonical_crate_name, detect_registry_crate_versi
 use stow_types::rustc::ParsedRustcArgs;
 
 use crate::rustc_args;
-use crate::supervisor::protocol::{Observed, Request};
+use crate::supervisor::protocol::{Answer, AwaitServeMap, Observed, Request};
 use crate::supervisor::{self, Endpoint};
 
 /// The `stow build` wiring carrying the serve-map file path to every
@@ -58,10 +58,11 @@ pub struct ServeMap {
     pub host: Vec<(String, String)>,
     /// The map may still grow: the driver wrote it from its cached slices
     /// alone because the fresh index fetch could not finish before cargo
-    /// started (stow#347). A facade the map cannot cover waits on the
-    /// readiness gate this flag announces rather than compiling a unit
-    /// the fetch may be about to cover; the driver's full analysis lands
-    /// by rewriting this file with `pending` cleared.
+    /// started (stow#347). A facade whose crate the map names but whose
+    /// unit it does not cover asks the supervisor — `AwaitServeMap` over
+    /// the build's existing transport — to hold it until the driver's
+    /// full analysis rewrites this file with `pending` cleared, rather
+    /// than compiling a unit the fetch may be about to cover.
     #[serde(default)]
     pub pending: bool,
 }
@@ -103,7 +104,7 @@ impl ServeMap {
 
     /// Any coverage at all, exact or wildcard: the empty map is the
     /// build that provably has nothing to serve yet — nothing local, no
-    /// cached slice — so a `pending` empty map waits on nothing
+    /// cached slice — so a `pending` map names nothing to wait on
     /// (stow#347).
     pub const fn is_empty(&self) -> bool {
         self.target.is_empty() && self.host.is_empty()
@@ -121,6 +122,20 @@ impl ServeMap {
         entries.iter().any(|(entry_name, entry_version)| {
             entry_name == canonical_name && (entry_version == version || entry_version == WILDCARD)
         })
+    }
+
+    /// Whether the build ever covered `name`: any version, either side.
+    /// A pending map's wait applies only to a crate this could still
+    /// gain coverage for — the local artifacts or a previous slice
+    /// already know it, so the fresh fetch plausibly adds the shape
+    /// this unit needs; a crate nobody covered waits on a lottery, and
+    /// stalling every first-wave unit on that measured about 0.8 s over
+    /// cargo's own noise (stow#347).
+    fn names(&self, canonical_name: &str) -> bool {
+        self.target
+            .iter()
+            .chain(&self.host)
+            .any(|(entry_name, _)| entry_name == canonical_name)
     }
 }
 
@@ -200,14 +215,14 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
     if invocation_covers(&map) {
         return Ok(FastPath::Defer);
     }
-    // A pending map's "not covered" is provisional — but only when the
-    // build provably has coverage the fetch may add to. An empty map
-    // means nothing local and no cached slice: the fetch is a lottery,
-    // and stalling every unit on it is exactly the slowdown the map
-    // exists to remove, so the facade compiles and units arriving after
-    // the final write still defer on it (stow#347).
-    if map.pending && !map.is_empty() {
-        wait_for_serve_map(&map_path);
+    // A pending map's "not covered" is provisional — but only for a
+    // crate the build already covers at some shape. A crate the local
+    // artifacts and the cached slices never covered waits on a
+    // lottery, and measured against cargo that stall is above noise, so
+    // the facade compiles and units arriving after the final write
+    // still defer on it (stow#347).
+    if map.pending && map.names(&canonical_crate_name(&crate_name)) {
+        await_serve_map(&endpoint, &token)?;
         map = ServeMap::read(&map_path)?;
         if invocation_covers(&map) {
             return Ok(FastPath::Defer);
@@ -263,94 +278,235 @@ fn run_uncovered(
     Ok(status.code().unwrap_or(1))
 }
 
-/// The path the driver's readiness gate binds for `map_path`:
-/// `<map>.wait`, the socket whose close tells every waiting facade the
-/// map is final.
-#[cfg(unix)]
-fn wait_socket_path(map_path: &Path) -> PathBuf {
-    let mut name = map_path
-        .file_name()
-        .map(OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(".wait");
-    map_path.with_file_name(name)
-}
-
-/// Wait on the gate a `pending` serve map announced: connect to its
-/// socket and block until the driver closes it — the final map has
-/// landed — or the bounded timeout expires. A gate that is absent (the
-/// driver never bound one, or its process already went away) reads as
-/// "decide on the map as it stands". Non-unix platforms have no gate:
-/// they decide on the map immediately (stow#347).
-#[cfg(unix)]
-fn wait_for_serve_map(map_path: &Path) {
-    use std::io::Read as _;
-
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(wait_socket_path(map_path)) else {
-        return;
+/// Ask the supervisor to hold this facade until the pending serve map
+/// is final: one `AwaitServeMap` frame, one `ServeMapReady` answer. The
+/// wait rides the transport every platform already speaks — unix socket
+/// or loopback TCP — so nothing here is unix-only anymore (stow#347).
+///
+/// What ends the wait is the supervisor's word or its absence: a driver
+/// that dies drops the connection, a driver whose analysis failed
+/// completes the signal anyway, and the read timeout bounds a driver
+/// that is alive but stuck — every ending leaves the facade deciding on
+/// the map it has, since the map file is re-read either way. What fails
+/// loudly is what means a bug: a refused request, a malformed frame,
+/// and a stream that cannot take the read bound it would otherwise
+/// silently ignore.
+fn await_serve_map(endpoint: &Endpoint, token: &str) -> stow_types::error::Result<()> {
+    let Ok(mut wire) = connect(endpoint) else {
+        // The supervisor being gone means the driver is gone: the map
+        // as it stands is the decision. If the driver is somehow alive
+        // but unreachable, the mark's own connect — still to come — is
+        // where that failure must surface.
+        return Ok(());
     };
-    let _ = stream.set_read_timeout(Some(SERVE_MAP_WAIT_TIMEOUT));
-    let mut byte = [0_u8; 1];
-    let _ = (&stream).read(&mut byte);
-}
-
-/// Non-unix builds have no gate to wait on; a pending map decides as-is.
-#[cfg(not(unix))]
-fn wait_for_serve_map(_map_path: &Path) {}
-
-/// The readiness gate a pending serve map leaves open, on unix the bound
-/// `<map>.wait` listener: every facade blocked on it wakes when this is
-/// dropped — after the driver's final map write, on error, or on process
-/// exit, so a waiter can never hang past the driver's lifetime. Other
-/// platforms carry no gate (stow#347).
-#[cfg(unix)]
-pub struct ServeMapGate {
-    /// Held only to be dropped; closing the socket is the signal, so the
-    /// listener is never read back.
-    #[allow(dead_code)]
-    listener: std::os::unix::net::UnixListener,
-}
-
-#[cfg(unix)]
-impl ServeMapGate {
-    /// Bind `<map>.wait`; `None` when the socket cannot be created — a
-    /// facade then finds no gate and decides on the map it has.
-    pub fn bind(map_path: &Path) -> Option<Self> {
-        std::os::unix::net::UnixListener::bind(wait_socket_path(map_path))
-            .ok()
-            .map(|listener| Self { listener })
+    wire.set_read_timeout(Some(SERVE_MAP_WAIT_TIMEOUT))
+        .map_err(|error| stow_types::stow_error!("bound the serve-map wait's read: {error}"))?;
+    let request = Request::AwaitServeMap(AwaitServeMap {
+        token: token.to_owned(),
+    });
+    if write_request(&mut wire, &request).is_err() {
+        // The write only fails against a driver that is already gone.
+        return Ok(());
+    }
+    match read_answer(&mut wire) {
+        Ok(Some(Answer::ServeMapReady) | None) | Err(FrameError::Io) => Ok(()),
+        Ok(Some(Answer::Failed { message })) => Err(stow_types::stow_error!(
+            "the supervisor refused the serve-map wait: {message}"
+        )),
+        Ok(Some(answer)) => Err(stow_types::stow_error!(
+            "the supervisor answered the serve-map wait with {answer:?}"
+        )),
+        Err(FrameError::Malformed(message)) => Err(stow_types::stow_error!(
+            "the serve-map wait read a malformed frame: {message}"
+        )),
     }
 }
 
-/// The readiness gate a pending serve map leaves open: absent on
-/// non-unix builds, whose facades decide on the map as it stands.
-#[cfg(not(unix))]
-pub struct ServeMapGate;
+/// The build's "the serve map is final" signal, spoken over the
+/// supervisor transport as `AwaitServeMap`: the enrichment completes it
+/// once the pending map's final write lands, and the waiters' guard
+/// completes it on drop, so a failed or cancelled analysis still
+/// releases every facade it held. The whole signal dying — supervisor
+/// included — drops the waiter's connection the same way (stow#347).
+#[derive(Debug)]
+pub struct ServeMapSignal {
+    ready: tokio::sync::watch::Sender<bool>,
+}
 
-#[cfg(not(unix))]
-impl ServeMapGate {
-    /// No gate exists to bind on this platform.
-    pub fn bind(_map_path: &Path) -> Option<Self> {
-        None
+impl ServeMapSignal {
+    /// A signal that has not yet seen the final write.
+    #[must_use]
+    pub fn pending() -> Self {
+        Self {
+            ready: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    /// A signal already final — the at-once answer a supervisor with no
+    /// pending map to wait on gives.
+    #[must_use]
+    pub fn settled() -> Self {
+        Self {
+            ready: tokio::sync::watch::channel(true).0,
+        }
+    }
+
+    /// The final map has landed: release every waiter.
+    pub fn complete(&self) {
+        let _ = self.ready.send(true);
+    }
+
+    /// Wait for [`Self::complete`], or for the signal's own end: a
+    /// sender that is gone resolves the same wait a completed one does.
+    pub async fn wait(&self) {
+        let mut receiver = self.ready.subscribe();
+        if !*receiver.borrow() {
+            let _ = receiver.changed().await;
+        }
     }
 }
 
-/// A blocking connection to the supervisor — two frame writes on the
-/// fast path's behalf, no runtime and no round trip.
-fn connect(endpoint: &Endpoint) -> std::io::Result<Box<dyn Write>> {
+impl Default for ServeMapSignal {
+    /// A context nobody armed has no pending map: the answer is at once.
+    fn default() -> Self {
+        Self::settled()
+    }
+}
+
+/// The completion side of a pending map's signal: dropping it — the
+/// successful write, a failed fetch, a cancelled task — completes the
+/// signal, so a facade's wait can never outlive the analysis it waits
+/// on (stow#347).
+#[derive(Debug)]
+pub struct ServeMapWaiters(std::sync::Arc<ServeMapSignal>);
+
+impl ServeMapWaiters {
+    /// Arm `signal` for this build's pending map.
+    pub const fn new(signal: std::sync::Arc<ServeMapSignal>) -> Self {
+        Self(signal)
+    }
+}
+
+impl Drop for ServeMapWaiters {
+    fn drop(&mut self) {
+        self.0.complete();
+    }
+}
+
+/// The stream a facade opens to its supervisor — unix socket on unix,
+/// loopback TCP elsewhere: the transport the Windows build's facades
+/// already speak (stow#347).
+enum FacadeStream {
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+    Tcp(std::net::TcpStream),
+}
+
+impl FacadeStream {
+    /// Bound the wait's read: the `ServeMapReady` answer cannot stall a
+    /// unit queue past it.
+    fn set_read_timeout(&self, duration: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_read_timeout(duration),
+            Self::Tcp(stream) => stream.set_read_timeout(duration),
+        }
+    }
+}
+
+impl Read for FacadeStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buffer),
+            Self::Tcp(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for FacadeStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.write(buffer),
+            Self::Tcp(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.flush(),
+            Self::Tcp(stream) => stream.flush(),
+        }
+    }
+}
+
+/// A blocking connection to the supervisor — frame writes and the
+/// serve-map wait on the fast path's behalf, no runtime.
+fn connect(endpoint: &Endpoint) -> std::io::Result<FacadeStream> {
     match endpoint {
         #[cfg(unix)]
-        Endpoint::Unix(path) => std::os::unix::net::UnixStream::connect(Path::new(path))
-            .map(|stream| Box::new(stream) as Box<dyn Write>),
-        Endpoint::Loopback(port) => std::net::TcpStream::connect(("127.0.0.1", *port))
-            .map(|stream| Box::new(stream) as Box<dyn Write>),
+        Endpoint::Unix(path) => {
+            std::os::unix::net::UnixStream::connect(Path::new(path)).map(FacadeStream::Unix)
+        }
+        Endpoint::Loopback(port) => {
+            std::net::TcpStream::connect(("127.0.0.1", *port)).map(FacadeStream::Tcp)
+        }
     }
 }
 
-/// One one-way `Observed` frame: length prefix plus JSON body, the same
-/// wire `client::Connection` speaks.
+/// One length-prefixed request frame: the same wire
+/// `client::Connection` speaks, minus the runtime.
+fn write_request(wire: &mut FacadeStream, request: &Request) -> std::io::Result<()> {
+    let body = serde_json::to_vec(request).expect("a request frame always serializes");
+    let length = u32::try_from(body.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "frame exceeds the wire limit",
+        )
+    })?;
+    wire.write_all(&length.to_le_bytes())?;
+    wire.write_all(&body)?;
+    wire.flush()
+}
+
+/// Why a blocking read of one answer frame failed: the transport broke
+/// — driver death, the wait's own bound — or the frame did not parse.
+/// `Io` carries no detail because every transport failure ends the wait
+/// the same way: the facade decides on the map it has.
+enum FrameError {
+    Io,
+    Malformed(String),
+}
+
+/// Read one answer frame, blocking. `Ok(None)` is a clean end of
+/// stream — the driver closed between frames — the same semantic the
+/// async `read_frame` gives the supervisor.
+fn read_answer(wire: &mut FacadeStream) -> Result<Option<Answer>, FrameError> {
+    let mut length_bytes = [0_u8; 4];
+    match wire.read_exact(&mut length_bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(_) => return Err(FrameError::Io),
+    }
+    let length = u32::from_le_bytes(length_bytes);
+    if length > 4 * 1024 * 1024 {
+        return Err(FrameError::Malformed(format!(
+            "peer announced a {length}-byte frame"
+        )));
+    }
+    let mut body = vec![0_u8; length as usize];
+    wire.read_exact(&mut body).map_err(|_| FrameError::Io)?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|error| FrameError::Malformed(format!("decode frame: {error}")))
+}
+
+/// One one-way `Observed` frame: mark or report, on the same wire
+/// `client::Connection` speaks.
 fn write_observed(
-    wire: &mut dyn Write,
+    wire: &mut FacadeStream,
     token: &str,
     executable: &OsString,
     wrapped_args: &[OsString],
@@ -364,21 +520,15 @@ fn write_observed(
         out_dir,
         success,
     ));
-    let body = serde_json::to_vec(&request).expect("an Observed frame always serializes");
-    let length = u32::try_from(body.len()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "frame exceeds the wire limit",
-        )
-    })?;
-    wire.write_all(&length.to_le_bytes())?;
-    wire.write_all(&body)?;
-    wire.flush()
+    write_request(wire, &request)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+
     use super::{ServeMap, WILDCARD};
+    use crate::supervisor::Endpoint;
 
     fn map(target: &[(&str, &str)], host: &[(&str, &str)]) -> ServeMap {
         ServeMap {
@@ -449,41 +599,118 @@ mod tests {
         assert!(decoded.pending);
     }
 
-    /// Dropping the gate wakes the facade blocked on it, so a pending
-    /// map's wait ends when the driver's final map lands (stow#347).
-    #[cfg(unix)]
-    #[test]
-    fn the_gate_releases_its_waiters_when_dropped() {
-        use std::time::{Duration, Instant};
-
-        let dir = std::env::temp_dir().join(format!("stow-gate-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create gate dir");
-        let map_path = dir.join("serve-map.json");
-        let gate = super::ServeMapGate::bind(&map_path).expect("bind the gate");
-        let waiter = std::thread::spawn(move || {
-            super::wait_for_serve_map(&map_path);
-            Instant::now()
+    /// Accept one `AwaitServeMap` frame on a loopback listener and
+    /// answer it with `answer` — after `hold`, so the test can see the
+    /// wait actually waited. Returns the port the facade connects to
+    /// and the frame the peer read.
+    fn serve_one_await(
+        hold: std::time::Duration,
+        answer: &super::Answer,
+    ) -> (u16, std::thread::JoinHandle<super::Request>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let answer = answer.clone();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept the facade");
+            let mut length_bytes = [0_u8; 4];
+            peer.read_exact(&mut length_bytes).expect("read length");
+            let mut body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
+            peer.read_exact(&mut body).expect("read body");
+            let request: super::Request = serde_json::from_slice(&body).expect("request frame");
+            std::thread::sleep(hold);
+            let encoded = serde_json::to_vec(&answer).expect("answer frame");
+            peer.write_all(
+                &u32::try_from(encoded.len())
+                    .expect("frame length fits u32")
+                    .to_le_bytes(),
+            )
+            .expect("write length");
+            peer.write_all(&encoded).expect("write body");
+            peer.flush().expect("flush");
+            request
         });
-        // Give the waiter its moment to block, then close the gate.
-        std::thread::sleep(Duration::from_millis(50));
-        let released = Instant::now();
-        drop(gate);
-        let woke = waiter.join().expect("waiter returns");
-        assert!(woke - released < Duration::from_secs(5));
-        std::fs::remove_dir_all(&dir).ok();
+        (port, server)
     }
 
-    /// A facade that finds no gate decides immediately — the driver may
-    /// have finished before this unit ever ran (stow#347).
-    #[cfg(unix)]
+    /// The serve-map wait rides the supervisor transport the Windows
+    /// build uses: a loopback peer that answers once the final map
+    /// lands releases the facade — the wait is the peer's word, not a
+    /// unix socket's close (stow#347).
     #[test]
-    fn a_missing_gate_never_blocks() {
+    fn the_wait_rides_the_loopback_transport() {
         use std::time::{Duration, Instant};
 
-        let map_path =
-            std::env::temp_dir().join(format!("stow-gate-absent-{}.json", std::process::id()));
+        let (port, server) =
+            serve_one_await(Duration::from_millis(80), &super::Answer::ServeMapReady);
         let started = Instant::now();
-        super::wait_for_serve_map(&map_path);
+        super::await_serve_map(&Endpoint::Loopback(port), "the-token").expect("the wait");
+        let waited = started.elapsed();
+        let request = server.join().expect("server thread");
+        assert_eq!(
+            request,
+            super::Request::AwaitServeMap(super::AwaitServeMap {
+                token: "the-token".to_owned()
+            })
+        );
+        assert!(waited >= Duration::from_millis(80), "{waited:?}");
+        assert!(waited < super::SERVE_MAP_WAIT_TIMEOUT, "{waited:?}");
+    }
+
+    /// A driver that dies mid-wait drops the connection; the facade
+    /// decides on the map it has rather than hanging on a signal that
+    /// can never come (stow#347).
+    #[test]
+    fn a_driver_that_dies_releases_the_wait() {
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept the facade");
+            let mut length_bytes = [0_u8; 4];
+            peer.read_exact(&mut length_bytes).expect("read length");
+            let mut body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
+            peer.read_exact(&mut body).expect("read body");
+            drop(peer);
+        });
+        let started = Instant::now();
+        super::await_serve_map(&Endpoint::Loopback(port), "the-token").expect("the wait");
+        server.join().expect("server thread");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A supervisor that refuses the wait — the wrong-token answer — is
+    /// a protocol bug the facade surfaces, not a release (stow#347).
+    #[test]
+    fn a_refused_wait_fails_loudly() {
+        use std::time::Duration;
+
+        let (port, server) = serve_one_await(
+            Duration::ZERO,
+            &super::Answer::Failed {
+                message: "supervisor token mismatch".to_owned(),
+            },
+        );
+        let error = super::await_serve_map(&Endpoint::Loopback(port), "the-token")
+            .expect_err("a refused wait must not pass");
+        server.join().expect("server thread");
+        assert!(
+            error.to_string().contains("supervisor token mismatch"),
+            "{error}"
+        );
+    }
+
+    /// A supervisor that is not there at all means the driver is gone:
+    /// the facade decides on the map it has (stow#347).
+    #[test]
+    fn a_dead_endpoint_decides_on_the_map_as_it_stands() {
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let started = Instant::now();
+        super::await_serve_map(&Endpoint::Loopback(port), "the-token").expect("the wait");
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

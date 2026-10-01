@@ -14,7 +14,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
-use super::protocol::{Answer, Compiled, Observed, Plan, Request, read_frame, write_frame};
+use super::protocol::{
+    Answer, AwaitServeMap, Compiled, Observed, Plan, Request, read_frame, write_frame,
+};
 use super::{ENDPOINT_ENV, Endpoint, TOKEN_ENV};
 
 /// What a supervisor does with the invocations its facades send.
@@ -46,6 +48,12 @@ pub trait Handler: Send + Sync + 'static {
     /// rustc starts (`observation.success` is `None`) and the observation
     /// after it ends (`Some`). One-way — nothing comes back.
     fn observed(self: &Arc<Self>, observation: Observation) -> impl Future<Output = ()> + Send;
+
+    /// Answer `AwaitServeMap` on the build's schedule: resolve when the
+    /// build's serve map is final — the pending map's final write landed
+    /// — and immediately when it already is. Every platform speaks this
+    /// over the transport it already carries (stow#347).
+    fn await_serve_map(self: &Arc<Self>) -> impl Future<Output = ()> + Send;
 
     /// What the handler needs to remember between asking for a compile and
     /// hearing that it finished.
@@ -348,7 +356,27 @@ async fn answer_request<H: Handler>(
             answer_observation(handler, token, observed).await;
             None
         }
+        Request::AwaitServeMap(await_map) => {
+            Some(answer_await_serve_map(handler, token, await_map).await)
+        }
     }
+}
+
+/// Hold the answer until the build's serve map is final. The handler's
+/// wait resolves on the driver's schedule, so this frame is how a
+/// `pending` map's facades hear the final write land (stow#347).
+async fn answer_await_serve_map<H: Handler>(
+    handler: &Arc<H>,
+    token: &str,
+    await_map: AwaitServeMap,
+) -> Answer {
+    if await_map.token != token {
+        return Answer::Failed {
+            message: "supervisor token mismatch".to_owned(),
+        };
+    }
+    handler.await_serve_map().await;
+    Answer::ServeMapReady
 }
 
 async fn answer_plan<H: Handler>(
@@ -490,6 +518,10 @@ mod tests {
         ) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
         }
+
+        fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
+            std::future::ready(())
+        }
     }
 
     /// The whole round trip a facade makes: ask, be told to compile, run
@@ -520,6 +552,106 @@ mod tests {
         };
         connection.report(&ticket, true).await.expect("report");
         assert_eq!(handler.reports.load(Ordering::SeqCst), 1);
+    }
+
+    /// The serve-map wait rides the loopback transport the Windows
+    /// build uses: the handler's word releases the answer, so a facade
+    /// blocked on it hears the final map land and nothing else
+    /// (stow#347).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_serve_map_wait_answers_when_the_map_is_final() {
+        use std::io::{Read as _, Write as _};
+        use std::time::Duration;
+
+        struct Gated {
+            ready: tokio::sync::watch::Receiver<bool>,
+        }
+        impl Handler for Gated {
+            type Pending = OsString;
+
+            fn plan(
+                self: &Arc<Self>,
+                _executable: OsString,
+                _args: Vec<OsString>,
+                _build_script_out_dir: Option<OsString>,
+            ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
+                std::future::ready(Decision::Served)
+            }
+
+            fn compiled(
+                self: &Arc<Self>,
+                _pending: Self::Pending,
+                _success: bool,
+            ) -> impl std::future::Future<Output = ()> + Send {
+                std::future::ready(())
+            }
+
+            fn observed(
+                self: &Arc<Self>,
+                _observation: super::Observation,
+            ) -> impl std::future::Future<Output = ()> + Send {
+                std::future::ready(())
+            }
+
+            fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
+                let mut ready = self.ready.clone();
+                async move {
+                    if !*ready.borrow() {
+                        let _ = ready.changed().await;
+                    }
+                }
+            }
+        }
+
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let handler = Arc::new(Gated { ready: ready_rx });
+        let (tickets, ticket_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::task::spawn(super::run_tickets(ticket_rx));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let token = "the-token".to_owned();
+        tokio::task::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept the facade");
+            super::serve_connection(stream, handler, tickets, token).await;
+        });
+
+        let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+        let facade = std::thread::spawn(move || {
+            let mut peer = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            let request =
+                super::Request::AwaitServeMap(crate::supervisor::protocol::AwaitServeMap {
+                    token: "the-token".to_owned(),
+                });
+            let body = serde_json::to_vec(&request).expect("request frame");
+            peer.write_all(
+                &u32::try_from(body.len())
+                    .expect("frame length fits u32")
+                    .to_le_bytes(),
+            )
+            .expect("write length");
+            peer.write_all(&body).expect("write body");
+            let mut length_bytes = [0_u8; 4];
+            peer.read_exact(&mut length_bytes).expect("read length");
+            let mut answer_body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
+            peer.read_exact(&mut answer_body).expect("read body");
+            let answer: super::Answer = serde_json::from_slice(&answer_body).expect("answer frame");
+            answered_tx.send(answer).expect("report answer");
+        });
+
+        // Nothing may answer while the map is still pending.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            answered_rx.try_recv().is_err(),
+            "the wait answered before the final map landed"
+        );
+        ready_tx.send(true).expect("release the map");
+        let answer = answered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the wait must answer");
+        facade.join().expect("facade thread");
+        assert_eq!(answer, super::Answer::ServeMapReady);
     }
 
     /// A served unit never runs rustc, so it never reports.
