@@ -866,6 +866,32 @@ pub fn resolve_repository(
         .collect())
 }
 
+/// Resolve one local project directory into its enqueue batch — the
+/// `preheat manual --dirs` lane. The tree is a disposable copy: its
+/// committed `Cargo.lock` is dropped like every lane's, so the resolve
+/// lands on the latest semver-compatible versions — a project
+/// contributes crate names and feature sets, never version pins.
+pub fn resolve_project_dir(
+    resolver: &stow_resolver::Resolver,
+    dir: &Path,
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+) -> Result<Vec<EnqueueRequest>, String> {
+    let source = resolver
+        .resolve_project_dir(
+            dir,
+            &crate::resolve::target_strings(targets),
+            rustc_version,
+            0,
+        )
+        .map_err(|error| format!("resolve {}: {error:#}", dir.display()))?;
+    Ok(source
+        .targets
+        .into_iter()
+        .flat_map(|(_target, tasks)| tasks)
+        .collect())
+}
+
 /// POST the batch in [`SUBMIT_CHUNK`]-sized pieces and sum the responses
 /// — a full wave is far over the edge's single-request bound.
 pub async fn submit_chunked(

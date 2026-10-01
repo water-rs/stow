@@ -66,6 +66,12 @@ pub struct ManualArgs {
     /// `[[project]] repo = "https://github.com/<owner>/<name>"`.
     #[arg(long)]
     projects: Option<PathBuf>,
+    /// Comma-separated local project directories — resolved like a
+    /// `--projects` entry (cargo's own resolver, the tree's `Cargo.lock`
+    /// dropped). Each directory is mutated: pass a disposable copy.
+    /// The mock lane seeds the wave with a consumer project's own graph.
+    #[arg(long, conflicts_with_all = ["crates", "projects"], value_delimiter = ',')]
+    dirs: Option<Vec<PathBuf>>,
     /// The stable rustc every task pins — `1.85.0`-style.
     #[arg(long)]
     rustc_version: String,
@@ -187,8 +193,10 @@ async fn run_inner(args: ManualArgs) -> stow_types::error::Result<()> {
     if args.in_flight == 0 {
         return Err(stow_error!("--in-flight must be at least 1"));
     }
-    if args.crates.is_none() && args.projects.is_none() {
-        return Err(stow_error!("one of --crates or --projects is required"));
+    if args.crates.is_none() && args.projects.is_none() && args.dirs.is_none() {
+        return Err(stow_error!(
+            "one of --crates, --projects or --dirs is required"
+        ));
     }
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
@@ -476,6 +484,18 @@ async fn resolve_sources(
             |_, repo, result| match result {
                 Ok(tasks) => requests.extend(tasks),
                 Err(error) => failures.push(format!("{repo}: {error}")),
+            },
+        );
+    }
+    if let Some(dirs) = &args.dirs {
+        pool.run(
+            dirs,
+            |resolver, dir| {
+                crate::projects::resolve_project_dir(resolver, dir, targets, rustc_version)
+            },
+            |_, dir, result| match result {
+                Ok(tasks) => requests.extend(tasks),
+                Err(error) => failures.push(format!("{}: {error}", dir.display())),
             },
         );
     }

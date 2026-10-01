@@ -995,8 +995,69 @@ fn emit_units(
         }
     }
 
+    emit_deduped_dep_edges(&mut units);
     units.sort_by(|a, b| a.key.cmp(&b.key));
     Ok((units, roots))
+}
+
+/// Mirror cargo's shared-dep dedup: a normal dep edge leaving a host
+/// unit resolves to the dep's normal unit whenever a real `cargo build`
+/// dedups the pair — the same package emitted at the same platform and
+/// feature set under both sides. A native `cargo build` compiles the
+/// dep once, at the normal unit, and hands the host parent's `--extern`
+/// that artifact; a `--target`-spelled build keeps the side split and
+/// resolves the edge to the host unit. Both edges are emitted so the
+/// task's dep pins cover each spelling's resolution (stow#506).
+fn emit_deduped_dep_edges(units: &mut [StowUnit]) {
+    let unit_features: HashMap<(&PackageIdSpec, &str, StowSide), &Vec<String>> = units
+        .iter()
+        .filter(|unit| unit.key.kind == StowUnitKind::Lib)
+        .map(|unit| {
+            (
+                (&unit.key.pkg, unit.key.platform.as_str(), unit.key.side),
+                &unit.features,
+            )
+        })
+        .collect();
+    let mut deduped: Vec<(usize, StowDep)> = Vec::new();
+    for (index, unit) in units.iter().enumerate() {
+        if unit.key.side != StowSide::Host || unit.key.kind != StowUnitKind::Lib {
+            continue;
+        }
+        for dep in &unit.deps {
+            if dep.dep_kind != DepKind::Normal
+                || dep.key.side != StowSide::Host
+                || dep.key.kind != StowUnitKind::Lib
+            {
+                continue;
+            }
+            let dep_features = unit_features
+                .get(&(&dep.key.pkg, dep.key.platform.as_str(), dep.key.side))
+                .copied();
+            let normal_features = unit_features
+                .get(&(&dep.key.pkg, dep.key.platform.as_str(), StowSide::Target))
+                .copied();
+            if dep_features.is_some() && dep_features == normal_features {
+                deduped.push((
+                    index,
+                    StowDep {
+                        key: StowUnitKey {
+                            pkg: dep.key.pkg.clone(),
+                            platform: dep.key.platform.clone(),
+                            side: StowSide::Target,
+                            kind: StowUnitKind::Lib,
+                        },
+                        name: dep.name.clone(),
+                        version: dep.version.clone(),
+                        dep_kind: dep.dep_kind,
+                    },
+                ));
+            }
+        }
+    }
+    for (index, dep) in deduped {
+        units[index].deps.push(dep);
+    }
 }
 
 /// The platform a dep edge lands on.

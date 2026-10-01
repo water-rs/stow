@@ -32,6 +32,7 @@ use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
     IndexError, content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
 };
+use stow_types::public_cache::UnitShape;
 use stow_types::records::{record_to_index_row, records_tag_rustc};
 use stow_types::registry::{GHCR_BASE, sha256_digest};
 use stow_types::stow_error;
@@ -456,6 +457,11 @@ struct ExportPass {
 type PullFut<'a, T> =
     std::pin::Pin<Box<dyn Future<Output = stow_types::error::Result<T>> + Send + 'a>>;
 
+/// Index rows keyed by the `(c_metadata, unit_shape)` pair a consumer's
+/// key space identifies — one artifact keeps every shape it can serve
+/// (stow#506).
+type RowsByIdentity = BTreeMap<(String, Option<UnitShape>), ArtifactIndexRow>;
+
 /// The `(target, rustc)` an `index.*` tag names — the same suffix shape
 /// [`folded_tag_parts`] splits, under the other half of the tag pair.
 pub fn index_tag_parts(tag: &str) -> Option<(&str, &str)> {
@@ -535,10 +541,7 @@ where
     // deterministic regardless of listing order.
     missing.sort_unstable();
     let pulled_count = missing.len();
-    let mut new_rows: BTreeMap<
-        (TargetTriple, WireRustcVersion),
-        BTreeMap<String, ArtifactIndexRow>,
-    > = BTreeMap::new();
+    let mut new_rows: BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity> = BTreeMap::new();
     let mut new_folded: BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>> =
         BTreeMap::new();
     let mut new_records: Vec<ArtifactRecord> = Vec::new();
@@ -559,7 +562,7 @@ where
                 new_rows
                     .entry(key)
                     .or_default()
-                    .insert(row.c_metadata.as_str().to_owned(), row);
+                    .insert((row.c_metadata.as_str().to_owned(), row.unit_shape), row);
             }
         }
         for key in named {
@@ -579,12 +582,13 @@ where
 }
 
 /// Fold the new records into the previous slices: previous rows first,
-/// new rows winning the dedup-by-`c_metadata` `records_into_slices`
-/// applies, and the folded set growing by every tag a record named.
-/// `generated_at` is stamped once so every slice of the pass matches.
+/// new rows winning the dedup-by-`(c_metadata, unit_shape)`
+/// `records_into_slices` applies, and the folded set growing by every
+/// tag a record named. `generated_at` is stamped once so every slice of
+/// the pass matches.
 fn merge_exports(
     mut prev: BTreeMap<(TargetTriple, WireRustcVersion), PrevSlice>,
-    new_rows: &BTreeMap<(TargetTriple, WireRustcVersion), BTreeMap<String, ArtifactIndexRow>>,
+    new_rows: &BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity>,
     new_folded: &BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>>,
     rustc: &WireRustcVersion,
 ) -> stow_types::error::Result<Vec<SliceExport>> {
@@ -594,22 +598,27 @@ fn merge_exports(
     let published: BTreeSet<(TargetTriple, WireRustcVersion)> = prev.keys().cloned().collect();
     let mut push_slice = |key: &(TargetTriple, WireRustcVersion)| {
         let prev_slice = prev.remove(key);
-        let mut merged: BTreeMap<String, ArtifactIndexRow> = prev_slice
+        let mut merged: RowsByIdentity = prev_slice
             .as_ref()
             .map(|slice| {
                 slice
                     .index
                     .rows
                     .iter()
-                    .map(|row| (row.c_metadata.as_str().to_owned(), row.clone()))
+                    .map(|row| {
+                        (
+                            (row.c_metadata.as_str().to_owned(), row.unit_shape),
+                            row.clone(),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
         // A re-run task rebuilding the same unit wins — the same dedup
-        // by `c_metadata` `records_into_slices` applies.
+        // by `(c_metadata, unit_shape)` `records_into_slices` applies.
         if let Some(rows) = new_rows.get(key) {
-            for (c_metadata, row) in rows {
-                merged.insert(c_metadata.clone(), row.clone());
+            for (row_key, row) in rows {
+                merged.insert(row_key.clone(), row.clone());
             }
         }
         let mut folded: BTreeSet<String> = prev_slice
