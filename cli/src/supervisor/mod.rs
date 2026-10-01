@@ -21,6 +21,7 @@ pub mod os_bytes;
 pub mod protocol;
 pub mod server;
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
 /// Endpoint the facade connects to, as spelled in [`ENDPOINT_ENV`].

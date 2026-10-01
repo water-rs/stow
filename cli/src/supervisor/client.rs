@@ -77,7 +77,9 @@ impl Connection {
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served => Ok(Decision::Served),
             Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
-            Answer::Recorded => Err("supervisor answered a plan with a report ack".to_owned()),
+            Answer::Recorded | Answer::ServeMapReady => {
+                Err("supervisor answered a plan with an answer that is not a decision".to_owned())
+            }
             Answer::Failed { message } => Err(message),
         }
     }
@@ -97,7 +99,7 @@ impl Connection {
         match self.exchange(&Request::Compiled(report)).await? {
             Answer::Recorded => Ok(()),
             Answer::Failed { message } => Err(message),
-            Answer::Served | Answer::Compile { .. } => {
+            Answer::Served | Answer::Compile { .. } | Answer::ServeMapReady => {
                 Err("supervisor answered a report with a plan answer".to_owned())
             }
         }

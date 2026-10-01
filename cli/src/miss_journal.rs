@@ -131,13 +131,13 @@ fn parent_pid() -> u32 {
         entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32>()).unwrap_or_default();
         let own = GetCurrentProcessId();
         let mut found = None;
-        if Process32First(snapshot, &mut entry) != 0 {
+        if Process32First(snapshot, &raw mut entry) != 0 {
             loop {
                 if entry.th32ProcessID == own {
                     found = Some(entry.th32ParentProcessID);
                     break;
                 }
-                if Process32Next(snapshot, &mut entry) == 0 {
+                if Process32Next(snapshot, &raw mut entry) == 0 {
                     break;
                 }
             }
@@ -189,8 +189,8 @@ fn process_alive(pid: u32) -> bool {
         let mut code = 0u32;
         // STILL_ACTIVE is an NTSTATUS (i32); the exit code is a u32 —
         // any code that does not fit is an exit code, not 'running'.
-        let alive =
-            GetExitCodeProcess(handle, &mut code) != 0 && i32::try_from(code) == Ok(STILL_ACTIVE);
+        let alive = GetExitCodeProcess(handle, &raw mut code) != 0
+            && i32::try_from(code) == Ok(STILL_ACTIVE);
         CloseHandle(handle);
         alive
     }
@@ -302,7 +302,7 @@ pub fn spawn_drain(target_dir: &Path) {
     {
         use std::os::windows::process::CommandExt as _;
         // DETACHED_PROCESS | CREATE_NO_WINDOW: no console flashes open.
-        command.creation_flags(0x00000008 | 0x00000200);
+        command.creation_flags(0x0000_0008 | 0x0000_0200);
     }
     if let Err(error) = command.spawn() {
         tracing::warn!(error = %error, "could not spawn the miss drain");
