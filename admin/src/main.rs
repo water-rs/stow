@@ -18,6 +18,7 @@ mod github;
 mod http_retry;
 mod index_cmd;
 mod launch_gate;
+mod launch_load;
 mod launch_model;
 mod maintenance;
 mod manual;
@@ -119,6 +120,10 @@ enum Command {
     /// report against the launch model and fail on an over-allowance
     /// dimension (stow#452).
     LaunchGate(launch_gate::LaunchGateArgs),
+    /// The stow#452 mock-stack load test: drive a running edge at the
+    /// launch model's peak rates and report per-lane p50/p99, error
+    /// and overload signals.
+    LaunchLoad(launch_load::LaunchLoadArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
@@ -230,6 +235,9 @@ fn main() -> stow_types::error::Result<()> {
         Command::Index(args) => index_cmd::run(args),
         Command::LaunchModel(args) => smol::block_on(launch_model::run(args, output)),
         Command::LaunchGate(args) => launch_gate::run(&args, output),
+        Command::LaunchLoad(args) => {
+            with_edge(|edge| async move { launch_load::run(&edge, &args, output).await })
+        }
         Command::Submit(args) => {
             with_edge(|edge| async move { submit_command(&edge, args, output).await })
         }
