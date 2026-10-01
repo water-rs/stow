@@ -109,7 +109,9 @@ pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Res
         }
         _ => None,
     };
-    let cfgs = cfgs.await.unwrap_or_default();
+    let cfgs = cfgs
+        .await
+        .map_err(|error| stow_types::stow_error!("join rustc cfg probe task: {error}"))?;
     let link = resolve_link_from(&config, target, cfgs.as_ref(), &process_env);
     if link.selects_mold {
         let real = link.probe();

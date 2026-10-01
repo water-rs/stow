@@ -48,30 +48,34 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
     run_inner(command, args).await
 }
 
+/// mold is mandatory on Linux — provisioning starts the moment the
+/// project's target is known and its linker probes run alongside the
+/// graph analysis in `run_inner` rather than in front of it (stow#347).
+/// The task joins before any cargo invocation, whatever path the build
+/// ends up taking through this driver. `check` is gated with `build`
+/// and `test`: a check still compiles proc-macro dependencies in full
+/// and compiles and runs build scripts, and both of those link. When
+/// the cargo config does not already select a reachable mold, the
+/// managed install is selected for this invocation only — `stow setup`
+/// is not required.
+fn spawn_mold_provision(
+    project: &ProjectContext,
+) -> tokio::task::JoinHandle<stow_types::error::Result<Vec<String>>> {
+    let target = project.target.clone();
+    let dir = project.current_dir().to_path_buf();
+    tokio::spawn(async move {
+        crate::mold::provision(&target, &dir)
+            .instrument(tracing::debug_span!("stow.precargo.mold_provision"))
+            .await
+    })
+}
+
 async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
     let invocation = CargoInvocation::new(command, args);
     let mut project = ProjectContext::load(&invocation.cargo_args)
         .instrument(tracing::debug_span!("stow.precargo.project_context"))
         .await?;
-    // mold is mandatory on Linux — provisioning starts the moment the
-    // project's target is known and its linker probes run alongside the
-    // graph analysis below rather than in front of it (stow#347). The
-    // task joins before any cargo invocation, whatever path the build
-    // ends up taking through this driver. `check` is gated with `build`
-    // and `test`: a check still compiles proc-macro dependencies in full
-    // and compiles and runs build scripts, and both of those link. When
-    // the cargo config does not already select a reachable mold, the
-    // managed install is selected for this invocation only — `stow
-    // setup` is not required.
-    let mold = tokio::spawn({
-        let target = project.target.clone();
-        let dir = project.current_dir().to_path_buf();
-        async move {
-            crate::mold::provision(&target, &dir)
-                .instrument(tracing::debug_span!("stow.precargo.mold_provision"))
-                .await
-        }
-    });
+    let mold = spawn_mold_provision(&project);
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -881,6 +885,29 @@ async fn analyze_workspace_prediction_lite(
     .await
 }
 
+/// The artifact cache's own listing of covered units. A broken local
+/// listing loses the local pairs only — the index answer still stands,
+/// and the facades whose units nothing covers still skip the plan path
+/// (stow#347) — so the failure warns and yields `None`.
+async fn locally_covered_units_or_warn(
+    config: &StowConfig,
+    rustc_version: &str,
+) -> Option<Vec<(String, String, String)>> {
+    match crate::artifact_cache::locally_covered_units(config, rustc_version)
+        .instrument(tracing::debug_span!("stow.precargo.local_units"))
+        .await
+    {
+        Ok(units) => Some(units),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not enumerate local coverage; the serve map carries index units only"
+            );
+            None
+        }
+    }
+}
+
 async fn analyze_workspace_prediction_from(
     project: &ProjectContext,
     manifest_path: &Path,
@@ -903,23 +930,7 @@ async fn analyze_workspace_prediction_from(
         .cloned()
         .map(into_api_dependency)
         .collect::<stow_types::error::Result<Vec<_>>>()?;
-    let local_units =
-        match crate::artifact_cache::locally_covered_units(config, &project.rustc_version)
-            .instrument(tracing::debug_span!("stow.precargo.local_units"))
-            .await
-        {
-            Ok(units) => Some(units),
-            // A broken local listing loses the local pairs only — the
-            // index answer still stands, and the facades whose units
-            // nothing covers still skip the plan path (stow#347).
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "could not enumerate local coverage; the serve map carries index units only"
-                );
-                None
-            }
-        };
+    let local_units = locally_covered_units_or_warn(config, &project.rustc_version).await;
     let expanded_in = expanded
         .as_ref()
         .map_or_else(Vec::new, |expanded| expanded.entries.clone());
