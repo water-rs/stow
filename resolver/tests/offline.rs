@@ -677,3 +677,108 @@ fn a_host_dep_with_different_features_keeps_its_own_edge() {
         "feature sets differ — no dedup, the edge stays host-only"
     );
 }
+
+/// `deep`'s task reaches `leaf` only through `pm`'s host edge, yet a
+/// consumer's native build still dedups `leaf` against the root's normal
+/// unit — the dep is in the task's host-side transitive closure and has
+/// a target-side unit. The task therefore carries `leaf`'s target unit
+/// as a normal dep edge so the generated wrapper pins it under
+/// `[dependencies]`, reproducing the consumer's dedup inside the task's
+/// own resolve (stow#506). The same closure gives `pm` target-side
+/// `deep` and `leaf` pins.
+#[test]
+fn a_host_tasks_closure_pins_deduped_packages_at_target_sides() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "leaf",
+            version: "1.0.0",
+            deps: vec![],
+            features: &[("a", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "deep",
+            version: "1.0.0",
+            deps: vec![("leaf", "1", &["a"])],
+            features: &[],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "pm",
+            version: "1.0.0",
+            deps: vec![("deep", "1", &[])],
+            features: &[],
+            yanked: false,
+            proc_macro: true,
+        },
+    );
+    let manifest = project(
+        &work.path().join("root"),
+        &json!({ "leaf": { "version": "1", "features": ["a"] }, "pm": "1" }),
+    );
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve(
+            &manifest,
+            &ResolveOptions::default(),
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+    let units: Vec<StowUnit> = out
+        .iter()
+        .flat_map(|(_target, out)| out.units.iter().cloned())
+        .collect();
+    let (requests, _nodes) = stow_resolver::enqueue_requests_from_output(
+        &units,
+        pinned_rustc_version(),
+        stow_types::api::EnqueueSource::CrateUpdate,
+        0,
+    )
+    .unwrap();
+
+    let sides_of = |request_crate: &str, dep_crate: &str| -> Vec<bool> {
+        requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == request_crate)
+            .unwrap_or_else(|| panic!("{request_crate} has an enqueue request"))
+            .depends_on
+            .iter()
+            .filter(|dep| dep.crate_name.as_str() == dep_crate)
+            .map(|dep| dep.host_side)
+            .collect()
+    };
+    let deep_leaf = sides_of("deep", "leaf");
+    assert!(
+        deep_leaf.contains(&false),
+        "deep's task pins `leaf` as a normal dep for the deduped spelling: {deep_leaf:?}"
+    );
+    assert!(
+        deep_leaf.contains(&true),
+        "deep's task keeps the host-side `leaf` dep: {deep_leaf:?}"
+    );
+    let pm_leaf = sides_of("pm", "leaf");
+    assert_eq!(
+        pm_leaf,
+        vec![false],
+        "pm reaches `leaf` only through deep's subtree — its task carries \
+         the dedup pin, not a direct edge: {pm_leaf:?}"
+    );
+    let pm_deep = sides_of("pm", "deep");
+    assert_eq!(
+        pm_deep,
+        vec![true],
+        "deep has no target-side unit — no normal pin to mirror cargo's dedup onto"
+    );
+}

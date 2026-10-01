@@ -717,7 +717,64 @@ fn task_graph(units: &[StowUnit]) -> Result<TaskGraph, ResolverError> {
         }
         entry.remove(&node);
     }
+    for (node, shadows) in dedup_shadow_edges(units, raw_deps, by_key, node_of)? {
+        edges.entry(node).or_default().extend(shadows);
+    }
     Ok((nodes, edges))
+}
+
+/// Mirror the consumer's shared-dep dedup inside the task's own
+/// resolve: a lib reachable through host-side edges that also has a
+/// target-side unit resolves to the deduped unit in a consumer's
+/// build, so the task carries the target unit as a normal dep edge —
+/// the wrapper then pins it under `[dependencies]` at the target
+/// unit's feature set, which is the identity a consumer computes.
+/// Without the pin the wrapper resolves the host subtree alone and
+/// the task publishes dep identities no consumer links (stow#506).
+fn dedup_shadow_edges<'u>(
+    units: &'u [StowUnit],
+    raw_deps: impl Fn(&'u StowUnit) -> Vec<&'u StowUnit>,
+    by_key: impl Fn(&str, &str, &str, stow_resolve::api::StowSide) -> Option<&'u StowUnit>,
+    node_of: impl Fn(&StowUnit) -> Result<TaskNode, ResolverError>,
+) -> Result<BTreeMap<TaskNode, BTreeSet<TaskNode>>, ResolverError> {
+    let mut extra_edges = BTreeMap::<TaskNode, BTreeSet<TaskNode>>::new();
+    for unit in units {
+        if unit.key.kind != StowUnitKind::Lib || !unit.is_crates_io {
+            continue;
+        }
+        let node = node_of(unit)?;
+        let mut seen = BTreeSet::new();
+        seen.insert(&unit.key);
+        let mut stack: Vec<&StowUnit> = raw_deps(unit)
+            .into_iter()
+            .filter(|dep| dep.key.side == stow_resolve::api::StowSide::Host)
+            .collect();
+        let mut shadows = BTreeSet::new();
+        while let Some(dep_unit) = stack.pop() {
+            if !seen.insert(&dep_unit.key) {
+                continue;
+            }
+            if dep_unit.is_crates_io
+                && let Some(target) = by_key(
+                    &dep_unit.name,
+                    &dep_unit.version,
+                    &dep_unit.key.platform,
+                    stow_resolve::api::StowSide::Target,
+                )
+                && target.is_crates_io
+            {
+                shadows.insert(node_of(target)?);
+            }
+            stack.extend(
+                raw_deps(dep_unit)
+                    .into_iter()
+                    .filter(|dep| dep.key.side == stow_resolve::api::StowSide::Host),
+            );
+        }
+        shadows.remove(&node);
+        extra_edges.entry(node).or_default().extend(shadows);
+    }
+    Ok(extra_edges)
 }
 
 /// Decode a canonical features JSON string back into the typed form.
