@@ -98,6 +98,14 @@ pub struct LaunchLoadArgs {
 /// Lane error share the run tolerates before it fails — one percent.
 const ERROR_RATE_BOUND: f64 = 0.01;
 
+/// A response that takes this long under the mock stack is a stall,
+/// not slowness: an unanswered request would otherwise freeze its lane
+/// forever — `run_lane` only checks the deadline between fires — and
+/// `join_all` would sit until the CI job's timeout kills the whole
+/// load run. The lane scores a stall as a transport error, the same
+/// signal any other failed request leaves.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// What one lane event is.
 #[derive(Debug)]
 enum Fire {
@@ -676,7 +684,20 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
     let mut counter = 0u64;
     loop {
         let fired = Instant::now();
-        match fire_once(&lane.fire, edge, &mut client, counter).await {
+        // A response the edge never sends cannot stall the run: the
+        // deadline check happens between fires, so bound each one.
+        let outcome = smol::future::or(
+            fire_once(&lane.fire, edge, &mut client, counter),
+            async {
+                smol::Timer::after(REQUEST_TIMEOUT).await;
+                Ok(Outcome::Transport(format!(
+                    "lane request exceeded {}s",
+                    REQUEST_TIMEOUT.as_secs()
+                )))
+            },
+        )
+        .await;
+        match outcome {
             Ok(Outcome::Response { status, overloaded }) => {
                 *stats.statuses.entry(status).or_default() += 1;
                 if (500..600).contains(&status) {
