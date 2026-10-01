@@ -269,6 +269,13 @@ wrangler d1 migrations apply stow-mock --local \
     || die "edge D1 migrations failed — see $LOG_DIR/edge-migrate.log"
 (
     cd "$REPO_ROOT/edge"
+    # workerd's embedded V8 dies at its default ~1.4 GiB heap under this
+    # fixture's churn — every alarm claim/dispatch/webhook cycle plus the
+    # lanes' traffic — ~20 min into the drive ("JavaScript heap out of
+    # memory", crash+restart), taking every in-flight request with it.
+    # MINIFLARE_WORKERD_V8_FLAGS lands in the generated workerd config;
+    # give the isolate real headroom for the run's lifetime.
+    export MINIFLARE_WORKERD_V8_FLAGS="${MINIFLARE_WORKERD_V8_FLAGS:+$MINIFLARE_WORKERD_V8_FLAGS }--max-old-space-size=6144"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
         --port "$EDGE_PORT" --persist-to "$WORK_DIR/edge-state"
 ) >"$LOG_DIR/edge.log" 2>&1 &
