@@ -378,15 +378,35 @@ async fn count_rows(db: &DurableDb, table: &str) -> Result<u64, QueueError> {
         .map_err(|error| QueueError::Sql(format!("count {table}: {error}")))
 }
 
-/// Re-marks the `POST /tasks/complete-run` drive's target in-flight —
-/// a run-completion report lands only on a live in-flight row, and the
-/// fixture's is spent: an earlier probe on this queue already completed
-/// it, or the drive's churn did — the seeded dep graph also names
-/// in-flight rows, so the pass's shape repair resurrects any of them
-/// the moment they complete. Re-arming outside the measured window —
-/// the same precedent as the installation-token seed — leaves the
-/// drive measuring a real completion on every probe, not a stale one.
-async fn rearm_complete_run_target(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+/// Restores the seeded queue the drives are calibrated on — outside
+/// the measured window, the same precedent as the installation-token
+/// seed. Every task the lanes and the probe itself insert carries a
+/// content-derived `task_id` (`crate-version-hash-target-rustc`), while
+/// seeded rows are `printf('%064x', n)`, so `task_id LIKE '%-%'`
+/// isolates exactly the rows a run added — deleting them returns the
+/// queue to the seeded shape every probe measures. Two surfaces would
+/// decay without it:
+///
+/// - `POST /admin/enqueue (trusted)` measures the batch's insert path
+///   (`resubmit` measures its resync) — left behind, the batch's tasks
+///   persist and the next probe prices a 31-edge `NOT EXISTS` rescan
+///   (~500 reads) where the budget is calibrated on an insert.
+/// - `POST /tasks/complete-run` lands only on a live in-flight row, and
+///   the fixture's is spent: an earlier probe on this queue already
+///   completed it, or the drive's churn did — the seeded dep graph also
+///   names in-flight rows, so the pass's shape repair resurrects any of
+///   them the moment they complete. The target is re-marked `running`
+///   with a fresh attempt so every probe measures a real completion.
+async fn rearm_fixture(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    for statement in [
+        "DELETE FROM queue_dependencies WHERE task_id LIKE '%-%'",
+        "DELETE FROM queue WHERE task_id LIKE '%-%'",
+    ] {
+        db.query(statement)
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("re-arm inserted rows: {error}")))?;
+    }
     db.query(
         "UPDATE queue \
          SET status = 'running', attempt = attempt + 1, updated_at = datetime('now') \
@@ -456,7 +476,7 @@ pub async fn run(
                 u32::try_from(queue_rows.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
             }),
     };
-    rearm_complete_run_target(db, shape).await?;
+    rearm_fixture(db, shape).await?;
     let log = Arc::new(Mutex::new(Vec::new()));
     let metered = DurableDb::new(MeteredBackend {
         inner: db.clone(),
