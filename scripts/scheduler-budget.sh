@@ -239,10 +239,6 @@ wrangler d1 migrations apply stow-mock --local \
     || die "edge D1 migrations failed — see $LOG_DIR/edge-migrate.log"
 (
     cd "$REPO_ROOT/edge"
-    # Same workerd V8 headroom launch-load.sh gives the edge: the dev
-    # runtime's default ~1.4 GiB heap aborts under sustained fixture
-    # churn and would strand the probe mid-run.
-    export MINIFLARE_WORKERD_V8_FLAGS="${MINIFLARE_WORKERD_V8_FLAGS:+$MINIFLARE_WORKERD_V8_FLAGS }--max-old-space-size=6144"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
         --port "$EDGE_PORT" --persist-to "$WORK_DIR/edge-state"
 ) >"$LOG_DIR/edge.log" 2>&1 &
