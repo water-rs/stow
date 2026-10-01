@@ -283,41 +283,64 @@ fn run_uncovered(
 /// wait rides the transport every platform already speaks — unix socket
 /// or loopback TCP — so nothing here is unix-only anymore (stow#347).
 ///
-/// What ends the wait is the supervisor's word or its absence: a driver
-/// that dies drops the connection, a driver whose analysis failed
-/// completes the signal anyway, and the read timeout bounds a driver
-/// that is alive but stuck — every ending leaves the facade deciding on
-/// the map it has, since the map file is re-read either way. What fails
-/// loudly is what means a bug: a refused request, a malformed frame,
-/// and a stream that cannot take the read bound it would otherwise
-/// silently ignore.
+/// The supervisor lives in the `stow` process that spawned cargo, so
+/// anything that says it is gone mid-build is a defect and fails the
+/// build loudly, naming the endpoint: a refused connect, a failed write,
+/// a closed or reset stream, a refused request, a malformed frame. The
+/// one quiet ending is the bounded read timeout — a driver that is alive
+/// but stuck — which leaves the facade deciding on the map it has, since
+/// the map file is re-read either way.
 fn await_serve_map(endpoint: &Endpoint, token: &str) -> stow_types::error::Result<()> {
-    let Ok(mut wire) = connect(endpoint) else {
-        // The supervisor being gone means the driver is gone: the map
-        // as it stands is the decision. If the driver is somehow alive
-        // but unreachable, the mark's own connect — still to come — is
-        // where that failure must surface.
-        return Ok(());
-    };
-    wire.set_read_timeout(Some(SERVE_MAP_WAIT_TIMEOUT))
-        .map_err(|error| stow_types::stow_error!("bound the serve-map wait's read: {error}"))?;
+    await_serve_map_within(endpoint, token, SERVE_MAP_WAIT_TIMEOUT)
+}
+
+/// [`await_serve_map`] with the read bound as a parameter, so a test
+/// does not have to wait the full timeout to see the quiet ending.
+fn await_serve_map_within(
+    endpoint: &Endpoint,
+    token: &str,
+    timeout: std::time::Duration,
+) -> stow_types::error::Result<()> {
+    let mut wire = connect(endpoint).map_err(|error| {
+        stow_types::stow_error!(
+            "the serve-map wait could not reach the supervisor at {endpoint:?}: {error}"
+        )
+    })?;
+    wire.set_read_timeout(Some(timeout)).map_err(|error| {
+        stow_types::stow_error!("bound the serve-map wait's read at {endpoint:?}: {error}")
+    })?;
     let request = Request::AwaitServeMap(AwaitServeMap {
         token: token.to_owned(),
     });
-    if write_request(&mut wire, &request).is_err() {
-        // The write only fails against a driver that is already gone.
-        return Ok(());
-    }
+    write_request(&mut wire, &request).map_err(|error| {
+        stow_types::stow_error!(
+            "the serve-map wait could not ask the supervisor at {endpoint:?}: {error}"
+        )
+    })?;
     match read_answer(&mut wire) {
-        Ok(Some(Answer::ServeMapReady) | None) | Err(FrameError::Io) => Ok(()),
+        Ok(Some(Answer::ServeMapReady)) => Ok(()),
+        Ok(None) => Err(stow_types::stow_error!(
+            "the supervisor at {endpoint:?} closed the serve-map wait unanswered"
+        )),
+        Err(FrameError::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(())
+        }
+        Err(FrameError::Io(error)) => Err(stow_types::stow_error!(
+            "the supervisor at {endpoint:?} dropped the serve-map wait: {error}"
+        )),
         Ok(Some(Answer::Failed { message })) => Err(stow_types::stow_error!(
-            "the supervisor refused the serve-map wait: {message}"
+            "the supervisor at {endpoint:?} refused the serve-map wait: {message}"
         )),
         Ok(Some(answer)) => Err(stow_types::stow_error!(
-            "the supervisor answered the serve-map wait with {answer:?}"
+            "the supervisor at {endpoint:?} answered the serve-map wait with {answer:?}"
         )),
         Err(FrameError::Malformed(message)) => Err(stow_types::stow_error!(
-            "the serve-map wait read a malformed frame: {message}"
+            "the serve-map wait at {endpoint:?} read a malformed frame: {message}"
         )),
     }
 }
@@ -472,11 +495,11 @@ fn write_request(wire: &mut FacadeStream, request: &Request) -> std::io::Result<
 }
 
 /// Why a blocking read of one answer frame failed: the transport broke
-/// — driver death, the wait's own bound — or the frame did not parse.
-/// `Io` carries no detail because every transport failure ends the wait
-/// the same way: the facade decides on the map it has.
+/// or did not answer — driver death, the wait's own bound — or the
+/// frame did not parse. `Io` carries the error so the caller can tell
+/// the bounded timeout apart from a dropped connection.
 enum FrameError {
-    Io,
+    Io(std::io::Error),
     Malformed(String),
 }
 
@@ -488,7 +511,7 @@ fn read_answer(wire: &mut FacadeStream) -> Result<Option<Answer>, FrameError> {
     match wire.read_exact(&mut length_bytes) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(_) => return Err(FrameError::Io),
+        Err(error) => return Err(FrameError::Io(error)),
     }
     let length = u32::from_le_bytes(length_bytes);
     if length > 4 * 1024 * 1024 {
@@ -497,7 +520,7 @@ fn read_answer(wire: &mut FacadeStream) -> Result<Option<Answer>, FrameError> {
         )));
     }
     let mut body = vec![0_u8; length as usize];
-    wire.read_exact(&mut body).map_err(|_| FrameError::Io)?;
+    wire.read_exact(&mut body).map_err(FrameError::Io)?;
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(|error| FrameError::Malformed(format!("decode frame: {error}")))
@@ -656,11 +679,12 @@ mod tests {
         assert!(waited < super::SERVE_MAP_WAIT_TIMEOUT, "{waited:?}");
     }
 
-    /// A driver that dies mid-wait drops the connection; the facade
-    /// decides on the map it has rather than hanging on a signal that
-    /// can never come (stow#347).
+    /// A driver that dies mid-wait drops the connection — the
+    /// supervisor lives in the `stow` process that spawned cargo, so
+    /// that is a defect the build fails on, named by its endpoint, not
+    /// a signal the facade decides around (stow#347).
     #[test]
-    fn a_driver_that_dies_releases_the_wait() {
+    fn a_driver_that_dies_fails_the_wait_loudly() {
         use std::time::{Duration, Instant};
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
@@ -674,9 +698,66 @@ mod tests {
             drop(peer);
         });
         let started = Instant::now();
-        super::await_serve_map(&Endpoint::Loopback(port), "the-token").expect("the wait");
+        let error = super::await_serve_map(&Endpoint::Loopback(port), "the-token")
+            .expect_err("a dropped supervisor must fail the build");
         server.join().expect("server thread");
+        assert!(
+            error.to_string().contains(&port.to_string()),
+            "the error must name the endpoint: {error}"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A supervisor that is not there at all is a driver gone before
+    /// the wait even began — the same defect, failing loudly with its
+    /// endpoint named (stow#347).
+    #[test]
+    fn a_dead_endpoint_fails_the_wait_loudly() {
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let started = Instant::now();
+        let error = super::await_serve_map(&Endpoint::Loopback(port), "the-token")
+            .expect_err("a refused connect must fail the build");
+        assert!(
+            error.to_string().contains(&port.to_string()),
+            "the error must name the endpoint: {error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A driver that is alive but never answers — the one quiet ending:
+    /// the read bound trips and the facade decides on the map it has
+    /// (stow#347).
+    #[test]
+    fn the_read_timeout_decides_on_the_map_as_it_stands() {
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept the facade");
+            let mut length_bytes = [0_u8; 4];
+            peer.read_exact(&mut length_bytes).expect("read length");
+            let mut body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
+            peer.read_exact(&mut body).expect("read body");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let started = Instant::now();
+        super::await_serve_map_within(
+            &Endpoint::Loopback(port),
+            "the-token",
+            Duration::from_millis(50),
+        )
+        .expect("the bounded timeout ends the wait quietly");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(50) && waited < Duration::from_secs(2),
+            "the wait ended on its own bound, not the peer's: {waited:?}"
+        );
+        server.join().expect("server thread");
     }
 
     /// A supervisor that refuses the wait — the wrong-token answer — is
@@ -698,19 +779,5 @@ mod tests {
             error.to_string().contains("supervisor token mismatch"),
             "{error}"
         );
-    }
-
-    /// A supervisor that is not there at all means the driver is gone:
-    /// the facade decides on the map it has (stow#347).
-    #[test]
-    fn a_dead_endpoint_decides_on_the_map_as_it_stands() {
-        use std::time::{Duration, Instant};
-
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
-        drop(listener);
-        let started = Instant::now();
-        super::await_serve_map(&Endpoint::Loopback(port), "the-token").expect("the wait");
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
