@@ -31,6 +31,15 @@ pub fn verbose_version(version: &str, host: &str) -> Option<&'static str> {
         ("1.98.1", "x86_64-unknown-linux-gnu") => Some(include_str!(
             "../rustc-data/1.98.1/verbose/x86_64-unknown-linux-gnu.txt"
         )),
+        ("1.99.0", "aarch64-apple-darwin") => Some(include_str!(
+            "../rustc-data/1.99.0/verbose/aarch64-apple-darwin.txt"
+        )),
+        ("1.99.0", "x86_64-pc-windows-msvc") => Some(include_str!(
+            "../rustc-data/1.99.0/verbose/x86_64-pc-windows-msvc.txt"
+        )),
+        ("1.99.0", "x86_64-unknown-linux-gnu") => Some(include_str!(
+            "../rustc-data/1.99.0/verbose/x86_64-unknown-linux-gnu.txt"
+        )),
         _ => None,
     }
 }
@@ -66,6 +75,33 @@ pub fn cfg(version: &str, triple: &str) -> Option<Vec<String>> {
         }
         ("1.98.1", "x86_64-unknown-linux-gnu") => {
             include_str!("../rustc-data/1.98.1/cfg/x86_64-unknown-linux-gnu.txt")
+        }
+        ("1.99.0", "aarch64-apple-darwin") => {
+            include_str!("../rustc-data/1.99.0/cfg/aarch64-apple-darwin.txt")
+        }
+        ("1.99.0", "aarch64-apple-ios") => {
+            include_str!("../rustc-data/1.99.0/cfg/aarch64-apple-ios.txt")
+        }
+        ("1.99.0", "aarch64-apple-ios-sim") => {
+            include_str!("../rustc-data/1.99.0/cfg/aarch64-apple-ios-sim.txt")
+        }
+        ("1.99.0", "aarch64-linux-android") => {
+            include_str!("../rustc-data/1.99.0/cfg/aarch64-linux-android.txt")
+        }
+        ("1.99.0", "aarch64-pc-windows-msvc") => {
+            include_str!("../rustc-data/1.99.0/cfg/aarch64-pc-windows-msvc.txt")
+        }
+        ("1.99.0", "aarch64-unknown-linux-gnu") => {
+            include_str!("../rustc-data/1.99.0/cfg/aarch64-unknown-linux-gnu.txt")
+        }
+        ("1.99.0", "wasm32-unknown-unknown") => {
+            include_str!("../rustc-data/1.99.0/cfg/wasm32-unknown-unknown.txt")
+        }
+        ("1.99.0", "x86_64-pc-windows-msvc") => {
+            include_str!("../rustc-data/1.99.0/cfg/x86_64-pc-windows-msvc.txt")
+        }
+        ("1.99.0", "x86_64-unknown-linux-gnu") => {
+            include_str!("../rustc-data/1.99.0/cfg/x86_64-unknown-linux-gnu.txt")
         }
         _ => return None,
     };
