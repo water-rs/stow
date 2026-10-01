@@ -150,10 +150,17 @@ pub async fn seed_queue_chunk(
     let not_before = "CASE WHEN n % 20 = 1 THEN datetime('now', '+30 minutes') \
                       ELSE '1970-01-01 00:00:00' END";
     let last_24h = FixtureShape::LAST_24H_ROWS;
+    // In-flight rows carry a heartbeat inside the shortest deploy lease
+    // (the mock's 10-minute `STOW_STALE_DISPATCH_MINUTES`): a dispatched
+    // row whose `updated_at` is older than its lease is stale, not
+    // in-flight, and the pass's stale recovery would reclaim it — the
+    // seed must not fake a pass cost the shape never meant to measure.
     // Exactly `LAST_24H_ROWS` rows inside the outcome window; the rest
     // spread 1–28 days back so the window count never tracks queue size.
     let updated_at = &format!(
-        "CASE WHEN n <= {last_24h} THEN datetime('now', '-' || (n % 1440) || ' minutes') \
+        "CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
+              THEN datetime('now', '-' || (n % 8) || ' minutes') \
+              WHEN n <= {last_24h} THEN datetime('now', '-' || (n % 1440) || ' minutes') \
               ELSE datetime('now', '-' || (1440 + n % 38880) || ' minutes') END"
     );
     let task_id = "printf('%064x', n)";
