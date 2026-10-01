@@ -73,8 +73,12 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 /// # Errors
 ///
 /// Fails when the mold install fails — the error says which step.
-pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Result<Vec<String>> {
-    if !cfg!(target_os = "linux") || !linux_target(target) {
+pub async fn provision(
+    target: impl std::future::Future<Output = Result<String, String>> + Send,
+    explicit_target: Option<&str>,
+    cargo_dir: &Path,
+) -> stow_types::error::Result<Vec<String>> {
+    if !cfg!(target_os = "linux") || explicit_target.is_some_and(|target| !linux_target(target)) {
         return Ok(Vec::new());
     }
     // The cfg probe and the availability probe are both process spawns,
@@ -84,17 +88,28 @@ pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Res
     // unanswered cfg probe — launches the probe the config asks for while
     // rustc is still answering. When the answered cfgs leave the probe
     // inputs untouched the speculative answer stands; when they change
-    // it the probe reruns on the real inputs.
+    // it the probe reruns on the real inputs. The read is made before
+    // the target triple resolves, too: an explicit `--target` already
+    // names it, and without one the probe asks rustc for the host's own
+    // cfgs — the build's target is the host. A `target.<triple>` table
+    // cannot be matched either way until the triple arrives, so a
+    // resolution that turns out to need one reruns on the real inputs
+    // like a changed cfg answer does (stow#517).
     let cfgs = tokio::spawn({
-        let target = target.to_owned();
+        let target = explicit_target.map(str::to_owned);
         async move {
-            rustc_target_cfgs(&target)
+            rustc_target_cfgs(target.as_deref())
                 .instrument(tracing::debug_span!("stow.precargo.mold_cfg_probe"))
                 .await
         }
     });
     let config = CargoConfig::load(cargo_dir, &process_env).await;
-    let candidate = resolve_link_from(&config, target, None, &process_env);
+    let candidate = resolve_link_from(
+        &config,
+        explicit_target.unwrap_or_default(),
+        None,
+        &process_env,
+    );
     let speculative = match (candidate.selects_mold, candidate.probe()) {
         (true, probe @ MoldProbe::Driver { .. }) => {
             let task = tokio::spawn({
@@ -109,10 +124,20 @@ pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Res
         }
         _ => None,
     };
+    let target = target
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    if !linux_target(&target) {
+        cfgs.abort();
+        if let Some((_, task)) = speculative {
+            task.abort();
+        }
+        return Ok(Vec::new());
+    }
     let cfgs = cfgs
         .await
         .map_err(|error| stow_types::stow_error!("join rustc cfg probe task: {error}"))?;
-    let link = resolve_link_from(&config, target, cfgs.as_ref(), &process_env);
+    let link = resolve_link_from(&config, &target, cfgs.as_ref(), &process_env);
     if link.selects_mold {
         let real = link.probe();
         let reason = match speculative {
@@ -211,7 +236,7 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     let (config, cfgs) = futures_util::future::join(
         CargoConfig::load_global(&process_env),
-        rustc_target_cfgs(&host),
+        rustc_target_cfgs(Some(&host)),
     )
     .await;
     let link = resolve_link_from(&config, &host, cfgs.as_ref(), &process_env);
@@ -497,9 +522,11 @@ fn path_contains(name: &str) -> bool {
 /// answer itself; this stays the question the tests ask.
 #[cfg(test)]
 async fn uses_mold(target: &str, cargo_dir: &Path, env: EnvLookup<'_>) -> bool {
-    let (config, cfgs) =
-        futures_util::future::join(CargoConfig::load(cargo_dir, env), rustc_target_cfgs(target))
-            .await;
+    let (config, cfgs) = futures_util::future::join(
+        CargoConfig::load(cargo_dir, env),
+        rustc_target_cfgs(Some(target)),
+    )
+    .await;
     resolve_link_from(&config, target, cfgs.as_ref(), env).selects_mold
 }
 
@@ -806,15 +833,18 @@ impl CargoConfig {
 }
 
 /// `rustc --print cfg --target <triple>` — the truth about which `cfg()`
-/// predicates match. `None` when rustc cannot answer, in which case every
-/// cfg table stays a candidate (favoring a read that errs toward mold
-/// being selected over one that refuses a working build).
-async fn rustc_target_cfgs(target: &str) -> Option<HashSet<String>> {
-    let output = async_process::Command::new("rustc")
-        .args(["--print", "cfg", "--target", target])
-        .output()
-        .await
-        .ok()?;
+/// predicates match; a `None` triple asks rustc about the host, which a
+/// build without `--target` links for. `None` when rustc cannot answer,
+/// in which case every cfg table stays a candidate (favoring a read that
+/// errs toward mold being selected over one that refuses a working
+/// build).
+async fn rustc_target_cfgs(target: Option<&str>) -> Option<HashSet<String>> {
+    let mut command = async_process::Command::new("rustc");
+    command.args(["--print", "cfg"]);
+    if let Some(target) = target {
+        command.arg("--target").arg(target);
+    }
+    let output = command.output().await.ok()?;
     if !output.status.success() {
         return None;
     }
