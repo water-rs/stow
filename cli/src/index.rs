@@ -218,36 +218,24 @@ async fn fetch_slice(
     let session = base.session();
     let reference = base.reference(&tag)?;
 
-    match session.fetch_manifest_digest(&reference).await {
-        Ok(remote_digest) => {
-            if let Some(pointer) = &pointer
-                && pointer.manifest_digest == remote_digest
-            {
-                let pointer = SlicePointer {
-                    row_count: pointer.row_count,
-                    manifest_digest: remote_digest,
-                    fetched_at: now_secs(),
-                };
-                write_pointer(&dir, &pointer).await?;
-                return load_cached(&dir, &pointer).await;
+    // With a cached pointer the freshness check is one `HEAD`; without one
+    // there is nothing to compare, so the manifest pull itself answers the
+    // digest — the `HEAD` would be a wasted round trip before every cold
+    // fetch (stow#347).
+    if let Some(pointer) = &pointer {
+        match session.fetch_manifest_digest(&reference).await {
+            Ok(remote_digest) => {
+                if pointer.manifest_digest == remote_digest {
+                    let pointer = SlicePointer {
+                        row_count: pointer.row_count,
+                        manifest_digest: remote_digest,
+                        fetched_at: now_secs(),
+                    };
+                    write_pointer(&dir, &pointer).await?;
+                    return load_cached(&dir, &pointer).await;
+                }
             }
-            let (blob, manifest_digest, index) =
-                download_verified_slice(config, &session, &reference, &tag, target, rustc_version)
-                    .await?;
-            store_slice(&dir, &manifest_digest, &blob).await?;
-            let pointer = SlicePointer {
-                row_count: index.rows.len() as u64,
-                manifest_digest: manifest_digest.clone(),
-                fetched_at: now_secs(),
-            };
-            write_pointer(&dir, &pointer).await?;
-            Ok(IndexSlice {
-                manifest_digest,
-                index,
-            })
-        }
-        Err(error) => {
-            if let Some(pointer) = &pointer {
+            Err(error) => {
                 tracing::info!(
                     error = %error,
                     tag = %tag,
@@ -255,14 +243,33 @@ async fn fetch_slice(
                 );
                 return load_cached(&dir, pointer).await;
             }
-            Err(stow_types::stow_error!("fetch index slice {tag}: {error}"))
         }
     }
+
+    let (blob, manifest_digest, index) =
+        download_verified_slice(config, &session, &reference, &tag, target, rustc_version).await?;
+    store_slice(&dir, &manifest_digest, &blob).await?;
+    let pointer = SlicePointer {
+        row_count: index.rows.len() as u64,
+        manifest_digest: manifest_digest.clone(),
+        fetched_at: now_secs(),
+    };
+    write_pointer(&dir, &pointer).await?;
+    Ok(IndexSlice {
+        manifest_digest,
+        index,
+    })
 }
 
 /// Pull, verify, and decode the index artifact `tag` resolves to. Any
 /// failure — manifest shape, blob digest, signature, slice identity —
 /// aborts before a byte is cached.
+///
+/// The three network legs that do not depend on each other run
+/// concurrently: the trust root (its own TUF repository download on a
+/// cold sigstore cache) starts before the manifest pull, and the blob and
+/// the signature materials fetch together once the manifest names them
+/// (stow#347).
 async fn download_verified_slice(
     config: &StowConfig,
     session: &stow_oci::RegistrySession,
@@ -271,6 +278,7 @@ async fn download_verified_slice(
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<(Vec<u8>, String, ArtifactIndex)> {
+    let trust = verify::spawn_trust(config);
     let (manifest_digest, manifest) = stow_oci::pull_tagged_manifest(session, reference).await?;
     let [layer] = manifest.layers.as_slice() else {
         return Err(stow_types::stow_error!(
@@ -284,14 +292,23 @@ async fn download_verified_slice(
             layer.media_type
         ));
     }
-    let blob = stow_oci::pull_blob_verified(session, layer).await?;
-    let materials =
-        stow_oci::pull_signature_materials(session, reference, &manifest_digest).await?;
+    let (blob, materials) = tokio::try_join!(
+        stow_oci::pull_blob_verified(session, layer),
+        stow_oci::pull_signature_materials(session, reference, &manifest_digest),
+    )?;
     // The signer binds the canonical GHCR reference, not whichever
     // transport base the pull came through.
     let identity_reference = format!("{GHCR_BASE}:{tag}");
-    verify::verify_index_signature(config, &identity_reference, &manifest_digest, &materials)
-        .await?;
+    let trust = trust
+        .await
+        .map_err(|error| stow_types::stow_error!("join sigstore trust task: {error}"))??;
+    verify::verify_index_signature_with_trust(
+        trust,
+        &identity_reference,
+        &manifest_digest,
+        &materials,
+    )
+    .await?;
     let index = stow_types::index::decode(&blob).wrap_err("decode index slice")?;
     if index.header.target.as_str() != target
         || index.header.rustc_version.as_str() != rustc_version
