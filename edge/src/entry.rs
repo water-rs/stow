@@ -7,11 +7,11 @@ use skyzen::utils::State;
 use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 use skyzen_services::Db;
 
+use stow_types::admission;
+
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
-use crate::{
-    admission, api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook,
-};
+use crate::{api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook};
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";

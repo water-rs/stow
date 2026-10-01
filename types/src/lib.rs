@@ -6,6 +6,7 @@
 //! `DependencyCMetadataJson`) that enforce the five-element artifact identity
 //! tuple at compile time.
 
+pub mod admission;
 pub mod analytics;
 pub mod api;
 pub mod artifact;
@@ -15,6 +16,7 @@ pub mod capture;
 pub mod crate_info;
 pub mod do_budgets;
 pub mod error;
+pub mod fixture;
 pub mod glibc;
 pub mod hash;
 pub mod identity;

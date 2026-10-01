@@ -43,8 +43,8 @@
 //! project from scratch, and never redeemed one.
 //!
 //! A public cache miss cannot enqueue a build directly — the fetch path
-//! returns an [`stow_types::api::EnqueueAdmission`] carrying the canonical
-//! [`stow_types::api::EnqueueRequest`], this module's challenge, and a
+//! returns an [`crate::api::EnqueueAdmission`] carrying the canonical
+//! [`crate::api::EnqueueRequest`], this module's challenge, and a
 //! difficulty; `POST /api/v1/enqueue` redeems it by forwarding the carried
 //! request to the scheduler. Nothing is persisted per challenge: the HMAC
 //! covers `task_id ‖ canonical request JSON ‖ issue_minute` and is
@@ -52,16 +52,21 @@
 //! after issue and a forged or tampered request cannot verify.
 //!
 //! Everything here is platform-free so the whole protocol is unit-testable
-//! on the host; the wasm handlers feed it wall-clock minutes from
-//! `js_sys::Date` and the canonical JSON from `serde_json::to_vec`.
+//! on the host — it lives in this crate rather than the edge's because
+//! the ticket protocol has two producers (the edge mints, a load driver
+//! or CLI client may re-issue under a known secret) and a shared protocol
+//! belongs where `EnqueueTicket` itself is typed.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use stow_types::pow::MAX_POW_DIFFICULTY;
+
+use crate::pow::MAX_POW_DIFFICULTY;
 
 /// Default for `STOW_POW_MIN_BITS` — the leading-zero bits every minted
 /// admission and every redeemed ticket carries, so an enqueue is never
-/// free. At a measured 66 ns per blake3 hash this is about 0.27 ms of
+/// free.
+///
+/// At a measured 66 ns per blake3 hash this is about 0.27 ms of
 /// expected work per admission: unmissable in aggregate to anyone
 /// enqueuing at scale, unnoticeable to a build that missed a few
 /// hundred artifacts.
@@ -69,10 +74,12 @@ pub const DEFAULT_POW_MIN_BITS: u32 = 12;
 
 type ChallengeMac = Hmac<Sha256>;
 
-/// Issue the hex-encoded HMAC-SHA256 challenge binding `task_id` and
-/// `request_json` (the canonical `serde_json::to_vec` of the carried
-/// [`stow_types::api::EnqueueRequest`]) as of `issue_minute` (unix time /
-/// 60).
+/// Issue the hex-encoded HMAC-SHA256 challenge.
+///
+/// The MAC binds `task_id` and `request_json` (the canonical
+/// `serde_json::to_vec` of the carried [`crate::api::EnqueueRequest`])
+/// as of `issue_minute` (unix time / 60).
+#[must_use]
 pub fn issue_challenge(
     secret: &str,
     task_id: &str,
@@ -123,13 +130,14 @@ fn challenge_mac(
 }
 
 /// The leading-zero bits an admission carries, which is also what
-/// `/api/v1/enqueue` requires of the ticket redeeming it. Minting and
-/// redemption compute the same value from the same configuration, so a
-/// ticket solved for its admission is always redeemable within the
-/// challenge's lifetime.
+/// `/api/v1/enqueue` requires of the ticket redeeming it.
 ///
-/// [`stow_types::pow::MAX_POW_DIFFICULTY`] clamps it: it guards against a
-/// misconfigured `STOW_POW_MIN_BITS`, not against load.
+/// Minting and redemption compute the same value from the same
+/// configuration, so a ticket solved for its admission is always
+/// redeemable within the challenge's lifetime.
+///
+/// [`MAX_POW_DIFFICULTY`] clamps it: it guards against a misconfigured
+/// `STOW_POW_MIN_BITS`, not against load.
 #[must_use]
 pub fn difficulty(min_bits: u32) -> u32 {
     min_bits.min(MAX_POW_DIFFICULTY)
@@ -138,7 +146,7 @@ pub fn difficulty(min_bits: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_POW_MIN_BITS, difficulty, issue_challenge, verify_challenge};
-    use stow_types::pow::MAX_POW_DIFFICULTY;
+    use crate::pow::MAX_POW_DIFFICULTY;
 
     const SECRET: &str = "test-secret";
     const REQUEST_JSON: &[u8] = b"{\"crate_name\":\"serde\"}";
@@ -270,9 +278,9 @@ mod tests {
         let bits = difficulty(DEFAULT_POW_MIN_BITS);
         let nonce = (0u64..(1 << 20))
             .find(|nonce| {
-                stow_types::pow::enqueue_pow_zero_bits("task-1", "challenge-1", *nonce) >= bits
+                crate::pow::enqueue_pow_zero_bits("task-1", "challenge-1", *nonce) >= bits
             })
             .expect("the default difficulty is reachable within a sequential scan");
-        assert!(stow_types::pow::enqueue_pow_zero_bits("task-1", "challenge-1", nonce) >= bits);
+        assert!(crate::pow::enqueue_pow_zero_bits("task-1", "challenge-1", nonce) >= bits);
     }
 }
