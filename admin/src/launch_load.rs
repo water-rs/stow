@@ -3,11 +3,15 @@
 //! The driver reads `launch-model.toml` and fires each lane at its
 //! peak-hour rate for `--duration-secs` (the issue's thirty minutes by
 //! default). The public lanes need no credential; `--scheduler` adds
-//! the trusted lanes on the operator bearer, and `--webhook-secret`
-//! adds the `workflow_run` callback lane signed under the mock's
-//! `STOW_GITHUB_WEBHOOK_SECRET`. Alarm passes are never fired directly —
-//! the submits, mutations and completions the lanes drive arm the
-//! dispatch alarm, which is exactly how production earns them.
+//! the trusted lanes on the operator bearer, `--webhook-secret` adds
+//! the `workflow_run` callback lane signed under the mock's
+//! `STOW_GITHUB_WEBHOOK_SECRET`, and `--pow-secret` adds the untrusted
+//! miss lanes — real `POST /api/v1/admissions` calls, and `POST
+//! /api/v1/enqueue` redemptions on tickets the driver mints itself
+//! under the mock's `STOW_POW_CHALLENGE_SECRET`. Alarm passes are
+//! never fired directly — the submits, mutations and completions the
+//! lanes drive arm the dispatch alarm, which is exactly how production
+//! earns them.
 //!
 //! Per lane it reports request count, the effective rate, p50/p99
 //! latency and the status mix, and the run exits nonzero on a breach:
@@ -24,9 +28,15 @@ use std::time::{Duration, Instant};
 use clap::Args;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use stow_types::api::{EnqueueRequest, EnqueueSource, QueueSelector};
+use stow_types::admission::{DEFAULT_POW_MIN_BITS, difficulty, issue_challenge};
+use stow_types::api::{
+    AdmissionRequest, DependencyGraphEntry, EnqueueRequest, EnqueueSource, EnqueueTicket,
+    QueueSelector, ResolvedDependencyGraphEntry,
+};
+use stow_types::fixture::{FixtureShape, task_hex_id};
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::launch_model::{EventKind, LaunchModel};
+use stow_types::pow::enqueue_pow_zero_bits;
 use stow_types::stow_error;
 
 use zenwave::Client;
@@ -72,6 +82,17 @@ pub struct LaunchLoadArgs {
     /// debugging aid; the harness runs them all.
     #[arg(long, value_delimiter = ',')]
     pub lanes: Vec<String>,
+    /// Mint the redemption lane's tickets under this challenge secret —
+    /// the mock manifest's `STOW_POW_CHALLENGE_SECRET`
+    /// (`mock-pow-challenge-secret`). With it the driver fires the
+    /// untrusted `admissions` and `enqueue` lanes; without it they stay
+    /// off.
+    #[arg(long)]
+    pub pow_secret: Option<String>,
+    /// Leading-zero bits the redemption lane's tickets solve to — the
+    /// mock manifest's `STOW_POW_MIN_BITS` (default 12).
+    #[arg(long, default_value_t = DEFAULT_POW_MIN_BITS)]
+    pub pow_min_bits: u32,
 }
 
 /// Lane error share the run tolerates before it fails — one percent.
@@ -105,6 +126,17 @@ enum Fire {
         secret: String,
         rustc: String,
         queue_rows: u64,
+    },
+    /// `POST /api/v1/admissions` — one miss entry whose resolved graph
+    /// rides in the body, so the lane pays the real mint path without
+    /// a crates.io hop.
+    Admission { target: String, rustc: String },
+    /// `POST /api/v1/enqueue` — a ticket the driver mints itself under
+    /// the mock's challenge secret, nonce solved to `min_bits`.
+    EnqueueRedeem {
+        secret: String,
+        min_bits: u32,
+        rustc: String,
     },
 }
 
@@ -170,38 +202,46 @@ struct LoadReport {
     breaches: Vec<String>,
 }
 
-/// A seeded queue row's task id — `printf('%064x', n)` in the fixture
-/// seed.
-fn seeded_task_id(n: u64) -> String {
-    format!("{n:064x}")
+/// The queue-order shape the seeded ids come from —
+/// `stow_types::fixture` owns the math so the lanes and the seeders
+/// cannot drift (stow#452 F11).
+fn shape(queue_rows: u64) -> FixtureShape {
+    FixtureShape {
+        queue_rows: u32::try_from(queue_rows).unwrap_or(u32::MAX),
+    }
 }
 
-/// The k-th dispatched row's task id: the fixture's in-flight range is
-/// `failed_end..failed_end+30` with even `n` dispatched.
+/// The k-th dispatched row's task id — the fixture's in-flight range,
+/// even `n` only.
 fn dispatched_task_id(k: u64, queue_rows: u64) -> String {
-    let failed_end = queue_rows / 40 * 39;
-    let n = failed_end + 2 + (k % 15) * 2;
-    seeded_task_id(n)
+    let shape = shape(queue_rows);
+    let index = u32::try_from(k % u64::from(FixtureShape::IN_FLIGHT_ROWS / 2)).unwrap_or_default();
+    task_hex_id(u64::from(shape.dispatched_row(index)))
 }
 
 /// The k-th failed row's task id — `completed_end < n <= failed_end`.
 fn failed_task_id(k: u64, queue_rows: u64) -> String {
-    let completed_end = queue_rows / 20 * 19;
-    let failed_end = queue_rows / 40 * 39;
-    let span = (failed_end - completed_end).max(1);
-    seeded_task_id(completed_end + 1 + (k % span))
+    let shape = shape(queue_rows);
+    let span = shape
+        .failed_end()
+        .saturating_sub(shape.completed_end())
+        .max(1);
+    let index = u32::try_from(k % u64::from(span)).unwrap_or_default();
+    task_hex_id(u64::from(shape.failed_row(index)))
 }
 
 /// The k-th pending row — `1..=pending_end`.
 fn pending_task_id(k: u64, queue_rows: u64) -> String {
-    let pending_end = (queue_rows / 10 * 6).max(1);
-    seeded_task_id(1 + (k % pending_end))
+    let pending_end = u64::from(shape(queue_rows).pending_end()).max(1);
+    task_hex_id(1 + (k % pending_end))
 }
 
 /// Real crates the submit lane rotates through — each resolves for
 /// real through the canonicalize step so the enqueue is the genuine
-/// trusted path, and `version` varies so the identities keep landing
-/// fresh rows across a long run.
+/// trusted path. The pool is fixed, so every submission dedupes onto
+/// the same eight task ids — the lane exercises the resubmit path;
+/// the fresh-row inserts come from the miss lanes' per-counter
+/// features.
 const SUBMIT_POOL: &[(&str, &str)] = &[
     ("cfg-if", "1.0.0"),
     ("scopeguard", "1.2.0"),
@@ -346,6 +386,94 @@ fn submit_task(rustc: &str, counter: u64) -> Result<EnqueueRequest, String> {
     })
 }
 
+/// The miss-lane task — same pool crates but a per-counter feature, so
+/// every admission mint and every redemption inserts a task the queue
+/// has not seen instead of measuring the dedup path (stow#452 F7/F9).
+fn miss_task(rustc: &str, counter: u64) -> Result<EnqueueRequest, String> {
+    let mut task = submit_task(rustc, counter)?;
+    task.source = EnqueueSource::CacheMiss;
+    task.features_json = FeaturesJson::canonicalize(vec![format!("stow-load-{counter}")])
+        .map_err(|error| format!("features: {error}"))?;
+    Ok(task)
+}
+
+/// The admission's request body: one miss entry whose resolved graph
+/// rides in `expanded_entries` — the edge's expansion consumes the
+/// supplied graph and never calls crates.io.
+fn admission_body(target: &str, rustc: &str, counter: u64) -> Result<serde_json::Value, String> {
+    let task = miss_task(rustc, counter)?;
+    let crate_name = task.crate_name.clone();
+    let version = semver::Version::parse(&task.version.to_string())
+        .map_err(|error| format!("version: {error}"))?;
+    let features = vec![format!("stow-load-{counter}")];
+    serde_json::to_value(AdmissionRequest {
+        target: target
+            .parse::<TargetTriple>()
+            .map_err(|error| format!("target: {error}"))?,
+        rustc_version: task.rustc_version,
+        entries: vec![DependencyGraphEntry {
+            crate_name: crate_name.clone(),
+            version: version.clone(),
+            features: features.clone(),
+        }],
+        expanded_entries: vec![ResolvedDependencyGraphEntry {
+            crate_name,
+            version,
+            features,
+            host_side: false,
+            dependencies: Vec::new(),
+        }],
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// Wall-clock minute the admission protocol stamps challenges with —
+/// the host twin of the edge handler's `now_minute()`.
+fn now_minute() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 60
+}
+
+/// Mint a redeemable ticket for `request` under `secret` — the same
+/// `issue_challenge` the edge runs, then a nonce scanned to the
+/// configured difficulty. A ticket exactly like what `POST
+/// /api/v1/admissions` would have returned, minus the round trip.
+fn mint_ticket(
+    secret: &str,
+    min_bits: u32,
+    request: &EnqueueRequest,
+) -> Result<EnqueueTicket, String> {
+    let task_id = stow_types::api::task_id(
+        request.crate_name.as_str(),
+        &request.version.to_string(),
+        request.features_json.raw().as_str(),
+        request.target.as_str(),
+        request.rustc_version.as_str(),
+        request.host_side,
+    );
+    let request_json = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let challenge = issue_challenge(secret, &task_id, &request_json, now_minute());
+    let required = difficulty(min_bits);
+    // The scan bound is 2^(bits+14) — at the default 12 that is ~16M
+    // hashes against an expected 4k, so `None` means the configured
+    // difficulty, not the search.
+    let bound = 1u64
+        .checked_shl(required.saturating_add(14).min(63))
+        .unwrap_or(u64::MAX);
+    let nonce = (0u64..bound)
+        .find(|nonce| enqueue_pow_zero_bits(&task_id, &challenge, *nonce) >= required)
+        .ok_or_else(|| format!("no PoW nonce below {bound} for {required} bits"))?;
+    Ok(EnqueueTicket {
+        task_id,
+        challenge,
+        nonce,
+        request: request.clone(),
+    })
+}
+
 /// Resolve one lane event into its request — the index pull's pointer
 /// hop and the bearer fetches happen here.
 async fn plan(
@@ -420,6 +548,24 @@ async fn plan(
                     ("Content-Type".to_owned(), "application/json".to_owned()),
                 ],
                 body: body.into_bytes(),
+            })
+        }
+        Fire::Admission { target, rustc } => Ok(Plan::PostJson {
+            url: format!("{base}/api/v1/admissions"),
+            bearer: None,
+            body: admission_body(target, rustc, counter)?,
+        }),
+        Fire::EnqueueRedeem {
+            secret,
+            min_bits,
+            rustc,
+        } => {
+            let request = miss_task(rustc, counter)?;
+            let ticket = mint_ticket(secret, *min_bits, &request)?;
+            Ok(Plan::PostJson {
+                url: format!("{base}/api/v1/enqueue"),
+                bearer: None,
+                body: serde_json::to_value(&ticket).map_err(|error| error.to_string())?,
             })
         }
     }
@@ -634,34 +780,25 @@ fn build_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
         },
     ];
     if args.scheduler {
+        lanes.extend(scheduler_lanes(args, model));
+    }
+    if let Some(secret) = &args.pow_secret {
         lanes.extend([
             Lane {
-                name: "admin-status",
-                eps: eps(EventKind::AdminOperation).max(0.005),
-                fire: Fire::TrustedGet("/api/v1/admin/status".to_owned()),
-                expected: ok2xx,
-            },
-            Lane {
-                name: "queue-read",
-                eps: eps(EventKind::AdminOperation).max(0.005),
-                fire: Fire::TrustedGet("/api/v1/admin/queue?status=failed&limit=50".to_owned()),
-                expected: ok2xx,
-            },
-            Lane {
-                name: "queue-mutate",
-                eps: eps(EventKind::AdminOperation).max(0.005),
-                fire: Fire::QueueMutate {
-                    verb: "retry",
-                    queue_rows: args.queue_rows,
+                name: "admission",
+                eps: eps(EventKind::Admission),
+                fire: Fire::Admission {
+                    target: "x86_64-unknown-linux-gnu".to_owned(),
+                    rustc: args.rustc.clone(),
                 },
                 expected: ok2xx,
             },
             Lane {
-                name: "trusted-submit",
-                // The DO write lanes the miss/human traffic causes —
-                // enqueues plus human submits arm passes and write rows.
-                eps: eps(EventKind::EnqueueRedemption) + eps(EventKind::HumanRequest),
-                fire: Fire::TrustedSubmit {
+                name: "enqueue-redeem",
+                eps: eps(EventKind::EnqueueRedemption),
+                fire: Fire::EnqueueRedeem {
+                    secret: secret.clone(),
+                    min_bits: args.pow_min_bits,
                     rustc: args.rustc.clone(),
                 },
                 expected: ok2xx,
@@ -682,6 +819,46 @@ fn build_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
     }
 
     lanes
+}
+
+/// The `--scheduler` lanes — the trusted surface's admin reads, a queue
+/// mutation, and the human-lane submits (the miss lanes' enqueues fire
+/// on their own routes, so `trusted-submit` carries only the model's
+/// human traffic).
+fn scheduler_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
+    let scale = args.rate_scale;
+    let eps = |kind: EventKind| model.peak_events_per_second(kind) * scale;
+    vec![
+        Lane {
+            name: "admin-status",
+            eps: eps(EventKind::AdminOperation).max(0.005),
+            fire: Fire::TrustedGet("/api/v1/admin/status".to_owned()),
+            expected: ok2xx,
+        },
+        Lane {
+            name: "queue-read",
+            eps: eps(EventKind::AdminOperation).max(0.005),
+            fire: Fire::TrustedGet("/api/v1/admin/queue?status=failed&limit=50".to_owned()),
+            expected: ok2xx,
+        },
+        Lane {
+            name: "queue-mutate",
+            eps: eps(EventKind::AdminOperation).max(0.005),
+            fire: Fire::QueueMutate {
+                verb: "retry",
+                queue_rows: args.queue_rows,
+            },
+            expected: ok2xx,
+        },
+        Lane {
+            name: "trusted-submit",
+            eps: eps(EventKind::HumanRequest).max(0.005),
+            fire: Fire::TrustedSubmit {
+                rustc: args.rustc.clone(),
+            },
+            expected: ok2xx,
+        },
+    ]
 }
 
 /// `stow-admin launch-load` — fire the lanes, then emit the report and
