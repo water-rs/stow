@@ -31,9 +31,6 @@ mod github_app;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod github_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub(crate) mod worker_resolver;
-
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod index_slice;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod miss_logger;

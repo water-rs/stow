@@ -1711,30 +1711,8 @@ pub struct CoverageArtifact {
     pub bundle_size: u64,
 }
 
-/// Request body for `POST /api/v1/admin/preheat/plan` — a dry run of the
-/// resolver's closure expansion and dominance pruning for one crate
-/// request. Nothing is enqueued.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PreheatPlanRequest {
-    /// Crate name to plan for.
-    pub crate_name: CrateName,
-    /// Exact version; absent resolves the newest non-prerelease,
-    /// non-yanked published release.
-    #[serde(default)]
-    pub version: Option<CrateVersion>,
-    /// Seed features (`[]` = `--no-default-features` semantics).
-    pub features_json: FeaturesJson,
-    /// One compilation target, or absent for every [`CI_TARGET_TRIPLES`]
-    /// target.
-    #[serde(default)]
-    pub target: Option<TargetTriple>,
-    /// Rustc version; absent resolves the scheduler's stable channel
-    /// version.
-    #[serde(default)]
-    pub rustc_version: Option<WireRustcVersion>,
-}
-
-/// Response of `POST /api/v1/admin/preheat/plan`.
+/// Output of `stow-admin preheat plan` — the dry-run enqueue plan for one
+/// crate request, computed in-process by `stow-resolver`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PreheatPlanResponse {
     /// Crate the plan was computed for.
@@ -1758,70 +1736,6 @@ pub struct PreheatPlanTarget {
     /// names its own dependencies — the row dispatches once every dep is
     /// servable — so tasks with an empty `depends_on` are the wave's
     /// roots.
-    pub tasks: Vec<EnqueueRequest>,
-}
-
-/// Request body for `POST /api/v1/admin/resolve/crate`.
-///
-/// Resolves one published `.crate` into the task batch its crates.io
-/// dependency graph produces. The tarball's bundled `Cargo.lock` is
-/// dropped before the resolve, so the resolve lands on the latest
-/// semver-compatible versions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AdminResolveCrateRequest {
-    /// Crate name on crates.io.
-    pub crate_name: CrateName,
-    /// Exact published version.
-    pub version: CrateVersion,
-    /// Compilation targets to resolve (CI triples).
-    pub targets: Vec<TargetTriple>,
-    /// Stable rustc version the tasks key on.
-    pub rustc_version: WireRustcVersion,
-    /// Download count carried into each task's priority.
-    #[serde(default)]
-    pub downloads: u64,
-}
-
-/// Request body for `POST /api/v1/admin/resolve/project`.
-///
-/// Resolves a GitHub repository's workspace into crate tasks. The
-/// committed `Cargo.lock` is dropped: a project contributes names and
-/// feature sets, never version pins.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AdminResolveProjectRequest {
-    /// Repository in `owner/name` form (codeload host).
-    pub repo: String,
-    /// Ref to fetch — a branch, tag, sha, or `HEAD` for the default branch.
-    pub git_ref: String,
-    /// Compilation targets to resolve (CI triples).
-    pub targets: Vec<TargetTriple>,
-    /// Stable rustc version the tasks key on.
-    pub rustc_version: WireRustcVersion,
-    /// Download count carried into each task's priority.
-    #[serde(default)]
-    pub downloads: u64,
-}
-
-/// Response of the admin resolve endpoints: publish-shape flags plus the
-/// task batch per requested target.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AdminResolveResponse {
-    /// Whether the resolved source ships a `[[bin]]` target — the binaries
-    /// lane's skip condition, read from cargo's own target knowledge.
-    pub has_binary: bool,
-    /// Whether the resolved root package ships a library target.
-    pub has_library: bool,
-    /// One task batch per requested target, in request order.
-    pub targets: Vec<AdminResolveTarget>,
-}
-
-/// One target's task batch inside [`AdminResolveResponse`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AdminResolveTarget {
-    /// Compilation target the batch was resolved for.
-    pub target: TargetTriple,
-    /// Tasks for every node in the resolved graph; each node's
-    /// `depends_on` names the dependencies that must publish first.
     pub tasks: Vec<EnqueueRequest>,
 }
 

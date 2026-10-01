@@ -155,7 +155,7 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
 /// the scheduler lane — each wrapped in `gate` so a rate-limited GitHub
 /// trust check answers 503 + `Retry-After` instead of the bare error
 /// envelope.
-fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
+fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
     [
         "/api/v1/admin"
             .route((
@@ -167,7 +167,6 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/dispatch-freeze"
                     .at(api::get_dispatch_freeze)
                     .post(api::set_dispatch_freeze),
-                "/preheat/plan".post(api::preheat_plan),
                 "/queue".at(api::admin_queue_list),
                 "/queue/retry".post(api::admin_queue_retry),
                 "/queue/cancel".post(api::admin_queue_cancel),
@@ -186,12 +185,6 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/sync".post(api::sync_artifacts),
                 "/prune".post(api::prune_artifacts),
                 "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
-            ))
-            .with(gate.clone()),
-        "/api/v1/admin/resolve"
-            .route((
-                "/crate".post(api::admin_resolve_crate),
-                "/project".post(api::admin_resolve_project),
             ))
             .with(gate.clone()),
         "/api/v1/scheduler"

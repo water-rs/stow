@@ -11,13 +11,9 @@
 //! connection exactly like a full read. [`OutboundPool`] keeps the
 //! resolve path's fetch fan-out inside the same budget.
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use async_lock::{Semaphore, SemaphoreGuardArc};
-
-use stow_resolve::util::network::http_async::BodyStream;
 
 /// A fetched body that can be actively released without reading it.
 ///
@@ -198,28 +194,6 @@ impl Default for OutboundPool {
 /// inside a poll that returned `Pending`, so `notify` can only ever
 /// wake a task that is asleep.
 pub type OutboundPermit = SemaphoreGuardArc;
-
-/// Bind an [`OutboundPermit`] to a body stream: the slot frees when the
-/// stream is consumed or dropped, never earlier.
-pub fn slotted(stream: BodyStream, permit: OutboundPermit) -> BodyStream {
-    Box::pin(SlottedStream {
-        _permit: permit,
-        inner: stream,
-    })
-}
-
-struct SlottedStream {
-    _permit: OutboundPermit,
-    inner: BodyStream,
-}
-
-impl futures_util::Stream for SlottedStream {
-    type Item = stow_resolve::util::CargoResult<Vec<u8>>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
-    }
-}
 
 /// Test double for [`FetchedResponse`]: records which terminal path the
 /// body took so host tests can prove a branch consumed or cancelled it.

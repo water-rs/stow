@@ -144,7 +144,6 @@ mod tests {
         let cases = [
             GetArtifactError::NotFound,
             GetArtifactError::BadRequest,
-            GetArtifactError::UnprocessableEntity(String::new()),
             GetArtifactError::SchedulerBusy(String::new()),
             GetArtifactError::InternalWithMessage(String::new()),
         ];

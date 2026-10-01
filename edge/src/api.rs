@@ -26,7 +26,7 @@ use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
     catalog, crates_io, dependency_resolver, ghcr, index_slice, miss_logger, rust_channel,
-    scheduler, scheduler_client, stats, worker_resolver,
+    scheduler, scheduler_client, stats,
 };
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -287,21 +287,6 @@ pub async fn set_dispatch_freeze(
     let stored = scheduler_client::set_dispatch_freeze(&scheduler, switch.enabled).await?;
     tracing::warn!(enabled = stored.enabled, %caller, "dispatch freeze flipped via admin endpoint");
     Ok(Json(stored))
-}
-
-/// The 503 the admin work-submitting routes answer while the freeze is
-/// engaged — the reason names the stored trigger. Lanes that reach the
-/// object's submit get this refusal from the object itself; this check
-/// covers the routes whose work never crosses it (resolve, preheat).
-async fn refuse_if_dispatch_frozen(scheduler: &CfDurableNamespace) -> Result<(), GetArtifactError> {
-    let freeze = scheduler_client::get_dispatch_freeze(scheduler).await?;
-    if let Some(record) = freeze.record {
-        return Err(GetArtifactError::DispatchFrozen(format!(
-            "dispatch is frozen ({})",
-            crate::freeze::summarize_trigger(&record.trigger)
-        )));
-    }
-    Ok(())
 }
 
 /// Query for `GET /api/v1/admin/index/{target}/{rustc_version}`.
@@ -642,178 +627,6 @@ pub async fn artifact_coverage(
     }))
 }
 
-/// POST /api/v1/admin/preheat/plan
-///
-/// Dry run of the request API's closure expansion and dominance pruning
-/// for one crate request: the tasks a dispatch wave would enqueue per
-/// target. Nothing is enqueued.
-pub async fn preheat_plan(
-    SchedulerCaller(_caller): SchedulerCaller,
-    Json(request): Json<stow_types::api::PreheatPlanRequest>,
-    db: Db,
-    State(cache): State<CfCache>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
-    State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::PreheatPlanResponse>, GetArtifactError> {
-    refuse_if_dispatch_frozen(&scheduler).await?;
-    if let Some(target) = &request.target
-        && !stow_types::api::is_ci_target(target.as_str())
-    {
-        return Err(GetArtifactError::UnsupportedTarget {
-            target: target.as_str().to_owned(),
-            supported: CI_TARGET_TRIPLES.join(", "),
-        });
-    }
-    // One bound for the whole request: the crates.io lookups and the
-    // resolve expansion below draw from the same invocation's budget.
-    let pool = OutboundPool::new();
-    let crates_io = crates_io::CfCratesIo::new(pool.clone());
-    let (version, rustc_version) = futures_util::try_join!(
-        async {
-            match &request.version {
-                Some(version) => dependency_resolver::published_version(
-                    &db,
-                    &crates_io,
-                    request.crate_name.as_str(),
-                    version.as_semver(),
-                )
-                .await
-                .map_err(GetArtifactError::from),
-                None => dependency_resolver::latest_published_version(
-                    &db,
-                    &crates_io,
-                    request.crate_name.as_str(),
-                )
-                .await
-                .map_err(GetArtifactError::from),
-            }
-        },
-        async {
-            match &request.rustc_version {
-                Some(rustc_version) => Ok(rustc_version.clone()),
-                None => rust_channel::stable_rustc_version(&cache, &rust_channel::CfRustChannel)
-                    .await
-                    .map_err(GetArtifactError::from),
-            }
-        },
-    )?;
-    let version = version.ok_or_else(|| GetArtifactError::VersionNotPublished {
-        crate_name: request.crate_name.as_str().to_owned(),
-        requested: request
-            .version
-            .as_ref()
-            .map_or_else(|| "stable release".to_owned(), |v| format!("version {v}")),
-    })?;
-    let seed_features =
-        dependency_resolver::normalize_feature_set(request.features_json.features().to_vec())
-            .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let target_list = match &request.target {
-        Some(target) => vec![target.clone()],
-        None => CI_TARGET_TRIPLES
-            .iter()
-            .map(|triple| {
-                TargetTriple::parse(*triple).map_err(|error| {
-                    GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    let targets = worker_resolver::expand_crate_request_on_targets(
-        &db,
-        &request.crate_name,
-        &version,
-        &seed_features,
-        &target_list,
-        &rustc_version,
-        settings.rustc_data_base_url.as_deref(),
-        &pool,
-    )
-    .into_send()
-    .await?
-    .into_iter()
-    .map(|(target, plan)| stow_types::api::PreheatPlanTarget {
-        target,
-        root_cached: plan.root_cached,
-        tasks: plan.enqueue_requests,
-    })
-    .collect::<Vec<_>>();
-    Ok(Json(stow_types::api::PreheatPlanResponse {
-        crate_name: request.crate_name,
-        version: CrateVersion::new(version),
-        rustc_version,
-        targets,
-    }))
-}
-
-/// `POST /api/v1/admin/resolve/crate`
-///
-/// Resolve one published `.crate` into the task batch its crates.io
-/// dependency graph produces — the binaries and top-lane expansion the
-/// admin CLI used to run as `cargo metadata` locally.
-pub async fn admin_resolve_crate(
-    SchedulerCaller(_caller): SchedulerCaller,
-    Json(request): Json<stow_types::api::AdminResolveCrateRequest>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
-    State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
-    refuse_if_dispatch_frozen(&scheduler).await?;
-    let pool = OutboundPool::new();
-    let resolved = worker_resolver::resolve_crate(
-        &request.crate_name,
-        request.version.as_semver(),
-        &request.targets,
-        &request.rustc_version,
-        request.downloads,
-        settings.rustc_data_base_url.as_deref(),
-        &pool,
-    )
-    .into_send()
-    .await?;
-    Ok(Json(resolve_response(resolved)))
-}
-
-/// `POST /api/v1/admin/resolve/project`
-///
-/// Resolve a GitHub repository's workspace into crate tasks — the
-/// projects lane's expansion, fetched as a codeload tarball and resolved
-/// by cargo's own machinery instead of a local `cargo metadata` run.
-pub async fn admin_resolve_project(
-    SchedulerCaller(_caller): SchedulerCaller,
-    Json(request): Json<stow_types::api::AdminResolveProjectRequest>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
-    State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::AdminResolveResponse>, GetArtifactError> {
-    refuse_if_dispatch_frozen(&scheduler).await?;
-    let pool = OutboundPool::new();
-    let resolved = worker_resolver::resolve_github_project(
-        &request.repo,
-        &request.git_ref,
-        &request.targets,
-        &request.rustc_version,
-        request.downloads,
-        settings.rustc_data_base_url.as_deref(),
-        &pool,
-    )
-    .into_send()
-    .await?;
-    Ok(Json(resolve_response(resolved)))
-}
-
-/// Shape a workspace resolve into the admin response.
-fn resolve_response(
-    resolved: worker_resolver::SourceResolve,
-) -> stow_types::api::AdminResolveResponse {
-    stow_types::api::AdminResolveResponse {
-        has_binary: resolved.has_binary,
-        has_library: resolved.has_library,
-        targets: resolved
-            .targets
-            .into_iter()
-            .map(|(target, tasks)| stow_types::api::AdminResolveTarget { target, tasks })
-            .collect(),
-    }
-}
-
 /// Row bound for the admin artifacts listing.
 const MAX_ADMIN_ARTIFACTS_LIST: u32 = 1000;
 /// `GET /api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=`
@@ -947,18 +760,12 @@ pub async fn prune_artifacts(
 pub async fn submit_scheduler_tasks(
     SchedulerCaller(caller): SchedulerCaller,
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
-    db: Db,
     State(scheduler): State<CfDurableNamespace>,
-    State(settings): State<crate::runtime_settings::ResolverSettings>,
 ) -> Result<Json<stow_types::api::SchedulerSubmitResponse>, GetArtifactError> {
-    let requested = requests.len();
-    let requests = dependency_resolver::canonicalize_enqueue_requests(
-        &db,
-        &crates_io::CfCratesIo::new(OutboundPool::new()),
-        requests,
-        settings.batch_fetch_concurrency,
-    )
-    .await?;
+    // The edge resolves nothing (stow#429): every lane that posts here
+    // already submits resolver-canonical requests, so they land verbatim —
+    // `Json` deserialization itself is the only check (`FeaturesJson`
+    // rejects a non-canonical feature list there).
     // Repo-writer submissions are exempt from the pending-depth cap — the
     // credential check is the bound on this path.
     let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &requests).await?;
@@ -968,9 +775,9 @@ pub async fn submit_scheduler_tasks(
             GetArtifactError::TooLarge("submitted task count exceeds u32".to_owned())
         })?,
         inserted,
-        dropped: u32::try_from(requested - requests.len()).map_err(|_| {
-            GetArtifactError::TooLarge("dropped request count exceeds u32".to_owned())
-        })?,
+        // Verbatim submission drops nothing; the field stays on the wire
+        // shape the submitters already parse.
+        dropped: 0,
     }))
 }
 
