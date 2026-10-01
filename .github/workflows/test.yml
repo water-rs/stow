@@ -270,6 +270,14 @@ jobs:
   # probes — the after report doubles as the launch-cost gate's input,
   # and `scripts/launch-load.sh` fails on any overload signal, error
   # share or row-count regression.
+  #
+  # The issue scopes the trigger to PRs touching `edge/`; this job
+  # deliberately keeps the scheduler-budget convention instead —
+  # `changes.outputs.code`, i.e. any non-doc change. The same-run report
+  # also gates types/ and admin/ edits, which reach the object through
+  # the shared wire types; paying the 75-minute lane on every code
+  # change is cheaper than discovering a non-edge change moved the cost
+  # after merge. The weekly cadence lives in launch-load-scheduled.yml.
   launch-load:
     needs: changes
     if: needs.changes.outputs.code == 'true'

@@ -1,0 +1,53 @@
+name: Launch load (scheduled)
+
+# stow#452 asks for the launch-rate load test on a schedule in addition
+# to the merge-queue run in test.yml — the model's allowances only hold
+# if production rates stay honest between merges, and a weekly run on
+# dev catches a drift that no change drove. The steps mirror test.yml's
+# `launch-load` job; keep the two copies in step.
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  launch-load:
+    name: Launch load (workerd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      # The load's scheduler lanes ride the trusted endpoints, which
+      # authenticate the credential's own repo permissions — GITHUB_TOKEN
+      # needs push (`contents: write`).
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: cargo build -p stow-admin
+      - run: scripts/launch-load.sh
+        env:
+          STOW_LOAD_WORK_DIR: ${{ runner.temp }}/stow-load
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: launch-load-logs
+          path: |
+            ${{ runner.temp }}/stow-load/logs
+            ${{ runner.temp }}/stow-load/budget-report-*.json
+            ${{ runner.temp }}/stow-load/launch-load-report.json
+          if-no-files-found: ignore
