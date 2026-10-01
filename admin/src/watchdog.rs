@@ -18,7 +18,8 @@
 //! never because it saw an incident.
 //!
 //! Costs (AGENTS.md "resources are spent deliberately"): one run is one
-//! GraphQL POST, one Analytics Engine SQL POST, ≤3 admin/endpoint calls,
+//! GraphQL POST, one Analytics Engine SQL POST, ≤4 admin/endpoint calls
+//! (status, dispatch-freeze, the reconcile pass, and the stats probe),
 //! one GHCR verified pull for the bundle probe (tag list + index
 //! manifest + signature + blob), ≤ `1 + MAX_CLASSIFIED_RUNS*2` GitHub
 //! REST reads, and, only while an incident is open, ≤8 REST mutations
@@ -270,6 +271,20 @@ const SIGNALS: &[Signal] = &[
         unit: "events",
         effect: Effect::Alert,
     },
+    // The in-flight↔GitHub reconcile pass (stow#526) as a point check:
+    // posting the route runs the pass, and the pass's drift count
+    // (completed-unreported + missing rows) is the breach — the drift
+    // rows ride the incident as evidence. Alerts only: the pass already
+    // applies the webhook transitions and the stale reclaim itself.
+    Signal {
+        id: "edge.reconcile_drift",
+        label: "scheduler in-flight↔GitHub drift (completed-unreported + missing)",
+        window_secs: 0,
+        min_sample: 1,
+        threshold: 1.0,
+        unit: "rows",
+        effect: Effect::Alert,
+    },
     // ── build pipeline ──
     Signal {
         id: "pipeline.failure_rate",
@@ -490,6 +505,7 @@ impl Watcher<'_> {
         gather!("pipeline", self.pipeline_readings());
         gather!("queue", self.queue_readings());
         gather!("dispatch-freeze", self.freeze_reading());
+        gather!("reconcile", self.reconcile_reading());
         let (endpoint_readings, endpoint_failure) = self.endpoint_readings().await;
         readings.extend(endpoint_readings);
         if let Some(error) = endpoint_failure {
@@ -811,6 +827,69 @@ impl Watcher<'_> {
             signal: signal("edge.dispatch_frozen"),
             sample: 1,
             value: f64::from(u8::from(freeze.enabled)),
+            evidence,
+        }])
+    }
+
+    /// `POST /api/v1/admin/scheduler/reconcile` — the in-flight↔GitHub
+    /// reconcile pass (stow#526) as one reading. Posting the route is
+    /// what runs the pass on the watchdog's cadence: the pass itself
+    /// applies the webhook's completion transitions and the stale
+    /// reclaim, so the reading only carries the drift count and the
+    /// drifting rows as evidence.
+    async fn reconcile_reading(&self) -> Result<Vec<Reading>, String> {
+        let report: stow_types::api::ReconcileReport = self
+            .edge
+            .post_json("/api/v1/admin/scheduler/reconcile", &serde_json::json!({}))
+            .await
+            .map_err(|error| error.to_string())?;
+        let drift = report.completed_unreported + report.missing;
+        let mut evidence = vec![format!(
+            "in_flight={} runs_listed={} running={} completed_unreported={} missing={} completions_applied={} completion_failures={} reclaimed={}",
+            report.in_flight,
+            report.runs_listed,
+            report.running,
+            report.completed_unreported,
+            report.missing,
+            report.completions_applied,
+            report.completion_failures,
+            report.reclaimed,
+        )];
+        let drifting: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|row| row.classification != stow_types::api::ReconcileClass::Running)
+            .collect();
+        for row in drifting.iter().take(5) {
+            let run = row
+                .run
+                .as_ref()
+                .and_then(|run| run.url.as_deref())
+                .map(|url| format!(" run={url}"))
+                .unwrap_or_default();
+            let detail = row
+                .detail
+                .as_deref()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            evidence.push(format!(
+                "{} {} {}@{} — applied={}{}{}",
+                row.classification.as_str(),
+                &row.task_id[..row.task_id.len().min(12)],
+                row.crate_name,
+                row.version,
+                row.applied.as_str(),
+                run,
+                detail,
+            ));
+        }
+        if drifting.len() > 5 {
+            evidence.push(format!("+{} more drifting rows", drifting.len() - 5));
+        }
+        Ok(vec![Reading {
+            signal: signal("edge.reconcile_drift"),
+            sample: 1,
+            value: f64::from(drift),
             evidence,
         }])
     }
@@ -2622,6 +2701,20 @@ mod tests {
         assert_eq!(decision.alerting.len(), 1);
         // And cleared dispatch stays clear.
         let cleared = decide(&[reading("edge.dispatch_frozen", 1, 0.0)], &[]);
+        assert!(!cleared.incident);
+    }
+
+    /// Drifting reconcile rows are an incident the watchdog records —
+    /// alert, never a trip: the pass already applied the webhook
+    /// transitions and the stale reclaim, so nothing remains to cut.
+    /// A clean pass is clear.
+    #[test]
+    fn reconcile_drift_alerts_without_tripping() {
+        let decision = decide(&[reading("edge.reconcile_drift", 1, 2.0)], &[]);
+        assert!(decision.incident);
+        assert_eq!(decision.tripped, [] as [usize; 0]);
+        assert_eq!(decision.alerting.len(), 1);
+        let cleared = decide(&[reading("edge.reconcile_drift", 1, 0.0)], &[]);
         assert!(!cleared.incident);
     }
 
