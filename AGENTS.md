@@ -24,8 +24,9 @@ task shape of its own:
 - admin operations.
 
 Every source does the same thing: it names crates, and cargo's own resolver
-(`stow-resolve`, carried in the edge) turns those names into nodes at the
-identities their consumers compile. Edges are dependency
+(`stow-resolver`, run inside the lanes — the `stow-admin` preheat paths and
+the `resolve-request.yml` job — never the edge) turns those names into nodes
+at the identities their consumers compile. Edges are dependency
 edges, and they are the build order — a node's dependencies are built before it, so
 each build compiles one crate and is served the rest. A build that compiles any
 node other than its own is a defect: either a dependency was dispatched before it was
@@ -42,7 +43,7 @@ identity. The build order is the edges. The unit rule is what may be a node.
 - Trust GitHub-hosted CI as the builder.
 - Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
 - The build path never calls the edge: `build-crate.yml` stamps its `run-name` `<rustc>-<task_id>` and pushes each task's bundle and `Vec<ArtifactRecord>` to GHCR as one cosign-signed `records-<rustc>-<task_id hash>` artifact under the pinned builder identity, and GitHub's `workflow_run` webhook (HMAC-verified at `POST /api/v1/github/workflow-run`) reports completion; the same webhook drives request-lane run updates — `resolve-request.yml` stamps `run-name` `resolve-a<attempt>-<request_id>` and its `in_progress`/`completed` deliveries advance the request record. `resolve-request.yml` is a submit lane, not the build path: like the preheat lanes it posts its outcome to the trusted scheduler route under its job's OIDC identity and writes no artifact records. GHCR plus cosign is the only record store; the edge's D1 `artifacts` table is a mirror `index sync` fills from those verified records.
-- Edge workers are untrusted-by-default serving infrastructure: index exports and webhook completion both verify the records artifact's cosign signature against the `build-crate.yml` identity before trusting a row, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the consumer sees a 404 or a digest failure and compiles locally).
+- Edge workers are untrusted-by-default serving infrastructure: index exports and webhook completion both verify the records artifact's cosign signature against the `build-crate.yml` identity before trusting a row, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the consumer sees a 404 or a digest failure and compiles locally). The bound on what a build may write is enforced where the trust lives — `stow-build publish` validates the plan against its self-resolved dependency closure (`ci/src/closure.rs`, `ci/src/validate.rs`) and only then signs the records artifact — so the edge checks the signature and the task-id annotation and does not re-resolve or re-bind the record set.
 
 ## Architecture map
 - `cli/`: end-user CLI and runtime wrappers.
@@ -55,8 +56,7 @@ identity. The build order is the edges. The unit rule is what may be a node.
   - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
 - `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/bundles/{digest}`, Workers Cache in front of the GHCR blob — no catalog lookup) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
   - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, `/api/v1/requests` Turnstile admission (hands the request to the scheduler, which dispatches `resolve-request.yml` — the edge resolves nothing), trusted admin/scheduler routes.
-  - `worker_resolver.rs`: the admin resolve routes' expansion — cargo's resolver (`stow-resolve`) over fetched manifests (removal is #429).
-  - `dependency_resolver.rs`: miss derivation for admissions and the shared crates.io record helpers.
+  - `dependency_resolver.rs`: the edge's remaining crates.io reads — the admissions coverage diff, the request route's version/rustc lookups, and the site pickers (search/versions/features).
   - `db.rs`: D1 schema helpers and artifact-catalog queries.
   - `scheduler/`: Durable Object queue, dispatch, miss draining, and request records (`requests` table — admit + `resolve-request.yml` dispatch on `POST /requests`, task submit on `/requests/{id}/outcome`, webhook-driven `run-update`).
 - `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.
