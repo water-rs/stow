@@ -53,7 +53,7 @@
           <div class="window-title"><span>targets</span><span>{{ request.targets.len() }} platforms</span></div>
           <table class="window-body result-table">
             <thead>
-              <tr><th scope="col">target</th><th scope="col">state</th><th scope="col" class="num">lane</th><th scope="col">task</th></tr>
+              <tr><th scope="col">target</th><th scope="col">state</th><th scope="col" class="num">lane</th><th scope="col" class="task-col">task</th></tr>
             </thead>
             <tbody>
               {%- for target in request.targets %}
@@ -61,7 +61,7 @@
                 <td>{{ target.target }}</td>
                 <td>{{ target.state }}</td>
                 <td class="num">{%- match target.queue_position %}{% when Some with (position) %}#{{ position }}{% when None %}—{% endmatch %}</td>
-                <td>{%- match target.task_id %}{% when Some with (task_id) %}{{ task_id }}{% when None %}—{% endmatch %}</td>
+                <td class="task-col">{%- match target.task_id %}{% when Some with (task_id) %}<a href="{{ target.task_url }}" title="{{ task_id }}">{{ target.task_short }}</a>{% when None %}—{% endmatch %}</td>
               </tr>
               {%- endfor %}
             </tbody>

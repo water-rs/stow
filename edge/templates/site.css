@@ -308,7 +308,10 @@ code { font-family: var(--mono); }
 #turnstile-widget:empty { display: none; }
 
 .leader-list { list-style: none; display: grid; gap: 10px; }
-.leader-list li { display: flex; align-items: baseline; gap: 8px; font-size: 14px; }
+.leader-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 14px; }
+/* The value may carry a long unbroken token (an error string); it
+   shrinks and wraps rather than pushing the row past the panel. */
+.leader-list li > :last-child { min-width: 0; overflow-wrap: anywhere; }
 .leader { flex: 1; border-bottom: 2px dotted var(--ink); transform: translateY(-4px); }
 
 /* ---- stats page ---- */
@@ -322,6 +325,7 @@ code { font-family: var(--mono); }
 .result { overflow-x: auto; }
 .result-table { width: 100%; border-collapse: collapse; font-size: 14px; }
 .result-table th, .result-table td { padding: 8px 10px; border-bottom: 1px solid var(--ink); text-align: left; vertical-align: top; }
+.result-table td { overflow-wrap: anywhere; }
 .result-table th { font-weight: 400; letter-spacing: 0.06em; text-transform: uppercase; font-size: 12px; }
 .result-table .num { text-align: right; }
 
@@ -362,4 +366,7 @@ code { font-family: var(--mono); }
   .lookup-grid { grid-template-columns: minmax(0, 1fr); }
   .stats-grid { grid-template-columns: minmax(0, 1fr); }
   .masthead { flex-direction: column; align-items: flex-start; }
+  /* The task column is the table's widest cell; on a phone it drops so
+     the row fits — the request's JSON still carries the full id. */
+  .status-page .task-col { display: none; }
 }

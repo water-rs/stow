@@ -99,15 +99,24 @@ pub struct RequestTargetView {
     target: String,
     state: &'static str,
     queue_position: Option<u32>,
-    /// The root task's queue id, printed so an operator can match it
-    /// against the scheduler's admin listing.
+    /// The root task's queue id — the link's `title`, so the full value
+    /// is one hover away.
     task_id: Option<String>,
+    /// The first 12 hex chars of `task_id`: a full queue id is 64 and
+    /// would carry the table past its panel on every viewport.
+    task_short: String,
+    /// The request's JSON — the public shape the full task id is
+    /// exposed in.
+    task_url: String,
     /// `false` while the task is still moving — queued or building.
     settled: bool,
 }
 
+/// How much of a task id the targets table renders.
+const TASK_ID_SHORT: usize = 12;
+
 impl RequestTargetView {
-    fn new(target: &stow_types::api::CrateRequestTarget) -> Self {
+    fn new(target: &stow_types::api::CrateRequestTarget, request_id: &str) -> Self {
         let (state, settled) = match target.state {
             stow_types::api::CrateRequestState::Cached => ("cached", true),
             stow_types::api::CrateRequestState::Queued => ("queued", false),
@@ -121,6 +130,12 @@ impl RequestTargetView {
             state,
             queue_position: target.human_lane_position,
             task_id: target.task_id.clone(),
+            task_short: target
+                .task_id
+                .as_deref()
+                .map(|id| id.chars().take(TASK_ID_SHORT).collect())
+                .unwrap_or_default(),
+            task_url: format!("/api/v1/requests/{request_id}"),
             settled,
         }
     }
@@ -158,8 +173,11 @@ pub struct RequestView {
 impl RequestView {
     fn new(status: stow_types::api::CrateRequestStatus) -> Self {
         let features = status.features_json.features().join(", ");
-        let targets: Vec<RequestTargetView> =
-            status.targets.iter().map(RequestTargetView::new).collect();
+        let targets: Vec<RequestTargetView> = status
+            .targets
+            .iter()
+            .map(|target| RequestTargetView::new(target, &status.request_id))
+            .collect();
         let (phase, settled, summary) = match status.status {
             stow_types::api::CrateRequestPhase::Accepted => (
                 "accepted",

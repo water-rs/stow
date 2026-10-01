@@ -1,4 +1,6 @@
-use skyzen_cloudflare::{CfFetch, worker};
+use skyzen_cloudflare::worker;
+use worker::send::IntoSendFuture;
+use worker::wasm_bindgen::JsCast;
 
 use crate::cf_http;
 use crate::fetch_guard::{GuardedResponse, OutboundPool};
@@ -117,10 +119,10 @@ pub async fn trigger_resolve(
 /// its JSON-encoded content — GitHub wants inputs as strings, while the
 /// local-CI arm posts the payload verbatim as `client_payload`.
 ///
-/// Uses `CfFetch` (Cloudflare Workers' native fetch binding) to POST to the
-/// GitHub API directly. We do not route this through `zenwave` because the
-/// edge worker only ever runs in the Cloudflare runtime and `CfFetch` is the
-/// canonical primitive there.
+/// Uses the Workers global `fetch` (through [`dispatch_fetch`]) to POST to
+/// the GitHub API directly. We do not route this through `zenwave` because the
+/// edge worker only ever runs in the Cloudflare runtime and the global fetch
+/// is the canonical primitive there.
 async fn trigger_workflow(
     workflow_file: &str,
     event_type: &str,
@@ -155,11 +157,7 @@ async fn trigger_workflow(
         }
     };
     let _slot = pool.slot().await;
-    let resp = CfFetch
-        .request(&request)
-        .await
-        .map(GuardedResponse::new)
-        .map_err(|error| DispatchError::Network(error.to_string()))?;
+    let resp = dispatch_fetch(&request).await.map(GuardedResponse::new)?;
 
     let status = resp.get_ref().status_code();
     if (200..300).contains(&status) {
@@ -195,6 +193,38 @@ fn build_local_dispatch_request(
 ) -> Result<worker::Request, DispatchError> {
     cf_http::json_request(worker::Method::Post, url, payload, &[])
         .map_err(|error| DispatchError::Network(error.to_string()))
+}
+
+/// The dispatch POST itself: the same global `fetch` `CfFetch` issues,
+/// except a rejection keeps the JS error's `.message` — `CfFetch`
+/// renders it with `JsValue`'s Debug (`JsValue(Error: msg\nError: msg)`)
+/// and a request's stored `error` is read by the requester.
+async fn dispatch_fetch(request: &worker::Request) -> Result<worker::Response, DispatchError> {
+    let request: worker::web_sys::Request = request
+        .try_into()
+        .map_err(|error: worker::Error| DispatchError::Network(error.to_string()))?;
+    let global: worker::web_sys::WorkerGlobalScope = worker::js_sys::global().unchecked_into();
+    let init = worker::web_sys::RequestInit::new();
+    let promise = global.fetch_with_request_and_init(&request, &init);
+    let value = worker::wasm_bindgen_futures::JsFuture::from(promise)
+        .into_send()
+        .await
+        .map_err(|error| js_error_message(&error))?;
+    Ok(worker::Response::from(
+        value.unchecked_into::<worker::web_sys::Response>(),
+    ))
+}
+
+/// A rejected `fetch` yields a JS `Error` object: the text a record
+/// stores is its `.message` (`Network connection lost.`), then the
+/// primitive-string form, then the `JsValue` Debug for anything else.
+fn js_error_message(error: &worker::wasm_bindgen::JsValue) -> DispatchError {
+    let message = error
+        .dyn_ref::<worker::js_sys::Error>()
+        .map(|js| js.message().into())
+        .or_else(|| error.as_string())
+        .unwrap_or_else(|| format!("{error:?}"));
+    DispatchError::Network(message)
 }
 
 #[derive(Debug, thiserror::Error)]
