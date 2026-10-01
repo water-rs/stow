@@ -419,8 +419,21 @@ pub async fn run(
         .fetch_scalar::<i64>()
         .await
         .map_err(|error| QueueError::Sql(format!("schema version: {error}")))?;
+    // The drives address rows positionally inside the layout the fixture
+    // wrote — `running_row`, `dep_row`, `completed_row` and friends are
+    // arithmetic on that shape. A queue that has been churned since
+    // seeding (admissions, enqueues, alarm traffic) has grown past it, so
+    // deriving the shape from the live count shifts every boundary and
+    // the drives hit rows their status predicates reject. The seed
+    // cursor is the record of what was written; only a queue nobody
+    // seeded falls back to the live count.
     let shape = FixtureShape {
-        queue_rows: u32::try_from(queue_rows.min(u64::from(u32::MAX))).unwrap_or(u32::MAX),
+        queue_rows: read_seed_cursor(db)
+            .await?
+            .and_then(|cursor| seed_cursor_shape(&cursor))
+            .unwrap_or_else(|| {
+                u32::try_from(queue_rows.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
+            }),
     };
     let log = Arc::new(Mutex::new(Vec::new()));
     let metered = DurableDb::new(MeteredBackend {
