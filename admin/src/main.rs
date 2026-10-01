@@ -15,7 +15,6 @@ mod coverage;
 mod crates_io;
 mod deploy;
 mod github;
-mod http_retry;
 mod index_cmd;
 mod launch_gate;
 mod launch_load;
