@@ -4255,11 +4255,12 @@ async fn commit_published_slice(
 /// flip delta — a publish touches 1 + the delta's direct dependents,
 /// never the queue or the graph (stow#521). The matched-edge set —
 /// edges whose dep identity a changed row can flip — is walked exactly
-/// once, in the flip statement: `json_each` drives one `dep_match`
-/// index walk per changed row, and DISTINCT dedupes each edge's old and
-/// new answers (several changed rows may satisfy one edge). `RETURNING`
-/// hands the flips back so the one `queue` update that follows keys
-/// off the flipped owners instead of re-walking the matched set.
+/// once, in the flip statement: the changed identities and matched edge
+/// rows are materialized and deduplicated before the exact membership
+/// expression runs, so several changed shapes satisfy one edge without
+/// repeating its slice count. `RETURNING` hands the flips back so the
+/// one `queue` update that follows keys off the flipped owners instead of
+/// re-walking the matched set.
 /// `live_generation` is the generation the marker commit already
 /// wrote — bound once into the edge probe instead of seeking the
 /// marker per edge.
@@ -4284,34 +4285,50 @@ async fn apply_slice_gate_delta(
         owner: String,
         delta: i64,
     }
-    let matched_edges = "FROM (SELECT value AS c FROM json_each(?)) AS j \
-         CROSS JOIN queue_dependencies d \
-           ON d.dep_target = ? AND d.dep_rustc_version = ? \
-          AND d.dep_crate_name = j.c ->> 'crate_name' \
-          AND d.dep_version = j.c ->> 'version' \
-          AND d.dep_features_json = j.c ->> 'features_json' \
-          AND d.dep_host_side = j.c ->> 'unit_side' \
-          AND (d.dep_host_side = 0 OR (j.c ->> 'unit_linked') = 1) \
-          AND (d.dep_invocations & ((j.c ->> 'unit_invocation') + 1)) != 0";
-    // Read both answers directly from the matched edge join. DISTINCT
-    // prevents flattening and emits one update per edge; the write guard
-    // uses the captured old answer instead of re-reading the target.
+    let matched_edges = "WITH changed AS MATERIALIZED ( \
+             SELECT DISTINCT value ->> 'crate_name' AS crate_name, \
+                    value ->> 'version' AS version, \
+                    value ->> 'features_json' AS features_json, \
+                    value ->> 'unit_side' AS unit_side, \
+                    value ->> 'unit_linked' AS unit_linked, \
+                    value ->> 'unit_invocation' AS unit_invocation \
+             FROM json_each(?) \
+         ), matched AS MATERIALIZED ( \
+             SELECT DISTINCT d.rowid AS rid, d.dep_met AS old_met, \
+                    d.dep_shapes, d.dep_target, d.dep_rustc_version, \
+                    d.dep_crate_name, d.dep_version, d.dep_features_json, \
+                    d.dep_host_side, d.dep_invocations \
+             FROM changed c \
+             CROSS JOIN queue_dependencies d \
+               ON d.dep_target = ? AND d.dep_rustc_version = ? \
+              AND d.dep_crate_name = c.crate_name \
+              AND d.dep_version = c.version \
+              AND d.dep_features_json = c.features_json \
+              AND d.dep_host_side = c.unit_side \
+              AND (d.dep_host_side = 0 OR c.unit_linked = 1) \
+              AND (d.dep_invocations & (c.unit_invocation + 1)) != 0 \
+         )";
+    // The materialized edge identity carries the captured old answer and
+    // every column the exact membership expression needs, so evaluating
+    // it below cannot re-walk the changed-shape join.
     let flipped = db
         .query(&format!(
-            "UPDATE queue_dependencies \
+            "{matched_edges} \
+             UPDATE queue_dependencies \
              SET dep_met = f.new_met \
-             FROM (SELECT DISTINCT d.rowid AS rid, d.dep_met AS old_met, \
+             FROM (SELECT m.rid, m.old_met, \
                           CASE WHEN {unpub} THEN 0 ELSE 1 END AS new_met \
-                   {matched_edges}) AS f \
+                   FROM matched m) AS f \
              WHERE queue_dependencies.rowid = f.rid \
                AND f.old_met != f.new_met \
              RETURNING queue_dependencies.task_id, queue_dependencies.dep_met",
-            unpub = dep_edge_unpublished_sql_at("d", "?"),
+            matched_edges = matched_edges,
+            unpub = dep_edge_unpublished_sql_at("m", "?"),
         ))
-        .bind(live_generation)
         .bind(changed_json)
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
+        .bind(live_generation)
         .fetch_all::<FlippedDepEdge>()
         .await
         .map_err(|error| format!("flip dep_met for slice {target}/{rustc_version}: {error}"))?;
