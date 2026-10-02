@@ -5541,6 +5541,41 @@ mod sqlite_tests {
         assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
     }
 
+    /// stow#444: a submit whose every row sits behind an unmet edge —
+    /// here a single task gated on a dep nobody has built — must leave
+    /// `schedule_alarm` with nothing to arm: `next_alarm` answers
+    /// `Delete`, so the request pays no wake for work it cannot run.
+    #[tokio::test]
+    async fn fully_gated_submit_arms_no_alarm() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("parent", vec![dependency("dep-missing")])])
+            .await
+            .expect("enqueue gated submit");
+
+        let plan = next_alarm(&db, ROW_TS_MS, &settings())
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::Delete);
+    }
+
+    /// stow#444: a submit that does leave dispatchable work arms the
+    /// pass immediately — `next_alarm` answers `At(now)` for a row
+    /// already past its wake instant, exactly the wake `setAlarm(now)`
+    /// used to issue unconditionally.
+    #[tokio::test]
+    async fn dispatchable_submit_arms_at_now() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("ready", Vec::new())])
+            .await
+            .expect("enqueue ready");
+        set_first_requested_at(&db, "ready", PAST_TS).await;
+
+        let plan = next_alarm(&db, ROW_TS_MS, &settings())
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS));
+    }
+
     /// A paused scheduler keeps accepting submits but never plans a wake
     /// for them: with nothing in flight the alarm is deleted, so the
     /// queue waits out the pause instead of spinning on eligibility.

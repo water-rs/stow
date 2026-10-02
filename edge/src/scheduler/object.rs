@@ -313,12 +313,14 @@ async fn submit(
         };
         to_error(error).set_status(status)
     })?;
-    // Dispatch is not this request's work: pointing the alarm at now lets
-    // `run_alarm`'s dispatch pass run it, so the submit answers once the
-    // queue write lands instead of holding the client — and burning the
-    // DO's per-request CPU budget — through claim plus a fan-out of
-    // GitHub calls.
-    arm_dispatch_alarm(alarm).await?;
+    // Dispatch is not this request's work: the alarm's dispatch pass
+    // runs it, so the submit answers once the queue write lands instead
+    // of holding the client — and burning the DO's per-request CPU
+    // budget — through claim plus a fan-out of GitHub calls. `next_alarm`
+    // decides whether a wake can make progress at all: a submit whose
+    // rows all sit behind unmet gates arms nothing, while a stale
+    // in-flight lease still arms at its expiry (stow#444).
+    schedule_alarm(env, db, alarm).await?;
     Ok(Json(InsertedResponse { inserted }))
 }
 
@@ -336,25 +338,6 @@ async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
         return Err(Error::msg(reason).set_status(StatusCode::SERVICE_UNAVAILABLE));
     }
     Ok(())
-}
-
-/// Point the DO alarm at now: `run_alarm` then performs the dispatch
-/// pass (`dispatch_pending` plus `schedule_alarm`) that a mutating
-/// handler used to run inline. `setAlarm` overrides any existing
-/// scheduled alarm rather than keeping the earliest
-/// (<https://developers.cloudflare.com/durable-objects/api/alarms/#setalarm>),
-/// which is correct here: `run_alarm` re-arms via `schedule_alarm`, so
-/// moving an earlier wake-up up to now only dispatches sooner.
-async fn arm_dispatch_alarm(alarm: &Alarm) -> Result<()> {
-    // `Date::now()` returns whole milliseconds well below 2^53; the value
-    // is exactly representable and always fits i64.
-    #[allow(clippy::cast_possible_truncation)]
-    let now_ms = js_sys::Date::now() as i64;
-    alarm.set_alarm(now_ms).await.map_err(|error| {
-        let error = to_error(error);
-        tracing::error!(%error, "failed to arm scheduler dispatch alarm");
-        error
-    })
 }
 
 /// `POST /tasks/complete-run` — the edge's webhook route forwards GitHub's
@@ -392,8 +375,10 @@ async fn complete_run(
     }
     // Same handoff as submit: the run's report is acknowledged as soon
     // as the queue row lands, and the alarm's dispatch pass — not this
-    // request — runs claim plus the GitHub fan-out.
-    arm_dispatch_alarm(&alarm).await?;
+    // request — runs claim plus the GitHub fan-out. The completion may
+    // leave nothing dispatchable (a failure with an empty queue, a
+    // finished backlog): `schedule_alarm` arms no wake then (stow#444).
+    schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -641,8 +626,9 @@ async fn apply_request_outcome(
             to_error(error).set_status(status)
         })?;
     // Same handoff as submit: the report answers once the rows land, and
-    // the alarm's dispatch pass — not this request — fans them out.
-    arm_dispatch_alarm(&alarm).await?;
+    // the alarm's dispatch pass — not this request — fans them out. An
+    // outcome whose batch is fully gated arms nothing (stow#444).
+    schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(status))
 }
 
