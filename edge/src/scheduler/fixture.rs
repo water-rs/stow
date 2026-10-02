@@ -133,6 +133,12 @@ fn seq_sql(lo: u32, hi: u32) -> String {
 /// including the `dispatch_key` the claim walk orders on and the
 /// `wake_at` the alarm probes read (computed under the same
 /// `dispatch_min_age_minutes` the deploy runs).
+///
+/// `(crate, version)` is injective in `n` — `n % 20000` carries the low
+/// digits in the crate name and `n / 20000` the quotient in the
+/// version — so the queue's UNIQUE identity holds at any `queue_rows`;
+/// under 20000 rows the version still reads `1.0.x`, the shape the
+/// drives and the 20k/100k runs were written against.
 pub async fn seed_queue_chunk(
     db: &DurableDb,
     shape: FixtureShape,
@@ -175,7 +181,7 @@ pub async fn seed_queue_chunk(
                             github_run_id, deps_met, wake_at, dispatch_family, dispatch_key) \
          SELECT {task_id}, \
                 'crate' || (n % 20000), \
-                '1.0.' || (n % 500), \
+                '1.' || (n / 20000) || '.' || (n % 500), \
                 '[]', \
                 {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
@@ -260,7 +266,7 @@ pub async fn seed_edges_chunk(
          SELECT printf('%064x', n), \
                 printf('%064x', {dep_expr}), \
                 'crate' || ({dep_expr} % 20000), \
-                '1.0.' || ({dep_expr} % 500), \
+                '1.' || (({dep_expr}) / 20000) || '.' || ({dep_expr} % 500), \
                 '[]', \
                 {dep_target_case}, \
                 CASE WHEN {dep_expr} % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
@@ -286,7 +292,7 @@ pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), Qu
               unit_side, unit_invocation, unit_linked) \
          SELECT {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                1, 'crate' || (n % 20000), '1.0.' || (n % 500), '[]', 0, 0, 1 \
+                1, 'crate' || (n % 20000), '1.' || (n / 20000) || '.' || (n % 500), '[]', 0, 0, 1 \
          FROM seq",
         seq = seq_sql(lo, hi),
     ))

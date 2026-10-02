@@ -99,6 +99,8 @@ async fn budget(
         // would restart the wipe it begins.
         let mut first = true;
         let mut attempts = 0u8;
+        let mut seeded = false;
+        let mut cursor = (0u64, 0u64, 0u64);
         for _ in 0..1024 {
             // The seed is resumable from its `settings` cursor, so a
             // transient workerd failure (a dropped dev-runtime stub
@@ -128,9 +130,21 @@ async fn budget(
                 seed.queue_rows, seed.dependency_rows, seed.slice_rows, seed.done
             );
             first = false;
+            cursor = (seed.queue_rows, seed.dependency_rows, seed.slice_rows);
             if seed.done {
+                seeded = true;
                 break;
             }
+        }
+        if !seeded {
+            // A loop that runs out without `done` was measuring a
+            // partial fixture — fail here instead of reporting budget
+            // numbers against a fraction of the intended queue.
+            return Err(stow_types::error::Error::msg(format!(
+                "scheduler seed never reported done after 1024 calls; \
+                 seed cursor: queue={} deps={} slices={}",
+                cursor.0, cursor.1, cursor.2
+            )));
         }
     }
     let report: SchedulerBudgetReport = edge

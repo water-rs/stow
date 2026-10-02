@@ -718,9 +718,13 @@ impl CoverageOracle for NoCoverage {
 use stow_types::fixture::task_hex_id as hex_id;
 
 /// The crate identity a queue row carries — the same formulas the seed
-/// SQL uses, kept in one place so a drive always names a real row.
+/// SQL uses, kept in one place so a drive always names a real row. The
+/// pair is injective in `n` at any fixture size.
 fn crate_identity(n: u32) -> (String, String) {
-    (format!("crate{}", n % 20000), format!("1.0.{}", n % 500))
+    (
+        format!("crate{}", n % 20000),
+        format!("1.{}.{}", n / 20000, n % 500),
+    )
 }
 
 /// A submit batch: a resync of fixture row 101's identity (its edge set
