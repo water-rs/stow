@@ -117,6 +117,7 @@ struct NodeRun {
     /// `Some(url)` once a run exists for the task — absent while the
     /// dispatch is still inside GitHub's registration grace.
     run_url: Option<String>,
+    workflow_run_id: Option<u64>,
     dispatched: bool,
     /// This node's own dispatch time — `RUN_GRACE_MINUTES` applies per
     /// node, not per layer.
@@ -153,6 +154,7 @@ enum Dispatch {
 #[derive(Debug)]
 struct RunState {
     task_id: String,
+    workflow_run_id: u64,
     status: String,
     conclusion: Option<String>,
     url: String,
@@ -173,6 +175,22 @@ impl RunState {
         !self.ran_current_code
             && self.status == "completed"
             && self.conclusion.as_deref() != Some("success")
+    }
+}
+
+fn retain_latest_run(
+    latest: &mut BTreeMap<String, RunState>,
+    state: RunState,
+    tracked_workflow_run_id: Option<u64>,
+) {
+    if tracked_workflow_run_id.is_some_and(|id| id != state.workflow_run_id) {
+        return;
+    }
+    let replace = latest.get(&state.task_id).map_or(true, |current| {
+        state.workflow_run_id > current.workflow_run_id
+    });
+    if replace {
+        latest.insert(state.task_id.clone(), state);
     }
 }
 
@@ -320,6 +338,7 @@ fn build_graph(
         nodes.entry(id).or_insert(NodeRun {
             request,
             run_url: None,
+            workflow_run_id: None,
             dispatched: false,
             dispatched_at: None,
             done: false,
@@ -785,10 +804,17 @@ async fn drive_layer(
     // adopted, so they cannot be mistaken for the wave's.
     let mut created_since = adopt_since;
     loop {
+        let mut latest = BTreeMap::<String, RunState>::new();
         for state in dispatch
             .list_runs(&open, created_since, rustc_version)
             .await?
         {
+            let Some(node) = nodes.get(&state.task_id) else {
+                continue;
+            };
+            retain_latest_run(&mut latest, state, node.workflow_run_id);
+        }
+        for state in latest.into_values() {
             let Some(node) = nodes.get_mut(&state.task_id) else {
                 continue;
             };
@@ -797,6 +823,7 @@ async fn drive_layer(
                 // older code: drop it, so the node dispatches afresh.
                 if node.run_url.as_deref() == Some(state.url.as_str()) {
                     node.run_url = None;
+                    node.workflow_run_id = None;
                     node.dispatched = false;
                 }
                 continue;
@@ -807,6 +834,7 @@ async fn drive_layer(
                 created_since = created_since.min(created);
             }
             node.run_url = Some(state.url);
+            node.workflow_run_id = Some(state.workflow_run_id);
             // An adopted run is a dispatch, whichever invocation sent it:
             // it counts against `in_flight` and is never sent twice.
             node.dispatched = true;
@@ -840,9 +868,10 @@ async fn drive_layer(
                 continue;
             }
             let payload = task_payload(id, &node.request);
-            dispatch.send(&payload).await?;
+            let workflow_run_id = dispatch.send(&payload).await?;
             let node = nodes.get_mut(id).expect("open node");
             node.dispatched = true;
+            node.workflow_run_id = Some(workflow_run_id);
             node.dispatched_at = Some(std::time::Instant::now());
             created_since = created_since.min(time::OffsetDateTime::now_utc());
             running += 1;
@@ -1058,19 +1087,21 @@ impl Dispatch {
     /// Send the build-crate dispatch: GitHub's `workflow_dispatch` under
     /// the operator token, or the local server's `/dispatch` POST — the
     /// same payload the scheduler emits either way.
-    async fn send(&self, payload: &BuildTaskPayload) -> stow_types::error::Result<()> {
+    async fn send(&self, payload: &BuildTaskPayload) -> stow_types::error::Result<u64> {
         match self {
             Self::GitHub { token } => {
                 let task_json = serde_json::to_string(payload)?;
-                crate::github::post_empty(
+                let response: WorkflowDispatchResponse = crate::github::post(
                     token,
                     &format!("actions/workflows/{WORKFLOW_FILE}/dispatches"),
                     &serde_json::json!({
                         "ref": BRANCH,
                         "inputs": { "task": task_json },
+                        "return_run_details": true,
                     }),
                 )
-                .await
+                .await?;
+                Ok(response.workflow_run_id)
             }
             Self::Local { base } => {
                 let url = format!("{base}/dispatch");
@@ -1079,14 +1110,16 @@ impl Dispatch {
                     "client_payload": payload,
                 });
                 let mut client = zenwave::client();
-                client
+                let response: WorkflowDispatchResponse = client
                     .post(&url)?
                     .header("Content-Type", "application/json")?
                     .bytes_body(serde_json::to_vec(&body)?)
                     .await?
                     .error_for_status()
+                    .await?
+                    .into_json()
                     .await?;
-                Ok(())
+                Ok(response.workflow_run_id)
             }
         }
     }
@@ -1141,6 +1174,7 @@ impl Dispatch {
                         (rustc == rustc_version.as_str() && open.contains(task_id)).then(|| {
                             RunState {
                                 task_id: task_id.to_owned(),
+                                workflow_run_id: run.id,
                                 status: run.status,
                                 conclusion: run.conclusion,
                                 url: run.html_url,
@@ -1175,6 +1209,7 @@ impl Dispatch {
                         (rustc == rustc_version.as_str() && open.contains(task_id)).then(|| {
                             RunState {
                                 task_id: task_id.to_owned(),
+                                workflow_run_id: run.workflow_run_id,
                                 status: run.status,
                                 conclusion: run.conclusion,
                                 url: run.html_url,
@@ -1197,6 +1232,7 @@ struct WorkflowRunsPage {
 
 #[derive(serde::Deserialize)]
 struct WorkflowRunRow {
+    id: u64,
     display_title: String,
     head_sha: String,
     status: String,
@@ -1223,7 +1259,13 @@ struct LocalTasksResponse {
 }
 
 #[derive(serde::Deserialize)]
+struct WorkflowDispatchResponse {
+    workflow_run_id: u64,
+}
+
+#[derive(serde::Deserialize)]
 struct LocalTaskRun {
+    workflow_run_id: u64,
     display_title: String,
     status: String,
     conclusion: Option<String>,
@@ -1235,11 +1277,21 @@ mod tests {
     use super::*;
 
     fn run_state(status: &str, conclusion: Option<&str>, ran_current_code: bool) -> RunState {
+        run_state_with_id(1, status, conclusion, ran_current_code)
+    }
+
+    fn run_state_with_id(
+        workflow_run_id: u64,
+        status: &str,
+        conclusion: Option<&str>,
+        ran_current_code: bool,
+    ) -> RunState {
         RunState {
             task_id: "task".to_owned(),
+            workflow_run_id,
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
-            url: "https://github.com/water-rs/stow/actions/runs/1".to_owned(),
+            url: format!("https://github.com/water-rs/stow/actions/runs/{workflow_run_id}"),
             created_at: None,
             ran_current_code,
         }
@@ -1254,6 +1306,53 @@ mod tests {
         assert!(!run_state("completed", Some("failure"), true).stale_failure());
         assert!(!run_state("completed", Some("success"), false).stale_failure());
         assert!(!run_state("in_progress", None, false).stale_failure());
+    }
+
+    #[test]
+    fn numeric_latest_run_wins_over_unordered_old_failure() {
+        let mut latest = BTreeMap::new();
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(10, "in_progress", None, true),
+            None,
+        );
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(9, "completed", Some("failure"), false),
+            None,
+        );
+        let selected = latest.remove("task").expect("latest run");
+        assert_eq!(selected.workflow_run_id, 10);
+        assert_eq!(selected.status, "in_progress");
+    }
+
+    #[test]
+    fn numeric_latest_run_wins_over_unordered_old_success() {
+        let mut latest = BTreeMap::new();
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(9, "completed", Some("success"), true),
+            None,
+        );
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(10, "in_progress", None, true),
+            None,
+        );
+        let selected = latest.remove("task").expect("latest run");
+        assert_eq!(selected.workflow_run_id, 10);
+        assert_eq!(selected.status, "in_progress");
+    }
+
+    #[test]
+    fn returned_run_id_rejects_old_visibility_until_new_run_appears() {
+        let mut latest = BTreeMap::new();
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(9, "completed", Some("success"), true),
+            Some(10),
+        );
+        assert!(latest.is_empty());
     }
 
     /// The smallest `EnqueueRequest` `build_graph` can fold — the test

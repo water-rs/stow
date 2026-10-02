@@ -14,16 +14,23 @@ CREATE TABLE IF NOT EXISTS queue (
     preserve_lockfile INTEGER NOT NULL DEFAULT 0,
     lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
-    -- Enqueue epoch: bumped every time a re-request resurrects a
-    -- failed/completed row, so a completion report only lands on the
-    -- attempt that was dispatched for it.
+    -- Dispatch generation is the unique claim identity; `attempt` is the
+    -- current retry-cycle counter and may restart when a row is retried.
     attempt INTEGER NOT NULL DEFAULT 1,
+    -- Unique claim identity. It is minted at claim time, so a late
+    -- external response cannot match a purged and recreated task row.
+    generation_id TEXT NOT NULL DEFAULT '',
     not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    -- GitHub Actions run id recorded when the build's workflow_run
-    -- webhook completed the task; NULL until the webhook lands.
+    -- The GitHub Actions run id bound to the live generation: the
+    -- claim clears it and the dispatch writes it from the
+    -- `workflow_dispatch` response's `workflow_run_id`, so a
+    -- `workflow_run` completion applies only to the run the in-flight
+    -- generation actually dispatched — a stale run's late report is a
+    -- conflict, never a silent overwrite. Terminal rows keep the last
+    -- bound id as evidence (`stow-admin status` renders its URL).
     github_run_id TEXT,
     -- The unit's compile side: 1 for a host-side node (a proc-macro,
     -- build dependency or build-script unit — minted on the runner
@@ -366,6 +373,40 @@ CREATE TABLE IF NOT EXISTS attempt_outcomes (
 -- finished_at — the index keeps those scans off the row payload.
 CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_finished
 ON attempt_outcomes (finished_at);
+
+-- Generation-keyed failure evidence. This table is additive so an older
+-- Worker may continue inserting the legacy attempt_outcomes columns while
+-- the new code rolls out; freeze evidence reads both tables.
+CREATE TABLE IF NOT EXISTS attempt_outcomes_v2 (
+    task_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    target TEXT NOT NULL,
+    failure_step TEXT,
+    failure_class TEXT,
+    github_run_id TEXT,
+    finished_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, generation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_v2_finished
+ON attempt_outcomes_v2 (finished_at);
+
+-- A verified workflow completion can beat the scheduler's write of the
+-- `workflow_dispatch` response. Keep that event by the run identity until
+-- the exact response binds the same run to the claimed generation. Rows are
+-- bounded by in-flight dispatches and are deleted when the binding applies
+-- or the unbound generation is abandoned.
+CREATE TABLE IF NOT EXISTS pending_run_completions (
+    github_run_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    success INTEGER NOT NULL CHECK (success IN (0, 1)),
+    error TEXT,
+    received_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_run_completions_task
+ON pending_run_completions (task_id);
 
 
 -- The dispatch-freeze transition log the watchdog (#450) turns into the

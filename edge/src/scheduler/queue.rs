@@ -43,6 +43,9 @@ pub trait CoverageOracle: Sync {
 #[derive(Debug, Clone)]
 pub struct QueuedTask {
     pub task_id: String,
+    /// Unique claim identity minted at dispatch claim time. It changes on
+    /// every new claim, including after purge and recreation.
+    pub generation_id: String,
     /// The row's enqueue epoch at claim time. The `workflow_run` event
     /// names no attempt — `complete_run` resolves the row's live one —
     /// so a late report for a superseded attempt cannot overwrite the
@@ -80,9 +83,9 @@ const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
 // Exponential dispatch-failure backoff cap.
 const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 
-/// Failed-build retry cap: a failure reported before `attempt` reaches
-/// this re-queues the row under `not_before` backoff; a failure at the
-/// cap parks it `failed` for an operator `retry`.
+/// Failed-build retry cap: a failure reported while `attempt` is under
+/// this re-queues the row under `not_before` backoff; a failure at the cap
+/// parks it `failed` for an operator `retry`, which resets the cycle to 1.
 const MAX_BUILD_ATTEMPTS: u32 = 4;
 
 /// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
@@ -336,9 +339,9 @@ fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
 /// carried per JSON entry: downloads keep the max, `request_count`
 /// grows by the occurrence count, priority recomputes from downloads and
 /// `miss_count` (`first_requested_at` untouched — re-requesting never
-/// jumps the queue), resurrection bumps `attempt` so a completion report
-/// in flight for the superseded attempt cannot land on the new one, and
-/// the lane only ever moves toward 'human'.
+/// jumps the queue), resurrection bumps the retry-cycle `attempt`, and the
+/// lane only ever
+/// moves toward 'human'.
 async fn apply_batched_updates(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -487,11 +490,11 @@ async fn apply_batched_inserts(
         let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, dispatch_key) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, dispatch_key) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
                         e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
-                        1, datetime('now'), \
+                        1, lower(hex(randomblob(16))), datetime('now'), \
                         e ->> 'unpublished_deps', e ->> 'deps_met', e ->> 'blocked', \
                         {wake}, {family}, {key} \
                  FROM (SELECT value AS e FROM json_each(?)) e \
@@ -1001,6 +1004,7 @@ fn plan_enqueue(
 #[derive(Debug)]
 struct BuildCompleteReport {
     task_id: String,
+    generation_id: String,
     attempt: u32,
     success: bool,
     error: Option<String>,
@@ -1016,6 +1020,7 @@ async fn complete(
     report: &BuildCompleteReport,
     window_minutes: u32,
 ) -> Result<(), QueueError> {
+    let generation_id = report.generation_id.clone();
     // `RETURNING target` hands the outcome counter the row's target —
     // the breaker files outcomes under it without a second read.
     #[derive(skyzen::FromRow)]
@@ -1029,11 +1034,11 @@ async fn complete(
     // been resurrected into (resurrection bumps `attempt`).
     //
     // A failure under `MAX_BUILD_ATTEMPTS` re-queues the row behind the
-    // same exponential backoff a dispatch failure applies — 2^attempt
-    // minutes, capped — with `attempt` bumped so the next dispatch's
-    // fencing holds; at the cap the row parks `failed` until an
-    // operator `retry` returns it to `pending`. SET terms see the old
-    // row, so `attempt` in each CASE is the attempt that just failed.
+    // same exponential backoff a dispatch failure applies — 2^cycle
+    // minutes, capped — with `attempt` bumped so the next dispatch is a
+    // new generation; at the cap the row parks `failed` until an
+    // operator `retry` returns it to `pending` at attempt 1. SET terms
+    // see the old row, so `attempt` is the cycle position that failed.
     let retry = format!("attempt < {MAX_BUILD_ATTEMPTS}");
     let next_not_before = format!(
         "datetime('now', '+' || MIN(1 << MIN(attempt, 6), {MAX_DISPATCH_BACKOFF_MINUTES}) || ' minutes')"
@@ -1042,7 +1047,8 @@ async fn complete(
         "UPDATE queue \
          SET status = 'completed', error_msg = ?, github_run_id = COALESCE(?, github_run_id), \
              updated_at = datetime('now') \
-         WHERE task_id = ? AND attempt = ? AND status IN ('dispatched', 'running') \
+         WHERE task_id = ? AND generation_id = ? \
+           AND status IN ('dispatched', 'running') \
          RETURNING target"
             .to_owned()
     } else {
@@ -1058,7 +1064,8 @@ async fn complete(
                  wake_at = CASE WHEN {retry} THEN {wake} ELSE wake_at END, \
                  dispatch_key = CASE WHEN {retry} THEN {key} ELSE dispatch_key END, \
                  updated_at = datetime('now') \
-             WHERE task_id = ? AND attempt = ? AND status IN ('dispatched', 'running') \
+             WHERE task_id = ? AND generation_id = ? \
+               AND status IN ('dispatched', 'running') \
              RETURNING target",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
@@ -1076,15 +1083,15 @@ async fn complete(
         .bind(report.error.clone().unwrap_or_default())
         .bind(report.github_run_id.clone())
         .bind(report.task_id.clone())
-        .bind(i64::from(report.attempt))
+        .bind(generation_id.clone())
         .fetch_optional::<UpdatedTarget>()
         .await
         .map_err(|error| format!("complete task: {error}"))?;
     // A report that applied to no row is never a silent success: an
     // unknown task id is a 404 at the handler, and a known row whose live
-    // attempt/status no longer matches is a stale or duplicate report —
+    // generation/status no longer matches is a stale or duplicate report —
     // logged and answered 409 so the reporter sees the conflict rather
-    // than believing it completed the current attempt.
+    // than believing it completed the current generation.
     if updated.is_none() {
         let row = db
             .query("SELECT attempt, status FROM queue WHERE task_id = ?")
@@ -1132,7 +1139,7 @@ async fn complete(
     // dispatch-freeze breaker's sliding window sees it even after a
     // re-request flips the queue row back to pending.
     let target = updated.expect("checked above").target;
-    record_attempt_outcome(db, report, &target, window_minutes).await?;
+    record_attempt_outcome(db, report, &generation_id, &target, window_minutes).await?;
 
     Ok(())
 }
@@ -1154,6 +1161,7 @@ const OUTCOME_BUCKET_SECS: i64 = 300;
 async fn record_attempt_outcome(
     db: &DurableDb,
     report: &BuildCompleteReport,
+    generation_id: &str,
     target: &str,
     window_minutes: u32,
 ) -> Result<(), QueueError> {
@@ -1172,13 +1180,14 @@ async fn record_attempt_outcome(
     .map_err(|error| format!("count attempt outcome in its bucket: {error}"))?;
     if !report.success {
         db.query(
-            "INSERT INTO attempt_outcomes \
-                 (task_id, attempt, target, failure_class, \
+            "INSERT INTO attempt_outcomes_v2 \
+                 (task_id, generation_id, attempt, target, failure_class, \
                   github_run_id, finished_at) \
-             VALUES (?, ?, ?, ?, ?, datetime('now')) \
-             ON CONFLICT(task_id, attempt) DO NOTHING",
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now')) \
+             ON CONFLICT(task_id, generation_id) DO NOTHING",
         )
         .bind(report.task_id.clone())
+        .bind(generation_id.to_owned())
         .bind(i64::from(report.attempt))
         .bind(target.to_owned())
         .bind(failure_class(report))
@@ -1193,6 +1202,11 @@ async fn record_attempt_outcome(
         .execute()
         .await
         .map_err(|error| format!("expire old attempt outcome rows: {error}"))?;
+    db.query("DELETE FROM attempt_outcomes_v2 WHERE finished_at < datetime('now', ?)")
+        .bind(format!("-{window_minutes} minutes"))
+        .execute()
+        .await
+        .map_err(|error| format!("expire old generation outcome rows: {error}"))?;
     db.query("DELETE FROM attempt_outcome_buckets WHERE bucket < unixepoch('now') - ?")
         .bind(i64::from(window_minutes) * 60)
         .execute()
@@ -1224,38 +1238,100 @@ fn failure_class(report: &BuildCompleteReport) -> Option<String> {
 }
 
 /// Apply a GitHub `workflow_run` completion — the webhook's wire report,
-/// which names the task and its outcome but no attempt number.
+/// which names the task and its outcome but no scheduler attempt number.
 ///
-/// The webhook cannot carry `attempt` (GitHub invented the event), so the
-/// row's live attempt is resolved here and the same in-flight predicate
-/// applies — a stale event can only fail the attempt it names when the
-/// records check upstream already refused the success.
+/// The webhook carries the platform run id, not the scheduler attempt; the
+/// bound generation resolves the exact in-flight claim and fences stale
+/// events before the records check can settle it.
 ///
 /// # Errors
 ///
 /// [`QueueError::UnknownTask`] when no queue row carries the task id;
 /// [`QueueError::StaleCompletion`] when the live row's attempt or status
-/// has moved past what the event describes.
+/// has moved past what the event describes, or when an in-flight row is
+/// bound to a different run than the one reporting;
+/// A completion that beats its dispatch response is persisted and
+/// acknowledged; the exact response binding later applies it.
 pub async fn complete_run(
     db: &DurableDb,
     settings: &SchedulerSettings,
     report: &stow_types::api::WorkflowRunComplete,
     window_minutes: u32,
 ) -> Result<(), QueueError> {
-    let row = db
-        .query("SELECT attempt, status FROM queue WHERE task_id = ?")
-        .bind(report.task_id.clone())
-        .fetch_optional::<AttemptStatusRow>()
-        .await
-        .map_err(|error| format!("load task {} for run completion: {error}", report.task_id))?;
-    let Some(row) = row else {
+    let mut row = load_run_binding(db, &report.task_id).await?;
+    let Some(mut row) = row.take() else {
         return Err(QueueError::UnknownTask(report.task_id.clone()));
     };
+    // An in-flight row answers only to the run its generation bound at
+    // dispatch: the claim cleared `github_run_id` and the
+    // `workflow_dispatch` response's `workflow_run_id` wrote it. A
+    // report naming a different run belongs to a stale generation —
+    // timed automatic retries make that path real: run A fails, retry B
+    // is claimed and bound, and A's delayed duplicate would otherwise
+    // apply to B. A row on a terminal or pending state takes no binding
+    // check — `complete`'s own generation/status predicate is the fence
+    // there.
+    if matches!(row.status.as_str(), "dispatched" | "running") {
+        match row.github_run_id.as_deref() {
+            Some(bound) if report.github_run_id.as_deref() == Some(bound) => {}
+            Some(bound) => {
+                tracing::warn!(
+                    task_id = %report.task_id,
+                    bound_run = %bound,
+                    reported_run = ?report.github_run_id,
+                    "rejected completion report from a run the generation is not bound to"
+                );
+                return Err(QueueError::StaleCompletion {
+                    task_id: report.task_id.clone(),
+                    attempt: row.attempt,
+                    row_attempt: row.attempt,
+                    row_status: row.status,
+                });
+            }
+            None => {
+                // GitHub does not redeliver a webhook merely because the
+                // receiver answered 500. Persist the verified event while
+                // the native dispatch response is still in flight. The
+                // response binds by this exact run id; an old run with the
+                // same title can therefore never apply to this generation.
+                if persist_pending_completion(db, report).await? {
+                    return Ok(());
+                }
+
+                // The binding may have landed between the first read and
+                // the guarded insert. Re-read the identity and apply only
+                // when it is now the exact run that sent this event.
+                row = load_run_binding(db, &report.task_id)
+                    .await?
+                    .ok_or_else(|| QueueError::UnknownTask(report.task_id.clone()))?;
+                match row.github_run_id.as_deref() {
+                    Some(bound) if report.github_run_id.as_deref() == Some(bound) => {}
+                    Some(_) => {
+                        return Err(QueueError::StaleCompletion {
+                            task_id: report.task_id.clone(),
+                            attempt: row.attempt,
+                            row_attempt: row.attempt,
+                            row_status: row.status,
+                        });
+                    }
+                    None => {
+                        return Err(QueueError::StaleCompletion {
+                            task_id: report.task_id.clone(),
+                            attempt: row.attempt,
+                            row_attempt: row.attempt,
+                            row_status: row.status,
+                        });
+                    }
+                }
+            }
+        }
+    }
     complete(
         db,
         settings,
         &BuildCompleteReport {
             task_id: report.task_id.clone(),
+            generation_id: row.generation_id.clone(),
             attempt: row.attempt,
             success: report.success,
             error: report.error.clone(),
@@ -1264,6 +1340,227 @@ pub async fn complete_run(
         window_minutes,
     )
     .await
+}
+
+async fn load_run_binding(
+    db: &DurableDb,
+    task_id: &str,
+) -> Result<Option<RunBindingRow>, QueueError> {
+    db.query("SELECT generation_id, attempt, status, github_run_id FROM queue WHERE task_id = ?")
+        .bind(task_id.to_owned())
+        .fetch_optional::<RunBindingRow>()
+        .await
+        .map_err(|error| format!("load task {task_id} for run completion: {error}").into())
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct RunBindingRow {
+    generation_id: String,
+    attempt: u32,
+    status: String,
+    github_run_id: Option<String>,
+}
+
+/// Store a verified completion that arrived before the dispatch response
+/// bound its run id. The guarded INSERT is the race fence: it writes only
+/// while the task is still in the same unbound in-flight state.
+async fn persist_pending_completion(
+    db: &DurableDb,
+    report: &stow_types::api::WorkflowRunComplete,
+) -> Result<bool, QueueError> {
+    let Some(github_run_id) = report.github_run_id.as_deref() else {
+        return Ok(false);
+    };
+    let inserted = db
+        .query(
+            "INSERT INTO pending_run_completions \
+                 (github_run_id, task_id, success, error) \
+             SELECT ?, task_id, ?, ? FROM queue \
+             WHERE task_id = ? AND status IN ('dispatched', 'running') \
+               AND github_run_id IS NULL \
+             ON CONFLICT(github_run_id) DO NOTHING",
+        )
+        .bind(github_run_id.to_owned())
+        .bind(i64::from(report.success))
+        .bind(report.error.clone())
+        .bind(report.task_id.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("persist pending completion for {github_run_id}: {error}"))?;
+    if inserted.rows_written > 0 {
+        return Ok(true);
+    }
+
+    let existing = db
+        .query(
+            "SELECT github_run_id, task_id, success, error \
+             FROM pending_run_completions WHERE github_run_id = ?",
+        )
+        .bind(github_run_id.to_owned())
+        .fetch_optional::<PendingCompletionRow>()
+        .await
+        .map_err(|error| format!("load pending completion for {github_run_id}: {error}"))?;
+    match existing {
+        None => Ok(false),
+        Some(existing)
+            if existing.task_id == report.task_id
+                && existing.success == i64::from(report.success)
+                && existing.error == report.error =>
+        {
+            Ok(true)
+        }
+        Some(existing) => Err(QueueError::Invariant(format!(
+            "run {github_run_id} was already pending for task {}",
+            existing.task_id
+        ))),
+    }
+}
+
+/// Apply one exact pending event after its run id has been bound. The event
+/// stays durable until `complete` succeeds; a stale row consumes it without
+/// allowing it to affect a later generation.
+async fn apply_pending_completion_for_binding(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    task_id: &str,
+    generation_id: &str,
+    github_run_id: &str,
+    window_minutes: u32,
+) -> Result<(), QueueError> {
+    db.query(
+        "DELETE FROM pending_run_completions \
+         WHERE task_id = ? AND github_run_id != ?",
+    )
+    .bind(task_id.to_owned())
+    .bind(github_run_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("discard stale pending completions for {task_id}: {error}"))?;
+
+    let pending = db
+        .query(
+            "SELECT github_run_id, task_id, success, error \
+             FROM pending_run_completions \
+             WHERE task_id = ? AND github_run_id = ?",
+        )
+        .bind(task_id.to_owned())
+        .bind(github_run_id.to_owned())
+        .fetch_optional::<PendingCompletionRow>()
+        .await
+        .map_err(|error| format!("load bound pending completion for {task_id}: {error}"))?;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let report = BuildCompleteReport {
+        task_id: pending.task_id,
+        generation_id: generation_id.to_owned(),
+        attempt: db
+            .query("SELECT attempt FROM queue WHERE task_id = ? AND generation_id = ?")
+            .bind(task_id.to_owned())
+            .bind(generation_id.to_owned())
+            .fetch_scalar::<u32>()
+            .await
+            .map_err(|error| format!("load bound attempt for {task_id}: {error}"))?,
+        success: pending.success != 0,
+        error: pending.error,
+        github_run_id: Some(pending.github_run_id.clone()),
+    };
+    match complete(db, settings, &report, window_minutes).await {
+        Ok(()) | Err(QueueError::UnknownTask(_)) | Err(QueueError::StaleCompletion { .. }) => {
+            db.query("DELETE FROM pending_run_completions WHERE github_run_id = ?")
+                .bind(pending.github_run_id)
+                .execute()
+                .await
+                .map_err(|error| format!("consume pending completion for {task_id}: {error}"))?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Recover pending events after a DO restart. The join is driven by the
+/// currently bound in-flight rows, so it reads only identities that can
+/// still apply and never scans historical workflow runs.
+pub async fn reconcile_pending_completions(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    window_minutes: u32,
+) -> Result<(), QueueError> {
+    let rows = db
+        .query(
+            "SELECT q.task_id, q.generation_id, q.github_run_id \
+             FROM queue q \
+             JOIN pending_run_completions p \
+               ON p.task_id = q.task_id AND p.github_run_id = q.github_run_id \
+             WHERE q.status IN ('dispatched', 'running') \
+               AND q.github_run_id IS NOT NULL",
+        )
+        .fetch_all::<BoundPendingCompletionRow>()
+        .await
+        .map_err(|error| format!("list bound pending completions: {error}"))?;
+    for row in rows {
+        apply_pending_completion_for_binding(
+            db,
+            settings,
+            &row.task_id,
+            &row.generation_id,
+            &row.github_run_id,
+            window_minutes,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Bind the run a `workflow_dispatch` response returned to the claimed
+/// row's generation. The claim cleared `github_run_id`, so the write is
+/// gated on the generation the dispatch was made for: a row that has
+/// since moved on (cancelled, failed over) takes no binding, and the
+/// orphan run's own report is rejected as stale when it lands.
+///
+/// The id is also what #526's reconciliation compares against — the
+/// persisted binding is the source of truth for which run a generation
+/// dispatched, where name-matching alone cannot tell two generations
+/// of `<rustc>-<task_id>` apart.
+///
+/// Returns `true` when the binding landed. `false` means the row no
+/// longer sits in the bound generation's claim — the caller logs and
+/// moves on.
+pub async fn bind_dispatch_run(
+    db: &DurableDb,
+    task_id: &str,
+    generation_id: &str,
+    github_run_id: &str,
+) -> Result<bool, QueueError> {
+    let result = db
+        .query(
+            "UPDATE queue SET github_run_id = ? \
+             WHERE task_id = ? AND generation_id = ? \
+                 AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
+        )
+        .bind(github_run_id.to_owned())
+        .bind(task_id.to_owned())
+        .bind(generation_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("bind dispatch run for {task_id}: {error}"))?;
+    if result.rows_written == 0 {
+        return Ok(false);
+    }
+    // A completion from an orphaned run can arrive while this generation is
+    // claimed but still unbound. Once the native response binds Y, every
+    // pending event for the task except Y belongs to an older or ambiguous
+    // generation and must be consumed here, even when Y had no early event.
+    db.query(
+        "DELETE FROM pending_run_completions \
+         WHERE task_id = ? AND github_run_id != ?",
+    )
+    .bind(task_id.to_owned())
+    .bind(github_run_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("discard superseded pending completions for {task_id}: {error}"))?;
+    Ok(true)
 }
 
 pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
@@ -2403,25 +2700,27 @@ pub async fn claim_dispatchable_tasks(
             if family == RunnerFamily::MacOs && macos_slots == 0 {
                 continue;
             }
-            let result = db
+            let claimed_generation = db
                 .query(
                     "UPDATE queue \
-                     SET status = 'dispatched', dispatch_attempts = dispatch_attempts + 1, \
-                         updated_at = datetime('now') \
-                     WHERE task_id = ? AND status = 'pending'",
+                     SET status = 'dispatched', generation_id = lower(hex(randomblob(16))), \
+                         dispatch_attempts = dispatch_attempts + 1, \
+                         github_run_id = NULL, updated_at = datetime('now') \
+                     WHERE task_id = ? AND status = 'pending' \
+                     RETURNING generation_id",
                 )
                 .bind(row.task_id.clone())
-                .execute()
+                .fetch_optional::<ClaimGenerationRow>()
                 .await
                 .map_err(|error| format!("claim task {}: {error}", row.task_id))?;
 
-            if result.rows_written == 0 {
+            let Some(claimed_generation) = claimed_generation else {
                 tracing::warn!(
                     task_id = %row.task_id,
                     "skipping task claim — already claimed by concurrent dispatch"
                 );
                 continue;
-            }
+            };
             total_slots -= 1;
             if family == RunnerFamily::MacOs {
                 macos_slots -= 1;
@@ -2429,6 +2728,7 @@ pub async fn claim_dispatchable_tasks(
 
             claimed.push(QueuedTask {
                 task_id: row.task_id,
+                generation_id: claimed_generation.generation_id,
                 attempt: row.attempt,
                 crate_name: row.crate_name,
                 version: row.version,
@@ -2661,18 +2961,28 @@ pub async fn mark_dispatch_failed(
     db: &DurableDb,
     settings: &SchedulerSettings,
     task_id: &str,
+    generation_id: &str,
     error: &str,
 ) -> Result<(), QueueError> {
     // Exponential backoff keyed on dispatch_attempts (incremented at claim
     // time): a persistent dispatch failure (GitHub outage, bad token) must
     // not spin the alarm in a zero-delay retry loop.
-    let dispatch_attempts = db
-        .query("SELECT dispatch_attempts FROM queue WHERE task_id = ?")
+    let Some(dispatch_attempts) = db
+        .query(
+            "SELECT dispatch_attempts FROM queue \
+             WHERE task_id = ? AND generation_id = ? \
+               AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
+        )
         .bind(task_id.to_owned())
+        .bind(generation_id.to_owned())
         .fetch_scalar_optional::<u32>()
         .await
         .map_err(|db_error| format!("load dispatch attempts for {task_id}: {db_error}"))?
-        .ok_or_else(|| QueueError::UnknownTask(task_id.to_owned()))?;
+    else {
+        // A late external-I/O failure for a superseded or already-bound
+        // generation must not overwrite the live row.
+        return Ok(());
+    };
     let backoff_minutes = dispatch_backoff_minutes(dispatch_attempts);
     // The row re-enters `pending`: `unpublished_deps`/`deps_met` stay
     // live on every status, so the recompute is a cheap count-derived
@@ -2682,30 +2992,62 @@ pub async fn mark_dispatch_failed(
     // SET operand is spelled out again — SET terms see the old row);
     // the human lane ignores the age gate.
     let next_not_before = "datetime('now', ?)";
-    db.query(&format!(
-        "UPDATE queue \
+    let updated = db
+        .query(&format!(
+            "UPDATE queue \
          SET status = 'pending', error_msg = ?, \
              not_before = {next_not_before}, \
              deps_met = {deps_met}, blocked = {blocked}, \
              wake_at = {wake}, \
              updated_at = datetime('now') \
-         WHERE task_id = ?",
-        deps_met = deps_met_sql("queue.task_id"),
-        blocked = blocked_sql("queue.task_id"),
-        wake = wake_at_sql(
-            "lane",
-            "first_requested_at",
-            next_not_before,
-            settings.dispatch_min_age_minutes,
-        ),
-    ))
-    .bind(error.to_owned())
-    .bind(format!("+{backoff_minutes} minutes"))
+         WHERE task_id = ? AND generation_id = ? \
+           AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
+            deps_met = deps_met_sql("queue.task_id"),
+            blocked = blocked_sql("queue.task_id"),
+            wake = wake_at_sql(
+                "lane",
+                "first_requested_at",
+                next_not_before,
+                settings.dispatch_min_age_minutes,
+            ),
+        ))
+        .bind(error.to_owned())
+        .bind(format!("+{backoff_minutes} minutes"))
+        .bind(task_id.to_owned())
+        .bind(generation_id.to_owned())
+        .execute()
+        .await
+        .map_err(|db_error| {
+            format!("mark dispatch failed for {task_id} generation {generation_id}: {db_error}")
+        })?;
+
+    if updated.rows_written > 0 {
+        discard_pending_completions(db, task_id, generation_id).await?;
+    }
+
+    Ok(())
+}
+
+async fn discard_pending_completions(
+    db: &DurableDb,
+    task_id: &str,
+    generation_id: &str,
+) -> Result<(), QueueError> {
+    db.query(
+        "DELETE FROM pending_run_completions \
+         WHERE task_id = ? AND EXISTS ( \
+             SELECT 1 FROM queue \
+             WHERE task_id = ? AND generation_id = ? AND status = 'pending' \
+         )",
+    )
     .bind(task_id.to_owned())
+    .bind(task_id.to_owned())
+    .bind(generation_id.to_owned())
     .execute()
     .await
-    .map_err(|db_error| format!("mark dispatch failed: {db_error}"))?;
-
+    .map_err(|error| {
+        format!("discard pending completions for {task_id} generation {generation_id}: {error}")
+    })?;
     Ok(())
 }
 
@@ -3015,7 +3357,11 @@ pub async fn evaluate_freeze_trip(
     let window = format!("-{} minutes", settings.window_minutes);
     let class_rows = db
         .query(
-            "SELECT failure_class, count(*) AS count FROM attempt_outcomes \
+            "SELECT failure_class, count(*) AS count FROM ( \
+                 SELECT failure_class, finished_at FROM attempt_outcomes \
+                 UNION ALL \
+                 SELECT failure_class, finished_at FROM attempt_outcomes_v2 \
+             ) \
              WHERE finished_at >= datetime('now', ?) \
              GROUP BY failure_class ORDER BY count DESC, failure_class",
         )
@@ -3032,7 +3378,11 @@ pub async fn evaluate_freeze_trip(
     }
     let example_run_ids = db
         .query(
-            "SELECT github_run_id FROM attempt_outcomes \
+            "SELECT github_run_id FROM ( \
+                 SELECT github_run_id, finished_at FROM attempt_outcomes \
+                 UNION ALL \
+                 SELECT github_run_id, finished_at FROM attempt_outcomes_v2 \
+             ) \
              WHERE github_run_id IS NOT NULL \
                AND finished_at >= datetime('now', ?) \
              GROUP BY github_run_id ORDER BY MAX(finished_at) DESC LIMIT ?",
@@ -3314,15 +3664,25 @@ pub async fn apply_mutation(
         }
         None => Vec::new(),
     };
+    if !dep_ids.is_empty() {
+        db.query(
+            "DELETE FROM pending_run_completions \
+             WHERE task_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(enqueue_json(&dep_ids)?)
+        .execute()
+        .await
+        .map_err(|error| format!("discard pending completions before mutation: {error}"))?;
+    }
     let sql = match mutation {
         QueueMutation::Retry => format!(
             // Rows re-enter `pending`: `deps_met` re-derives from the
             // live counter, and `blocked` — maintained for pending
             // rows only — may be stale on a failed row; both recompute
             // in the same statement. `not_before` resets to epoch, so
-            // `wake_at` is the age gate (miss lane) or epoch (human);
-            // `attempt` resets too, so a retried row gets a fresh retry
-            // budget.
+            // `wake_at` is the age gate (miss lane) or epoch (human).
+            // The operator retry starts a fresh four-attempt cycle. The
+            // generation_id remains the sole dispatch identity fence.
             "UPDATE queue SET status = 'pending', attempt = 1, error_msg = '', \
              not_before = '1970-01-01 00:00:00', deps_met = {deps_met}, \
              blocked = {blocked}, wake_at = {wake}, \
@@ -4507,7 +4867,7 @@ async fn apply_slice_gate_delta(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 9;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -4664,6 +5024,7 @@ pub async fn migrate(
         )));
     }
     migrate_schema(db).await?;
+    migrate_generation_identity(db, settings).await?;
     migrate_queue_dependencies_columns(db).await?;
     migrate_published_slice_row_shape(db).await?;
     migrate_published_slice_columns(db).await?;
@@ -4805,6 +5166,10 @@ async fn migrate_queue_columns(
             "ALTER TABLE queue ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
         ),
         (
+            "generation_id",
+            "ALTER TABLE queue ADD COLUMN generation_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
             "not_before",
             "ALTER TABLE queue ADD COLUMN not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'",
         ),
@@ -4853,6 +5218,46 @@ async fn migrate_queue_columns(
                 .map_err(|error| format!("add queue.{column} column: {error}"))?;
         }
     }
+    Ok(())
+}
+
+/// Give every queue row a unique dispatch identity and expand the raw
+/// failure evidence key beyond the resettable attempt counter. This is
+/// operator migration work: request paths only read and write the columns.
+async fn migrate_generation_identity(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<(), QueueError> {
+    let next_not_before =
+        "datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')";
+    db.query(&format!(
+        "UPDATE queue SET status = 'pending', \
+             error_msg = 'legacy in-flight dispatch requeued during generation migration', \
+             not_before = {next_not_before}, \
+             deps_met = {deps_met}, blocked = {blocked}, wake_at = {wake}, \
+             updated_at = datetime('now') \
+         WHERE generation_id = '' AND status IN ('dispatched', 'running') \
+           AND github_run_id IS NULL",
+        deps_met = deps_met_sql("queue.task_id"),
+        blocked = blocked_sql("queue.task_id"),
+        wake = wake_at_sql(
+            "lane",
+            "first_requested_at",
+            next_not_before,
+            settings.dispatch_min_age_minutes,
+        ),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("requeue unbound legacy dispatches: {error}"))?;
+    db.query(
+        "UPDATE queue SET generation_id = lower(hex(randomblob(16))) \
+         WHERE generation_id = ''",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("backfill queue generation identities: {error}"))?;
+
     Ok(())
 }
 
@@ -5285,6 +5690,17 @@ async fn recover_stale_active_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<(), QueueError> {
+    db.query(
+        "DELETE FROM pending_run_completions WHERE task_id IN ( \
+             SELECT task_id FROM queue \
+             WHERE status IN ('dispatched', 'running') \
+               AND updated_at <= datetime('now', ?) \
+         )",
+    )
+    .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
+    .execute()
+    .await
+    .map_err(|error| format!("discard stale pending completions: {error}"))?;
     // Rows re-enter `pending`: `deps_met` re-derives from the live
     // counter, and `blocked` — maintained for pending rows only — may
     // be stale on a stale in-flight row; both recompute in the same
@@ -5473,6 +5889,11 @@ struct TaskRow {
     dispatch_key: String,
 }
 
+#[derive(Debug, skyzen::FromRow)]
+struct ClaimGenerationRow {
+    generation_id: String,
+}
+
 /// One queue row as needed to build a [`RequestStatus`].
 #[derive(Debug, skyzen::FromRow)]
 struct RequestStatusRow {
@@ -5498,6 +5919,21 @@ struct RequestStatusRow {
 struct AttemptStatusRow {
     attempt: u32,
     status: String,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct PendingCompletionRow {
+    github_run_id: String,
+    task_id: String,
+    success: i64,
+    error: Option<String>,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct BoundPendingCompletionRow {
+    task_id: String,
+    generation_id: String,
+    github_run_id: String,
 }
 
 /// One `PRAGMA table_info` row — only the column name matters.
@@ -6661,6 +7097,7 @@ mod sqlite_tests {
             &claim_settings(),
             &super::BuildCompleteReport {
                 task_id: claimed[0].task_id.clone(),
+                generation_id: claimed[0].generation_id.clone(),
                 attempt: claimed[0].attempt,
                 success: false,
                 error: Some("boom".to_owned()),
@@ -6724,7 +7161,12 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&claimed[0].task_id, super::MAX_BUILD_ATTEMPTS, false),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                super::MAX_BUILD_ATTEMPTS,
+                false,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -6769,6 +7211,7 @@ mod sqlite_tests {
             &claim_settings(),
             &super::BuildCompleteReport {
                 task_id: claimed[0].task_id.clone(),
+                generation_id: claimed[0].generation_id.clone(),
                 attempt: claimed[0].attempt,
                 success: true,
                 error: None,
@@ -6900,7 +7343,7 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&id, 1, true),
+            &report(&id, &claimed[0].generation_id, 1, true),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -6952,7 +7395,7 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&id, 1, false),
+            &report(&id, &claimed[0].generation_id, 1, false),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -7276,6 +7719,7 @@ mod sqlite_tests {
             &claim_settings(),
             &super::BuildCompleteReport {
                 task_id: id.clone(),
+                generation_id: claimed[0].generation_id.clone(),
                 attempt: claimed[0].attempt,
                 success: true,
                 error: None,
@@ -7300,6 +7744,7 @@ mod sqlite_tests {
             &claim_settings(),
             &super::BuildCompleteReport {
                 task_id: "never-enqueued".to_owned(),
+                generation_id: "unknown-generation".to_owned(),
                 attempt: 1,
                 success: true,
                 error: None,
@@ -7335,7 +7780,7 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&id, 1, true),
+            &report(&id, &claimed[0].generation_id, 1, true),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -7354,7 +7799,7 @@ mod sqlite_tests {
         let error = super::complete(
             &db,
             &claim_settings(),
-            &report(&id, 1, true),
+            &report(&id, &claimed[0].generation_id, 1, true),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -7378,7 +7823,7 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&id, 2, true),
+            &report(&id, &reclaimed[0].generation_id, 2, true),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -7409,7 +7854,7 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&id, 1, true),
+            &report(&id, &claimed[0].generation_id, 1, true),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -7417,7 +7862,7 @@ mod sqlite_tests {
         let error = super::complete(
             &db,
             &claim_settings(),
-            &report(&id, 1, true),
+            &report(&id, &claimed[0].generation_id, 1, true),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -7491,7 +7936,12 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&claimed[0].task_id, claimed[0].attempt, true),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                claimed[0].attempt,
+                true,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -7533,7 +7983,12 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&claimed[0].task_id, claimed[0].attempt, false),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                claimed[0].attempt,
+                false,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -7586,7 +8041,12 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&claimed[0].task_id, super::MAX_BUILD_ATTEMPTS, false),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                super::MAX_BUILD_ATTEMPTS,
+                false,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -8093,7 +8553,12 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&claimed[0].task_id, claimed[0].attempt, false),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                claimed[0].attempt,
+                false,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -8119,7 +8584,12 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&claimed[0].task_id, claimed[0].attempt, true),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                claimed[0].attempt,
+                true,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -8474,14 +8944,646 @@ mod sqlite_tests {
         assert_eq!(super::status(&db).await.expect("status").blocked, 1);
     }
 
-    fn report(task_id: &str, attempt: u32, success: bool) -> super::BuildCompleteReport {
+    fn report(
+        task_id: &str,
+        generation_id: &str,
+        attempt: u32,
+        success: bool,
+    ) -> super::BuildCompleteReport {
         super::BuildCompleteReport {
             task_id: task_id.to_owned(),
+            generation_id: generation_id.to_owned(),
             attempt,
             success,
             error: None,
             github_run_id: None,
         }
+    }
+
+    fn report_with_run(
+        task_id: &str,
+        success: bool,
+        github_run_id: &str,
+    ) -> stow_types::api::WorkflowRunComplete {
+        stow_types::api::WorkflowRunComplete {
+            task_id: task_id.to_owned(),
+            success,
+            error: (!success).then(|| "build failed".to_owned()),
+            github_run_id: Some(github_run_id.to_owned()),
+        }
+    }
+
+    #[derive(skyzen::FromRow)]
+    struct AttemptEvidenceRow {
+        generation_id: String,
+        attempt: i64,
+        github_run_id: Option<String>,
+    }
+
+    #[tokio::test]
+    async fn two_retry_cycles_keep_distinct_failure_evidence() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("flaky", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("flaky", TARGET);
+
+        for attempt in 1..=4 {
+            mark_active(&db, "flaky", TARGET, "dispatched").await;
+            db.query(
+                "UPDATE queue SET attempt = ?, generation_id = lower(hex(randomblob(16))) \
+                 WHERE task_id = ?",
+            )
+            .bind(i64::from(attempt))
+            .bind(id.clone())
+            .execute()
+            .await
+            .expect("seed first-cycle attempt");
+            super::complete(
+                &db,
+                &settings(),
+                &super::BuildCompleteReport {
+                    task_id: id.clone(),
+                    generation_id: db
+                        .query("SELECT generation_id FROM queue WHERE task_id = ?")
+                        .bind(id.clone())
+                        .fetch_scalar::<String>()
+                        .await
+                        .expect("first-cycle generation"),
+                    attempt,
+                    success: false,
+                    error: Some(format!("cycle-a-{attempt}")),
+                    github_run_id: Some(format!("run-a-{attempt}")),
+                },
+                TEST_WINDOW_MINUTES,
+            )
+            .await
+            .expect("record first-cycle failure");
+            db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
+                .bind(id.clone())
+                .execute()
+                .await
+                .expect("open next first-cycle attempt");
+        }
+
+        super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Retry,
+            &ids_selector(std::slice::from_ref(&id)),
+        )
+        .await
+        .expect("operator retry");
+        assert_eq!(
+            row_column(&db, "flaky", "CAST(attempt AS TEXT)").await,
+            "1",
+            "operator retry resets the visible failure cycle to attempt 1"
+        );
+        for attempt in 1..=4 {
+            mark_active(&db, "flaky", TARGET, "dispatched").await;
+            db.query(
+                "UPDATE queue SET attempt = ?, generation_id = lower(hex(randomblob(16))) \
+                 WHERE task_id = ?",
+            )
+            .bind(i64::from(attempt))
+            .bind(id.clone())
+            .execute()
+            .await
+            .expect("seed second-cycle attempt");
+            super::complete(
+                &db,
+                &settings(),
+                &super::BuildCompleteReport {
+                    task_id: id.clone(),
+                    generation_id: db
+                        .query("SELECT generation_id FROM queue WHERE task_id = ?")
+                        .bind(id.clone())
+                        .fetch_scalar::<String>()
+                        .await
+                        .expect("second-cycle generation"),
+                    attempt,
+                    success: false,
+                    error: Some(format!("cycle-b-{attempt}")),
+                    github_run_id: Some(format!("run-b-{attempt}")),
+                },
+                TEST_WINDOW_MINUTES,
+            )
+            .await
+            .expect("record second-cycle failure");
+            if attempt == 1 {
+                let short_backoff = db
+                    .query(
+                        "SELECT CASE WHEN not_before <= datetime('now', '+3 minutes') \
+                         THEN 1 ELSE 0 END FROM queue WHERE task_id = ?",
+                    )
+                    .bind(id.clone())
+                    .fetch_scalar::<i64>()
+                    .await
+                    .expect("read second-cycle backoff");
+                assert_eq!(
+                    short_backoff, 1,
+                    "retry cycle backoff must restart at 2 minutes"
+                );
+            }
+            db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
+                .bind(id.clone())
+                .execute()
+                .await
+                .expect("open next second-cycle attempt");
+        }
+
+        let evidence = db
+            .query(
+                "SELECT generation_id, attempt, github_run_id FROM attempt_outcomes_v2 \
+                 WHERE task_id = ? ORDER BY github_run_id",
+            )
+            .bind(id)
+            .fetch_all::<AttemptEvidenceRow>()
+            .await
+            .expect("read failure evidence");
+        assert_eq!(evidence.len(), 8);
+        assert_eq!(evidence[0].attempt, 1);
+        assert_eq!(evidence[3].attempt, 4);
+        assert_eq!(evidence[4].attempt, 1);
+        assert_eq!(evidence[7].attempt, 4);
+        assert_eq!(evidence[0].github_run_id.as_deref(), Some("run-a-1"));
+        assert_eq!(evidence[4].github_run_id.as_deref(), Some("run-b-1"));
+        let mut generation_ids = evidence
+            .iter()
+            .map(|row| row.generation_id.clone())
+            .collect::<Vec<_>>();
+        generation_ids.sort();
+        generation_ids.dedup();
+        assert_eq!(
+            generation_ids.len(),
+            8,
+            "each failure has a distinct generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_old_run_cannot_complete_new_bound_generation() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("flaky", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("flaky", TARGET);
+        let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim A")[0]
+            .clone();
+        super::bind_dispatch_run(&db, &id, &first.generation_id, "run-a")
+            .await
+            .expect("bind A");
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, false, "run-a"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete A");
+        db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
+            .bind(id.clone())
+            .execute()
+            .await
+            .expect("open retry");
+        let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim B")[0]
+            .clone();
+        super::bind_dispatch_run(&db, &id, &second.generation_id, "run-b")
+            .await
+            .expect("bind B");
+        let stale = super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, false, "run-a"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("old A must conflict with B");
+        assert!(matches!(stale, QueueError::StaleCompletion { .. }));
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, true, "run-b"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete B");
+        assert_eq!(row_column(&db, "flaky", "status").await, "completed");
+    }
+
+    #[tokio::test]
+    async fn early_completion_is_acknowledged_then_applied_after_exact_binding() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("early", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("early", TARGET);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, false, "run-early"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("early report is durably acknowledged");
+        assert_eq!(row_column(&db, "early", "status").await, "dispatched");
+        assert_eq!(pending_completion_count(&db).await, 1);
+        super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-early")
+            .await
+            .expect("bind exact run");
+        super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
+            .await
+            .expect("apply pending exact run");
+        assert_eq!(row_column(&db, "early", "status").await, "pending");
+        assert_eq!(pending_completion_count(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_early_delivery_is_idempotent_and_replay_conflicts_after_apply() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("replay", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("replay", TARGET);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        let event = report_with_run(&id, true, "run-replay");
+        super::complete_run(&db, &settings(), &event, TEST_WINDOW_MINUTES)
+            .await
+            .expect("first early delivery");
+        super::complete_run(&db, &settings(), &event, TEST_WINDOW_MINUTES)
+            .await
+            .expect("duplicate early delivery");
+        assert_eq!(pending_completion_count(&db).await, 1);
+        super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-replay")
+            .await
+            .expect("bind replay run");
+        super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
+            .await
+            .expect("apply replay run");
+        let replay = super::complete_run(&db, &settings(), &event, TEST_WINDOW_MINUTES)
+            .await
+            .expect_err("replayed applied delivery conflicts");
+        assert!(matches!(replay, QueueError::StaleCompletion { .. }));
+        assert_eq!(pending_completion_count(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn response_loss_reclaim_drops_unbound_event_before_new_claim() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("lost", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("lost", TARGET);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, false, "run-lost"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("store response-loss event");
+        super::mark_dispatch_failed(
+            &db,
+            &settings(),
+            &id,
+            &claimed.generation_id,
+            "response lost",
+        )
+        .await
+        .expect("reclaim response-loss generation");
+        assert_eq!(pending_completion_count(&db).await, 0);
+        db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
+            .bind(id.clone())
+            .execute()
+            .await
+            .expect("open replacement dispatch");
+        let replacement = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim replacement")[0]
+            .clone();
+        assert_eq!(replacement.attempt, claimed.attempt);
+        super::bind_dispatch_run(&db, &id, &replacement.generation_id, "run-new")
+            .await
+            .expect("bind replacement");
+        let stale = super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, false, "run-lost"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("orphaned response-loss run is stale");
+        assert!(matches!(stale, QueueError::StaleCompletion { .. }));
+    }
+
+    #[tokio::test]
+    async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("fenced", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("fenced", TARGET);
+        let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim A")[0]
+            .clone();
+        super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Cancel,
+            &ids_selector(std::slice::from_ref(&id)),
+        )
+        .await
+        .expect("cancel A");
+        super::mark_dispatch_failed(
+            &db,
+            &settings(),
+            &id,
+            &first.generation_id,
+            "late A failure",
+        )
+        .await
+        .expect("fence late A failure after cancel");
+        assert_eq!(row_column(&db, "fenced", "status").await, "failed");
+
+        super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Retry,
+            &ids_selector(std::slice::from_ref(&id)),
+        )
+        .await
+        .expect("retry for B");
+        let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim B")[0]
+            .clone();
+        assert_eq!(second.attempt, 1);
+        assert_ne!(second.generation_id, first.generation_id);
+
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, true, "run-b"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("persist early B completion");
+        assert_eq!(pending_completion_count(&db).await, 1);
+        super::bind_dispatch_run(&db, &id, &second.generation_id, "run-b")
+            .await
+            .expect("bind B");
+
+        super::mark_dispatch_failed(
+            &db,
+            &settings(),
+            &id,
+            &first.generation_id,
+            "late A failure",
+        )
+        .await
+        .expect("fence late A failure after retry");
+        assert_eq!(row_column(&db, "fenced", "status").await, "dispatched");
+        assert_eq!(row_column(&db, "fenced", "github_run_id").await, "run-b");
+        assert_eq!(pending_completion_count(&db).await, 1);
+
+        super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
+            .await
+            .expect("apply B completion");
+        assert_eq!(row_column(&db, "fenced", "status").await, "completed");
+        assert_eq!(pending_completion_count(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("purged", Vec::new())])
+            .await
+            .expect("enqueue A");
+        let id = task_id_on("purged", TARGET);
+        let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim A")[0]
+            .clone();
+        db.query("UPDATE queue SET attempt = 4 WHERE task_id = ?")
+            .bind(id.clone())
+            .execute()
+            .await
+            .expect("seed terminal attempt");
+        super::complete(
+            &db,
+            &settings(),
+            &super::BuildCompleteReport {
+                task_id: id.clone(),
+                generation_id: first.generation_id.clone(),
+                attempt: 4,
+                success: false,
+                error: Some("cycle A".to_owned()),
+                github_run_id: Some("run-a".to_owned()),
+            },
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("record terminal A");
+
+        super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Purge,
+            &ids_selector(std::slice::from_ref(&id)),
+        )
+        .await
+        .expect("purge A");
+        enqueue(&db, &[request("purged", Vec::new())])
+            .await
+            .expect("enqueue B");
+        let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim B")[0]
+            .clone();
+        super::complete(
+            &db,
+            &settings(),
+            &super::BuildCompleteReport {
+                task_id: id.clone(),
+                generation_id: second.generation_id.clone(),
+                attempt: second.attempt,
+                success: false,
+                error: Some("cycle B".to_owned()),
+                github_run_id: Some("run-b".to_owned()),
+            },
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("record B");
+
+        let rows = db
+            .query(
+                "SELECT generation_id, attempt FROM attempt_outcomes_v2 \
+                 WHERE task_id = ? ORDER BY finished_at",
+            )
+            .bind(id)
+            .fetch_all::<AttemptEvidenceRow>()
+            .await
+            .expect("read preserved evidence");
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].generation_id, rows[1].generation_id);
+        assert_eq!(rows[0].attempt, 4);
+        assert_eq!(rows[1].attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn late_failure_cannot_match_purged_recreated_generation() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("recreated", Vec::new())])
+            .await
+            .expect("enqueue A");
+        let id = task_id_on("recreated", TARGET);
+        let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim A")[0]
+            .clone();
+        assert_eq!(
+            row_column(&db, "recreated", "generation_id").await,
+            first.generation_id
+        );
+
+        super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Cancel,
+            &ids_selector(std::slice::from_ref(&id)),
+        )
+        .await
+        .expect("cancel A");
+        super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Purge,
+            &ids_selector(std::slice::from_ref(&id)),
+        )
+        .await
+        .expect("purge A");
+        enqueue(&db, &[request("recreated", Vec::new())])
+            .await
+            .expect("enqueue B");
+        let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim B")[0]
+            .clone();
+        assert_ne!(first.generation_id, second.generation_id);
+        assert_eq!(
+            row_column(&db, "recreated", "generation_id").await,
+            second.generation_id
+        );
+
+        super::mark_dispatch_failed(&db, &settings(), &id, &first.generation_id, "late A")
+            .await
+            .expect("fence old failure");
+        assert_eq!(row_column(&db, "recreated", "status").await, "dispatched");
+        assert_eq!(
+            row_column(&db, "recreated", "generation_id").await,
+            second.generation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_clears_orphan_pending_run_before_normal_completion() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("orphan", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("orphan", TARGET);
+        let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim A")[0]
+            .clone();
+        super::mark_dispatch_failed(&db, &settings(), &id, &first.generation_id, "response lost")
+            .await
+            .expect("reclaim A");
+        db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
+            .bind(id.clone())
+            .execute()
+            .await
+            .expect("open B");
+        let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim B")[0]
+            .clone();
+        assert_eq!(second.attempt, first.attempt);
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, false, "run-x"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("persist orphan X");
+        assert_eq!(pending_completion_count(&db).await, 1);
+        super::bind_dispatch_run(&db, &id, &second.generation_id, "run-y")
+            .await
+            .expect("bind Y");
+        assert_eq!(pending_completion_count(&db).await, 0);
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, true, "run-y"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete Y");
+        assert_eq!(row_column(&db, "orphan", "status").await, "completed");
+    }
+
+    #[tokio::test]
+    async fn persisted_bound_pending_event_recovers_after_restart() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("restart", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("restart", TARGET);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, false, "run-restart"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("persist pending event");
+        super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-restart")
+            .await
+            .expect("persist binding");
+        super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
+            .await
+            .expect("restart recovery");
+        assert_eq!(row_column(&db, "restart", "status").await, "pending");
+        assert_eq!(pending_completion_count(&db).await, 0);
+    }
+
+    async fn pending_completion_count(db: &DurableDb) -> i64 {
+        db.query("SELECT count(*) FROM pending_run_completions")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("pending completion count")
     }
 
     /// A `pending` count at or above `max_queue_pending` turns miss-lane
@@ -8722,9 +9824,8 @@ mod sqlite_tests {
         assert_eq!(row_column(&db, "beta", "status").await, "pending");
     }
 
-    /// A retried row re-enters `pending` with its retry budget back at
-    /// the start: `attempt` resets to 1 alongside the backoff and the
-    /// error.
+    /// A retried row re-enters `pending` with a fresh retry budget while
+    /// its dispatch generation remains monotone for evidence fencing.
     #[tokio::test]
     async fn retry_returns_failed_rows_to_pending_with_a_fresh_attempt() {
         let db = memory_db().await.expect("memory db");
@@ -9125,14 +10226,53 @@ mod sqlite_tests {
         }
         #[derive(skyzen::FromRow)]
         struct QueueRow {
+            task_id: String,
             status: String,
             host_side: i64,
             shape_requeue: i64,
+            attempt: i64,
+            dispatch_attempts: i64,
+            generation_id: String,
+            github_run_id: Option<String>,
+            not_before: String,
+            wake_at: String,
         }
         let db = memory_db_raw().await.expect("raw memory db");
         for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
             db.query(statement).execute().await.expect("dev-era ddl");
         }
+        db.query("ALTER TABLE queue ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 2")
+            .execute()
+            .await
+            .expect("legacy dispatch attempt column");
+        db.query("ALTER TABLE queue ADD COLUMN attempt INTEGER NOT NULL DEFAULT 3")
+            .execute()
+            .await
+            .expect("legacy retry-cycle attempt column");
+        db.query(
+            "CREATE TABLE attempt_outcomes (
+                task_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                target TEXT NOT NULL,
+                failure_step TEXT,
+                failure_class TEXT,
+                github_run_id TEXT,
+                finished_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (task_id, attempt)
+            )",
+        )
+        .execute()
+        .await
+        .expect("legacy outcome ddl");
+        db.query(
+            "INSERT INTO attempt_outcomes \
+             (task_id, attempt, target, failure_class, github_run_id) \
+             VALUES ('legacy-before-migrate', 1, ?, 'legacy', 'run-legacy')",
+        )
+        .bind(TARGET)
+        .execute()
+        .await
+        .expect("legacy outcome row");
         let owner = task_id_on("parent", TARGET);
         let dep = task_id_on("dep", TARGET);
         db.query(
@@ -9152,12 +10292,23 @@ mod sqlite_tests {
              (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version)
              VALUES (?, ?, 'dep', '1.0.0', '[]', ?, '1.85.0')",
         )
-        .bind(owner)
-        .bind(dep)
+        .bind(owner.clone())
+        .bind(dep.clone())
         .bind(TARGET)
         .execute()
         .await
         .expect("dev-era edge row");
+        db.query("UPDATE queue SET status = 'dispatched' WHERE task_id = ?")
+            .bind(dep.clone())
+            .execute()
+            .await
+            .expect("seed unbound legacy dispatch");
+        db.query("UPDATE queue SET status = 'running', github_run_id = ? WHERE task_id = ?")
+            .bind("legacy-run")
+            .bind(owner.clone())
+            .execute()
+            .await
+            .expect("seed bound legacy dispatch");
 
         let report = super::migrate(&db, &settings()).await.expect("migrate");
         assert_eq!(
@@ -9165,6 +10316,26 @@ mod sqlite_tests {
             (0, super::SCHEMA_VERSION),
             "a pre-versioned queue reports 0 → SCHEMA_VERSION"
         );
+        let before_retry = db
+            .query(
+                "SELECT task_id, status, host_side, shape_requeue, attempt, dispatch_attempts, \
+                    generation_id, github_run_id, not_before, wake_at \
+                 FROM queue WHERE task_id = ?",
+            )
+            .bind(dep.clone())
+            .fetch_one::<QueueRow>()
+            .await
+            .expect("read requeued row before migration retry");
+        let stale = super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&dep, false, "legacy-run"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("legacy unbound completion cannot settle requeued work");
+        assert!(matches!(stale, QueueError::StaleCompletion { .. }));
+
         // A second pass must be a no-op, not a failure — deploy retries.
         let retry = super::migrate(&db, &settings())
             .await
@@ -9195,14 +10366,75 @@ mod sqlite_tests {
         assert_eq!(edge.shapes, 2);
 
         let rows = db
-            .query("SELECT status, host_side, shape_requeue FROM queue")
+            .query(
+                "SELECT task_id, status, host_side, shape_requeue, attempt, dispatch_attempts, \
+                    generation_id, github_run_id, not_before, wake_at \
+                 FROM queue",
+            )
             .fetch_all::<QueueRow>()
             .await
             .expect("queue rows");
         assert_eq!(rows.len(), 2, "the rebuild keeps every queue row");
         assert!(
             rows.iter()
-                .all(|row| row.status == "pending" && row.host_side == 0 && row.shape_requeue == 0)
+                .all(|row| row.host_side == 0 && row.shape_requeue == 0)
+        );
+        let abandoned = rows
+            .iter()
+            .find(|row| row.task_id == dep)
+            .expect("abandoned row");
+        assert_eq!(abandoned.status, "pending");
+        assert_eq!(abandoned.attempt, 3);
+        assert_eq!(abandoned.dispatch_attempts, 2);
+        assert_ne!(abandoned.not_before, "1970-01-01 00:00:00");
+        assert_ne!(abandoned.wake_at, "1970-01-01 00:00:00");
+        assert!(!abandoned.generation_id.is_empty());
+        assert_eq!(abandoned.github_run_id, None);
+        assert_eq!(
+            (
+                abandoned.status.clone(),
+                abandoned.attempt,
+                abandoned.dispatch_attempts,
+                abandoned.generation_id.clone(),
+                abandoned.not_before.clone(),
+                abandoned.wake_at.clone(),
+            ),
+            (
+                before_retry.status,
+                before_retry.attempt,
+                before_retry.dispatch_attempts,
+                before_retry.generation_id,
+                before_retry.not_before,
+                before_retry.wake_at,
+            ),
+            "rerunning migration leaves the requeued claim unchanged"
+        );
+        let preserved = rows
+            .iter()
+            .find(|row| row.task_id == owner)
+            .expect("bound row");
+        assert_eq!(preserved.status, "running");
+        assert!(!preserved.generation_id.is_empty());
+        assert_eq!(preserved.github_run_id.as_deref(), Some("legacy-run"));
+        let stale_bound = super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&owner, false, "older-run"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("an old run cannot settle a preserved bound claim");
+        assert!(matches!(stale_bound, QueueError::StaleCompletion { .. }));
+        assert_eq!(
+            db.query(
+                "SELECT count(*) FROM attempt_outcomes \
+                 WHERE task_id = 'legacy-before-migrate'",
+            )
+            .fetch_scalar::<i64>()
+            .await
+            .expect("read preserved legacy outcome history"),
+            1,
+            "migration keeps legacy outcome evidence"
         );
 
         assert_eq!(
@@ -9211,6 +10443,25 @@ mod sqlite_tests {
                 .expect("schema version"),
             super::SCHEMA_VERSION,
             "a migrated queue is stamped at the current schema version"
+        );
+        db.query(
+            "INSERT INTO attempt_outcomes \
+             (task_id, attempt, target, failure_class, github_run_id) \
+             VALUES ('legacy-after-migrate', 1, ?, 'legacy', 'run-legacy-2')",
+        )
+        .bind(TARGET)
+        .execute()
+        .await
+        .expect("old writer remains compatible");
+        let generation_columns = db
+            .query("PRAGMA table_info(attempt_outcomes_v2)")
+            .fetch_all::<super::QueueTableInfoRow>()
+            .await
+            .expect("generation outcome table");
+        assert!(
+            generation_columns
+                .iter()
+                .any(|column| column.name == "generation_id")
         );
     }
 
@@ -9673,7 +10924,12 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&claimed[0].task_id, claimed[0].attempt, true),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                claimed[0].attempt,
+                true,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -9746,7 +11002,12 @@ mod sqlite_tests {
         super::complete(
             &db,
             &claim_settings(),
-            &report(&claimed[0].task_id, claimed[0].attempt, true),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                claimed[0].attempt,
+                true,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -10179,7 +11440,7 @@ mod sqlite_tests {
             .await
             .expect("seed buckets");
             db.query(
-                "WITH RECURSIVE seq(x) AS (                     SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x <= ?                 )                  INSERT INTO attempt_outcomes                      (task_id, attempt, target, failure_class,                       github_run_id, finished_at)                  SELECT 'seed-' || x, 1, ?, 'boom',                         'run-' || x, datetime('now', '-' || (x % 50) || ' minutes')                  FROM seq",
+                "WITH RECURSIVE seq(x) AS (                     SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x <= ?                 )                  INSERT INTO attempt_outcomes_v2                      (task_id, generation_id, attempt, target, failure_class,                       github_run_id, finished_at)                  SELECT 'seed-' || x, 'seed-generation-' || x, 1, ?, 'boom',                         'run-' || x, datetime('now', '-' || (x % 50) || ' minutes')                  FROM seq",
             )
             .bind(i64::try_from(volume).expect("fits"))
             .bind(TARGET)
@@ -10202,6 +11463,7 @@ mod sqlite_tests {
                 &claim_settings(),
                 &super::BuildCompleteReport {
                     task_id: claimed[0].task_id.clone(),
+                    generation_id: claimed[0].generation_id.clone(),
                     attempt: claimed[0].attempt,
                     success: false,
                     error: Some("boom".to_owned()),

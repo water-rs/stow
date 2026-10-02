@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_net::TcpListener;
@@ -41,6 +42,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// stand-in for a GitHub Actions workflow run.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MockTaskRun {
+    /// Numeric GitHub-compatible run identity, stable for this dispatch.
+    pub workflow_run_id: u64,
     /// The run's name — `<rustc>-<task_id>`, the same shape
     /// `build-crate.yml`'s `run-name` stamps on the real API.
     pub display_title: String,
@@ -71,6 +74,9 @@ pub struct LocalServerState {
     pub mock_registry_root: String,
     /// Every dispatched task's run state, served by `GET /tasks`.
     pub runs: Arc<Mutex<BTreeMap<String, MockTaskRun>>>,
+    /// The local equivalent of GitHub assigning a fresh id to every
+    /// workflow dispatch, including repeated task/attempt keys.
+    next_run_id: Arc<AtomicU64>,
     /// The bound listen address, filled by `serve` — the `html_url` a
     /// mock run reports.
     pub listen: SocketAddr,
@@ -103,30 +109,38 @@ impl LocalServerState {
             mock_private_key_path,
             mock_registry_root,
             runs: Arc::new(Mutex::new(BTreeMap::new())),
+            next_run_id: Arc::new(AtomicU64::new(1)),
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         }
     }
 
-    /// Record a dispatched run — `run_key` is the id `GET /tasks`
-    /// indexes by (the task id for builds, the request id for resolves)
-    /// and `display_title` the run-name its workflow stamps.
+    fn allocate_run_id(&self) -> u64 {
+        self.next_run_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("local workflow run id space exhausted")
+    }
+
+    /// Record a dispatched run under the id GitHub assigned it. The
+    /// display title remains the workflow's stable task/request run-name,
+    /// so repeated dispatches retain separate records.
     fn mark_run(
         &self,
-        run_key: &str,
+        workflow_run_id: u64,
         display_title: &str,
         status: &'static str,
         conclusion: Option<&'static str>,
     ) {
         let entry = MockTaskRun {
+            workflow_run_id,
             display_title: display_title.to_string(),
             status,
             conclusion,
-            html_url: format!("http://{}/tasks/{display_title}", self.listen),
+            html_url: format!("http://{}/tasks/{workflow_run_id}", self.listen),
         };
         self.runs
             .lock()
             .expect("runs mutex poisoned")
-            .insert(run_key.to_owned(), entry);
+            .insert(workflow_run_id.to_string(), entry);
     }
 
     /// `run_title` under `build-crate.yml`'s convention for a task —
@@ -140,11 +154,12 @@ impl LocalServerState {
     fn mark_build_run(
         &self,
         task: &BuildTaskPayload,
+        workflow_run_id: u64,
         status: &'static str,
         conclusion: Option<&'static str>,
     ) {
         self.mark_run(
-            &task.task_id,
+            workflow_run_id,
             &Self::build_run_title(task),
             status,
             conclusion,
@@ -164,7 +179,9 @@ struct RepositoryDispatchEvent {
 
 #[derive(Debug, serde::Serialize)]
 struct DispatchResponse {
-    ok: bool,
+    workflow_run_id: u64,
+    run_url: String,
+    html_url: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -258,15 +275,21 @@ fn bad_request(error: &str) -> serde_json::Value {
 }
 
 fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
-    state.mark_build_run(&task, "in_progress", None);
+    let workflow_run_id = state.allocate_run_id();
+    let run = task_workflow_run(&state, &task, workflow_run_id, None, None);
+    let response = dispatch_response(&run);
+    state.mark_build_run(&task, workflow_run_id, "in_progress", None);
     tokio::spawn(async move {
         let state_for_task = state.clone();
-        if let Err(error) = run_dispatched_task(state_for_task.clone(), task.clone()).await {
+        if let Err(error) =
+            run_dispatched_task(state_for_task.clone(), task.clone(), workflow_run_id).await
+        {
             tracing::error!(task_id = %task.task_id, %error, "local CI dispatched task failed");
-            state_for_task.mark_build_run(&task, "completed", Some("failure"));
+            state_for_task.mark_build_run(&task, workflow_run_id, "completed", Some("failure"));
             if let Err(report_error) = report_failed_task(
                 &state_for_task,
                 &task,
+                workflow_run_id,
                 format!("local CI dispatch failed: {error}"),
             )
             .await
@@ -279,7 +302,7 @@ fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
             }
         }
     });
-    json_response(&DispatchResponse { ok: true }, StatusCode::ACCEPTED)
+    json_response(&response, StatusCode::ACCEPTED)
 }
 
 /// A `resolve-request` dispatch (stow#428): the stub absorbs the hop
@@ -290,18 +313,22 @@ fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
 /// the record the admit pass wrote stays `resolving` here until the
 /// operator drives the resolve for real.
 fn dispatch_resolve(state: LocalServerState, dispatch: RequestDispatch) -> Response {
+    let workflow_run_id = state.allocate_run_id();
     let display_title =
         stow_types::records::resolve_run_title(dispatch.attempt, &dispatch.request_id);
-    state.mark_run(&dispatch.request_id, &display_title, "in_progress", None);
+    let run_key = resolve_run_key(&dispatch);
+    state.mark_run(workflow_run_id, &display_title, "in_progress", None);
     let report = WorkflowRunReport {
-        run_key: dispatch.request_id.clone(),
+        workflow_run_id,
+        run_key,
         workflow_file: stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE,
         display_title,
         action: "in_progress",
         conclusion: None,
-        html_url: format!("http://{}/tasks/{}", state.listen, dispatch.request_id),
+        html_url: format!("http://{}/tasks/{workflow_run_id}", state.listen),
         error: None,
     };
+    let response = dispatch_response(&report);
     tokio::spawn(async move {
         if let Err(error) = post_workflow_run(&state, &report).await {
             tracing::error!(
@@ -311,7 +338,17 @@ fn dispatch_resolve(state: LocalServerState, dispatch: RequestDispatch) -> Respo
             );
         }
     });
-    json_response(&DispatchResponse { ok: true }, StatusCode::ACCEPTED)
+    json_response(&response, StatusCode::ACCEPTED)
+}
+
+fn dispatch_response(run: &WorkflowRunReport) -> DispatchResponse {
+    let workflow_run_id = run.workflow_run_id;
+    let url = run.html_url.clone();
+    DispatchResponse {
+        workflow_run_id,
+        run_url: url.clone(),
+        html_url: url,
+    }
 }
 
 fn json_response(payload: &impl serde::Serialize, status: StatusCode) -> Response {
@@ -328,11 +365,12 @@ fn json_response(payload: &impl serde::Serialize, status: StatusCode) -> Respons
 async fn report_failed_task(
     state: &LocalServerState,
     task: &BuildTaskPayload,
+    workflow_run_id: u64,
     error: String,
 ) -> stow_types::error::Result<()> {
     post_workflow_run(
         state,
-        &task_workflow_run(state, task, Some("failure"), Some(error)),
+        &task_workflow_run(state, task, workflow_run_id, Some("failure"), Some(error)),
     )
     .await
 }
@@ -390,6 +428,7 @@ impl DispatchLayout {
 async fn run_dispatched_task(
     state: LocalServerState,
     task: BuildTaskPayload,
+    workflow_run_id: u64,
 ) -> stow_types::error::Result<()> {
     // `STOW_LOCAL_CI_STUB=1` short-circuits the build stage: the dispatch
     // POST — the hop the alarm pass pays per claimed task — is the piece
@@ -412,10 +451,10 @@ async fn run_dispatched_task(
             &std::env::current_exe()?,
         )
         .await?;
-        state.mark_build_run(&task, "completed", Some("success"));
+        state.mark_build_run(&task, workflow_run_id, "completed", Some("success"));
         return post_workflow_run(
             &state,
-            &task_workflow_run(&state, &task, Some("success"), None),
+            &task_workflow_run(&state, &task, workflow_run_id, Some("success"), None),
         )
         .await;
     }
@@ -428,10 +467,16 @@ async fn run_dispatched_task(
     let status = run_build_stage(&exe, &task_json, &layout).await?;
     if !status.success() {
         let error = format!("stow-build exited with status {status}");
-        state.mark_build_run(&task, "completed", Some("failure"));
+        state.mark_build_run(&task, workflow_run_id, "completed", Some("failure"));
         post_workflow_run(
             &state,
-            &task_workflow_run(&state, &task, Some("failure"), Some(error.clone())),
+            &task_workflow_run(
+                &state,
+                &task,
+                workflow_run_id,
+                Some("failure"),
+                Some(error.clone()),
+            ),
         )
         .await?;
         return Err(stow_types::stow_error!("{error}"));
@@ -444,20 +489,20 @@ async fn run_dispatched_task(
         // Even an artifact-less task publishes its (empty) records
         // artifact — the webhook's existence check must find it.
         push_records(&state, &task, &layout.records_path, exe.as_path()).await?;
-        state.mark_build_run(&task, "completed", Some("success"));
+        state.mark_build_run(&task, workflow_run_id, "completed", Some("success"));
         return post_workflow_run(
             &state,
-            &task_workflow_run(&state, &task, Some("success"), None),
+            &task_workflow_run(&state, &task, workflow_run_id, Some("success"), None),
         )
         .await;
     }
 
-    populate_mock_registry(&exe, &state, &task, &layout).await?;
+    populate_mock_registry(&exe, &state, &task, workflow_run_id, &layout).await?;
     push_records(&state, &task, &layout.records_path, exe.as_path()).await?;
-    state.mark_build_run(&task, "completed", Some("success"));
+    state.mark_build_run(&task, workflow_run_id, "completed", Some("success"));
     post_workflow_run(
         &state,
-        &task_workflow_run(&state, &task, Some("success"), None),
+        &task_workflow_run(&state, &task, workflow_run_id, Some("success"), None),
     )
     .await
 }
@@ -506,6 +551,7 @@ async fn populate_mock_registry(
     exe: &Path,
     state: &LocalServerState,
     task: &BuildTaskPayload,
+    workflow_run_id: u64,
     layout: &DispatchLayout,
 ) -> stow_types::error::Result<()> {
     let registry_sqlite = layout.task_root.join("mock-registry.sqlite");
@@ -544,10 +590,16 @@ async fn populate_mock_registry(
         return Ok(());
     }
     let error = format!("mock registry populate exited with status {populate_status}");
-    state.mark_build_run(task, "completed", Some("failure"));
+    state.mark_build_run(task, workflow_run_id, "completed", Some("failure"));
     post_workflow_run(
         state,
-        &task_workflow_run(state, task, Some("failure"), Some(error.clone())),
+        &task_workflow_run(
+            state,
+            task,
+            workflow_run_id,
+            Some("failure"),
+            Some(error.clone()),
+        ),
     )
     .await?;
     Err(stow_types::stow_error!("{error}"))
@@ -601,9 +653,12 @@ async fn push_records(
 /// The `workflow_run` event a mock run reports — the fields GitHub's
 /// payload carries that the edge's signature check, authority boundary
 /// and title correlation consume. `run_key` (task id or request id)
-/// seeds the synthetic run id; `display_title` is the run-name the
-/// workflow stamps and the edge parses back.
+/// identifies the workflow's title context; `workflow_run_id` is the
+/// per-dispatch identity shared by the response and callback.
 struct WorkflowRunReport {
+    /// The id allocated for this dispatch. Every response and webhook for
+    /// the run carries this captured value.
+    workflow_run_id: u64,
     run_key: String,
     /// The workflow file — `build-crate.yml` or `resolve-request.yml`.
     workflow_file: &'static str,
@@ -618,21 +673,31 @@ struct WorkflowRunReport {
     error: Option<String>,
 }
 
+fn build_run_key(task: &BuildTaskPayload) -> String {
+    format!("{}:{}", task.task_id, task.attempt)
+}
+
+fn resolve_run_key(dispatch: &RequestDispatch) -> String {
+    format!("{}:{}", dispatch.request_id, dispatch.attempt)
+}
+
 /// A dispatched build task's `completed` report under
 /// `build-crate.yml`'s run-name.
 fn task_workflow_run(
     state: &LocalServerState,
     task: &BuildTaskPayload,
+    workflow_run_id: u64,
     conclusion: Option<&'static str>,
     error: Option<String>,
 ) -> WorkflowRunReport {
     WorkflowRunReport {
-        run_key: task.task_id.clone(),
+        workflow_run_id,
+        run_key: build_run_key(task),
         workflow_file: stow_types::trusted_builder::WORKFLOW_FILE,
         display_title: LocalServerState::build_run_title(task),
         action: "completed",
         conclusion,
-        html_url: format!("http://{}/tasks/{}", state.listen, task.task_id),
+        html_url: format!("http://{}/tasks/{workflow_run_id}", state.listen),
         error,
     }
 }
@@ -654,9 +719,7 @@ async fn post_workflow_run(
         "action": run.action,
         "repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
         "workflow_run": {
-            "id": blake3::hash(run.run_key.as_bytes()).as_bytes()[..8]
-                .iter()
-                .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte)),
+            "id": run.workflow_run_id,
             "name": run.workflow_file,
             "path": format!(".github/workflows/{}", run.workflow_file),
             "event": "workflow_dispatch",
@@ -711,7 +774,62 @@ async fn post_workflow_run(
 
 #[cfg(test)]
 mod tests {
-    use super::task_directory_name;
+    use super::{LocalServerState, WorkflowRunReport, dispatch_response, task_directory_name};
+
+    #[test]
+    fn repeated_dispatches_keep_distinct_captured_run_ids() {
+        let state = LocalServerState::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        let first = WorkflowRunReport {
+            workflow_run_id: state.allocate_run_id(),
+            run_key: "task:1".to_owned(),
+            workflow_file: "build-crate.yml",
+            display_title: "1.86.0-task".to_owned(),
+            action: "completed",
+            conclusion: None,
+            html_url: String::new(),
+            error: None,
+        };
+        let first_response = dispatch_response(&first);
+        state.mark_run(
+            first.workflow_run_id,
+            &first.display_title,
+            "in_progress",
+            None,
+        );
+
+        let second = WorkflowRunReport {
+            workflow_run_id: state.allocate_run_id(),
+            run_key: first.run_key.clone(),
+            workflow_file: first.workflow_file,
+            display_title: first.display_title.clone(),
+            action: first.action,
+            conclusion: None,
+            html_url: String::new(),
+            error: None,
+        };
+        let second_response = dispatch_response(&second);
+        state.mark_run(
+            second.workflow_run_id,
+            &second.display_title,
+            "in_progress",
+            None,
+        );
+
+        assert_ne!(first.workflow_run_id, second.workflow_run_id);
+        assert_eq!(first_response.workflow_run_id, first.workflow_run_id);
+        assert_eq!(second_response.workflow_run_id, second.workflow_run_id);
+        assert_eq!(
+            state.runs.lock().expect("runs mutex poisoned").len(),
+            2,
+            "repeated task/attempt keys retain both run records"
+        );
+    }
 
     #[test]
     fn plain_task_ids_name_their_directory() {

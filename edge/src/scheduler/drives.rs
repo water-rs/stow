@@ -309,6 +309,9 @@ pub const DRIVES: &[Drive] = &[
         },
     },
     Drive {
+        // The fixture's in-flight rows carry a bound `github_run_id`
+        // (`run-{n}`) as a claimed generation does — the report must
+        // name it or the run-binding gate rejects it.
         name: "POST /tasks/complete-run",
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
@@ -319,7 +322,7 @@ pub const DRIVES: &[Drive] = &[
                         task_id: hex_id(u64::from(shape.running_row())),
                         success: true,
                         error: None,
-                        github_run_id: Some("12345".to_owned()),
+                        github_run_id: Some(format!("run-{}", shape.running_row())),
                     },
                     crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
                 )
@@ -343,7 +346,7 @@ pub const DRIVES: &[Drive] = &[
                         task_id: hex_id(u64::from(shape.dispatched_row(0))),
                         success: false,
                         error: Some("build failed".to_owned()),
-                        github_run_id: Some("12346".to_owned()),
+                        github_run_id: Some(format!("run-{}", shape.dispatched_row(0))),
                     },
                     crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
                 )
