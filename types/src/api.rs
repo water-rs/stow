@@ -930,9 +930,7 @@ pub enum QueueTaskStatus {
 }
 
 impl QueueTaskStatus {
-    /// The stable string a queue row's `status` carries on the wire —
-    /// `blocked` only ever appears as that derived read-time value, never
-    /// in the stored column.
+    /// The stable string a queue row's `status` carries on the wire.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1378,6 +1376,9 @@ pub struct QueueSelector {
     /// Compilation target to match.
     #[serde(default)]
     pub target: Option<TargetTriple>,
+    /// Rustc version to match (`rustc` on the wire).
+    #[serde(default, rename = "rustc", alias = "rustc_version")]
+    pub rustc_version: Option<WireRustcVersion>,
     /// Crate name to match (`crate` on the wire).
     #[serde(default, rename = "crate", alias = "crate_name")]
     pub crate_name: Option<CrateName>,
@@ -1392,8 +1393,8 @@ pub struct QueueSelector {
     pub limit: Option<u32>,
 }
 
-/// Response of the `queue retry|cancel|promote|purge` endpoints: how many
-/// rows the transition touched.
+/// Response of the `queue retry|cancel|promote|purge` endpoints:
+/// how many rows the transition touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueueMutationResult {
     /// Rows the transition affected.

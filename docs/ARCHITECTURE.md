@@ -247,10 +247,12 @@ edge resolves to a row the latest report for that dependency's own
 `(target, rustc_version)` serves. Ordering here is correctness, not a
 cache-locality optimization — a dependent dispatched before its
 dependency is servable compiles the dependency itself. A failed
-dependency keeps its dependents waiting while it retries; if it
-fails for good the read paths report the dependents as `blocked`,
-naming the failed task id, until a retry or a later successful build
-plus publish releases them back to `pending`. An edge whose dependency
+dependency keeps its dependents waiting while it retries — each
+failure report re-queues it under an exponential `not_before` backoff
+until the attempt cap, where it parks `failed`. From there the read
+paths report the dependents as `blocked`, naming the failed task
+id, until the operator's `queue retry` (or a later successful build
+plus publish) releases them back to `pending`. An edge whose dependency
 identity was never resolved reports `blocked` too, named `unknown
 dependency identity` — it can never resolve to a published row, so
 pending would hide a wait that no build can end.
@@ -619,7 +621,7 @@ Four workflows keep it warm:
   failed dispatch simply retries on the next tick. Re-submitting the
   whole list is cheap: `enqueue` deduplicates on task identity and
   leaves a completed task completed, so a wave builds only what is
-  missing or previously failed.
+  missing — a failed build retries on its own `not_before` backoff.
 - `preheat-missed.yml` (weekly, Mondays 06:00 UTC, plus manual) promotes
   observed demand: `stow-admin preheat missed` queries the
   `stow_cache_misses` Analytics Engine dataset for the top-K
@@ -681,7 +683,7 @@ deserialization.
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|clear`) |
 | GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
-| GET `/api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
+| GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: repo-workflow OIDC or push user | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |

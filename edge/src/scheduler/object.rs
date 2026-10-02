@@ -356,16 +356,21 @@ async fn complete_run(
     Json(report): Json<stow_types::api::WorkflowRunComplete>,
 ) -> Result<Json<OkResponse>> {
     let freeze = freeze_settings(&env)?;
-    queue::complete_run(&db, &report, freeze.window_minutes)
-        .await
-        .map_err(|error| {
-            let status = match &error {
-                crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-                crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
+    queue::complete_run(
+        &db,
+        &scheduler_settings(&env)?,
+        &report,
+        freeze.window_minutes,
+    )
+    .await
+    .map_err(|error| {
+        let status = match &error {
+            crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
+            crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        to_error(error).set_status(status)
+    })?;
     // A failed attempt may have closed the window's trip condition —
     // evaluate while this request still holds the outcome row's write
     // context. The freeze then eats the dispatch the alarm was about
@@ -1026,6 +1031,11 @@ pub(super) async fn dispatch_pass(
     coverage: &impl queue::CoverageOracle,
 ) -> Result<Vec<String>> {
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+    let freeze = freeze_settings(env)?;
+    queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
+        .await
+        .map_err(to_error)?;
+    evaluate_dispatch_freeze(env, db, &freeze).await?;
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
@@ -1063,6 +1073,7 @@ pub(super) async fn dispatch_pass(
                             db,
                             settings,
                             &task.task_id,
+                            &task.generation_id,
                             &error.to_string(),
                         )
                         .await
@@ -1089,9 +1100,11 @@ pub(super) async fn dispatch_pass(
             let (credential, github_repo, pool) = (&credential, github_repo.as_str(), &pool);
             async move {
                 let task_id = task.task_id.clone();
+                let generation_id = task.generation_id.clone();
                 (
                     index,
                     task_id,
+                    generation_id,
                     dispatch::trigger_build(&task, credential, github_repo, pool).await,
                 )
             }
@@ -1101,17 +1114,67 @@ pub(super) async fn dispatch_pass(
         .await;
     // A failed dispatch still marks exactly its own task, in the claim
     // order the sequential loop wrote.
-    results.sort_unstable_by_key(|(index, _, _)| *index);
-    for (_, task_id, result) in results {
-        if let Err(error) = result {
-            queue::mark_dispatch_failed(db, settings, &task_id, &error.to_string())
+    results.sort_unstable_by_key(|(index, _, _, _)| *index);
+    for (_, task_id, generation_id, result) in results {
+        persist_dispatch_outcome(db, settings, &task_id, &generation_id, result).await?;
+    }
+
+    // A completion may have been persisted while this pass was waiting for
+    // the dispatch response. Consume it now that all returned identities are
+    // bound; the same join also makes this path restart-safe.
+    queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
+        .await
+        .map_err(to_error)?;
+    evaluate_dispatch_freeze(env, db, &freeze).await?;
+
+    Ok(task_ids)
+}
+
+async fn persist_dispatch_outcome(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    task_id: &str,
+    generation_id: &str,
+    outcome: std::result::Result<dispatch::DispatchedRun, dispatch::DispatchError>,
+) -> Result<()> {
+    match outcome {
+        Ok(run) => match queue::bind_dispatch_run(
+            db,
+            task_id,
+            generation_id,
+            &run.workflow_run_id.to_string(),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = run.workflow_run_id,
+                    "dispatch run binding skipped — the claimed generation moved on"
+                );
+            }
+            Err(error) => {
+                queue::mark_dispatch_failed(
+                    db,
+                    settings,
+                    task_id,
+                    generation_id,
+                    &error.to_string(),
+                )
+                .await
+                .map_err(to_error)?;
+                tracing::error!(task_id = %task_id, %error, "failed to bind dispatch run");
+            }
+        },
+        Err(error) => {
+            queue::mark_dispatch_failed(db, settings, task_id, generation_id, &error.to_string())
                 .await
                 .map_err(to_error)?;
             tracing::error!(task_id = %task_id, error = %error, "failed to dispatch build");
         }
     }
-
-    Ok(task_ids)
+    Ok(())
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {

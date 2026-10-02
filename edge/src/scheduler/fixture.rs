@@ -330,6 +330,7 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "attempt",
     "shape_requeue",
     "github_run_id",
+    "generation_id",
     "unpublished_deps",
     "deps_met",
     "wake_at",
@@ -338,12 +339,14 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
 ];
 
 /// Build the seed's queue statement over an arbitrary `seq` source:
-/// every column a pure function of `n`, including the `dispatch_key`
+/// identity and scheduling columns are functions of `n`, including the `dispatch_key`
 /// the claim walk orders on and the `wake_at` the alarm probes read
 /// (computed under the same `dispatch_min_age_minutes` the deploy runs).
 /// `verb` distinguishes the idempotent seed (`INSERT OR IGNORE`) from
 /// the restore (`INSERT`), and `conflict` carries the upsert clause —
 /// empty for the seed.
+/// Dispatch generations are fresh 128-bit identities on each insert or
+/// restore; they identify an execution, independently of the stable task.
 ///
 /// `(crate, version)` is injective in `n` — `n / 20000` carries the
 /// quotient in the version and `n % 500` its low digits — so the
@@ -367,8 +370,11 @@ fn queue_seed_insert_sql(
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let lane_case = &format!("CASE WHEN n <= {human_end} THEN 'human' ELSE 'miss' END");
     let first_at = "datetime('now', '-' || (n % 2880) || ' minutes')";
-    let not_before = "CASE WHEN n % 20 = 1 THEN datetime('now', '+30 minutes') \
-                      ELSE '1970-01-01 00:00:00' END";
+    let not_before = &format!(
+        "CASE WHEN (n <= {failed_end} OR n > {in_flight_end}) AND n % 20 = 1 \
+         THEN datetime('now', '+30 minutes') \
+         ELSE '1970-01-01 00:00:00' END"
+    );
     let last_24h = FixtureShape::LAST_24H_ROWS;
     // In-flight rows model attempts with a live heartbeat: stamped ahead
     // of any lease horizon so the stale-dispatch recovery never reclaims
@@ -402,14 +408,15 @@ fn queue_seed_insert_sql(
                           ELSE 'running' END \
                      ELSE 'failed' END, \
                 {lane_case}, \
-                0, \
+                CASE WHEN n > {failed_end} AND n <= {in_flight_end} THEN 1 ELSE 0 END, \
                 {not_before}, \
                 {first_at}, \
                 {first_at}, \
                 {updated_at}, \
                 CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
                 0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
-                CASE WHEN n > {in_flight_end} THEN 'run-' || n ELSE NULL END, \
+                CASE WHEN n > {failed_end} THEN 'run-' || n ELSE NULL END, \
+                lower(hex(randomblob(16))), \
                 0, 0, {wake}, {family}, {key} \
          FROM seq \
          {conflict}",
@@ -811,11 +818,10 @@ async fn restore_claimed_rows(
 ///   is the recorded claim outcome, never a predicate over row
 ///   state. A claimed row a drive inserted dies in the `%-%` cleanup
 ///   — only seeded (hex) ids reach the upsert.
-/// - Attempt epochs: the running target's restore bumps `attempt`
-///   past the value the last pass left (`attempt_outcomes` keys on
-///   `(task_id, attempt)`, so a repeated attempt would make the next
-///   pass's completion a replay of the old epoch, not a fresh
-///   completion).
+/// - Execution identities: restored rows receive fresh generations, so
+///   failure evidence never collides across passes. The running target's
+///   attempt advances, while the failure target resets to attempt 1 to
+///   keep measuring the retry arm below the four-attempt cap.
 /// - Row 101's edges: the resync's delta edge sync deleted the seeded
 ///   edge set and wrote its own; both edge phases re-seed the owner's
 ///   range after a delete (each `INSERT OR IGNORE` is idempotent).
@@ -861,6 +867,7 @@ pub async fn rearm(
         shape.completed_row(0),
         shape.completed_row(1),
         shape.running_row(),
+        shape.dispatched_row(0),
     ];
     // The attempt the running target is at *before* the upsert rewrites
     // it to the seeded 1 — read first so the restore below can step the
