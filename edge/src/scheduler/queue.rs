@@ -4033,9 +4033,9 @@ fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
 /// The delta-report apply: the reporter already knows the change set, so
 /// the stored membership is edited by exactly `retired` then `added` —
 /// never a read of the live set. Retire resolves identities through the
-/// PK in one statement: the `json_each` join produces each stale row's
-/// rowid with a PK probe per report row, so reads stay proportional to
-/// the delta. Returns the changed row set for the dependent refresh.
+/// PK in one statement: the tuple IN probes the complete primary key
+/// directly, without a join that first materializes the same rowids.
+/// Returns the changed row set for the dependent refresh.
 async fn apply_slice_delta(
     db: &DurableDb,
     target: &str,
@@ -4049,22 +4049,17 @@ async fn apply_slice_delta(
             .map_err(|error| QueueError::Sql(format!("encode slice retire json: {error}")))?;
         db.query(
             "DELETE FROM published_slice_rows \
-             WHERE rowid IN ( \
-                 SELECT p.rowid \
-                 FROM (SELECT value AS e FROM json_each(?)) AS j \
-                 CROSS JOIN published_slice_rows p \
-                   ON p.target = ? AND p.rustc_version = ? AND p.generation = ? \
-                  AND p.crate_name = j.e ->> 'crate_name' \
-                  AND p.version = j.e ->> 'version' \
-                  AND p.features_json = j.e ->> 'features_json' \
-                  AND p.unit_side = j.e ->> 'unit_side' \
-                  AND p.unit_invocation = j.e ->> 'unit_invocation' \
-                  AND p.unit_linked = j.e ->> 'unit_linked')",
+             WHERE (target, rustc_version, generation, crate_name, version, features_json, \
+                    unit_side, unit_invocation, unit_linked) IN ( \
+                 SELECT ?, ?, ?, value ->> 'crate_name', value ->> 'version', \
+                        value ->> 'features_json', value ->> 'unit_side', \
+                        value ->> 'unit_invocation', value ->> 'unit_linked' \
+                 FROM json_each(?))",
         )
-        .bind(retired_json)
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
         .bind(live_generation)
+        .bind(retired_json)
         .execute()
         .await
         .map_err(|error| format!("drop retired slice rows {target}/{rustc_version}: {error}"))?;
@@ -4235,12 +4230,20 @@ async fn commit_published_slice(
     if run_stale_cleanup {
         // Rows a crashed pre-delta report left at a never-published
         // generation have no live-set claim; delete them so they cannot
-        // merge into the answer the gate reads. O(slice) — the full
-        // path pays it; the per-wave delta path skips it.
+        // merge into the answer the gate reads. Two disjoint PK ranges
+        // avoid reading the live generation merely to exclude it.
         db.query(
             "DELETE FROM published_slice_rows \
-             WHERE target = ? AND rustc_version = ? AND generation != ?",
+             WHERE rowid IN ( \
+                 SELECT rowid FROM published_slice_rows \
+                 WHERE target = ? AND rustc_version = ? AND generation < ? \
+                 UNION ALL \
+                 SELECT rowid FROM published_slice_rows \
+                 WHERE target = ? AND rustc_version = ? AND generation > ?)",
         )
+        .bind(target.to_owned())
+        .bind(rustc_version.to_owned())
+        .bind(live_generation)
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
         .bind(live_generation)
@@ -4261,9 +4264,8 @@ async fn commit_published_slice(
 /// never the queue or the graph (stow#521). The matched-edge set —
 /// edges whose dep identity a changed row can flip — is walked exactly
 /// once, in the flip statement: `json_each` drives one `dep_match`
-/// index walk per changed row, `DISTINCT rowid` dedupes (several
-/// changed rows may satisfy one edge), and the PK seek back to the edge
-/// keeps reads proportional to the delta's dependents. `RETURNING`
+/// index walk per changed row, and DISTINCT dedupes each edge's old and
+/// new answers (several changed rows may satisfy one edge). `RETURNING`
 /// hands the flips back so the one `queue` update that follows keys
 /// off the flipped owners instead of re-walking the matched set.
 /// `live_generation` is the generation the marker commit already
@@ -4290,8 +4292,7 @@ async fn apply_slice_gate_delta(
         owner: String,
         delta: i64,
     }
-    let matched_edges = "SELECT DISTINCT d.rowid AS rid \
-         FROM (SELECT value AS c FROM json_each(?)) AS j \
+    let matched_edges = "FROM (SELECT value AS c FROM json_each(?)) AS j \
          CROSS JOIN queue_dependencies d \
            ON d.dep_target = ? AND d.dep_rustc_version = ? \
           AND d.dep_crate_name = j.c ->> 'crate_name' \
@@ -4300,23 +4301,18 @@ async fn apply_slice_gate_delta(
           AND d.dep_host_side = j.c ->> 'unit_side' \
           AND (d.dep_host_side = 0 OR (j.c ->> 'unit_linked') = 1) \
           AND (d.dep_invocations & ((j.c ->> 'unit_invocation') + 1)) != 0";
-    // 1. Flip the matched edges — `f` materializes each edge's fresh
-    //    answer once (`LIMIT -1`), so the `dep_met !=` guard compares
-    //    against the computed value instead of re-running the slice
-    //    probe per edge, and the marker commit already wrote the live
-    //    generation, so `?` binds it rather than re-seeking the marker
-    //    row per edge. `RETURNING` yields exactly the flipped edges
-    //    with the flag they now carry.
+    // Read both answers directly from the matched edge join. DISTINCT
+    // prevents flattening and emits one update per edge; the write guard
+    // uses the captured old answer instead of re-reading the target.
     let flipped = db
         .query(&format!(
             "UPDATE queue_dependencies \
              SET dep_met = f.new_met \
-             FROM (SELECT d.rowid AS rid, CASE WHEN {unpub} THEN 0 ELSE 1 END AS new_met \
-                   FROM queue_dependencies d \
-                   WHERE d.rowid IN ({matched_edges}) \
-                   LIMIT -1) AS f \
+             FROM (SELECT DISTINCT d.rowid AS rid, d.dep_met AS old_met, \
+                          CASE WHEN {unpub} THEN 0 ELSE 1 END AS new_met \
+                   {matched_edges}) AS f \
              WHERE queue_dependencies.rowid = f.rid \
-               AND queue_dependencies.dep_met != f.new_met \
+               AND f.old_met != f.new_met \
              RETURNING queue_dependencies.task_id, queue_dependencies.dep_met",
             unpub = dep_edge_unpublished_sql_at("d", "?"),
         ))
@@ -4340,9 +4336,10 @@ async fn apply_slice_gate_delta(
     //    the CASE, not as an outer literal, so the planner never walks
     //    the status index over the whole pending group (measured 60k
     //    reads on the 100k fixture) — and non-pending owners keep their
-    //    stored flag. `f` materializes each owner's answers once
-    //    (`LIMIT -1`), so the write guard compares columns instead of
-    //    re-running the blocked probe.
+    //    stored flag. Join the unique owner payload directly to the
+    //    target: a second owner lookup and materialization would read
+    //    the same row again just to assign these expressions. Net-zero
+    //    owners still refresh blocked from the changed edge flags.
     let mut deltas = std::collections::BTreeMap::<String, i64>::new();
     for edge in &flipped {
         *deltas.entry(edge.task_id.clone()).or_default() += 1 - 2 * edge.dep_met;
@@ -4356,20 +4353,13 @@ async fn apply_slice_gate_delta(
         .collect::<Vec<_>>();
     db.query(&format!(
         "UPDATE queue \
-         SET unpublished_deps = f.unpublished, deps_met = f.met, blocked = f.blocked \
-         FROM (SELECT o.task_id AS tid, \
-                      o.unpublished_deps + j.delta AS unpublished, \
-                      CASE WHEN o.unpublished_deps + j.delta = 0 THEN 1 ELSE 0 END AS met, \
-                      CASE WHEN o.status = 'pending' THEN {blocked} ELSE o.blocked END AS blocked \
-               FROM (SELECT value ->> 'owner' AS owner, value ->> 'delta' AS delta \
-                     FROM json_each(?)) AS j \
-               CROSS JOIN queue o ON o.task_id = j.owner \
-               LIMIT -1) AS f \
-         WHERE queue.task_id = f.tid \
-           AND (queue.unpublished_deps != f.unpublished \
-                OR queue.deps_met != f.met \
-                OR queue.blocked != f.blocked)",
-        blocked = blocked_sql("o.task_id"),
+         SET unpublished_deps = queue.unpublished_deps + j.delta, \
+             deps_met = (queue.unpublished_deps + j.delta = 0), \
+             blocked = CASE WHEN queue.status = 'pending' THEN {blocked} ELSE queue.blocked END \
+         FROM (SELECT value ->> 'owner' AS owner, value ->> 'delta' AS delta \
+               FROM json_each(?)) AS j \
+         WHERE queue.task_id = j.owner",
+        blocked = blocked_sql("queue.task_id"),
     ))
     .bind(enqueue_json(&owners)?)
     .execute()
@@ -7530,6 +7520,76 @@ mod sqlite_tests {
             claimed.iter().all(|task| task.crate_name != "parent"),
             "an owner whose counter returns above 0 stops dispatching"
         );
+    }
+
+    #[tokio::test]
+    async fn net_zero_slice_flips_refresh_blocked_and_replays_preserve_counters() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("failed-dep", Vec::new()),
+                request("other-dep", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue deps");
+        publish(&db, "other-dep").await;
+        enqueue(
+            &db,
+            &[request(
+                "parent",
+                vec![dependency("failed-dep"), dependency("other-dep")],
+            )],
+        )
+        .await
+        .expect("enqueue parent");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim failed dependency");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "failed-dep");
+        super::complete(
+            &db,
+            &report(&claimed[0].task_id, claimed[0].attempt, false),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("fail dependency");
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+        assert_eq!(row_column(&db, "failed-dep", "status").await, "failed");
+        assert_eq!(
+            edge_flags(&db).await,
+            vec![("failed-dep".to_owned(), 0), ("other-dep".to_owned(), 1),]
+        );
+        let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+            .await
+            .expect("read parent status")
+            .expect("parent row");
+        assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Blocked);
+        assert_eq!(super::status(&db).await.expect("status").blocked, 1);
+
+        // Several changed shapes match each edge, but each edge flips
+        // only once. The owner's counter is unchanged while blocked
+        // clears: the remaining unmet edge names a non-failed dep.
+        for base in [1, 2] {
+            super::record_published_slice(
+                &db,
+                TARGET,
+                RUSTC,
+                Some(base),
+                None,
+                &dep_slice_rows("failed-dep"),
+                &dep_slice_rows("other-dep"),
+            )
+            .await
+            .expect("swap or replay slice membership");
+            assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+            assert_eq!(super::status(&db).await.expect("status").blocked, 0);
+        }
+        publish(&db, "other-dep").await;
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+        assert_eq!(super::status(&db).await.expect("status").blocked, 1);
     }
 
     /// The counter stays live on non-pending rows: an edge flip against
