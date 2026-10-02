@@ -204,9 +204,21 @@ fn main() -> stow_types::error::Result<()> {
     } else {
         Output::Table
     };
+    run(dispatch(cli.command, output))?
+}
+
+/// Drive `future` on the binary's single executor — one multi-thread
+/// Tokio runtime every command dispatches onto. `stow-oci`'s reqwest
+/// session, the sigstore trust root (`tough` reads through
+/// `tokio::fs`), and every `tokio::{fs,process,time}` call need that
+/// reactor; issue #530 was the watchdog panicking "there is no reactor
+/// running" when dispatch ran under `smol::block_on`. Tests share this
+/// entry so a mixed-executor regression fails `cargo test`, not
+/// production.
+fn run<F: std::future::Future>(future: F) -> stow_types::error::Result<F::Output> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|error| stow_error!("build tokio runtime: {error}"))?;
-    runtime.block_on(dispatch(cli.command, output))
+    Ok(runtime.block_on(future))
 }
 
 async fn dispatch(command: Command, output: Output) -> stow_types::error::Result<()> {
@@ -756,4 +768,25 @@ fn install_tracing() {
         // stderr, never stdout: keep diagnostics off the data stream.
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    /// #510 made `run` the one executor entry; #530 was the watchdog
+    /// panicking "there is no reactor running" the moment a dispatched
+    /// future touched Tokio machinery (`tokio::fs`, `tokio::spawn` —
+    /// what reqwest and the sigstore trust root call). Drive the same
+    /// entry the binary does so a non-Tokio executor fails here.
+    #[test]
+    fn run_provides_the_tokio_reactor() {
+        let path = std::env::temp_dir().join(format!("stow-admin-run-{}", std::process::id()));
+        std::fs::write(&path, b"x").expect("write probe file");
+        super::run(async {
+            let bytes = tokio::fs::read(&path).await.expect("tokio::fs::read");
+            assert_eq!(bytes, b"x");
+            tokio::spawn(async {}).await.expect("tokio::spawn join");
+        })
+        .expect("run drives the future");
+        std::fs::remove_file(&path).expect("remove probe file");
+    }
 }
