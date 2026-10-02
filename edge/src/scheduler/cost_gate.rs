@@ -300,14 +300,15 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
-    // A report whose membership moved by DELTA_ROWS: the `deps_met`
-    // refresh reads only edges matching the changed rows, so its cost
-    // is proportional to the delta, never to the slice or the graph.
+    // A report whose membership moved by DELTA_ROWS: the gate writes
+    // touch only the changed rows' matched edges and their owners'
+    // counters, so its cost is proportional to the delta, never to the
+    // slice or the graph (stow#521).
     RouteBudget {
         name: "POST /index/published (delta)",
-        statements: 12,
-        rows_read: 4_000,
-        rows_written: 120,
+        statements: 16,
+        rows_read: 60,
+        rows_written: 200,
         scan_allowlist: &[],
         ddl_permitted: false,
     },

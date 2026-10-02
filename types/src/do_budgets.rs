@@ -232,10 +232,16 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
+        // The delta's gate writes are the matched edges' `dep_met`
+        // flips plus their owners' `unpublished_deps` adjustments —
+        // 1 + the delta's direct dependents, never the queue or the
+        // graph (stow#521). `rowsRead` counts workerd's internal index
+        // seeks: the per-edge `dep_match` probes, the slice-row
+        // re-evaluation per matched edge and the owner PK seeks.
         name: "POST /index/published (delta)",
-        statements: 8,
-        rows_read: 700,
-        rows_written: 500,
+        statements: 12,
+        rows_read: 500,
+        rows_written: 200,
         wall_ms: 500,
     },
     DriveBudget {
