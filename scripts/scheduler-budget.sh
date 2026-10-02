@@ -26,8 +26,8 @@
 # production: `stow-mock-registry` on 28123 (the edge's GHCR_BASE_URL —
 # the webhook's records check), `stow-build serve` on 28124 under
 # STOW_LOCAL_CI_STUB (the edge's STOW_LOCAL_CI_URL — a real dispatch
-# POST per claimed task, the pass's serialized fan-out, then the
-# signed workflow_run callback; only the cargo build is stubbed), and
+# POST per claimed task, the pass's bounded-concurrent fan-out, then
+# the signed workflow_run callback; only the cargo build is stubbed), and
 # the production dispatch cap carried to the probe via
 # `--dispatch-limit` — the mock deploy pins STOW_MAX_CONCURRENT_JOBS=3,
 # below the fixture's 30 in-flight rows, which would price a pass that

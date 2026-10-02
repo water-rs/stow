@@ -43,8 +43,9 @@ type DriveRun = for<'a> fn(
 /// Worker env and the catalog D1 handle wrapped in the counted backend,
 /// so the pass drive runs the real dispatch path — binding resolution,
 /// the paged claim with its per-page coverage lookup, and the
-/// sequential `trigger_build` fan-out — and the report can price the
-/// coverage lookup's D1 rows against what the pass claimed.
+/// `MAX_OUTBOUND_INFLIGHT`-bounded `trigger_build` fan-out — and the
+/// report can price the coverage lookup's D1 rows against what the
+/// pass claimed.
 pub struct DriveContext {
     /// The Worker env — set only on the wasm32 probe.
     #[cfg(target_arch = "wasm32")]
@@ -608,11 +609,11 @@ pub const DRIVES: &[Drive] = &[
         // One dispatch pass end to end — on wasm the real
         // `dispatch_pass` (`object.rs`): binding resolution, the claim
         // paged at `2 × open slots` rows with its per-page catalog
-        // coverage lookup, and the sequential `trigger_build` fan-out,
-        // the serialized HTTP hop the launch gate's peak-wall bound
-        // exists to measure. On host the claim runs the same queue
-        // code against the empty-catalog oracle — the host gate checks
-        // statements and counters only.
+        // coverage lookup, and the `MAX_OUTBOUND_INFLIGHT`-bounded
+        // `trigger_build` fan-out — the HTTP wall the launch gate's
+        // peak-wall bound exists to measure. On host the claim runs the
+        // same queue code against the empty-catalog oracle — the host
+        // gate checks statements and counters only.
         name: "alarm pass",
         run: |db, _shape, settings, ctx| {
             Box::pin(async move { dispatch_pass_drive(db, settings, ctx, false).await })

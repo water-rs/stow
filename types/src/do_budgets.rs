@@ -242,8 +242,8 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // The full dispatch pass: binding reads, the claim paged at
         // `2 × open slots`, the per-page catalog coverage lookup (a
         // counted-D1 read, not object rows), the per-claim UPDATE and
-        // the sequential `trigger_build` hop — wall includes the
-        // serialized HTTP fan-out.
+        // the bounded-concurrent `trigger_build` hop — wall includes
+        // the fan-out's slowest HTTP leg.
         name: "alarm pass",
         statements: 120,
         rows_read: 1_000,

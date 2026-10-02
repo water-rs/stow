@@ -1,6 +1,7 @@
 //! Durable Object glue: routes scheduler HTTP/alarm events into the queue
 //! state machine and GitHub dispatch.
 
+use futures_util::stream::{self, StreamExt as _};
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
@@ -1028,7 +1029,7 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
 
 /// The claim-plus-fan-out half of a dispatch pass, shared with the
 /// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
-/// `wall_ms` covers the serialized `trigger_build` hop and the
+/// `wall_ms` covers the concurrent `trigger_build` fan-out and the
 /// counted-D1 coverage lookups a real wake pays. Returns the claimed
 /// task count.
 pub(super) async fn dispatch_pass(
@@ -1087,16 +1088,39 @@ pub(super) async fn dispatch_pass(
         }
     };
 
-    // One bound for the whole DO fetch invocation: dispatch is a
-    // sequential loop, so a slot is always free — the pool exists so a
-    // future parallel fan-out cannot exceed the invocation's budget.
+    // The fan-out runs concurrently, bounded twice at the invocation's
+    // outbound ceiling: the stream's `buffer_unordered` admits at most
+    // `MAX_OUTBOUND_INFLIGHT` (4) `workflow_dispatch` calls at once, and
+    // the pool slot `trigger_workflow` waits on enforces the same bound
+    // before any request posts.
     let pool = crate::fetch_guard::OutboundPool::new();
-    for task in tasks {
-        if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo, &pool).await {
-            queue::mark_dispatch_failed(db, settings, &task.task_id, &error.to_string())
+    let mut results = stream::iter(tasks.into_iter().enumerate())
+        .map(|(index, task)| {
+            // Each future owns its task and shares the credential,
+            // repo and pool by reference — copied per call so
+            // `async move` moves nothing out of the map closure.
+            let (credential, github_repo, pool) = (&credential, github_repo.as_str(), &pool);
+            async move {
+                let task_id = task.task_id.clone();
+                (
+                    index,
+                    task_id,
+                    dispatch::trigger_build(&task, credential, github_repo, pool).await,
+                )
+            }
+        })
+        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    // A failed dispatch still marks exactly its own task, in the claim
+    // order the sequential loop wrote.
+    results.sort_unstable_by_key(|(index, _, _)| *index);
+    for (_, task_id, result) in results {
+        if let Err(error) = result {
+            queue::mark_dispatch_failed(db, settings, &task_id, &error.to_string())
                 .await
                 .map_err(to_error)?;
-            tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
+            tracing::error!(task_id = %task_id, error = %error, "failed to dispatch build");
         }
     }
 
