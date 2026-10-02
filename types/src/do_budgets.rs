@@ -225,9 +225,9 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
-        // The actual 100k workerd gate measured 206 reads; tighten the
-        // development ceiling to the accepted baseline without adding
-        // wall-time or write headroom.
+        // The accepted development ceiling is 303 reads — the latest
+        // 100k workerd gate measured 157 under it, without wall-time
+        // or write headroom.
         name: "POST /index/published (full)",
         statements: 8,
         rows_read: 303,
@@ -241,10 +241,10 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // graph (stow#521). `rowsRead` counts workerd's internal index
         // seeks: the per-edge `dep_match` probes, the slice-row
         // re-evaluation per matched edge and the owner PK seeks.
-        // The actual 100k workerd gate measured 459 reads; keep the
-        // accepted development ceiling at 488.
+        // The accepted development ceiling is 488 reads — the latest
+        // 100k workerd gate measured 486 under it.
         name: "POST /index/published (delta)",
-        statements: 12,
+        statements: 8,
         rows_read: 488,
         rows_written: 200,
         wall_ms: 500,

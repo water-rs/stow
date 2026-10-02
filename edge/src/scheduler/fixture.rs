@@ -330,6 +330,7 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "attempt",
     "shape_requeue",
     "github_run_id",
+    "unpublished_deps",
     "deps_met",
     "wake_at",
     "dispatch_family",
@@ -409,7 +410,7 @@ fn queue_seed_insert_sql(
                 CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
                 0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
                 CASE WHEN n > {in_flight_end} THEN 'run-' || n ELSE NULL END, \
-                0, {wake}, {family}, {key} \
+                0, 0, {wake}, {family}, {key} \
          FROM seq \
          {conflict}",
         columns = QUEUE_SEED_COLUMNS.join(", "),
@@ -463,9 +464,9 @@ pub async fn seed_queue_chunk(
 /// the named rows are touched. The upsert (not `INSERT OR REPLACE`,
 /// whose implied DELETE would mis-fire the status counters' triggers)
 /// restores every seeded column; the two columns the seed leaves to
-/// defaults (`error_msg`, `blocked`) reset explicitly. `deps_met` and
-/// `blocked` land as defaults here and the caller recomputes them once
-/// the edges and slices the flags read are restored too.
+/// defaults (`error_msg`, `blocked`) reset explicitly. The gate counter
+/// fields land at their seed values here and the caller recomputes them
+/// once the edges and slices the flags read are restored too.
 pub async fn restore_queue_rows(
     db: &DurableDb,
     shape: FixtureShape,
@@ -655,6 +656,57 @@ pub async fn seed_deps_met_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(),
     .execute()
     .await
     .map_err(|error| format!("seed deps_met/blocked: {error}"))?;
+    Ok(())
+}
+
+/// Restore persisted gate answers for the exact rows a probe touched:
+/// edge flags first, then each owner's counter and status flags. The owner
+/// set is the explicit control/claimed rows plus their direct dependents;
+/// it never ranges over the stored queue or edge bulk.
+async fn refresh_rearm_gate_state(db: &DurableDb, touched: &[u32]) -> Result<(), QueueError> {
+    if touched.is_empty() {
+        return Ok(());
+    }
+    let touched_json = serde_json::to_string(touched)
+        .map_err(|error| QueueError::Sql(format!("encode re-arm ids: {error}")))?;
+    let owners = "WITH touched(task_id) AS ( \
+                      SELECT printf('%064x', value) FROM json_each(?) \
+                  ), owners(task_id) AS ( \
+                      SELECT task_id FROM touched \
+                      UNION \
+                      SELECT d.task_id \
+                      FROM queue_dependencies d \
+                      JOIN touched t ON t.task_id = d.depends_on_task_id \
+                  )";
+    db.query(&format!(
+        "{owners} UPDATE queue_dependencies \
+         SET dep_met = CASE WHEN {unpublished} THEN 0 ELSE 1 END \
+         WHERE task_id IN (SELECT task_id FROM owners) \
+           AND dep_met != (CASE WHEN {unpublished} THEN 0 ELSE 1 END)",
+        unpublished = crate::scheduler::queue::dep_edge_unpublished_sql("queue_dependencies"),
+    ))
+    .bind(touched_json.clone())
+    .execute()
+    .await
+    .map_err(|error| format!("re-arm edge dep_met: {error}"))?;
+    db.query(&format!(
+        "{owners} UPDATE queue \
+         SET unpublished_deps = {unpublished}, \
+             deps_met = {deps_met}, \
+             blocked = CASE WHEN queue.status = 'pending' THEN {blocked} \
+                            ELSE queue.blocked END \
+         WHERE queue.task_id IN (SELECT task_id FROM owners) \
+           AND (queue.unpublished_deps != {unpublished} \
+                OR queue.deps_met != {deps_met} \
+                OR (queue.status = 'pending' AND queue.blocked != {blocked}))",
+        unpublished = crate::scheduler::queue::unpublished_deps_sql("queue.task_id"),
+        deps_met = crate::scheduler::queue::deps_met_sql("queue.task_id"),
+        blocked = crate::scheduler::queue::blocked_sql("queue.task_id"),
+    ))
+    .bind(touched_json)
+    .execute()
+    .await
+    .map_err(|error| format!("re-arm gate counters: {error}"))?;
     Ok(())
 }
 
@@ -884,22 +936,7 @@ pub async fn rearm(
     for i in 0..super::drives::DELTA_ROWS {
         touched.push(first + (live - 1 - i) * 9);
     }
-    let touched_json = serde_json::to_string(&touched)
-        .map_err(|error| QueueError::Sql(format!("encode re-arm ids: {error}")))?;
-    db.query(&format!(
-        "UPDATE queue SET deps_met = {deps_met}, blocked = {blocked} \
-         WHERE status = 'pending' AND ( \
-             task_id IN (SELECT printf('%064x', value) FROM json_each(?)) OR \
-             task_id IN (SELECT task_id FROM queue_dependencies \
-                         WHERE depends_on_task_id IN (SELECT printf('%064x', value) FROM json_each(?))))",
-        deps_met = crate::scheduler::queue::deps_met_sql("queue.task_id"),
-        blocked = crate::scheduler::queue::blocked_sql("queue.task_id"),
-    ))
-    .bind(touched_json.clone())
-    .bind(touched_json)
-    .execute()
-    .await
-    .map_err(|error| QueueError::Sql(format!("re-arm gate flags: {error}")))?;
+    refresh_rearm_gate_state(db, &touched).await?;
     Ok(())
 }
 
