@@ -1,3 +1,5 @@
+#[cfg(target_arch = "wasm32")]
+use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 use skyzen_cloudflare::{CfFetch, worker};
 
 use crate::cf_http;
@@ -58,24 +60,31 @@ pub async fn trigger_build(
         "dep_pins": task.dep_pins,
     });
     let response = send_workflow_dispatch(
-        stow_types::trusted_builder::WORKFLOW_FILE,
-        "build-crate",
-        "task",
-        &payload,
-        true,
+        &WorkflowDispatch {
+            workflow_file: stow_types::trusted_builder::WORKFLOW_FILE,
+            event_type: "build-crate",
+            input_name: "task",
+            input: &payload,
+            return_run_details: true,
+        },
         credential,
         repo,
         pool,
     )
     .await?;
-    let body = response
-        .into_inner()
-        .text()
+    let mut response = response.into_inner();
+    let body = response.text();
+    #[cfg(target_arch = "wasm32")]
+    let body = body.into_send();
+    let body = body
         .await
-        .map_err(DispatchError::Response)?;
+        .map_err(|error| DispatchError::Response(error.to_string()))?;
     decode_build_run_details(&body)
-        .inspect(|_| {
+        .inspect(|run| {
             tracing::info!(
+                run_id = run.workflow_run_id,
+                run_url = %run.run_url,
+                html_url = %run.html_url,
                 task_id = %task.task_id,
                 crate_name = %task.crate_name,
                 target = %task.target,
@@ -108,18 +117,20 @@ pub async fn trigger_resolve(
     let input = serde_json::to_value(dispatch)
         .map_err(|error| DispatchError::Network(error.to_string()))?;
     send_workflow_dispatch(
-        stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE,
-        "resolve-request",
-        "request",
-        &input,
-        false,
+        &WorkflowDispatch {
+            workflow_file: stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE,
+            event_type: "resolve-request",
+            input_name: "request",
+            input: &input,
+            return_run_details: false,
+        },
         credential,
         repo,
         pool,
     )
     .await
     .map(|_| ())
-    .inspect(|_| {
+    .inspect(|()| {
         tracing::info!(
             request_id = %dispatch.request_id,
             attempt = dispatch.attempt,
@@ -135,6 +146,15 @@ pub async fn trigger_resolve(
             "GH Actions resolve dispatch failed"
         );
     })
+}
+
+/// The workflow and payload sent through either dispatch transport.
+struct WorkflowDispatch<'a> {
+    workflow_file: &'a str,
+    event_type: &'a str,
+    input_name: &'a str,
+    input: &'a serde_json::Value,
+    return_run_details: bool,
 }
 
 /// The shared `workflow_dispatch` fan-out one dispatch hop costs.
@@ -154,34 +174,33 @@ pub async fn trigger_resolve(
 /// edge worker only ever runs in the Cloudflare runtime and `CfFetch` is the
 /// canonical primitive there.
 async fn send_workflow_dispatch(
-    workflow_file: &str,
-    event_type: &str,
-    input_name: &str,
-    input: &serde_json::Value,
-    return_run_details: bool,
+    dispatch: &WorkflowDispatch<'_>,
     credential: &DispatchCredential,
     repo: &str,
     pool: &OutboundPool,
 ) -> Result<GuardedResponse<worker::Response>, DispatchError> {
-    let (url, request) = match credential {
+    let request = match credential {
         DispatchCredential::LocalCi(local_ci_url) => {
             let url = format!("{}/dispatch", local_ci_url.trim_end_matches('/'));
             let payload = serde_json::json!({
-                "event_type": event_type,
-                "client_payload": input,
+                "event_type": dispatch.event_type,
+                "client_payload": dispatch.input,
             });
-            let request = build_local_dispatch_request(&url, &payload)?;
-            (url, request)
+            build_local_dispatch_request(&url, &payload)?
         }
         DispatchCredential::GitHub(token) => {
             let url = format!(
-                "https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/dispatches"
+                "https://api.github.com/repos/{repo}/actions/workflows/{}/dispatches",
+                dispatch.workflow_file,
             );
-            let input_json = serde_json::to_string(input)
+            let input_json = serde_json::to_string(dispatch.input)
                 .map_err(|error| DispatchError::Network(error.to_string()))?;
-            let payload = github_dispatch_payload(input_name, input_json, return_run_details);
-            let request = build_dispatch_request(&url, &token.token, &payload)?;
-            (url, request)
+            let payload = github_dispatch_payload(
+                dispatch.input_name,
+                &input_json,
+                dispatch.return_run_details,
+            );
+            build_dispatch_request(&url, &token.token, &payload)?
         }
     };
     let _slot = pool.slot().await;
@@ -197,7 +216,7 @@ async fn send_workflow_dispatch(
 
 fn github_dispatch_payload(
     input_name: &str,
-    input_json: String,
+    input_json: &str,
     return_run_details: bool,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
@@ -287,12 +306,12 @@ mod tests {
             ensure_success_status(204).expect("successful resolve dispatch status");
         }
         assert!(
-            github_dispatch_payload("request", "{}".to_owned(), false)
+            github_dispatch_payload("request", "{}", false)
                 .get("return_run_details")
                 .is_none()
         );
         assert!(
-            github_dispatch_payload("task", "{}".to_owned(), true)
+            github_dispatch_payload("task", "{}", true)
                 .get("return_run_details")
                 .is_some()
         );

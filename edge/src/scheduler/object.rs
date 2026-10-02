@@ -1116,49 +1116,7 @@ pub(super) async fn dispatch_pass(
     // order the sequential loop wrote.
     results.sort_unstable_by_key(|(index, _, _, _)| *index);
     for (_, task_id, generation_id, result) in results {
-        match result {
-            Ok(run) => match queue::bind_dispatch_run(
-                db,
-                &task_id,
-                &generation_id,
-                &run.workflow_run_id.to_string(),
-            )
-            .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        run_id = run.workflow_run_id,
-                        "dispatch run binding skipped — the claimed generation moved on"
-                    );
-                }
-                Err(error) => {
-                    queue::mark_dispatch_failed(
-                        db,
-                        settings,
-                        &task_id,
-                        &generation_id,
-                        &error.to_string(),
-                    )
-                    .await
-                    .map_err(to_error)?;
-                    tracing::error!(task_id = %task_id, %error, "failed to bind dispatch run");
-                }
-            },
-            Err(error) => {
-                queue::mark_dispatch_failed(
-                    db,
-                    settings,
-                    &task_id,
-                    &generation_id,
-                    &error.to_string(),
-                )
-                .await
-                .map_err(to_error)?;
-                tracing::error!(task_id = %task_id, error = %error, "failed to dispatch build");
-            }
-        }
+        persist_dispatch_outcome(db, settings, &task_id, &generation_id, result).await?;
     }
 
     // A completion may have been persisted while this pass was waiting for
@@ -1170,6 +1128,53 @@ pub(super) async fn dispatch_pass(
     evaluate_dispatch_freeze(env, db, &freeze).await?;
 
     Ok(task_ids)
+}
+
+async fn persist_dispatch_outcome(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    task_id: &str,
+    generation_id: &str,
+    outcome: std::result::Result<dispatch::DispatchedRun, dispatch::DispatchError>,
+) -> Result<()> {
+    match outcome {
+        Ok(run) => match queue::bind_dispatch_run(
+            db,
+            task_id,
+            generation_id,
+            &run.workflow_run_id.to_string(),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = run.workflow_run_id,
+                    "dispatch run binding skipped — the claimed generation moved on"
+                );
+            }
+            Err(error) => {
+                queue::mark_dispatch_failed(
+                    db,
+                    settings,
+                    task_id,
+                    generation_id,
+                    &error.to_string(),
+                )
+                .await
+                .map_err(to_error)?;
+                tracing::error!(task_id = %task_id, %error, "failed to bind dispatch run");
+            }
+        },
+        Err(error) => {
+            queue::mark_dispatch_failed(db, settings, task_id, generation_id, &error.to_string())
+                .await
+                .map_err(to_error)?;
+            tracing::error!(task_id = %task_id, error = %error, "failed to dispatch build");
+        }
+    }
+    Ok(())
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {

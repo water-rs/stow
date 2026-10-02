@@ -296,21 +296,6 @@ struct InsertRow<'a> {
     blocked: u8,
 }
 
-/// The failed-dependency requeue applied to one dep task id: the
-/// in-memory replay of the old per-edge `UPDATE … WHERE status =
-/// 'failed'` emits at most one entry per dep (a 'failed' row flips to
-/// 'pending' in the status map, so later parents in the chunk no-op
-/// exactly as the sequential statements did). The deltas and `revived`
-/// flag travel per row so the statement is a keyed UPDATE, not a
-/// count(*) fold.
-#[derive(serde::Serialize)]
-struct BatchedRequeue {
-    task_id: String,
-    attempt_delta: u32,
-    request_count_delta: u32,
-    revived: u8,
-}
-
 /// One dependency edge, fully resolved for the bulk insert: the dep's
 /// task id and the gate's invocation-mask / shape-count pair are
 /// computed in Rust so the statement only has to write them.
@@ -3016,6 +3001,8 @@ pub async fn mark_dispatch_failed(
         ))
         .bind(error.to_owned())
         .bind(format!("+{backoff_minutes} minutes"))
+        .bind(format!("+{backoff_minutes} minutes"))
+        .bind(format!("+{backoff_minutes} minutes"))
         .bind(task_id.to_owned())
         .bind(generation_id.to_owned())
         .execute()
@@ -3641,42 +3628,6 @@ pub async fn apply_mutation(
     selector: &QueueSelector,
 ) -> Result<u32, QueueError> {
     let (predicate, values) = selector_predicate(selector)?;
-    // Retry, Cancel and Purge move a dep into or out of `failed` (or out
-    // of the queue entirely) — the only outside-the-row events that move
-    // a pending dependent's `blocked` flag. The dep set is the selector
-    // applied to the statuses the arm can touch, captured before the
-    // mutation runs (the selector itself may carry a status that no
-    // longer matches after the UPDATE).
-    let dep_side = match mutation {
-        QueueMutation::Retry => Some("status = 'failed'"),
-        QueueMutation::Cancel => Some("status IN ('pending', 'dispatched')"),
-        QueueMutation::Promote => None,
-        QueueMutation::Purge => Some("status IN ('completed', 'failed')"),
-    };
-    let dep_ids = match dep_side {
-        Some(statuses) => {
-            let dep_sql = format!("SELECT task_id FROM queue WHERE {statuses} AND {predicate}");
-            let mut query = db.query(&dep_sql);
-            for value in values.iter().cloned() {
-                query = query.bind(value);
-            }
-            query
-                .fetch_scalars::<String>()
-                .await
-                .map_err(|error| format!("list dep ids before mutation: {error}"))?
-        }
-        None => Vec::new(),
-    };
-    if !dep_ids.is_empty() {
-        db.query(
-            "DELETE FROM pending_run_completions \
-             WHERE task_id IN (SELECT value FROM json_each(?))",
-        )
-        .bind(enqueue_json(&dep_ids)?)
-        .execute()
-        .await
-        .map_err(|error| format!("discard pending completions before mutation: {error}"))?;
-    }
     let sql = match mutation {
         QueueMutation::Retry => format!(
             // Rows re-enter `pending`: `deps_met` re-derives from the
@@ -3751,11 +3702,23 @@ pub async fn apply_mutation(
         .fetch_scalars::<String>()
         .await
         .map_err(|error| format!("apply queue mutation: {error}"))?;
-    if !dep_ids.is_empty() {
+    // The pinned DO backend completes each statement synchronously: no
+    // external await separates the mutation, cleanup and dependent refresh.
+    // RETURNING keeps both follow-up writes scoped to precisely changed rows.
+    if mutation != QueueMutation::Promote && !mutated.is_empty() {
+        let ids = enqueue_json(&mutated)?;
+        db.query(
+            "DELETE FROM pending_run_completions \
+             WHERE task_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(ids.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("discard pending completions after mutation: {error}"))?;
         refresh_dependents(
             db,
             "SELECT value AS task_id FROM json_each(?)",
-            &[DbValue::Text(enqueue_json(&dep_ids)?)],
+            &[DbValue::Text(ids)],
         )
         .await?;
     }
@@ -5027,11 +4990,11 @@ pub async fn migrate(
         )));
     }
     migrate_schema(db).await?;
-    migrate_generation_identity(db, settings).await?;
     migrate_queue_dependencies_columns(db).await?;
     migrate_published_slice_row_shape(db).await?;
     migrate_published_slice_columns(db).await?;
     migrate_dispatch_gate(db, settings).await?;
+    migrate_generation_identity(db, settings).await?;
     // Every `migrate_schema` path has applied `schema.sql`, so `settings`
     // exists here. Its `panic` row belonged to the in-Worker circuit
     // breaker the zone's WAF maintenance rules replaced; nothing reads it.
@@ -6959,7 +6922,7 @@ mod sqlite_tests {
     /// single readiness pass over the batch's edges: a row with no
     /// edges lands met, a dep published at both of the shapes its
     /// target requires releases its parent, a half-published dep only
-    /// waits, a failed dep the same submit revived waits unblocked,
+    /// waits, a dep retrying a transient failure waits unblocked,
     /// and an unresolved-side edge blocks. Multi-dep owners fold per
     /// edge: a met edge beside an unmet one still gates, and a blocker
     /// flag on an already-published dep never blocks on its own.
@@ -6967,20 +6930,12 @@ mod sqlite_tests {
     async fn a_submit_gates_each_new_task_on_its_published_deps() {
         let db = memory_db().await.expect("memory db");
 
-        // `dep-failed` is queued, failed and unpublished — but naming
-        // it revives the row to `pending` inside the same submit (the
-        // requeue lands with the edge sync, before the insert
-        // evaluates), so the parent waits unblocked: `blocked` for a
-        // failed dep is a flag set when the dep's status flips after
-        // the owner exists, which the refresh paths own.
+        // A transient failure leaves the unpublished dependency pending
+        // behind its retry backoff, so its parent waits unblocked.
         enqueue(&db, &[request("dep-failed", Vec::new())])
             .await
             .expect("enqueue dep");
-        db.query("UPDATE queue SET status = 'failed' WHERE task_id = ?")
-            .bind(task_id_on("dep-failed", TARGET))
-            .execute()
-            .await
-            .expect("fail dep");
+        fail_dependency_at_attempt(&db, "dep-failed", 1).await;
         enqueue(&db, &[request("dep-fpub", Vec::new())])
             .await
             .expect("enqueue published dep");
@@ -8323,6 +8278,26 @@ mod sqlite_tests {
         );
     }
 
+    async fn fail_dependency_at_attempt(db: &DurableDb, name: &str, attempt: u32) {
+        let id = task_id_on(name, TARGET);
+        mark_active(db, name, TARGET, "dispatched").await;
+        let generation = db
+            .query("UPDATE queue SET attempt = ? WHERE task_id = ? RETURNING generation_id")
+            .bind(i64::from(attempt))
+            .bind(id.clone())
+            .fetch_scalar::<String>()
+            .await
+            .expect("seed dependency failure attempt");
+        super::complete(
+            db,
+            &claim_settings(),
+            &report(&id, &generation, attempt, false),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete dependency failure");
+    }
+
     #[tokio::test]
     async fn net_zero_slice_flips_refresh_blocked_and_replays_preserve_counters() {
         let db = memory_db().await.expect("memory db");
@@ -8350,19 +8325,7 @@ mod sqlite_tests {
             .expect("claim failed dependency");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].crate_name, "failed-dep");
-        super::complete(
-            &db,
-            &settings(),
-            &report(
-                &claimed[0].task_id,
-                &claimed[0].generation_id,
-                claimed[0].attempt,
-                false,
-            ),
-            TEST_WINDOW_MINUTES,
-        )
-        .await
-        .expect("fail dependency");
+        fail_dependency_at_attempt(&db, "failed-dep", super::MAX_BUILD_ATTEMPTS).await;
         assert_eq!(gate_counters(&db, "parent").await, (1, 0));
         assert_eq!(row_column(&db, "failed-dep", "status").await, "failed");
         assert_eq!(
@@ -8562,32 +8525,25 @@ mod sqlite_tests {
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim dep");
-        super::complete(
-            &db,
-            &claim_settings(),
-            &report(
-                &claimed[0].task_id,
-                &claimed[0].generation_id,
-                claimed[0].attempt,
-                false,
-            ),
-            TEST_WINDOW_MINUTES,
-        )
-        .await
-        .expect("fail dep");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "dep");
+        fail_dependency_at_attempt(&db, "dep", super::MAX_BUILD_ATTEMPTS).await;
         assert_eq!(gate_counters(&db, "parent").await, (1, 0));
         assert_eq!(super::status(&db).await.expect("status").blocked, 1);
 
-        // The dependency's retry backoff lapses and its retry succeeds
-        // — but the dependent still waits for the slice that serves it.
-        db.query(
-            "UPDATE queue SET not_before = '1970-01-01 00:00:00', \
-             wake_at = '1970-01-01 00:00:00' WHERE task_id = ?",
+        // An operator starts a fresh retry cycle; even after success,
+        // the dependent still waits for the slice that serves it.
+        super::apply_mutation(
+            &db,
+            &claim_settings(),
+            super::QueueMutation::Retry,
+            &stow_types::api::QueueSelector {
+                task_ids: vec![claimed[0].task_id.clone()],
+                ..Default::default()
+            },
         )
-        .bind(claimed[0].task_id.clone())
-        .execute()
         .await
-        .expect("lapse the retry backoff");
+        .expect("retry terminal dependency");
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim dep retry");
@@ -8992,6 +8948,61 @@ mod sqlite_tests {
         github_run_id: Option<String>,
     }
 
+    async fn seed_failed_retry_cycle(db: &DurableDb, id: &str, cycle: &str) {
+        for attempt in 1..=4 {
+            mark_active(db, "flaky", TARGET, "dispatched").await;
+            db.query(
+                "UPDATE queue SET attempt = ?, generation_id = lower(hex(randomblob(16))) \
+                 WHERE task_id = ?",
+            )
+            .bind(i64::from(attempt))
+            .bind(id.to_owned())
+            .execute()
+            .await
+            .expect("seed retry-cycle attempt");
+            super::complete(
+                db,
+                &settings(),
+                &super::BuildCompleteReport {
+                    task_id: id.to_owned(),
+                    generation_id: db
+                        .query("SELECT generation_id FROM queue WHERE task_id = ?")
+                        .bind(id.to_owned())
+                        .fetch_scalar::<String>()
+                        .await
+                        .expect("retry-cycle generation"),
+                    attempt,
+                    success: false,
+                    error: Some(format!("cycle-{cycle}-{attempt}")),
+                    github_run_id: Some(format!("run-{cycle}-{attempt}")),
+                },
+                TEST_WINDOW_MINUTES,
+            )
+            .await
+            .expect("record retry-cycle failure");
+            if attempt == 1 {
+                let short_backoff = db
+                    .query(
+                        "SELECT CASE WHEN not_before <= datetime('now', '+3 minutes') \
+                         THEN 1 ELSE 0 END FROM queue WHERE task_id = ?",
+                    )
+                    .bind(id.to_owned())
+                    .fetch_scalar::<i64>()
+                    .await
+                    .expect("read second-cycle backoff");
+                assert_eq!(
+                    short_backoff, 1,
+                    "retry cycle backoff must restart at 2 minutes"
+                );
+            }
+            db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
+                .bind(id.to_owned())
+                .execute()
+                .await
+                .expect("open next retry-cycle attempt");
+        }
+    }
+
     #[tokio::test]
     async fn two_retry_cycles_keep_distinct_failure_evidence() {
         let db = memory_db().await.expect("memory db");
@@ -9000,43 +9011,7 @@ mod sqlite_tests {
             .expect("enqueue");
         let id = task_id_on("flaky", TARGET);
 
-        for attempt in 1..=4 {
-            mark_active(&db, "flaky", TARGET, "dispatched").await;
-            db.query(
-                "UPDATE queue SET attempt = ?, generation_id = lower(hex(randomblob(16))) \
-                 WHERE task_id = ?",
-            )
-            .bind(i64::from(attempt))
-            .bind(id.clone())
-            .execute()
-            .await
-            .expect("seed first-cycle attempt");
-            super::complete(
-                &db,
-                &settings(),
-                &super::BuildCompleteReport {
-                    task_id: id.clone(),
-                    generation_id: db
-                        .query("SELECT generation_id FROM queue WHERE task_id = ?")
-                        .bind(id.clone())
-                        .fetch_scalar::<String>()
-                        .await
-                        .expect("first-cycle generation"),
-                    attempt,
-                    success: false,
-                    error: Some(format!("cycle-a-{attempt}")),
-                    github_run_id: Some(format!("run-a-{attempt}")),
-                },
-                TEST_WINDOW_MINUTES,
-            )
-            .await
-            .expect("record first-cycle failure");
-            db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
-                .bind(id.clone())
-                .execute()
-                .await
-                .expect("open next first-cycle attempt");
-        }
+        seed_failed_retry_cycle(&db, &id, "a").await;
 
         super::apply_mutation(
             &db,
@@ -9051,58 +9026,7 @@ mod sqlite_tests {
             "1",
             "operator retry resets the visible failure cycle to attempt 1"
         );
-        for attempt in 1..=4 {
-            mark_active(&db, "flaky", TARGET, "dispatched").await;
-            db.query(
-                "UPDATE queue SET attempt = ?, generation_id = lower(hex(randomblob(16))) \
-                 WHERE task_id = ?",
-            )
-            .bind(i64::from(attempt))
-            .bind(id.clone())
-            .execute()
-            .await
-            .expect("seed second-cycle attempt");
-            super::complete(
-                &db,
-                &settings(),
-                &super::BuildCompleteReport {
-                    task_id: id.clone(),
-                    generation_id: db
-                        .query("SELECT generation_id FROM queue WHERE task_id = ?")
-                        .bind(id.clone())
-                        .fetch_scalar::<String>()
-                        .await
-                        .expect("second-cycle generation"),
-                    attempt,
-                    success: false,
-                    error: Some(format!("cycle-b-{attempt}")),
-                    github_run_id: Some(format!("run-b-{attempt}")),
-                },
-                TEST_WINDOW_MINUTES,
-            )
-            .await
-            .expect("record second-cycle failure");
-            if attempt == 1 {
-                let short_backoff = db
-                    .query(
-                        "SELECT CASE WHEN not_before <= datetime('now', '+3 minutes') \
-                         THEN 1 ELSE 0 END FROM queue WHERE task_id = ?",
-                    )
-                    .bind(id.clone())
-                    .fetch_scalar::<i64>()
-                    .await
-                    .expect("read second-cycle backoff");
-                assert_eq!(
-                    short_backoff, 1,
-                    "retry cycle backoff must restart at 2 minutes"
-                );
-            }
-            db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
-                .bind(id.clone())
-                .execute()
-                .await
-                .expect("open next second-cycle attempt");
-        }
+        seed_failed_retry_cycle(&db, &id, "b").await;
 
         let evidence = db
             .query(
@@ -9446,7 +9370,7 @@ mod sqlite_tests {
 
         let rows = db
             .query(
-                "SELECT generation_id, attempt FROM attempt_outcomes_v2 \
+                "SELECT generation_id, attempt, github_run_id FROM attempt_outcomes_v2 \
                  WHERE task_id = ? ORDER BY finished_at",
             )
             .bind(id)
@@ -10228,39 +10152,24 @@ mod sqlite_tests {
     /// joins `queue.host_side`, so it must run after the host-side
     /// rebuild and must not depend on whether the ALTER columns it fills
     /// were just added (stow#367).
-    #[tokio::test]
-    async fn migrate_migrates_a_dev_era_queue_and_backfills_edge_masks() {
-        #[derive(skyzen::FromRow)]
-        struct EdgeRow {
-            side: i64,
-            invocations: i64,
-            shapes: i64,
-        }
-        #[derive(skyzen::FromRow)]
-        struct QueueRow {
-            task_id: String,
-            status: String,
-            host_side: i64,
-            shape_requeue: i64,
-            attempt: i64,
-            dispatch_attempts: i64,
-            generation_id: String,
-            github_run_id: Option<String>,
-            not_before: String,
-            wake_at: String,
-        }
-        let db = memory_db_raw().await.expect("raw memory db");
+    #[derive(skyzen::FromRow)]
+    struct MigratedClaimRow {
+        task_id: String,
+        status: String,
+        host_side: i64,
+        shape_requeue: i64,
+        attempt: i64,
+        dispatch_attempts: i64,
+        generation_id: String,
+        github_run_id: Option<String>,
+        not_before: String,
+        wake_at: String,
+    }
+
+    async fn seed_legacy_inflight_claims(db: &DurableDb, owner: &str, dep: &str) {
         for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
             db.query(statement).execute().await.expect("dev-era ddl");
         }
-        db.query("ALTER TABLE queue ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 2")
-            .execute()
-            .await
-            .expect("legacy dispatch attempt column");
-        db.query("ALTER TABLE queue ADD COLUMN attempt INTEGER NOT NULL DEFAULT 3")
-            .execute()
-            .await
-            .expect("legacy retry-cycle attempt column");
         db.query(
             "CREATE TABLE attempt_outcomes (
                 task_id TEXT NOT NULL,
@@ -10285,16 +10194,14 @@ mod sqlite_tests {
         .execute()
         .await
         .expect("legacy outcome row");
-        let owner = task_id_on("parent", TARGET);
-        let dep = task_id_on("dep", TARGET);
         db.query(
             "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version)
              VALUES (?, 'dep', '1.0.0', '[]', ?, '1.85.0'),
                     (?, 'parent', '1.0.0', '[]', ?, '1.85.0')",
         )
-        .bind(dep.clone())
+        .bind(dep.to_owned())
         .bind(TARGET)
-        .bind(owner.clone())
+        .bind(owner.to_owned())
         .bind(TARGET)
         .execute()
         .await
@@ -10304,59 +10211,36 @@ mod sqlite_tests {
              (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version)
              VALUES (?, ?, 'dep', '1.0.0', '[]', ?, '1.85.0')",
         )
-        .bind(owner.clone())
-        .bind(dep.clone())
+        .bind(owner.to_owned())
+        .bind(dep.to_owned())
         .bind(TARGET)
         .execute()
         .await
         .expect("dev-era edge row");
+        db.query("UPDATE queue SET dispatch_attempts = 2, attempt = 3")
+            .execute()
+            .await
+            .expect("seed legacy attempt counters");
         db.query("UPDATE queue SET status = 'dispatched' WHERE task_id = ?")
-            .bind(dep.clone())
+            .bind(dep.to_owned())
             .execute()
             .await
             .expect("seed unbound legacy dispatch");
         db.query("UPDATE queue SET status = 'running', github_run_id = ? WHERE task_id = ?")
             .bind("legacy-run")
-            .bind(owner.clone())
+            .bind(owner.to_owned())
             .execute()
             .await
             .expect("seed bound legacy dispatch");
+    }
 
-        let report = super::migrate(&db, &settings()).await.expect("migrate");
-        assert_eq!(
-            (report.before, report.after),
-            (0, super::SCHEMA_VERSION),
-            "a pre-versioned queue reports 0 → SCHEMA_VERSION"
-        );
-        let before_retry = db
-            .query(
-                "SELECT task_id, status, host_side, shape_requeue, attempt, dispatch_attempts, \
-                    generation_id, github_run_id, not_before, wake_at \
-                 FROM queue WHERE task_id = ?",
-            )
-            .bind(dep.clone())
-            .fetch_one::<QueueRow>()
-            .await
-            .expect("read requeued row before migration retry");
-        let stale = super::complete_run(
-            &db,
-            &settings(),
-            &report_with_run(&dep, false, "legacy-run"),
-            TEST_WINDOW_MINUTES,
-        )
-        .await
-        .expect_err("legacy unbound completion cannot settle requeued work");
-        assert!(matches!(stale, QueueError::StaleCompletion { .. }));
-
-        // A second pass must be a no-op, not a failure — deploy retries.
-        let retry = super::migrate(&db, &settings())
-            .await
-            .expect("migrate retry");
-        assert_eq!(
-            (retry.before, retry.after),
-            (super::SCHEMA_VERSION, super::SCHEMA_VERSION)
-        );
-
+    async fn assert_migrated_edge_masks(db: &DurableDb) {
+        #[derive(skyzen::FromRow)]
+        struct EdgeRow {
+            side: i64,
+            invocations: i64,
+            shapes: i64,
+        }
         let edge = db
             .query(
                 "SELECT dep_host_side AS side, dep_invocations AS invocations, dep_shapes AS shapes \
@@ -10376,14 +10260,21 @@ mod sqlite_tests {
         // out of the unbackfilled-0 marker class.
         assert_eq!(edge.invocations, 1);
         assert_eq!(edge.shapes, 2);
+    }
 
+    async fn assert_migrated_claims(
+        db: &DurableDb,
+        owner: &str,
+        dep: &str,
+        before_retry: MigratedClaimRow,
+    ) {
         let rows = db
             .query(
                 "SELECT task_id, status, host_side, shape_requeue, attempt, dispatch_attempts, \
                     generation_id, github_run_id, not_before, wake_at \
                  FROM queue",
             )
-            .fetch_all::<QueueRow>()
+            .fetch_all::<MigratedClaimRow>()
             .await
             .expect("queue rows");
         assert_eq!(rows.len(), 2, "the rebuild keeps every queue row");
@@ -10400,7 +10291,7 @@ mod sqlite_tests {
         assert_eq!(abandoned.dispatch_attempts, 2);
         assert_ne!(abandoned.not_before, "1970-01-01 00:00:00");
         assert_ne!(abandoned.wake_at, "1970-01-01 00:00:00");
-        assert!(!abandoned.generation_id.is_empty());
+        assert_ne!(abandoned.generation_id, "");
         assert_eq!(abandoned.github_run_id, None);
         assert_eq!(
             (
@@ -10426,17 +10317,11 @@ mod sqlite_tests {
             .find(|row| row.task_id == owner)
             .expect("bound row");
         assert_eq!(preserved.status, "running");
-        assert!(!preserved.generation_id.is_empty());
+        assert_ne!(preserved.generation_id, "");
         assert_eq!(preserved.github_run_id.as_deref(), Some("legacy-run"));
-        let stale_bound = super::complete_run(
-            &db,
-            &settings(),
-            &report_with_run(&owner, false, "older-run"),
-            TEST_WINDOW_MINUTES,
-        )
-        .await
-        .expect_err("an old run cannot settle a preserved bound claim");
-        assert!(matches!(stale_bound, QueueError::StaleCompletion { .. }));
+    }
+
+    async fn assert_migrated_outcome_history(db: &DurableDb) {
         assert_eq!(
             db.query(
                 "SELECT count(*) FROM attempt_outcomes \
@@ -10450,7 +10335,7 @@ mod sqlite_tests {
         );
 
         assert_eq!(
-            super::stored_schema_version(&db)
+            super::stored_schema_version(db)
                 .await
                 .expect("schema version"),
             super::SCHEMA_VERSION,
@@ -10475,6 +10360,63 @@ mod sqlite_tests {
                 .iter()
                 .any(|column| column.name == "generation_id")
         );
+    }
+
+    #[tokio::test]
+    async fn migrate_migrates_a_dev_era_queue_and_backfills_edge_masks() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        let owner = task_id_on("parent", TARGET);
+        let dep = task_id_on("dep", TARGET);
+        seed_legacy_inflight_claims(&db, &owner, &dep).await;
+
+        let report = super::migrate(&db, &settings()).await.expect("migrate");
+        assert_eq!(
+            (report.before, report.after),
+            (0, super::SCHEMA_VERSION),
+            "a pre-versioned queue reports 0 → SCHEMA_VERSION"
+        );
+        let before_retry = db
+            .query(
+                "SELECT task_id, status, host_side, shape_requeue, attempt, dispatch_attempts, \
+                    generation_id, github_run_id, not_before, wake_at \
+                 FROM queue WHERE task_id = ?",
+            )
+            .bind(dep.clone())
+            .fetch_one::<MigratedClaimRow>()
+            .await
+            .expect("read requeued row before migration retry");
+        let stale = super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&dep, false, "legacy-run"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("legacy unbound completion cannot settle requeued work");
+        assert!(matches!(stale, QueueError::StaleCompletion { .. }));
+
+        // A second pass must be a no-op, not a failure — deploy retries.
+        let retry = super::migrate(&db, &settings())
+            .await
+            .expect("migrate retry");
+        assert_eq!(
+            (retry.before, retry.after),
+            (super::SCHEMA_VERSION, super::SCHEMA_VERSION)
+        );
+
+        assert_migrated_edge_masks(&db).await;
+
+        assert_migrated_claims(&db, &owner, &dep, before_retry).await;
+        let stale_bound = super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&owner, false, "older-run"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("an old run cannot settle a preserved bound claim");
+        assert!(matches!(stale_bound, QueueError::StaleCompletion { .. }));
+        assert_migrated_outcome_history(&db).await;
     }
 
     /// A queue carrying the retired `rust_stable_channel` cache table
