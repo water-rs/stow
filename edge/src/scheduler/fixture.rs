@@ -43,7 +43,7 @@ use crate::errors::QueueError;
 
 /// The host-gate shape — 10k rows — small enough that `cargo test`
 /// stays fast. Only the host pre-check uses it; the workerd harness
-/// seeds `PRODUCTION` and the 20k shape `STOW_BUDGET_SIZES` carries.
+/// seeds `PRODUCTION` and the 1M shape `STOW_BUDGET_SIZES` carries.
 #[cfg(test)]
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
 

@@ -14,7 +14,7 @@
 #                                 non-zero on any over-budget route.
 #
 # The gate measures scale, not just a budget at one size: the same pass
-# runs at two fixture sizes (20k and 100k queue rows, same shape) and a
+# runs at two fixture sizes (100k and 1M queue rows, same shape) and a
 # drive fails when its rowsRead or rowsWritten at the larger size
 # exceeds its smaller-size value by more than 10% plus 50 rows. The
 # absolute budgets remain the second check. Quantities a route may
@@ -37,7 +37,7 @@
 #   STOW_BUDGET_WORK_DIR       work dir instead of a fresh mktemp
 #   STOW_E2E_TOOLCHAIN         rustup toolchain for the run (default: stable)
 #   STOW_BUDGET_SIZES          fixture sizes for the scale check
-#                            (default: "20000 100000")
+#                            (default: "100000 1000000")
 #   STOW_BUDGET_QUEUE_ROWS     run a single size instead (legacy dev
 #                            path; disables the scale check)
 #   STOW_E2E_READY_DEADLINE    seconds to wait for the edge (default: 600)
@@ -62,7 +62,7 @@ if [ -z "$EDGE_BEARER" ]; then
 fi
 READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
 QUEUE_ROWS="${STOW_BUDGET_QUEUE_ROWS:-}"
-SIZES="${STOW_BUDGET_SIZES:-20000 100000}"
+SIZES="${STOW_BUDGET_SIZES:-100000 1000000}"
 RESEED="${STOW_BUDGET_RESEED:-}"
 # The production dispatch cap (`STOW_MAX_CONCURRENT_JOBS` in
 # edge/Skyzen.toml): the probe runs the claim walk under the real cap
