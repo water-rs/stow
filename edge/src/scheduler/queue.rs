@@ -418,22 +418,52 @@ async fn apply_batched_inserts(
     settings: &SchedulerSettings,
     inserts: &[BatchedInsert],
 ) -> Result<u64, QueueError> {
+    // `deps_met` and `blocked` both answer "does an unpublished edge
+    // exist" — evaluated as separate EXISTS per new row they paid the
+    // membership subquery twice per edge (the trusted submit's QUEUE
+    // INSERT read ~10× the batch's edges). `edge_flags` evaluates the
+    // edge predicates once per edge of this batch's owners — the
+    // `MATERIALIZED` hint keeps the result a stored column so the
+    // aggregates below cannot re-inline the membership subquery — and
+    // `readiness` folds it per owner. `blocked` edges are a subset of
+    // `unmet` edges, so `unmet = 0` proves `blocked = 0`.
+    let unpub = dep_edge_unpublished_sql("d");
     let mut inserted = 0u64;
     for chunk in inserts.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        let payload = enqueue_json(chunk)?;
         let inserted_rows = db
             .query(&format!(
-                "INSERT INTO queue \
+                "WITH edge_flags AS MATERIALIZED ( \
+                    SELECT d.task_id AS owner, \
+                           CASE WHEN {unpub} THEN 1 ELSE 0 END AS unpub, \
+                           CASE WHEN bdep.status = 'failed' OR d.dep_crate_name = '' \
+                                     OR d.dep_host_side < 0 \
+                                THEN 1 ELSE 0 END AS blocker \
+                    FROM queue_dependencies d \
+                    LEFT JOIN queue bdep ON bdep.task_id = d.depends_on_task_id \
+                    WHERE d.task_id IN ( \
+                        SELECT je.value ->> 'task_id' FROM json_each(?) je \
+                    ) \
+                ), \
+                readiness AS ( \
+                    SELECT owner, sum(unpub) AS unmet, sum(unpub * blocker) AS blocked \
+                    FROM edge_flags GROUP BY owner \
+                ) \
+                INSERT INTO queue \
                  (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at, deps_met, blocked, wake_at, dispatch_family, dispatch_key) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
                         e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
-                        1, datetime('now'), {deps_met}, {blocked}, {wake}, {family}, {key} \
-                 FROM (SELECT value AS e FROM json_each(?)) \
+                        1, datetime('now'), \
+                        CASE WHEN COALESCE(r.unmet, 0) = 0 THEN 1 ELSE 0 END, \
+                        CASE WHEN COALESCE(r.blocked, 0) > 0 THEN 1 ELSE 0 END, \
+                        {wake}, {family}, {key} \
+                 FROM (SELECT value AS e FROM json_each(?)) e \
+                 LEFT JOIN readiness r ON r.owner = e ->> 'task_id' \
                  WHERE TRUE \
                  ON CONFLICT DO NOTHING \
                  RETURNING task_id",
-                deps_met = deps_met_sql("e ->> 'task_id'"),
-                blocked = blocked_sql("e ->> 'task_id'"),
+                unpub = unpub,
                 // `not_before` takes its epoch default, so the wake is
                 // the age gate alone for a miss row, epoch for human.
                 wake = wake_at_sql(
@@ -452,7 +482,11 @@ async fn apply_batched_inserts(
                     "e ->> 'task_id'",
                 ),
             ))
-            .bind(enqueue_json(chunk)?)
+            // The readiness CTE's `json_each` reads the same batch the
+            // outer SELECT does — two `?` positions, one payload bound
+            // twice (the backend counts positional `?` only).
+            .bind(payload.clone())
+            .bind(payload)
             .fetch_scalars::<String>()
             .await
             .map_err(|error| format!("insert tasks: {error}"))?;
@@ -5997,6 +6031,108 @@ mod sqlite_tests {
         .await
         .expect("mixed submit");
         assert_eq!(mixed, 1, "only the newcomer counts");
+    }
+
+    /// One submit derives every newcomer's `deps_met`/`blocked` from a
+    /// single readiness pass over the batch's edges: a row with no
+    /// edges lands met, a dep published at both of the shapes its
+    /// target requires releases its parent, a half-published dep only
+    /// waits, and a failed dep or an unresolved-side edge blocks.
+    #[tokio::test]
+    async fn a_submit_gates_each_new_task_on_its_published_deps() {
+        let db = memory_db().await.expect("memory db");
+
+        // One slice report serves `dep-met` at both shapes a native
+        // target dep requires — (Target, Native, Linked) and (…,
+        // Unlinked) — and `dep-short` at only the linked one. The
+        // report replaces a (target, rustc) slice's membership
+        // wholesale, so two `publish` calls would drop one crate.
+        let pub_rows = [
+            shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
+            shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Unlinked),
+        ]
+        .iter()
+        .map(|s| stow_types::api::PublishedSliceRow {
+            crate_name: "dep-met".parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            unit_shape: Some(*s),
+        })
+        .chain(std::iter::once(stow_types::api::PublishedSliceRow {
+            crate_name: "dep-short".parse().expect("valid crate name"),
+            version: VERSION.parse().expect("valid semver"),
+            features_json: FeaturesJson::default(),
+            unit_shape: Some(shape(
+                UnitSide::Target,
+                UnitInvocation::Native,
+                UnitKind::Linked,
+            )),
+        }))
+        .collect::<Vec<_>>();
+        super::record_published_slice(&db, TARGET, RUSTC, None, None, &pub_rows, &[])
+            .await
+            .expect("record shared published slice");
+        // `dep-failed` is queued, failed and unpublished — but naming
+        // it revives the row to `pending` inside the same submit (the
+        // requeue lands with the edge sync, before the insert
+        // evaluates), so the parent waits unblocked: `blocked` for a
+        // failed dep is a flag set when the dep's status flips after
+        // the owner exists, which the refresh paths own.
+        enqueue(&db, &[request("dep-failed", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        db.query("UPDATE queue SET status = 'failed' WHERE task_id = ?")
+            .bind(task_id_on("dep-failed", TARGET))
+            .execute()
+            .await
+            .expect("fail dep");
+        // The migration's spelling for an edge whose required side it
+        // could not derive — seeded directly so the owner below is
+        // born carrying it (its empty `depends_on` means the resync
+        // never deletes the row).
+        db.query(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, \
+              dep_features_json, dep_target, dep_rustc_version, \
+              dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
+             VALUES (?, 'unresolved', '', '', '', '', '', -1, 0, 0, 0)",
+        )
+        .bind(task_id_on("mystery", TARGET))
+        .execute()
+        .await
+        .expect("seed unknown-side edge");
+
+        let inserted = enqueue(
+            &db,
+            &[
+                request("free", Vec::new()),
+                request("met", vec![dependency("dep-met")]),
+                request("short", vec![dependency("dep-short")]),
+                request("stalled", vec![dependency("dep-failed")]),
+                request("mystery", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue gate cases");
+        assert_eq!(inserted, 5, "every newcomer landed");
+
+        for (name, deps_met, blocked) in [
+            ("free", 1, 0),
+            ("met", 1, 0),
+            ("short", 0, 0),
+            ("stalled", 0, 0),
+            ("mystery", 0, 1),
+        ] {
+            for (column, expected) in [("deps_met", deps_met), ("blocked", blocked)] {
+                let stored = db
+                    .query(&format!("SELECT {column} FROM queue WHERE task_id = ?"))
+                    .bind(task_id_on(name, TARGET))
+                    .fetch_scalar::<i64>()
+                    .await
+                    .expect("stored gate flag");
+                assert_eq!(stored, expected, "{name}: {column}");
+            }
+        }
     }
 
     #[tokio::test]
