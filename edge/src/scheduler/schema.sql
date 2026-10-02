@@ -81,11 +81,18 @@ CREATE TABLE IF NOT EXISTS queue (
     -- enqueue — target never changes. Lets the wake-time probes prefix
     -- equality-filter by family instead of scanning.
     dispatch_family TEXT NOT NULL DEFAULT '',
+    -- The number the claim order descends on (stow#442 I6): precedence
+    -- bands over `priority` — two for the human lane, one for the
+    -- Windows family — so lane, family and priority compare inside one
+    -- integer. Refreshed with `dispatch_key` wherever a lane or
+    -- priority operand changes (re-request, promote, revive); the
+    -- family never changes after insert.
+    value INTEGER NOT NULL DEFAULT 0,
     -- The claim ORDER BY tuple encoded as one sortable string:
-    -- lane rank | family rank (Windows first) | first_requested_at |
-    -- inverted priority | created_at | task_id. The claim walk orders by
-    -- it under an index and pages by keyset, so a dispatch pass reads
-    -- rows proportional to the slots it fills, not the queue size.
+    -- inverted `value` | first_requested_at | created_at | task_id.
+    -- The claim walk orders by it under an index and pages by keyset,
+    -- so a dispatch pass reads rows proportional to the slots it
+    -- fills, not the queue size.
     dispatch_key TEXT NOT NULL DEFAULT '',
     UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
 );
@@ -94,6 +101,12 @@ CREATE TABLE IF NOT EXISTS queue (
 -- claim and recover filter on them.
 CREATE INDEX IF NOT EXISTS idx_queue_status_lane
 ON queue (status, lane);
+
+-- Request status positions count a human lane prefix by dispatch key.
+-- Keep lane before the range key so the bounded human-depth walk does not
+-- scan pending miss rows; all selected columns are covered by the index.
+CREATE INDEX IF NOT EXISTS idx_queue_human_position
+ON queue (status, lane, dispatch_key);
 
 -- Dependency edges between queue tasks. The dep_* columns hold the
 -- dependency's semantic identity verbatim so DEPENDENCY_NOT_BLOCKED_SQL

@@ -168,16 +168,32 @@ impl Default for SchedulerSettings {
     }
 }
 
-/// Priority breaks ties between tasks first requested in the same second —
-/// dispatch order is FIFO by `first_requested_at`, so `request_count` is
-/// deliberately absent: hammering one pending task must never let it
-/// overtake older work.
+/// Priority is the third precedence operand of `queue.value` — dispatch
+/// orders on value before the FIFO tie-breakers, and `request_count` is
+/// deliberately absent from it: hammering one pending task must never
+/// inflate its value to overtake older work.
 fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> {
     let downloads_bucket = downloads / 1000;
     let downloads_bucket = i64::try_from(downloads_bucket)
         .map_err(|_| format!("downloads bucket exceeds i64: {downloads_bucket}"))?;
     Ok(downloads_bucket + i64::from(miss_count) * 10)
 }
+
+/// The largest priority [`compute_priority`] can return, derived from
+/// its operand types — `u64::MAX / 1000 + 10 × u32::MAX` — not a
+/// guessed cap: a precedence band this wide can never alias a priority
+/// across a band boundary.
+const PRIORITY_MAX: i64 = (u64::MAX / 1000 + 10 * u32::MAX as u64).cast_signed();
+
+/// Width of one precedence band in `queue.value`. The persisted value
+/// is `bands × VALUE_BAND + priority`, with the human lane contributing
+/// two bands and the Windows family one — today's "human first, then
+/// Windows, then priority" claim order encoded additively in one
+/// descending number (stow#442 I6). The largest value a row can take is
+/// `3 × VALUE_BAND + PRIORITY_MAX = 4 × PRIORITY_MAX + 3 =
+/// 73,787,148,093,530,007`, below `i64::MAX`, so no operand can
+/// overflow the column.
+const VALUE_BAND: i64 = PRIORITY_MAX + 1;
 
 /// The queue-identity columns of one enqueue request.
 struct TaskIdentity {
@@ -323,8 +339,9 @@ fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
 /// per slice. Semantics of the old per-request `update_existing_task`,
 /// carried per JSON entry: downloads keep the max, `request_count`
 /// grows by the occurrence count, priority recomputes from downloads and
-/// `miss_count` (`first_requested_at` untouched — re-requesting never
-/// jumps the queue), resurrection bumps the retry-cycle `attempt`, and the
+/// `miss_count` (`first_requested_at` untouched — the FIFO operand stays
+/// put, though a higher recomputed priority can still move the row up in
+/// `value` order), resurrection bumps the retry-cycle `attempt`, and the
 /// lane only ever
 /// moves toward 'human'.
 async fn apply_batched_updates(
@@ -475,13 +492,13 @@ async fn apply_batched_inserts(
         let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, dispatch_key) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
                         e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
                         1, lower(hex(randomblob(16))), datetime('now'), \
                         e ->> 'unpublished_deps', e ->> 'deps_met', e ->> 'blocked', \
-                        {wake}, {family}, {key} \
+                        {wake}, {family}, {value}, {key} \
                  FROM (SELECT value AS e FROM json_each(?)) e \
                  WHERE TRUE \
                  ON CONFLICT DO NOTHING \
@@ -495,11 +512,18 @@ async fn apply_batched_inserts(
                     settings.dispatch_min_age_minutes,
                 ),
                 family = dispatch_family_sql("e ->> 'target'"),
-                key = dispatch_key_sql(
+                value = value_sql(
                     "e ->> 'lane'",
-                    "e ->> 'target'",
-                    "datetime('now')",
+                    &dispatch_family_sql("e ->> 'target'"),
                     "e ->> 'priority'",
+                ),
+                key = dispatch_key_sql(
+                    &value_sql(
+                        "e ->> 'lane'",
+                        &dispatch_family_sql("e ->> 'target'"),
+                        "e ->> 'priority'",
+                    ),
+                    "datetime('now')",
                     "datetime('now')",
                     "e ->> 'task_id'",
                 ),
@@ -1596,7 +1620,7 @@ pub async fn task_status(
     let row = db
         .query(&format!(
             "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, \
-             ({}) AS status, preserve_lockfile, first_requested_at, priority, created_at, \
+             ({}) AS status, preserve_lockfile, dispatch_key, \
              ({}) AS blocked_by \
              FROM queue WHERE task_id = ?",
             effective_status_sql(),
@@ -1628,7 +1652,7 @@ pub async fn tasks_status(
     for chunk in task_ids.chunks(crate::sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
             "SELECT task_id, crate_name, version, features_json, target, rustc_version, lane, \
-             ({}) AS status, preserve_lockfile, first_requested_at, priority, created_at, \
+             ({}) AS status, preserve_lockfile, dispatch_key, \
              ({}) AS blocked_by \
              FROM queue WHERE task_id IN ({})",
             effective_status_sql(),
@@ -1703,38 +1727,20 @@ async fn request_status(
 /// of pending human rows that sort ahead of it (matching the
 /// `claim_dispatchable_tasks` ordering) plus one.
 async fn human_lane_position(db: &DurableDb, row: &RequestStatusRow) -> Result<u32, QueueError> {
-    // The position must equal `claim_dispatchable_tasks` dispatch order:
-    // Windows-family rows sort first within the lane, then the FIFO
-    // tie-breakers. The subject row's own Windows rank is computed in
-    // Rust from the same target list the SQL `IN` clause binds.
-    let windows_targets = RunnerFamily::Windows.targets();
-    let windows_rank = i64::from(!windows_targets.contains(&row.target.as_str()));
-    let sql = format!(
-        "SELECT count(*) AS count FROM queue q \
+    // The position must equal `claim_dispatchable_tasks` dispatch order,
+    // so it compares the same persisted ordering tuple the claim walk
+    // orders on: `dispatch_key` (inverted `value` first, then the FIFO
+    // tie-breakers), one TEXT column instead of a duplicated comparison
+    // formula. TEXT is also the only lossless transport for this
+    // magnitude — `value` outgrows the JS-safe integer range the
+    // workerd cursor can decode (>2^53), so no `value` scalar may cross
+    // the row/bind boundary.
+    let sql = "SELECT count(*) AS count FROM queue q \
          WHERE q.lane = 'human' AND q.status = 'pending' \
-           AND (CASE WHEN q.target IN ({0}) THEN 0 ELSE 1 END < ? \
-                OR (CASE WHEN q.target IN ({0}) THEN 0 ELSE 1 END = ? \
-                    AND (q.first_requested_at < ? \
-                        OR (q.first_requested_at = ? AND (q.priority > ? \
-                            OR (q.priority = ? AND (q.created_at < ? \
-                                OR (q.created_at = ? AND q.task_id < ?))))))))",
-        crate::sql_batch::placeholders(windows_targets.len())
-    );
-    let mut query = db.query(&sql);
-    for _ in 0..2 {
-        for target in windows_targets {
-            query = query.bind((*target).to_owned());
-        }
-        query = query.bind(windows_rank);
-    }
-    let ahead = query
-        .bind(row.first_requested_at.clone())
-        .bind(row.first_requested_at.clone())
-        .bind(row.priority)
-        .bind(row.priority)
-        .bind(row.created_at.clone())
-        .bind(row.created_at.clone())
-        .bind(row.task_id.clone())
+           AND q.dispatch_key < ?";
+    let ahead = db
+        .query(sql)
+        .bind(row.dispatch_key.clone())
         .fetch_scalar::<u64>()
         .await
         .map_err(|error| format!("compute human lane position: {error}"))?;
@@ -2410,48 +2416,56 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
     }
 }
 
-/// The claim `ORDER BY` tuple encoded as one sortable string over row
-/// columns: human lane first, then Windows targets (the slowest legs of
-/// a wave start earliest), then FIFO by `first_requested_at` with
-/// priority, creation and id as the tie breakers — the same ordering the
-/// pre-index CASE expressions produced. Priority is inverted into a
-/// full-`i64`-width field (`i64::MAX - priority`), so the text sort is
-/// the numeric `DESC` at every magnitude — no clamp, no tie horizon.
-pub(super) fn dispatch_key_sql(
-    lane: &str,
-    target: &str,
-    first: &str,
-    priority: &str,
-    created: &str,
-    task_id: &str,
-) -> String {
-    let windows = RunnerFamily::Windows
-        .targets()
-        .iter()
-        .map(|triple| format!("'{triple}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
+/// `queue.value` as a SQL expression — the persisted number the claim
+/// order descends on: precedence bands over the baseline `priority`.
+/// `family` is the row's `dispatch_family` (an expression or column):
+/// the family never changes after insert, so reading the derived
+/// column is one operand with the lane and priority the row already
+/// carries. A statement assigning an operand column in the same UPDATE
+/// must pass the assigned expression, since SET terms read the
+/// pre-update row.
+pub(super) fn value_sql(lane: &str, family: &str, priority: &str) -> String {
+    format!(
+        "((CASE WHEN ({lane}) = 'human' THEN 2 ELSE 0 END) + \
+          (CASE WHEN ({family}) = 'windows' THEN 1 ELSE 0 END)) * {VALUE_BAND} \
+         + MAX(0, ({priority}))"
+    )
+}
+
+/// `value_sql` over the queue's own columns — the in-row form the
+/// backfill and the claim-order refresh share.
+pub(super) fn value_row_sql() -> String {
+    value_sql("lane", "dispatch_family", "priority")
+}
+
+/// The claim `ORDER BY` tuple encoded as one sortable string: the
+/// dispatch `value` descending (stow#442 I6 — lane and family bands
+/// plus priority all compare inside the one number), then FIFO by
+/// `first_requested_at` with creation and id as the tie breakers.
+/// Value is inverted into a full-`i64`-width field
+/// (`i64::MAX - value`), so the text sort is the numeric `DESC` at
+/// every magnitude — no clamp, no tie horizon. The operand is an
+/// expression (usually [`value_sql`]), not the `value` column: a SET
+/// that also writes `value` must see the fresh answer.
+pub(super) fn dispatch_key_sql(value: &str, first: &str, created: &str, task_id: &str) -> String {
     // Every operand is parenthesized: `->>` and `||` share one
     // precedence level and associate left, so a bare `x || e ->> 'col'`
     // would evaluate `(x || e) ->> 'col'` — a JSON operator on the
     // concatenated string — instead of `x || (e ->> 'col')`.
     format!(
-        "(CASE WHEN {lane} = 'human' THEN '0' ELSE '1' END) || '|' || \
-         (CASE WHEN {target} IN ({windows}) THEN '0' ELSE '1' END) || '|' || \
-         ({first}) || '|' || \
-         printf('%019d', 9223372036854775807 - MAX(0, ({priority}))) || '|' || \
-         ({created}) || '|' || ({task_id})"
+        "printf('%019d', 9223372036854775807 - MAX(0, ({value}))) || '|' || \
+         ({first}) || '|' || ({created}) || '|' || ({task_id})"
     )
 }
 
 /// `dispatch_key_sql` over the queue's own columns — the in-row form the
-/// backfill, the re-request update and the promote refresh share.
+/// backfill, the re-request update and the promote refresh share. The
+/// value operand is [`value_row_sql`]'s recomputation, so a key refresh
+/// never reads a stale `value` column.
 pub(super) fn dispatch_key_row_sql() -> String {
     dispatch_key_sql(
-        "lane",
-        "target",
+        &value_row_sql(),
         "first_requested_at",
-        "priority",
         "created_at",
         "task_id",
     )
@@ -2542,16 +2556,19 @@ async fn refresh_dependents(
     Ok(())
 }
 
-/// Recompute `dispatch_key` for a task-id set after a mutation that may
-/// have moved a row's lane or priority (re-request humanization, revive
-/// priority bump). Rows already carrying the right key write nothing.
+/// Recompute `value` and `dispatch_key` for a task-id set after a
+/// mutation that may have moved a row's lane or priority (re-request
+/// humanization, revive priority bump) — the two claim-order columns
+/// always refresh together, since the key orders on the value. Rows
+/// already carrying the right pair write nothing.
 async fn refresh_dispatch_keys(db: &DurableDb, task_ids: &[String]) -> Result<(), QueueError> {
     for chunk in task_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(&format!(
-            "UPDATE queue SET dispatch_key = {expr} \
+            "UPDATE queue SET value = {value}, dispatch_key = {key} \
              WHERE task_id IN (SELECT value FROM json_each(?)) \
-               AND dispatch_key != {expr}",
-            expr = dispatch_key_row_sql()
+               AND (queue.value != {value} OR queue.dispatch_key != {key})",
+            value = value_row_sql(),
+            key = dispatch_key_row_sql()
         ))
         .bind(enqueue_json(chunk)?)
         .execute()
@@ -2895,10 +2912,9 @@ const CLAIM_MAX_PAGES: usize = 8;
 /// the slots it can fill, not to the queue size. `deps_met` is the
 /// dependency gate's persisted answer (refreshed where an edge or slice
 /// write can change it) and `dispatch_key` is the persisted claim-order
-/// tuple (human lane first, then Windows targets — the slowest legs of
-/// a wave start earliest — then FIFO by `first_requested_at` with the
-/// priority, creation and id tie breakers), so neither is evaluated per
-/// row.
+/// tuple (the `value` descending — human lane and Windows bands over
+/// priority — then FIFO by `first_requested_at` with creation and id
+/// tie breakers), so neither is evaluated per row.
 ///
 /// `full_family` names a runner family with zero free slots — its rows
 /// are excluded in SQL, the same predicate the wake probes build: a
@@ -2934,8 +2950,8 @@ async fn select_dispatchable_page(
          LIMIT ?"
     );
     let cutoff = dispatch_cutoff_modifier(settings.dispatch_min_age_minutes);
-    // The keyset cursor: every real key starts with a lane rank digit,
-    // so '' orders before all of them.
+    // The keyset cursor: every real key starts with an inverted-value
+    // digit, so '' orders before all of them.
     db.query(&sql)
         .bind(cutoff)
         .bind(after.to_owned())
@@ -3657,21 +3673,20 @@ pub async fn apply_mutation(
              WHERE status IN ('pending', 'dispatched') AND {predicate}"
         ),
         QueueMutation::Promote => format!(
-            // `dispatch_key` re-derives from the row — but a SET
-            // expression reads the pre-update row, so the key's lane
-            // operand is the value this statement assigns, 'human',
-            // not the `lane` column it is about to overwrite. The same
-            // goes for `wake_at`: the human lane pays no age gate, so
-            // the promote's wake is the row's `not_before` as-is.
+            // `value`/`dispatch_key` re-derive from the row — but a SET
+            // expression reads the pre-update row, so the lane operand
+            // is the value this statement assigns, 'human', not the
+            // `lane` column it is about to overwrite. The same goes for
+            // `wake_at`: the human lane pays no age gate, so the
+            // promote's wake is the row's `not_before` as-is.
             "UPDATE queue SET lane = 'human', updated_at = datetime('now'), \
                  wake_at = not_before, \
-                 dispatch_key = {} \
+                 value = {value}, dispatch_key = {key} \
              WHERE status = 'pending' AND lane = 'miss' AND {predicate}",
-            dispatch_key_sql(
-                "'human'",
-                "target",
+            value = value_sql("'human'", "dispatch_family", "priority"),
+            key = dispatch_key_sql(
+                &value_sql("'human'", "dispatch_family", "priority"),
                 "first_requested_at",
-                "priority",
                 "created_at",
                 "task_id",
             )
@@ -4833,7 +4848,7 @@ async fn apply_slice_gate_delta(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -4878,20 +4893,33 @@ async fn migrate_dispatch_gate(
         }
         migrate_schema(db).await?;
     }
-    // The claim-order tuple is derived from columns every row carries.
-    // `dep_met` replays each edge's slice EXISTS once — the seed for the
-    // per-owner counter — then `unpublished_deps` counts those flags,
-    // `deps_met` is the `= 0` derivation, and `blocked`/`wake_at` carry
-    // their stored expressions. Queue-wide passes are legal here and
-    // only here — this is operations code. The `!=` guards recompute
-    // any row whose persisted form drifted — a key written under an
-    // older format rebuilds under the current one.
+    // The claim-order columns are derived from columns every row
+    // carries — `value`'s lane/family/priority bands and the
+    // `dispatch_key` that orders on it — so one pass backfills both
+    // (`value` came in the version-10 step; a key written under an
+    // older format rebuilds under the current one through the `!=`
+    // guards). `dep_met` replays each edge's slice EXISTS once — the
+    // seed for the per-owner counter — then `unpublished_deps` counts
+    // those flags, `deps_met` is the `= 0` derivation, and
+    // `blocked`/`wake_at` carry their stored expressions. Queue-wide
+    // passes are legal here and only here — this is operations code.
+    // `value`'s family operand comes from `target`, not the
+    // `dispatch_family` column — a SET term reads the pre-update row,
+    // so reading the column here would bake the stale family into the
+    // value this statement assigns.
     db.query(&format!(
         "UPDATE queue \
-         SET dispatch_family = {family}, dispatch_key = {key} \
-         WHERE dispatch_family != {family} OR dispatch_key != {key}",
+         SET dispatch_family = {family}, value = {value}, dispatch_key = {key} \
+         WHERE dispatch_family != {family} OR queue.value != {value} \
+            OR dispatch_key != {key}",
         family = dispatch_family_sql("target"),
-        key = dispatch_key_row_sql(),
+        value = value_sql("lane", &dispatch_family_sql("target"), "priority"),
+        key = dispatch_key_sql(
+            &value_sql("lane", &dispatch_family_sql("target"), "priority"),
+            "first_requested_at",
+            "created_at",
+            "task_id",
+        ),
     ))
     .execute()
     .await
@@ -5171,6 +5199,10 @@ async fn migrate_queue_columns(
         (
             "dispatch_family",
             "ALTER TABLE queue ADD COLUMN dispatch_family TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "value",
+            "ALTER TABLE queue ADD COLUMN value INTEGER NOT NULL DEFAULT 0",
         ),
         (
             "dispatch_key",
@@ -5872,9 +5904,7 @@ struct RequestStatusRow {
     lane: String,
     status: String,
     preserve_lockfile: i64,
-    first_requested_at: String,
-    priority: i64,
-    created_at: String,
+    dispatch_key: String,
     blocked_by: Option<String>,
 }
 
@@ -6664,8 +6694,11 @@ mod sqlite_tests {
         assert_eq!(claimed[0].crate_name, "old");
     }
 
+    /// stow#442 I6: `value` orders before FIFO, and the baseline value
+    /// carries the download/miss priority — a popular newer row now
+    /// outranks a less popular older one at equal lane and family.
     #[tokio::test]
-    async fn newer_high_downloads_task_still_loses_to_older_first_seen() {
+    async fn higher_priority_value_claims_before_older_first_seen() {
         let db = memory_db().await.expect("memory db");
         enqueue(&db, &[request("old", Vec::new())])
             .await
@@ -6675,13 +6708,189 @@ mod sqlite_tests {
             .expect("enqueue popular");
         set_first_requested_at(&db, "old", PAST_TS).await;
 
-        // Downloads still feed the tie-break priority, but first-seen order
-        // dominates: the older, less popular task claims the single slot.
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "popular");
+    }
+
+    /// FIFO is the tie-breaker at equal value: two same-lane,
+    /// same-priority rows dispatch oldest-first (stow#442 I6).
+    #[tokio::test]
+    async fn equal_value_claims_in_first_seen_order() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("young", Vec::new())])
+            .await
+            .expect("enqueue young");
+        enqueue(&db, &[request("old", Vec::new())])
+            .await
+            .expect("enqueue old");
+        set_first_requested_at(&db, "old", PAST_TS).await;
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 2);
         assert_eq!(claimed[0].crate_name, "old");
+        assert_eq!(claimed[1].crate_name, "young");
+    }
+
+    /// The bands cover every lane/family combination: human rows always
+    /// outrank miss rows, and inside a lane a Windows row outranks a
+    /// non-Windows row — the same precedence today's CASE-encoded key
+    /// produced, arrived at regardless of request order or priority
+    /// (stow#442 I6).
+    #[tokio::test]
+    async fn value_bands_preserve_lane_then_family_precedence() {
+        let db = memory_db().await.expect("memory db");
+        // Worst case for the bands: the miss/Windows row is the oldest
+        // and carries the largest admissible downloads; band order must
+        // still dominate.
+        let mut miss_win = request_on("miss-win", WINDOWS_TARGET, Vec::new());
+        miss_win.downloads = i64::MAX as u64;
+        enqueue(&db, &[miss_win]).await.expect("enqueue miss-win");
+        enqueue(&db, &[request("miss-lin", Vec::new())])
+            .await
+            .expect("enqueue miss-lin");
+        enqueue(
+            &db,
+            &[
+                EnqueueRequest {
+                    source: EnqueueSource::HumanRequest,
+                    ..request_on("human-lin", TARGET, Vec::new())
+                },
+                EnqueueRequest {
+                    source: EnqueueSource::HumanRequest,
+                    ..request_on("human-win", WINDOWS_TARGET, Vec::new())
+                },
+            ],
+        )
+        .await
+        .expect("enqueue human");
+        set_first_requested_at_on(
+            &db,
+            "miss-win",
+            WINDOWS_TARGET,
+            PAST_TS,
+            settings().dispatch_min_age_minutes,
+        )
+        .await;
+
+        let settings = SchedulerSettings {
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+            .await
+            .expect("claim");
+        let order = claimed
+            .iter()
+            .map(|task| task.crate_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["human-win", "human-lin", "miss-win", "miss-lin"]);
+    }
+
+    /// The band arithmetic never overflows: a human Windows row at
+    /// `PRIORITY_MAX` takes the largest possible value,
+    /// `3 * VALUE_BAND + PRIORITY_MAX` — still inside `i64` — and
+    /// still dispatches first (stow#442 I6).
+    #[tokio::test]
+    async fn value_extremes_stay_within_i64_and_order() {
+        #[derive(skyzen::FromRow)]
+        struct ValueRow {
+            value: i64,
+            key: String,
+        }
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                EnqueueRequest {
+                    source: EnqueueSource::HumanRequest,
+                    ..request_on("max", WINDOWS_TARGET, Vec::new())
+                },
+                request("min", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        db.query("UPDATE queue SET priority = ? WHERE task_id = ?")
+            .bind(super::PRIORITY_MAX)
+            .bind(task_id_on("max", WINDOWS_TARGET))
+            .execute()
+            .await
+            .expect("set priority bound");
+        super::refresh_dispatch_keys(&db, &[task_id_on("max", WINDOWS_TARGET)])
+            .await
+            .expect("refresh claim order");
+        let row = db
+            .query("SELECT value, dispatch_key AS key FROM queue WHERE task_id = ?")
+            .bind(task_id_on("max", WINDOWS_TARGET))
+            .fetch_one::<ValueRow>()
+            .await
+            .expect("value row");
+        assert_eq!(
+            row.value,
+            3 * super::VALUE_BAND + super::PRIORITY_MAX,
+            "human + windows + PRIORITY_MAX is the largest legal value"
+        );
+        // The persisted key's inverted field stays non-negative, so the
+        // text sort is still the numeric descent.
+        assert!(row.key.starts_with('9'));
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed[0].crate_name, "max");
+    }
+
+    /// A row migrated from a pre-`value` queue (the column still at its
+    /// ALTER default, the key in any older form) backfills to exactly
+    /// the formula a fresh insert writes — migrated and fresh rows
+    /// agree (stow#442 I6).
+    #[tokio::test]
+    async fn migrate_backfills_value_to_match_fresh_rows() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        super::migrate(&db, &settings())
+            .await
+            .expect("first migrate");
+        enqueue(
+            &db,
+            &[
+                EnqueueRequest {
+                    source: EnqueueSource::HumanRequest,
+                    ..request("human", Vec::new())
+                },
+                request_on("win", WINDOWS_TARGET, Vec::new()),
+                request("lin", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        // Simulate the ALTER's untouched state: `value` at its 0
+        // default and the key in an obsolete form.
+        db.query("UPDATE queue SET value = 0, dispatch_key = '0|0|1970|x|1970|0'")
+            .execute()
+            .await
+            .expect("simulate migrated rows");
+
+        super::migrate(&db, &settings()).await.expect("migrate");
+
+        let drifted = db
+            .query(&format!(
+                "SELECT count(*) AS n FROM queue \
+                 WHERE value != ({}) OR dispatch_key != ({})",
+                super::value_row_sql(),
+                super::dispatch_key_row_sql()
+            ))
+            .fetch_scalar::<u64>()
+            .await
+            .expect("count drifted rows");
+        assert_eq!(drifted, 0, "every row carries the current formula");
     }
 
     /// With the macOS slot count spent mid-pass, the pass skips the
@@ -7635,6 +7844,50 @@ mod sqlite_tests {
         assert_eq!(claimed.len(), 2);
         assert_eq!(claimed[0].crate_name, "alpha");
         assert_eq!(claimed[1].crate_name, "zed");
+    }
+
+    /// Positions order exactly when `value` sits above the workerd
+    /// cursor's JS-safe integer range: two human rows whose values
+    /// differ by 1 — far past 2^53, where a JS-number decode would
+    /// collapse them to one float — still rank correctly through the
+    /// persisted TEXT `dispatch_key` (stow#442 I6).
+    #[tokio::test]
+    async fn human_lane_position_orders_values_above_js_safe_integer() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[human_request("below"), human_request("above")])
+            .await
+            .expect("enqueue");
+        for (name, priority) in [("below", 1_000_005_i64), ("above", 1_000_006_i64)] {
+            db.query("UPDATE queue SET priority = ? WHERE task_id = ?")
+                .bind(priority)
+                .bind(crate_task_id(name))
+                .execute()
+                .await
+                .expect("set priority");
+        }
+        super::refresh_dispatch_keys(&db, &[crate_task_id("below"), crate_task_id("above")])
+            .await
+            .expect("refresh claim order");
+        // Guard the premise: the human band puts both rows' stored
+        // values above 2^53, the range the JS cursor cannot represent.
+        let stored = db
+            .query("SELECT value FROM queue WHERE task_id = ?")
+            .bind(crate_task_id("below"))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("stored value");
+        assert!(stored > (1_i64 << 53));
+
+        let below = super::task_status(&db, &crate_task_id("below"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        let above = super::task_status(&db, &crate_task_id("above"))
+            .await
+            .expect("task status")
+            .expect("row exists");
+        assert_eq!(above.human_lane_position, Some(1));
+        assert_eq!(below.human_lane_position, Some(2));
     }
 
     #[tokio::test]
@@ -10625,6 +10878,32 @@ mod sqlite_tests {
         assert_eq!(sides, vec![-1, 0, 0, 1]);
     }
 
+    /// The human-lane position count must drive from the covering
+    /// `(status, lane, dispatch_key)` index — a plain status scan would
+    /// walk every pending miss row to reach a human lane's prefix.
+    async fn assert_human_position_plan(db: &DurableDb) {
+        #[derive(Debug, skyzen::FromRow)]
+        struct PlanRow {
+            detail: String,
+        }
+        let plan = db
+            .query(
+                "EXPLAIN QUERY PLAN \
+                 SELECT count(*) FROM queue \
+                 WHERE status = 'pending' AND lane = 'human' AND dispatch_key < ?",
+            )
+            .bind("9999999999999999999")
+            .fetch_all::<PlanRow>()
+            .await
+            .expect("human position query plan");
+        assert!(
+            plan.iter().any(|row| row
+                .detail
+                .contains("USING COVERING INDEX idx_queue_human_position")),
+            "human position must use the covering lane/key index: {plan:?}"
+        );
+    }
+
     /// The `host_side` rebuild renames `queue` aside, recreates it, copies
     /// the rows and drops the copy — and `SQLite` moves the old table's
     /// named indexes and triggers onto `queue_migrated` with the rename,
@@ -10699,6 +10978,8 @@ mod sqlite_tests {
             missing.is_empty(),
             "the rebuild dropped queue objects: {missing:?}"
         );
+
+        assert_human_position_plan(&db).await;
 
         // And the counters must track a write made after the migration —
         // the defect's other half is triggers that exist but never fire.

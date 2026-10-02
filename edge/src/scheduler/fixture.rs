@@ -335,6 +335,7 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "deps_met",
     "wake_at",
     "dispatch_family",
+    "value",
     "dispatch_key",
 ];
 
@@ -417,7 +418,7 @@ fn queue_seed_insert_sql(
                 0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
                 CASE WHEN n > {failed_end} THEN 'run-' || n ELSE NULL END, \
                 lower(hex(randomblob(16))), \
-                0, 0, {wake}, {family}, {key} \
+                0, 0, {wake}, {family}, {value}, {key} \
          FROM seq \
          {conflict}",
         columns = QUEUE_SEED_COLUMNS.join(", "),
@@ -428,11 +429,18 @@ fn queue_seed_insert_sql(
             min_age_minutes,
         ),
         family = crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
-        key = crate::scheduler::queue::dispatch_key_sql(
-            lane_case,
-            &format!("({target_case})"),
-            first_at,
+        value = crate::scheduler::queue::value_sql(
+            &format!("({lane_case})"),
+            &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
             "(n % 7)",
+        ),
+        key = crate::scheduler::queue::dispatch_key_sql(
+            &crate::scheduler::queue::value_sql(
+                &format!("({lane_case})"),
+                &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
+                "(n % 7)",
+            ),
+            first_at,
             first_at,
             task_id,
         ),

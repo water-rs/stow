@@ -137,9 +137,10 @@ person the lane exists for, while the miss path's PoW stays sized for
 scripted CLI redemption and is unchanged.
 
 Accepted work lands in the scheduler's `human` lane, which dispatches
-ahead of the `miss` lane: `claim_dispatchable_tasks` orders by lane
-first, then Windows-family targets, then `first_requested_at` within a
-lane, so no miss queueing
+ahead of the `miss` lane: `claim_dispatchable_tasks` orders by a
+persisted `value` — the human lane band, then the Windows-family band,
+then `priority` — with `first_requested_at`, `created_at` and `task_id`
+as stable FIFO tie-breakers at equal value, so no miss queueing
 ahead of time can starve a human request, and human rows are exempt
 from `STOW_DISPATCH_MIN_AGE_MINUTES` (the coalescing hold exists to
 batch identical misses; a human already said exactly what they want).
