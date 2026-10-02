@@ -9365,7 +9365,7 @@ mod sqlite_tests {
         let rows = db
             .query(
                 "SELECT generation_id, attempt, github_run_id FROM attempt_outcomes_v2 \
-                 WHERE task_id = ? ORDER BY finished_at",
+                 WHERE task_id = ? ORDER BY finished_at, rowid",
             )
             .bind(id)
             .fetch_all::<AttemptEvidenceRow>()
