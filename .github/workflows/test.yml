@@ -273,7 +273,7 @@ jobs:
           name: scheduler-budget-logs
           path: |
             ${{ runner.temp }}/stow-budget/logs
-            ${{ runner.temp }}/stow-budget/budget-report.json
+            ${{ runner.temp }}/stow-budget/budget-report*.json
           if-no-files-found: ignore
 
 

@@ -6037,7 +6037,8 @@ mod sqlite_tests {
     /// single readiness pass over the batch's edges: a row with no
     /// edges lands met, a dep published at both of the shapes its
     /// target requires releases its parent, a half-published dep only
-    /// waits, and a failed dep or an unresolved-side edge blocks.
+    /// waits, a failed dep the same submit revived waits unblocked,
+    /// and an unresolved-side edge blocks.
     #[tokio::test]
     async fn a_submit_gates_each_new_task_on_its_published_deps() {
         let db = memory_db().await.expect("memory db");
