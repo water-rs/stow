@@ -1990,13 +1990,15 @@ async fn request_record_status(
 /// shapeless dep stays gated until the node republishes — legacy rows
 /// are unreachable under this lookup, never migrated into it.
 fn dep_edge_unpublished_sql(dep: &str) -> String {
+    // The live-generation check is a scalar lookup on the slice's
+    // primary key: `published_slices` is keyed `(target,
+    // rustc_version)`, so the subquery returns at most one row; a
+    // missing slice marker yields NULL, which matches no generation —
+    // the same empty result the JOIN produced.
     format!(
         "({dep}.dep_shapes = 0 \
          OR (SELECT count(DISTINCT p.unit_invocation * 2 + p.unit_linked) \
              FROM published_slice_rows p \
-             JOIN published_slices s \
-               ON s.target = p.target AND s.rustc_version = p.rustc_version \
-              AND s.generation = p.generation \
              WHERE p.target = {dep}.dep_target \
                AND p.rustc_version = {dep}.dep_rustc_version \
                AND p.crate_name = {dep}.dep_crate_name \
@@ -2005,6 +2007,9 @@ fn dep_edge_unpublished_sql(dep: &str) -> String {
                AND p.unit_side = {dep}.dep_host_side \
                AND ({dep}.dep_host_side = 0 OR p.unit_linked = 1) \
                AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
+               AND p.generation = (SELECT s.generation FROM published_slices s \
+                                    WHERE s.target = {dep}.dep_target \
+                                      AND s.rustc_version = {dep}.dep_rustc_version) \
             ) < {dep}.dep_shapes)"
     )
 }
