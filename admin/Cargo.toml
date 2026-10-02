@@ -38,5 +38,9 @@ hmac = "0.13"
 sha2 = "0.11"
 hex.workspace = true
 
+[dev-dependencies]
+# `#[tokio::test]` + `start_paused` for the pacing loop's boundary tests.
+tokio = { version = "1", features = ["macros", "test-util"] }
+
 [lints]
 workspace = true

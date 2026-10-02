@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Args;
 use hmac::{Hmac, KeyInit, Mac};
@@ -670,6 +670,40 @@ fn ok_or_404(status: u16) -> bool {
     ok2xx(status) || status == 404
 }
 
+/// Fire `fire` every `interval` until `duration` elapses — the pacing
+/// loop every lane runs. Beats are anchored to each event's start (a
+/// response slower than the interval waits nothing), but the tail
+/// sleep wakes AT the deadline rather than running on to the next
+/// beat: under the launch model's slowest lanes the rate floor
+/// (0.005eps) makes the interval 200s, so a lane that fired at 0/200/400
+/// in a 450s segment used to sleep from 400s to 600s — every segment
+/// in queue run 36945779831 read 600s for that reason. An event still
+/// in flight at the deadline completes on its own [`REQUEST_TIMEOUT`]:
+/// it was scheduled inside the segment, so its latency counts, and
+/// cancelling it would report a fake transport error into the
+/// error-share gate. The clock is `tokio::time`'s so the boundary
+/// cases run under a paused clock.
+async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncFnMut(u64)) {
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut counter = 0u64;
+    loop {
+        let fired = tokio::time::Instant::now();
+        fire(counter).await;
+        counter += 1;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wake = (fired + interval).min(deadline);
+        if now < wake {
+            tokio::time::sleep_until(wake).await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+}
+
 /// Run one lane to the deadline, pacing at `eps`.
 #[expect(
     clippy::cast_precision_loss,
@@ -681,10 +715,8 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
     let mut client = zenwave::client();
     let mut stats = LaneStats::default();
     let interval = Duration::from_secs_f64(1.0 / lane.eps.max(1e-4));
-    let deadline = Instant::now() + duration;
-    let mut counter = 0u64;
-    loop {
-        let fired = Instant::now();
+    let fire = async |counter: u64| {
+        let fired = tokio::time::Instant::now();
         // A response the edge never sends cannot stall the run: the
         // deadline check happens between fires, so bound each one.
         let outcome = tokio::time::timeout(
@@ -724,19 +756,8 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
             .latencies_ms
             .push(fired.elapsed().as_secs_f64() * 1000.0);
         stats.requests += 1;
-        counter += 1;
-        let elapsed = fired.elapsed();
-        if Instant::now() >= deadline {
-            break;
-        }
-        let wait = interval.saturating_sub(elapsed);
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-    }
+    };
+    run_paced(interval, duration, fire).await;
     let mut sorted = std::mem::take(&mut stats.latencies_ms);
     sorted.sort_by(f64::total_cmp);
     let percentile = |p: f64| -> f64 {
@@ -1008,4 +1029,106 @@ fn render_report(report: &LoadReport) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Duration, run_paced};
+    use tokio::time::Instant;
+
+    /// Run `run_paced` under the paused clock and return every event's
+    /// virtual fire instant plus the virtual instant the run returned —
+    /// each event spends `work` in flight before its call completes.
+    /// `run_paced` awaits `fire` sequentially, so the closure holds the
+    /// recording vec by `&mut` alone.
+    async fn run_recording(
+        interval: Duration,
+        duration: Duration,
+        work: Duration,
+    ) -> (Vec<Duration>, Duration) {
+        let start = Instant::now();
+        let mut seen = Vec::new();
+        run_paced(interval, duration, async |_counter: u64| {
+            seen.push(Instant::now() - start);
+            tokio::time::sleep(work).await;
+        })
+        .await;
+        (seen, Instant::now() - start)
+    }
+
+    /// The defect this fixes: a 0.005eps lane (200s interval) in a 450s
+    /// segment fires at 0/200/400 and must end AT the 450s deadline —
+    /// the old pacing slept the tail to the 600s beat.
+    #[tokio::test(start_paused = true)]
+    async fn run_ends_at_deadline_not_next_beat() {
+        let (fires, elapsed) = run_recording(
+            Duration::from_secs(200),
+            Duration::from_secs(450),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            fires,
+            [0, 200, 400].map(Duration::from_secs),
+            "fires only land inside the segment",
+        );
+        assert_eq!(
+            elapsed,
+            Duration::from_secs(450),
+            "run ends at the deadline"
+        );
+    }
+
+    /// A run shorter than its lane's interval still ends at its
+    /// deadline, not at the first beat.
+    #[tokio::test(start_paused = true)]
+    async fn short_run_ends_at_deadline() {
+        let (fires, elapsed) = run_recording(
+            Duration::from_secs(200),
+            Duration::from_secs(45),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(fires, [Duration::ZERO]);
+        assert_eq!(elapsed, Duration::from_secs(45));
+    }
+
+    /// An event landing exactly on the deadline is not fired — the
+    /// segment is `[start, deadline)`. With a 10s interval and 30s run
+    /// the beats are 0/10/20 and the run still returns at 30s.
+    #[tokio::test(start_paused = true)]
+    async fn beat_on_deadline_is_not_fired() {
+        let (fires, elapsed) = run_recording(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(fires, [0, 10, 20].map(Duration::from_secs));
+        assert_eq!(elapsed, Duration::from_secs(30));
+    }
+
+    /// An event slower than the interval waits nothing before the next
+    /// fire — pacing anchors to the fire's start — and an in-flight
+    /// event at the deadline completes instead of being cut (cancelling
+    /// would report a fake transport error).
+    #[tokio::test(start_paused = true)]
+    async fn slow_events_wait_nothing_and_complete() {
+        let (fires, elapsed) = run_recording(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            Duration::from_millis(1500),
+        )
+        .await;
+        assert_eq!(
+            fires,
+            [0, 1500, 3000].map(Duration::from_millis),
+            "back-to-back fires when the event outlasts the interval",
+        );
+        assert_eq!(
+            elapsed,
+            Duration::from_millis(4500),
+            "the in-flight event completes past the deadline",
+        );
+    }
 }
