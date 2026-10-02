@@ -21,7 +21,7 @@ use stow_types::api::{
     QueueTaskStatus,
 };
 use stow_types::identity::FeaturesJson;
-use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+use stow_types::public_cache::{UnitInvocation, UnitShape};
 
 use super::fixture::FixtureShape;
 use super::queue::{self, QueueMutation, SchedulerSettings};
@@ -43,8 +43,9 @@ type DriveRun = for<'a> fn(
 /// Worker env and the catalog D1 handle wrapped in the counted backend,
 /// so the pass drive runs the real dispatch path — binding resolution,
 /// the paged claim with its per-page coverage lookup, and the
-/// sequential `trigger_build` fan-out — and the report can price the
-/// coverage lookup's D1 rows against what the pass claimed.
+/// `MAX_OUTBOUND_INFLIGHT`-bounded `trigger_build` fan-out — and the
+/// report can price the coverage lookup's D1 rows against what the
+/// pass claimed.
 pub struct DriveContext {
     /// The Worker env — set only on the wasm32 probe.
     #[cfg(target_arch = "wasm32")]
@@ -56,11 +57,13 @@ pub struct DriveContext {
     /// Σ D1 `meta` rows the counted backend observed — read back into
     /// the report row after each drive.
     pub d1_rows: std::sync::Arc<std::sync::Mutex<(u64, u64)>>,
-    /// Tasks the pass drives claimed. The launch gate's per-claim
-    /// marginal price divides the hot-minus-idle delta by this count —
-    /// never by a checked-in slots assumption — and refuses a report
-    /// that claims nothing while build traffic is nonzero.
-    pub claimed_tasks: std::sync::Arc<std::sync::Mutex<u64>>,
+    /// The claimed task ids, in claim order — the pass's own outcome.
+    /// The launch gate's per-claim marginal price divides the
+    /// hot-minus-idle delta by their count — never by a checked-in
+    /// slots assumption — and the re-arm's restore set is exactly
+    /// these rows rather than any predicate over row state that could
+    /// name a row another lane moved.
+    pub claimed_tasks: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl DriveContext {
@@ -75,7 +78,7 @@ impl DriveContext {
             #[cfg(target_arch = "wasm32")]
             d1: None,
             d1_rows: std::sync::Arc::new(std::sync::Mutex::new((0, 0))),
-            claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -89,7 +92,7 @@ impl DriveContext {
             env: Some(env.clone()),
             d1: Some(d1),
             d1_rows,
-            claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -98,14 +101,23 @@ impl DriveContext {
         *self.d1_rows.lock().expect("d1 counter")
     }
 
-    /// Tasks claimed by the pass drives so far.
+    /// Tasks claimed by the pass drives so far — the id record's own
+    /// count, so the two can never drift.
     pub fn claims(&self) -> u64 {
-        *self.claimed_tasks.lock().expect("claim counter")
+        u64::try_from(self.claimed_tasks.lock().expect("claim record").len()).unwrap_or(u64::MAX)
     }
 
-    /// Record `n` claimed tasks.
-    fn add_claims(&self, n: usize) {
-        *self.claimed_tasks.lock().expect("claim counter") += u64::try_from(n).unwrap_or(u64::MAX);
+    /// Append the ids a claiming pass just moved out of `pending`.
+    fn record_claimed(&self, task_ids: Vec<String>) {
+        self.claimed_tasks
+            .lock()
+            .expect("claim record")
+            .extend(task_ids);
+    }
+
+    /// Every task id the pass drives claimed so far, in claim order.
+    pub fn claimed_ids(&self) -> Vec<String> {
+        self.claimed_tasks.lock().expect("claim record").clone()
     }
 }
 
@@ -233,6 +245,9 @@ pub const DRIVES: &[Drive] = &[
         },
     },
     Drive {
+        // The crate selector seeks `queue`'s identity index on
+        // `crate_name`, so the read is the name's own version set —
+        // pinned at `fixture::CRATE_NAME_ROWS` rows across sizes.
         name: "GET /tasks?crate=…",
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
@@ -329,8 +344,15 @@ pub const DRIVES: &[Drive] = &[
                     },
                 )
                 .await
-                .map(|_| ())
                 .map_err(|error| error.to_string())
+                .and_then(|mutated| {
+                    // The selector names two failed rows — the reported
+                    // count is exactly the tasks updated, never billed
+                    // index or status-count writes.
+                    (mutated == 2)
+                        .then_some(())
+                        .ok_or_else(|| format!("retry mutated {mutated}, expected 2"))
+                })
             })
         },
     },
@@ -351,8 +373,12 @@ pub const DRIVES: &[Drive] = &[
                     },
                 )
                 .await
-                .map(|_| ())
                 .map_err(|error| error.to_string())
+                .and_then(|mutated| {
+                    (mutated == 2)
+                        .then_some(())
+                        .ok_or_else(|| format!("cancel mutated {mutated}, expected 2"))
+                })
             })
         },
     },
@@ -365,13 +391,21 @@ pub const DRIVES: &[Drive] = &[
                     settings,
                     QueueMutation::Promote,
                     &QueueSelector {
-                        task_ids: vec![hex_id(u64::from(FixtureShape::pending_row(703)))],
+                        // Row 4703 sits in the miss lane — the fixture's
+                        // human prefix ends at `HUMAN_LANE_ROWS`, and a
+                        // promote selects `lane = 'miss'`, so a smaller
+                        // pending id would silently match nothing.
+                        task_ids: vec![hex_id(u64::from(FixtureShape::pending_row(4703)))],
                         ..QueueSelector::default()
                     },
                 )
                 .await
-                .map(|_| ())
                 .map_err(|error| error.to_string())
+                .and_then(|mutated| {
+                    (mutated == 1)
+                        .then_some(())
+                        .ok_or_else(|| format!("promote mutated {mutated}, expected 1"))
+                })
             })
         },
     },
@@ -392,8 +426,12 @@ pub const DRIVES: &[Drive] = &[
                     },
                 )
                 .await
-                .map(|_| ())
                 .map_err(|error| error.to_string())
+                .and_then(|mutated| {
+                    (mutated == 2)
+                        .then_some(())
+                        .ok_or_else(|| format!("purge mutated {mutated}, expected 2"))
+                })
             })
         },
     },
@@ -524,10 +562,17 @@ pub const DRIVES: &[Drive] = &[
             let mut lifted = *settings;
             lifted.max_queue_pending = u32::MAX;
             Box::pin(async move {
+                // Every identity in the accept batch is new — the
+                // returned count is exactly the inserted records (the
+                // billed write count would include index writes).
                 queue::enqueue(db, &submit_accept_batch(shape), &lifted)
                     .await
-                    .map(|_| ())
                     .map_err(|error| error.to_string())
+                    .and_then(|inserted| {
+                        (inserted == 3)
+                            .then_some(())
+                            .ok_or_else(|| format!("accept submit inserted {inserted}, expected 3"))
+                    })
             })
         },
     },
@@ -535,10 +580,16 @@ pub const DRIVES: &[Drive] = &[
         name: "POST /admin/enqueue (trusted)",
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
+                // One resync + two new identities — the returned count
+                // is the new records only.
                 queue::enqueue_trusted(db, &submit_batch(shape), settings)
                     .await
-                    .map(|_| ())
                     .map_err(|error| error.to_string())
+                    .and_then(|inserted| {
+                        (inserted == 2).then_some(()).ok_or_else(|| {
+                            format!("trusted submit inserted {inserted}, expected 2")
+                        })
+                    })
             })
         },
     },
@@ -546,10 +597,16 @@ pub const DRIVES: &[Drive] = &[
         name: "POST /admin/enqueue (resubmit)",
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
+                // The same batch again lands nothing — the count must
+                // be zero, which billed index writes cannot fake.
                 queue::enqueue_trusted(db, &submit_batch(shape), settings)
                     .await
-                    .map(|_| ())
                     .map_err(|error| error.to_string())
+                    .and_then(|inserted| {
+                        (inserted == 0)
+                            .then_some(())
+                            .ok_or_else(|| format!("resubmit inserted {inserted}, expected 0"))
+                    })
             })
         },
     },
@@ -608,11 +665,11 @@ pub const DRIVES: &[Drive] = &[
         // One dispatch pass end to end — on wasm the real
         // `dispatch_pass` (`object.rs`): binding resolution, the claim
         // paged at `2 × open slots` rows with its per-page catalog
-        // coverage lookup, and the sequential `trigger_build` fan-out,
-        // the serialized HTTP hop the launch gate's peak-wall bound
-        // exists to measure. On host the claim runs the same queue
-        // code against the empty-catalog oracle — the host gate checks
-        // statements and counters only.
+        // coverage lookup, and the `MAX_OUTBOUND_INFLIGHT`-bounded
+        // `trigger_build` fan-out — the HTTP wall the launch gate's
+        // peak-wall bound exists to measure. On host the claim runs the
+        // same queue code against the empty-catalog oracle — the host
+        // gate checks statements and counters only.
         name: "alarm pass",
         run: |db, _shape, settings, ctx| {
             Box::pin(async move { dispatch_pass_drive(db, settings, ctx, false).await })
@@ -657,10 +714,10 @@ async fn dispatch_pass_drive(
             .as_ref()
             .ok_or_else(|| "dispatch pass drive needs the counted D1".to_owned())?;
         let coverage = super::object::CatalogCoverage { db: d1.clone() };
-        let claimed = super::object::dispatch_pass(env, db, &pass_settings, &coverage)
+        let task_ids = super::object::dispatch_pass(env, db, &pass_settings, &coverage)
             .await
             .map_err(|error| error.to_string())?;
-        ctx.add_claims(claimed);
+        ctx.record_claimed(task_ids);
         if !idle {
             // Under `LocalCi` `dispatch_pass` resolves no credential,
             // but a production claiming pass pays
@@ -683,7 +740,7 @@ async fn dispatch_pass_drive(
         let claimed = queue::claim_dispatchable_tasks(db, &pass_settings, &NoCoverage)
             .await
             .map_err(|error| error.to_string())?;
-        ctx.add_claims(claimed.len());
+        ctx.record_claimed(claimed.iter().map(|task| task.task_id.clone()).collect());
     }
     queue::next_alarm(db, 0, &pass_settings)
         .await
@@ -694,7 +751,7 @@ async fn dispatch_pass_drive(
 /// Slice rows a delta report moves — retired from the live set plus the
 /// same number added. The dependent refresh must stay proportional to
 /// this, not to the slice.
-const DELTA_ROWS: u32 = 30;
+pub const DELTA_ROWS: u32 = 30;
 
 /// A coverage oracle that answers "not covered" for every row — the
 /// catalog is empty under the fixture, which is the shape a cold cache
@@ -717,9 +774,15 @@ impl CoverageOracle for NoCoverage {
 use stow_types::fixture::task_hex_id as hex_id;
 
 /// The crate identity a queue row carries — the same formulas the seed
-/// SQL uses, kept in one place so a drive always names a real row.
+/// SQL uses, kept in one place so a drive always names a real row. The
+/// pair is injective in `n` at any fixture size; the name's version
+/// set is bounded at `CRATE_NAME_ROWS` (see fixture), so a
+/// `crate_name =` probe's cardinality cannot grow with the table.
 fn crate_identity(n: u32) -> (String, String) {
-    (format!("crate{}", n % 20000), format!("1.0.{}", n % 500))
+    (
+        format!("crate{}", n / super::fixture::CRATE_NAME_ROWS),
+        format!("1.{}.{}", n / 20000, n % 500),
+    )
 }
 
 /// A submit batch: a resync of fixture row 101's identity (its edge set
@@ -894,53 +957,76 @@ fn dep_request(n: u32) -> EnqueueDependency {
     }
 }
 
-/// The report's unit shape — every published row serves the target-side
-/// linked unit of a native invocation.
-const GATE_UNIT: Option<UnitShape> = Some(UnitShape {
-    side: UnitSide::Target,
-    invocation: UnitInvocation::Native,
-    kind: UnitKind::Linked,
-});
+/// A node's published membership — production's `required_unit_shapes`
+/// at the node's own side and the invocation `for_task` assigns its
+/// target on the family's host triple.
+fn node_shapes(host_side: bool, target: &str) -> Vec<UnitShape> {
+    let invocation = stow_types::api::runner_family(target)
+        .map_or(UnitInvocation::Native, |family| {
+            UnitInvocation::for_task(target, family.host_triple())
+        });
+    stow_types::public_cache::required_unit_shapes(host_side, invocation)
+}
 
 /// The full-report drive's slice: a held-size membership (100 rows) on
 /// a dedicated slice — `CI_TARGET_TRIPLES[8]` / `9.9.9` — that the seed
 /// never writes, so the same report shape applies at both fixture
-/// sizes.
+/// sizes. Fifty identities carry both rows of their
+/// `required_unit_shapes`, the membership a genuinely completed node
+/// publishes.
 fn full_slice_report() -> Vec<PublishedSliceRow> {
-    (0..100)
-        .map(|i| PublishedSliceRow {
-            crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
-            version: "1.0.0".parse().expect("full version"),
-            features_json: FeaturesJson::default(),
-            unit_shape: GATE_UNIT,
+    let target = stow_types::api::CI_TARGET_TRIPLES[8];
+    (0..50)
+        .flat_map(|i| {
+            node_shapes(false, target)
+                .into_iter()
+                .map(move |shape| PublishedSliceRow {
+                    crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
+                    version: "1.0.0".parse().expect("full version"),
+                    features_json: FeaturesJson::default(),
+                    unit_shape: Some(shape),
+                })
         })
         .collect()
 }
 
-/// The delta report for `(CI_TARGET_TRIPLES[0], '1.85.0')`: retire the
-/// slice's [`DELTA_ROWS`] tail members and add as many fresh rows — a
-/// `2 * DELTA_ROWS` change set. The fixture's live members are the
-/// completed rows whose `n % 9` lands on that target — `n % 9 == 0`
-/// implies `n % 3 == 0`, the `1.85.0` rustc arm.
+/// The delta report for `(CI_TARGET_TRIPLES[0], '1.85.0')`: retire one
+/// required shape row of each of the slice's [`DELTA_ROWS`] tail
+/// members and add as many fresh rows (`DELTA_ROWS / 2` identities ×
+/// their two shapes) — a `2 * DELTA_ROWS` change set. Every retired
+/// row is one the fixture actually stores for that node — its first
+/// `required_unit_shapes` entry — so each retire leaves a real node
+/// partially published, the missing-shape probe the dependent refresh
+/// measures; it is never a shape nobody published. The fixture's live
+/// members are the completed rows whose `n % 9` lands on that target —
+/// `n % 9 == 0` implies `n % 3 == 0`, the `1.85.0` rustc arm.
 fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<PublishedSliceRow>) {
     let live = shape.slice_live_rows(0);
     let first = shape.slice_first_row(0);
+    let target = stow_types::api::CI_TARGET_TRIPLES[0];
     let mut retired = Vec::new();
     let mut added = Vec::new();
     for i in 0..DELTA_ROWS {
-        let (crate_name, version) = crate_identity(first + (live - 1 - i) * 9);
+        let n = first + (live - 1 - i) * 9;
+        let (crate_name, version) = crate_identity(n);
         retired.push(PublishedSliceRow {
             crate_name: crate_name.parse().expect("retire crate"),
             version: version.parse().expect("retire version"),
             features_json: FeaturesJson::default(),
-            unit_shape: GATE_UNIT,
+            unit_shape: Some(node_shapes(n.is_multiple_of(10), target)[0]),
         });
-        added.push(PublishedSliceRow {
-            crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
-            version: "9.9.9".parse().expect("delta version"),
-            features_json: FeaturesJson::default(),
-            unit_shape: GATE_UNIT,
-        });
+    }
+    for i in 0..DELTA_ROWS / 2 {
+        added.extend(
+            node_shapes(false, target)
+                .into_iter()
+                .map(|shape| PublishedSliceRow {
+                    crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
+                    version: "9.9.9".parse().expect("delta version"),
+                    features_json: FeaturesJson::default(),
+                    unit_shape: Some(shape),
+                }),
+        );
     }
     (added, retired)
 }

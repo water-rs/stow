@@ -1,6 +1,7 @@
 //! Durable Object glue: routes scheduler HTTP/alarm events into the queue
 //! state machine and GitHub dispatch.
 
+use futures_util::stream::{self, StreamExt as _};
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
@@ -312,12 +313,14 @@ async fn submit(
         };
         to_error(error).set_status(status)
     })?;
-    // Dispatch is not this request's work: pointing the alarm at now lets
-    // `run_alarm`'s dispatch pass run it, so the submit answers once the
-    // queue write lands instead of holding the client — and burning the
-    // DO's per-request CPU budget — through claim plus a fan-out of
-    // GitHub calls.
-    arm_dispatch_alarm(alarm).await?;
+    // Dispatch is not this request's work: the alarm's dispatch pass
+    // runs it, so the submit answers once the queue write lands instead
+    // of holding the client — and burning the DO's per-request CPU
+    // budget — through claim plus a fan-out of GitHub calls. `next_alarm`
+    // decides whether a wake can make progress at all: a submit whose
+    // rows all sit behind unmet gates arms nothing, while a stale
+    // in-flight lease still arms at its expiry (stow#444).
+    schedule_alarm(env, db, alarm).await?;
     Ok(Json(InsertedResponse { inserted }))
 }
 
@@ -335,25 +338,6 @@ async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
         return Err(Error::msg(reason).set_status(StatusCode::SERVICE_UNAVAILABLE));
     }
     Ok(())
-}
-
-/// Point the DO alarm at now: `run_alarm` then performs the dispatch
-/// pass (`dispatch_pending` plus `schedule_alarm`) that a mutating
-/// handler used to run inline. `setAlarm` overrides any existing
-/// scheduled alarm rather than keeping the earliest
-/// (<https://developers.cloudflare.com/durable-objects/api/alarms/#setalarm>),
-/// which is correct here: `run_alarm` re-arms via `schedule_alarm`, so
-/// moving an earlier wake-up up to now only dispatches sooner.
-async fn arm_dispatch_alarm(alarm: &Alarm) -> Result<()> {
-    // `Date::now()` returns whole milliseconds well below 2^53; the value
-    // is exactly representable and always fits i64.
-    #[allow(clippy::cast_possible_truncation)]
-    let now_ms = js_sys::Date::now() as i64;
-    alarm.set_alarm(now_ms).await.map_err(|error| {
-        let error = to_error(error);
-        tracing::error!(%error, "failed to arm scheduler dispatch alarm");
-        error
-    })
 }
 
 /// `POST /tasks/complete-run` — the edge's webhook route forwards GitHub's
@@ -391,8 +375,10 @@ async fn complete_run(
     }
     // Same handoff as submit: the run's report is acknowledged as soon
     // as the queue row lands, and the alarm's dispatch pass — not this
-    // request — runs claim plus the GitHub fan-out.
-    arm_dispatch_alarm(&alarm).await?;
+    // request — runs claim plus the GitHub fan-out. The completion may
+    // leave nothing dispatchable (a failure with an empty queue, a
+    // finished backlog): `schedule_alarm` arms no wake then (stow#444).
+    schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -640,8 +626,9 @@ async fn apply_request_outcome(
             to_error(error).set_status(status)
         })?;
     // Same handoff as submit: the report answers once the rows land, and
-    // the alarm's dispatch pass — not this request — fans them out.
-    arm_dispatch_alarm(&alarm).await?;
+    // the alarm's dispatch pass — not this request — fans them out. An
+    // outcome whose batch is fully gated arms nothing (stow#444).
+    schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(status))
 }
 
@@ -1028,15 +1015,16 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
 
 /// The claim-plus-fan-out half of a dispatch pass, shared with the
 /// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
-/// `wall_ms` covers the serialized `trigger_build` hop and the
+/// `wall_ms` covers the concurrent `trigger_build` fan-out and the
 /// counted-D1 coverage lookups a real wake pays. Returns the claimed
-/// task count.
+/// task ids — the probe's claim record and the launch gate's claim
+/// count both derive from the pass's own set.
 pub(super) async fn dispatch_pass(
     env: &WasmEnv,
     db: &DurableDb,
     settings: &SchedulerSettings,
     coverage: &impl queue::CoverageOracle,
-) -> Result<usize> {
+) -> Result<Vec<String>> {
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
@@ -1050,9 +1038,9 @@ pub(super) async fn dispatch_pass(
         "scheduler dispatch_pending selected tasks"
     );
     if tasks.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    let claimed = tasks.len();
+    let task_ids: Vec<String> = tasks.iter().map(|task| task.task_id.clone()).collect();
 
     // The credential resolves once per pass, only when tasks exist: the
     // local-CI branch carries no Authorization; the GitHub branch reuses
@@ -1081,26 +1069,49 @@ pub(super) async fn dispatch_pass(
                         .map_err(to_error)?;
                         tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
                     }
-                    return Ok(claimed);
+                    return Ok(task_ids);
                 }
             }
         }
     };
 
-    // One bound for the whole DO fetch invocation: dispatch is a
-    // sequential loop, so a slot is always free — the pool exists so a
-    // future parallel fan-out cannot exceed the invocation's budget.
+    // The fan-out runs concurrently, bounded twice at the invocation's
+    // outbound ceiling: the stream's `buffer_unordered` admits at most
+    // `MAX_OUTBOUND_INFLIGHT` (4) `workflow_dispatch` calls at once, and
+    // the pool slot `trigger_workflow` waits on enforces the same bound
+    // before any request posts.
     let pool = crate::fetch_guard::OutboundPool::new();
-    for task in tasks {
-        if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo, &pool).await {
-            queue::mark_dispatch_failed(db, settings, &task.task_id, &error.to_string())
+    let mut results = stream::iter(tasks.into_iter().enumerate())
+        .map(|(index, task)| {
+            // Each future owns its task and shares the credential,
+            // repo and pool by reference — copied per call so
+            // `async move` moves nothing out of the map closure.
+            let (credential, github_repo, pool) = (&credential, github_repo.as_str(), &pool);
+            async move {
+                let task_id = task.task_id.clone();
+                (
+                    index,
+                    task_id,
+                    dispatch::trigger_build(&task, credential, github_repo, pool).await,
+                )
+            }
+        })
+        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    // A failed dispatch still marks exactly its own task, in the claim
+    // order the sequential loop wrote.
+    results.sort_unstable_by_key(|(index, _, _)| *index);
+    for (_, task_id, result) in results {
+        if let Err(error) = result {
+            queue::mark_dispatch_failed(db, settings, &task_id, &error.to_string())
                 .await
                 .map_err(to_error)?;
-            tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
+            tracing::error!(task_id = %task_id, error = %error, "failed to dispatch build");
         }
     }
 
-    Ok(claimed)
+    Ok(task_ids)
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {

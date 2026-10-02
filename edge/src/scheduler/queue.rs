@@ -269,6 +269,29 @@ struct BatchedInsert {
     lane: &'static str,
 }
 
+/// One stored edge's readiness as probed for an insert chunk: whether
+/// the dep's required publication is missing (`unpub`) and whether that
+/// edge also blocks (`blocker` — the dep failed, names no crate, or
+/// carries an unresolved legacy side).
+#[derive(Debug, skyzen::FromRow)]
+struct EdgeFlag {
+    owner: String,
+    unpub: i64,
+    blocker: i64,
+}
+
+/// The serialized form the `INSERT INTO queue` payload takes: the
+/// first-occurrence identity plus the readiness flags the per-edge
+/// probe and Rust fold already answered, so the statement never
+/// re-evaluates them.
+#[derive(serde::Serialize)]
+struct InsertRow<'a> {
+    #[serde(flatten)]
+    insert: &'a BatchedInsert,
+    deps_met: u8,
+    blocked: u8,
+}
+
 /// The failed-dependency requeue applied to one dep task id: the
 /// in-memory replay of the old per-edge `UPDATE … WHERE status =
 /// 'failed'` emits at most one entry per dep (a 'failed' row flips to
@@ -391,31 +414,97 @@ async fn apply_batched_updates(
     .await
 }
 
+/// Rows the last completed statement changed — SQLite's `changes()`
+/// counts the statement's own record writes only: index maintenance
+/// and trigger effects are excluded by definition, so unlike the
+/// backend's billed `rows_written` it names real row deltas (an
+/// `ON CONFLICT DO NOTHING` insert reports just the rows that
+/// landed). Read it as the statement immediately after the write —
+/// the synchronous backend runs them back to back, so nothing
+/// interleaves and the count belongs to the write.
+pub async fn changes(db: &DurableDb) -> Result<u64, QueueError> {
+    db.query("SELECT changes()")
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("read changes(): {error}")))
+}
+
 /// `INSERT INTO queue` for the batch's first occurrences, one statement
 /// per slice; `ON CONFLICT DO NOTHING` is a belt under the Rust-side
 /// existence fold — a task another submit landed between the probe and
-/// the write stays untouched, and `rows_written` still counts exactly
-/// the rows this batch inserted.
+/// the write stays untouched, and `RETURNING` hands back exactly the
+/// rows the batch inserted — the logical record count the billed
+/// `rows_written` cannot give (it includes the identity index's
+/// writes).
 async fn apply_batched_inserts(
     db: &DurableDb,
     settings: &SchedulerSettings,
     inserts: &[BatchedInsert],
 ) -> Result<u64, QueueError> {
+    // Each new owner's readiness is probed once per edge — the same
+    // unpublished/blocker predicates `deps_met`/`blocked` answered as
+    // two per-row EXISTS (the trusted submit's QUEUE INSERT paid the
+    // membership subquery twice per edge). The flag query returns one
+    // typed row per stored edge of this chunk's owners and Rust folds
+    // them into the flags the INSERT then reads straight off the
+    // payload, so nothing aggregates or re-evaluates them. An owner
+    // with no edge row yields no flag row: `blocked` edges are a subset
+    // of `unmet` edges, so zero unmet proves unblocked — the row is
+    // born (deps_met=1, blocked=0).
+    let unpub = dep_edge_unpublished_sql("d");
     let mut inserted = 0u64;
     for chunk in inserts.chunks(ENQUEUE_JSON_BATCH_ROWS) {
-        let result = db
+        let owners: Vec<&str> = chunk.iter().map(|insert| insert.task_id.as_str()).collect();
+        let flags = db
+            .query(&format!(
+                "SELECT d.task_id AS owner, \
+                        CASE WHEN {unpub} THEN 1 ELSE 0 END AS unpub, \
+                        CASE WHEN bdep.status = 'failed' OR d.dep_crate_name = '' \
+                                  OR d.dep_host_side < 0 \
+                             THEN 1 ELSE 0 END AS blocker \
+                 FROM queue_dependencies d \
+                 LEFT JOIN queue bdep ON bdep.task_id = d.depends_on_task_id \
+                 WHERE d.task_id IN (SELECT value FROM json_each(?))",
+            ))
+            .bind(enqueue_json(&owners)?)
+            .fetch_all::<EdgeFlag>()
+            .await
+            .map_err(|error| format!("probe insert edge readiness: {error}"))?;
+        let mut readiness: std::collections::HashMap<&str, (u64, u64)> =
+            std::collections::HashMap::new();
+        for flag in &flags {
+            let (unmet, blocked) = readiness.entry(flag.owner.as_str()).or_default();
+            *unmet += u64::try_from(flag.unpub).unwrap_or(0);
+            *blocked += u64::try_from(flag.unpub * flag.blocker).unwrap_or(0);
+        }
+        let rows: Vec<InsertRow<'_>> = chunk
+            .iter()
+            .map(|insert| {
+                let (unmet, blocked) = readiness
+                    .get(insert.task_id.as_str())
+                    .copied()
+                    .unwrap_or_default();
+                InsertRow {
+                    insert,
+                    deps_met: u8::from(unmet == 0),
+                    blocked: u8::from(blocked > 0),
+                }
+            })
+            .collect();
+        let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
                  (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at, deps_met, blocked, wake_at, dispatch_family, dispatch_key) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
                         e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
-                        1, datetime('now'), {deps_met}, {blocked}, {wake}, {family}, {key} \
-                 FROM (SELECT value AS e FROM json_each(?)) \
+                        1, datetime('now'), \
+                        e ->> 'deps_met', e ->> 'blocked', \
+                        {wake}, {family}, {key} \
+                 FROM (SELECT value AS e FROM json_each(?)) e \
                  WHERE TRUE \
-                 ON CONFLICT DO NOTHING",
-                deps_met = deps_met_sql("e ->> 'task_id'"),
-                blocked = blocked_sql("e ->> 'task_id'"),
+                 ON CONFLICT DO NOTHING \
+                 RETURNING task_id",
                 // `not_before` takes its epoch default, so the wake is
                 // the age gate alone for a miss row, epoch for human.
                 wake = wake_at_sql(
@@ -434,12 +523,12 @@ async fn apply_batched_inserts(
                     "e ->> 'task_id'",
                 ),
             ))
-            .bind(enqueue_json(chunk)?)
-            .execute()
+            .bind(enqueue_json(&rows)?)
+            .fetch_scalars::<String>()
             .await
             .map_err(|error| format!("insert tasks: {error}"))?;
         inserted = inserted
-            .checked_add(result.rows_written)
+            .checked_add(u64::try_from(inserted_rows.len()).unwrap_or(u64::MAX))
             .ok_or(QueueError::Overflow {
                 field: "inserted task count",
                 value: inserted,
@@ -1938,13 +2027,15 @@ async fn request_record_status(
 /// shapeless dep stays gated until the node republishes — legacy rows
 /// are unreachable under this lookup, never migrated into it.
 fn dep_edge_unpublished_sql(dep: &str) -> String {
+    // The live-generation check is a scalar lookup on the slice's
+    // primary key: `published_slices` is keyed `(target,
+    // rustc_version)`, so the subquery returns at most one row; a
+    // missing slice marker yields NULL, which matches no generation —
+    // the same empty result the JOIN produced.
     format!(
         "({dep}.dep_shapes = 0 \
          OR (SELECT count(DISTINCT p.unit_invocation * 2 + p.unit_linked) \
              FROM published_slice_rows p \
-             JOIN published_slices s \
-               ON s.target = p.target AND s.rustc_version = p.rustc_version \
-              AND s.generation = p.generation \
              WHERE p.target = {dep}.dep_target \
                AND p.rustc_version = {dep}.dep_rustc_version \
                AND p.crate_name = {dep}.dep_crate_name \
@@ -1953,6 +2044,9 @@ fn dep_edge_unpublished_sql(dep: &str) -> String {
                AND p.unit_side = {dep}.dep_host_side \
                AND ({dep}.dep_host_side = 0 OR p.unit_linked = 1) \
                AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
+               AND p.generation = (SELECT s.generation FROM published_slices s \
+                                    WHERE s.target = {dep}.dep_target \
+                                      AND s.rustc_version = {dep}.dep_rustc_version) \
             ) < {dep}.dep_shapes)"
     )
 }
@@ -3288,12 +3382,17 @@ pub async fn apply_mutation(
             format!("DELETE FROM queue WHERE status IN ('completed', 'failed') AND {predicate}")
         }
     };
-    let mut query = db.query(&sql);
+    // `RETURNING` hands back the rows the one statement mutated —
+    // the logical count the billed `rows_written` cannot give (index
+    // maintenance inflates it) — atomically inside the statement, so
+    // no extra round-trip exists to interpose.
+    let returning = format!("{sql} RETURNING task_id");
+    let mut query = db.query(&returning);
     for value in values {
         query = query.bind(value);
     }
-    let result = query
-        .execute()
+    let mutated = query
+        .fetch_scalars::<String>()
         .await
         .map_err(|error| format!("apply queue mutation: {error}"))?;
     if !dep_ids.is_empty() {
@@ -3304,7 +3403,10 @@ pub async fn apply_mutation(
         )
         .await?;
     }
-    u64_to_u32(result.rows_written, "mutated row count")
+    u64_to_u32(
+        u64::try_from(mutated.len()).unwrap_or(u64::MAX),
+        "mutated row count",
+    )
 }
 
 /// Operator view of the whole queue for `GET /admin/status`: lane depths,
@@ -3660,7 +3762,7 @@ async fn earliest_active_lease_expiry_ms(
 /// host-side task runs every phase both natively and under `--target`
 /// (its deps are host units under either spelling); a target-side task
 /// runs the one spelling its target implies.
-fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
+pub fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
     if owner_host_side {
         return 0b11;
     }
@@ -3679,7 +3781,7 @@ fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
 /// build does. A target-side dep edge needs both kinds at the dep
 /// node's own invocation spelling — the only one a target task
 /// produces.
-fn dep_edge_requirements(
+pub fn dep_edge_requirements(
     owner_target: &str,
     owner_host_side: bool,
     dep_target: &str,
@@ -5541,6 +5643,41 @@ mod sqlite_tests {
         assert_eq!(plan, AlarmPlan::At(ROW_TS_MS + stale_ms()));
     }
 
+    /// stow#444: a submit whose every row sits behind an unmet edge —
+    /// here a single task gated on a dep nobody has built — must leave
+    /// `schedule_alarm` with nothing to arm: `next_alarm` answers
+    /// `Delete`, so the request pays no wake for work it cannot run.
+    #[tokio::test]
+    async fn fully_gated_submit_arms_no_alarm() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("parent", vec![dependency("dep-missing")])])
+            .await
+            .expect("enqueue gated submit");
+
+        let plan = next_alarm(&db, ROW_TS_MS, &settings())
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::Delete);
+    }
+
+    /// stow#444: a submit that does leave dispatchable work arms the
+    /// pass immediately — `next_alarm` answers `At(now)` for a row
+    /// already past its wake instant, exactly the wake `setAlarm(now)`
+    /// used to issue unconditionally.
+    #[tokio::test]
+    async fn dispatchable_submit_arms_at_now() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("ready", Vec::new())])
+            .await
+            .expect("enqueue ready");
+        set_first_requested_at(&db, "ready", PAST_TS).await;
+
+        let plan = next_alarm(&db, ROW_TS_MS, &settings())
+            .await
+            .expect("next_alarm");
+        assert_eq!(plan, AlarmPlan::At(ROW_TS_MS));
+    }
+
     /// A paused scheduler keeps accepting submits but never plans a wake
     /// for them: with nothing in flight the alarm is deleted, so the
     /// queue waits out the pause instead of spinning on eligibility.
@@ -5906,6 +6043,195 @@ mod sqlite_tests {
 
         assert_eq!(inserted, 1);
         assert_eq!(super::status(&db).await.expect("status").pending, 1);
+    }
+
+    /// `inserted` counts the records the submit landed — never the
+    /// backend's billed write rows, which include index maintenance:
+    /// a resync reports 0 and a mixed batch reports only its
+    /// newcomers.
+    #[tokio::test]
+    async fn a_submit_reports_only_the_records_it_inserted() {
+        let db = memory_db().await.expect("memory db");
+
+        let inserted = enqueue(
+            &db,
+            &[request("alpha", Vec::new()), request("beta", Vec::new())],
+        )
+        .await
+        .expect("enqueue pair");
+        assert_eq!(inserted, 2);
+
+        let resync = enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("resync");
+        assert_eq!(resync, 0, "a resync lands no new row");
+
+        let mixed = enqueue(
+            &db,
+            &[request("beta", Vec::new()), request("gamma", Vec::new())],
+        )
+        .await
+        .expect("mixed submit");
+        assert_eq!(mixed, 1, "only the newcomer counts");
+    }
+
+    /// The gate regression's slice membership: `dep-met` and
+    /// `dep-fpub` at both shapes a native target dep requires —
+    /// (Target, Native, Linked) and (…, Unlinked) — and `dep-short`
+    /// at only the linked one.
+    fn gate_pub_rows() -> Vec<stow_types::api::PublishedSliceRow> {
+        let full = || {
+            [
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Unlinked),
+            ]
+        };
+        ["dep-met", "dep-fpub"]
+            .iter()
+            .flat_map(|name| full().iter().map(|s| (name, *s)).collect::<Vec<_>>())
+            .map(|(name, s)| stow_types::api::PublishedSliceRow {
+                crate_name: name.parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+                unit_shape: Some(s),
+            })
+            .chain(std::iter::once(stow_types::api::PublishedSliceRow {
+                crate_name: "dep-short".parse().expect("valid crate name"),
+                version: VERSION.parse().expect("valid semver"),
+                features_json: FeaturesJson::default(),
+                unit_shape: Some(shape(
+                    UnitSide::Target,
+                    UnitInvocation::Native,
+                    UnitKind::Linked,
+                )),
+            }))
+            .collect()
+    }
+
+    /// One submit derives every newcomer's `deps_met`/`blocked` from a
+    /// single readiness pass over the batch's edges: a row with no
+    /// edges lands met, a dep published at both of the shapes its
+    /// target requires releases its parent, a half-published dep only
+    /// waits, a failed dep the same submit revived waits unblocked,
+    /// and an unresolved-side edge blocks. Multi-dep owners fold per
+    /// edge: a met edge beside an unmet one still gates, and a blocker
+    /// flag on an already-published dep never blocks on its own.
+    #[tokio::test]
+    async fn a_submit_gates_each_new_task_on_its_published_deps() {
+        let db = memory_db().await.expect("memory db");
+
+        // One slice report serves `dep-met` at both shapes a native
+        // target dep requires — (Target, Native, Linked) and (…,
+        // Unlinked) — and `dep-short` at only the linked one. The
+        // report replaces a (target, rustc) slice's membership
+        // wholesale, so two `publish` calls would drop one crate.
+        super::record_published_slice(&db, TARGET, RUSTC, None, None, &gate_pub_rows(), &[])
+            .await
+            .expect("record shared published slice");
+        // `dep-failed` is queued, failed and unpublished — but naming
+        // it revives the row to `pending` inside the same submit (the
+        // requeue lands with the edge sync, before the insert
+        // evaluates), so the parent waits unblocked: `blocked` for a
+        // failed dep is a flag set when the dep's status flips after
+        // the owner exists, which the refresh paths own.
+        enqueue(&db, &[request("dep-failed", Vec::new())])
+            .await
+            .expect("enqueue dep");
+        db.query("UPDATE queue SET status = 'failed' WHERE task_id = ?")
+            .bind(task_id_on("dep-failed", TARGET))
+            .execute()
+            .await
+            .expect("fail dep");
+        enqueue(&db, &[request("dep-fpub", Vec::new())])
+            .await
+            .expect("enqueue published dep");
+        db.query("UPDATE queue SET status = 'failed' WHERE task_id = ?")
+            .bind(task_id_on("dep-fpub", TARGET))
+            .execute()
+            .await
+            .expect("fail published dep");
+        // The migration's spelling for an edge whose required side it
+        // could not derive — seeded directly so the owner below is
+        // born carrying it (its empty `depends_on` means the resync
+        // never deletes the row).
+        db.query(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, \
+              dep_features_json, dep_target, dep_rustc_version, \
+              dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
+             VALUES (?, 'unresolved', '', '', '', '', '', -1, 0, 0, 0)",
+        )
+        .bind(task_id_on("mystery", TARGET))
+        .execute()
+        .await
+        .expect("seed unknown-side edge");
+        // `pair` holds two stored edges, so the fold must sum across
+        // them — and only an edge that is unmet *and* blocking may
+        // raise `blocked`: dep-fpub publishes both shapes but its row
+        // sits 'failed' (nothing in this submit names it, so no
+        // requeue revives it), contributing unpub=0/blocker=1, while
+        // dep-short is unmet but pending-free, unpub=1/blocker=0.
+        let (invocations, shapes) = super::dep_edge_requirements(TARGET, false, TARGET, false);
+        for (dep, side_known) in [("dep-fpub", 1), ("dep-short", 1)] {
+            db.query(
+                "INSERT INTO queue_dependencies \
+                 (task_id, depends_on_task_id, dep_crate_name, dep_version, \
+                  dep_features_json, dep_target, dep_rustc_version, \
+                  dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
+                 VALUES (?, ?, ?, '1.0.0', '[]', ?, ?, 0, ?, ?, ?)",
+            )
+            .bind(task_id_on("pair", TARGET))
+            .bind(task_id_on(dep, TARGET))
+            .bind(dep.to_owned())
+            .bind(TARGET.to_owned())
+            .bind(RUSTC.to_owned())
+            .bind(invocations)
+            .bind(shapes)
+            .bind(side_known)
+            .execute()
+            .await
+            .expect("seed known-side edge");
+        }
+
+        let inserted = enqueue(
+            &db,
+            &[
+                request("free", Vec::new()),
+                request("met", vec![dependency("dep-met")]),
+                request("short", vec![dependency("dep-short")]),
+                request("stalled", vec![dependency("dep-failed")]),
+                request("mystery", Vec::new()),
+                request("twin", vec![dependency("dep-met"), dependency("dep-short")]),
+                request("pair", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue gate cases");
+        assert_eq!(inserted, 7, "every newcomer landed");
+
+        for (name, deps_met, blocked) in [
+            ("free", 1, 0),
+            ("met", 1, 0),
+            ("short", 0, 0),
+            ("stalled", 0, 0),
+            ("mystery", 0, 1),
+            // A met edge beside an unmet one: the fold still reports
+            // the owner unmet, and a pending dep never blocks.
+            ("twin", 0, 0),
+            // A blocker flag on a met edge (published but failed dep)
+            // cannot block, while the unmet edge still gates the owner.
+            ("pair", 0, 0),
+        ] {
+            for (column, expected) in [("deps_met", deps_met), ("blocked", blocked)] {
+                let stored = db
+                    .query(&format!("SELECT {column} FROM queue WHERE task_id = ?"))
+                    .bind(task_id_on(name, TARGET))
+                    .fetch_scalar::<i64>()
+                    .await
+                    .expect("stored gate flag");
+                assert_eq!(stored, expected, "{name}: {column}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -8569,14 +8895,14 @@ mod sqlite_tests {
             .expect("enqueue chunk");
 
         let issued = log.lock().expect("log").len() - base;
-        // Seven: edge delete + edge insert + task insert + task update
-        // + dep-requeue + `deps_met` refresh + `dispatch_key` refresh,
-        // each a single statement over the whole chunk regardless of
-        // request count.
+        // Eight: edge delete + edge insert + edge-flag probe + task
+        // insert + task update + dep-requeue + `deps_met` refresh +
+        // `dispatch_key` refresh, each a single statement over the
+        // whole chunk regardless of request count.
         assert!(
-            issued <= 7,
+            issued <= 8,
             "a 1000-request chunk must stay a constant statement count \
-             (measured 7), got {issued}"
+             (measured 8), got {issued}"
         );
     }
 

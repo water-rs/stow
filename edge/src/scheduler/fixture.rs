@@ -43,9 +43,18 @@ use crate::errors::QueueError;
 
 /// The host-gate shape — 10k rows — small enough that `cargo test`
 /// stays fast. Only the host pre-check uses it; the workerd harness
-/// seeds `PRODUCTION` and the 20k shape `STOW_BUDGET_SIZES` carries.
+/// seeds `PRODUCTION` and the 1M shape `STOW_BUDGET_SIZES` carries.
 #[cfg(test)]
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
+
+/// Rows one crate name covers — the fixture's pinned per-name bound.
+/// `'crate' || (n / CRATE_NAME_ROWS)` bounds every name to at most
+/// `CRATE_NAME_ROWS` rows at any `queue_rows` — `n` starts at 1, so
+/// `crate0` and the final bucket can be short — so a `crate_name =`
+/// probe (`GET /tasks?crate=` sizes its budget by it) reads a
+/// size-invariant cardinality at 10k, 100k and 1M instead of growing
+/// with the table.
+pub const CRATE_NAME_ROWS: u32 = 50;
 
 /// How the fixture's `n % len` target spread maps onto
 /// [`CI_TARGET_TRIPLES`].
@@ -66,10 +75,175 @@ fn target_case_sql(expr: &str) -> String {
     format!("CASE ({expr}) % {} {arms}END", target_count())
 }
 
+/// `dep_invocation_mask(triple, false)` per CI target, evaluated in
+/// Rust so the CASE constants are production's own rule — the
+/// target-side arm of `dep_edge_requirements` and the non-host side of
+/// the owner's mask. (The host-owner arm is the literal `3` the
+/// callers add: a host-side task's mask is not a function of its
+/// target.)
+fn target_mask_case(expr: &str) -> String {
+    use std::fmt::Write as _;
+    let mut arms = String::new();
+    for (index, target) in CI_TARGET_TRIPLES.iter().enumerate() {
+        let _ = write!(
+            arms,
+            "WHEN {index} THEN {} ",
+            crate::scheduler::queue::dep_invocation_mask(target, false)
+        );
+    }
+    format!("CASE ({expr}) % {} {arms}END", target_count())
+}
+
+/// The invocation spelling a target-side node's own build runs —
+/// `UnitInvocation::for_task` on the node's target against its
+/// family's host triple — as a per-target CASE, matching the
+/// invocation `required_unit_shapes` takes.
+fn target_invocation_case(expr: &str) -> String {
+    use std::fmt::Write as _;
+    let mut arms = String::new();
+    for (index, target) in CI_TARGET_TRIPLES.iter().enumerate() {
+        let invocation = stow_types::api::runner_family(target).map_or(
+            stow_types::public_cache::UnitInvocation::Native,
+            |family| {
+                stow_types::public_cache::UnitInvocation::for_task(target, family.host_triple())
+            },
+        );
+        let _ = write!(arms, "WHEN {index} THEN {} ", invocation.to_int());
+    }
+    format!("CASE ({expr}) % {} {arms}END", target_count())
+}
+
 /// Rows one seeder call covers — bounded so a probe request never holds
 /// a statement (or a request's worth of trigger and index writes) large
 /// enough to outlive the Durable Object runtime.
 pub const SEED_BATCH_ROWS: u32 = 4_000;
+
+/// One of the three fixture tables the seed report counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountedTable {
+    /// `queue`.
+    Queue,
+    /// `queue_dependencies`.
+    Dependencies,
+    /// `published_slice_rows`.
+    Slices,
+}
+
+impl CountedTable {
+    /// The table a counter names, by its SQL name — `None` for a table
+    /// the seed does not count (`requests`, `published_slices`).
+    pub fn for_table(table: &str) -> Option<Self> {
+        match table {
+            "queue" => Some(Self::Queue),
+            "queue_dependencies" => Some(Self::Dependencies),
+            "published_slice_rows" => Some(Self::Slices),
+            _ => None,
+        }
+    }
+}
+
+/// Rows the seed's three counted fixture tables hold — the totals the
+/// `/budget/seed` report answers. They ride inside the seed cursor's
+/// `settings` row so a chunk's advance and its tallies commit as one
+/// statement: the write either lands whole or not at all, so a reply
+/// lost after the commit cannot split the progress record, and a
+/// replay of the call re-derives the same counters from the same
+/// cursor. They are never re-derived from `COUNT(*)` per request — a
+/// per-call count re-read a table that grows with the fixture, the
+/// linear cost the chunked seed exists to bound.
+///
+/// The counters' authority differs per table, matching how the chunk
+/// writes are shaped: `queue`/`slices` chunk inserts are atomic
+/// `INSERT … SELECT` over a known row range, so the counter is SET to
+/// the cursor position (the position is the count — a statement
+/// either inserted the whole chunk or errored). `queue_dependencies`
+/// inserts are `OR IGNORE` — a dep already present is skipped — so
+/// its counter accumulates `SELECT changes()`, which SQLite defines
+/// as the statement's direct row changes, never index or trigger
+/// writes (the billed `rows_written` the backend reports counts
+/// those, and cannot name records).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SeedCounts {
+    /// Rows `queue` holds.
+    pub queue: u64,
+    /// Rows `queue_dependencies` holds.
+    pub dependencies: u64,
+    /// Rows `published_slice_rows` holds.
+    pub slices: u64,
+}
+
+impl SeedCounts {
+    /// The cursor's counts field — `"<queue>,<deps>,<slices>"`.
+    pub fn encode(self) -> String {
+        format!("{},{},{}", self.queue, self.dependencies, self.slices)
+    }
+
+    /// The counts field of a cursor — `Err` on anything but three
+    /// `u64`s; the cursor is internal operator state, so a malformed
+    /// field is corruption, not a compatibility case.
+    pub fn decode(field: &str) -> Result<Self, QueueError> {
+        let bad = || QueueError::Sql(format!("bad seed cursor counts {field:?}"));
+        let mut parts = field.split(',');
+        let mut number = || {
+            parts
+                .next()
+                .ok_or_else(bad)?
+                .parse::<u64>()
+                .map_err(|_| bad())
+        };
+        let counts = Self {
+            queue: number()?,
+            dependencies: number()?,
+            slices: number()?,
+        };
+        if parts.next().is_some() {
+            return Err(bad());
+        }
+        Ok(counts)
+    }
+
+    /// `table`'s current counter.
+    pub const fn get(&self, table: CountedTable) -> u64 {
+        match table {
+            CountedTable::Queue => self.queue,
+            CountedTable::Dependencies => self.dependencies,
+            CountedTable::Slices => self.slices,
+        }
+    }
+
+    /// Set `table`'s counter — the position-derived totals.
+    pub const fn set(&mut self, table: CountedTable, n: u64) {
+        match table {
+            CountedTable::Queue => self.queue = n,
+            CountedTable::Dependencies => self.dependencies = n,
+            CountedTable::Slices => self.slices = n,
+        }
+    }
+
+    /// Add `n` inserted records to `table` — exact arithmetic: a
+    /// counter that could overflow or go negative means the progress
+    /// record is already wrong, which is a bug to surface, not a
+    /// bound to clamp.
+    pub fn add(&mut self, table: CountedTable, n: u64) -> Result<(), QueueError> {
+        let next = self
+            .get(table)
+            .checked_add(n)
+            .ok_or_else(|| QueueError::Sql("seed counter overflow".to_owned()))?;
+        self.set(table, next);
+        Ok(())
+    }
+
+    /// Subtract `n` deleted records — the wipe chunk's telemetry, exact
+    /// like `add`.
+    pub fn subtract(&mut self, table: CountedTable, n: u64) -> Result<(), QueueError> {
+        let next = self
+            .get(table)
+            .checked_sub(n)
+            .ok_or_else(|| QueueError::Sql("seed counter underflow".to_owned()))?;
+        self.set(table, next);
+        Ok(())
+    }
+}
 
 /// Which stretch of the fixture a seeder call writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +266,9 @@ pub enum SeedPhase {
 
 impl SeedPhase {
     /// The phase's `n` ceiling; `next` is where the cursor goes when `n`
-    /// reaches it.
-    const fn range_end(self, shape: FixtureShape) -> u32 {
+    /// reaches it. `pub` for the budget route's position-derived
+    /// counters (an ended phase reports its range end).
+    pub const fn range_end(self, shape: FixtureShape) -> u32 {
         match self {
             Self::Queue => shape.queue_rows,
             Self::EdgesEvery | Self::EdgesThirds | Self::DepsMet => shape.pending_end(),
@@ -129,17 +304,60 @@ fn seq_sql(lo: u32, hi: u32) -> String {
     format!("SELECT {lo} + 1 UNION ALL SELECT n + 1 FROM seq WHERE n < {hi}")
 }
 
-/// Seed `queue` rows `(lo, hi]` — every column a pure function of `n`,
-/// including the `dispatch_key` the claim walk orders on and the
-/// `wake_at` the alarm probes read (computed under the same
-/// `dispatch_min_age_minutes` the deploy runs).
-pub async fn seed_queue_chunk(
-    db: &DurableDb,
+/// The `queue` columns the seed writes, in statement order — shared
+/// between the chunk INSERT and the re-arm upsert so both address the
+/// same list (`task_id` is the conflict key, never an update target).
+const QUEUE_SEED_COLUMNS: &[&str] = &[
+    "task_id",
+    "crate_name",
+    "version",
+    "features_json",
+    "target",
+    "rustc_version",
+    "downloads",
+    "miss_count",
+    "request_count",
+    "priority",
+    "status",
+    "lane",
+    "dispatch_attempts",
+    "not_before",
+    "first_requested_at",
+    "created_at",
+    "updated_at",
+    "host_side",
+    "preserve_lockfile",
+    "attempt",
+    "shape_requeue",
+    "github_run_id",
+    "deps_met",
+    "wake_at",
+    "dispatch_family",
+    "dispatch_key",
+];
+
+/// Build the seed's queue statement over an arbitrary `seq` source:
+/// every column a pure function of `n`, including the `dispatch_key`
+/// the claim walk orders on and the `wake_at` the alarm probes read
+/// (computed under the same `dispatch_min_age_minutes` the deploy runs).
+/// `verb` distinguishes the idempotent seed (`INSERT OR IGNORE`) from
+/// the restore (`INSERT`), and `conflict` carries the upsert clause —
+/// empty for the seed.
+///
+/// `(crate, version)` is injective in `n` — `n / 20000` carries the
+/// quotient in the version and `n % 500` its low digits — so the
+/// queue's UNIQUE identity holds at any `queue_rows`; under 20000 rows
+/// the version still reads `1.0.x`, the shape the drives and the
+/// 20k/100k runs were written against. The name groups a bounded
+/// version set: `n / CRATE_NAME_ROWS` bounds every `crate_name` to at
+/// most `CRATE_NAME_ROWS` rows at any size (see the constant).
+fn queue_seed_insert_sql(
     shape: FixtureShape,
-    lo: u32,
-    hi: u32,
+    seq_source: &str,
     min_age_minutes: u32,
-) -> Result<(), QueueError> {
+    verb: &str,
+    conflict: &str,
+) -> String {
     let pending_end = shape.pending_end();
     let completed_end = shape.completed_end();
     let failed_end = shape.failed_end();
@@ -166,16 +384,12 @@ pub async fn seed_queue_chunk(
               ELSE datetime('now', '-' || (1440 + n % 38880) || ' minutes') END"
     );
     let task_id = "printf('%064x', n)";
-    db.query(&format!(
-        "WITH RECURSIVE seq(n) AS ({seq}) \
-         INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version, \
-                            downloads, miss_count, request_count, priority, status, lane, \
-                            dispatch_attempts, not_before, first_requested_at, created_at, \
-                            updated_at, host_side, preserve_lockfile, attempt, shape_requeue, \
-                            github_run_id, deps_met, wake_at, dispatch_family, dispatch_key) \
+    format!(
+        "WITH RECURSIVE seq(n) AS ({seq_source}) \
+         {verb} INTO queue ({columns}) \
          SELECT {task_id}, \
-                'crate' || (n % 20000), \
-                '1.0.' || (n % 500), \
+                'crate' || (n / {CRATE_NAME_ROWS}), \
+                '1.' || (n / 20000) || '.' || (n % 500), \
                 '[]', \
                 {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
@@ -196,8 +410,9 @@ pub async fn seed_queue_chunk(
                 0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
                 CASE WHEN n > {in_flight_end} THEN 'run-' || n ELSE NULL END, \
                 0, {wake}, {family}, {key} \
-         FROM seq",
-        seq = seq_sql(lo, hi),
+         FROM seq \
+         {conflict}",
+        columns = QUEUE_SEED_COLUMNS.join(", "),
         wake = crate::scheduler::queue::wake_at_sql(
             &format!("({lane_case})"),
             first_at,
@@ -213,10 +428,80 @@ pub async fn seed_queue_chunk(
             first_at,
             task_id,
         ),
+    )
+}
+
+/// Seed `queue` rows `(lo, hi]`.
+pub async fn seed_queue_chunk(
+    db: &DurableDb,
+    shape: FixtureShape,
+    lo: u32,
+    hi: u32,
+    min_age_minutes: u32,
+) -> Result<(), QueueError> {
+    // `OR IGNORE` — not for collisions (the identities are injective)
+    // but so a replay of a chunk whose cursor commit was lost re-runs
+    // idempotently instead of stalling on its own identity keys.
+    db.query(&queue_seed_insert_sql(
+        shape,
+        &seq_sql(lo, hi),
+        min_age_minutes,
+        "INSERT OR IGNORE",
+        "",
     ))
     .execute()
     .await
     .map_err(|error| format!("seed queue rows: {error}"))?;
+    Ok(())
+}
+
+/// Re-seed the exact rows `ns` name — the budget re-arm's restore for
+/// the seeded rows the drives mutate or delete: each listed `n` is
+/// written with the seed's own column formulas, so a retried, purged,
+/// resynced or completed row returns to the state the probe was
+/// calibrated on. `seq` is fed from `json_each`, not a range — only
+/// the named rows are touched. The upsert (not `INSERT OR REPLACE`,
+/// whose implied DELETE would mis-fire the status counters' triggers)
+/// restores every seeded column; the two columns the seed leaves to
+/// defaults (`error_msg`, `blocked`) reset explicitly. `deps_met` and
+/// `blocked` land as defaults here and the caller recomputes them once
+/// the edges and slices the flags read are restored too.
+pub async fn restore_queue_rows(
+    db: &DurableDb,
+    shape: FixtureShape,
+    min_age_minutes: u32,
+    ns: &[u32],
+) -> Result<(), QueueError> {
+    if ns.is_empty() {
+        return Ok(());
+    }
+    let assignments = QUEUE_SEED_COLUMNS
+        .iter()
+        .filter(|column| **column != "task_id")
+        .map(|column| format!("{column} = excluded.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = queue_seed_insert_sql(
+        shape,
+        "SELECT CAST(value AS INTEGER) FROM json_each(?)",
+        min_age_minutes,
+        "INSERT",
+        // `WHERE 1` ends the SELECT's join grammar — without it `ON
+        // CONFLICT` parses as a join constraint and `DO` is a syntax
+        // error (SQLite's documented upsert ambiguity).
+        &format!(
+            "WHERE 1 ON CONFLICT(task_id) DO UPDATE SET {assignments}, \
+             error_msg = NULL, blocked = 0"
+        ),
+    );
+    db.query(&sql)
+        .bind(
+            serde_json::to_string(ns)
+                .map_err(|error| QueueError::Sql(format!("encode restore row ids: {error}")))?,
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("restore seeded queue rows: {error}"))?;
     Ok(())
 }
 
@@ -229,7 +514,7 @@ pub async fn seed_edges_chunk(
     phase: SeedPhase,
     lo: u32,
     hi: u32,
-) -> Result<(), QueueError> {
+) -> Result<u64, QueueError> {
     let rows = shape.queue_rows;
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
@@ -239,8 +524,7 @@ pub async fn seed_edges_chunk(
         SeedPhase::EdgesEvery => (
             format!(
                 "CASE WHEN n > {human_pin} AND n <= {human_end} \
-                 THEN {completed_dep} + (n % 64) \
-                 ELSE (n * 7919) % {rows} + 1 END"
+                 THEN {completed_dep} + (n % 64) ELSE (n * 7919) % {rows} + 1 END"
             ),
             "",
         ),
@@ -250,7 +534,27 @@ pub async fn seed_edges_chunk(
         ),
         _ => return Err(QueueError::Sql("not an edge phase".to_owned())),
     };
-    let dep_target_case = target_case_sql(&dep_expr);
+    // `dep` is the dep row's `n` as one parenthesized unit — spliced
+    // next to an operator it must evaluate as a whole, or the outer
+    // operator binds into the expression's last term (`%` and `/`
+    // bind tighter than `+`, so an arm like `X % rows + 1` would
+    // otherwise evaluate the outer operator against `1` first).
+    let dep = format!("({dep_expr})");
+    let dep_target_case = target_case_sql(&dep);
+    // The edge's side and requirement columns are the same inputs
+    // production's `dep_edge_requirements` reads, evaluated as CASEs:
+    // `dep_host_side` is the dep row's own side (`n % 10 = 0` is the
+    // fixture's host arm); a host-side dep needs the owner's
+    // invocation mask and its popcount (a host owner's mask covers
+    // both spellings — 3, popcount 2 — a target owner's one spelling,
+    // popcount 1); a target-side dep needs its own target's mask and
+    // its two linked/unlinked shapes. No production edge carries the
+    // old `(0, 1, 1)` literals.
+    let owner_mask = format!(
+        "CASE WHEN n % 10 = 0 THEN 3 ELSE {} END",
+        target_mask_case("n")
+    );
+    let dep_mask = target_mask_case(&dep);
     db.query(&format!(
         "WITH RECURSIVE seq(n) AS ({seq}) \
          INSERT OR IGNORE INTO queue_dependencies \
@@ -258,36 +562,50 @@ pub async fn seed_edges_chunk(
               dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, \
               dep_side_known) \
          SELECT printf('%064x', n), \
-                printf('%064x', {dep_expr}), \
-                'crate' || ({dep_expr} % 20000), \
-                '1.0.' || ({dep_expr} % 500), \
+                printf('%064x', {dep}), \
+                'crate' || ({dep} / {CRATE_NAME_ROWS}), \
+                '1.' || ({dep} / 20000) || '.' || ({dep} % 500), \
                 '[]', \
                 {dep_target_case}, \
-                CASE WHEN {dep_expr} % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                0, 1, 1, 1 \
+                CASE WHEN {dep} % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
+                CASE WHEN {dep} % 10 = 0 THEN 1 ELSE 0 END, \
+                CASE WHEN {dep} % 10 = 0 THEN ({owner_mask}) ELSE ({dep_mask}) END, \
+                CASE WHEN {dep} % 10 = 0 THEN CASE WHEN n % 10 = 0 THEN 2 ELSE 1 END ELSE 2 END, \
+                1 \
          FROM seq {extra}",
         seq = seq_sql(lo, hi),
     ))
     .execute()
     .await
     .map_err(|error| format!("seed dependency edges: {error}"))?;
-    Ok(())
+    // The `OR IGNORE` makes the actual insert count a measured value,
+    // not `(hi - lo)` — deps an earlier owner already wrote are
+    // skipped.
+    crate::scheduler::queue::changes(db).await
 }
 
 /// Seed the published-slice membership of completed rows `(lo, hi]` —
-/// the identity columns are the row's own `n` formula, so the chunk
-/// reads nothing outside its range.
+/// two rows per node, the pair `required_unit_shapes` publishes for
+/// it: a host-side node (`n % 10 = 0`, the fixture's host arm)
+/// carries the linked unit under both invocation spellings, and a
+/// target-side node carries the unlinked and linked units at its own
+/// invocation — the spelling `UnitInvocation::for_task` assigns its
+/// target on the family's host. The `part` join enumerates the pair.
 pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), QueueError> {
     let target_case = target_case_sql("n");
+    let node_invocation = target_invocation_case("n");
     db.query(&format!(
         "WITH RECURSIVE seq(n) AS ({seq}) \
-         INSERT INTO published_slice_rows \
+         INSERT OR IGNORE INTO published_slice_rows \
              (target, rustc_version, generation, crate_name, version, features_json, \
               unit_side, unit_invocation, unit_linked) \
          SELECT {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                1, 'crate' || (n % 20000), '1.0.' || (n % 500), '[]', 0, 0, 1 \
-         FROM seq",
+                1, 'crate' || (n / {CRATE_NAME_ROWS}), '1.' || (n / 20000) || '.' || (n % 500), '[]', \
+                CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
+                CASE WHEN n % 10 = 0 THEN part ELSE {node_invocation} END, \
+                CASE WHEN n % 10 = 0 THEN 1 ELSE part END \
+         FROM seq, (SELECT 0 AS part UNION ALL SELECT 1 AS part)",
         seq = seq_sql(lo, hi),
     ))
     .execute()
@@ -301,7 +619,7 @@ pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), Qu
 /// finishes.
 pub async fn seed_slice_headers(db: &DurableDb) -> Result<(), QueueError> {
     db.query(
-        "INSERT INTO published_slices (target, rustc_version, generation) \
+        "INSERT OR IGNORE INTO published_slices (target, rustc_version, generation) \
          SELECT DISTINCT target, rustc_version, 1 FROM published_slice_rows",
     )
     .execute()
@@ -325,6 +643,251 @@ pub async fn seed_deps_met_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(),
     .execute()
     .await
     .map_err(|error| format!("seed deps_met/blocked: {error}"))?;
+    Ok(())
+}
+
+/// The `settings` key the budget pass's claim record lives under — the
+/// pass's own dispatch outcome written there after the metered window
+/// closes, so the next run's [`rearm`] restores exactly the rows the
+/// pass claimed, never a status- or band-scoped guess at them.
+const PROBE_CLAIMED_KEY: &str = "budget_probe_claimed";
+
+/// Persist the task ids a budget pass claimed — one `settings` upsert
+/// outside the metered window, read and cleared by [`rearm`] on the
+/// next run. An empty record is kept, not dropped: the previous run's
+/// record must never survive a pass that claimed nothing.
+pub async fn record_probe_claimed(db: &DurableDb, task_ids: &[String]) -> Result<(), QueueError> {
+    db.query(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(PROBE_CLAIMED_KEY)
+    .bind(
+        serde_json::to_string(task_ids)
+            .map_err(|error| QueueError::Sql(format!("encode probe claim record: {error}")))?,
+    )
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("record probe claims: {error}")))?;
+    Ok(())
+}
+
+/// Read, clear, and re-seed the last pass's claim set — consumed on
+/// read so a pass that claims nothing leaves nothing to restore. The
+/// ids are the pass's own recorded outcome: only they are upserted
+/// back to the seeded row, claim-written `attempt`/`wake_at`/
+/// `not_before`/`dispatch_attempts` and all, never a status- or
+/// band-scoped guess. Returns the seeded row numbers for the flag
+/// recompute's `touched` set.
+async fn restore_claimed_rows(
+    db: &DurableDb,
+    shape: FixtureShape,
+    min_age_minutes: u32,
+) -> Result<Vec<u32>, QueueError> {
+    let claimed_ids: Option<Vec<String>> = db
+        .query("SELECT value FROM settings WHERE key = ?")
+        .bind(PROBE_CLAIMED_KEY)
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("read probe claim record: {error}")))?
+        .map(|json| {
+            serde_json::from_str::<Vec<String>>(&json)
+                .map_err(|error| QueueError::Sql(format!("parse probe claim record: {error}")))
+        })
+        .transpose()?;
+    if claimed_ids.is_some() {
+        db.query("DELETE FROM settings WHERE key = ?")
+            .bind(PROBE_CLAIMED_KEY)
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("clear probe claim record: {error}")))?;
+    }
+    let claimed_ns: Vec<u32> = claimed_ids
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|id| {
+            // A claimed row a drive inserted is content-keyed — the
+            // `%-%` cleanup already deleted it; only seeded (hex) ids
+            // name a row to restore.
+            u64::from_str_radix(id, 16)
+                .ok()
+                .and_then(|n| u32::try_from(n).ok())
+        })
+        .collect();
+    restore_queue_rows(db, shape, min_age_minutes, &claimed_ns).await?;
+    Ok(claimed_ns)
+}
+
+/// Restores the seeded queue the drives are calibrated on — outside
+/// the measured window, the same precedent as the installation-token
+/// seed. The contract is the seeded state, not just its shape: every
+/// row and membership a probe moved must read exactly as the seed
+/// wrote it, or the next `POST /budget` on this persisted fixture
+/// measures a queue the drives were not calibrated for — a retry
+/// drive whose two `failed` rows the last probe already re-entered
+/// finds nothing to mutate.
+///
+/// - Inserted artifacts: every task the lanes and the probe itself
+///   insert carries a content-derived `task_id`
+///   (`crate-version-hash-target-rustc`), while seeded rows are
+///   `printf('%064x', n)`, so `task_id LIKE '%-%'` isolates exactly the
+///   rows a run added. The request drives' records die with them; the
+///   two fixture records survive — `GET /requests/{id}` reads the
+///   `enqueued` one.
+/// - Mutated seeded rows: retry's failed pair, cancel's pair,
+///   promote's miss-lane row, purge's deleted pair, the resync's row
+///   101 and the complete-run target are re-written through the seed's
+///   own column formulas ([`restore_queue_rows`]) — a row a probe moved
+///   or deleted returns to seeded truth.
+/// - Claimed rows: the pass records the ids its own claim moved out
+///   of `pending` into probe control state
+///   ([`record_probe_claimed`]); the re-arm restores exactly those
+///   through the same seed upsert. A status- or band-scoped restore
+///   could resurrect a row a load lane legitimately moved, so the set
+///   is the recorded claim outcome, never a predicate over row
+///   state. A claimed row a drive inserted dies in the `%-%` cleanup
+///   — only seeded (hex) ids reach the upsert.
+/// - Attempt epochs: the running target's restore bumps `attempt`
+///   past the value the last pass left (`attempt_outcomes` keys on
+///   `(task_id, attempt)`, so a repeated attempt would make the next
+///   pass's completion a replay of the old epoch, not a fresh
+///   completion).
+/// - Row 101's edges: the resync's delta edge sync deleted the seeded
+///   edge set and wrote its own; both edge phases re-seed the owner's
+///   range after a delete (each `INSERT OR IGNORE` is idempotent).
+/// - Slice membership: the delta report retires 30 of the
+///   `(target[0], 1.85.0)` slice's rows and adds its own; the full
+///   report publishes a dedicated `(target[8], 9.9.9)` slice. Only the
+///   probe's rows move — `stow-gate-*` is a crate prefix no fixture or
+///   load row carries — plus the delta's `applied_generation` bump and
+///   the full report's marker, then the retire band re-seeds (`OR
+///   IGNORE` rewrites only the missing rows; the loaded bulk's
+///   publication is untouched).
+/// - Persisted gate flags: dependents of every touched dep and the
+///   restored pending rows recompute `deps_met`/`blocked` through the
+///   production expressions — the pass's own refreshes answered for
+///   the post-probe truth, and restored dep statuses must not leave
+///   them stale.
+pub async fn rearm(
+    db: &DurableDb,
+    shape: FixtureShape,
+    min_age_minutes: u32,
+) -> Result<(), QueueError> {
+    for statement in [
+        "DELETE FROM queue_dependencies WHERE task_id LIKE '%-%'",
+        "DELETE FROM queue WHERE task_id LIKE '%-%'",
+        "DELETE FROM requests WHERE request_id NOT IN \
+         ('req-fixture-enqueued', 'req-fixture-failed')",
+    ] {
+        db.query(statement)
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("re-arm inserted rows: {error}")))?;
+    }
+    // The mutation drives' exact targets. `pending_row`/`failed_row`
+    // and friends are the same positional helpers the drives select
+    // with, so the restore cannot drift from the selectors.
+    let restored = [
+        101, // the resync's fixture identity (its edge set re-seeded below)
+        FixtureShape::pending_row(701),
+        FixtureShape::pending_row(702),
+        FixtureShape::pending_row(4703),
+        shape.failed_row(0),
+        shape.failed_row(1),
+        shape.completed_row(0),
+        shape.completed_row(1),
+        shape.running_row(),
+    ];
+    // The attempt the running target is at *before* the upsert rewrites
+    // it to the seeded 1 — read first so the restore below can step the
+    // epoch forward instead of letting the next pass reuse it.
+    let running_attempt = db
+        .query("SELECT attempt FROM queue WHERE task_id = printf('%064x', ?)")
+        .bind(i64::from(shape.running_row()))
+        .fetch_scalar_optional::<i64>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("read running attempt: {error}")))?;
+    restore_queue_rows(db, shape, min_age_minutes, &restored).await?;
+    if let Some(attempt) = running_attempt {
+        db.query("UPDATE queue SET attempt = ? WHERE task_id = printf('%064x', ?)")
+            .bind(attempt + 1)
+            .bind(i64::from(shape.running_row()))
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("re-arm running attempt: {error}")))?;
+    }
+    // Whatever the last pass claimed — its own recorded outcome, kept
+    // in `settings` under [`PROBE_CLAIMED_KEY`] so the set survives
+    // between `POST /budget` calls.
+    let claimed_ns = restore_claimed_rows(db, shape, min_age_minutes).await?;
+    // Row 101's seeded edge set: the resync's delta sync rewrote it.
+    db.query("DELETE FROM queue_dependencies WHERE task_id = printf('%064x', ?)")
+        .bind(101_i64)
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("re-arm resync edges: {error}")))?;
+    seed_edges_chunk(db, shape, SeedPhase::EdgesEvery, 100, 101).await?;
+    seed_edges_chunk(db, shape, SeedPhase::EdgesThirds, 100, 101).await?;
+    // The probe's publication — the full report's dedicated slice plus
+    // the delta's added rows, then the delta's marker bump.
+    for (statement, binds) in [
+        (
+            "DELETE FROM published_slice_rows WHERE crate_name LIKE 'stow-gate-%'",
+            Vec::new(),
+        ),
+        (
+            "DELETE FROM published_slices WHERE target = ? AND rustc_version = '9.9.9'",
+            vec![CI_TARGET_TRIPLES[8].to_owned()],
+        ),
+        (
+            "UPDATE published_slices SET generation = 1, applied_generation = 0 \
+             WHERE target = ? AND rustc_version = '1.85.0'",
+            vec![CI_TARGET_TRIPLES[0].to_owned()],
+        ),
+    ] {
+        let mut query = db.query(statement);
+        for bind in binds {
+            query = query.bind(bind);
+        }
+        query
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("re-arm slice tables: {error}")))?;
+    }
+    // The retire band the delta report clears — `slice_first_row` +
+    // `slice_live_rows` produce the same member list the report walks.
+    // `OR IGNORE` makes the chunk write only the rows the retire
+    // actually removed.
+    let live = shape.slice_live_rows(0);
+    let first = shape.slice_first_row(0);
+    let retire_lo = first + (live - super::drives::DELTA_ROWS) * 9 - 1;
+    let retire_hi = first + (live - 1) * 9;
+    seed_slice_chunk(db, retire_lo, retire_hi).await?;
+    // Persisted gate flags on the restored pending rows and on the
+    // dependents of every dep a drive touched — recomputed through the
+    // same expressions the production transitions use, over a set
+    // bounded by the touched ids, not by the queue.
+    let mut touched: Vec<u32> = restored.to_vec();
+    touched.extend_from_slice(&claimed_ns);
+    for i in 0..super::drives::DELTA_ROWS {
+        touched.push(first + (live - 1 - i) * 9);
+    }
+    let touched_json = serde_json::to_string(&touched)
+        .map_err(|error| QueueError::Sql(format!("encode re-arm ids: {error}")))?;
+    db.query(&format!(
+        "UPDATE queue SET deps_met = {deps_met}, blocked = {blocked} \
+         WHERE status = 'pending' AND ( \
+             task_id IN (SELECT printf('%064x', value) FROM json_each(?)) OR \
+             task_id IN (SELECT task_id FROM queue_dependencies \
+                         WHERE depends_on_task_id IN (SELECT printf('%064x', value) FROM json_each(?))))",
+        deps_met = crate::scheduler::queue::deps_met_sql("queue.task_id"),
+        blocked = crate::scheduler::queue::blocked_sql("queue.task_id"),
+    ))
+    .bind(touched_json.clone())
+    .bind(touched_json)
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("re-arm gate flags: {error}")))?;
     Ok(())
 }
 
@@ -362,7 +925,7 @@ pub async fn seed_requests(db: &DurableDb, shape: FixtureShape) -> Result<(), Qu
     ])
     .to_string();
     db.query(
-        "INSERT INTO requests (request_id, attempt, crate_name, version, features_json, \
+        "INSERT OR IGNORE INTO requests (request_id, attempt, crate_name, version, features_json, \
          rustc_version, state, dispatched_at, github_run_id, github_run_url, \
          outcome_json, error) \
          VALUES (?, 1, 'serde', '1.0.0', '[]', '1.86.0', 'enqueued', 0, \
@@ -380,6 +943,37 @@ pub async fn seed_requests(db: &DurableDb, shape: FixtureShape) -> Result<(), Qu
     Ok(())
 }
 
+/// The counted table a phase's chunk writes — the counter the cursor
+/// advances for it. `DepsMet` only updates, so it reports no table.
+pub const fn counted_table(phase: SeedPhase) -> Option<CountedTable> {
+    match phase {
+        SeedPhase::Queue => Some(CountedTable::Queue),
+        SeedPhase::EdgesEvery | SeedPhase::EdgesThirds => Some(CountedTable::Dependencies),
+        SeedPhase::Slices => Some(CountedTable::Slices),
+        SeedPhase::DepsMet => None,
+    }
+}
+
+/// What one [`seed_batch`] chunk call did.
+#[derive(Debug, Clone, Copy)]
+pub struct SeedStep {
+    /// The phase the cursor resumes from (the next phase once this one
+    /// finished).
+    pub phase: SeedPhase,
+    /// The `n` the cursor resumes at.
+    pub n: u32,
+    /// The seed is finished.
+    pub done: bool,
+    /// The chunk wrote or updated fixture state (its range was
+    /// non-empty at this `n`).
+    pub wrote: bool,
+    /// Edge records the chunk actually inserted — measured by
+    /// `SELECT changes()`, the only counter a position cannot derive,
+    /// since `OR IGNORE` skips deps an earlier owner already wrote.
+    /// Zero outside the edge phases.
+    pub edges_written: u64,
+}
+
 /// Seed one `(n, n + batch]` chunk of `phase` and return where the seed
 /// resumes — the next phase (or `None` once `DepsMet` finishes).
 pub async fn seed_batch(
@@ -389,9 +983,11 @@ pub async fn seed_batch(
     n: u32,
     batch: u32,
     min_age_minutes: u32,
-) -> Result<(SeedPhase, u32, bool), QueueError> {
+) -> Result<SeedStep, QueueError> {
     let hi = (n + batch).min(phase.range_end(shape));
-    if hi > n {
+    let mut edges_written = 0u64;
+    let wrote = hi > n;
+    if wrote {
         match phase {
             SeedPhase::Queue => {
                 seed_queue_chunk(db, shape, n, hi, min_age_minutes).await?;
@@ -400,7 +996,7 @@ pub async fn seed_batch(
                 }
             }
             SeedPhase::EdgesEvery | SeedPhase::EdgesThirds => {
-                seed_edges_chunk(db, shape, phase, n, hi).await?;
+                edges_written = seed_edges_chunk(db, shape, phase, n, hi).await?;
             }
             SeedPhase::Slices => {
                 seed_slice_chunk(db, n.max(phase.range_start(shape)), hi).await?;
@@ -411,14 +1007,20 @@ pub async fn seed_batch(
             SeedPhase::DepsMet => seed_deps_met_chunk(db, n, hi).await?,
         }
     }
-    if hi >= phase.range_end(shape) {
-        phase.next().map_or_else(
-            || Ok((phase, hi, true)),
-            |next| Ok((next, next.range_start(shape), false)),
-        )
+    let (next_phase, next_n, done) = if hi >= phase.range_end(shape) {
+        phase.next().map_or((phase, hi, true), |next| {
+            (next, next.range_start(shape), false)
+        })
     } else {
-        Ok((phase, hi, false))
-    }
+        (phase, hi, false)
+    };
+    Ok(SeedStep {
+        phase: next_phase,
+        n: next_n,
+        done,
+        wrote,
+        edges_written,
+    })
 }
 
 /// Seed the whole fixture on the host path — the same chunks the
@@ -435,12 +1037,350 @@ pub async fn seed_production_shape(
     let mut phase = SeedPhase::Queue;
     let mut n = phase.range_start(*shape);
     loop {
-        let (next_phase, next_n, done) =
-            seed_batch(db, *shape, phase, n, SEED_BATCH_ROWS, min_age_minutes).await?;
-        if done {
+        let step = seed_batch(db, *shape, phase, n, SEED_BATCH_ROWS, min_age_minutes).await?;
+        if step.done {
             return Ok(());
         }
-        phase = next_phase;
-        n = next_n;
+        phase = step.phase;
+        n = step.n;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::test_db::memory_db;
+
+    /// The cursor's counts field round-trips and rejects anything that
+    /// is not three `u64`s — it is internal operator state, so a
+    /// malformed field is corruption, never a legacy shape.
+    #[test]
+    fn seed_counts_codec() {
+        let counts = SeedCounts {
+            queue: 1_000_000,
+            dependencies: 799_994,
+            slices: 350_000,
+        };
+        assert_eq!(
+            SeedCounts::decode(&counts.encode()).expect("round-trip"),
+            counts
+        );
+        for bad in ["", "1,2", "1,2,3,4", "a,2,3", "1,2,3x", "1,2,3 "] {
+            assert!(SeedCounts::decode(bad).is_err(), "{bad:?} decoded");
+        }
+    }
+
+    /// `SELECT changes()` names the records a statement actually wrote —
+    /// the counter source the backend's billed `rows_written` cannot
+    /// be, since workerd folds index writes into it. A replayed `OR
+    /// IGNORE` chunk reports only the rows it inserted: the first run
+    /// writes the whole range, a partial re-run only the unwritten
+    /// tail, and a full replay nothing at all.
+    #[tokio::test]
+    async fn edge_chunk_counts_only_inserted_records() {
+        let db = memory_db().await.expect("memory db");
+        let shape = FixtureShape { queue_rows: 400 };
+        let written = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, 200)
+            .await
+            .expect("edges");
+        assert_eq!(written, 200, "a fresh chunk inserts its whole range");
+        let resumed = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 100, 300)
+            .await
+            .expect("overlapping chunk");
+        assert_eq!(
+            resumed, 100,
+            "an overlapping chunk counts only its unwritten tail"
+        );
+        let replay = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, 300)
+            .await
+            .expect("replay");
+        assert_eq!(replay, 0, "a replay inserts nothing");
+        let rows: i64 = db
+            .query("SELECT count(*) FROM queue_dependencies")
+            .fetch_scalar()
+            .await
+            .expect("count");
+        assert_eq!(rows, 300, "the table holds exactly the written union");
+    }
+
+    /// Queue and slice chunks replay idempotently too — the derived
+    /// position counters stay exact after a cursor-commit loss because
+    /// the re-run completes the same range.
+    #[tokio::test]
+    async fn queue_and_slice_chunks_replay_idempotently() {
+        let db = memory_db().await.expect("memory db");
+        let shape = FixtureShape { queue_rows: 400 };
+        seed_queue_chunk(&db, shape, 0, 100, 0)
+            .await
+            .expect("queue chunk");
+        seed_queue_chunk(&db, shape, 0, 100, 0)
+            .await
+            .expect("queue replay");
+        let rows: i64 = db
+            .query("SELECT count(*) FROM queue")
+            .fetch_scalar()
+            .await
+            .expect("count");
+        assert_eq!(rows, 100, "a replayed queue chunk adds nothing");
+        seed_slice_chunk(&db, 200, 300).await.expect("slice chunk");
+        seed_slice_chunk(&db, 200, 300).await.expect("slice replay");
+        let rows: i64 = db
+            .query("SELECT count(*) FROM published_slice_rows")
+            .fetch_scalar()
+            .await
+            .expect("count");
+        // Two stored rows per node — the `required_unit_shapes` pair.
+        assert_eq!(rows, 200, "a replayed slice chunk adds nothing");
+    }
+
+    /// One edge joined to its owner and dep queue rows — the stored
+    /// requirement columns against the facts production computes them
+    /// from.
+    #[derive(Debug, skyzen::FromRow)]
+    struct EdgeRequirement {
+        owner_target: String,
+        owner_side: i64,
+        dep_target: String,
+        dep_side: i64,
+        stored_side: i64,
+        invocations: i64,
+        shapes: i64,
+    }
+    /// One stored slice row joined to its node's queue facts.
+    #[derive(Debug, skyzen::FromRow)]
+    struct SliceMembership {
+        target: String,
+        host_side: i64,
+        unit_side: i64,
+        unit_invocation: i64,
+        unit_linked: i64,
+    }
+
+    /// A node's invocation spelling — `for_task` on its target against
+    /// the family's host triple, the same input `required_unit_shapes`
+    /// takes.
+    fn node_invocation(target: &str) -> stow_types::public_cache::UnitInvocation {
+        stow_types::api::runner_family(target).map_or(
+            stow_types::public_cache::UnitInvocation::Native,
+            |family| {
+                stow_types::public_cache::UnitInvocation::for_task(target, family.host_triple())
+            },
+        )
+    }
+
+    /// The seeded fixture's three consistency sweeps — edge identity
+    /// against the joined queue row, edge requirements against
+    /// production's `dep_edge_requirements`, and slice membership
+    /// against `required_unit_shapes` — run once per test phase so a
+    /// chunk replay is checked against the same contract as the fresh
+    /// seed.
+    async fn assert_edge_fixture(db: &DurableDb, label: &str) {
+        assert_edge_identity(db, label).await;
+        assert_edge_requirements(db, label).await;
+        assert_slice_membership(db, label).await;
+    }
+
+    /// Every stored dep column equals the row `depends_on_task_id`
+    /// joins to — stored values compared, never the formula that
+    /// generated them.
+    async fn assert_edge_identity(db: &DurableDb, label: &str) {
+        const MISMATCH: &str = "SELECT count(*) FROM queue_dependencies d \
+            JOIN queue q ON q.task_id = d.depends_on_task_id WHERE ";
+        // Identity: every stored dep column equals the row
+        // `depends_on_task_id` joins to — stored values compared,
+        // never the formula that generated them.
+        for (column, pair) in [
+            ("crate", "d.dep_crate_name != q.crate_name"),
+            ("version", "d.dep_version != q.version"),
+            ("features", "d.dep_features_json != q.features_json"),
+            ("target", "d.dep_target != q.target"),
+            ("rustc", "d.dep_rustc_version != q.rustc_version"),
+            ("host_side", "d.dep_host_side != q.host_side"),
+        ] {
+            let mismatches: i64 = db
+                .query(&format!("{MISMATCH} {pair}"))
+                .fetch_scalar()
+                .await
+                .expect("join");
+            assert_eq!(mismatches, 0, "{label} {column} mismatches");
+        }
+    }
+
+    /// `dep_invocations`/`dep_shapes` equal production's
+    /// `dep_edge_requirements` over the joined owner/dep facts —
+    /// every edge class present: host and target deps, native and
+    /// cross invocation families, both owner sides (no edge carries
+    /// `(1, 1)`).
+    async fn assert_edge_requirements(db: &DurableDb, label: &str) {
+        let edges = db
+            .query(
+                "SELECT o.target AS owner_target, o.host_side AS owner_side, \
+                        d.target AS dep_target, d.host_side AS dep_side, \
+                        e.dep_host_side AS stored_side, \
+                        e.dep_invocations AS invocations, e.dep_shapes AS shapes \
+                 FROM queue_dependencies e \
+                 JOIN queue o ON o.task_id = e.task_id \
+                 JOIN queue d ON d.task_id = e.depends_on_task_id",
+            )
+            .fetch_all::<EdgeRequirement>()
+            .await
+            .expect("edge requirements");
+        assert!(!edges.is_empty(), "{label}: no edges joined");
+        for edge in &edges {
+            assert_eq!(edge.stored_side, edge.dep_side, "{label}: stored side");
+            assert_eq!(
+                (edge.invocations, edge.shapes),
+                crate::scheduler::queue::dep_edge_requirements(
+                    &edge.owner_target,
+                    edge.owner_side != 0,
+                    &edge.dep_target,
+                    edge.dep_side != 0,
+                ),
+                "{label}: requirements for {} dep {} (owner {})",
+                edge.dep_side,
+                edge.dep_target,
+                edge.owner_target,
+            );
+        }
+    }
+
+    /// Every stored slice row is one of its node's
+    /// `required_unit_shapes`, and every completed node carries its
+    /// full pair — a node missing either shape is the probe, not the
+    /// fixture's noise.
+    async fn assert_slice_membership(db: &DurableDb, label: &str) {
+        let membership = db
+            .query(
+                "SELECT s.target AS target, q.host_side AS host_side, \
+                        s.unit_side AS unit_side, s.unit_invocation AS unit_invocation, \
+                        s.unit_linked AS unit_linked \
+                 FROM published_slice_rows s \
+                 JOIN queue q ON q.crate_name = s.crate_name AND q.version = s.version \
+                    AND q.features_json = s.features_json AND q.target = s.target \
+                    AND q.rustc_version = s.rustc_version",
+            )
+            .fetch_all::<SliceMembership>()
+            .await
+            .expect("slice membership");
+        assert!(!membership.is_empty(), "{label}: no slice rows joined");
+        for row in &membership {
+            let invocation = node_invocation(&row.target);
+            let covered =
+                stow_types::public_cache::required_unit_shapes(row.host_side != 0, invocation)
+                    .iter()
+                    .any(|shape| {
+                        shape.side.to_int() == row.unit_side
+                            && shape.invocation.to_int() == row.unit_invocation
+                            && shape.kind.to_int() == row.unit_linked
+                    });
+            assert!(
+                covered,
+                "{label}: slice row ({},{},{}) of {} (host_side={}) is no required shape",
+                row.unit_side, row.unit_invocation, row.unit_linked, row.target, row.host_side,
+            );
+        }
+        let incomplete: i64 = db
+            .query(
+                "SELECT COUNT(*) FROM (\
+                    SELECT q.task_id FROM queue q \
+                    LEFT JOIN published_slice_rows s \
+                      ON s.crate_name = q.crate_name AND s.version = q.version \
+                     AND s.features_json = q.features_json AND s.target = q.target \
+                     AND s.rustc_version = q.rustc_version \
+                    WHERE q.status = 'completed' \
+                    GROUP BY q.task_id HAVING COUNT(*) != 2)",
+            )
+            .fetch_scalar()
+            .await
+            .expect("slice completeness");
+        assert_eq!(incomplete, 0, "{label}: completed nodes missing shapes");
+    }
+
+    /// The dep_* columns cache the dependency row's own identity — the
+    /// values the `queue` seed wrote at the dep's `n`. Every seeded
+    /// edge joins its `depends_on_task_id` to that row and must agree
+    /// on every identity column; a mismatch means the edge formula
+    /// stopped mirroring the row formula (an unparenthesized splice,
+    /// a literal where the row varies). Covered for both edge phases
+    /// and across a replay, which must add nothing and break nothing.
+    #[tokio::test]
+    async fn edge_dep_identity_matches_the_dependency_row() {
+        let db = memory_db().await.expect("memory db");
+        let shape = FixtureShape { queue_rows: 4_000 };
+        seed_queue_chunk(&db, shape, 0, shape.queue_rows, 0)
+            .await
+            .expect("queue rows");
+        seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, shape.queue_rows)
+            .await
+            .expect("every edges");
+        seed_edges_chunk(&db, shape, SeedPhase::EdgesThirds, 0, shape.queue_rows)
+            .await
+            .expect("thirds edges");
+        seed_slice_chunk(&db, shape.pending_end(), shape.completed_end())
+            .await
+            .expect("slice rows");
+
+        assert_edge_fixture(&db, "fresh every+thirds+slices").await;
+
+        // Replay an overlapping chunk of each phase — OR IGNORE makes
+        // the re-run a no-op, so the checks stay clean.
+        seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 1_000, 3_000)
+            .await
+            .expect("every replay");
+        seed_edges_chunk(&db, shape, SeedPhase::EdgesThirds, 1_000, 3_000)
+            .await
+            .expect("thirds replay");
+        seed_slice_chunk(&db, shape.pending_end() + 500, shape.completed_end() - 500)
+            .await
+            .expect("slice replay");
+        assert_edge_fixture(&db, "replayed").await;
+    }
+
+    /// The `GET /tasks?crate=` drive's probe reads a name's pinned
+    /// version set, not a slice of the table: `crate123` covers
+    /// `n ∈ [6150, 6200)` — `CRATE_NAME_ROWS` rows — at every fixture
+    /// size, and the lookup seeks the identity index rather than
+    /// scanning.
+    #[tokio::test]
+    async fn crate_name_lookup_reads_a_pinned_version_set() {
+        /// `EXPLAIN QUERY PLAN` detail rows — the plan text only.
+        #[derive(Debug, skyzen::FromRow)]
+        struct PlanRow {
+            detail: String,
+        }
+        for queue_rows in [8_000u32, 15_000] {
+            let db = memory_db().await.expect("memory db");
+            let shape = FixtureShape { queue_rows };
+            seed_queue_chunk(&db, shape, 0, queue_rows, 0)
+                .await
+                .expect("queue rows");
+            let matches: i64 = db
+                .query("SELECT count(*) FROM queue WHERE crate_name = 'crate123'")
+                .fetch_scalar()
+                .await
+                .expect("count");
+            assert_eq!(
+                matches,
+                i64::from(CRATE_NAME_ROWS),
+                "crate123 cardinality at {queue_rows} rows"
+            );
+            let plan = db
+                .query(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT task_id FROM queue WHERE crate_name = 'crate123'",
+                )
+                .fetch_all::<PlanRow>()
+                .await
+                .expect("plan");
+            assert!(
+                plan.iter()
+                    .any(|row| row.detail.starts_with("SEARCH queue")),
+                "crate lookup does not seek at {queue_rows} rows: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|row| row.detail.starts_with("SCAN queue")),
+                "crate lookup scans at {queue_rows} rows: {plan:?}"
+            );
+        }
     }
 }

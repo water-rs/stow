@@ -716,18 +716,19 @@ pub async fn list_artifact_records(
 /// of `artifacts prune`. Returns the deleted row count.
 pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<u32, DbError> {
     validate_rustc_version(rustc_version)?;
-    let result = db
-        .query("DELETE FROM artifacts WHERE rustc_version = ?")
+    // `RETURNING` carries the deleted rows' identities inside the one
+    // statement — the billed `rows_written` would include the indexes'
+    // writes, and `changes()` cannot be used: every D1 query is its own
+    // async request, so a follow-up `SELECT changes()` is not provably
+    // the DELETE's count.
+    let deleted = db
+        .query("DELETE FROM artifacts WHERE rustc_version = ? RETURNING c_metadata")
         .bind(rustc_version)
-        .execute()
+        .fetch_scalars::<String>()
         .await
         .map_err(|error| DbError::Query(format!("delete artifacts for rustc: {error}")))?;
-    u32::try_from(result.rows_written).map_err(|_| {
-        DbError::Invariant(format!(
-            "deleted row count {} exceeds u32",
-            result.rows_written
-        ))
-    })
+    u32::try_from(deleted.len())
+        .map_err(|_| DbError::Invariant(format!("deleted row count {} exceeds u32", deleted.len())))
 }
 
 /// The subset of `identities` the catalog serves: servable rows (each
