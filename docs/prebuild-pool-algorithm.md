@@ -197,7 +197,7 @@ permanent admission into the pool.
 Instead, misses are turned into prioritized overlay candidates and ranked
 against the rest of the queue.
 
-> **Not implemented — tracked in [#442](https://github.com/water-rs/stow/issues/442).** A miss today enters the queue in the miss lane and is dispatched first-come first-served once its dependencies are published.
+> **Base ordering implemented in [#442](https://github.com/water-rs/stow/issues/442) I6; overlay ranking not implemented.** A miss enters the queue in the miss lane and dispatches by its persisted `value` (the download/miss `priority` band, FIFO at equal value) once its dependencies are published; turning misses into prioritized overlay candidates ranked against the rest of the queue is the demand application (#522) and the hourly demand feed (#523), tracked separately.
 
 ## Candidate Identity
 
@@ -222,7 +222,7 @@ overlay candidates using one common abstraction.
 
 ## Budgeting Model
 
-> **Not implemented — tracked in [#442](https://github.com/water-rs/stow/issues/442).** Dispatch today orders ready nodes by the human lane, then Windows targets, then first-request time; nothing below scores or budgets candidates yet.
+> **Not implemented.** Dispatch orders ready nodes by a persisted `value` — the human lane band, then the Windows-family band, then `priority` — with `first_requested_at`, `created_at` and `task_id` FIFO ties (#442 I6); nothing below scores or budgets candidates yet — the cost divisor and pool floor are tracked separately in #524/#525.
 
 The pool is not allowed to expand indefinitely.
 
@@ -247,7 +247,7 @@ The implementation may use one or more of these simultaneously.
 
 ## Recommended Scoring Signals
 
-> **Not implemented — tracked in [#442](https://github.com/water-rs/stow/issues/442).** Dispatch today orders ready nodes by the human lane, then Windows targets, then first-request time; nothing below scores or budgets candidates yet.
+> **Not implemented.** Dispatch orders ready nodes by a persisted `value` — the human lane band, then the Windows-family band, then `priority` — with `first_requested_at`, `created_at` and `task_id` FIFO ties (#442 I6); nothing below scores or budgets candidates yet — the demand application/feed, cost divisor and floor are tracked separately in #522/#523/#524/#525.
 
 Candidate ranking should combine signals from several sources:
 
