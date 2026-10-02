@@ -181,14 +181,17 @@ fn budget_of(name: &str) -> Result<&'static DriveBudget, QueueError> {
 }
 
 /// The `settings` row carrying the seed cursor —
-/// `"<tag>:<n>:<queue_rows>"` with tag `reset` (n = table index),
-/// `queue`, `edges_every`, `edges_thirds`, `slices`, `deps` or `done`
-/// (n = 0). Each call advances it by at most one
-/// [`fixture::SEED_BATCH_ROWS`] chunk, so a seed survives the
-/// per-request work ceiling a whole 100k-row fixture would hit. The
-/// stored shape gates reuse: a cursor for a different `queue_rows`
-/// restarts the seed rather than resuming into a fixture whose rows
-/// describe another shape.
+/// `"<tag>:<n>:<queue_rows>:<queue>,<deps>,<slices>"` with tag `reset`
+/// (n = table index), `queue`, `edges_every`, `edges_thirds`, `slices`,
+/// `deps` or `done` (n = 0) and the trailing field the counted fixture
+/// tables' row totals ([`fixture::SeedCounts`]). Each call advances it
+/// by at most one [`fixture::SEED_BATCH_ROWS`] chunk, so a seed
+/// survives the per-request work ceiling a whole 100k-row fixture
+/// would hit; the counters ride in the same statement the cursor's
+/// position commits with, so a reply lost between them cannot split
+/// the progress record. The stored shape gates reuse: a cursor for a
+/// different `queue_rows` restarts the seed rather than resuming into
+/// a fixture whose rows describe another shape.
 const SEED_CURSOR_KEY: &str = "budget_seed";
 
 /// Tables `reset` clears, in child-before-parent order.
@@ -200,20 +203,21 @@ const SEED_TABLES: &[&str] = &[
     "queue",
 ];
 
-/// `POST /budget/seed` — load the fixture through the operator path:
-/// `queue::migrate` first (the probe is operations work, so schema
-/// discipline applies), then one cursor step. `reset` restarts the
-/// cursor and clears the fixture's tables chunk by chunk. Callers loop
-/// until `done`; a finished (or hand-populated) queue reports
+/// `POST /budget/seed` — load the fixture through the operator path,
+/// one cursor step per call. The schema is the operator migrate
+/// route's product — the harness runs it before seeding, and request
+/// code neither issues DDL nor re-checks the migration's queue-wide
+/// passes (a `queue::migrate` inside every chunk call walked the
+/// growing queue for a no-op `!=` guard — the linear request cost that
+/// outlived the dev proxy's reply window at 1M rows). `reset` restarts
+/// the cursor and clears the fixture's tables chunk by chunk. Callers
+/// loop until `done`; a finished (or hand-populated) queue reports
 /// `done = true, seeded = false` unless `reset` is passed.
 pub async fn seed(
     db: &DurableDb,
     request: &SchedulerSeedRequest,
     settings: &queue::SchedulerSettings,
 ) -> Result<SchedulerSeedReport, QueueError> {
-    queue::migrate(db, settings)
-        .await
-        .map_err(|error| QueueError::Sql(format!("probe seed migrate: {error}")))?;
     let shape = FixtureShape {
         queue_rows: request
             .queue_rows
@@ -223,50 +227,79 @@ pub async fn seed(
         .batch
         .unwrap_or(fixture::SEED_BATCH_ROWS)
         .clamp(1, fixture::SEED_BATCH_ROWS * 4);
-    let fresh = format!("reset:0:{}", shape.queue_rows);
-    // `reset` restarts the wipe; a cursor written for a different
-    // `queue_rows` does the same — its chunks describe another shape.
-    let cursor = match (request.reset.unwrap_or(false), read_seed_cursor(db).await?) {
-        (false, Some(cursor)) if seed_cursor_shape(&cursor) == Some(shape.queue_rows) => cursor,
-        (true, _) | (false, Some(_)) => fresh,
+    // The counters name what the counted tables hold. They are
+    // measured once per cursor birth — a reset's starting sizes, a
+    // fresh seed's empties, a populated queue's report — and never
+    // again: the step's own write deltas carry them forward, which is
+    // what the per-call `COUNT(*)` re-scans used to do at the cost of
+    // a full-table walk per request.
+    let (cursor, counts) = match (request.reset.unwrap_or(false), read_seed_cursor(db).await?) {
+        (false, Some(cursor)) if seed_cursor_shape(&cursor)? == shape.queue_rows => {
+            // The counters resume from the cursor row itself — it is
+            // internal operator state, so a malformed value is an
+            // error, not a case to recover.
+            let counts = seed_cursor_counts(&cursor)?;
+            (cursor, counts)
+        }
+        (true, _) | (false, Some(_)) => {
+            // `reset` restarts the wipe; a cursor written for a
+            // different `queue_rows` does the same — its chunks
+            // describe another shape.
+            let counts = measure_seed_counts(db).await?;
+            (
+                format!("reset:0:{}:{}", shape.queue_rows, counts.encode()),
+                counts,
+            )
+        }
         (false, None) => {
             // No cursor: a populated queue is a fixture seeded before
             // cursors existed (or by hand) — report done rather than
             // double-seed; an empty one starts at the queue phase.
-            if count_rows(db, "queue").await? == 0 {
-                format!("queue:0:{}", shape.queue_rows)
-            } else {
-                format!("done:0:{}", shape.queue_rows)
-            }
+            let counts = measure_seed_counts(db).await?;
+            let tag = if counts.queue == 0 { "queue" } else { "done" };
+            (
+                format!("{tag}:0:{}:{}", shape.queue_rows, counts.encode()),
+                counts,
+            )
         }
     };
-    let (next, seeded) =
-        run_seed_step(db, shape, &cursor, batch, settings.dispatch_min_age_minutes).await?;
+    let (next, seeded, counts) = run_seed_step(
+        db,
+        shape,
+        &cursor,
+        batch,
+        settings.dispatch_min_age_minutes,
+        counts,
+    )
+    .await?;
     if next != cursor {
         set_seed_cursor(db, &next).await?;
     }
     Ok(SchedulerSeedReport {
-        queue_rows: count_rows(db, "queue").await?,
-        dependency_rows: count_rows(db, "queue_dependencies").await?,
-        slice_rows: count_rows(db, "published_slice_rows").await?,
+        queue_rows: counts.queue,
+        dependency_rows: counts.dependencies,
+        slice_rows: counts.slices,
         seeded,
         done: next.starts_with("done:"),
     })
 }
 
 /// One cursor step: clear one `reset` table chunk, or write one fixture
-/// chunk and return the cursor it resumes from. `seeded` reports whether
-/// the step wrote rows (a finished or empty reset step reports false).
+/// chunk and return the cursor it resumes from, counters updated by the
+/// step's position and measured write deltas. `seeded` reports whether
+/// the step advanced fixture readiness (a wipe or finished seed does
+/// not).
 async fn run_seed_step(
     db: &DurableDb,
     shape: FixtureShape,
     cursor: &str,
     batch: u32,
     min_age_minutes: u32,
-) -> Result<(String, bool), QueueError> {
-    let (tag, n, _) = parse_seed_cursor(cursor)?;
+    mut counts: fixture::SeedCounts,
+) -> Result<(String, bool, fixture::SeedCounts), QueueError> {
+    let (tag, n, _, _) = parse_seed_cursor(cursor)?;
     if tag == "done" {
-        return Ok((cursor.to_owned(), false));
+        return Ok((cursor.to_owned(), false, counts));
     }
     if tag == "reset" {
         let table = SEED_TABLES
@@ -281,28 +314,78 @@ async fn run_seed_step(
         .execute()
         .await
         .map_err(|error| QueueError::Sql(format!("reset {table}: {error}")))?;
-        let remaining = count_rows(db, table).await?;
-        let next = if remaining == 0 {
-            if (n as usize) + 1 < SEED_TABLES.len() {
-                format!("reset:{}:{}", n + 1, shape.queue_rows)
-            } else {
-                format!("queue:0:{}", shape.queue_rows)
-            }
-        } else {
-            cursor.to_owned()
+        let counted = fixture::CountedTable::for_table(table);
+        if let Some(table) = counted {
+            counts.subtract(table, fixture::changes(db).await?)?;
+        }
+        // A counted table's emptiness is read straight off its counter —
+        // the wipe's own DELETEs keep it exact; an uncounted table asks
+        // a one-row probe. `COUNT(*)` per chunk re-read the whole table
+        // being cleared.
+        let remaining = match counted {
+            Some(table) => counts.get(table) > 0,
+            None => db
+                .query(&format!("SELECT 1 FROM {table} LIMIT 1"))
+                .fetch_scalar_optional::<i64>()
+                .await
+                .map_err(|error| QueueError::Sql(format!("probe {table} empty: {error}")))?
+                .is_some(),
         };
-        return Ok((next, true));
+        let next = if remaining {
+            format!("reset:{n}:{}:{}", shape.queue_rows, counts.encode())
+        } else if (n as usize) + 1 < SEED_TABLES.len() {
+            format!("reset:{}:{}:{}", n + 1, shape.queue_rows, counts.encode())
+        } else {
+            format!("queue:0:{}:{}", shape.queue_rows, counts.encode())
+        };
+        // A wipe writes no fixture state — `seeded` reports fixture
+        // readiness progress, so it stays false until a seed chunk runs.
+        return Ok((next, false, counts));
     }
     let phase = parse_seed_phase(tag)
         .ok_or_else(|| QueueError::Sql(format!("bad seed cursor {cursor}")))?;
-    let (next_phase, next_n, done) =
-        fixture::seed_batch(db, shape, phase, n, batch, min_age_minutes).await?;
-    let next_tag = if done {
+    let step = fixture::seed_batch(db, shape, phase, n, batch, min_age_minutes).await?;
+    // The position this phase reached: `step.n` is the NEXT phase's
+    // start on a boundary, so an ended phase takes its own range end.
+    let phase_n = if step.phase == phase && !step.done {
+        step.n
+    } else {
+        phase.range_end(shape)
+    };
+    match fixture::counted_table(phase) {
+        // Position-derived: the table was empty when the phase began and
+        // each chunk inserts its whole range atomically (`OR IGNORE`
+        // only skips replayed rows), so the position IS the row count —
+        // no arithmetic to drift.
+        Some(fixture::CountedTable::Queue) => {
+            counts.set(fixture::CountedTable::Queue, u64::from(phase_n));
+        }
+        Some(fixture::CountedTable::Slices) => counts.set(
+            fixture::CountedTable::Slices,
+            u64::from(phase_n - shape.pending_end()),
+        ),
+        // `changes()`-tracked: `OR IGNORE` skips deps another owner
+        // already wrote, so inserts are a measured delta, not a range.
+        Some(fixture::CountedTable::Dependencies) => {
+            counts.add(fixture::CountedTable::Dependencies, step.edges_written)?;
+        }
+        None => {}
+    }
+    let next_tag = if step.done {
         "done"
     } else {
-        seed_phase_tag(next_phase)
+        seed_phase_tag(step.phase)
     };
-    Ok((format!("{next_tag}:{next_n}:{}", shape.queue_rows), true))
+    Ok((
+        format!(
+            "{next_tag}:{}:{}:{}",
+            step.n,
+            shape.queue_rows,
+            counts.encode()
+        ),
+        step.wrote,
+        counts,
+    ))
 }
 
 /// The phase tag of a seed cursor value.
@@ -328,26 +411,49 @@ fn parse_seed_phase(tag: &str) -> Option<fixture::SeedPhase> {
     }
 }
 
-/// `"<tag>:<n>:<queue_rows>"` → its parts; every cursor variant carries
-/// the shape it was seeded with.
-fn parse_seed_cursor(cursor: &str) -> Result<(&str, u32, u32), QueueError> {
+/// `"<tag>:<n>:<queue_rows>:<queue>,<deps>,<slices>"` → its parts;
+/// every cursor variant carries the shape it was seeded with and the
+/// counted tables' totals, so a resume never re-scans for them. The
+/// cursor is internal operator state — anything not in this shape is
+/// corruption the call fails on, not a legacy form to translate.
+fn parse_seed_cursor(cursor: &str) -> Result<(&str, u32, u32, fixture::SeedCounts), QueueError> {
     let bad = || QueueError::Sql(format!("bad seed cursor {cursor}"));
-    let mut parts = cursor.splitn(3, ':');
-    let (tag, n, rows) = (
+    let mut parts = cursor.split(':');
+    let (tag, n, rows, counts_field) = (
+        parts.next().ok_or_else(bad)?,
         parts.next().ok_or_else(bad)?,
         parts.next().ok_or_else(bad)?,
         parts.next().ok_or_else(bad)?,
     );
+    if parts.next().is_some() {
+        return Err(bad());
+    }
     Ok((
         tag,
         n.parse().map_err(|_| bad())?,
         rows.parse().map_err(|_| bad())?,
+        fixture::SeedCounts::decode(counts_field)?,
     ))
 }
 
+/// The cursor's counted-table totals.
+fn seed_cursor_counts(cursor: &str) -> Result<fixture::SeedCounts, QueueError> {
+    parse_seed_cursor(cursor).map(|(_, _, _, counts)| counts)
+}
+
+/// The counted tables' live sizes — the one `COUNT(*)` each table pays
+/// per seed, run at cursor birth or when resuming a pre-counter cursor.
+async fn measure_seed_counts(db: &DurableDb) -> Result<fixture::SeedCounts, QueueError> {
+    Ok(fixture::SeedCounts {
+        queue: count_rows(db, "queue").await?,
+        dependencies: count_rows(db, "queue_dependencies").await?,
+        slices: count_rows(db, "published_slice_rows").await?,
+    })
+}
+
 /// The `queue_rows` a cursor was written for, if it parses.
-fn seed_cursor_shape(cursor: &str) -> Option<u32> {
-    parse_seed_cursor(cursor).ok().map(|(_, _, rows)| rows)
+fn seed_cursor_shape(cursor: &str) -> Result<u32, QueueError> {
+    parse_seed_cursor(cursor).map(|(_, _, rows, _)| rows)
 }
 
 async fn read_seed_cursor(db: &DurableDb) -> Result<Option<String>, QueueError> {
@@ -477,7 +583,7 @@ pub async fn run(
     let shape = FixtureShape {
         queue_rows: read_seed_cursor(db)
             .await?
-            .and_then(|cursor| seed_cursor_shape(&cursor))
+            .and_then(|cursor| seed_cursor_shape(&cursor).ok())
             .unwrap_or_else(|| {
                 u32::try_from(queue_rows.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
             }),

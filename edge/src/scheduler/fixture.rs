@@ -71,6 +71,145 @@ fn target_case_sql(expr: &str) -> String {
 /// enough to outlive the Durable Object runtime.
 pub const SEED_BATCH_ROWS: u32 = 4_000;
 
+/// One of the three fixture tables the seed report counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountedTable {
+    /// `queue`.
+    Queue,
+    /// `queue_dependencies`.
+    Dependencies,
+    /// `published_slice_rows`.
+    Slices,
+}
+
+impl CountedTable {
+    /// The table a counter names, by its SQL name — `None` for a table
+    /// the seed does not count (`requests`, `published_slices`).
+    pub fn for_table(table: &str) -> Option<Self> {
+        match table {
+            "queue" => Some(Self::Queue),
+            "queue_dependencies" => Some(Self::Dependencies),
+            "published_slice_rows" => Some(Self::Slices),
+            _ => None,
+        }
+    }
+}
+
+/// Rows the seed's three counted fixture tables hold — the totals the
+/// `/budget/seed` report answers. They ride inside the seed cursor's
+/// `settings` row so a chunk's advance and its tallies commit as one
+/// statement: the write either lands whole or not at all, so a reply
+/// lost after the commit cannot split the progress record, and a
+/// replay of the call re-derives the same counters from the same
+/// cursor. They are never re-derived from `COUNT(*)` per request — a
+/// per-call count re-read a table that grows with the fixture, the
+/// linear cost the chunked seed exists to bound.
+///
+/// The counters' authority differs per table, matching how the chunk
+/// writes are shaped: `queue`/`slices` chunk inserts are atomic
+/// `INSERT … SELECT` over a known row range, so the counter is SET to
+/// the cursor position (the position is the count — a statement
+/// either inserted the whole chunk or errored). `queue_dependencies`
+/// inserts are `OR IGNORE` — a dep already present is skipped — so
+/// its counter accumulates `SELECT changes()`, which SQLite defines
+/// as the statement's direct row changes, never index or trigger
+/// writes (the billed `rows_written` the backend reports counts
+/// those, and cannot name records).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SeedCounts {
+    /// Rows `queue` holds.
+    pub queue: u64,
+    /// Rows `queue_dependencies` holds.
+    pub dependencies: u64,
+    /// Rows `published_slice_rows` holds.
+    pub slices: u64,
+}
+
+impl SeedCounts {
+    /// The cursor's counts field — `"<queue>,<deps>,<slices>"`.
+    pub fn encode(self) -> String {
+        format!("{},{},{}", self.queue, self.dependencies, self.slices)
+    }
+
+    /// The counts field of a cursor — `Err` on anything but three
+    /// `u64`s; the cursor is internal operator state, so a malformed
+    /// field is corruption, not a compatibility case.
+    pub fn decode(field: &str) -> Result<Self, QueueError> {
+        let bad = || QueueError::Sql(format!("bad seed cursor counts {field:?}"));
+        let mut parts = field.split(',');
+        let mut number = || {
+            parts
+                .next()
+                .ok_or_else(bad)?
+                .parse::<u64>()
+                .map_err(|_| bad())
+        };
+        let counts = Self {
+            queue: number()?,
+            dependencies: number()?,
+            slices: number()?,
+        };
+        if parts.next().is_some() {
+            return Err(bad());
+        }
+        Ok(counts)
+    }
+
+    /// `table`'s current counter.
+    pub const fn get(&self, table: CountedTable) -> u64 {
+        match table {
+            CountedTable::Queue => self.queue,
+            CountedTable::Dependencies => self.dependencies,
+            CountedTable::Slices => self.slices,
+        }
+    }
+
+    /// Set `table`'s counter — the position-derived totals.
+    pub const fn set(&mut self, table: CountedTable, n: u64) {
+        match table {
+            CountedTable::Queue => self.queue = n,
+            CountedTable::Dependencies => self.dependencies = n,
+            CountedTable::Slices => self.slices = n,
+        }
+    }
+
+    /// Add `n` inserted records to `table` — exact arithmetic: a
+    /// counter that could overflow or go negative means the progress
+    /// record is already wrong, which is a bug to surface, not a
+    /// bound to clamp.
+    pub fn add(&mut self, table: CountedTable, n: u64) -> Result<(), QueueError> {
+        let next = self
+            .get(table)
+            .checked_add(n)
+            .ok_or_else(|| QueueError::Sql("seed counter overflow".to_owned()))?;
+        self.set(table, next);
+        Ok(())
+    }
+
+    /// Subtract `n` deleted records — the wipe chunk's telemetry, exact
+    /// like `add`.
+    pub fn subtract(&mut self, table: CountedTable, n: u64) -> Result<(), QueueError> {
+        let next = self
+            .get(table)
+            .checked_sub(n)
+            .ok_or_else(|| QueueError::Sql("seed counter underflow".to_owned()))?;
+        self.set(table, next);
+        Ok(())
+    }
+}
+
+/// Rows the last completed statement changed — SQLite's `changes()`
+/// counts the statement's own record writes only: index maintenance
+/// and trigger effects are excluded by definition, so unlike the
+/// backend's billed `rows_written` it names real row deltas (an `OR
+/// IGNORE` insert reports just the rows that landed).
+pub async fn changes(db: &DurableDb) -> Result<u64, QueueError> {
+    db.query("SELECT changes()")
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("read changes(): {error}")))
+}
+
 /// Which stretch of the fixture a seeder call writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedPhase {
@@ -92,8 +231,9 @@ pub enum SeedPhase {
 
 impl SeedPhase {
     /// The phase's `n` ceiling; `next` is where the cursor goes when `n`
-    /// reaches it.
-    const fn range_end(self, shape: FixtureShape) -> u32 {
+    /// reaches it. `pub` for the budget route's position-derived
+    /// counters (an ended phase reports its range end).
+    pub const fn range_end(self, shape: FixtureShape) -> u32 {
         match self {
             Self::Queue => shape.queue_rows,
             Self::EdgesEvery | Self::EdgesThirds | Self::DepsMet => shape.pending_end(),
@@ -172,9 +312,12 @@ pub async fn seed_queue_chunk(
               ELSE datetime('now', '-' || (1440 + n % 38880) || ' minutes') END"
     );
     let task_id = "printf('%064x', n)";
+    // `OR IGNORE` — not for collisions (the identities are injective)
+    // but so a replay of a chunk whose cursor commit was lost re-runs
+    // idempotently instead of stalling on its own identity keys.
     db.query(&format!(
         "WITH RECURSIVE seq(n) AS ({seq}) \
-         INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version, \
+         INSERT OR IGNORE INTO queue (task_id, crate_name, version, features_json, target, rustc_version, \
                             downloads, miss_count, request_count, priority, status, lane, \
                             dispatch_attempts, not_before, first_requested_at, created_at, \
                             updated_at, host_side, preserve_lockfile, attempt, shape_requeue, \
@@ -235,7 +378,7 @@ pub async fn seed_edges_chunk(
     phase: SeedPhase,
     lo: u32,
     hi: u32,
-) -> Result<(), QueueError> {
+) -> Result<u64, QueueError> {
     let rows = shape.queue_rows;
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
@@ -277,7 +420,10 @@ pub async fn seed_edges_chunk(
     .execute()
     .await
     .map_err(|error| format!("seed dependency edges: {error}"))?;
-    Ok(())
+    // The `OR IGNORE` makes the actual insert count a measured value,
+    // not `(hi - lo)` — deps an earlier owner already wrote are
+    // skipped.
+    changes(db).await
 }
 
 /// Seed the published-slice membership of completed rows `(lo, hi]` —
@@ -287,7 +433,7 @@ pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), Qu
     let target_case = target_case_sql("n");
     db.query(&format!(
         "WITH RECURSIVE seq(n) AS ({seq}) \
-         INSERT INTO published_slice_rows \
+         INSERT OR IGNORE INTO published_slice_rows \
              (target, rustc_version, generation, crate_name, version, features_json, \
               unit_side, unit_invocation, unit_linked) \
          SELECT {target_case}, \
@@ -307,7 +453,7 @@ pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), Qu
 /// finishes.
 pub async fn seed_slice_headers(db: &DurableDb) -> Result<(), QueueError> {
     db.query(
-        "INSERT INTO published_slices (target, rustc_version, generation) \
+        "INSERT OR IGNORE INTO published_slices (target, rustc_version, generation) \
          SELECT DISTINCT target, rustc_version, 1 FROM published_slice_rows",
     )
     .execute()
@@ -368,7 +514,7 @@ pub async fn seed_requests(db: &DurableDb, shape: FixtureShape) -> Result<(), Qu
     ])
     .to_string();
     db.query(
-        "INSERT INTO requests (request_id, attempt, crate_name, version, features_json, \
+        "INSERT OR IGNORE INTO requests (request_id, attempt, crate_name, version, features_json, \
          rustc_version, state, dispatched_at, github_run_id, github_run_url, \
          outcome_json, error) \
          VALUES (?, 1, 'serde', '1.0.0', '[]', '1.86.0', 'enqueued', 0, \
@@ -386,6 +532,37 @@ pub async fn seed_requests(db: &DurableDb, shape: FixtureShape) -> Result<(), Qu
     Ok(())
 }
 
+/// The counted table a phase's chunk writes — the counter the cursor
+/// advances for it. `DepsMet` only updates, so it reports no table.
+pub const fn counted_table(phase: SeedPhase) -> Option<CountedTable> {
+    match phase {
+        SeedPhase::Queue => Some(CountedTable::Queue),
+        SeedPhase::EdgesEvery | SeedPhase::EdgesThirds => Some(CountedTable::Dependencies),
+        SeedPhase::Slices => Some(CountedTable::Slices),
+        SeedPhase::DepsMet => None,
+    }
+}
+
+/// What one [`seed_batch`] chunk call did.
+#[derive(Debug, Clone, Copy)]
+pub struct SeedStep {
+    /// The phase the cursor resumes from (the next phase once this one
+    /// finished).
+    pub phase: SeedPhase,
+    /// The `n` the cursor resumes at.
+    pub n: u32,
+    /// The seed is finished.
+    pub done: bool,
+    /// The chunk wrote or updated fixture state (its range was
+    /// non-empty at this `n`).
+    pub wrote: bool,
+    /// Edge records the chunk actually inserted — measured by
+    /// `SELECT changes()`, the only counter a position cannot derive,
+    /// since `OR IGNORE` skips deps an earlier owner already wrote.
+    /// Zero outside the edge phases.
+    pub edges_written: u64,
+}
+
 /// Seed one `(n, n + batch]` chunk of `phase` and return where the seed
 /// resumes — the next phase (or `None` once `DepsMet` finishes).
 pub async fn seed_batch(
@@ -395,9 +572,11 @@ pub async fn seed_batch(
     n: u32,
     batch: u32,
     min_age_minutes: u32,
-) -> Result<(SeedPhase, u32, bool), QueueError> {
+) -> Result<SeedStep, QueueError> {
     let hi = (n + batch).min(phase.range_end(shape));
-    if hi > n {
+    let mut edges_written = 0u64;
+    let wrote = hi > n;
+    if wrote {
         match phase {
             SeedPhase::Queue => {
                 seed_queue_chunk(db, shape, n, hi, min_age_minutes).await?;
@@ -406,7 +585,7 @@ pub async fn seed_batch(
                 }
             }
             SeedPhase::EdgesEvery | SeedPhase::EdgesThirds => {
-                seed_edges_chunk(db, shape, phase, n, hi).await?;
+                edges_written = seed_edges_chunk(db, shape, phase, n, hi).await?;
             }
             SeedPhase::Slices => {
                 seed_slice_chunk(db, n.max(phase.range_start(shape)), hi).await?;
@@ -417,14 +596,20 @@ pub async fn seed_batch(
             SeedPhase::DepsMet => seed_deps_met_chunk(db, n, hi).await?,
         }
     }
-    if hi >= phase.range_end(shape) {
-        phase.next().map_or_else(
-            || Ok((phase, hi, true)),
-            |next| Ok((next, next.range_start(shape), false)),
-        )
+    let (next_phase, next_n, done) = if hi >= phase.range_end(shape) {
+        phase.next().map_or((phase, hi, true), |next| {
+            (next, next.range_start(shape), false)
+        })
     } else {
-        Ok((phase, hi, false))
-    }
+        (phase, hi, false)
+    };
+    Ok(SeedStep {
+        phase: next_phase,
+        n: next_n,
+        done,
+        wrote,
+        edges_written,
+    })
 }
 
 /// Seed the whole fixture on the host path — the same chunks the
@@ -441,12 +626,98 @@ pub async fn seed_production_shape(
     let mut phase = SeedPhase::Queue;
     let mut n = phase.range_start(*shape);
     loop {
-        let (next_phase, next_n, done) =
-            seed_batch(db, *shape, phase, n, SEED_BATCH_ROWS, min_age_minutes).await?;
-        if done {
+        let step = seed_batch(db, *shape, phase, n, SEED_BATCH_ROWS, min_age_minutes).await?;
+        if step.done {
             return Ok(());
         }
-        phase = next_phase;
-        n = next_n;
+        phase = step.phase;
+        n = step.n;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::test_db::memory_db;
+
+    /// The cursor's counts field round-trips and rejects anything that
+    /// is not three `u64`s — it is internal operator state, so a
+    /// malformed field is corruption, never a legacy shape.
+    #[test]
+    fn seed_counts_codec() {
+        let counts = SeedCounts {
+            queue: 1_000_000,
+            dependencies: 799_994,
+            slices: 350_000,
+        };
+        assert_eq!(
+            SeedCounts::decode(&counts.encode()).expect("round-trip"),
+            counts
+        );
+        for bad in ["", "1,2", "1,2,3,4", "a,2,3", "1,2,3x", "1,2,3 "] {
+            assert!(SeedCounts::decode(bad).is_err(), "{bad:?} decoded");
+        }
+    }
+
+    /// `SELECT changes()` names the records a statement actually wrote —
+    /// the counter source the backend's billed `rows_written` cannot
+    /// be, since workerd folds index writes into it. A replayed `OR
+    /// IGNORE` chunk reports only the rows it inserted: the first run
+    /// writes the whole range, a partial re-run only the unwritten
+    /// tail, and a full replay nothing at all.
+    #[tokio::test]
+    async fn edge_chunk_counts_only_inserted_records() {
+        let db = memory_db().await.expect("memory db");
+        let shape = FixtureShape { queue_rows: 400 };
+        let written = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, 200)
+            .await
+            .expect("edges");
+        assert_eq!(written, 200, "a fresh chunk inserts its whole range");
+        let resumed = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 100, 300)
+            .await
+            .expect("overlapping chunk");
+        assert_eq!(
+            resumed, 100,
+            "an overlapping chunk counts only its unwritten tail"
+        );
+        let replay = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, 300)
+            .await
+            .expect("replay");
+        assert_eq!(replay, 0, "a replay inserts nothing");
+        let rows: i64 = db
+            .query("SELECT count(*) FROM queue_dependencies")
+            .fetch_scalar()
+            .await
+            .expect("count");
+        assert_eq!(rows, 300, "the table holds exactly the written union");
+    }
+
+    /// Queue and slice chunks replay idempotently too — the derived
+    /// position counters stay exact after a cursor-commit loss because
+    /// the re-run completes the same range.
+    #[tokio::test]
+    async fn queue_and_slice_chunks_replay_idempotently() {
+        let db = memory_db().await.expect("memory db");
+        let shape = FixtureShape { queue_rows: 400 };
+        seed_queue_chunk(&db, shape, 0, 100, 0)
+            .await
+            .expect("queue chunk");
+        seed_queue_chunk(&db, shape, 0, 100, 0)
+            .await
+            .expect("queue replay");
+        let rows: i64 = db
+            .query("SELECT count(*) FROM queue")
+            .fetch_scalar()
+            .await
+            .expect("count");
+        assert_eq!(rows, 100, "a replayed queue chunk adds nothing");
+        seed_slice_chunk(&db, 200, 300).await.expect("slice chunk");
+        seed_slice_chunk(&db, 200, 300).await.expect("slice replay");
+        let rows: i64 = db
+            .query("SELECT count(*) FROM published_slice_rows")
+            .fetch_scalar()
+            .await
+            .expect("count");
+        assert_eq!(rows, 100, "a replayed slice chunk adds nothing");
     }
 }
