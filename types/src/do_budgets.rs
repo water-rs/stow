@@ -225,17 +225,28 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // The accepted development ceiling is 303 reads — the latest
+        // 100k workerd gate measured 157 under it, without wall-time
+        // or write headroom.
         name: "POST /index/published (full)",
         statements: 8,
-        rows_read: 500,
+        rows_read: 303,
         rows_written: 800,
         wall_ms: 500,
     },
     DriveBudget {
+        // The delta's gate writes are the matched edges' `dep_met`
+        // flips plus their owners' `unpublished_deps` adjustments —
+        // 1 + the delta's direct dependents, never the queue or the
+        // graph (stow#521). `rowsRead` counts workerd's internal index
+        // seeks: the per-edge `dep_match` probes, the slice-row
+        // re-evaluation per matched edge and the owner PK seeks.
+        // The accepted development ceiling is 488 reads — the latest
+        // 100k workerd gate measured 486 under it.
         name: "POST /index/published (delta)",
         statements: 8,
-        rows_read: 700,
-        rows_written: 500,
+        rows_read: 488,
+        rows_written: 200,
         wall_ms: 500,
     },
     DriveBudget {

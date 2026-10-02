@@ -37,12 +37,21 @@ CREATE TABLE IF NOT EXISTS queue (
     -- re-queue is at most once — the rebuild republishes real shapes, so
     -- the missing-shape condition cannot recur.
     shape_requeue INTEGER NOT NULL DEFAULT 0,
+    -- The owner's count of unmet dependency edges — edges whose
+    -- `dep_met` is 0 — maintained as a counter: set at insert, ±1'd by
+    -- slice deltas on the edges they flip, and recounted on edge resync
+    -- (stow#521). The gate never re-evaluates the edge set to know
+    -- whether a row is blocked: `deps_met` is `unpublished_deps = 0`,
+    -- and a publish touches the changed rows' matched edges plus their
+    -- owners, never every dependent's whole edge list.
+    unpublished_deps INTEGER NOT NULL DEFAULT 0,
     -- The dependency gate's answer, persisted: 1 while every edge of this
-    -- row resolves to units the published slice serves. Written at edge
-    -- sync, recomputed by every transition into `pending`, and refreshed
-    -- on pending rows only where an edge or slice write can change the
-    -- answer — the claim reads the flag only on pending rows, so a
-    -- dispatch pass never re-evaluates the dependency EXISTS.
+    -- row resolves to units the published slice serves — the stored form
+    -- of `unpublished_deps = 0`, derived wherever the counter is
+    -- written (insert, edge resync, slice delta, migration) and kept
+    -- current by every transition into `pending` — the claim reads the
+    -- flag only on pending rows, so a dispatch pass never re-evaluates
+    -- the dependency EXISTS.
     deps_met INTEGER NOT NULL DEFAULT 0,
     -- The dependency gate's terminal answer, persisted: 1 while a
     -- pending row owns an edge whose dep failed or was never resolved
@@ -110,6 +119,14 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     -- the columns existed; it fails closed until resynced.
     dep_invocations INTEGER NOT NULL DEFAULT 0,
     dep_shapes INTEGER NOT NULL DEFAULT 0,
+    -- The edge's own gate answer, persisted: 1 while the live published
+    -- slice for the dep's (dep_target, dep_rustc_version) serves every
+    -- unit shape the mask requires — the row form of
+    -- dep_edge_unpublished_sql. Written at insert, flipped by slice
+    -- deltas on the edges they match, backfilled by the migration — so
+    -- the owner's `unpublished_deps` counter can move by ±1 on a flip
+    -- instead of re-evaluating the slice join per edge.
+    dep_met INTEGER NOT NULL DEFAULT 0,
     -- Whether the edge's required side is established — resolver-written
     -- edges carry 1, legacy rows the side migration derives stamp their
     -- outcome and mark themselves known so it runs once.

@@ -300,14 +300,15 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
-    // A report whose membership moved by DELTA_ROWS: the `deps_met`
-    // refresh reads only edges matching the changed rows, so its cost
-    // is proportional to the delta, never to the slice or the graph.
+    // A report whose membership moved by DELTA_ROWS: the gate writes
+    // touch only the changed rows' matched edges and their owners'
+    // counters, so its cost is proportional to the delta, never to the
+    // slice or the graph (stow#521).
     RouteBudget {
         name: "POST /index/published (delta)",
-        statements: 12,
-        rows_read: 4_000,
-        rows_written: 120,
+        statements: 16,
+        rows_read: 60,
+        rows_written: 200,
         scan_allowlist: &[],
         ddl_permitted: false,
     },
@@ -769,6 +770,78 @@ async fn status_of(db: &DurableDb, task_id: &str) -> String {
         .expect("status")
 }
 
+/// The gate truth a re-arm must leave behind. Every stored edge flag
+/// answers the strict slice predicate — the re-arm reverts the probe's
+/// membership moves, so no `dep_met` may stay flipped — and on the
+/// rows the refresh scopes (the restored and claimed rows plus the
+/// dependents of every dep they name, pending or not) the persisted
+/// `unpublished_deps` counter counts the unmet edges, `deps_met` is
+/// its `= 0` derivation, and `blocked` holds while the row is pending.
+async fn assert_rearm_gate_truth(db: &DurableDb, shape: fixture::FixtureShape, claimed: &[String]) {
+    // The touched set `rearm` derives: its fixed restore list, the
+    // pass's recorded claim set and the delta's retire-band members.
+    let mut touched = vec![
+        101,
+        fixture::FixtureShape::pending_row(701),
+        fixture::FixtureShape::pending_row(702),
+        fixture::FixtureShape::pending_row(4703),
+        shape.failed_row(0),
+        shape.failed_row(1),
+        shape.completed_row(0),
+        shape.completed_row(1),
+        shape.running_row(),
+    ];
+    touched.extend(claimed.iter().filter_map(|id| {
+        u64::from_str_radix(id, 16)
+            .ok()
+            .and_then(|n| u32::try_from(n).ok())
+    }));
+    let live = shape.slice_live_rows(0);
+    let first = shape.slice_first_row(0);
+    for i in 0..drives::DELTA_ROWS {
+        touched.push(first + (live - 1 - i) * 9);
+    }
+    let stale_edges: i64 = db
+        .query(&format!(
+            "SELECT count(*) FROM queue_dependencies d \
+             WHERE d.dep_met != (CASE WHEN {unpublished} THEN 0 ELSE 1 END)",
+            unpublished = queue::dep_edge_unpublished_sql("d"),
+        ))
+        .fetch_scalar()
+        .await
+        .expect("edge dep_met sweep");
+    assert_eq!(
+        stale_edges, 0,
+        "re-arm left edges stale against the live slice"
+    );
+    let drifted_owners: i64 = db
+        .query(&format!(
+            "WITH touched(task_id) AS ( \
+                 SELECT printf('%064x', value) FROM json_each(?) \
+             ), owners(task_id) AS ( \
+                 SELECT task_id FROM touched UNION \
+                 SELECT d.task_id FROM queue_dependencies d \
+                 JOIN touched t ON t.task_id = d.depends_on_task_id \
+             ) \
+             SELECT count(*) FROM queue \
+             WHERE task_id IN (SELECT task_id FROM owners) \
+               AND (unpublished_deps != {unpublished} \
+                    OR deps_met != {deps_met} \
+                    OR (status = 'pending' AND blocked != {blocked}))",
+            unpublished = queue::unpublished_deps_sql("queue.task_id"),
+            deps_met = queue::deps_met_sql("queue.task_id"),
+            blocked = queue::blocked_sql("queue.task_id"),
+        ))
+        .bind(serde_json::to_string(&touched).expect("encode touched"))
+        .fetch_scalar()
+        .await
+        .expect("owner counter sweep");
+    assert_eq!(
+        drifted_owners, 0,
+        "re-arm left touched owners' counters off the production expressions"
+    );
+}
+
 /// The workerd probe runs `POST /budget` repeatedly against the same
 /// persisted fixture — the launch gate measures once before and once
 /// after the load lane. `fixture::rearm` must return every row and
@@ -849,6 +922,7 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
         .await
         .expect("re-arm fixture");
+    assert_rearm_gate_truth(&db, shape, &claimed).await;
 
     for (n, status, _) in untouched {
         let id = format!("{n:064x}");
