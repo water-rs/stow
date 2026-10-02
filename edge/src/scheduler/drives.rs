@@ -234,6 +234,9 @@ pub const DRIVES: &[Drive] = &[
         },
     },
     Drive {
+        // The crate selector seeks `queue`'s identity index on
+        // `crate_name`, so the read is the name's own version set —
+        // pinned at `fixture::CRATE_NAME_ROWS` rows across sizes.
         name: "GET /tasks?crate=…",
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
@@ -719,10 +722,12 @@ use stow_types::fixture::task_hex_id as hex_id;
 
 /// The crate identity a queue row carries — the same formulas the seed
 /// SQL uses, kept in one place so a drive always names a real row. The
-/// pair is injective in `n` at any fixture size.
+/// pair is injective in `n` at any fixture size; the name is a pinned
+/// `CRATE_NAME_ROWS` version set (see fixture), so a `crate_name =`
+/// probe's cardinality cannot grow with the table.
 fn crate_identity(n: u32) -> (String, String) {
     (
-        format!("crate{}", n % 20000),
+        format!("crate{}", n / super::fixture::CRATE_NAME_ROWS),
         format!("1.{}.{}", n / 20000, n % 500),
     )
 }

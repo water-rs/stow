@@ -47,6 +47,14 @@ use crate::errors::QueueError;
 #[cfg(test)]
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
 
+/// Rows one crate name covers — the fixture's pinned per-name bound.
+/// `'crate' || (n / CRATE_NAME_ROWS)` gives every name exactly
+/// `CRATE_NAME_ROWS` rows at any `queue_rows`, so a `crate_name =`
+/// probe (`GET /tasks?crate=` sizes its budget by it) reads a
+/// size-invariant cardinality at 10k, 100k and 1M instead of growing
+/// with the table.
+pub const CRATE_NAME_ROWS: u32 = 50;
+
 /// How the fixture's `n % len` target spread maps onto
 /// [`CI_TARGET_TRIPLES`].
 fn target_count() -> u32 {
@@ -274,11 +282,13 @@ fn seq_sql(lo: u32, hi: u32) -> String {
 /// `wake_at` the alarm probes read (computed under the same
 /// `dispatch_min_age_minutes` the deploy runs).
 ///
-/// `(crate, version)` is injective in `n` — `n % 20000` carries the low
-/// digits in the crate name and `n / 20000` the quotient in the
-/// version — so the queue's UNIQUE identity holds at any `queue_rows`;
-/// under 20000 rows the version still reads `1.0.x`, the shape the
-/// drives and the 20k/100k runs were written against.
+/// `(crate, version)` is injective in `n` — `n / 20000` carries the
+/// quotient in the version and `n % 500` its low digits — so the
+/// queue's UNIQUE identity holds at any `queue_rows`; under 20000 rows
+/// the version still reads `1.0.x`, the shape the drives and the
+/// 20k/100k runs were written against. The name groups a bounded
+/// version set: `n / CRATE_NAME_ROWS` pins every `crate_name` to
+/// `CRATE_NAME_ROWS` rows at any size (see the constant).
 pub async fn seed_queue_chunk(
     db: &DurableDb,
     shape: FixtureShape,
@@ -323,7 +333,7 @@ pub async fn seed_queue_chunk(
                             updated_at, host_side, preserve_lockfile, attempt, shape_requeue, \
                             github_run_id, deps_met, wake_at, dispatch_family, dispatch_key) \
          SELECT {task_id}, \
-                'crate' || (n % 20000), \
+                'crate' || (n / {CRATE_NAME_ROWS}), \
                 '1.' || (n / 20000) || '.' || (n % 500), \
                 '[]', \
                 {target_case}, \
@@ -408,7 +418,7 @@ pub async fn seed_edges_chunk(
               dep_side_known) \
          SELECT printf('%064x', n), \
                 printf('%064x', {dep_expr}), \
-                'crate' || ({dep_expr} % 20000), \
+                'crate' || ({dep_expr} / {CRATE_NAME_ROWS}), \
                 '1.' || (({dep_expr}) / 20000) || '.' || ({dep_expr} % 500), \
                 '[]', \
                 {dep_target_case}, \
@@ -438,7 +448,7 @@ pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), Qu
               unit_side, unit_invocation, unit_linked) \
          SELECT {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                1, 'crate' || (n % 20000), '1.' || (n / 20000) || '.' || (n % 500), '[]', 0, 0, 1 \
+                1, 'crate' || (n / {CRATE_NAME_ROWS}), '1.' || (n / 20000) || '.' || (n % 500), '[]', 0, 0, 1 \
          FROM seq",
         seq = seq_sql(lo, hi),
     ))
@@ -719,5 +729,53 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(rows, 100, "a replayed slice chunk adds nothing");
+    }
+
+    /// The `GET /tasks?crate=` drive's probe reads a name's pinned
+    /// version set, not a slice of the table: `crate123` covers
+    /// `n ∈ [6150, 6200)` — `CRATE_NAME_ROWS` rows — at every fixture
+    /// size, and the lookup seeks the identity index rather than
+    /// scanning.
+    #[tokio::test]
+    async fn crate_name_lookup_reads_a_pinned_version_set() {
+        /// `EXPLAIN QUERY PLAN` detail rows — the plan text only.
+        #[derive(Debug, skyzen::FromRow)]
+        struct PlanRow {
+            detail: String,
+        }
+        for queue_rows in [8_000u32, 15_000] {
+            let db = memory_db().await.expect("memory db");
+            let shape = FixtureShape { queue_rows };
+            seed_queue_chunk(&db, shape, 0, queue_rows, 0)
+                .await
+                .expect("queue rows");
+            let matches: i64 = db
+                .query("SELECT count(*) FROM queue WHERE crate_name = 'crate123'")
+                .fetch_scalar()
+                .await
+                .expect("count");
+            assert_eq!(
+                matches,
+                i64::from(CRATE_NAME_ROWS),
+                "crate123 cardinality at {queue_rows} rows"
+            );
+            let plan = db
+                .query(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT task_id FROM queue WHERE crate_name = 'crate123'",
+                )
+                .fetch_all::<PlanRow>()
+                .await
+                .expect("plan");
+            assert!(
+                plan.iter()
+                    .any(|row| row.detail.starts_with("SEARCH queue")),
+                "crate lookup does not seek at {queue_rows} rows: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|row| row.detail.starts_with("SCAN queue")),
+                "crate lookup scans at {queue_rows} rows: {plan:?}"
+            );
+        }
     }
 }
