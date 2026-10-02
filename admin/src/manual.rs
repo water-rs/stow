@@ -186,9 +186,9 @@ fn retain_latest_run(
     if tracked_workflow_run_id.is_some_and(|id| id != state.workflow_run_id) {
         return;
     }
-    let replace = latest.get(&state.task_id).map_or(true, |current| {
-        state.workflow_run_id > current.workflow_run_id
-    });
+    let replace = latest
+        .get(&state.task_id)
+        .is_none_or(|current| state.workflow_run_id > current.workflow_run_id);
     if replace {
         latest.insert(state.task_id.clone(), state);
     }
@@ -776,6 +776,20 @@ fn task_payload(task_id: &str, request: &EnqueueRequest) -> BuildTaskPayload {
     }
 }
 
+/// Dispatch a node and bind it to the exact run returned by the transport.
+async fn dispatch_node(
+    dispatch: &Dispatch,
+    task_id: &str,
+    node: &mut NodeRun,
+) -> stow_types::error::Result<()> {
+    let payload = task_payload(task_id, &node.request);
+    let workflow_run_id = dispatch.send(&payload).await?;
+    node.dispatched = true;
+    node.workflow_run_id = Some(workflow_run_id);
+    node.dispatched_at = Some(std::time::Instant::now());
+    Ok(())
+}
+
 /// Drive one layer to completion: adopt runs already on the tracker,
 /// dispatch the rest bounded by `in_flight`, and poll until every node
 /// resolves. Nodes whose runs never materialize inside the grace window
@@ -863,16 +877,11 @@ async fn drive_layer(
             if running >= in_flight {
                 break;
             }
-            let node = nodes.get(id).expect("open node");
+            let node = nodes.get_mut(id).expect("open node");
             if node.dispatched {
                 continue;
             }
-            let payload = task_payload(id, &node.request);
-            let workflow_run_id = dispatch.send(&payload).await?;
-            let node = nodes.get_mut(id).expect("open node");
-            node.dispatched = true;
-            node.workflow_run_id = Some(workflow_run_id);
-            node.dispatched_at = Some(std::time::Instant::now());
+            dispatch_node(dispatch, id, node).await?;
             created_since = created_since.min(time::OffsetDateTime::now_utc());
             running += 1;
         }

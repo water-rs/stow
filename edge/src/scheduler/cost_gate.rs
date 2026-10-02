@@ -748,10 +748,11 @@ async fn per_request_cost_gate() {
 struct RunningTarget {
     attempt: i64,
     github_run_id: Option<String>,
+    generation_id: String,
 }
 
 async fn running_target(db: &DurableDb, shape: fixture::FixtureShape) -> RunningTarget {
-    db.query("SELECT attempt, github_run_id FROM queue WHERE task_id = printf('%064x', ?)")
+    db.query("SELECT attempt, github_run_id, generation_id FROM queue WHERE task_id = printf('%064x', ?)")
         .bind(i64::from(shape.running_row()))
         .fetch_optional::<RunningTarget>()
         .await
@@ -778,6 +779,26 @@ async fn status_of(db: &DurableDb, task_id: &str) -> String {
         .expect("status")
 }
 
+async fn assert_failure_evidence(db: &DurableDb, shape: fixture::FixtureShape, expected: usize) {
+    let generations = db
+        .query("SELECT generation_id FROM attempt_outcomes_v2 WHERE task_id = printf('%064x', ?) AND attempt = 1")
+        .bind(i64::from(shape.dispatched_row(0)))
+        .fetch_scalars::<String>()
+        .await
+        .expect("failure generations");
+    assert_eq!(generations.len(), expected, "each pass records its failure");
+    assert_eq!(
+        generations
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        expected,
+        "each failure belongs to a distinct generation"
+    );
+    assert!(generations.iter().all(|generation| generation.len() == 32
+        && generation.bytes().all(|byte| byte.is_ascii_hexdigit())));
+}
+
 /// The gate truth a re-arm must leave behind. Every stored edge flag
 /// answers the strict slice predicate — the re-arm reverts the probe's
 /// membership moves, so no `dep_met` may stay flipped — and on the
@@ -798,6 +819,7 @@ async fn assert_rearm_gate_truth(db: &DurableDb, shape: fixture::FixtureShape, c
         shape.completed_row(0),
         shape.completed_row(1),
         shape.running_row(),
+        shape.dispatched_row(0),
     ];
     touched.extend(claimed.iter().filter_map(|id| {
         u64::from_str_radix(id, 16)
@@ -912,9 +934,10 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     // bucket's `outcomes` count is the completion's evidence, and it
     // must increase exactly once per landed transition.
     let first = running_target(&db, shape).await;
+    let run_id = format!("run-{}", shape.running_row());
     assert_eq!(
         first.github_run_id.as_deref(),
-        Some("12345"),
+        Some(run_id.as_str()),
         "the pass's completion landed and stamped its run id"
     );
     assert_eq!(
@@ -923,6 +946,7 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
         "the first pass's completed transition counted once"
     );
     let claimed = ctx.claimed_ids();
+    assert_failure_evidence(&db, shape, 1).await;
     assert!(!claimed.is_empty(), "the gate pass claims rows");
     fixture::record_probe_claimed(&db, &claimed)
         .await
@@ -952,13 +976,13 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
 
     run_drives(&db, shape, &settings, &ctx, &log).await;
     let second = running_target(&db, shape).await;
-    assert_eq!(second.github_run_id.as_deref(), Some("12345"));
+    assert_eq!(second.github_run_id.as_deref(), Some(run_id.as_str()));
+    assert_ne!(second.generation_id, first.generation_id);
+    assert_failure_evidence(&db, shape, 2).await;
     // The second pass's own transition — counted once more, on a
-    // fresh epoch: the re-arm steps `attempt` past whatever the last
-    // pass left (its requeue had already advanced it), so the two
-    // landings are distinct, not a `(task_id, attempt)` replay. The
-    // requeue's +1 rides on top, so strict increase is the form, not
-    // +1.
+    // fresh generation. The re-arm also steps `attempt` past whatever
+    // the last pass left; the requeue's +1 rides on top, so strict
+    // increase is the form, not +1.
     assert_eq!(
         running_outcomes(&db, shape).await,
         2,

@@ -8400,13 +8400,7 @@ mod sqlite_tests {
             .expect("claim fatal dependency");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].crate_name, "fatal-dep");
-        super::complete(
-            &db,
-            &report(&claimed[0].task_id, claimed[0].attempt, false),
-            TEST_WINDOW_MINUTES,
-        )
-        .await
-        .expect("fail fatal dependency");
+        fail_dependency_at_attempt(&db, "fatal-dep", super::MAX_BUILD_ATTEMPTS).await;
         assert_eq!(gate_counters(&db, "parent").await, (1, 0));
         assert_parent_status(&db, stow_types::api::QueueTaskStatus::Blocked).await;
 

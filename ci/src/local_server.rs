@@ -116,7 +116,7 @@ impl LocalServerState {
 
     fn allocate_run_id(&self) -> u64 {
         self.next_run_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("local workflow run id space exhausted")
     }
 
