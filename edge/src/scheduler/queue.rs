@@ -391,11 +391,28 @@ async fn apply_batched_updates(
     .await
 }
 
+/// Rows the last completed statement changed — SQLite's `changes()`
+/// counts the statement's own record writes only: index maintenance
+/// and trigger effects are excluded by definition, so unlike the
+/// backend's billed `rows_written` it names real row deltas (an
+/// `ON CONFLICT DO NOTHING` insert reports just the rows that
+/// landed). Read it as the statement immediately after the write —
+/// the synchronous backend runs them back to back, so nothing
+/// interleaves and the count belongs to the write.
+pub async fn changes(db: &DurableDb) -> Result<u64, QueueError> {
+    db.query("SELECT changes()")
+        .fetch_scalar::<u64>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("read changes(): {error}")))
+}
+
 /// `INSERT INTO queue` for the batch's first occurrences, one statement
 /// per slice; `ON CONFLICT DO NOTHING` is a belt under the Rust-side
 /// existence fold — a task another submit landed between the probe and
-/// the write stays untouched, and `rows_written` still counts exactly
-/// the rows this batch inserted.
+/// the write stays untouched, and `RETURNING` hands back exactly the
+/// rows the batch inserted — the logical record count the billed
+/// `rows_written` cannot give (it includes the identity index's
+/// writes).
 async fn apply_batched_inserts(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -403,7 +420,7 @@ async fn apply_batched_inserts(
 ) -> Result<u64, QueueError> {
     let mut inserted = 0u64;
     for chunk in inserts.chunks(ENQUEUE_JSON_BATCH_ROWS) {
-        let result = db
+        let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
                  (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, first_requested_at, deps_met, blocked, wake_at, dispatch_family, dispatch_key) \
@@ -413,7 +430,8 @@ async fn apply_batched_inserts(
                         1, datetime('now'), {deps_met}, {blocked}, {wake}, {family}, {key} \
                  FROM (SELECT value AS e FROM json_each(?)) \
                  WHERE TRUE \
-                 ON CONFLICT DO NOTHING",
+                 ON CONFLICT DO NOTHING \
+                 RETURNING task_id",
                 deps_met = deps_met_sql("e ->> 'task_id'"),
                 blocked = blocked_sql("e ->> 'task_id'"),
                 // `not_before` takes its epoch default, so the wake is
@@ -435,11 +453,11 @@ async fn apply_batched_inserts(
                 ),
             ))
             .bind(enqueue_json(chunk)?)
-            .execute()
+            .fetch_scalars::<String>()
             .await
             .map_err(|error| format!("insert tasks: {error}"))?;
         inserted = inserted
-            .checked_add(result.rows_written)
+            .checked_add(u64::try_from(inserted_rows.len()).unwrap_or(u64::MAX))
             .ok_or(QueueError::Overflow {
                 field: "inserted task count",
                 value: inserted,
@@ -3288,12 +3306,17 @@ pub async fn apply_mutation(
             format!("DELETE FROM queue WHERE status IN ('completed', 'failed') AND {predicate}")
         }
     };
-    let mut query = db.query(&sql);
+    // `RETURNING` hands back the rows the one statement mutated —
+    // the logical count the billed `rows_written` cannot give (index
+    // maintenance inflates it) — atomically inside the statement, so
+    // no extra round-trip exists to interpose.
+    let returning = format!("{sql} RETURNING task_id");
+    let mut query = db.query(&returning);
     for value in values {
         query = query.bind(value);
     }
-    let result = query
-        .execute()
+    let mutated = query
+        .fetch_scalars::<String>()
         .await
         .map_err(|error| format!("apply queue mutation: {error}"))?;
     if !dep_ids.is_empty() {
@@ -3304,7 +3327,10 @@ pub async fn apply_mutation(
         )
         .await?;
     }
-    u64_to_u32(result.rows_written, "mutated row count")
+    u64_to_u32(
+        u64::try_from(mutated.len()).unwrap_or(u64::MAX),
+        "mutated row count",
+    )
 }
 
 /// Operator view of the whole queue for `GET /admin/status`: lane depths,
@@ -5941,6 +5967,36 @@ mod sqlite_tests {
 
         assert_eq!(inserted, 1);
         assert_eq!(super::status(&db).await.expect("status").pending, 1);
+    }
+
+    /// `inserted` counts the records the submit landed — never the
+    /// backend's billed write rows, which include index maintenance:
+    /// a resync reports 0 and a mixed batch reports only its
+    /// newcomers.
+    #[tokio::test]
+    async fn a_submit_reports_only_the_records_it_inserted() {
+        let db = memory_db().await.expect("memory db");
+
+        let inserted = enqueue(
+            &db,
+            &[request("alpha", Vec::new()), request("beta", Vec::new())],
+        )
+        .await
+        .expect("enqueue pair");
+        assert_eq!(inserted, 2);
+
+        let resync = enqueue(&db, &[request("alpha", Vec::new())])
+            .await
+            .expect("resync");
+        assert_eq!(resync, 0, "a resync lands no new row");
+
+        let mixed = enqueue(
+            &db,
+            &[request("beta", Vec::new()), request("gamma", Vec::new())],
+        )
+        .await
+        .expect("mixed submit");
+        assert_eq!(mixed, 1, "only the newcomer counts");
     }
 
     #[tokio::test]

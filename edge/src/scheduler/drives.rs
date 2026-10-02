@@ -333,8 +333,15 @@ pub const DRIVES: &[Drive] = &[
                     },
                 )
                 .await
-                .map(|_| ())
                 .map_err(|error| error.to_string())
+                .and_then(|mutated| {
+                    // The selector names two failed rows — the reported
+                    // count is exactly the tasks updated, never billed
+                    // index or status-count writes.
+                    (mutated == 2)
+                        .then_some(())
+                        .ok_or_else(|| format!("retry mutated {mutated}, expected 2"))
+                })
             })
         },
     },
@@ -355,8 +362,12 @@ pub const DRIVES: &[Drive] = &[
                     },
                 )
                 .await
-                .map(|_| ())
                 .map_err(|error| error.to_string())
+                .and_then(|mutated| {
+                    (mutated == 2)
+                        .then_some(())
+                        .ok_or_else(|| format!("cancel mutated {mutated}, expected 2"))
+                })
             })
         },
     },
@@ -369,13 +380,21 @@ pub const DRIVES: &[Drive] = &[
                     settings,
                     QueueMutation::Promote,
                     &QueueSelector {
-                        task_ids: vec![hex_id(u64::from(FixtureShape::pending_row(703)))],
+                        // Row 4703 sits in the miss lane — the fixture's
+                        // human prefix ends at `HUMAN_LANE_ROWS`, and a
+                        // promote selects `lane = 'miss'`, so a smaller
+                        // pending id would silently match nothing.
+                        task_ids: vec![hex_id(u64::from(FixtureShape::pending_row(4703)))],
                         ..QueueSelector::default()
                     },
                 )
                 .await
-                .map(|_| ())
                 .map_err(|error| error.to_string())
+                .and_then(|mutated| {
+                    (mutated == 1)
+                        .then_some(())
+                        .ok_or_else(|| format!("promote mutated {mutated}, expected 1"))
+                })
             })
         },
     },
@@ -396,8 +415,12 @@ pub const DRIVES: &[Drive] = &[
                     },
                 )
                 .await
-                .map(|_| ())
                 .map_err(|error| error.to_string())
+                .and_then(|mutated| {
+                    (mutated == 2)
+                        .then_some(())
+                        .ok_or_else(|| format!("purge mutated {mutated}, expected 2"))
+                })
             })
         },
     },
@@ -528,10 +551,17 @@ pub const DRIVES: &[Drive] = &[
             let mut lifted = *settings;
             lifted.max_queue_pending = u32::MAX;
             Box::pin(async move {
+                // Every identity in the accept batch is new — the
+                // returned count is exactly the inserted records (the
+                // billed write count would include index writes).
                 queue::enqueue(db, &submit_accept_batch(shape), &lifted)
                     .await
-                    .map(|_| ())
                     .map_err(|error| error.to_string())
+                    .and_then(|inserted| {
+                        (inserted == 3)
+                            .then_some(())
+                            .ok_or_else(|| format!("accept submit inserted {inserted}, expected 3"))
+                    })
             })
         },
     },
@@ -539,10 +569,16 @@ pub const DRIVES: &[Drive] = &[
         name: "POST /admin/enqueue (trusted)",
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
+                // One resync + two new identities — the returned count
+                // is the new records only.
                 queue::enqueue_trusted(db, &submit_batch(shape), settings)
                     .await
-                    .map(|_| ())
                     .map_err(|error| error.to_string())
+                    .and_then(|inserted| {
+                        (inserted == 2).then_some(()).ok_or_else(|| {
+                            format!("trusted submit inserted {inserted}, expected 2")
+                        })
+                    })
             })
         },
     },
@@ -550,10 +586,16 @@ pub const DRIVES: &[Drive] = &[
         name: "POST /admin/enqueue (resubmit)",
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
+                // The same batch again lands nothing — the count must
+                // be zero, which billed index writes cannot fake.
                 queue::enqueue_trusted(db, &submit_batch(shape), settings)
                     .await
-                    .map(|_| ())
                     .map_err(|error| error.to_string())
+                    .and_then(|inserted| {
+                        (inserted == 0)
+                            .then_some(())
+                            .ok_or_else(|| format!("resubmit inserted {inserted}, expected 0"))
+                    })
             })
         },
     },

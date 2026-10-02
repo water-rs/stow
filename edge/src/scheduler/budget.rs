@@ -316,7 +316,7 @@ async fn run_seed_step(
         .map_err(|error| QueueError::Sql(format!("reset {table}: {error}")))?;
         let counted = fixture::CountedTable::for_table(table);
         if let Some(table) = counted {
-            counts.subtract(table, fixture::changes(db).await?)?;
+            counts.subtract(table, super::queue::changes(db).await?)?;
         }
         // A counted table's emptiness is read straight off its counter —
         // the wipe's own DELETEs keep it exact; an uncounted table asks

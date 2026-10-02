@@ -245,18 +245,6 @@ impl SeedCounts {
     }
 }
 
-/// Rows the last completed statement changed — SQLite's `changes()`
-/// counts the statement's own record writes only: index maintenance
-/// and trigger effects are excluded by definition, so unlike the
-/// backend's billed `rows_written` it names real row deltas (an `OR
-/// IGNORE` insert reports just the rows that landed).
-pub async fn changes(db: &DurableDb) -> Result<u64, QueueError> {
-    db.query("SELECT changes()")
-        .fetch_scalar::<u64>()
-        .await
-        .map_err(|error| QueueError::Sql(format!("read changes(): {error}")))
-}
-
 /// Which stretch of the fixture a seeder call writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedPhase {
@@ -494,7 +482,7 @@ pub async fn seed_edges_chunk(
     // The `OR IGNORE` makes the actual insert count a measured value,
     // not `(hi - lo)` — deps an earlier owner already wrote are
     // skipped.
-    changes(db).await
+    crate::scheduler::queue::changes(db).await
 }
 
 /// Seed the published-slice membership of completed rows `(lo, hi]` —
