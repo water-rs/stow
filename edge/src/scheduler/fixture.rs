@@ -48,8 +48,9 @@ use crate::errors::QueueError;
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
 
 /// Rows one crate name covers — the fixture's pinned per-name bound.
-/// `'crate' || (n / CRATE_NAME_ROWS)` gives every name exactly
-/// `CRATE_NAME_ROWS` rows at any `queue_rows`, so a `crate_name =`
+/// `'crate' || (n / CRATE_NAME_ROWS)` bounds every name to at most
+/// `CRATE_NAME_ROWS` rows at any `queue_rows` — `n` starts at 1, so
+/// `crate0` and the final bucket can be short — so a `crate_name =`
 /// probe (`GET /tasks?crate=` sizes its budget by it) reads a
 /// size-invariant cardinality at 10k, 100k and 1M instead of growing
 /// with the table.
@@ -70,6 +71,44 @@ fn target_case_sql(expr: &str) -> String {
     let mut arms = String::new();
     for (index, target) in CI_TARGET_TRIPLES.iter().enumerate() {
         let _ = write!(arms, "WHEN {index} THEN '{target}' ");
+    }
+    format!("CASE ({expr}) % {} {arms}END", target_count())
+}
+
+/// `dep_invocation_mask(triple, false)` per CI target, evaluated in
+/// Rust so the CASE constants are production's own rule — the
+/// target-side arm of `dep_edge_requirements` and the non-host side of
+/// the owner's mask. (The host-owner arm is the literal `3` the
+/// callers add: a host-side task's mask is not a function of its
+/// target.)
+fn target_mask_case(expr: &str) -> String {
+    use std::fmt::Write as _;
+    let mut arms = String::new();
+    for (index, target) in CI_TARGET_TRIPLES.iter().enumerate() {
+        let _ = write!(
+            arms,
+            "WHEN {index} THEN {} ",
+            crate::scheduler::queue::dep_invocation_mask(target, false)
+        );
+    }
+    format!("CASE ({expr}) % {} {arms}END", target_count())
+}
+
+/// The invocation spelling a target-side node's own build runs —
+/// `UnitInvocation::for_task` on the node's target against its
+/// family's host triple — as a per-target CASE, matching the
+/// invocation `required_unit_shapes` takes.
+fn target_invocation_case(expr: &str) -> String {
+    use std::fmt::Write as _;
+    let mut arms = String::new();
+    for (index, target) in CI_TARGET_TRIPLES.iter().enumerate() {
+        let invocation = stow_types::api::runner_family(target).map_or(
+            stow_types::public_cache::UnitInvocation::Native,
+            |family| {
+                stow_types::public_cache::UnitInvocation::for_task(target, family.host_triple())
+            },
+        );
+        let _ = write!(arms, "WHEN {index} THEN {} ", invocation.to_int());
     }
     format!("CASE ({expr}) % {} {arms}END", target_count())
 }
@@ -287,8 +326,8 @@ fn seq_sql(lo: u32, hi: u32) -> String {
 /// queue's UNIQUE identity holds at any `queue_rows`; under 20000 rows
 /// the version still reads `1.0.x`, the shape the drives and the
 /// 20k/100k runs were written against. The name groups a bounded
-/// version set: `n / CRATE_NAME_ROWS` pins every `crate_name` to
-/// `CRATE_NAME_ROWS` rows at any size (see the constant).
+/// version set: `n / CRATE_NAME_ROWS` bounds every `crate_name` to at
+/// most `CRATE_NAME_ROWS` rows at any size (see the constant).
 pub async fn seed_queue_chunk(
     db: &DurableDb,
     shape: FixtureShape,
@@ -398,8 +437,7 @@ pub async fn seed_edges_chunk(
         SeedPhase::EdgesEvery => (
             format!(
                 "CASE WHEN n > {human_pin} AND n <= {human_end} \
-                 THEN {completed_dep} + (n % 64) \
-                 ELSE (n * 7919) % {rows} + 1 END"
+                 THEN {completed_dep} + (n % 64) ELSE (n * 7919) % {rows} + 1 END"
             ),
             "",
         ),
@@ -409,7 +447,27 @@ pub async fn seed_edges_chunk(
         ),
         _ => return Err(QueueError::Sql("not an edge phase".to_owned())),
     };
-    let dep_target_case = target_case_sql(&dep_expr);
+    // `dep` is the dep row's `n` as one parenthesized unit — spliced
+    // next to an operator it must evaluate as a whole, or the outer
+    // operator binds into the expression's last term (`%` and `/`
+    // bind tighter than `+`, so an arm like `X % rows + 1` would
+    // otherwise evaluate the outer operator against `1` first).
+    let dep = format!("({dep_expr})");
+    let dep_target_case = target_case_sql(&dep);
+    // The edge's side and requirement columns are the same inputs
+    // production's `dep_edge_requirements` reads, evaluated as CASEs:
+    // `dep_host_side` is the dep row's own side (`n % 10 = 0` is the
+    // fixture's host arm); a host-side dep needs the owner's
+    // invocation mask and its popcount (a host owner's mask covers
+    // both spellings — 3, popcount 2 — a target owner's one spelling,
+    // popcount 1); a target-side dep needs its own target's mask and
+    // its two linked/unlinked shapes. No production edge carries the
+    // old `(0, 1, 1)` literals.
+    let owner_mask = format!(
+        "CASE WHEN n % 10 = 0 THEN 3 ELSE {} END",
+        target_mask_case("n")
+    );
+    let dep_mask = target_mask_case(&dep);
     db.query(&format!(
         "WITH RECURSIVE seq(n) AS ({seq}) \
          INSERT OR IGNORE INTO queue_dependencies \
@@ -417,13 +475,16 @@ pub async fn seed_edges_chunk(
               dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, \
               dep_side_known) \
          SELECT printf('%064x', n), \
-                printf('%064x', {dep_expr}), \
-                'crate' || ({dep_expr} / {CRATE_NAME_ROWS}), \
-                '1.' || (({dep_expr}) / 20000) || '.' || ({dep_expr} % 500), \
+                printf('%064x', {dep}), \
+                'crate' || ({dep} / {CRATE_NAME_ROWS}), \
+                '1.' || ({dep} / 20000) || '.' || ({dep} % 500), \
                 '[]', \
                 {dep_target_case}, \
-                CASE WHEN {dep_expr} % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                0, 1, 1, 1 \
+                CASE WHEN {dep} % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
+                CASE WHEN {dep} % 10 = 0 THEN 1 ELSE 0 END, \
+                CASE WHEN {dep} % 10 = 0 THEN ({owner_mask}) ELSE ({dep_mask}) END, \
+                CASE WHEN {dep} % 10 = 0 THEN CASE WHEN n % 10 = 0 THEN 2 ELSE 1 END ELSE 2 END, \
+                1 \
          FROM seq {extra}",
         seq = seq_sql(lo, hi),
     ))
@@ -437,10 +498,15 @@ pub async fn seed_edges_chunk(
 }
 
 /// Seed the published-slice membership of completed rows `(lo, hi]` —
-/// the identity columns are the row's own `n` formula, so the chunk
-/// reads nothing outside its range.
+/// two rows per node, the pair `required_unit_shapes` publishes for
+/// it: a host-side node (`n % 10 = 0`, the fixture's host arm)
+/// carries the linked unit under both invocation spellings, and a
+/// target-side node carries the unlinked and linked units at its own
+/// invocation — the spelling `UnitInvocation::for_task` assigns its
+/// target on the family's host. The `part` join enumerates the pair.
 pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), QueueError> {
     let target_case = target_case_sql("n");
+    let node_invocation = target_invocation_case("n");
     db.query(&format!(
         "WITH RECURSIVE seq(n) AS ({seq}) \
          INSERT OR IGNORE INTO published_slice_rows \
@@ -448,8 +514,11 @@ pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), Qu
               unit_side, unit_invocation, unit_linked) \
          SELECT {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                1, 'crate' || (n / {CRATE_NAME_ROWS}), '1.' || (n / 20000) || '.' || (n % 500), '[]', 0, 0, 1 \
-         FROM seq",
+                1, 'crate' || (n / {CRATE_NAME_ROWS}), '1.' || (n / 20000) || '.' || (n % 500), '[]', \
+                CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
+                CASE WHEN n % 10 = 0 THEN part ELSE {node_invocation} END, \
+                CASE WHEN n % 10 = 0 THEN 1 ELSE part END \
+         FROM seq, (SELECT 0 AS part UNION ALL SELECT 1 AS part)",
         seq = seq_sql(lo, hi),
     ))
     .execute()
@@ -728,7 +797,211 @@ mod tests {
             .fetch_scalar()
             .await
             .expect("count");
-        assert_eq!(rows, 100, "a replayed slice chunk adds nothing");
+        // Two stored rows per node — the `required_unit_shapes` pair.
+        assert_eq!(rows, 200, "a replayed slice chunk adds nothing");
+    }
+
+    /// One edge joined to its owner and dep queue rows — the stored
+    /// requirement columns against the facts production computes them
+    /// from.
+    #[derive(Debug, skyzen::FromRow)]
+    struct EdgeRequirement {
+        owner_target: String,
+        owner_side: i64,
+        dep_target: String,
+        dep_side: i64,
+        stored_side: i64,
+        invocations: i64,
+        shapes: i64,
+    }
+    /// One stored slice row joined to its node's queue facts.
+    #[derive(Debug, skyzen::FromRow)]
+    struct SliceMembership {
+        target: String,
+        host_side: i64,
+        unit_side: i64,
+        unit_invocation: i64,
+        unit_linked: i64,
+    }
+
+    /// A node's invocation spelling — `for_task` on its target against
+    /// the family's host triple, the same input `required_unit_shapes`
+    /// takes.
+    fn node_invocation(target: &str) -> stow_types::public_cache::UnitInvocation {
+        stow_types::api::runner_family(target).map_or(
+            stow_types::public_cache::UnitInvocation::Native,
+            |family| {
+                stow_types::public_cache::UnitInvocation::for_task(target, family.host_triple())
+            },
+        )
+    }
+
+    /// The seeded fixture's three consistency sweeps — edge identity
+    /// against the joined queue row, edge requirements against
+    /// production's `dep_edge_requirements`, and slice membership
+    /// against `required_unit_shapes` — run once per test phase so a
+    /// chunk replay is checked against the same contract as the fresh
+    /// seed.
+    async fn assert_edge_fixture(db: &DurableDb, label: &str) {
+        assert_edge_identity(db, label).await;
+        assert_edge_requirements(db, label).await;
+        assert_slice_membership(db, label).await;
+    }
+
+    /// Every stored dep column equals the row `depends_on_task_id`
+    /// joins to — stored values compared, never the formula that
+    /// generated them.
+    async fn assert_edge_identity(db: &DurableDb, label: &str) {
+        const MISMATCH: &str = "SELECT count(*) FROM queue_dependencies d \
+            JOIN queue q ON q.task_id = d.depends_on_task_id WHERE ";
+        // Identity: every stored dep column equals the row
+        // `depends_on_task_id` joins to — stored values compared,
+        // never the formula that generated them.
+        for (column, pair) in [
+            ("crate", "d.dep_crate_name != q.crate_name"),
+            ("version", "d.dep_version != q.version"),
+            ("features", "d.dep_features_json != q.features_json"),
+            ("target", "d.dep_target != q.target"),
+            ("rustc", "d.dep_rustc_version != q.rustc_version"),
+            ("host_side", "d.dep_host_side != q.host_side"),
+        ] {
+            let mismatches: i64 = db
+                .query(&format!("{MISMATCH} {pair}"))
+                .fetch_scalar()
+                .await
+                .expect("join");
+            assert_eq!(mismatches, 0, "{label} {column} mismatches");
+        }
+    }
+
+    /// `dep_invocations`/`dep_shapes` equal production's
+    /// `dep_edge_requirements` over the joined owner/dep facts —
+    /// every edge class present: host and target deps, native and
+    /// cross invocation families, both owner sides (no edge carries
+    /// `(1, 1)`).
+    async fn assert_edge_requirements(db: &DurableDb, label: &str) {
+        let edges = db
+            .query(
+                "SELECT o.target AS owner_target, o.host_side AS owner_side, \
+                        d.target AS dep_target, d.host_side AS dep_side, \
+                        e.dep_host_side AS stored_side, \
+                        e.dep_invocations AS invocations, e.dep_shapes AS shapes \
+                 FROM queue_dependencies e \
+                 JOIN queue o ON o.task_id = e.task_id \
+                 JOIN queue d ON d.task_id = e.depends_on_task_id",
+            )
+            .fetch_all::<EdgeRequirement>()
+            .await
+            .expect("edge requirements");
+        assert!(!edges.is_empty(), "{label}: no edges joined");
+        for edge in &edges {
+            assert_eq!(edge.stored_side, edge.dep_side, "{label}: stored side");
+            assert_eq!(
+                (edge.invocations, edge.shapes),
+                crate::scheduler::queue::dep_edge_requirements(
+                    &edge.owner_target,
+                    edge.owner_side != 0,
+                    &edge.dep_target,
+                    edge.dep_side != 0,
+                ),
+                "{label}: requirements for {} dep {} (owner {})",
+                edge.dep_side,
+                edge.dep_target,
+                edge.owner_target,
+            );
+        }
+    }
+
+    /// Every stored slice row is one of its node's
+    /// `required_unit_shapes`, and every completed node carries its
+    /// full pair — a node missing either shape is the probe, not the
+    /// fixture's noise.
+    async fn assert_slice_membership(db: &DurableDb, label: &str) {
+        let membership = db
+            .query(
+                "SELECT s.target AS target, q.host_side AS host_side, \
+                        s.unit_side AS unit_side, s.unit_invocation AS unit_invocation, \
+                        s.unit_linked AS unit_linked \
+                 FROM published_slice_rows s \
+                 JOIN queue q ON q.crate_name = s.crate_name AND q.version = s.version \
+                    AND q.features_json = s.features_json AND q.target = s.target \
+                    AND q.rustc_version = s.rustc_version",
+            )
+            .fetch_all::<SliceMembership>()
+            .await
+            .expect("slice membership");
+        assert!(!membership.is_empty(), "{label}: no slice rows joined");
+        for row in &membership {
+            let invocation = node_invocation(&row.target);
+            let covered =
+                stow_types::public_cache::required_unit_shapes(row.host_side != 0, invocation)
+                    .iter()
+                    .any(|shape| {
+                        shape.side.to_int() == row.unit_side
+                            && shape.invocation.to_int() == row.unit_invocation
+                            && shape.kind.to_int() == row.unit_linked
+                    });
+            assert!(
+                covered,
+                "{label}: slice row ({},{},{}) of {} (host_side={}) is no required shape",
+                row.unit_side, row.unit_invocation, row.unit_linked, row.target, row.host_side,
+            );
+        }
+        let incomplete: i64 = db
+            .query(
+                "SELECT COUNT(*) FROM (\
+                    SELECT q.task_id FROM queue q \
+                    LEFT JOIN published_slice_rows s \
+                      ON s.crate_name = q.crate_name AND s.version = q.version \
+                     AND s.features_json = q.features_json AND s.target = q.target \
+                     AND s.rustc_version = q.rustc_version \
+                    WHERE q.status = 'completed' \
+                    GROUP BY q.task_id HAVING COUNT(*) != 2)",
+            )
+            .fetch_scalar()
+            .await
+            .expect("slice completeness");
+        assert_eq!(incomplete, 0, "{label}: completed nodes missing shapes");
+    }
+
+    /// The dep_* columns cache the dependency row's own identity — the
+    /// values the `queue` seed wrote at the dep's `n`. Every seeded
+    /// edge joins its `depends_on_task_id` to that row and must agree
+    /// on every identity column; a mismatch means the edge formula
+    /// stopped mirroring the row formula (an unparenthesized splice,
+    /// a literal where the row varies). Covered for both edge phases
+    /// and across a replay, which must add nothing and break nothing.
+    #[tokio::test]
+    async fn edge_dep_identity_matches_the_dependency_row() {
+        let db = memory_db().await.expect("memory db");
+        let shape = FixtureShape { queue_rows: 4_000 };
+        seed_queue_chunk(&db, shape, 0, shape.queue_rows, 0)
+            .await
+            .expect("queue rows");
+        seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, shape.queue_rows)
+            .await
+            .expect("every edges");
+        seed_edges_chunk(&db, shape, SeedPhase::EdgesThirds, 0, shape.queue_rows)
+            .await
+            .expect("thirds edges");
+        seed_slice_chunk(&db, shape.pending_end(), shape.completed_end())
+            .await
+            .expect("slice rows");
+
+        assert_edge_fixture(&db, "fresh every+thirds+slices").await;
+
+        // Replay an overlapping chunk of each phase — OR IGNORE makes
+        // the re-run a no-op, so the checks stay clean.
+        seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 1_000, 3_000)
+            .await
+            .expect("every replay");
+        seed_edges_chunk(&db, shape, SeedPhase::EdgesThirds, 1_000, 3_000)
+            .await
+            .expect("thirds replay");
+        seed_slice_chunk(&db, shape.pending_end() + 500, shape.completed_end() - 500)
+            .await
+            .expect("slice replay");
+        assert_edge_fixture(&db, "replayed").await;
     }
 
     /// The `GET /tasks?crate=` drive's probe reads a name's pinned

@@ -3660,7 +3660,7 @@ async fn earliest_active_lease_expiry_ms(
 /// host-side task runs every phase both natively and under `--target`
 /// (its deps are host units under either spelling); a target-side task
 /// runs the one spelling its target implies.
-fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
+pub fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
     if owner_host_side {
         return 0b11;
     }
@@ -3679,7 +3679,7 @@ fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
 /// build does. A target-side dep edge needs both kinds at the dep
 /// node's own invocation spelling — the only one a target task
 /// produces.
-fn dep_edge_requirements(
+pub fn dep_edge_requirements(
     owner_target: &str,
     owner_host_side: bool,
     dep_target: &str,

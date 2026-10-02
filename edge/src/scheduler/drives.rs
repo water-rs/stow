@@ -21,7 +21,7 @@ use stow_types::api::{
     QueueTaskStatus,
 };
 use stow_types::identity::FeaturesJson;
-use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+use stow_types::public_cache::{UnitInvocation, UnitShape};
 
 use super::fixture::FixtureShape;
 use super::queue::{self, QueueMutation, SchedulerSettings};
@@ -722,9 +722,9 @@ use stow_types::fixture::task_hex_id as hex_id;
 
 /// The crate identity a queue row carries — the same formulas the seed
 /// SQL uses, kept in one place so a drive always names a real row. The
-/// pair is injective in `n` at any fixture size; the name is a pinned
-/// `CRATE_NAME_ROWS` version set (see fixture), so a `crate_name =`
-/// probe's cardinality cannot grow with the table.
+/// pair is injective in `n` at any fixture size; the name's version
+/// set is bounded at `CRATE_NAME_ROWS` (see fixture), so a
+/// `crate_name =` probe's cardinality cannot grow with the table.
 fn crate_identity(n: u32) -> (String, String) {
     (
         format!("crate{}", n / super::fixture::CRATE_NAME_ROWS),
@@ -904,53 +904,76 @@ fn dep_request(n: u32) -> EnqueueDependency {
     }
 }
 
-/// The report's unit shape — every published row serves the target-side
-/// linked unit of a native invocation.
-const GATE_UNIT: Option<UnitShape> = Some(UnitShape {
-    side: UnitSide::Target,
-    invocation: UnitInvocation::Native,
-    kind: UnitKind::Linked,
-});
+/// A node's published membership — production's `required_unit_shapes`
+/// at the node's own side and the invocation `for_task` assigns its
+/// target on the family's host triple.
+fn node_shapes(host_side: bool, target: &str) -> Vec<UnitShape> {
+    let invocation = stow_types::api::runner_family(target)
+        .map_or(UnitInvocation::Native, |family| {
+            UnitInvocation::for_task(target, family.host_triple())
+        });
+    stow_types::public_cache::required_unit_shapes(host_side, invocation)
+}
 
 /// The full-report drive's slice: a held-size membership (100 rows) on
 /// a dedicated slice — `CI_TARGET_TRIPLES[8]` / `9.9.9` — that the seed
 /// never writes, so the same report shape applies at both fixture
-/// sizes.
+/// sizes. Fifty identities carry both rows of their
+/// `required_unit_shapes`, the membership a genuinely completed node
+/// publishes.
 fn full_slice_report() -> Vec<PublishedSliceRow> {
-    (0..100)
-        .map(|i| PublishedSliceRow {
-            crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
-            version: "1.0.0".parse().expect("full version"),
-            features_json: FeaturesJson::default(),
-            unit_shape: GATE_UNIT,
+    let target = stow_types::api::CI_TARGET_TRIPLES[8];
+    (0..50)
+        .flat_map(|i| {
+            node_shapes(false, target)
+                .into_iter()
+                .map(move |shape| PublishedSliceRow {
+                    crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
+                    version: "1.0.0".parse().expect("full version"),
+                    features_json: FeaturesJson::default(),
+                    unit_shape: Some(shape),
+                })
         })
         .collect()
 }
 
-/// The delta report for `(CI_TARGET_TRIPLES[0], '1.85.0')`: retire the
-/// slice's [`DELTA_ROWS`] tail members and add as many fresh rows — a
-/// `2 * DELTA_ROWS` change set. The fixture's live members are the
-/// completed rows whose `n % 9` lands on that target — `n % 9 == 0`
-/// implies `n % 3 == 0`, the `1.85.0` rustc arm.
+/// The delta report for `(CI_TARGET_TRIPLES[0], '1.85.0')`: retire one
+/// required shape row of each of the slice's [`DELTA_ROWS`] tail
+/// members and add as many fresh rows (`DELTA_ROWS / 2` identities ×
+/// their two shapes) — a `2 * DELTA_ROWS` change set. Every retired
+/// row is one the fixture actually stores for that node — its first
+/// `required_unit_shapes` entry — so each retire leaves a real node
+/// partially published, the missing-shape probe the dependent refresh
+/// measures; it is never a shape nobody published. The fixture's live
+/// members are the completed rows whose `n % 9` lands on that target —
+/// `n % 9 == 0` implies `n % 3 == 0`, the `1.85.0` rustc arm.
 fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<PublishedSliceRow>) {
     let live = shape.slice_live_rows(0);
     let first = shape.slice_first_row(0);
+    let target = stow_types::api::CI_TARGET_TRIPLES[0];
     let mut retired = Vec::new();
     let mut added = Vec::new();
     for i in 0..DELTA_ROWS {
-        let (crate_name, version) = crate_identity(first + (live - 1 - i) * 9);
+        let n = first + (live - 1 - i) * 9;
+        let (crate_name, version) = crate_identity(n);
         retired.push(PublishedSliceRow {
             crate_name: crate_name.parse().expect("retire crate"),
             version: version.parse().expect("retire version"),
             features_json: FeaturesJson::default(),
-            unit_shape: GATE_UNIT,
+            unit_shape: Some(node_shapes(n.is_multiple_of(10), target)[0]),
         });
-        added.push(PublishedSliceRow {
-            crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
-            version: "9.9.9".parse().expect("delta version"),
-            features_json: FeaturesJson::default(),
-            unit_shape: GATE_UNIT,
-        });
+    }
+    for i in 0..DELTA_ROWS / 2 {
+        added.extend(
+            node_shapes(false, target)
+                .into_iter()
+                .map(|shape| PublishedSliceRow {
+                    crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
+                    version: "9.9.9".parse().expect("delta version"),
+                    features_json: FeaturesJson::default(),
+                    unit_shape: Some(shape),
+                }),
+        );
     }
     (added, retired)
 }

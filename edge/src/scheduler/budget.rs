@@ -360,9 +360,11 @@ async fn run_seed_step(
         Some(fixture::CountedTable::Queue) => {
             counts.set(fixture::CountedTable::Queue, u64::from(phase_n));
         }
+        // Two stored rows per completed node — the `required_unit_shapes`
+        // pair the slice seed publishes.
         Some(fixture::CountedTable::Slices) => counts.set(
             fixture::CountedTable::Slices,
-            u64::from(phase_n - shape.pending_end()),
+            u64::from(phase_n - shape.pending_end()) * 2,
         ),
         // `changes()`-tracked: `OR IGNORE` skips deps another owner
         // already wrote, so inserts are a measured delta, not a range.
