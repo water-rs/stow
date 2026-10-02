@@ -442,17 +442,14 @@ async fn apply_batched_inserts(
     settings: &SchedulerSettings,
     inserts: &[BatchedInsert],
 ) -> Result<u64, QueueError> {
-    // Each new owner's readiness is probed once per edge — the same
-    // unpublished/blocker predicates `deps_met`/`blocked` answered as
-    // two per-row EXISTS (the trusted submit's QUEUE INSERT paid the
-    // membership subquery twice per edge). The flag query returns one
-    // typed row per stored edge of this chunk's owners and Rust folds
-    // them into the flags the INSERT then reads straight off the
-    // payload, so nothing aggregates or re-evaluates them. An owner
-    // with no edge row yields no flag row: `blocked` edges are a subset
-    // of `unmet` edges, so zero unmet proves unblocked — the row is
-    // born (deps_met=1, blocked=0).
-    let unpub = dep_edge_unpublished_sql("d");
+    // Each owner's stored edge flags are folded once in Rust, then the
+    // direct INSERT reads the resulting counter and booleans from its
+    // payload. `dep_met` was initialized by dependency insertion, so
+    // this probe only reads the persisted flag; it never repeats the
+    // signed-slice membership query. An owner with no edge row yields no
+    // flag row: zero unmet proves unblocked — the row is born
+    // (unpublished_deps=0, deps_met=1, blocked=0).
+    let unpub = "d.dep_met = 0";
     let mut inserted = 0u64;
     for chunk in inserts.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         let owners: Vec<&str> = chunk.iter().map(|insert| insert.task_id.as_str()).collect();
@@ -2050,15 +2047,10 @@ async fn request_record_status(
 /// shapeless dep stays gated until the node republishes — legacy rows
 /// are unreachable under this lookup, never migrated into it.
 pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
-    // The live-generation check is a scalar lookup on the slice's
-    // primary key: `published_slices` is keyed `(target,
-    // rustc_version)`, so the subquery returns at most one row; a
-    // missing slice marker yields NULL, which matches no generation —
-    // the same empty result the JOIN produced.
-    // The live generation is a scalar probe on the slice marker's
-    // (target, rustc_version) key rather than a `published_slices` join:
-    // joined, the planner scans the marker table once per edge this
-    // predicate evaluates, and every marker row bills a read.
+    // The live generation is a scalar lookup on the slice marker's
+    // primary key `(target, rustc_version)`, so each edge probes one
+    // marker row instead of joining the marker table. A missing marker
+    // yields NULL and therefore matches no published generation.
     dep_edge_unpublished_sql_at(
         dep,
         &format!(
@@ -4339,7 +4331,9 @@ async fn apply_slice_gate_delta(
     //    stored flag. Join the unique owner payload directly to the
     //    target: a second owner lookup and materialization would read
     //    the same row again just to assign these expressions. Net-zero
-    //    owners still refresh blocked from the changed edge flags.
+    //    owners still refresh blocked from the changed edge flags. When
+    //    the new counter is zero, every edge is met, so blocked is
+    //    provably zero and the failed-dependency probe is unnecessary.
     let mut deltas = std::collections::BTreeMap::<String, i64>::new();
     for edge in &flipped {
         *deltas.entry(edge.task_id.clone()).or_default() += 1 - 2 * edge.dep_met;
@@ -4355,7 +4349,9 @@ async fn apply_slice_gate_delta(
         "UPDATE queue \
          SET unpublished_deps = queue.unpublished_deps + j.delta, \
              deps_met = (queue.unpublished_deps + j.delta = 0), \
-             blocked = CASE WHEN queue.status = 'pending' THEN {blocked} ELSE queue.blocked END \
+             blocked = CASE WHEN queue.status != 'pending' THEN queue.blocked \
+                            WHEN queue.unpublished_deps + j.delta = 0 THEN 0 \
+                            ELSE {blocked} END \
          FROM (SELECT value ->> 'owner' AS owner, value ->> 'delta' AS delta \
                FROM json_each(?)) AS j \
          WHERE queue.task_id = j.owner",
@@ -5618,6 +5614,32 @@ mod sqlite_tests {
         super::enqueue(db, requests, &settings()).await
     }
 
+    #[derive(skyzen::FromRow)]
+    struct PairEdgeFlag {
+        dep_crate_name: String,
+        dep_met: i64,
+    }
+
+    async fn assert_pair_flags_after_publication(db: &DurableDb) {
+        let pair_flags = db
+            .query(
+                "SELECT dep_crate_name, dep_met FROM queue_dependencies \
+                 WHERE task_id = ? ORDER BY dep_crate_name",
+            )
+            .bind(task_id_on("pair", TARGET))
+            .fetch_all::<PairEdgeFlag>()
+            .await
+            .expect("read pair edge flags after publication")
+            .into_iter()
+            .map(|edge| (edge.dep_crate_name, edge.dep_met))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pair_flags,
+            vec![("dep-fpub".to_owned(), 1), ("dep-short".to_owned(), 0)],
+            "real publication initializes the fabricated pair edges"
+        );
+    }
+
     /// An artifact catalog that covers nothing: every claim goes to a
     /// build, as before claim-time retirement existed.
     struct NoCoverage;
@@ -6302,14 +6324,6 @@ mod sqlite_tests {
     async fn a_submit_gates_each_new_task_on_its_published_deps() {
         let db = memory_db().await.expect("memory db");
 
-        // One slice report serves `dep-met` at both shapes a native
-        // target dep requires — (Target, Native, Linked) and (…,
-        // Unlinked) — and `dep-short` at only the linked one. The
-        // report replaces a (target, rustc) slice's membership
-        // wholesale, so two `publish` calls would drop one crate.
-        super::record_published_slice(&db, TARGET, RUSTC, None, None, &gate_pub_rows(), &[])
-            .await
-            .expect("record shared published slice");
         // `dep-failed` is queued, failed and unpublished — but naming
         // it revives the row to `pending` inside the same submit (the
         // requeue lands with the edge sync, before the insert
@@ -6374,6 +6388,15 @@ mod sqlite_tests {
             .await
             .expect("seed known-side edge");
         }
+
+        // One slice report serves `dep-met` and `dep-fpub` at both shapes
+        // a native target dep requires, and `dep-short` at only the linked
+        // shape. Publish it after the fabricated edges exist so the real
+        // slice-delta path initializes the persisted `dep_met` flags.
+        super::record_published_slice(&db, TARGET, RUSTC, None, None, &gate_pub_rows(), &[])
+            .await
+            .expect("record shared published slice");
+        assert_pair_flags_after_publication(&db).await;
 
         let inserted = enqueue(
             &db,
@@ -7669,6 +7692,8 @@ mod sqlite_tests {
         )
         .await
         .expect("fail dep");
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+        assert_eq!(super::status(&db).await.expect("status").blocked, 1);
 
         // The dependency is retried and this time succeeds — but the
         // dependent still waits for the slice that serves it.
@@ -7701,6 +7726,12 @@ mod sqlite_tests {
         assert!(claimed.is_empty(), "completed is still not servable");
 
         publish(&db, "dep").await;
+        assert_eq!(
+            gate_counters(&db, "parent").await,
+            (0, 1),
+            "publishing the only unmet edge reaches the counter-zero fast path"
+        );
+        assert_eq!(super::status(&db).await.expect("status").blocked, 0);
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim parent after publish");
