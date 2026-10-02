@@ -1017,13 +1017,14 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
 /// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
 /// `wall_ms` covers the concurrent `trigger_build` fan-out and the
 /// counted-D1 coverage lookups a real wake pays. Returns the claimed
-/// task count.
+/// task ids — the probe's claim record and the launch gate's claim
+/// count both derive from the pass's own set.
 pub(super) async fn dispatch_pass(
     env: &WasmEnv,
     db: &DurableDb,
     settings: &SchedulerSettings,
     coverage: &impl queue::CoverageOracle,
-) -> Result<usize> {
+) -> Result<Vec<String>> {
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
@@ -1037,9 +1038,9 @@ pub(super) async fn dispatch_pass(
         "scheduler dispatch_pending selected tasks"
     );
     if tasks.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    let claimed = tasks.len();
+    let task_ids: Vec<String> = tasks.iter().map(|task| task.task_id.clone()).collect();
 
     // The credential resolves once per pass, only when tasks exist: the
     // local-CI branch carries no Authorization; the GitHub branch reuses
@@ -1068,7 +1069,7 @@ pub(super) async fn dispatch_pass(
                         .map_err(to_error)?;
                         tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
                     }
-                    return Ok(claimed);
+                    return Ok(task_ids);
                 }
             }
         }
@@ -1110,7 +1111,7 @@ pub(super) async fn dispatch_pass(
         }
     }
 
-    Ok(claimed)
+    Ok(task_ids)
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {

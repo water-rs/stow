@@ -304,10 +304,45 @@ fn seq_sql(lo: u32, hi: u32) -> String {
     format!("SELECT {lo} + 1 UNION ALL SELECT n + 1 FROM seq WHERE n < {hi}")
 }
 
-/// Seed `queue` rows `(lo, hi]` — every column a pure function of `n`,
-/// including the `dispatch_key` the claim walk orders on and the
-/// `wake_at` the alarm probes read (computed under the same
-/// `dispatch_min_age_minutes` the deploy runs).
+/// The `queue` columns the seed writes, in statement order — shared
+/// between the chunk INSERT and the re-arm upsert so both address the
+/// same list (`task_id` is the conflict key, never an update target).
+const QUEUE_SEED_COLUMNS: &[&str] = &[
+    "task_id",
+    "crate_name",
+    "version",
+    "features_json",
+    "target",
+    "rustc_version",
+    "downloads",
+    "miss_count",
+    "request_count",
+    "priority",
+    "status",
+    "lane",
+    "dispatch_attempts",
+    "not_before",
+    "first_requested_at",
+    "created_at",
+    "updated_at",
+    "host_side",
+    "preserve_lockfile",
+    "attempt",
+    "shape_requeue",
+    "github_run_id",
+    "deps_met",
+    "wake_at",
+    "dispatch_family",
+    "dispatch_key",
+];
+
+/// Build the seed's queue statement over an arbitrary `seq` source:
+/// every column a pure function of `n`, including the `dispatch_key`
+/// the claim walk orders on and the `wake_at` the alarm probes read
+/// (computed under the same `dispatch_min_age_minutes` the deploy runs).
+/// `verb` distinguishes the idempotent seed (`INSERT OR IGNORE`) from
+/// the restore (`INSERT`), and `conflict` carries the upsert clause —
+/// empty for the seed.
 ///
 /// `(crate, version)` is injective in `n` — `n / 20000` carries the
 /// quotient in the version and `n % 500` its low digits — so the
@@ -316,13 +351,13 @@ fn seq_sql(lo: u32, hi: u32) -> String {
 /// 20k/100k runs were written against. The name groups a bounded
 /// version set: `n / CRATE_NAME_ROWS` bounds every `crate_name` to at
 /// most `CRATE_NAME_ROWS` rows at any size (see the constant).
-pub async fn seed_queue_chunk(
-    db: &DurableDb,
+fn queue_seed_insert_sql(
     shape: FixtureShape,
-    lo: u32,
-    hi: u32,
+    seq_source: &str,
     min_age_minutes: u32,
-) -> Result<(), QueueError> {
+    verb: &str,
+    conflict: &str,
+) -> String {
     let pending_end = shape.pending_end();
     let completed_end = shape.completed_end();
     let failed_end = shape.failed_end();
@@ -349,16 +384,9 @@ pub async fn seed_queue_chunk(
               ELSE datetime('now', '-' || (1440 + n % 38880) || ' minutes') END"
     );
     let task_id = "printf('%064x', n)";
-    // `OR IGNORE` — not for collisions (the identities are injective)
-    // but so a replay of a chunk whose cursor commit was lost re-runs
-    // idempotently instead of stalling on its own identity keys.
-    db.query(&format!(
-        "WITH RECURSIVE seq(n) AS ({seq}) \
-         INSERT OR IGNORE INTO queue (task_id, crate_name, version, features_json, target, rustc_version, \
-                            downloads, miss_count, request_count, priority, status, lane, \
-                            dispatch_attempts, not_before, first_requested_at, created_at, \
-                            updated_at, host_side, preserve_lockfile, attempt, shape_requeue, \
-                            github_run_id, deps_met, wake_at, dispatch_family, dispatch_key) \
+    format!(
+        "WITH RECURSIVE seq(n) AS ({seq_source}) \
+         {verb} INTO queue ({columns}) \
          SELECT {task_id}, \
                 'crate' || (n / {CRATE_NAME_ROWS}), \
                 '1.' || (n / 20000) || '.' || (n % 500), \
@@ -382,8 +410,9 @@ pub async fn seed_queue_chunk(
                 0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
                 CASE WHEN n > {in_flight_end} THEN 'run-' || n ELSE NULL END, \
                 0, {wake}, {family}, {key} \
-         FROM seq",
-        seq = seq_sql(lo, hi),
+         FROM seq \
+         {conflict}",
+        columns = QUEUE_SEED_COLUMNS.join(", "),
         wake = crate::scheduler::queue::wake_at_sql(
             &format!("({lane_case})"),
             first_at,
@@ -399,10 +428,80 @@ pub async fn seed_queue_chunk(
             first_at,
             task_id,
         ),
+    )
+}
+
+/// Seed `queue` rows `(lo, hi]`.
+pub async fn seed_queue_chunk(
+    db: &DurableDb,
+    shape: FixtureShape,
+    lo: u32,
+    hi: u32,
+    min_age_minutes: u32,
+) -> Result<(), QueueError> {
+    // `OR IGNORE` — not for collisions (the identities are injective)
+    // but so a replay of a chunk whose cursor commit was lost re-runs
+    // idempotently instead of stalling on its own identity keys.
+    db.query(&queue_seed_insert_sql(
+        shape,
+        &seq_sql(lo, hi),
+        min_age_minutes,
+        "INSERT OR IGNORE",
+        "",
     ))
     .execute()
     .await
     .map_err(|error| format!("seed queue rows: {error}"))?;
+    Ok(())
+}
+
+/// Re-seed the exact rows `ns` name — the budget re-arm's restore for
+/// the seeded rows the drives mutate or delete: each listed `n` is
+/// written with the seed's own column formulas, so a retried, purged,
+/// resynced or completed row returns to the state the probe was
+/// calibrated on. `seq` is fed from `json_each`, not a range — only
+/// the named rows are touched. The upsert (not `INSERT OR REPLACE`,
+/// whose implied DELETE would mis-fire the status counters' triggers)
+/// restores every seeded column; the two columns the seed leaves to
+/// defaults (`error_msg`, `blocked`) reset explicitly. `deps_met` and
+/// `blocked` land as defaults here and the caller recomputes them once
+/// the edges and slices the flags read are restored too.
+pub async fn restore_queue_rows(
+    db: &DurableDb,
+    shape: FixtureShape,
+    min_age_minutes: u32,
+    ns: &[u32],
+) -> Result<(), QueueError> {
+    if ns.is_empty() {
+        return Ok(());
+    }
+    let assignments = QUEUE_SEED_COLUMNS
+        .iter()
+        .filter(|column| **column != "task_id")
+        .map(|column| format!("{column} = excluded.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = queue_seed_insert_sql(
+        shape,
+        "SELECT CAST(value AS INTEGER) FROM json_each(?)",
+        min_age_minutes,
+        "INSERT",
+        // `WHERE 1` ends the SELECT's join grammar — without it `ON
+        // CONFLICT` parses as a join constraint and `DO` is a syntax
+        // error (SQLite's documented upsert ambiguity).
+        &format!(
+            "WHERE 1 ON CONFLICT(task_id) DO UPDATE SET {assignments}, \
+             error_msg = NULL, blocked = 0"
+        ),
+    );
+    db.query(&sql)
+        .bind(
+            serde_json::to_string(ns)
+                .map_err(|error| QueueError::Sql(format!("encode restore row ids: {error}")))?,
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("restore seeded queue rows: {error}"))?;
     Ok(())
 }
 
@@ -544,6 +643,251 @@ pub async fn seed_deps_met_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(),
     .execute()
     .await
     .map_err(|error| format!("seed deps_met/blocked: {error}"))?;
+    Ok(())
+}
+
+/// The `settings` key the budget pass's claim record lives under — the
+/// pass's own dispatch outcome written there after the metered window
+/// closes, so the next run's [`rearm`] restores exactly the rows the
+/// pass claimed, never a status- or band-scoped guess at them.
+const PROBE_CLAIMED_KEY: &str = "budget_probe_claimed";
+
+/// Persist the task ids a budget pass claimed — one `settings` upsert
+/// outside the metered window, read and cleared by [`rearm`] on the
+/// next run. An empty record is kept, not dropped: the previous run's
+/// record must never survive a pass that claimed nothing.
+pub async fn record_probe_claimed(db: &DurableDb, task_ids: &[String]) -> Result<(), QueueError> {
+    db.query(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(PROBE_CLAIMED_KEY)
+    .bind(
+        serde_json::to_string(task_ids)
+            .map_err(|error| QueueError::Sql(format!("encode probe claim record: {error}")))?,
+    )
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("record probe claims: {error}")))?;
+    Ok(())
+}
+
+/// Read, clear, and re-seed the last pass's claim set — consumed on
+/// read so a pass that claims nothing leaves nothing to restore. The
+/// ids are the pass's own recorded outcome: only they are upserted
+/// back to the seeded row, claim-written `attempt`/`wake_at`/
+/// `not_before`/`dispatch_attempts` and all, never a status- or
+/// band-scoped guess. Returns the seeded row numbers for the flag
+/// recompute's `touched` set.
+async fn restore_claimed_rows(
+    db: &DurableDb,
+    shape: FixtureShape,
+    min_age_minutes: u32,
+) -> Result<Vec<u32>, QueueError> {
+    let claimed_ids: Option<Vec<String>> = db
+        .query("SELECT value FROM settings WHERE key = ?")
+        .bind(PROBE_CLAIMED_KEY)
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("read probe claim record: {error}")))?
+        .map(|json| {
+            serde_json::from_str::<Vec<String>>(&json)
+                .map_err(|error| QueueError::Sql(format!("parse probe claim record: {error}")))
+        })
+        .transpose()?;
+    if claimed_ids.is_some() {
+        db.query("DELETE FROM settings WHERE key = ?")
+            .bind(PROBE_CLAIMED_KEY)
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("clear probe claim record: {error}")))?;
+    }
+    let claimed_ns: Vec<u32> = claimed_ids
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|id| {
+            // A claimed row a drive inserted is content-keyed — the
+            // `%-%` cleanup already deleted it; only seeded (hex) ids
+            // name a row to restore.
+            u64::from_str_radix(id, 16)
+                .ok()
+                .and_then(|n| u32::try_from(n).ok())
+        })
+        .collect();
+    restore_queue_rows(db, shape, min_age_minutes, &claimed_ns).await?;
+    Ok(claimed_ns)
+}
+
+/// Restores the seeded queue the drives are calibrated on — outside
+/// the measured window, the same precedent as the installation-token
+/// seed. The contract is the seeded state, not just its shape: every
+/// row and membership a probe moved must read exactly as the seed
+/// wrote it, or the next `POST /budget` on this persisted fixture
+/// measures a queue the drives were not calibrated for — a retry
+/// drive whose two `failed` rows the last probe already re-entered
+/// finds nothing to mutate.
+///
+/// - Inserted artifacts: every task the lanes and the probe itself
+///   insert carries a content-derived `task_id`
+///   (`crate-version-hash-target-rustc`), while seeded rows are
+///   `printf('%064x', n)`, so `task_id LIKE '%-%'` isolates exactly the
+///   rows a run added. The request drives' records die with them; the
+///   two fixture records survive — `GET /requests/{id}` reads the
+///   `enqueued` one.
+/// - Mutated seeded rows: retry's failed pair, cancel's pair,
+///   promote's miss-lane row, purge's deleted pair, the resync's row
+///   101 and the complete-run target are re-written through the seed's
+///   own column formulas ([`restore_queue_rows`]) — a row a probe moved
+///   or deleted returns to seeded truth.
+/// - Claimed rows: the pass records the ids its own claim moved out
+///   of `pending` into probe control state
+///   ([`record_probe_claimed`]); the re-arm restores exactly those
+///   through the same seed upsert. A status- or band-scoped restore
+///   could resurrect a row a load lane legitimately moved, so the set
+///   is the recorded claim outcome, never a predicate over row
+///   state. A claimed row a drive inserted dies in the `%-%` cleanup
+///   — only seeded (hex) ids reach the upsert.
+/// - Attempt epochs: the running target's restore bumps `attempt`
+///   past the value the last pass left (`attempt_outcomes` keys on
+///   `(task_id, attempt)`, so a repeated attempt would make the next
+///   pass's completion a replay of the old epoch, not a fresh
+///   completion).
+/// - Row 101's edges: the resync's delta edge sync deleted the seeded
+///   edge set and wrote its own; both edge phases re-seed the owner's
+///   range after a delete (each `INSERT OR IGNORE` is idempotent).
+/// - Slice membership: the delta report retires 30 of the
+///   `(target[0], 1.85.0)` slice's rows and adds its own; the full
+///   report publishes a dedicated `(target[8], 9.9.9)` slice. Only the
+///   probe's rows move — `stow-gate-*` is a crate prefix no fixture or
+///   load row carries — plus the delta's `applied_generation` bump and
+///   the full report's marker, then the retire band re-seeds (`OR
+///   IGNORE` rewrites only the missing rows; the loaded bulk's
+///   publication is untouched).
+/// - Persisted gate flags: dependents of every touched dep and the
+///   restored pending rows recompute `deps_met`/`blocked` through the
+///   production expressions — the pass's own refreshes answered for
+///   the post-probe truth, and restored dep statuses must not leave
+///   them stale.
+pub async fn rearm(
+    db: &DurableDb,
+    shape: FixtureShape,
+    min_age_minutes: u32,
+) -> Result<(), QueueError> {
+    for statement in [
+        "DELETE FROM queue_dependencies WHERE task_id LIKE '%-%'",
+        "DELETE FROM queue WHERE task_id LIKE '%-%'",
+        "DELETE FROM requests WHERE request_id NOT IN \
+         ('req-fixture-enqueued', 'req-fixture-failed')",
+    ] {
+        db.query(statement)
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("re-arm inserted rows: {error}")))?;
+    }
+    // The mutation drives' exact targets. `pending_row`/`failed_row`
+    // and friends are the same positional helpers the drives select
+    // with, so the restore cannot drift from the selectors.
+    let restored = [
+        101, // the resync's fixture identity (its edge set re-seeded below)
+        FixtureShape::pending_row(701),
+        FixtureShape::pending_row(702),
+        FixtureShape::pending_row(4703),
+        shape.failed_row(0),
+        shape.failed_row(1),
+        shape.completed_row(0),
+        shape.completed_row(1),
+        shape.running_row(),
+    ];
+    // The attempt the running target is at *before* the upsert rewrites
+    // it to the seeded 1 — read first so the restore below can step the
+    // epoch forward instead of letting the next pass reuse it.
+    let running_attempt = db
+        .query("SELECT attempt FROM queue WHERE task_id = printf('%064x', ?)")
+        .bind(i64::from(shape.running_row()))
+        .fetch_scalar_optional::<i64>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("read running attempt: {error}")))?;
+    restore_queue_rows(db, shape, min_age_minutes, &restored).await?;
+    if let Some(attempt) = running_attempt {
+        db.query("UPDATE queue SET attempt = ? WHERE task_id = printf('%064x', ?)")
+            .bind(attempt + 1)
+            .bind(i64::from(shape.running_row()))
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("re-arm running attempt: {error}")))?;
+    }
+    // Whatever the last pass claimed — its own recorded outcome, kept
+    // in `settings` under [`PROBE_CLAIMED_KEY`] so the set survives
+    // between `POST /budget` calls.
+    let claimed_ns = restore_claimed_rows(db, shape, min_age_minutes).await?;
+    // Row 101's seeded edge set: the resync's delta sync rewrote it.
+    db.query("DELETE FROM queue_dependencies WHERE task_id = printf('%064x', ?)")
+        .bind(101_i64)
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("re-arm resync edges: {error}")))?;
+    seed_edges_chunk(db, shape, SeedPhase::EdgesEvery, 100, 101).await?;
+    seed_edges_chunk(db, shape, SeedPhase::EdgesThirds, 100, 101).await?;
+    // The probe's publication — the full report's dedicated slice plus
+    // the delta's added rows, then the delta's marker bump.
+    for (statement, binds) in [
+        (
+            "DELETE FROM published_slice_rows WHERE crate_name LIKE 'stow-gate-%'",
+            Vec::new(),
+        ),
+        (
+            "DELETE FROM published_slices WHERE target = ? AND rustc_version = '9.9.9'",
+            vec![CI_TARGET_TRIPLES[8].to_owned()],
+        ),
+        (
+            "UPDATE published_slices SET generation = 1, applied_generation = 0 \
+             WHERE target = ? AND rustc_version = '1.85.0'",
+            vec![CI_TARGET_TRIPLES[0].to_owned()],
+        ),
+    ] {
+        let mut query = db.query(statement);
+        for bind in binds {
+            query = query.bind(bind);
+        }
+        query
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("re-arm slice tables: {error}")))?;
+    }
+    // The retire band the delta report clears — `slice_first_row` +
+    // `slice_live_rows` produce the same member list the report walks.
+    // `OR IGNORE` makes the chunk write only the rows the retire
+    // actually removed.
+    let live = shape.slice_live_rows(0);
+    let first = shape.slice_first_row(0);
+    let retire_lo = first + (live - super::drives::DELTA_ROWS) * 9 - 1;
+    let retire_hi = first + (live - 1) * 9;
+    seed_slice_chunk(db, retire_lo, retire_hi).await?;
+    // Persisted gate flags on the restored pending rows and on the
+    // dependents of every dep a drive touched — recomputed through the
+    // same expressions the production transitions use, over a set
+    // bounded by the touched ids, not by the queue.
+    let mut touched: Vec<u32> = restored.to_vec();
+    touched.extend_from_slice(&claimed_ns);
+    for i in 0..super::drives::DELTA_ROWS {
+        touched.push(first + (live - 1 - i) * 9);
+    }
+    let touched_json = serde_json::to_string(&touched)
+        .map_err(|error| QueueError::Sql(format!("encode re-arm ids: {error}")))?;
+    db.query(&format!(
+        "UPDATE queue SET deps_met = {deps_met}, blocked = {blocked} \
+         WHERE status = 'pending' AND ( \
+             task_id IN (SELECT printf('%064x', value) FROM json_each(?)) OR \
+             task_id IN (SELECT task_id FROM queue_dependencies \
+                         WHERE depends_on_task_id IN (SELECT printf('%064x', value) FROM json_each(?))))",
+        deps_met = crate::scheduler::queue::deps_met_sql("queue.task_id"),
+        blocked = crate::scheduler::queue::blocked_sql("queue.task_id"),
+    ))
+    .bind(touched_json.clone())
+    .bind(touched_json)
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("re-arm gate flags: {error}")))?;
     Ok(())
 }
 

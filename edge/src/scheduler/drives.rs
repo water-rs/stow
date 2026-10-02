@@ -57,11 +57,13 @@ pub struct DriveContext {
     /// Σ D1 `meta` rows the counted backend observed — read back into
     /// the report row after each drive.
     pub d1_rows: std::sync::Arc<std::sync::Mutex<(u64, u64)>>,
-    /// Tasks the pass drives claimed. The launch gate's per-claim
-    /// marginal price divides the hot-minus-idle delta by this count —
-    /// never by a checked-in slots assumption — and refuses a report
-    /// that claims nothing while build traffic is nonzero.
-    pub claimed_tasks: std::sync::Arc<std::sync::Mutex<u64>>,
+    /// The claimed task ids, in claim order — the pass's own outcome.
+    /// The launch gate's per-claim marginal price divides the
+    /// hot-minus-idle delta by their count — never by a checked-in
+    /// slots assumption — and the re-arm's restore set is exactly
+    /// these rows rather than any predicate over row state that could
+    /// name a row another lane moved.
+    pub claimed_tasks: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl DriveContext {
@@ -76,7 +78,7 @@ impl DriveContext {
             #[cfg(target_arch = "wasm32")]
             d1: None,
             d1_rows: std::sync::Arc::new(std::sync::Mutex::new((0, 0))),
-            claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -90,7 +92,7 @@ impl DriveContext {
             env: Some(env.clone()),
             d1: Some(d1),
             d1_rows,
-            claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -99,14 +101,23 @@ impl DriveContext {
         *self.d1_rows.lock().expect("d1 counter")
     }
 
-    /// Tasks claimed by the pass drives so far.
+    /// Tasks claimed by the pass drives so far — the id record's own
+    /// count, so the two can never drift.
     pub fn claims(&self) -> u64 {
-        *self.claimed_tasks.lock().expect("claim counter")
+        u64::try_from(self.claimed_tasks.lock().expect("claim record").len()).unwrap_or(u64::MAX)
     }
 
-    /// Record `n` claimed tasks.
-    fn add_claims(&self, n: usize) {
-        *self.claimed_tasks.lock().expect("claim counter") += u64::try_from(n).unwrap_or(u64::MAX);
+    /// Append the ids a claiming pass just moved out of `pending`.
+    fn record_claimed(&self, task_ids: Vec<String>) {
+        self.claimed_tasks
+            .lock()
+            .expect("claim record")
+            .extend(task_ids);
+    }
+
+    /// Every task id the pass drives claimed so far, in claim order.
+    pub fn claimed_ids(&self) -> Vec<String> {
+        self.claimed_tasks.lock().expect("claim record").clone()
     }
 }
 
@@ -703,10 +714,10 @@ async fn dispatch_pass_drive(
             .as_ref()
             .ok_or_else(|| "dispatch pass drive needs the counted D1".to_owned())?;
         let coverage = super::object::CatalogCoverage { db: d1.clone() };
-        let claimed = super::object::dispatch_pass(env, db, &pass_settings, &coverage)
+        let task_ids = super::object::dispatch_pass(env, db, &pass_settings, &coverage)
             .await
             .map_err(|error| error.to_string())?;
-        ctx.add_claims(claimed);
+        ctx.record_claimed(task_ids);
         if !idle {
             // Under `LocalCi` `dispatch_pass` resolves no credential,
             // but a production claiming pass pays
@@ -729,7 +740,7 @@ async fn dispatch_pass_drive(
         let claimed = queue::claim_dispatchable_tasks(db, &pass_settings, &NoCoverage)
             .await
             .map_err(|error| error.to_string())?;
-        ctx.add_claims(claimed.len());
+        ctx.record_claimed(claimed.iter().map(|task| task.task_id.clone()).collect());
     }
     queue::next_alarm(db, 0, &pass_settings)
         .await
@@ -740,7 +751,7 @@ async fn dispatch_pass_drive(
 /// Slice rows a delta report moves — retired from the live set plus the
 /// same number added. The dependent refresh must stay proportional to
 /// this, not to the slice.
-const DELTA_ROWS: u32 = 30;
+pub const DELTA_ROWS: u32 = 30;
 
 /// A coverage oracle that answers "not covered" for every row — the
 /// catalog is empty under the fixture, which is the shape a cold cache

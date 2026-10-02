@@ -27,6 +27,7 @@
 //! may never be raised to pass a regression.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use skyzen::FromRow;
 use skyzen_services::durable::DurableDb;
@@ -667,6 +668,27 @@ fn every_drive_has_exactly_one_row_in_each_budget_table() {
     }
 }
 
+/// Every drive once under the gate, logging per-statement counters —
+/// the loop `per_request_cost_gate` and the persisted-fixture repeat
+/// share.
+async fn run_drives(
+    db: &DurableDb,
+    shape: fixture::FixtureShape,
+    settings: &SchedulerSettings,
+    ctx: &drives::DriveContext,
+    log: &Arc<Mutex<Vec<LoggedStatement>>>,
+) {
+    for drive in drives::DRIVES {
+        let base = log.lock().expect("statement log").len();
+        (drive.run)(db, shape, settings, ctx)
+            .await
+            .unwrap_or_else(|error| panic!("{} failed: {error}", drive.name));
+        let statements = log.lock().expect("statement log")[base..].to_vec();
+        let measurement = Measurement::of(statements);
+        check(db, budget_of(drive.name), &measurement).await;
+    }
+}
+
 /// Every entry of [`drives::DRIVES`] holds its budget on the 10k gate
 /// fixture. The two tables must cover each other exactly — a drive with
 /// no budget row, or a row no drive produces, is a gate bug and fails
@@ -691,15 +713,7 @@ async fn per_request_cost_gate() {
     }
     let shape = fixture::GATE;
     let ctx = drives::DriveContext::host();
-    for drive in drives::DRIVES {
-        let base = log.lock().expect("statement log").len();
-        (drive.run)(&db, shape, &settings, &ctx)
-            .await
-            .unwrap_or_else(|error| panic!("{} failed: {error}", drive.name));
-        let statements = log.lock().expect("statement log")[base..].to_vec();
-        let measurement = Measurement::of(statements);
-        check(&db, budget_of(drive.name), &measurement).await;
-    }
+    run_drives(&db, shape, &settings, &ctx, &log).await;
 
     // The migrate route is the only DDL path — it runs on the same seeded
     // fixture under the raw (permit-open) counting backend.
@@ -718,5 +732,160 @@ async fn per_request_cost_gate() {
         measurement.statement_count,
         measurement.rows_read,
         measurement.rows_written,
+    );
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct RunningTarget {
+    attempt: i64,
+    github_run_id: Option<String>,
+}
+
+async fn running_target(db: &DurableDb, shape: fixture::FixtureShape) -> RunningTarget {
+    db.query("SELECT attempt, github_run_id FROM queue WHERE task_id = printf('%064x', ?)")
+        .bind(i64::from(shape.running_row()))
+        .fetch_optional::<RunningTarget>()
+        .await
+        .expect("running target query")
+        .expect("running target row")
+}
+
+async fn running_outcomes(db: &DurableDb, shape: fixture::FixtureShape) -> i64 {
+    db.query(
+        "SELECT COALESCE(SUM(outcomes), 0) FROM attempt_outcome_buckets \
+         WHERE target = (SELECT target FROM queue WHERE task_id = printf('%064x', ?))",
+    )
+    .bind(i64::from(shape.running_row()))
+    .fetch_scalar::<i64>()
+    .await
+    .expect("running outcomes")
+}
+
+async fn status_of(db: &DurableDb, task_id: &str) -> String {
+    db.query("SELECT status FROM queue WHERE task_id = ?")
+        .bind(task_id.to_owned())
+        .fetch_scalar::<String>()
+        .await
+        .expect("status")
+}
+
+/// The workerd probe runs `POST /budget` repeatedly against the same
+/// persisted fixture — the launch gate measures once before and once
+/// after the load lane. `fixture::rearm` must return every row and
+/// membership the first pass moved to the seeded truth, or the second
+/// pass fails its logical assertions (the retry drive's two `failed`
+/// rows) or drifts off the calibrated costs. Two full passes on one
+/// fixture prove the restore covers the whole mutation class — and the
+/// probe's own control state carries it: claimed rows restore from the
+/// pass's recorded claim set (a non-pending row the pass never touched
+/// survives), and the running target's `attempt` steps forward so each
+/// pass's completion lands on a fresh epoch.
+#[tokio::test]
+async fn budget_probe_repeats_on_a_persisted_fixture() {
+    every_drive_has_exactly_one_row_in_each_budget_table();
+    let settings = SchedulerSettings::default();
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+    let shape = fixture::GATE;
+
+    // Two non-pending rows inside the pending band that no drive names
+    // and no claim can reach — the re-arm's claimed-row restore is the
+    // pass's recorded set, so these must survive it untouched. The
+    // `completed` marker carries the repair latch so the pass's own
+    // shape-requeue sweep cannot move it either.
+    let untouched = [
+        (shape.pending_end() / 3, "completed", "shape_requeue = 1"),
+        (
+            shape.pending_end() / 3 + 1,
+            "failed",
+            "shape_requeue = shape_requeue",
+        ),
+    ];
+    for (n, status, extra) in untouched {
+        db.query(&format!(
+            "UPDATE queue SET status = ?, {extra} \
+             WHERE task_id = printf('%064x', ?)"
+        ))
+        .bind(status)
+        .bind(i64::from(n))
+        .execute()
+        .await
+        .expect("stage untouched marker");
+    }
+
+    // The probe's own order: `budget::run` re-arms before every metered
+    // pass and records the pass's claim set after it.
+    let ctx = drives::DriveContext::host();
+    fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
+        .await
+        .expect("re-arm (baseline)");
+    run_drives(&db, shape, &settings, &ctx, &log).await;
+
+    // The complete drive lands `completed` + stamps the run id; the
+    // same pass's shape-requeue sweep then re-enters the row as
+    // `pending` at `attempt + 1` — the post-pass read is that state,
+    // which is also the state the re-arm restores from. A success
+    // never writes a raw `attempt_outcomes` row: the per-target
+    // bucket's `outcomes` count is the completion's evidence, and it
+    // must increase exactly once per landed transition.
+    let first = running_target(&db, shape).await;
+    assert_eq!(
+        first.github_run_id.as_deref(),
+        Some("12345"),
+        "the pass's completion landed and stamped its run id"
+    );
+    assert_eq!(
+        running_outcomes(&db, shape).await,
+        1,
+        "the first pass's completed transition counted once"
+    );
+    let claimed = ctx.claimed_ids();
+    assert!(!claimed.is_empty(), "the gate pass claims rows");
+    fixture::record_probe_claimed(&db, &claimed)
+        .await
+        .expect("record claims");
+    fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
+        .await
+        .expect("re-arm fixture");
+
+    for (n, status, _) in untouched {
+        let id = format!("{n:064x}");
+        assert_eq!(
+            status_of(&db, &id).await,
+            status,
+            "unclaimed {status} row at n={n} survived the re-arm"
+        );
+    }
+    for id in &claimed {
+        if u64::from_str_radix(id, 16).is_ok() {
+            assert_eq!(
+                status_of(&db, id).await,
+                "pending",
+                "claimed row {id} returned to pending"
+            );
+        }
+    }
+
+    run_drives(&db, shape, &settings, &ctx, &log).await;
+    let second = running_target(&db, shape).await;
+    assert_eq!(second.github_run_id.as_deref(), Some("12345"));
+    // The second pass's own transition — counted once more, on a
+    // fresh epoch: the re-arm steps `attempt` past whatever the last
+    // pass left (its requeue had already advanced it), so the two
+    // landings are distinct, not a `(task_id, attempt)` replay. The
+    // requeue's +1 rides on top, so strict increase is the form, not
+    // +1.
+    assert_eq!(
+        running_outcomes(&db, shape).await,
+        2,
+        "the second pass's completed transition counted once more"
+    );
+    assert!(
+        second.attempt > first.attempt,
+        "each pass completes a fresh attempt epoch: {} then {}",
+        first.attempt,
+        second.attempt,
     );
 }
