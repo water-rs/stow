@@ -2066,9 +2066,13 @@ pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
 /// one caller that already knows it: the slice-commit gate delta, where
 /// a correlated probe would re-seek the same marker row once per edge.
 fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
+    // Keep legacy -1 shape legs out of coverage. The integer enums are
+    // stored as 0/1 and legacy rows as -1, so BETWEEN is equivalent to
+    // the accepted domain while letting SQLite retain a bounded suffix
+    // range on the published-row primary key.
     format!(
         "({dep}.dep_shapes = 0 \
-         OR (SELECT count(DISTINCT p.unit_invocation * 2 + p.unit_linked) \
+         OR (SELECT count(*) \
              FROM published_slice_rows p \
              WHERE p.target = {dep}.dep_target \
                AND p.rustc_version = {dep}.dep_rustc_version \
@@ -2077,6 +2081,8 @@ fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
                AND p.version = {dep}.dep_version \
                AND p.features_json = {dep}.dep_features_json \
                AND p.unit_side = {dep}.dep_host_side \
+               AND p.unit_invocation BETWEEN 0 AND 1 \
+               AND p.unit_linked BETWEEN 0 AND 1 \
                AND ({dep}.dep_host_side = 0 OR p.unit_linked = 1) \
                AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
             ) < {dep}.dep_shapes)"
@@ -3874,6 +3880,69 @@ struct SliceRowJson {
     unit_linked: i64,
 }
 
+/// One explicit delta row with the direction that changed the live set.
+/// The direction is private wire data for the delta gate; full reports keep
+/// the generic changed-row path because their retirements are inferred from
+/// the whole replacement set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SliceChangeKind {
+    Added,
+    Retired,
+}
+
+struct ChangedSliceRow {
+    row: SliceRowJson,
+    kind: SliceChangeKind,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GateIdentity {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    unit_side: i64,
+    kind: Option<SliceChangeKind>,
+}
+
+#[derive(serde::Serialize)]
+struct NormalizedGateRow {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    unit_side: i64,
+    invocations: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<SliceChangeKind>,
+}
+
+struct GateChangeSet {
+    json: String,
+    directional: bool,
+}
+
+#[derive(skyzen::FromRow)]
+struct FlippedDepEdge {
+    task_id: String,
+    dep_met: i64,
+    is_blocking: i64,
+}
+
+#[derive(serde::Serialize)]
+struct OwnerDepDelta {
+    owner: String,
+    delta: i64,
+    new_blocker: i64,
+    cleared_blocker: i64,
+}
+
+#[derive(Default)]
+struct OwnerDelta {
+    delta: i64,
+    new_blocker: i64,
+    cleared_blocker: i64,
+}
+
 fn slice_row_key(row: &SliceRowJson) -> (String, String, String, i64, i64, i64) {
     (
         row.crate_name.clone(),
@@ -3883,6 +3952,62 @@ fn slice_row_key(row: &SliceRowJson) -> (String, String, String, i64, i64, i64) 
         row.unit_invocation,
         row.unit_linked,
     )
+}
+
+fn normalize_gate_rows(
+    rows: impl IntoIterator<Item = (SliceRowJson, Option<SliceChangeKind>)>,
+) -> Vec<NormalizedGateRow> {
+    let mut normalized = std::collections::BTreeMap::<GateIdentity, i64>::new();
+    for (row, kind) in rows {
+        let Some(invocation) =
+            stow_types::public_cache::UnitInvocation::from_int(row.unit_invocation)
+        else {
+            continue;
+        };
+        let Some(side) = stow_types::public_cache::UnitSide::from_int(row.unit_side) else {
+            continue;
+        };
+        let linked = match row.unit_linked {
+            0 => false,
+            1 => true,
+            _ => continue,
+        };
+        if side == stow_types::public_cache::UnitSide::Host && !linked {
+            continue;
+        }
+        let identity = GateIdentity {
+            crate_name: row.crate_name,
+            version: row.version,
+            features_json: row.features_json,
+            unit_side: side.to_int(),
+            kind,
+        };
+        let bit = 1_i64 << invocation.to_int();
+        *normalized.entry(identity).or_default() |= bit;
+    }
+    normalized
+        .into_iter()
+        .map(|(identity, invocations)| NormalizedGateRow {
+            crate_name: identity.crate_name,
+            version: identity.version,
+            features_json: identity.features_json,
+            unit_side: identity.unit_side,
+            invocations,
+            kind: identity.kind,
+        })
+        .collect()
+}
+
+fn normalized_gate_json(
+    rows: impl IntoIterator<Item = (SliceRowJson, Option<SliceChangeKind>)>,
+) -> Result<Option<String>, QueueError> {
+    let normalized = normalize_gate_rows(rows);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&normalized)
+        .map(Some)
+        .map_err(|error| QueueError::Sql(format!("encode slice gate json: {error}")))
 }
 
 pub async fn record_published_slice(
@@ -3916,13 +4041,13 @@ pub async fn record_published_slice(
         .map_err(|error| format!("read live slice {target}/{rustc_version}: {error}"))?;
     let live_generation = live.as_ref().map_or(1, |row| row.generation);
     let live_applied = live.as_ref().map(|row| row.applied_generation);
-    let (changed, run_stale_cleanup) = match (base_generation, live_applied) {
+    let (changed, delta_changed_json, run_stale_cleanup) = match (base_generation, live_applied) {
         (Some(base), Some(applied)) if applied == base => {
             // Delta report on a live base: apply `added`/`retired`
             // directly — no live-slice read — and the stale-generation
             // sweep stays on the full path (it reads in proportion to
             // the slice, which a per-wave delta must not pay).
-            let changed = apply_slice_delta(
+            let directional = apply_slice_delta(
                 db,
                 target,
                 rustc_version,
@@ -3931,7 +4056,16 @@ pub async fn record_published_slice(
                 &to_slice_rows(retired),
             )
             .await?;
-            (changed, false)
+            let changed = directional
+                .iter()
+                .map(|change| change.row.clone())
+                .collect::<Vec<_>>();
+            let changed_json = normalized_gate_json(
+                directional
+                    .iter()
+                    .map(|change| (change.row.clone(), Some(change.kind))),
+            )?;
+            (changed, changed_json, false)
         }
         (Some(base), applied) => {
             return Err(QueueError::SliceGenerationConflict {
@@ -3958,7 +4092,7 @@ pub async fn record_published_slice(
                 &to_slice_rows(added),
             )
             .await?;
-            (changed, true)
+            (changed, None, true)
         }
     };
     // The applied generation the marker stamps: on a delta it is the
@@ -3975,13 +4109,18 @@ pub async fn record_published_slice(
     };
     // `None` when the report changed no live row — no dependent's gate
     // answer can have moved, and the refresh statement is skipped whole.
-    let changed_json = if changed.is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::to_string(&changed)
-                .map_err(|error| QueueError::Sql(format!("encode slice delta json: {error}")))?,
-        )
+    let gate_changes = match delta_changed_json {
+        Some(json) => Some(GateChangeSet {
+            json,
+            directional: true,
+        }),
+        None if changed.is_empty() => None,
+        None => normalized_gate_json(changed.into_iter().map(|row| (row, None)))?.map(|json| {
+            GateChangeSet {
+                json,
+                directional: false,
+            }
+        }),
     };
     let marker_generation = live.as_ref().map_or(1, |row| row.generation);
     commit_published_slice(
@@ -3989,7 +4128,7 @@ pub async fn record_published_slice(
         target,
         rustc_version,
         marker_generation,
-        changed_json,
+        gate_changes,
         run_stale_cleanup,
         next_applied,
     )
@@ -4035,7 +4174,7 @@ async fn apply_slice_delta(
     live_generation: i64,
     added: &[SliceRowJson],
     retired: &[SliceRowJson],
-) -> Result<Vec<SliceRowJson>, QueueError> {
+) -> Result<Vec<ChangedSliceRow>, QueueError> {
     if !retired.is_empty() {
         let retired_json = serde_json::to_string(retired)
             .map_err(|error| QueueError::Sql(format!("encode slice retire json: {error}")))?;
@@ -4056,7 +4195,14 @@ async fn apply_slice_delta(
         .await
         .map_err(|error| format!("drop retired slice rows {target}/{rustc_version}: {error}"))?;
     }
-    let mut changed: Vec<SliceRowJson> = retired.to_vec();
+    let mut changed = retired
+        .iter()
+        .cloned()
+        .map(|row| ChangedSliceRow {
+            row,
+            kind: SliceChangeKind::Retired,
+        })
+        .collect::<Vec<_>>();
     if !added.is_empty() {
         let added_json = serde_json::to_string(added)
             .map_err(|error| QueueError::Sql(format!("encode slice insert json: {error}")))?;
@@ -4076,7 +4222,10 @@ async fn apply_slice_delta(
         .execute()
         .await
         .map_err(|error| format!("record published slice rows {target}/{rustc_version}: {error}"))?;
-        changed.extend(added.iter().cloned());
+        changed.extend(added.iter().cloned().map(|row| ChangedSliceRow {
+            row,
+            kind: SliceChangeKind::Added,
+        }));
     }
     Ok(changed)
 }
@@ -4185,7 +4334,7 @@ async fn commit_published_slice(
     target: &str,
     rustc_version: &str,
     live_generation: i64,
-    changed_json: Option<String>,
+    gate_changes: Option<GateChangeSet>,
     run_stale_cleanup: bool,
     next_applied: Option<i64>,
 ) -> Result<(), QueueError> {
@@ -4243,10 +4392,64 @@ async fn commit_published_slice(
         .await
         .map_err(|error| format!("retire stale slice rows {target}/{rustc_version}: {error}"))?;
     }
-    let Some(changed_json) = changed_json else {
+    let Some(gate_changes) = gate_changes else {
         return Ok(());
     };
-    apply_slice_gate_delta(db, target, rustc_version, changed_json, live_generation).await
+    apply_slice_gate_delta(
+        db,
+        target,
+        rustc_version,
+        gate_changes.json,
+        live_generation,
+        gate_changes.directional,
+    )
+    .await
+}
+
+/// Build the direct-dependent join, optionally restricting explicit delta
+/// rows by the only old flag each direction can change.
+fn matched_edges_sql(directional_delta: bool) -> String {
+    let direction_filter = if directional_delta {
+        "AND ((j.c ->> 'kind' = 'added' AND d.dep_met = 0) \
+              OR (j.c ->> 'kind' = 'retired' AND d.dep_met = 1))"
+    } else {
+        ""
+    };
+    format!(
+        "FROM (SELECT value AS c FROM json_each(?)) AS j \
+         CROSS JOIN queue_dependencies d \
+           ON d.dep_target = ? AND d.dep_rustc_version = ? \
+          AND d.dep_crate_name = j.c ->> 'crate_name' \
+          AND d.dep_version = j.c ->> 'version' \
+          AND d.dep_features_json = j.c ->> 'features_json' \
+          AND d.dep_host_side = j.c ->> 'unit_side' \
+          AND (d.dep_invocations & (j.c ->> 'invocations')) != 0 \
+          {direction_filter}",
+    )
+}
+
+fn fold_owner_deltas(flipped: &[FlippedDepEdge]) -> Vec<OwnerDepDelta> {
+    let mut deltas = std::collections::BTreeMap::<String, OwnerDelta>::new();
+    for edge in flipped {
+        let owner = deltas.entry(edge.task_id.clone()).or_default();
+        owner.delta += 1 - 2 * edge.dep_met;
+        if edge.is_blocking != 0 {
+            if edge.dep_met == 0 {
+                owner.new_blocker = 1;
+            } else {
+                owner.cleared_blocker = 1;
+            }
+        }
+    }
+    deltas
+        .into_iter()
+        .map(|(owner, delta)| OwnerDepDelta {
+            owner,
+            delta: delta.delta,
+            new_blocker: delta.new_blocker,
+            cleared_blocker: delta.cleared_blocker,
+        })
+        .collect()
 }
 
 /// The gate half of a slice commit: membership changed for exactly the
@@ -4254,13 +4457,12 @@ async fn commit_published_slice(
 /// they match and move each owner's `unpublished_deps` counter by the
 /// flip delta — a publish touches 1 + the delta's direct dependents,
 /// never the queue or the graph (stow#521). The matched-edge set —
-/// edges whose dep identity a changed row can flip — is walked exactly
-/// once, in the flip statement: the changed identities and matched edge
-/// rows are materialized and deduplicated before the exact membership
-/// expression runs, so several changed shapes satisfy one edge without
-/// repeating its slice count. `RETURNING` hands the flips back so the
-/// one `queue` update that follows keys off the flipped owners instead of
-/// re-walking the matched set.
+/// edges whose dep identity a changed row can flip — is bounded in the
+/// flip statement: Rust normalizes duplicate shapes before JSON, then
+/// `json_each` drives the indexed match join and `GROUP BY d.rowid` emits
+/// one answer per changed edge. `RETURNING` hands the flips
+/// back so the one `queue` update that follows keys off the flipped owners
+/// instead of re-walking the matched set.
 /// `live_generation` is the generation the marker commit already
 /// wrote — bound once into the edge probe instead of seeking the
 /// marker per edge.
@@ -4270,65 +4472,42 @@ async fn apply_slice_gate_delta(
     rustc_version: &str,
     changed_json: String,
     live_generation: i64,
+    directional_delta: bool,
 ) -> Result<(), QueueError> {
-    /// One edge the flip statement returned — its owner and the flag it
-    /// now carries.
-    #[derive(skyzen::FromRow)]
-    struct FlippedDepEdge {
-        task_id: String,
-        dep_met: i64,
-    }
-    /// One owner's counter movement, serialized into the counter
-    /// statement's JSON payload.
-    #[derive(serde::Serialize)]
-    struct OwnerDepDelta {
-        owner: String,
-        delta: i64,
-    }
-    let matched_edges = "WITH changed AS MATERIALIZED ( \
-             SELECT DISTINCT value ->> 'crate_name' AS crate_name, \
-                    value ->> 'version' AS version, \
-                    value ->> 'features_json' AS features_json, \
-                    value ->> 'unit_side' AS unit_side, \
-                    value ->> 'unit_linked' AS unit_linked, \
-                    value ->> 'unit_invocation' AS unit_invocation \
-             FROM json_each(?) \
-         ), matched AS MATERIALIZED ( \
-             SELECT DISTINCT d.rowid AS rid, d.dep_met AS old_met, \
-                    d.dep_shapes, d.dep_target, d.dep_rustc_version, \
-                    d.dep_crate_name, d.dep_version, d.dep_features_json, \
-                    d.dep_host_side, d.dep_invocations \
-             FROM changed c \
-             CROSS JOIN queue_dependencies d \
-               ON d.dep_target = ? AND d.dep_rustc_version = ? \
-              AND d.dep_crate_name = c.crate_name \
-              AND d.dep_version = c.version \
-              AND d.dep_features_json = c.features_json \
-              AND d.dep_host_side = c.unit_side \
-              AND (d.dep_host_side = 0 OR c.unit_linked = 1) \
-              AND (d.dep_invocations & (c.unit_invocation + 1)) != 0 \
-         )";
-    // The materialized edge identity carries the captured old answer and
-    // every column the exact membership expression needs, so evaluating
-    // it below cannot re-walk the changed-shape join.
+    let matched_edges = matched_edges_sql(directional_delta);
+    // Materialize one answer per matched edge. GROUP BY d.rowid collapses
+    // duplicate changed shapes before the membership expression is projected,
+    // while the MATERIALIZED boundary prevents UPDATE/filter planning from
+    // reevaluating that bounded answer probe. The write guard still avoids
+    // touching an edge whose persisted flag already equals that answer.
     let flipped = db
         .query(&format!(
-            "{matched_edges} \
+            "WITH answers AS MATERIALIZED ( \
+                 SELECT d.rowid AS rid, d.dep_met AS old_met, \
+                        CASE WHEN {unpub} THEN 0 ELSE 1 END AS new_met \
+                 {matched_edges} \
+                 GROUP BY d.rowid \
+             ) \
              UPDATE queue_dependencies \
-             SET dep_met = f.new_met \
-             FROM (SELECT m.rid, m.old_met, \
-                          CASE WHEN {unpub} THEN 0 ELSE 1 END AS new_met \
-                   FROM matched m) AS f \
-             WHERE queue_dependencies.rowid = f.rid \
-               AND f.old_met != f.new_met \
-             RETURNING queue_dependencies.task_id, queue_dependencies.dep_met",
-            matched_edges = matched_edges,
-            unpub = dep_edge_unpublished_sql_at("m", "?"),
+             SET dep_met = answers.new_met \
+             FROM answers \
+             WHERE queue_dependencies.rowid = answers.rid \
+               AND answers.old_met != answers.new_met \
+             RETURNING queue_dependencies.task_id, queue_dependencies.dep_met, \
+                       CASE WHEN queue_dependencies.dep_crate_name = '' \
+                                  OR queue_dependencies.dep_host_side < 0 \
+                                  OR EXISTS ( \
+                                      SELECT 1 FROM queue bdep \
+                                      WHERE bdep.task_id = queue_dependencies.depends_on_task_id \
+                                        AND bdep.status = 'failed' \
+                                  ) \
+                            THEN 1 ELSE 0 END AS is_blocking",
+            unpub = dep_edge_unpublished_sql_at("d", "?"),
         ))
+        .bind(live_generation)
         .bind(changed_json)
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
-        .bind(live_generation)
         .fetch_all::<FlippedDepEdge>()
         .await
         .map_err(|error| format!("flip dep_met for slice {target}/{rustc_version}: {error}"))?;
@@ -4347,29 +4526,26 @@ async fn apply_slice_gate_delta(
     //    reads on the 100k fixture) — and non-pending owners keep their
     //    stored flag. Join the unique owner payload directly to the
     //    target: a second owner lookup and materialization would read
-    //    the same row again just to assign these expressions. Net-zero
-    //    owners still refresh blocked from the changed edge flags. When
-    //    the new counter is zero, every edge is met, so blocked is
-    //    provably zero and the failed-dependency probe is unnecessary.
-    let mut deltas = std::collections::BTreeMap::<String, i64>::new();
-    for edge in &flipped {
-        *deltas.entry(edge.task_id.clone()).or_default() += 1 - 2 * edge.dep_met;
-    }
-    let owners = deltas
-        .iter()
-        .map(|(owner, delta)| OwnerDepDelta {
-            owner: owner.clone(),
-            delta: *delta,
-        })
-        .collect::<Vec<_>>();
+    //    the same row again just to assign these expressions. The
+    //    returned blocking bit also proves two owner-local cases without
+    //    rewalking that owner's edges: a newly unmet fatal edge sets
+    //    blocked, while no fatal edge cleared leaves it unchanged. Only
+    //    a clear without a new blocker needs the exact residual probe;
+    //    net-zero owners still take that path when it is ambiguous, and
+    //    a zero counter takes the direct zero case.
+    let owners = fold_owner_deltas(&flipped);
     db.query(&format!(
         "UPDATE queue \
          SET unpublished_deps = queue.unpublished_deps + j.delta, \
              deps_met = (queue.unpublished_deps + j.delta = 0), \
              blocked = CASE WHEN queue.status != 'pending' THEN queue.blocked \
                             WHEN queue.unpublished_deps + j.delta = 0 THEN 0 \
+                            WHEN j.new_blocker != 0 THEN 1 \
+                            WHEN j.cleared_blocker = 0 THEN queue.blocked \
                             ELSE {blocked} END \
-         FROM (SELECT value ->> 'owner' AS owner, value ->> 'delta' AS delta \
+         FROM (SELECT value ->> 'owner' AS owner, value ->> 'delta' AS delta, \
+                      value ->> 'new_blocker' AS new_blocker, \
+                      value ->> 'cleared_blocker' AS cleared_blocker \
                FROM json_each(?)) AS j \
          WHERE queue.task_id = j.owner",
         blocked = blocked_sql("queue.task_id"),
@@ -5409,8 +5585,10 @@ struct GitHubAppTokenRow {
 
 #[cfg(test)]
 mod tests {
-    use super::{AlarmInputs, AlarmPlan, DispatchCapacity, plan_alarm, seconds_until_utc_midnight};
-
+    use super::{
+        AlarmInputs, AlarmPlan, DispatchCapacity, SliceChangeKind, SliceRowJson,
+        normalize_gate_rows, normalized_gate_json, plan_alarm, seconds_until_utc_midnight,
+    };
     const NOW_MS: i64 = 1_000_000;
 
     fn inputs() -> AlarmInputs {
@@ -5420,6 +5598,62 @@ mod tests {
             earliest_pending_eligible_ms: None,
             earliest_active_lease_expiry_ms: None,
         }
+    }
+
+    #[test]
+    fn normalizes_gate_shapes_by_identity_direction_and_eligibility() {
+        let row = |unit_side, unit_invocation, unit_linked| SliceRowJson {
+            rowid: 0,
+            crate_name: "crate".to_owned(),
+            version: "1.0.0".to_owned(),
+            features_json: "[]".to_owned(),
+            unit_side,
+            unit_invocation,
+            unit_linked,
+        };
+        let added = [
+            (row(0, 0, 0), Some(SliceChangeKind::Added)),
+            (row(0, 0, 1), Some(SliceChangeKind::Added)),
+            (row(0, 1, 0), Some(SliceChangeKind::Added)),
+            (row(1, 0, 0), Some(SliceChangeKind::Added)),
+            (row(1, 0, 1), Some(SliceChangeKind::Added)),
+            (row(1, 1, 1), Some(SliceChangeKind::Added)),
+            (row(-1, 0, 1), Some(SliceChangeKind::Added)),
+            (row(0, -1, 1), Some(SliceChangeKind::Added)),
+        ];
+        let normalized = normalize_gate_rows(added);
+        let shapes = normalized
+            .iter()
+            .map(|row| (row.unit_side, row.invocations, row.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shapes,
+            vec![
+                (0, 3, Some(SliceChangeKind::Added)),
+                (1, 3, Some(SliceChangeKind::Added)),
+            ]
+        );
+
+        let retired = normalize_gate_rows([(row(0, 0, 1), Some(SliceChangeKind::Retired))]);
+        assert_eq!(
+            retired
+                .iter()
+                .map(|row| (row.unit_side, row.invocations, row.kind))
+                .collect::<Vec<_>>(),
+            vec![(0, 1, Some(SliceChangeKind::Retired))]
+        );
+
+        let full = normalize_gate_rows([(row(0, 0, 0), None), (row(0, 1, 1), None)]);
+        assert_eq!(
+            full.iter()
+                .map(|row| (row.unit_side, row.invocations, row.kind))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, None)]
+        );
+        assert_eq!(
+            normalized_gate_json([(row(-1, -1, -1), None)]).expect("normalize legacy rows"),
+            None
+        );
     }
 
     #[test]
@@ -5601,6 +5835,17 @@ mod sqlite_tests {
     const TEST_WINDOW_MINUTES: u32 = 60;
 
     const STALE_DISPATCH_MINUTES: u32 = 60;
+
+    async fn assert_parent_status(db: &DurableDb, expected: stow_types::api::QueueTaskStatus) {
+        assert_eq!(
+            super::task_status(db, &task_id_on("parent", TARGET))
+                .await
+                .expect("read parent status")
+                .expect("parent row")
+                .status,
+            expected
+        );
+    }
 
     fn stale_ms() -> i64 {
         i64::from(STALE_DISPATCH_MINUTES) * 60_000
@@ -7630,6 +7875,99 @@ mod sqlite_tests {
         publish(&db, "other-dep").await;
         assert_eq!(gate_counters(&db, "parent").await, (1, 0));
         assert_eq!(super::status(&db).await.expect("status").blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("fatal-dep", Vec::new()),
+                request("dep-a", Vec::new()),
+                request("dep-b", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue dependencies");
+        let mut initial_rows = dep_slice_rows("dep-a");
+        initial_rows.extend(dep_slice_rows("dep-b"));
+        super::record_published_slice(&db, TARGET, RUSTC, None, None, &initial_rows, &[])
+            .await
+            .expect("publish nonfatal dependencies");
+        enqueue(
+            &db,
+            &[request(
+                "parent",
+                vec![
+                    dependency("fatal-dep"),
+                    dependency("dep-a"),
+                    dependency("dep-b"),
+                ],
+            )],
+        )
+        .await
+        .expect("enqueue parent");
+        mark_active(&db, "dep-a", TARGET, "completed").await;
+        mark_active(&db, "dep-b", TARGET, "completed").await;
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim fatal dependency");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].crate_name, "fatal-dep");
+        super::complete(
+            &db,
+            &report(&claimed[0].task_id, claimed[0].attempt, false),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("fail fatal dependency");
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+        assert_parent_status(&db, stow_types::api::QueueTaskStatus::Blocked).await;
+
+        let mut retired = dep_slice_rows("dep-a");
+        retired.extend(dep_slice_rows("dep-b"));
+        super::record_published_slice(
+            &db,
+            TARGET,
+            RUSTC,
+            Some(1),
+            None,
+            &dep_slice_rows("fatal-dep"),
+            &retired,
+        )
+        .await
+        .expect("clear fatal and retire two nonfatal deps");
+        assert_eq!(gate_counters(&db, "parent").await, (2, 0));
+        assert_parent_status(&db, stow_types::api::QueueTaskStatus::Pending).await;
+
+        super::record_published_slice(
+            &db,
+            TARGET,
+            RUSTC,
+            Some(2),
+            None,
+            &retired,
+            &dep_slice_rows("fatal-dep"),
+        )
+        .await
+        .expect("reintroduce fatal blocker and serve nonfatal deps");
+        assert_eq!(gate_counters(&db, "parent").await, (1, 0));
+        assert_parent_status(&db, stow_types::api::QueueTaskStatus::Blocked).await;
+
+        super::record_published_slice(
+            &db,
+            TARGET,
+            RUSTC,
+            Some(3),
+            None,
+            &[],
+            &dep_slice_rows("dep-a"),
+        )
+        .await
+        .expect("retire a nonfatal dependency while fatal remains unmet");
+        assert_eq!(gate_counters(&db, "parent").await, (2, 0));
+        assert_parent_status(&db, stow_types::api::QueueTaskStatus::Blocked).await;
     }
 
     /// The counter stays live on non-pending rows: an edge flip against
