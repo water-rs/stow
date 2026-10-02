@@ -1011,6 +1011,11 @@ struct BuildCompleteReport {
     github_run_id: Option<String>,
 }
 
+#[derive(Debug, skyzen::FromRow)]
+struct CompletedTargetRow {
+    target: String,
+}
+
 /// `window_minutes` bounds the outcome evidence the record keeps: the
 /// freeze breaker's window, so the expiry deletes carried inside the
 /// insert drop exactly what the trip check can no longer read.
@@ -1023,11 +1028,6 @@ async fn complete(
     let generation_id = report.generation_id.clone();
     // `RETURNING target` hands the outcome counter the row's target —
     // the breaker files outcomes under it without a second read.
-    #[derive(skyzen::FromRow)]
-    struct UpdatedTarget {
-        target: String,
-    }
-
     // The report must name the row's live attempt in an in-flight status:
     // without that predicate a late or duplicate report for a superseded
     // attempt would overwrite the state of the attempt the row has since
@@ -1084,7 +1084,7 @@ async fn complete(
         .bind(report.github_run_id.clone())
         .bind(report.task_id.clone())
         .bind(generation_id.clone())
-        .fetch_optional::<UpdatedTarget>()
+        .fetch_optional::<CompletedTargetRow>()
         .await
         .map_err(|error| format!("complete task: {error}"))?;
     // A report that applied to no row is never a silent success: an
@@ -1306,15 +1306,7 @@ pub async fn complete_run(
                     .ok_or_else(|| QueueError::UnknownTask(report.task_id.clone()))?;
                 match row.github_run_id.as_deref() {
                     Some(bound) if report.github_run_id.as_deref() == Some(bound) => {}
-                    Some(_) => {
-                        return Err(QueueError::StaleCompletion {
-                            task_id: report.task_id.clone(),
-                            attempt: row.attempt,
-                            row_attempt: row.attempt,
-                            row_status: row.status,
-                        });
-                    }
-                    None => {
+                    Some(_) | None => {
                         return Err(QueueError::StaleCompletion {
                             task_id: report.task_id.clone(),
                             attempt: row.attempt,
@@ -1466,7 +1458,7 @@ async fn apply_pending_completion_for_binding(
         github_run_id: Some(pending.github_run_id.clone()),
     };
     match complete(db, settings, &report, window_minutes).await {
-        Ok(()) | Err(QueueError::UnknownTask(_)) | Err(QueueError::StaleCompletion { .. }) => {
+        Ok(()) | Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => {
             db.query("DELETE FROM pending_run_completions WHERE github_run_id = ?")
                 .bind(pending.github_run_id)
                 .execute()
@@ -1502,9 +1494,9 @@ pub async fn reconcile_pending_completions(
         apply_pending_completion_for_binding(
             db,
             settings,
-            &row.task_id,
-            &row.generation_id,
-            &row.github_run_id,
+            &row.task,
+            &row.generation,
+            &row.run,
             window_minutes,
         )
         .await?;
@@ -2618,6 +2610,47 @@ fn blocked_by_sql() -> String {
         .to_owned()
 }
 
+async fn claim_dispatchable_row(
+    db: &DurableDb,
+    row: TaskRow,
+) -> Result<Option<QueuedTask>, QueueError> {
+    let claimed_generation = db
+        .query(
+            "UPDATE queue \
+             SET status = 'dispatched', generation_id = lower(hex(randomblob(16))), \
+                 dispatch_attempts = dispatch_attempts + 1, \
+                 github_run_id = NULL, updated_at = datetime('now') \
+             WHERE task_id = ? AND status = 'pending' \
+             RETURNING generation_id",
+        )
+        .bind(row.task_id.clone())
+        .fetch_optional::<ClaimGenerationRow>()
+        .await
+        .map_err(|error| format!("claim task {}: {error}", row.task_id))?;
+
+    let Some(claimed_generation) = claimed_generation else {
+        tracing::warn!(
+            task_id = %row.task_id,
+            "skipping task claim — already claimed by concurrent dispatch"
+        );
+        return Ok(None);
+    };
+
+    Ok(Some(QueuedTask {
+        task_id: row.task_id,
+        generation_id: claimed_generation.generation_id,
+        attempt: row.attempt,
+        crate_name: row.crate_name,
+        version: row.version,
+        features_json: row.features_json,
+        target: row.target,
+        rustc_version: row.rustc_version,
+        host_side: row.host_side != 0,
+        preserve_lockfile: row.preserve_lockfile != 0,
+        dep_pins: Vec::new(),
+    }))
+}
+
 pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -2700,25 +2733,7 @@ pub async fn claim_dispatchable_tasks(
             if family == RunnerFamily::MacOs && macos_slots == 0 {
                 continue;
             }
-            let claimed_generation = db
-                .query(
-                    "UPDATE queue \
-                     SET status = 'dispatched', generation_id = lower(hex(randomblob(16))), \
-                         dispatch_attempts = dispatch_attempts + 1, \
-                         github_run_id = NULL, updated_at = datetime('now') \
-                     WHERE task_id = ? AND status = 'pending' \
-                     RETURNING generation_id",
-                )
-                .bind(row.task_id.clone())
-                .fetch_optional::<ClaimGenerationRow>()
-                .await
-                .map_err(|error| format!("claim task {}: {error}", row.task_id))?;
-
-            let Some(claimed_generation) = claimed_generation else {
-                tracing::warn!(
-                    task_id = %row.task_id,
-                    "skipping task claim — already claimed by concurrent dispatch"
-                );
+            let Some(task) = claim_dispatchable_row(db, row).await? else {
                 continue;
             };
             total_slots -= 1;
@@ -2726,19 +2741,7 @@ pub async fn claim_dispatchable_tasks(
                 macos_slots -= 1;
             }
 
-            claimed.push(QueuedTask {
-                task_id: row.task_id,
-                generation_id: claimed_generation.generation_id,
-                attempt: row.attempt,
-                crate_name: row.crate_name,
-                version: row.version,
-                features_json: row.features_json,
-                target: row.target,
-                rustc_version: row.rustc_version,
-                host_side: row.host_side != 0,
-                preserve_lockfile: row.preserve_lockfile != 0,
-                dep_pins: Vec::new(),
-            });
+            claimed.push(task);
         }
         if !full_page {
             break;
@@ -5931,9 +5934,12 @@ struct PendingCompletionRow {
 
 #[derive(Debug, skyzen::FromRow)]
 struct BoundPendingCompletionRow {
-    task_id: String,
-    generation_id: String,
-    github_run_id: String,
+    #[row(rename = "task_id")]
+    task: String,
+    #[row(rename = "generation_id")]
+    generation: String,
+    #[row(rename = "github_run_id")]
+    run: String,
 }
 
 /// One `PRAGMA table_info` row — only the column name matters.
@@ -8346,7 +8352,13 @@ mod sqlite_tests {
         assert_eq!(claimed[0].crate_name, "failed-dep");
         super::complete(
             &db,
-            &report(&claimed[0].task_id, claimed[0].attempt, false),
+            &settings(),
+            &report(
+                &claimed[0].task_id,
+                &claimed[0].generation_id,
+                claimed[0].attempt,
+                false,
+            ),
             TEST_WINDOW_MINUTES,
         )
         .await
@@ -11229,7 +11241,12 @@ mod sqlite_tests {
             .expect("seed claim");
         assert_eq!(claimed.len(), count);
         for task in claimed {
-            let mut report = report(&task.task_id, task.attempt, failure.is_none());
+            let mut report = report(
+                &task.task_id,
+                &task.generation_id,
+                task.attempt,
+                failure.is_none(),
+            );
             if let Some((error, run_id)) = failure {
                 report.error = Some(error.to_owned());
                 report.github_run_id = Some(run_id.to_owned());
