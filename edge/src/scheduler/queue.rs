@@ -3252,12 +3252,15 @@ const UNBUILT_STATUSES: &str = "'pending', 'failed'";
 /// Acceptance is the last statement, and it is atomic: the guarded
 /// `UPDATE` flipping `prepared` to `accepted` fires the `demand_fold`
 /// trigger, which folds every staged delta into
-/// `demand`/`value`/`dispatch_key` inside that one statement, and a
-/// failure anywhere — including the trigger's own staged-count
-/// `RAISE(ABORT)` — rolls back the transition AND all triggered queue
-/// effects. Once it returns, the batch is complete; nothing accepted
-/// is ever applied again. `value` and `dispatch_key` refresh for the
-/// event's own closure only.
+/// `demand`/`value`/`dispatch_key` inside that one statement, verifies
+/// the staged count reached the accepted count, then retires this
+/// batch's staged rows — an accepted batch's replay reads only the
+/// header, so consumed staging cannot accumulate (stow#523). A
+/// failure anywhere — including the trigger's own `RAISE(ABORT)` —
+/// rolls back the transition AND all triggered queue effects, staged
+/// rows preserved for accept-or-retry. Once it returns, the batch is
+/// complete; nothing accepted is ever applied again. `value` and
+/// `dispatch_key` refresh for the event's own closure only.
 ///
 /// A batch id is a window identity, not a lookup key: the first
 /// accepted payload wins the id. Input order and duplicate identities
@@ -6225,7 +6228,7 @@ async fn apply_slice_gate_delta(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -6749,7 +6752,12 @@ async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
     // verifies the staged count reached the accepted count:
     // `RAISE(ABORT)` on a shortfall rolls the transition AND every
     // triggered queue effect back out of the same statement. A staged
-    // row naming no queue task simply matches nothing.
+    // row naming no queue task simply matches nothing. The staged rows
+    // are then consumed in the same statement: an accepted batch's
+    // replay reads only the header, so the recurring feed (#523) would
+    // otherwise accumulate dead staging forever — retiring it here is
+    // still O(this batch's closure) and a failed later statement
+    // cannot leak unbounded dead rows.
     db.query(
         "CREATE TRIGGER demand_fold \
          AFTER UPDATE OF state ON demand_batches \
@@ -6769,6 +6777,7 @@ async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
              SELECT RAISE(ABORT, 'demand batch staged set short of accepted count') \
              WHERE (SELECT count(*) FROM demand_contributions c \
                     WHERE c.batch_id = NEW.batch_id) != NEW.touched_count; \
+             DELETE FROM demand_contributions WHERE batch_id = NEW.batch_id; \
          END",
     )
     .execute()

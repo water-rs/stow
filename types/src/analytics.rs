@@ -54,3 +54,20 @@ pub fn de_f64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, 
         Number::Quoted(text) => text.parse().map_err(serde::de::Error::custom),
     }
 }
+
+/// Lossless `Float64 → u64` for callers that consume an estimate as a
+/// count: accepts only finite non-negative integral values in range —
+/// never clamps a negative or out-of-range aggregate, and reports a
+/// fractional estimate rather than silently rounding it.
+///
+/// # Errors
+/// The value is non-finite, negative, fractional, or above `u64::MAX`.
+pub fn f64_to_u64_exact(value: f64, what: &str) -> Result<u64, String> {
+    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64 {
+        Ok(value as u64)
+    } else {
+        Err(format!(
+            "{what}: non-integral or out-of-range estimate {value}"
+        ))
+    }
+}

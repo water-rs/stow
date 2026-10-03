@@ -62,6 +62,11 @@ const TARGETS_SQL: &str = include_str!("sql/stats_targets.sql");
 /// `stats_cli_versions.sql` — hits per `stow-cli` version over 30 days.
 const CLI_VERSIONS_SQL: &str = include_str!("sql/stats_cli_versions.sql");
 
+/// `demand_feed.sql` — one closed hour's miss identities with their
+/// additive demand weights; the hourly demand feed's single
+/// Analytics Engine query (stow#523).
+const DEMAND_FEED_SQL: &str = include_str!("sql/demand_feed.sql");
+
 /// The Analytics Engine SQL API prefix `run_sql` posts under when no
 /// `STOW_STATS_SQL_URL` override points the route at a stub.
 pub const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
@@ -247,6 +252,69 @@ mod worker {
         Ok(envelope.data)
     }
 
+    /// Run the closed-hour demand-feed query and stream the
+    /// `FORMAT JSON` document to the caller unbuffered (stow#523):
+    /// `hour` is the validated `YYYY-MM-DD HH` literal
+    /// [`stow_types::api::DemandFeedHour::sql_literal`] emits — the
+    /// only substitution into the checked-in query file. The materializer
+    /// parses the stream itself, so the edge never holds an hour in
+    /// memory; the [`GuardedResponse`] cancels the connection on every
+    /// early-return arm and the 2xx arm hands the body to the caller.
+    pub async fn demand_feed_query(
+        context: &StatsContext,
+        hour: &str,
+    ) -> Result<skyzen::Response, crate::errors::GetArtifactError> {
+        use super::DEMAND_FEED_SQL;
+        use crate::fetch_guard::{FetchedResponse as _, GuardedResponse};
+        use skyzen::runtime::wasm::from_js_response;
+        use skyzen_cloudflare::worker::send::SendWrapper;
+
+        let sql = DEMAND_FEED_SQL.replace("__HOUR__", hour);
+        let url = context.sql_url.as_str();
+        let authorization = format!("Bearer {}", context.analytics_token);
+        let request = SendWrapper::new(
+            crate::cf_http::bare_request(
+                skyzen_cloudflare::worker::Method::Post,
+                url,
+                &[("Authorization", authorization.as_str())],
+                Some(sql.as_bytes()),
+            )
+            .map_err(|error| {
+                crate::errors::GetArtifactError::InternalWithMessage(format!(
+                    "build demand feed query: {error}"
+                ))
+            })?,
+        );
+        let response =
+            SendWrapper::new(skyzen_cloudflare::CfFetch.request(&request).await.map_err(
+                |error| {
+                    crate::errors::GetArtifactError::InternalWithMessage(format!(
+                        "demand feed query fetch: {error}"
+                    ))
+                },
+            )?);
+        let guarded = GuardedResponse::new(response);
+        let status = guarded.get_ref().status_code();
+        if !(200..300).contains(&status) {
+            let body = guarded
+                .into_inner()
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_owned());
+            return Err(crate::errors::GetArtifactError::InternalWithMessage(
+                format!("demand feed query failed: {status} {body}"),
+            ));
+        }
+        let worker_response = guarded.into_inner().0;
+        let js: skyzen_cloudflare::worker::web_sys::Response = worker_response.into();
+        #[allow(clippy::used_underscore_items)]
+        from_js_response(&js).map_err(|error| {
+            crate::errors::GetArtifactError::InternalWithMessage(format!(
+                "wrap demand feed response: {error:?}"
+            ))
+        })
+    }
+
     /// The one row every single-value `stats_*.sql` query returns.
     fn first_row<T>(
         mut rows: Vec<T>,
@@ -268,15 +336,20 @@ mod worker {
     pub async fn compute_usage_stats(
         context: &StatsContext,
     ) -> Result<stow_types::api::UsageStats, crate::errors::GetArtifactError> {
-        let events = first_row(run_sql(context, super::EVENTS_SQL).await?, "stats_events")?;
-        let installs = first_row(
-            run_sql(context, super::INSTALLS_SQL).await?,
-            "stats_installs",
+        // Six independent HTTP queries against the same analytics
+        // endpoint — one shared transport, a fixed `try_join` bound of
+        // six, first error propagates.
+        let (events, installs, misses, top_crates, targets, cli_versions) = futures_util::try_join!(
+            run_sql(context, super::EVENTS_SQL),
+            run_sql(context, super::INSTALLS_SQL),
+            run_sql(context, super::MISSES_SQL),
+            run_sql(context, super::TOP_CRATES_SQL),
+            run_sql(context, super::TARGETS_SQL),
+            run_sql(context, super::CLI_VERSIONS_SQL),
         )?;
-        let misses = first_row(run_sql(context, super::MISSES_SQL).await?, "stats_misses")?;
-        let top_crates = run_sql(context, super::TOP_CRATES_SQL).await?;
-        let targets = run_sql(context, super::TARGETS_SQL).await?;
-        let cli_versions = run_sql(context, super::CLI_VERSIONS_SQL).await?;
+        let events = first_row(events, "stats_events")?;
+        let installs = first_row(installs, "stats_installs")?;
+        let misses = first_row(misses, "stats_misses")?;
         Ok(super::usage_stats_from_rows(
             &events,
             &installs,
@@ -289,7 +362,7 @@ mod worker {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use worker::{StatsContext, compute_usage_stats};
+pub use worker::{StatsContext, compute_usage_stats, demand_feed_query};
 
 #[cfg(test)]
 mod tests {

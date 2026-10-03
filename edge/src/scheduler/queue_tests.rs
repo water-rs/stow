@@ -1509,7 +1509,9 @@
             .expect("demand");
         assert_eq!(report.touched_tasks, 4);
         assert_eq!(demand_of(&db, &task_id_on("c", TARGET)).await, 7);
-        assert_eq!(contribution_rows(&db, "h0").await, 4);
+        // Acceptance consumes the staged set in the same statement
+        // (stow#523): an accepted batch's replay reads the header only.
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
     }
 
     /// One entry names a node identity without its side: both the
@@ -1663,7 +1665,9 @@
             .expect("replay");
         assert!(!replay.applied);
         assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
-        assert_eq!(contribution_rows(&db, "hour-1").await, 1);
+        // The staged set retired at acceptance — the replay answered
+        // from the header alone.
+        assert_eq!(contribution_rows(&db, "hour-1").await, 0);
 
         // The shared pass still returns the planner's answer on an
         // exact replay — the route arms it, repairing a schedule a
@@ -2012,11 +2016,12 @@
             .await
             .expect_err("conflicting identity must fail");
 
-        // Nothing moved: demands, contribution rows and the batch
-        // record are exactly what the first delivery established.
+        // Nothing moved: demands and the batch record are exactly
+        // what the first delivery established — the staged set stayed
+        // retired.
         assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
         assert_eq!(demand_of(&db, &task_id_on("mid", TARGET)).await, 5);
-        assert_eq!(contribution_rows(&db, "h0").await, 2);
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
         assert_eq!(batch_rows(&db, "h0").await, 1);
     }
 
@@ -2064,7 +2069,9 @@
         assert!(!replay.applied);
         assert_eq!(replay.touched_tasks, 2);
         assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 0);
-        assert_eq!(contribution_rows(&db, "h0").await, 2);
+        // Acceptance already retired the staged rows — the frozen
+        // answer lives in the header, not staging.
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
     }
 
     /// An accepted batch that froze an empty contribution set keeps
@@ -2163,7 +2170,9 @@
         // skipped it, and the draft's staged row for it was cleared —
         // its demand is 0, not the staged 9.
         assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 0);
-        assert_eq!(contribution_rows(&db, "h0").await, 2, "restaged set");
+        // The recomputed set accepted — and consumed its staging in
+        // the same statement.
+        assert_eq!(contribution_rows(&db, "h0").await, 0, "staged set retired");
         assert_eq!(batch_state(&db, "h0").await, "accepted");
     }
 
@@ -2203,7 +2212,7 @@
         let root = task_id_on("root", TARGET);
         assert_eq!(demand_of(&db, &root).await, 7, "5 recomputed + 2 from h1");
         assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 7);
-        assert_eq!(contribution_rows(&db, "h0").await, 2);
+        assert_eq!(contribution_rows(&db, "h0").await, 0, "staged set retired");
     }
 
     /// An accepted batch's replay is a pure header read: after the
@@ -2456,7 +2465,9 @@
         let report = apply(db, "big", entries).await.expect("retry converges");
         assert!(report.applied);
         assert_eq!(report.touched_tasks, chain as u64);
-        assert_eq!(contribution_rows(db, "big").await, chain as u64);
+        // The accepted fold retired the whole staged set in the same
+        // statement.
+        assert_eq!(contribution_rows(db, "big").await, 0);
         assert_eq!(batch_state(db, "big").await, "accepted");
         assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 2);
         assert_eq!(

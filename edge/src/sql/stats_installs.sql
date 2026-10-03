@@ -1,11 +1,15 @@
--- Install-days over the last 7 days, from the `stow_events` dataset.
--- index1 is the daily-salted install hash: it changes every day, so
--- distinct values over 7 days count install-days, and the reader divides
--- by 7 for the daily average. `count(DISTINCT ...)` is the only distinct
--- aggregate the Analytics Engine SQL API supports (no `uniq`/`uniqIf`),
--- which is why the window is a WHERE clause rather than a condition.
+-- Unique install events in the last 24 hours. index1 = toYYYYMMDD(timestamp)
+-- salts the time_trunc_group key per day, so distinct counter values of
+-- (day, counter) survive the engine's own aggregation — the count is
+-- unique installs per day, deduplicated across retries and page views.
+--
+-- This is a sample-observed figure, not an additive estimate: privacy
+-- suppression drops some installs entirely and their counter values
+-- never reach the dataset, so no `_sample_interval` rescaling recovers
+-- them. `count(DISTINCT index1)` reports exactly what was observed —
+-- we do not fabricate an unbiased estimate from the observed set.
 SELECT
-    count(DISTINCT index1) AS install_days_7d
+    count(DISTINCT index1) AS installs_24h
 FROM stow_events
-WHERE blob1 = 'hit' AND timestamp >= NOW() - INTERVAL '7' DAY
+WHERE blob1 = 'install' AND timestamp >= NOW() - INTERVAL '1' DAY
 FORMAT JSON

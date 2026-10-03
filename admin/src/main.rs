@@ -376,6 +376,69 @@ impl Edge {
             .await
             .map_err(|error| stow_error!("decode {url}: {error}"))
     }
+
+    /// `POST` a JSON body whose answer carries nothing the caller
+    /// reads — the response body is still drained so the connection
+    /// returns to the pool rather than stalling in it.
+    pub(crate) async fn post_unit<B: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> stow_types::error::Result<()> {
+        let url = format!("{}{path}", self.base);
+        let bearer = self.bearer().await?;
+        let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
+        let request = client
+            .post(&url)
+            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
+            .and_then(|request| match &self.version_override {
+                Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
+                None => Ok(request),
+            })
+            .and_then(|request| request.json_body(body))
+            .map_err(|error| stow_error!("POST {url}: {error}"))?;
+        let response = request
+            .await
+            .map_err(|error| stow_error!("POST {url}: {error}"))?;
+        response
+            .error_for_status()
+            .await
+            .map_err(|error| stow_error!("POST {url}: {error}"))?
+            .into_bytes()
+            .await
+            .map(|_| ())
+            .map_err(|error| stow_error!("drain {url}: {error}"))
+    }
+
+    /// `POST` a JSON body and hand the 2xx response back with its body
+    /// unbuffered — the demand feed's hour document is larger than
+    /// anything this process should hold (stow#523), so the caller
+    /// streams it to disk itself.
+    pub(crate) async fn post_stream<B: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> stow_types::error::Result<zenwave::Response> {
+        let url = format!("{}{path}", self.base);
+        let bearer = self.bearer().await?;
+        let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
+        let request = client
+            .post(&url)
+            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
+            .and_then(|request| match &self.version_override {
+                Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
+                None => Ok(request),
+            })
+            .and_then(|request| request.json_body(body))
+            .map_err(|error| stow_error!("POST {url}: {error}"))?;
+        let response = request
+            .await
+            .map_err(|error| stow_error!("POST {url}: {error}"))?;
+        response
+            .error_for_status()
+            .await
+            .map_err(|error| stow_error!("POST {url}: {error}"))
+    }
 }
 
 /// Whether the Actions OIDC mint endpoint is advertised — both env vars

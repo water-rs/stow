@@ -50,27 +50,39 @@ const ANALYTICS_SQL: &[&str] = &[
     "SELECT count(DISTINCT index1) AS value FROM stow_events \
      WHERE blob1 = 'hit' AND timestamp >= toDateTime('$since 00:00:00') \
      AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
-    // Byte-path fetches: hit points are 1/10-sampled, `double1` carries
-    // the weight — `sum` restores the true count.
-    "SELECT sum(double1) AS value FROM stow_events \
+    // Byte-path fetches: hit points carry `double1` as their caller
+    // weight — `sum(_sample_interval * double1)` is the additive
+    // estimate: exact for unsampled writes (interval 1) and scaled
+    // when the engine samples.
+    "SELECT sum(_sample_interval * double1) AS value FROM stow_events \
      WHERE blob1 = 'hit' AND timestamp >= toDateTime('$since 00:00:00') \
      AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
     // Miss nodes: `stow_cache_misses` points are unsampled — one per
-    // uncovered node the admissions lane minted a ticket for.
-    "SELECT count() AS value FROM stow_cache_misses \
+    // uncovered node the admissions lane minted a ticket for. The
+    // `_sample_interval * double1` product equals `count()` today and
+    // stays correct if the dataset ever samples.
+    "SELECT sum(_sample_interval * double1) AS value FROM stow_cache_misses \
      WHERE blob1 = 'miss' AND timestamp >= toDateTime('$since 00:00:00') \
      AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
 ];
 
-/// One `count()`/`sum()` row an [`ANALYTICS_SQL`] query returns —
-/// `FORMAT JSON` quotes 64-bit integers, so the shared Analytics
-/// Engine deserializer decodes it.
+/// One `count(DISTINCT)` row [`ANALYTICS_SQL`][0] returns — `FORMAT
+/// JSON` quotes `UInt64`, so `de_u64` decodes it.
 #[derive(Debug, Deserialize)]
 struct AeCountRow {
-    /// The queried aggregate — each `ANALYTICS_SQL` selects it as
-    /// `value`.
+    /// The queried aggregate — the query selects it as `value`.
     #[serde(deserialize_with = "stow_types::analytics::de_u64")]
     value: u64,
+}
+
+/// One `sum(_sample_interval * double1)` row — the additive estimate
+/// is `Float64`, decoded with `de_f64` and validated losslessly
+/// before its u64 use rather than clamped.
+#[derive(Debug, Deserialize)]
+struct AeSumRow {
+    /// The queried aggregate — the query selects it as `value`.
+    #[serde(deserialize_with = "stow_types::analytics::de_f64")]
+    value: f64,
 }
 
 /// `launch-model.graphql` — the zone's HTTP request counts by method
@@ -276,29 +288,34 @@ async fn gather_snapshot(
     let window_end = end.map_or_else(default_window_end, str::to_owned);
     let since = shift_day(&window_end, -i64::from(window_days))?;
 
-    let mut ae_rows = Vec::new();
-    for template in ANALYTICS_SQL {
-        let sql = template
+    let analytic_sql = |index: usize| {
+        ANALYTICS_SQL[index]
             .replace("$since", &since)
-            .replace("$until", &window_end);
-        ae_rows.push(
-            cloudflare::analytics_engine_sql::<AeCountRow>(&token, &account, &sql)
-                .await
-                .map_err(|error| stow_error!("analytics engine: {error}"))?,
-        );
-    }
-    let install_days = ae_rows[0]
-        .first()
-        .map(|row| row.value)
-        .ok_or_else(|| stow_error!("install-days query returned no row"))?;
-    let cli_fetches = ae_rows[1]
-        .first()
-        .map(|row| row.value)
-        .ok_or_else(|| stow_error!("fetch query returned no row"))?;
-    let miss_nodes = ae_rows[2]
-        .first()
-        .map(|row| row.value)
-        .ok_or_else(|| stow_error!("miss query returned no row"))?;
+            .replace("$until", &window_end)
+    };
+    let install_days =
+        cloudflare::analytics_engine_sql::<AeCountRow>(&token, &account, &analytic_sql(0))
+            .await
+            .map_err(|error| stow_error!("analytics engine: {error}"))?
+            .first()
+            .map(|row| row.value)
+            .ok_or_else(|| stow_error!("install-days query returned no row"))?;
+    // Rows 1 and 2 are `Float64` estimates — decode at the actual
+    // column type, then validate before the u64 conversion.
+    let analytic_sum = async |index: usize, what: &str| -> stow_types::error::Result<u64> {
+        cloudflare::analytics_engine_sql::<AeSumRow>(&token, &account, &analytic_sql(index))
+            .await
+            .map_err(|error| stow_error!("analytics engine: {error}"))?
+            .first()
+            .map(|row| row.value)
+            .ok_or_else(|| stow_error!("{what} query returned no row"))
+            .and_then(|value| {
+                stow_types::analytics::f64_to_u64_exact(value, what)
+                    .map_err(stow_types::error::Error::msg)
+            })
+    };
+    let cli_fetches = analytic_sum(1, "fetch").await?;
+    let miss_nodes = analytic_sum(2, "miss").await?;
     let requests = zone_path_counts(&token, &zone, &since, &window_end).await?;
     Ok(WindowSnapshot {
         window_days,

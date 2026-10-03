@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::artifact::{ArtifactKind, RustCrateType};
@@ -1617,6 +1617,303 @@ pub struct SchedulerDemandReport {
     /// reports the stored count and writes nothing.
     pub applied: bool,
 }
+
+// ----- Hourly demand feed (stow#523) -----
+
+/// One closed hour of the demand feed — the canonical `YYYY-MM-DDTHH`
+/// (UTC) the hour header, the page keys and every batch identity
+/// derive from. `DEMAND_FEED_HOUR_LEN` is its fixed length.
+pub const DEMAND_FEED_HOUR_LEN: usize = 13;
+
+/// The `YYYY-MM-DDTHH` shape `time` parses and re-emits — the
+/// canonical literal every feed key carries.
+const DEMAND_FEED_HOUR_FORMAT: &[time::format_description::FormatItem<'static>] =
+    time::macros::format_description!("[year]-[month]-[day]T[hour]");
+
+/// A validated `YYYY-MM-DDTHH` UTC hour literal (stow#523).
+///
+/// Parsing goes through `time`'s real calendar — February 31,
+/// month 13, or a mis-shaped literal can never reach a feed write or
+/// an Analytics Engine query — and the stored form is the re-emitted
+/// canonical shape, so `Ord` on it sorts chronologically. The shared
+/// parser serves the Durable Object's writes, the edge's query proxy
+/// and `stow-admin`'s resume/backfill arithmetic; `parse_closed`
+/// additionally requires the hour to be fully over.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, ToSchema)]
+#[serde(transparent)]
+pub struct DemandFeedHour(String);
+
+impl DemandFeedHour {
+    /// Parse shape + calendar — rejects February 31 and any
+    /// non-canonical padding. Does not check whether the hour has
+    /// closed; callers writing or querying use
+    /// [`parse_closed`](Self::parse_closed).
+    pub fn parse(hour: &str) -> Result<Self, String> {
+        if hour.len() != DEMAND_FEED_HOUR_LEN {
+            return Err(format!("demand feed hour {hour:?} is not YYYY-MM-DDTHH"));
+        }
+        let parsed = time::PrimitiveDateTime::parse(hour, DEMAND_FEED_HOUR_FORMAT)
+            .map_err(|_| format!("demand feed hour {hour:?} is not a calendar hour"))?;
+        let canonical = parsed
+            .format(DEMAND_FEED_HOUR_FORMAT)
+            .map_err(|error| format!("reformat demand feed hour {hour:?}: {error}"))?;
+        if canonical != hour {
+            return Err(format!(
+                "demand feed hour {hour:?} is not the canonical {canonical:?}"
+            ));
+        }
+        Ok(Self(canonical))
+    }
+
+    /// [`parse`](Self::parse) plus require the hour fully closed at
+    /// `now_unix_secs` — every feed write and Analytics Engine query
+    /// goes through this.
+    pub fn parse_closed(hour: &str, now_unix_secs: i64) -> Result<Self, String> {
+        let this = Self::parse(hour)?;
+        this.ensure_closed(now_unix_secs)?;
+        Ok(this)
+    }
+
+    /// Require this hour fully closed at `now_unix_secs` — the check
+    /// feed writes and queries apply to an already-parsed hour.
+    pub fn ensure_closed(&self, now_unix_secs: i64) -> Result<(), String> {
+        if self.end_unix_secs() > now_unix_secs {
+            return Err(format!("demand feed hour {} is not closed", self.0));
+        }
+        Ok(())
+    }
+
+    /// The canonical `YYYY-MM-DDTHH` literal.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The `YYYY-MM-DD HH` form `demand_feed.sql`'s `__HOUR__`
+    /// marker substitutes.
+    pub fn sql_literal(&self) -> String {
+        self.0.replacen('T', " ", 1)
+    }
+
+    /// The hour after this one (calendar arithmetic — it may not be
+    /// closed; that check happens at use).
+    pub fn next(&self) -> Self {
+        let next = self.parsed() + time::Duration::hours(1);
+        Self(
+            next.format(DEMAND_FEED_HOUR_FORMAT)
+                .unwrap_or_else(|_| unreachable!("calendar hour always formats")),
+        )
+    }
+
+    /// The hour before this one — the watermark contiguity check
+    /// compares the stored cursor against `prev()` of the hour being
+    /// marked delivered.
+    pub fn prev(&self) -> Self {
+        let prev = self.parsed() - time::Duration::hours(1);
+        Self(
+            prev.format(DEMAND_FEED_HOUR_FORMAT)
+                .unwrap_or_else(|_| unreachable!("calendar hour always formats")),
+        )
+    }
+
+    /// The first second after this hour — the closure boundary.
+    fn end_unix_secs(&self) -> i64 {
+        (self.parsed() + time::Duration::hours(1))
+            .assume_utc()
+            .unix_timestamp()
+    }
+
+    fn parsed(&self) -> time::PrimitiveDateTime {
+        time::PrimitiveDateTime::parse(&self.0, DEMAND_FEED_HOUR_FORMAT)
+            .unwrap_or_else(|_| unreachable!("stored hour was validated"))
+    }
+}
+
+impl std::fmt::Display for DemandFeedHour {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DemandFeedHour {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/query` request — run the
+/// closed-hour Analytics Engine miss query for `hour` and stream the
+/// `FORMAT JSON` document back unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedQueryRequest {
+    /// UTC hour, already closed.
+    pub hour: DemandFeedHour,
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/begin` request — open
+/// (or resume) the staging attempt for `hour`. Once an hour froze
+/// (`complete`/`delivered`) a begin refuses: a complete hour never
+/// re-queries Analytics Engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedBeginRequest {
+    /// UTC hour, already closed.
+    pub hour: DemandFeedHour,
+}
+
+/// What `begin` returns: the attempt's generation. A resume rotates
+/// to a fresh generation — the restarted materialization is a new
+/// attempt, never a merge into the abandoned one's staged pages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedBeginReport {
+    /// The hour, echoed.
+    pub hour: DemandFeedHour,
+    /// The staging attempt's generation — pages and `complete` bind
+    /// to it, so bytes from a different attempt cannot mix in.
+    pub generation: i64,
+    /// `true` when abandoned-generation page rows still await
+    /// retirement — the caller drains them through
+    /// `POST …/demand-feed/cleanup` before finishing, so obsolete
+    /// payloads never become an unbounded archive.
+    pub stale_pages_pending: bool,
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/cleanup` request —
+/// retire up to a bounded chunk of page rows for `hour`: obsolete
+/// generations (a rotated staging attempt's leftovers) or a
+/// `delivered` hour's acknowledged payloads. Explicit event work;
+/// nothing runs on a timer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedCleanupRequest {
+    /// UTC hour, already closed.
+    pub hour: DemandFeedHour,
+}
+
+/// What `cleanup` reports per bounded call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedCleanupReport {
+    /// The hour, echoed.
+    pub hour: DemandFeedHour,
+    /// Page rows this call physically retired.
+    pub retired: u64,
+    /// `true` while further rows remain — the caller keeps calling
+    /// until `false`.
+    pub remaining: bool,
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/page` request — stage
+/// one bounded page of the hour's materialized entries. The payload
+/// serializes at most `DEMAND_FEED_PAGE_MAX_ENTRIES` entries below
+/// `DEMAND_FEED_PAGE_MAX_BYTES` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedPageRequest {
+    /// UTC hour, already closed.
+    pub hour: DemandFeedHour,
+    /// The `begin` generation this page belongs to.
+    pub generation: i64,
+    /// Zero-based page index — every page in `[0, page_count)` must be
+    /// staged before `complete` accepts.
+    pub page_no: u32,
+    /// The page's entries — non-empty, bounded.
+    pub entries: Vec<SchedulerDemandEntry>,
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/complete` request —
+/// freeze the hour when every page of this generation is staged. The
+/// scheduler verifies the staged counters and the ordered page-hash
+/// manifest atomically in the same statement that freezes; after it
+/// succeeds the hour's payload is frozen and never re-materialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedCompleteRequest {
+    /// UTC hour, already closed.
+    pub hour: DemandFeedHour,
+    /// The attempt generation the pages were staged under.
+    pub generation: i64,
+    /// Pages the materializer posted — `0` completes a zero-entry
+    /// hour, which then delivers with no demand calls at all.
+    pub page_count: u32,
+    /// Total entries across all pages.
+    pub entry_count: u64,
+    /// blake3 rolling hash of the ordered page hashes —
+    /// `chain(page) = blake3(chain(page-1) || page_hash)`, seeded by
+    /// `chain(0) = blake3(page0_hash)` — proving every staged page of
+    /// this attempt, in order. Ignored when `page_count` is `0`.
+    pub manifest_hash: String,
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/deliver` request —
+/// deliver the next undelivered page of a `complete` hour as one
+/// #522 demand batch (`demand-feed/{hour}/{page_no}`). A call is
+/// bounded work: one page at a time, the durable `applied` mark
+/// advancing only after the batch reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedDeliverRequest {
+    /// UTC hour, already closed.
+    pub hour: DemandFeedHour,
+}
+
+/// What `deliver` reports per call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedDeliverReport {
+    /// The hour, echoed.
+    pub hour: String,
+    /// `delivered` when no page remained; `complete` while pages are
+    /// still outstanding.
+    pub state: String,
+    /// The page this call applied, when one remained.
+    pub delivered_page: Option<u32>,
+    /// Whether the page's batch performed its acceptance transition —
+    /// `false` on a lost-ack replay, which still marks the page.
+    pub applied: bool,
+    /// Queue tasks the delivered page's closures touched.
+    pub touched_tasks: u64,
+    /// Pages still awaiting delivery after this call.
+    pub remaining_pages: u64,
+}
+
+/// `GET /api/v1/admin/scheduler/demand-feed/status` answer — the
+/// durable resume cursor: the oldest unfinished hour (if any) plus
+/// the watermark every hour at or below has fully delivered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedStatus {
+    /// Newest fully delivered hour, `YYYY-MM-DDTHH`.
+    pub watermark: Option<String>,
+    /// The unfinished hour's header, when the partial index holds one.
+    pub unfinished: Option<DemandFeedUnfinished>,
+}
+
+/// One unfinished hour header from [`DemandFeedStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandFeedUnfinished {
+    /// UTC hour, `YYYY-MM-DDTHH`.
+    pub hour: String,
+    /// `staging` (materialization in flight) or `complete` (frozen,
+    /// pages awaiting delivery).
+    pub state: String,
+    /// The staging attempt's generation.
+    pub generation: i64,
+    /// Pages staged so far (staging) or frozen at complete.
+    pub staged_pages: i64,
+    /// Entries staged so far.
+    pub staged_entries: i64,
+}
+
+/// Page bounds the feed's wire and Durable Object enforce: the
+/// request stays below the 100-bound-parameter / statement-size
+/// native limits and the existing 512 KiB operand cap.
+pub const DEMAND_FEED_PAGE_MAX_ENTRIES: usize = 256;
+/// Serialized `entries` byte ceiling per page.
+pub const DEMAND_FEED_PAGE_MAX_BYTES: usize = 512 * 1024;
+/// Page rows one `cleanup` call physically retires — payload
+/// retirement is bounded indexed event work, never a one-statement
+/// wipe of a huge hour (stow#523).
+pub const DEMAND_FEED_RETIRE_CHUNK: i64 = 256;
+/// `batch_id` prefix the feed derives per page —
+/// `demand-feed/{hour}/{page_no}` — so a page's delivery replays the
+/// same frozen payload under a stable identity.
+pub const DEMAND_FEED_BATCH_PREFIX: &str = "demand-feed/";
 
 /// One queue row as `GET /api/v1/admin/queue` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

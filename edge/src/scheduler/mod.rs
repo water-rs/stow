@@ -4,6 +4,9 @@
 //! every target so its logic is host-testable; `dispatch` and `object` are the
 //! Cloudflare-bound dispatch and Durable Object glue.
 
+/// The hourly demand feed's durable hour/page state machine —
+/// backend-abstracted like `queue` so it host-tests on every target.
+pub mod feed;
 pub mod meter;
 pub mod queue;
 /// The exact `value`/`dispatch_key` rank — one shared Rust derivation
