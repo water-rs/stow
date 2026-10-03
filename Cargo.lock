@@ -7905,6 +7905,7 @@ dependencies = [
  "async-lock",
  "base64 0.23.1",
  "blake3",
+ "crypto-bigint",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",

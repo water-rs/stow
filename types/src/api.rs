@@ -1572,10 +1572,12 @@ pub struct SchedulerDemandEntry {
 /// batch.
 ///
 /// `batch_id` is the replay contract the hourly feed (#523) reuses:
-/// contributions are keyed `(task_id, batch_id)` and each folds its
-/// delta into `queue.demand` exactly once, so redelivering a batch
-/// applies nothing twice and a batch interrupted mid-application
-/// converges on the next delivery.
+/// staged contributions fold into `queue.demand` inside the single
+/// `prepared → accepted` acceptance statement, so an accepted batch
+/// has no remainder — a delivery interrupted before acceptance
+/// (`prepared`) recomputes the current graph on retry, and an
+/// accepted-batch replay answers from the stored record and writes
+/// nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerDemandRequest {
     /// The batch's durable identity — the feed's hour window.
@@ -1596,8 +1598,10 @@ pub struct SchedulerDemandReport {
     /// Queue tasks the batch's closures named — each took its share of
     /// every entry whose walk reached it.
     pub touched_tasks: u64,
-    /// `true` when the call recorded new contribution rows — `false`
-    /// on an exact replay or a batch whose closure was empty.
+    /// `true` when this call performed the batch's acceptance
+    /// transition — including an empty closure, which accepts like
+    /// any other; `false` on an exact accepted-batch replay, which
+    /// reports the stored count and writes nothing.
     pub applied: bool,
 }
 
@@ -1653,6 +1657,13 @@ pub struct QueueTask {
     /// (`EnqueueRequest::host_side`).
     #[serde(default)]
     pub host_side: bool,
+    /// The persisted dispatch score as an exact decimal string. The
+    /// integer column legitimately outgrows the JavaScript-safe range
+    /// (human-lane values sit above 2^53), so the Durable Object
+    /// projects `CAST(value AS TEXT)` and this field carries the text
+    /// unchanged — parsing or rounding it would corrupt adjacent
+    /// scores (stow#525 I10).
+    pub value: String,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].

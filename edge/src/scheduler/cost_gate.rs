@@ -163,10 +163,16 @@ const BUDGETS: &[RouteBudget] = &[
     // Mutation routes — one keyed statement each against a bounded
     // selector.
     RouteBudget {
+        // The success arm also prices the build-cost bookkeeping
+        // (stow#524): one generation-keyed sample insert, the
+        // newest-BUILD_SAMPLE_WINDOW cap delete, the window's
+        // ≤-window read, the stats upsert and — only when the median
+        // moved — a keyed refresh over exactly the same-(crate, target)
+        // pending rows.
         name: "POST /tasks/complete-run",
-        statements: 7,
-        rows_read: 70,
-        rows_written: 20,
+        statements: 14,
+        rows_read: 120,
+        rows_written: 60,
         scan_allowlist: &[],
         ddl_permitted: false,
     },
@@ -180,7 +186,7 @@ const BUDGETS: &[RouteBudget] = &[
     },
     RouteBudget {
         name: "POST /tasks/retry",
-        statements: 3,
+        statements: 4,
         rows_read: 10,
         rows_written: 4,
         scan_allowlist: &[],
@@ -299,7 +305,7 @@ const BUDGETS: &[RouteBudget] = &[
     },
     RouteBudget {
         name: "POST /demand",
-        statements: 8,
+        statements: 9,
         rows_read: 200,
         rows_written: 60,
         // The recursive walk's working table and the json_each payload

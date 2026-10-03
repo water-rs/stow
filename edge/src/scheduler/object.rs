@@ -37,6 +37,7 @@ const STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_MACOS_
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
+const STOW_MIN_DISPATCH_VALUE_BINDING: &str = "STOW_MIN_DISPATCH_VALUE";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -85,6 +86,8 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
             STOW_HUMAN_DAILY_TASK_BUDGET_BINDING,
         )?
         .unwrap_or(defaults.human_daily_task_budget),
+        min_dispatch_value: read_optional_i64_binding(env, STOW_MIN_DISPATCH_VALUE_BINDING)?
+            .unwrap_or(defaults.min_dispatch_value),
     })
 }
 
@@ -269,20 +272,30 @@ fn budget_probe_enabled(env: &WasmEnv) -> bool {
 /// `POST /demand` — trusted demand batches (stow#522 I7). Reached only
 /// through `POST /api/v1/admin/scheduler/demand`; never a request path.
 async fn scheduler_demand(
+    env: WasmEnv,
     db: DurableDb,
+    alarm: Alarm,
     Json(request): Json<stow_types::api::SchedulerDemandRequest>,
 ) -> Result<Json<stow_types::api::SchedulerDemandReport>> {
-    queue::apply_demand(&db, &request)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            let status = match &error {
-                crate::errors::QueueError::Invariant(_)
-                | crate::errors::QueueError::Overflow { .. } => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })
+    let report = queue::apply_demand(&db, &request).await.map_err(|error| {
+        let status = match &error {
+            crate::errors::QueueError::Invariant(_)
+            | crate::errors::QueueError::Overflow { .. } => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        to_error(error).set_status(status)
+    })?;
+    // A folded batch can raise a queue row over the admission floor
+    // (or clear its age gate) — re-arm the wake unconditionally, an
+    // exact replay included: the indexed next-alarm probe costs the
+    // same one read it always costs, and a replay repairs a schedule a
+    // previously lost response never armed. An under-floor queue arms
+    // nothing (stow#525).
+    schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+        tracing::error!(%error, "scheduler demand schedule_alarm failed");
+        error
+    })?;
+    Ok(Json(report))
 }
 
 /// `POST /tasks/submit` — the anonymous-lane submit. The pending-depth
@@ -1256,6 +1269,33 @@ fn read_optional_u32_binding(env: &WasmEnv, binding_name: &str) -> Result<Option
     let parsed = raw
         .parse::<u32>()
         .map_err(|error| Error::msg(format!("parse binding '{binding_name}' as u32: {error}")))?;
+    Ok(Some(parsed))
+}
+
+/// An optional decimal-integer binding parsed as `i64`. The text form
+/// is what crosses the env-binding boundary — a JavaScript number
+/// property could not carry the wide values this is meant to hold, and
+/// `i64::from_str` is what rejects overflow/rounding rather than
+/// admitting a `f64`-decoded tail.
+fn read_optional_i64_binding(env: &WasmEnv, binding_name: &str) -> Result<Option<i64>> {
+    let value = Reflect::get(env.as_js(), &JsValue::from_str(binding_name))
+        .map_err(|error| Error::msg(format!("{error:?}")))?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let raw = value.as_string().ok_or_else(|| {
+        Error::msg(format!(
+            "Cloudflare Workers binding '{binding_name}' must be a string when set"
+        ))
+    })?;
+    let parsed = raw
+        .parse::<i64>()
+        .map_err(|error| Error::msg(format!("parse binding '{binding_name}' as i64: {error}")))?;
+    if parsed < 0 {
+        return Err(Error::msg(format!(
+            "Cloudflare Workers binding '{binding_name}' must be nonnegative"
+        )));
+    }
     Ok(Some(parsed))
 }
 

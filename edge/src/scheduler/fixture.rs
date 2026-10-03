@@ -337,6 +337,8 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "dispatch_family",
     "value",
     "dispatch_key",
+    "claimed_at",
+    "dispatch_eligible",
     "demand",
 ];
 
@@ -393,6 +395,15 @@ fn queue_seed_insert_sql(
               ELSE datetime('now', '-' || (1440 + n % 38880) || ' minutes') END"
     );
     let task_id = "printf('%064x', n)";
+    let bands_expr = format!(
+        "(CASE WHEN ({lane_case}) = 'human' THEN 2 ELSE 0 END) + \
+         (CASE WHEN ({family}) = 'windows' THEN 1 ELSE 0 END)",
+        family = crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
+    );
+    let key = format!(
+        "({prefix}) || '|' || ({first_at}) || '|' || ({first_at}) || '|' || ({task_id})",
+        prefix = rank_prefix_case_sql(&bands_expr),
+    );
     format!(
         "WITH RECURSIVE seq(n) AS ({seq_source}) \
          {verb} INTO queue ({columns}) \
@@ -419,7 +430,10 @@ fn queue_seed_insert_sql(
                 0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
                 CASE WHEN n > {failed_end} THEN 'run-' || n ELSE NULL END, \
                 lower(hex(randomblob(16))), \
-                0, 0, {wake}, {family}, {value}, {key}, 0 \
+                0, 0, {wake}, {family}, {value}, {key}, \
+                CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
+                     THEN datetime('now', '-30 minutes') ELSE NULL END, \
+                {eligible}, 0 \
          FROM seq \
          {conflict}",
         columns = QUEUE_SEED_COLUMNS.join(", "),
@@ -436,18 +450,43 @@ fn queue_seed_insert_sql(
             "(n % 7)",
             "0",
         ),
-        key = crate::scheduler::queue::dispatch_key_sql(
+        key = key,
+        eligible = crate::scheduler::queue::dispatch_eligible_sql(
+            &format!("({lane_case})"),
             &crate::scheduler::queue::value_sql(
                 &format!("({lane_case})"),
                 &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
                 "(n % 7)",
                 "0",
             ),
-            first_at,
-            first_at,
-            task_id,
         ),
     )
+}
+
+/// The `dispatch_key` rank prefix for the seed's small constant
+/// operand set — lane/family bands (0–3) crossed with the `n % 7`
+/// priority — each arm carrying the shared Rust abstraction's fixed
+/// prefix at the unmeasured cost 1, so a fixture row's key is
+/// byte-identical to what a writer derives for the same operands. The
+/// ranking formula itself never appears in SQL; the CASE only
+/// selects among the precomputed prefixes, and an operand outside the
+/// covered set yields NULL — a loud seed failure, not a silent key.
+fn rank_prefix_case_sql(bands_expr: &str) -> String {
+    use std::fmt::Write as _;
+    let mut case = format!("CASE ({bands_expr}) * 7 + (n % 7)");
+    for band in 0_i64..4 {
+        for priority in 0_i64..7 {
+            let lane = if band >= 2 { "human" } else { "miss" };
+            let value = band * crate::scheduler::queue::VALUE_BAND + priority;
+            let prefix = crate::scheduler::rank::rank_prefix(
+                lane,
+                value,
+                crate::scheduler::rank::UNMEASURED_COST,
+            );
+            let _ = write!(case, " WHEN {} THEN '{prefix}'", band * 7 + priority);
+        }
+    }
+    format!("{case} END")
 }
 
 /// Seed `queue` rows `(lo, hi]`.
@@ -861,6 +900,11 @@ pub async fn rearm(
         "DELETE FROM queue WHERE task_id LIKE '%-%'",
         "DELETE FROM requests WHERE request_id NOT IN \
          ('req-fixture-enqueued', 'req-fixture-failed')",
+        // Each fixture phase starts with its intended cost state:
+        // medians learned by an earlier phase must not leak into the
+        // next one's rank.
+        "DELETE FROM crate_build_samples",
+        "DELETE FROM crate_build_stats",
     ] {
         db.query(statement)
             .execute()

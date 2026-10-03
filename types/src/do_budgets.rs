@@ -104,11 +104,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 100,
     },
     DriveBudget {
+        // The success arm also lands the bounded build-cost sample and
+        // keyed dispatch-key refresh (stow#524): the sample window caps
+        // at BUILD_SAMPLE_WINDOW rows per (crate, target) and the
+        // refresh touches only that key's pending set.
         name: "POST /tasks/complete-run",
-        statements: 10,
-        rows_read: 200,
-        rows_written: 200,
-        wall_ms: 300,
+        statements: 16,
+        rows_read: 300,
+        rows_written: 300,
+        wall_ms: 400,
     },
     DriveBudget {
         // The failure arm: same report resolution plus the dependents'

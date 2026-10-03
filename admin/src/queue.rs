@@ -146,6 +146,7 @@ async fn list(edge: &Edge, args: ListArgs, output: Output) -> stow_types::error:
             "lane",
             "status",
             "blocked by",
+            "value",
             "attempt",
             "updated",
         ]);
@@ -160,6 +161,7 @@ async fn list(edge: &Edge, args: ListArgs, output: Output) -> stow_types::error:
                 task.blocked_by
                     .as_deref()
                     .map_or_else(|| "—".to_owned(), short_id),
+                task.value.clone(),
                 task.attempt.to_string(),
                 task.updated_at.clone(),
             ]);
@@ -213,6 +215,7 @@ async fn mutate(
                 "crate",
                 "status",
                 "blocked by",
+                "value",
                 "lane",
                 "target",
                 "applies",
@@ -225,6 +228,7 @@ async fn mutate(
                     task.blocked_by
                         .as_deref()
                         .map_or_else(|| "—".to_owned(), short_id),
+                    task.value.clone(),
                     task.lane.as_str().to_owned(),
                     task.target.as_str().to_owned(),
                     if in_domain(plan.verb, task) {

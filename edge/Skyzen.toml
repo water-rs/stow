@@ -32,6 +32,17 @@ STOW_HUMAN_MAX_CLOSURE = "150"
 # Human-lane tasks the scheduler accepts per UTC day; the Durable Object
 # keeps the counter and refuses overspending submits with 429.
 STOW_HUMAN_DAILY_TASK_BUDGET = "2000"
+# Admission floor on a pending row's dispatch score (queue.value): a
+# miss-lane row claims only while its score reaches the bound —
+# under-floor work stays queued and visible in `queue list` instead of
+# being built. The human lane is exempt by contract. Decimal text: the
+# floor can exceed the JS-safe integer range, and the DO parses it as a
+# typed i64 when its settings initialize — overflow or a negative value
+# fails then, not a clamp. The floor is applied by the operator
+# migration (`stow-admin scheduler migrate`), which stamps it into the
+# queue's persisted eligibility flag — changing this binding changes
+# nothing until that pass runs. Unset means "0", admit everything.
+# STOW_MIN_DISPATCH_VALUE = "0"
 # Public Turnstile site key (invisible widget) rendered by the request page
 # on stow.waterui.dev; the matching secret is a Worker secret below.
 TURNSTILE_SITE_KEY = "0x4AAAAAAE8LjhnMsqdVhiSp"
