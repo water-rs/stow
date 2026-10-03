@@ -32,11 +32,6 @@ STOW_HUMAN_MAX_CLOSURE = "150"
 # Human-lane tasks the scheduler accepts per UTC day; the Durable Object
 # keeps the counter and refuses overspending submits with 429.
 STOW_HUMAN_DAILY_TASK_BUDGET = "2000"
-# Generated rustc-data tree (`resolve/rustc-data/`) as published on `dev`:
-# resolves fetch `{base}/<version>/verbose/{host}.txt` and
-# `{base}/<version>/cfg/{triple}.txt` for a stable rustc newer than the
-# vendored bundle, so a channel bump needs no worker redeploy.
-STOW_RUSTC_DATA_BASE_URL = "https://raw.githubusercontent.com/water-rs/stow/dev/resolve/rustc-data"
 # Public Turnstile site key (invisible widget) rendered by the request page
 # on stow.waterui.dev; the matching secret is a Worker secret below.
 TURNSTILE_SITE_KEY = "0x4AAAAAAE8LjhnMsqdVhiSp"
@@ -136,6 +131,21 @@ routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "wat
 [[cloudflare.raw.analytics_engine_datasets]]
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
+
+# Workers Cache — the platform cache that answers cacheable GETs before
+# this Worker runs. A hit is still billed as a Workers request; what it
+# saves is the Worker running — the CPU time, subrequests and D1/Durable
+# Object reads a miss would spend. Cacheability is the response's own
+# Cache-Control: the digest-addressed byte paths emit `public,
+# max-age=31536000, immutable`, the catalog and stats endpoints short
+# max-ages, and the point-in-time lanes and every error answer
+# `no-store` (errors without one get heuristic freshness — a 404 would
+# be held for minutes). Entries key on the Worker version, so a deploy
+# never replays an older deploy's answers
+# (developers.cloudflare.com/workers/cache/configuration/; Wrangler
+# >=4.69 — the deploy workflow installs wrangler@4).
+[cloudflare.raw.cache]
+enabled = true
 
 
 # Paid plan defaults subrequests to 10k/invocation, which a cold-closure

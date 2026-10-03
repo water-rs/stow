@@ -77,23 +77,6 @@ pub enum ResolverError {
     /// rustc-data base. Handlers map this to 5xx; retrying may help.
     #[error("upstream fetch: {0}")]
     Upstream(String),
-    /// The source repository or ref a projects-lane request named does
-    /// not exist — the anonymous GitHub tree fetch answered 404.
-    /// Handlers map this to `404 Not Found` naming `repo`@`git_ref`.
-    #[error("`{repo}` at `{git_ref}` was not found on github.com")]
-    RepoNotFound {
-        /// The `owner/repo` the request asked for.
-        repo: String,
-        /// The ref the request asked for.
-        git_ref: String,
-    },
-    /// The project's own manifest or dependency graph cannot be resolved
-    /// — cargo's answer for this workspace, not an edge or upstream
-    /// fault. Handlers map this to `422 Unprocessable Entity` carrying
-    /// the full resolver error chain; the same request resolves the same
-    /// way, so retrying cannot help.
-    #[error("{0}")]
-    Unresolvable(String),
     /// crates.io answered 404 — the crate (or version) is not published.
     /// Handlers map this to `404 Not Found`, not an internal error.
     #[error("crate `{crate_name}` is not published on crates.io")]
@@ -167,6 +150,24 @@ pub enum QueueError {
         row_attempt: u32,
         /// The row's current status.
         row_status: String,
+    },
+    /// A request-lane report or update named a request id the scheduler
+    /// has no record for.
+    #[error("request report for unknown request `{0}`")]
+    UnknownRequest(String),
+    /// A request-lane report claimed an attempt that is not the record's
+    /// live one — a stale report from a superseded run. Handlers map
+    /// this to `409 Conflict`: retrying it unchanged can never apply.
+    #[error(
+        "report for request `{request_id}` names attempt {reported}; the record's live attempt is {live}"
+    )]
+    RequestAttemptSuperseded {
+        /// The request id the report named.
+        request_id: String,
+        /// The attempt the record is currently on.
+        live: u32,
+        /// The attempt the report claimed.
+        reported: u32,
     },
     /// The `STOW_MAX_QUEUE_PENDING` gate refused a miss-lane submit: the
     /// queue already holds `cap` pending tasks.
@@ -364,22 +365,12 @@ pub enum GetArtifactError {
         /// `version X.Y.Z` when one was asked for, else `stable release`.
         requested: String,
     },
-    /// `GET /api/v1/requests/{task_id}` for a task the scheduler does not
-    /// know: never enqueued, or already reaped.
-    #[error("unknown request task id `{task_id}`", status = NOT_FOUND)]
-    UnknownTask {
+    /// `GET /api/v1/requests/{request_id}` for a request the scheduler
+    /// has no record for: never admitted, or a mistyped id.
+    #[error("unknown request id `{request_id}`", status = NOT_FOUND)]
+    UnknownRequest {
         /// The id from the request path.
-        task_id: String,
-    },
-    /// The repository or ref a projects-lane request named does not
-    /// exist — the anonymous GitHub tree fetch answered 404. The body
-    /// names `repo`@`ref` so the caller can fix the request.
-    #[error("`{repo}` at `{git_ref}` was not found on github.com", status = NOT_FOUND)]
-    RepoNotFound {
-        /// The `owner/repo` the request asked for.
-        repo: String,
-        /// The ref the request asked for.
-        git_ref: String,
+        request_id: String,
     },
     #[error("GHCR unavailable", status = BAD_GATEWAY)]
     GhcrUnavailable,
@@ -401,11 +392,6 @@ pub enum GetArtifactError {
     /// never help.
     #[error("{0}", status = PAYLOAD_TOO_LARGE)]
     TooLarge(String),
-    /// The request is well-formed but the edge declines to process it —
-    /// e.g. a `POST /api/v1/requests` dependency closure over
-    /// `STOW_HUMAN_MAX_CLOSURE`. Retrying unchanged can never help.
-    #[error("{0}", status = UNPROCESSABLE_ENTITY)]
-    UnprocessableEntity(String),
     /// The scheduler refused a submit with 429 — on the human lane the
     /// daily task budget, on the miss lane the pending-depth cap.
     /// Handlers that know the retry semantics answer a `Retry-After`
@@ -478,8 +464,6 @@ impl From<ResolverError> for GetArtifactError {
                 crate_name,
                 requested: format!("version {version}"),
             },
-            ResolverError::RepoNotFound { repo, git_ref } => Self::RepoNotFound { repo, git_ref },
-            ResolverError::Unresolvable(message) => Self::UnprocessableEntity(message),
             ResolverError::BadRequest(message) => Self::BadRequestWithMessage(message),
             other => Self::InternalWithMessage(other.to_string()),
         }
@@ -490,36 +474,6 @@ impl From<ResolverError> for GetArtifactError {
 mod tests {
     use super::{GetArtifactError, ResolverError};
     use skyzen::{HttpError as _, StatusCode};
-
-    /// A missing source repository answers 404 with `repo`@`ref` in the
-    /// body — the caller can fix the request — not a redacted 500.
-    #[test]
-    fn repo_not_found_maps_to_404_naming_the_repo_and_ref() {
-        let error = GetArtifactError::from(ResolverError::RepoNotFound {
-            repo: "owner/missing".to_owned(),
-            git_ref: "dev".to_owned(),
-        });
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            error.to_string(),
-            "`owner/missing` at `dev` was not found on github.com"
-        );
-    }
-
-    /// The project's own dependency graph failing to resolve answers 422
-    /// carrying cargo's error chain — the body tells the caller their
-    /// manifest is the problem, not the edge.
-    #[test]
-    fn unresolvable_maps_to_422_with_the_resolver_message() {
-        let error = GetArtifactError::from(ResolverError::Unresolvable(
-            "resolve failed: failed to select a version for `dep`".to_owned(),
-        ));
-        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(
-            error.to_string(),
-            "resolve failed: failed to select a version for `dep`"
-        );
-    }
 
     /// An upstream fetch failure stays a server error — its detail is
     /// redacted from the body by the shared renderer, so only the status

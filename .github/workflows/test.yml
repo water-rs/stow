@@ -16,6 +16,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # No debuginfo in CI builds. A failing test reports its file and line
+  # without it, and it was most of every cached target directory: a
+  # workspace `cargo test --no-run` is 11 GB with it and 3.4 GB without,
+  # and compiles in 128 s instead of 174 s. The per-job caches held the full
+  # size, filled the repository's 10 GB cache allowance and evicted each
+  # other.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   # Documentation cannot change what a compiler or a test observes, so the
@@ -35,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      launch-load: ${{ steps.filter.outputs.launch-load }}
     steps:
       # The filter diffs against the previous tip (or the merge group's base)
       # with git, so it needs the repository checked out.
@@ -57,6 +65,17 @@ jobs:
               - '!**/*.md'
               - '!LICENSE*'
               - '!.gitignore'
+            # The load lane's merge-queue trigger (stow#452): edge/
+            # plus the files that define what it measures — the lanes,
+            # the model, the fixture/admission protocol, the wire types,
+            # the local-CI stub, the measured table, and both harness
+            # scripts. The doc negations repeat because `every` requires
+            # each file to satisfy all rules.
+            launch-load:
+              - '{edge/**,admin/src/launch_*.rs,admin/src/scheduler.rs,ci/src/local_server.rs,types/src/launch_model.rs,types/src/do_budgets.rs,types/src/fixture.rs,types/src/admission.rs,types/src/api.rs,scripts/launch-load.sh,scripts/scheduler-budget.sh,launch-model.toml}'
+              - '!**/*.md'
+              - '!LICENSE*'
+              - '!.gitignore'
 
   test:
     needs: changes
@@ -75,7 +94,7 @@ jobs:
       # Linux artifacts link with mold, the linker the project recommends.
       - uses: ./.github/actions/link-with-mold
         if: matrix.os == 'ubuntu-latest'
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -115,29 +134,6 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
-
-  edge-wasm:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    name: Edge wasm32 check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-      # Host build scripts compile for x86_64-unknown-linux-gnu, so they
-      # link with mold too.
-      - uses: ./.github/actions/link-with-mold
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: edge-wasm
-          # Pull requests restore the `dev` cache and never save their own:
-          # a per-PR copy of every job's cache duplicated the whole set
-          # under the PR ref and evicted the build-crate caches (#177).
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-      - run: cargo check -p stow-edge --target wasm32-unknown-unknown
 
   publish-dry-run:
     needs: changes
@@ -248,10 +244,12 @@ jobs:
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
+      # The same stow-admin and edge bundle build as mock-e2e, so it
+      # restores that job's cache instead of saving a second copy of it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: scheduler-budget
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          shared-key: mock-e2e
+          save-if: false
       - uses: ./.github/actions/link-with-mold
       - uses: ./.github/actions/install-skyzen-cli
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -261,79 +259,80 @@ jobs:
         env:
           STOW_BUDGET_WORK_DIR: ${{ runner.temp }}/stow-budget
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # stow#452's launch-cost gate: the production-shape report the
+      # harness just measured is the per-event cost vector, and the
+      # checked-in `launch-model.toml` supplies the event counts. The
+      # step fails the job when a projected monthly usage crosses half
+      # the product's included allowance, and prints the per-route
+      # projection table either way.
+      - name: Launch-cost gate
+        run: ./target/debug/stow-admin launch-gate --report "${{ runner.temp }}/stow-budget/budget-report-100000.json" --model launch-model.toml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
           name: scheduler-budget-logs
           path: |
             ${{ runner.temp }}/stow-budget/logs
-            ${{ runner.temp }}/stow-budget/budget-report.json
+            ${{ runner.temp }}/stow-budget/budget-report*.json
           if-no-files-found: ignore
 
-  # The resolver is cargo's own code carried into `stow-resolve`; this job
-  # proves it: for every corpus entry and target it diffs the stow-resolve
-  # output against `cargo build --unit-graph` (per-unit
-  # platform/kind/features) and `cargo metadata --filter-platform`, run on
-  # the same manifest by the pinned stable cargo (`RUSTC_BOOTSTRAP` lets it
-  # take `-Z unstable-options` for the unit graph). Each job replays the
-  # recorded fixture in `resolve/tests/resolve-diff-fixture` — the corpus
-  # versions are frozen in the fixture, so a crates.io release cannot flip
-  # CI — on the runner matching that family's host triple, because host
-  # units must land on it. A scheduled live run keeps watching upstream in
-  # `resolve-diff-live.yml`.
-  resolve-diff:
+
+  # stow#452's load test: the mock stack on the 100k fixture, driven at
+  # the launch model's peak rates for thirty minutes between two budget
+  # probes — the after report doubles as the launch-cost gate's input,
+  # and `scripts/launch-load.sh` fails on any overload signal, error
+  # share or row-count regression.
+  #
+  # stow#452 scopes the merge-queue trigger to the surface the lane
+  # measures: `changes.outputs.launch-load` — `edge/` plus the lane,
+  # model, table and harness files — not every code change. A 75-minute
+  # leg on every merge would add half an hour to the queue for changes
+  # that cannot move the projection; anything else skips the job, which
+  # `gate` already counts as passing. The cheap part — the `launch-gate`
+  # step inside scheduler-budget, a projection over that job's own
+  # report — still runs on every code change, and the weekly cadence
+  # (launch-load-scheduled.yml) holds the whole lane unconditionally.
+  launch-load:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
-    name: Resolver differential test
+    if: needs.changes.outputs.launch-load == 'true'
+    name: Launch load (workerd)
     runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      # Same operator auth as scheduler-budget: the load's scheduler
+      # lanes ride the trusted endpoints, which authenticate the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`).
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: 1.98.1
+          toolchain: stable
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: resolve-diff
-          # Pull requests restore the `dev` cache and never save their own:
-          # a per-PR copy of every job's cache duplicated the whole set
-          # under the PR ref and evicted the build-crate caches (#177).
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-      - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --replay resolve/tests/resolve-diff-fixture --family linux
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: cargo build -p stow-admin
+      - run: scripts/launch-load.sh
+        env:
+          STOW_LOAD_WORK_DIR: ${{ runner.temp }}/stow-load
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: launch-load-logs
+          path: |
+            ${{ runner.temp }}/stow-load/logs
+            ${{ runner.temp }}/stow-load/budget-report-*.json
+            ${{ runner.temp }}/stow-load/launch-load-report-seg*.json
+          if-no-files-found: ignore
 
-  # The same replay on the runner whose host triple is the macOS family's:
-  # host units for darwin/ios targets resolve on aarch64-apple-darwin.
-  resolve-diff-macos:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    name: Resolver differential test (macOS family)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: resolve-diff-macos
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-      - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --replay resolve/tests/resolve-diff-fixture --family macos
-
-  # And the Windows family host, x86_64-pc-windows-msvc.
-  resolve-diff-windows:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    name: Resolver differential test (Windows family)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: resolve-diff-windows
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-      - run: cargo run --release -p stow-resolve --features harness --bin resolve-diff -- --replay resolve/tests/resolve-diff-fixture --family windows
 
   # One check to require. Rulesets and the merge queue name this job instead
   # of every leg: it needs all of them, `if: always()` runs it past a failed
@@ -345,13 +344,10 @@ jobs:
       - changes
       - test
       - lint
-      - edge-wasm
       - publish-dry-run
       - mock-e2e
       - scheduler-budget
-      - resolve-diff
-      - resolve-diff-macos
-      - resolve-diff-windows
+      - launch-load
     if: always()
     name: CI gate
     runs-on: ubuntu-latest

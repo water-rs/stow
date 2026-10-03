@@ -32,6 +32,7 @@ use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
     IndexError, content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
 };
+use stow_types::public_cache::UnitShape;
 use stow_types::records::{record_to_index_row, records_tag_rustc};
 use stow_types::registry::{GHCR_BASE, sha256_digest};
 use stow_types::stow_error;
@@ -210,44 +211,21 @@ struct IndexReportSummary {
     tag: String,
 }
 
-/// The executor `publish`-adjacent subcommands run on: `RegistrySession`
-/// is reqwest/hyper, which needs a Tokio reactor, so they run on a
-/// dedicated current-thread runtime exactly as `stow-build publish` does,
-/// with rustls's process-level provider installed before any TLS client
-/// is built. The other subcommands run on smol like the rest of the
-/// binary.
-pub fn run(args: IndexArgs) -> stow_types::error::Result<()> {
+/// Dispatch one `index` subcommand.
+pub async fn run(args: IndexArgs) -> stow_types::error::Result<()> {
     match args.command {
-        IndexCommand::Export(args) => on_tokio(index_export(args)),
-        IndexCommand::Sync(args) => on_tokio(async {
+        IndexCommand::Export(args) => index_export(args).await,
+        IndexCommand::Sync(args) => {
             let edge = Edge::connect().await?;
             index_sync(&edge, args).await
-        }),
-        IndexCommand::Publish(args) => on_tokio(index_publish(args)),
-        IndexCommand::Report(args) => {
-            smol::block_on(async move { index_report(&Edge::connect().await?, args).await })
         }
+        IndexCommand::Publish(args) => index_publish(args).await,
+        IndexCommand::Report(args) => index_report(&Edge::connect().await?, args).await,
         IndexCommand::Targets => {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())
         }
     }
-}
-
-/// Run `future` on the dedicated tokio runtime the registry session
-/// needs (see [`run`]).
-fn on_tokio<F>(future: F) -> stow_types::error::Result<()>
-where
-    F: std::future::Future<Output = stow_types::error::Result<()>>,
-{
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| stow_error!("install ring CryptoProvider"))?;
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| stow_error!("build tokio runtime: {error}"))?
-        .block_on(future)
 }
 
 /// The trust a records read verifies against — the mock registry's local
@@ -456,6 +434,11 @@ struct ExportPass {
 type PullFut<'a, T> =
     std::pin::Pin<Box<dyn Future<Output = stow_types::error::Result<T>> + Send + 'a>>;
 
+/// Index rows keyed by the `(c_metadata, unit_shape)` pair a consumer's
+/// key space identifies — one artifact keeps every shape it can serve
+/// (stow#506).
+type RowsByIdentity = BTreeMap<(String, Option<UnitShape>), ArtifactIndexRow>;
+
 /// The `(target, rustc)` an `index.*` tag names — the same suffix shape
 /// [`folded_tag_parts`] splits, under the other half of the tag pair.
 pub fn index_tag_parts(tag: &str) -> Option<(&str, &str)> {
@@ -535,10 +518,7 @@ where
     // deterministic regardless of listing order.
     missing.sort_unstable();
     let pulled_count = missing.len();
-    let mut new_rows: BTreeMap<
-        (TargetTriple, WireRustcVersion),
-        BTreeMap<String, ArtifactIndexRow>,
-    > = BTreeMap::new();
+    let mut new_rows: BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity> = BTreeMap::new();
     let mut new_folded: BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>> =
         BTreeMap::new();
     let mut new_records: Vec<ArtifactRecord> = Vec::new();
@@ -559,7 +539,7 @@ where
                 new_rows
                     .entry(key)
                     .or_default()
-                    .insert(row.c_metadata.as_str().to_owned(), row);
+                    .insert((row.c_metadata.as_str().to_owned(), row.unit_shape), row);
             }
         }
         for key in named {
@@ -579,12 +559,13 @@ where
 }
 
 /// Fold the new records into the previous slices: previous rows first,
-/// new rows winning the dedup-by-`c_metadata` `records_into_slices`
-/// applies, and the folded set growing by every tag a record named.
-/// `generated_at` is stamped once so every slice of the pass matches.
+/// new rows winning the dedup-by-`(c_metadata, unit_shape)`
+/// `records_into_slices` applies, and the folded set growing by every
+/// tag a record named. `generated_at` is stamped once so every slice of
+/// the pass matches.
 fn merge_exports(
     mut prev: BTreeMap<(TargetTriple, WireRustcVersion), PrevSlice>,
-    new_rows: &BTreeMap<(TargetTriple, WireRustcVersion), BTreeMap<String, ArtifactIndexRow>>,
+    new_rows: &BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity>,
     new_folded: &BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>>,
     rustc: &WireRustcVersion,
 ) -> stow_types::error::Result<Vec<SliceExport>> {
@@ -594,22 +575,27 @@ fn merge_exports(
     let published: BTreeSet<(TargetTriple, WireRustcVersion)> = prev.keys().cloned().collect();
     let mut push_slice = |key: &(TargetTriple, WireRustcVersion)| {
         let prev_slice = prev.remove(key);
-        let mut merged: BTreeMap<String, ArtifactIndexRow> = prev_slice
+        let mut merged: RowsByIdentity = prev_slice
             .as_ref()
             .map(|slice| {
                 slice
                     .index
                     .rows
                     .iter()
-                    .map(|row| (row.c_metadata.as_str().to_owned(), row.clone()))
+                    .map(|row| {
+                        (
+                            (row.c_metadata.as_str().to_owned(), row.unit_shape),
+                            row.clone(),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
         // A re-run task rebuilding the same unit wins — the same dedup
-        // by `c_metadata` `records_into_slices` applies.
+        // by `(c_metadata, unit_shape)` `records_into_slices` applies.
         if let Some(rows) = new_rows.get(key) {
-            for (c_metadata, row) in rows {
-                merged.insert(c_metadata.clone(), row.clone());
+            for (row_key, row) in rows {
+                merged.insert(row_key.clone(), row.clone());
             }
         }
         let mut folded: BTreeSet<String> = prev_slice
@@ -734,7 +720,7 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
         "exported artifact index"
     );
 
-    smol::fs::create_dir_all(&args.out_dir)
+    tokio::fs::create_dir_all(&args.out_dir)
         .await
         .map_err(|error| stow_error!("create {}: {error}", args.out_dir.display()))?;
     let mut summaries = Vec::new();
@@ -744,10 +730,10 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
         let folded_name = folded_tag(slice.target.as_str(), slice.rustc_version.as_str());
         let index_file = args.out_dir.join(&index_name);
         let folded_file = args.out_dir.join(&folded_name);
-        smol::fs::write(&index_file, &bytes)
+        tokio::fs::write(&index_file, &bytes)
             .await
             .map_err(|error| stow_error!("write index {}: {error}", index_file.display()))?;
-        smol::fs::write(&folded_file, serde_json::to_vec(&slice.folded)?)
+        tokio::fs::write(&folded_file, serde_json::to_vec(&slice.folded)?)
             .await
             .map_err(|error| stow_error!("write folded {}: {error}", folded_file.display()))?;
         // The `.prev` sidecar is the report's delta base — the index
@@ -755,7 +741,7 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
         if let Some(prev) = &slice.prev {
             let prev_bytes =
                 encode(prev).map_err(|error| stow_error!("encode previous index: {error}"))?;
-            smol::fs::write(prev_path(&index_file), &prev_bytes)
+            tokio::fs::write(prev_path(&index_file), &prev_bytes)
                 .await
                 .map_err(|error| stow_error!("write previous-index sidecar: {error}"))?;
         }
@@ -777,13 +763,13 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
         render::emit_line(&line);
         summaries.push(summary);
     }
-    smol::fs::write(
+    tokio::fs::write(
         args.out_dir.join("slices.json"),
         serde_json::to_vec(&summaries)?,
     )
     .await
     .map_err(|error| stow_error!("write slices.json: {error}"))?;
-    smol::fs::write(
+    tokio::fs::write(
         args.out_dir.join("new-records.json"),
         serde_json::to_vec(&pass.new_records)?,
     )
@@ -813,7 +799,7 @@ async fn read_prev_sidecar(
     generation: i64,
 ) -> stow_types::error::Result<Option<ArtifactIndex>> {
     let sidecar = prev_path(file);
-    let bytes = match smol::fs::read(&sidecar).await {
+    let bytes = match tokio::fs::read(&sidecar).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if generation == 1 {
@@ -898,12 +884,12 @@ fn row_key(
 /// same step so the pair can never skew: the next export's folded set is
 /// always the one this slice was built from.
 async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> {
-    let bytes = smol::fs::read(&args.file)
+    let bytes = tokio::fs::read(&args.file)
         .await
         .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
     let index = decode(&bytes)
         .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
-    let folded_bytes = smol::fs::read(&args.folded)
+    let folded_bytes = tokio::fs::read(&args.folded)
         .await
         .map_err(|error| stow_error!("read folded file {}: {error}", args.folded.display()))?;
     let folded: Vec<String> = serde_json::from_slice(&folded_bytes)
@@ -965,7 +951,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
 /// baseline host cannot load it, so it releases no dependent — the same
 /// rule the catalog's coverage oracle applies.
 async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::Result<()> {
-    let bytes = smol::fs::read(&args.file)
+    let bytes = tokio::fs::read(&args.file)
         .await
         .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
     let index = decode(&bytes)
@@ -1035,7 +1021,7 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
 /// the full records, not index rows — unbundled (still-building) units
 /// sync too, so the catalog reflects every task the pass saw.
 async fn index_sync(edge: &Edge, args: IndexSyncArgs) -> stow_types::error::Result<()> {
-    let bytes = smol::fs::read(&args.file)
+    let bytes = tokio::fs::read(&args.file)
         .await
         .map_err(|error| stow_error!("read new-records file {}: {error}", args.file.display()))?;
     let records: Vec<ArtifactRecord> = serde_json::from_slice(&bytes)
@@ -1099,7 +1085,7 @@ async fn publish_index_mock(
             mock_registry_exe.display()
         ));
     }
-    let output = smol::process::Command::new(&mock_registry_exe)
+    let output = tokio::process::Command::new(&mock_registry_exe)
         .arg("publish-index")
         .arg("--file")
         .arg(file)
@@ -1143,6 +1129,14 @@ async fn publish_index_mock(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
 
     use semver::Version;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
@@ -1291,7 +1285,7 @@ mod tests {
                 .map(|r| records_tag(RUSTC, r.c_metadata.as_str())),
         )
         .collect();
-        let pass = smol::block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
+        let pass = block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
             .expect("export pass");
         let mut pulled = pulled.into_inner().unwrap();
         pulled.sort();
@@ -1356,7 +1350,7 @@ mod tests {
         // One records artifact for TARGET only; no folded/index pairs
         // exist at all — the first publish of a fresh registry.
         let tags = vec![records_tag(RUSTC, "aaaa1111")];
-        let pass = smol::block_on(export_pass(&tags, no_prev, pull_records, false, &rustc))
+        let pass = block_on(export_pass(&tags, no_prev, pull_records, false, &rustc))
             .expect("export pass");
         let mut emitted: Vec<&str> = pass.slices.iter().map(|s| s.target.as_str()).collect();
         emitted.sort_unstable();
@@ -1371,7 +1365,7 @@ mod tests {
                 assert_eq!(slice.folded.len(), 1);
             } else {
                 assert_eq!(slice.index.rows.len(), 0);
-                assert!(slice.folded.is_empty());
+                assert_eq!(slice.folded, [] as [std::string::String; 0]);
             }
         }
 
@@ -1407,7 +1401,7 @@ mod tests {
             Box::pin(async move { Ok(vec![record(&task_id)]) })
                 as PullFut<'static, Vec<ArtifactRecord>>
         };
-        let pass = smol::block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
+        let pass = block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
             .expect("export pass");
         assert!(pass.slices.is_empty(), "nothing new emits nothing");
         assert_eq!(pass.pulled, 0);
@@ -1432,14 +1426,14 @@ mod tests {
     #[test]
     fn a_first_publish_without_a_prev_sends_the_full_report() {
         let file = no_sidecar_file();
-        let prev = smol::block_on(read_prev_sidecar(&file, 1)).expect("first publish");
+        let prev = block_on(read_prev_sidecar(&file, 1)).expect("first publish");
         assert!(prev.is_none());
     }
 
     #[test]
     fn a_missing_prev_after_the_first_publish_is_an_error() {
         let file = no_sidecar_file();
-        let error = smol::block_on(read_prev_sidecar(&file, 7)).expect_err("must fail");
+        let error = block_on(read_prev_sidecar(&file, 7)).expect_err("must fail");
         let message = error.to_string();
         assert!(
             message.contains(&prev_path(&file).display().to_string())

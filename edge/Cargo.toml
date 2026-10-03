@@ -10,13 +10,12 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-skyzen = { version = "0.3.0", default-features = false, features = ["json", "query"] }
+skyzen = { version = "0.4.3", default-features = false, features = ["json", "query"] }
 skyzen-core = "0.2"
-skyzen-cloudflare = "0.3.0"
+skyzen-cloudflare = "0.4.3"
 skyzen-services = { version = "0.2.1", default-features = false }
 stow-types.workspace = true
 stow-shim.workspace = true
-stow-resolve.workspace = true
 http = "1"
 anyhow = "1"
 thiserror.workspace = true

@@ -7,11 +7,11 @@ use skyzen::utils::State;
 use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
 use skyzen_services::Db;
 
+use stow_types::admission;
+
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
-use crate::{
-    admission, api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook,
-};
+use crate::{api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook};
 
 const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
@@ -31,6 +31,7 @@ const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
 const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
+const STOW_STATS_SQL_URL_BINDING: &str = "STOW_STATS_SQL_URL";
 const STOW_GITHUB_WEBHOOK_SECRET_BINDING: &str = "STOW_GITHUB_WEBHOOK_SECRET";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
@@ -49,7 +50,7 @@ pub async fn fetch(
     wasm::launch(|env| async move { worker(&env) }, request, env, ctx).await
 }
 
-fn worker(env: &wasm::Env) -> Router {
+fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
     let d1 = CfD1::from_env(env, STOW_DB_BINDING)
         .unwrap_or_else(|error| panic!("failed to load D1 binding '{STOW_DB_BINDING}': {error}"));
     let db = Db::new(d1);
@@ -58,9 +59,26 @@ fn worker(env: &wasm::Env) -> Router {
     });
     let cache = CfCache::default();
     let analytics = env_binding::required_analytics_dataset(env, STOW_ANALYTICS_BINDING);
+    let account_id = env_binding::required_string(env, CF_ACCOUNT_ID_BINDING);
     let stats = StatsContext {
-        account_id: env_binding::required_string(env, CF_ACCOUNT_ID_BINDING),
         analytics_token: env_binding::required_string(env, CF_ANALYTICS_TOKEN_BINDING),
+        // `STOW_STATS_SQL_URL` is the mock manifest's override; it is
+        // absent in production, where the route always posts the account's
+        // real endpoint. The token rides in Authorization, so the same
+        // loopback rule `STOW_LOCAL_CI_URL` gets applies here.
+        sql_url: env_binding::optional_string(env, STOW_STATS_SQL_URL_BINDING).map_or_else(
+            || {
+                format!(
+                    "{}/{}/analytics_engine/sql",
+                    crate::stats::SQL_API_URL,
+                    account_id
+                )
+            },
+            |url| {
+                crate::scheduler::object::loopback_url("STOW_STATS_SQL_URL", &url)
+                    .unwrap_or_else(|error| panic!("{error}"))
+            },
+        ),
     };
     // The scheduler Durable Object reads the same bindings lazily on each
     // dispatch pass; probing them here fails worker startup on a missing
@@ -101,7 +119,7 @@ fn worker(env: &wasm::Env) -> Router {
     // must drain during a partial reopen).
     nodes.push("/api/v1/github/workflow-run".post(webhook::github_workflow_run));
 
-    Route::new(nodes)
+    let router = Route::new(nodes)
         .with(db)
         .with(State(scheduler))
         .with(State(cache))
@@ -125,14 +143,19 @@ fn worker(env: &wasm::Env) -> Router {
             env,
             STOW_GITHUB_WEBHOOK_SECRET_BINDING,
         ))))
-        .build()
+        .build();
+
+    // The outermost response boundary — every error answer leaves here,
+    // so `Cache-Control: no-store` is stamped in one place rather than
+    // per handler (`no_store` module docs).
+    crate::no_store::NoStoreOnError::new(router)
 }
 
 /// Every route that requires a trusted caller — the admin surface and
 /// the scheduler lane — each wrapped in `gate` so a rate-limited GitHub
 /// trust check answers 503 + `Retry-After` instead of the bare error
 /// envelope.
-fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
+fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
     [
         "/api/v1/admin"
             .route((
@@ -144,7 +167,6 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/dispatch-freeze"
                     .at(api::get_dispatch_freeze)
                     .post(api::set_dispatch_freeze),
-                "/preheat/plan".post(api::preheat_plan),
                 "/queue".at(api::admin_queue_list),
                 "/queue/retry".post(api::admin_queue_retry),
                 "/queue/cancel".post(api::admin_queue_cancel),
@@ -165,15 +187,10 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 4] {
                 "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
             ))
             .with(gate.clone()),
-        "/api/v1/admin/resolve"
-            .route((
-                "/crate".post(api::admin_resolve_crate),
-                "/project".post(api::admin_resolve_project),
-            ))
-            .with(gate.clone()),
         "/api/v1/scheduler"
             .route((
                 "/tasks/submit".post(api::submit_scheduler_tasks),
+                "/requests/{request_id}/outcome".post(api::scheduler_request_outcome),
                 "/status".at(api::scheduler_status),
             ))
             .with(gate.clone()),

@@ -533,6 +533,32 @@ impl Resolver {
         Ok(Self::source_resolve(&outputs, rustc_version, downloads))
     }
 
+    /// The admin local-dirs lane: a project tree already on disk. Its
+    /// `Cargo.lock` is dropped like every other lane's — the resolve
+    /// lands on the latest semver-compatible versions, the lockfile's
+    /// pins surviving only as `dropped_lockfile` admission. The tree is
+    /// mutated: its lockfile is deleted, so callers pass a disposable
+    /// copy.
+    ///
+    /// # Errors
+    /// Manifest, resolve, or emission failures.
+    pub fn resolve_project_dir(
+        &self,
+        dir: &Path,
+        targets: &[String],
+        rustc_version: &WireRustcVersion,
+        downloads: u64,
+    ) -> CargoResult<SourceResolve> {
+        let tree = crate::fetch::prepare_project_tree(dir, true)?;
+        let opts = ResolveOptions {
+            members_are_crates_io: false,
+            dropped_lockfile: tree.dropped_lockfile,
+            ..ResolveOptions::default()
+        };
+        let outputs = self.resolve(&tree.manifest_path, &opts, targets)?;
+        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
+    }
+
     /// `source_resolve` parity: per-target unit outputs → per-target
     /// enqueue batches, plus the lane's publish-shape flags.
     fn source_resolve(

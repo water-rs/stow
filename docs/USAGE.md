@@ -276,11 +276,14 @@ acting unless `--yes` is given.
 - `stow-admin status` — lane depths, dependents blocked behind failed
   dependencies, oldest pending age, in-flight builds with their GitHub
   Actions run URLs, and per-target outcomes over the trailing 24 h.
-- `stow-admin queue list [--status failed] [--target T] [--crate X] [--older-than 24h]`
-  — filtered queue rows; `queue retry|cancel|promote|purge` mutate the
-  same selection (explicit `--task-id`s or filter flags), printing the
-  matched rows first and applying only under `--yes`. `purge` also
-  requires `--older-than` so live work can never be swept.
+- `stow-admin queue list [--status failed] [--target T] [--rustc V] [--crate X] [--older-than 24h]`
+  — filtered queue rows; `queue retry|cancel|promote|purge`
+  mutate the same selection (explicit `--task-id`s or filter flags),
+  printing the matched rows first and applying only under `--yes`.
+  `purge` also requires `--older-than` so live work can never be
+  swept. `retry` returns `failed` rows — builds that exhausted their
+  automatic retries or were operator-cancelled — to `pending` with a
+  fresh `attempt`, e.g. `--status failed --rustc V --target T`.
 - `stow-admin coverage <crate>[@version] [--target T]` — which servable
   identities exist per CI target, and which targets have none.
 - `stow-admin runs failures --since 24h` — classify failed

@@ -27,12 +27,13 @@
 //! may never be raised to pass a regression.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use skyzen::FromRow;
 use skyzen_services::durable::DurableDb;
 
 use super::drives;
-use super::fixture::{self, FixtureShape};
+use super::fixture;
 use super::queue::{self, SchedulerSettings};
 use super::test_db::{LoggedStatement, counting_memory_db, counting_memory_db_raw};
 
@@ -159,28 +160,20 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
-    RouteBudget {
-        name: "GET /tasks/status (batch)",
-        statements: 4,
-        rows_read: 40,
-        rows_written: 0,
-        scan_allowlist: &[],
-        ddl_permitted: false,
-    },
-    RouteBudget {
-        name: "GET /tasks/{id}",
-        statements: 6,
-        rows_read: 60,
-        rows_written: 0,
-        scan_allowlist: &[],
-        ddl_permitted: false,
-    },
     // Mutation routes — one keyed statement each against a bounded
     // selector.
     RouteBudget {
         name: "POST /tasks/complete-run",
         statements: 7,
         rows_read: 70,
+        rows_written: 20,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /tasks/complete-run (failure)",
+        statements: 9,
+        rows_read: 80,
         rows_written: 20,
         scan_allowlist: &[],
         ddl_permitted: false,
@@ -220,15 +213,68 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
+    // The request lane — point reads and writes on `requests`, a table
+    // that never grows past the live request set.
+    RouteBudget {
+        name: "GET /requests/{id}",
+        statements: 4,
+        rows_read: 40,
+        rows_written: 0,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /requests",
+        statements: 4,
+        rows_read: 20,
+        rows_written: 6,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /requests/{id}/run-update (in_progress)",
+        statements: 3,
+        rows_read: 10,
+        rows_written: 4,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /requests/{id}/outcome",
+        statements: 14,
+        rows_read: 60,
+        rows_written: 40,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        name: "POST /requests/{id}/run-update (completed)",
+        statements: 3,
+        rows_read: 10,
+        rows_written: 4,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
     // Submit paths: a batch of three requests (one resync, one fresh,
-    // one human). The untrusted route hits the pending cap on the
-    // fixture — that is the refusal path; the trusted route runs the
-    // full write path including edge resync.
+    // one human). The untrusted route refuses on a pinned-zero pending
+    // cap — that is the refusal path; the accept drive lifts the cap
+    // and measures the insert; the trusted route runs the full write
+    // path including edge resync.
     RouteBudget {
         name: "POST /enqueue (untrusted)",
         statements: 8,
         rows_read: 40,
         rows_written: 4,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // The same batch past the cap: pending-count read, the
+        // human-lane budget charge and position walk, the insert.
+        name: "POST /enqueue (untrusted accept)",
+        statements: 20,
+        rows_read: 300,
+        rows_written: 100,
         scan_allowlist: &[],
         ddl_permitted: false,
     },
@@ -262,14 +308,15 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
-    // A report whose membership moved by DELTA_ROWS: the `deps_met`
-    // refresh reads only edges matching the changed rows, so its cost
-    // is proportional to the delta, never to the slice or the graph.
+    // A report whose membership moved by DELTA_ROWS: the gate writes
+    // touch only the changed rows' matched edges and their owners'
+    // counters, so its cost is proportional to the delta, never to the
+    // slice or the graph (stow#521).
     RouteBudget {
         name: "POST /index/published (delta)",
-        statements: 12,
-        rows_read: 4_000,
-        rows_written: 120,
+        statements: 16,
+        rows_read: 60,
+        rows_written: 200,
         scan_allowlist: &[],
         ddl_permitted: false,
     },
@@ -286,6 +333,16 @@ const BUDGETS: &[RouteBudget] = &[
         // status='completed' AND shape_requeue=0` — so EXPLAIN calls the
         // walk a SCAN but it covers only completed rows a prior pass
         // already flagged for repair: a ~0-entry set on a warm queue.
+        scan_allowlist: &["idx_queue_shape_requeue"],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // The pass's fixed floor under paused dispatch: recovery probes
+        // and the re-arm only — no claim work.
+        name: "alarm pass (idle)",
+        statements: 12,
+        rows_read: 80,
+        rows_written: 4,
         scan_allowlist: &["idx_queue_shape_requeue"],
         ddl_permitted: false,
     },
@@ -620,6 +677,27 @@ fn every_drive_has_exactly_one_row_in_each_budget_table() {
     }
 }
 
+/// Every drive once under the gate, logging per-statement counters —
+/// the loop `per_request_cost_gate` and the persisted-fixture repeat
+/// share.
+async fn run_drives(
+    db: &DurableDb,
+    shape: fixture::FixtureShape,
+    settings: &SchedulerSettings,
+    ctx: &drives::DriveContext,
+    log: &Arc<Mutex<Vec<LoggedStatement>>>,
+) {
+    for drive in drives::DRIVES {
+        let base = log.lock().expect("statement log").len();
+        (drive.run)(db, shape, settings, ctx)
+            .await
+            .unwrap_or_else(|error| panic!("{} failed: {error}", drive.name));
+        let statements = log.lock().expect("statement log")[base..].to_vec();
+        let measurement = Measurement::of(statements);
+        check(db, budget_of(drive.name), &measurement).await;
+    }
+}
+
 /// Every entry of [`drives::DRIVES`] holds its budget on the 10k gate
 /// fixture. The two tables must cover each other exactly — a drive with
 /// no budget row, or a row no drive produces, is a gate bug and fails
@@ -630,7 +708,7 @@ async fn per_request_cost_gate() {
     let settings = SchedulerSettings::default();
     let (db, log) = counting_memory_db().await.expect("counting db");
     let seed_base = log.lock().expect("log").len();
-    fixture::seed_production_shape(&db, &FixtureShape::GATE, settings.dispatch_min_age_minutes)
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
         .await
         .expect("seed fixture");
     // The fixture itself must obey the gate — it is seeded with DML only,
@@ -642,27 +720,16 @@ async fn per_request_cost_gate() {
             statement.sql
         );
     }
-    let shape = FixtureShape::GATE;
-    for drive in drives::DRIVES {
-        let base = log.lock().expect("statement log").len();
-        (drive.run)(&db, shape, &settings)
-            .await
-            .unwrap_or_else(|error| panic!("{} failed: {error}", drive.name));
-        let statements = log.lock().expect("statement log")[base..].to_vec();
-        let measurement = Measurement::of(statements);
-        check(&db, budget_of(drive.name), &measurement).await;
-    }
+    let shape = fixture::GATE;
+    let ctx = drives::DriveContext::host();
+    run_drives(&db, shape, &settings, &ctx, &log).await;
 
     // The migrate route is the only DDL path — it runs on the same seeded
     // fixture under the raw (permit-open) counting backend.
     let (raw_db, raw_log) = counting_memory_db_raw().await.expect("raw counting db");
-    fixture::seed_production_shape(
-        &raw_db,
-        &FixtureShape::GATE,
-        settings.dispatch_min_age_minutes,
-    )
-    .await
-    .expect("seed fixture");
+    fixture::seed_production_shape(&raw_db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
     let base = raw_log.lock().expect("statement log").len();
     queue::migrate(&raw_db, &SchedulerSettings::default())
         .await
@@ -674,5 +741,257 @@ async fn per_request_cost_gate() {
         measurement.statement_count,
         measurement.rows_read,
         measurement.rows_written,
+    );
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct RunningTarget {
+    attempt: i64,
+    github_run_id: Option<String>,
+    generation_id: String,
+}
+
+async fn running_target(db: &DurableDb, shape: fixture::FixtureShape) -> RunningTarget {
+    db.query("SELECT attempt, github_run_id, generation_id FROM queue WHERE task_id = printf('%064x', ?)")
+        .bind(i64::from(shape.running_row()))
+        .fetch_optional::<RunningTarget>()
+        .await
+        .expect("running target query")
+        .expect("running target row")
+}
+
+async fn running_outcomes(db: &DurableDb, shape: fixture::FixtureShape) -> i64 {
+    db.query(
+        "SELECT COALESCE(SUM(outcomes), 0) FROM attempt_outcome_buckets \
+         WHERE target = (SELECT target FROM queue WHERE task_id = printf('%064x', ?))",
+    )
+    .bind(i64::from(shape.running_row()))
+    .fetch_scalar::<i64>()
+    .await
+    .expect("running outcomes")
+}
+
+async fn status_of(db: &DurableDb, task_id: &str) -> String {
+    db.query("SELECT status FROM queue WHERE task_id = ?")
+        .bind(task_id.to_owned())
+        .fetch_scalar::<String>()
+        .await
+        .expect("status")
+}
+
+async fn assert_failure_evidence(db: &DurableDb, shape: fixture::FixtureShape, expected: usize) {
+    let generations = db
+        .query("SELECT generation_id FROM attempt_outcomes_v2 WHERE task_id = printf('%064x', ?) AND attempt = 1")
+        .bind(i64::from(shape.dispatched_row(0)))
+        .fetch_scalars::<String>()
+        .await
+        .expect("failure generations");
+    assert_eq!(generations.len(), expected, "each pass records its failure");
+    assert_eq!(
+        generations
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        expected,
+        "each failure belongs to a distinct generation"
+    );
+    assert!(generations.iter().all(|generation| generation.len() == 32
+        && generation.bytes().all(|byte| byte.is_ascii_hexdigit())));
+}
+
+/// The gate truth a re-arm must leave behind. Every stored edge flag
+/// answers the strict slice predicate — the re-arm reverts the probe's
+/// membership moves, so no `dep_met` may stay flipped — and on the
+/// rows the refresh scopes (the restored and claimed rows plus the
+/// dependents of every dep they name, pending or not) the persisted
+/// `unpublished_deps` counter counts the unmet edges, `deps_met` is
+/// its `= 0` derivation, and `blocked` holds while the row is pending.
+async fn assert_rearm_gate_truth(db: &DurableDb, shape: fixture::FixtureShape, claimed: &[String]) {
+    // The touched set `rearm` derives: its fixed restore list, the
+    // pass's recorded claim set and the delta's retire-band members.
+    let mut touched = vec![
+        101,
+        fixture::FixtureShape::pending_row(701),
+        fixture::FixtureShape::pending_row(702),
+        fixture::FixtureShape::pending_row(4703),
+        shape.failed_row(0),
+        shape.failed_row(1),
+        shape.completed_row(0),
+        shape.completed_row(1),
+        shape.running_row(),
+        shape.dispatched_row(0),
+    ];
+    touched.extend(claimed.iter().filter_map(|id| {
+        u64::from_str_radix(id, 16)
+            .ok()
+            .and_then(|n| u32::try_from(n).ok())
+    }));
+    let live = shape.slice_live_rows(0);
+    let first = shape.slice_first_row(0);
+    for i in 0..drives::DELTA_ROWS {
+        touched.push(first + (live - 1 - i) * 9);
+    }
+    let stale_edges: i64 = db
+        .query(&format!(
+            "SELECT count(*) FROM queue_dependencies d \
+             WHERE d.dep_met != (CASE WHEN {unpublished} THEN 0 ELSE 1 END)",
+            unpublished = queue::dep_edge_unpublished_sql("d"),
+        ))
+        .fetch_scalar()
+        .await
+        .expect("edge dep_met sweep");
+    assert_eq!(
+        stale_edges, 0,
+        "re-arm left edges stale against the live slice"
+    );
+    let drifted_owners: i64 = db
+        .query(&format!(
+            "WITH touched(task_id) AS ( \
+                 SELECT printf('%064x', value) FROM json_each(?) \
+             ), owners(task_id) AS ( \
+                 SELECT task_id FROM touched UNION \
+                 SELECT d.task_id FROM queue_dependencies d \
+                 JOIN touched t ON t.task_id = d.depends_on_task_id \
+             ) \
+             SELECT count(*) FROM queue \
+             WHERE task_id IN (SELECT task_id FROM owners) \
+               AND (unpublished_deps != {unpublished} \
+                    OR deps_met != {deps_met} \
+                    OR (status = 'pending' AND blocked != {blocked}))",
+            unpublished = queue::unpublished_deps_sql("queue.task_id"),
+            deps_met = queue::deps_met_sql("queue.task_id"),
+            blocked = queue::blocked_sql("queue.task_id"),
+        ))
+        .bind(serde_json::to_string(&touched).expect("encode touched"))
+        .fetch_scalar()
+        .await
+        .expect("owner counter sweep");
+    assert_eq!(
+        drifted_owners, 0,
+        "re-arm left touched owners' counters off the production expressions"
+    );
+}
+
+/// The workerd probe runs `POST /budget` repeatedly against the same
+/// persisted fixture — the launch gate measures once before and once
+/// after the load lane. `fixture::rearm` must return every row and
+/// membership the first pass moved to the seeded truth, or the second
+/// pass fails its logical assertions (the retry drive's two `failed`
+/// rows) or drifts off the calibrated costs. Two full passes on one
+/// fixture prove the restore covers the whole mutation class — and the
+/// probe's own control state carries it: claimed rows restore from the
+/// pass's recorded claim set (a non-pending row the pass never touched
+/// survives), and the running target's `attempt` steps forward so each
+/// pass's completion lands on a fresh epoch.
+#[tokio::test]
+async fn budget_probe_repeats_on_a_persisted_fixture() {
+    every_drive_has_exactly_one_row_in_each_budget_table();
+    let settings = SchedulerSettings::default();
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+    let shape = fixture::GATE;
+
+    // Two non-pending rows inside the pending band that no drive names
+    // and no claim can reach — the re-arm's claimed-row restore is the
+    // pass's recorded set, so these must survive it untouched. The
+    // `completed` marker carries the repair latch so the pass's own
+    // shape-requeue sweep cannot move it either.
+    let untouched = [
+        (shape.pending_end() / 3, "completed", "shape_requeue = 1"),
+        (
+            shape.pending_end() / 3 + 1,
+            "failed",
+            "shape_requeue = shape_requeue",
+        ),
+    ];
+    for (n, status, extra) in untouched {
+        db.query(&format!(
+            "UPDATE queue SET status = ?, {extra} \
+             WHERE task_id = printf('%064x', ?)"
+        ))
+        .bind(status)
+        .bind(i64::from(n))
+        .execute()
+        .await
+        .expect("stage untouched marker");
+    }
+
+    // The probe's own order: `budget::run` re-arms before every metered
+    // pass and records the pass's claim set after it.
+    let ctx = drives::DriveContext::host();
+    fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
+        .await
+        .expect("re-arm (baseline)");
+    run_drives(&db, shape, &settings, &ctx, &log).await;
+
+    // The complete drive lands `completed` + stamps the run id; the
+    // same pass's shape-requeue sweep then re-enters the row as
+    // `pending` at `attempt + 1` — the post-pass read is that state,
+    // which is also the state the re-arm restores from. A success
+    // never writes a raw `attempt_outcomes` row: the per-target
+    // bucket's `outcomes` count is the completion's evidence, and it
+    // must increase exactly once per landed transition.
+    let first = running_target(&db, shape).await;
+    let run_id = format!("run-{}", shape.running_row());
+    assert_eq!(
+        first.github_run_id.as_deref(),
+        Some(run_id.as_str()),
+        "the pass's completion landed and stamped its run id"
+    );
+    assert_eq!(
+        running_outcomes(&db, shape).await,
+        1,
+        "the first pass's completed transition counted once"
+    );
+    let claimed = ctx.claimed_ids();
+    assert_failure_evidence(&db, shape, 1).await;
+    assert!(!claimed.is_empty(), "the gate pass claims rows");
+    fixture::record_probe_claimed(&db, &claimed)
+        .await
+        .expect("record claims");
+    fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
+        .await
+        .expect("re-arm fixture");
+    assert_rearm_gate_truth(&db, shape, &claimed).await;
+
+    for (n, status, _) in untouched {
+        let id = format!("{n:064x}");
+        assert_eq!(
+            status_of(&db, &id).await,
+            status,
+            "unclaimed {status} row at n={n} survived the re-arm"
+        );
+    }
+    for id in &claimed {
+        if u64::from_str_radix(id, 16).is_ok() {
+            assert_eq!(
+                status_of(&db, id).await,
+                "pending",
+                "claimed row {id} returned to pending"
+            );
+        }
+    }
+
+    run_drives(&db, shape, &settings, &ctx, &log).await;
+    let second = running_target(&db, shape).await;
+    assert_eq!(second.github_run_id.as_deref(), Some(run_id.as_str()));
+    assert_ne!(second.generation_id, first.generation_id);
+    assert_failure_evidence(&db, shape, 2).await;
+    // The second pass's own transition — counted once more, on a
+    // fresh generation. The re-arm also steps `attempt` past whatever
+    // the last pass left; the requeue's +1 rides on top, so strict
+    // increase is the form, not +1.
+    assert_eq!(
+        running_outcomes(&db, shape).await,
+        2,
+        "the second pass's completed transition counted once more"
+    );
+    assert!(
+        second.attempt > first.attempt,
+        "each pass completes a fresh attempt epoch: {} then {}",
+        first.attempt,
+        second.attempt,
     );
 }

@@ -3,9 +3,9 @@ description: >-
   Download the stow toolchain artifact for a commit from GHCR, verify its
   cosign signature against the merge-queue signing identity, and put the
   requested binaries on PATH.
-# toolchain-publish.yml builds stow-build, stow-cli and stow-admin once per
-# platform on the merge queue and pushes them to ghcr.io/water-rs/stow-toolchain
-# as `<sha>-<os>-<arch>` — the merge group head sha is exactly what main is
+# toolchain-publish.yml builds stow-build and stow-cli (and on Linux
+# stow-admin) once per platform on the merge queue and pushes them to
+# ghcr.io/water-rs/stow-toolchain as `<sha>-<os>-<arch>` — the merge group head sha is exactly what main is
 # fast-forwarded to (stow#431). The pull resolves the tag to its manifest
 # digest, cosign proves the signer was toolchain-publish.yml on a
 # gh-readonly-queue ref — only GitHub's merge queue can create those — and

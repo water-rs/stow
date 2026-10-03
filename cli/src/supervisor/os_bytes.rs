@@ -42,12 +42,14 @@ pub fn decode(bytes: &[u8]) -> Result<OsString, String> {
     }
     #[cfg(windows)]
     {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return Err(format!("{} bytes cannot be UTF-16 code units", bytes.len()));
         }
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         Ok(std::os::windows::ffi::OsStringExt::from_wide(&units))
     }

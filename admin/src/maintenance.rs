@@ -778,7 +778,7 @@ mod tests {
         assert_eq!(wanted.len(), ALL_SCOPES.len());
         for (scope, expression) in &wanted {
             assert!(expression.contains("edge.example.com"));
-            assert!(!scope.description().is_empty());
+            assert_ne!(scope.description(), "");
         }
     }
 }

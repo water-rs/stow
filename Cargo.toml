@@ -14,7 +14,6 @@ members = [
     "edge",
     "mock-registry",
     "oci",
-    "resolve",
     "resolver",
     "shim",
     "types",
@@ -51,12 +50,11 @@ stow-types = { path = "types", version = "0.6.0" }
 stow-shim = { path = "shim", version = "0.6.0" }
 stow-oci = { path = "oci", version = "0.6.0" }
 stow-cli = { path = "cli", version = "0.6.0" }
-stow-resolve = { path = "resolve" }
 stow-resolver = { path = "resolver", version = "0.6.0" }
 anyhow = "1.0.102"
 toml = "0.9"
 tempfile = "3"
-target-lexicon = "0.12"
+target-lexicon = "0.13"
 # The `.crate` tarball readers: the trusted runner unpacks a crate to build
 # it, `stow-admin` reads one to decide a preheat task's resolution mode.
 flate2 = "1.0"
@@ -117,11 +115,21 @@ sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c
 sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
 # skyzen dev at this rev moves services to sqlx 0.9 and takes services
 # with default-features off, so only the pinned sqlx 0.9 graph exists.
-# Only the crates the 0.3 `skyzen` release resolves through are pinned.
-skyzen-core = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
-skyzen-hyper = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
-skyzen-manifest = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
-skyzen-services = { git = "https://github.com/zen-rs/skyzen", rev = "ffd2d16eb24de8c7f4f584409831d25f074ce460" }
+# The rev also carries two unreleased fixes: encodeBody for
+# double-encoded responses (zen-rs/skyzen#96) and CfFetch rendering a
+# rejected fetch's JS `.message` (zen-rs/skyzen#100) — no 0.4.x tag or
+# crates.io release carries either. Every skyzen crate the edge
+# resolves is pinned to one rev so the whole graph agrees: pinning
+# `skyzen-cloudflare` alone duplicates the graph, because a git
+# package's in-repo path deps resolve inside its own checkout while
+# stow-edge's direct deps keep the older rev's crate instances.
+skyzen = { git = "https://github.com/zen-rs/skyzen", rev = "a589a326b091c5b0d66b6392e8678a3e820fb8b3" }
+skyzen-cloudflare = { git = "https://github.com/zen-rs/skyzen", rev = "a589a326b091c5b0d66b6392e8678a3e820fb8b3" }
+skyzen-core = { git = "https://github.com/zen-rs/skyzen", rev = "a589a326b091c5b0d66b6392e8678a3e820fb8b3" }
+skyzen-hyper = { git = "https://github.com/zen-rs/skyzen", rev = "a589a326b091c5b0d66b6392e8678a3e820fb8b3" }
+skyzen-macros = { git = "https://github.com/zen-rs/skyzen", rev = "a589a326b091c5b0d66b6392e8678a3e820fb8b3" }
+skyzen-manifest = { git = "https://github.com/zen-rs/skyzen", rev = "a589a326b091c5b0d66b6392e8678a3e820fb8b3" }
+skyzen-services = { git = "https://github.com/zen-rs/skyzen", rev = "a589a326b091c5b0d66b6392e8678a3e820fb8b3" }
 sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
 sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
 sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }

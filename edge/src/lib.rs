@@ -11,8 +11,6 @@
 // runtime caller lives behind the wasm gate below, so dead-code analysis is
 // only meaningful for the wasm target.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod admission;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod catalog;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod crates_io_fetch;
@@ -33,14 +31,11 @@ mod github_app;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod github_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub(crate) mod worker_resolver;
-
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod cache_key;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod index_slice;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod miss_logger;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod no_store;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod registry_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]

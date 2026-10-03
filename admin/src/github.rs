@@ -3,9 +3,8 @@
 //! token; the edge is not involved.
 
 use stow_types::stow_error;
+use stow_types::transient::{Backoff, is_transient_status, retry_after_hint};
 use zenwave::{Client, ResponseExt};
-
-use crate::http_retry::{Backoff, is_retryable, retry_after_hint};
 
 /// The repository every request below addresses — `build-crate.yml` runs
 /// and the Actions cache live here.
@@ -74,9 +73,11 @@ async fn send_get(
             None => request,
         };
         let (error, retry_after) = match request.await {
-            Ok(response) if !is_retryable(response.status()) => return Ok(response),
+            Ok(response) if !is_transient_status(response.status().as_u16()) => {
+                return Ok(response);
+            }
             Ok(response) => {
-                let retry_after = retry_after_hint(&response);
+                let retry_after = retry_after_hint(response.headers());
                 match response.error_for_status().await {
                     Ok(response) => return Ok(response),
                     Err(error) => (error, retry_after),
@@ -88,7 +89,7 @@ async fn send_get(
             return Err(error);
         };
         tracing::warn!(url, %error, "GitHub request failed; retrying");
-        smol::Timer::after(wait).await;
+        tokio::time::sleep(wait).await;
     }
 }
 

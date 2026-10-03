@@ -28,6 +28,17 @@ pub async fn resolve_trust(config: &StowConfig) -> stow_types::error::Result<Tru
     }
 }
 
+/// Start resolving the trust material on a spawned task so its cold-cache
+/// TUF download overlaps the caller's own network work instead of stacking
+/// behind it (stow#347). `Trust::MockKey` resolves without any fetch, so
+/// the spawn is cheap on the mock path too.
+pub fn spawn_trust(
+    config: &StowConfig,
+) -> tokio::task::JoinHandle<stow_types::error::Result<Trust>> {
+    let config = config.clone();
+    tokio::task::spawn(async move { resolve_trust(&config).await })
+}
+
 use crate::artifact_cache;
 use crate::artifact_cache::CachedArtifactBundle;
 use crate::config::{StowConfig, VerifyMode};
@@ -145,7 +156,9 @@ pub async fn store_downloaded_bundle_with_trust_marker(
 /// Verify an index manifest's signature material with the same machinery
 /// bundles get — the cosign payload binding, Rekor entry, and Fulcio chain
 /// — with the certificate pinned to the index-publish workflow identity
-/// rather than the build workflow.
+/// rather than the build workflow. The download path resolves `trust`
+/// concurrently with the slice pull, so it arrives already resolved
+/// (stow#347).
 ///
 /// One valid signature is enough, matching the bundle path. `materials`
 /// come from the `sha256-<hex>.sig` image pulled next to the index
@@ -155,10 +168,10 @@ pub async fn store_downloaded_bundle_with_trust_marker(
 ///
 /// # Errors
 ///
-/// Returns an error when `materials` is empty or the signature does not
-/// satisfy the configured verify mode.
-pub async fn verify_index_signature(
-    config: &StowConfig,
+/// Returns an error when `materials` is empty or no signature satisfies
+/// the trust's policy.
+pub async fn verify_index_signature_with_trust(
+    trust: Trust,
     oci_reference: &str,
     oci_digest: &str,
     materials: &[stow_types::bundle::BundleSignatureMaterial],
@@ -169,7 +182,6 @@ pub async fn verify_index_signature(
         ));
     }
     let materials = materials.to_vec();
-    let trust = resolve_trust(config).await?;
     let oci_reference = oci_reference.to_owned();
     let oci_digest = oci_digest.to_owned();
     smol::unblock(move || {

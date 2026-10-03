@@ -1,6 +1,8 @@
 //! Privacy-preserving usage statistics: the public `UsageStats`
-//! aggregates are computed from the Analytics Engine SQL API and served
-//! through the Cache API — never D1.
+//! aggregates are computed from the Analytics Engine SQL API — never D1
+//! — and cached at the edge by Workers Cache on the answer's own
+//! `Cache-Control` (the SQL API is billed per query, so the figure
+//! tolerates an hour of staleness).
 //!
 //! `stow_events` holds one point per sampled cache hit from the era when
 //! the byte path resolved catalog rows and knew the artifact's identity;
@@ -12,6 +14,7 @@
 //! extractors and the SQL API calls are wasm-only.
 
 use serde::Deserialize;
+use stow_types::analytics;
 use stow_types::api::{UsageStatEntry, UsageStats};
 
 /// Header the CLI sets on every edge request when `STOW_NO_ANALYTICS=1`.
@@ -59,6 +62,10 @@ const TARGETS_SQL: &str = include_str!("sql/stats_targets.sql");
 /// `stats_cli_versions.sql` — hits per `stow-cli` version over 30 days.
 const CLI_VERSIONS_SQL: &str = include_str!("sql/stats_cli_versions.sql");
 
+/// The Analytics Engine SQL API prefix `run_sql` posts under when no
+/// `STOW_STATS_SQL_URL` override points the route at a stub.
+pub const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
+
 /// Below this many distinct installs per day the figure is suppressed —
 /// stow publishes no small counts that could single out a user.
 const MIN_PUBLISHABLE_INSTALLS: f64 = 20.0;
@@ -67,56 +74,36 @@ const MIN_PUBLISHABLE_INSTALLS: f64 = 20.0;
 /// day's installs distinct, so the average is install-days over days.
 const INSTALL_WINDOW_DAYS: f64 = 7.0;
 
-/// The Analytics Engine `FORMAT JSON` envelope: rows arrive under `data`,
-/// each an object keyed by the query's column aliases.
-#[derive(Debug, Deserialize)]
-struct SqlEnvelope<T> {
-    data: Vec<T>,
-}
-
-/// ClickHouse-style `FORMAT JSON` quotes 64-bit integers, so every numeric
-/// column accepts either a JSON number or its string form.
-fn de_f64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Number {
-        Float(f64),
-        Quoted(String),
-    }
-    match Number::deserialize(deserializer)? {
-        Number::Float(value) => Ok(value),
-        Number::Quoted(text) => text.parse().map_err(serde::de::Error::custom),
-    }
-}
-
-/// One row of [`EVENTS_SQL`].
+/// One row of [`EVENTS_SQL`]. `sumIf` over `double*` is `Float64`.
 #[derive(Debug, Deserialize)]
 struct EventsRow {
-    #[serde(deserialize_with = "de_f64")]
+    #[serde(deserialize_with = "analytics::de_f64")]
     hits_24h: f64,
-    #[serde(deserialize_with = "de_f64")]
+    #[serde(deserialize_with = "analytics::de_f64")]
     hit_compile_millis_30d: f64,
 }
 
-/// One row of [`INSTALLS_SQL`].
+/// One row of [`INSTALLS_SQL`]. `count(DISTINCT …)` is a `UInt64`,
+/// which `FORMAT JSON` quotes.
 #[derive(Debug, Deserialize)]
 struct InstallsRow {
-    #[serde(deserialize_with = "de_f64")]
-    install_days_7d: f64,
+    #[serde(deserialize_with = "analytics::de_u64")]
+    install_days_7d: u64,
 }
 
-/// One row of [`MISSES_SQL`].
+/// One row of [`MISSES_SQL`]. `count()` is a `UInt64`.
 #[derive(Debug, Deserialize)]
 struct MissesRow {
-    #[serde(deserialize_with = "de_f64")]
-    misses_24h: f64,
+    #[serde(deserialize_with = "analytics::de_u64")]
+    misses_24h: u64,
 }
 
-/// One row of a leaderboard query — `(name, scaled hits)`.
+/// One row of a leaderboard query — `(name, scaled hits)`; `sum` over
+/// `double1` is `Float64`.
 #[derive(Debug, Deserialize)]
 struct LeaderboardRow {
     name: String,
-    #[serde(deserialize_with = "de_f64")]
+    #[serde(deserialize_with = "analytics::de_f64")]
     hits: f64,
 }
 
@@ -139,7 +126,7 @@ fn usage_stats_from_rows(
     cli_versions: Vec<LeaderboardRow>,
 ) -> UsageStats {
     let hits_24h = events.hits_24h.round() as u64;
-    let misses_24h = misses.misses_24h.round() as u64;
+    let misses_24h = misses.misses_24h;
     let served_24h = hits_24h + misses_24h;
     let hit_rate_24h = if served_24h == 0 {
         0.0
@@ -147,7 +134,7 @@ fn usage_stats_from_rows(
         hits_24h as f64 / served_24h as f64
     };
     let cpu_hours_saved_30d = events.hit_compile_millis_30d / 3_600_000.0;
-    let daily_installs = installs.install_days_7d / INSTALL_WINDOW_DAYS;
+    let daily_installs = installs.install_days_7d as f64 / INSTALL_WINDOW_DAYS;
     let daily_active_installs_7d =
         (daily_installs >= MIN_PUBLISHABLE_INSTALLS).then(|| daily_installs.round() as u64);
     let entries = |rows: Vec<LeaderboardRow>| {
@@ -197,15 +184,14 @@ mod worker {
     /// Analytics Engine SQL API.
     #[derive(Debug, Clone)]
     pub struct StatsContext {
-        /// `CF_ACCOUNT_ID` — the account the SQL API is queried under.
-        pub account_id: String,
         /// `CF_ANALYTICS_TOKEN` — an API token with Analytics Engine read
         /// on the account. A credential: never logged, never in a response.
         pub analytics_token: String,
+        /// The full SQL API URL `run_sql` posts to — the account's real
+        /// endpoint under `CF_ACCOUNT_ID`, or the harness stub
+        /// `STOW_STATS_SQL_URL` names.
+        pub sql_url: String,
     }
-
-    /// The Analytics Engine SQL API endpoint `run_sql` posts to.
-    const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
 
     /// Run one `stats_*.sql` query through the Analytics Engine SQL API
     /// and decode the `FORMAT JSON` `data` rows it returns.
@@ -218,15 +204,12 @@ mod worker {
     {
         use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
 
-        let url = format!(
-            "{}/{}/analytics_engine/sql",
-            SQL_API_URL, context.account_id
-        );
+        let url = context.sql_url.as_str();
         let authorization = format!("Bearer {}", context.analytics_token);
         let request = SendWrapper::new(
             crate::cf_http::bare_request(
                 skyzen_cloudflare::worker::Method::Post,
-                &url,
+                url,
                 &[("Authorization", authorization.as_str())],
                 Some(sql.as_bytes()),
             )
@@ -255,7 +238,7 @@ mod worker {
                 format!("stats query failed: {status} {body}"),
             ));
         }
-        let envelope: super::SqlEnvelope<T> =
+        let envelope: stow_types::analytics::Envelope<T> =
             response.json().into_send().await.map_err(|error| {
                 crate::errors::GetArtifactError::InternalWithMessage(format!(
                     "decode stats query result: {error}"
@@ -278,23 +261,13 @@ mod worker {
         }
     }
 
-    /// The public [`stow_types::api::UsageStats`] — served from the Cache
-    /// API when fresh, else computed from the `stats_*.sql` queries and
-    /// cached for one hour so the SQL API is hit at most hourly per colo.
-    pub async fn cached_usage_stats(
+    /// The public [`stow_types::api::UsageStats`] — computed from the
+    /// `stats_*.sql` queries on a Workers Cache miss; the answer's
+    /// `Cache-Control` holds the result for the staleness the figures
+    /// tolerate.
+    pub async fn compute_usage_stats(
         context: &StatsContext,
-        cache: &skyzen_cloudflare::CfCache,
     ) -> Result<stow_types::api::UsageStats, crate::errors::GetArtifactError> {
-        if let Some(bytes) = crate::cache::get_stats(cache).await.map_err(|error| {
-            crate::errors::GetArtifactError::InternalWithMessage(error.to_string())
-        })? {
-            match serde_json::from_slice(&bytes) {
-                Ok(stats) => return Ok(stats),
-                Err(error) => {
-                    tracing::warn!(%error, "cached stats failed to parse; recomputing");
-                }
-            }
-        }
         let events = first_row(run_sql(context, super::EVENTS_SQL).await?, "stats_events")?;
         let installs = first_row(
             run_sql(context, super::INSTALLS_SQL).await?,
@@ -304,28 +277,19 @@ mod worker {
         let top_crates = run_sql(context, super::TOP_CRATES_SQL).await?;
         let targets = run_sql(context, super::TARGETS_SQL).await?;
         let cli_versions = run_sql(context, super::CLI_VERSIONS_SQL).await?;
-        let stats = super::usage_stats_from_rows(
+        Ok(super::usage_stats_from_rows(
             &events,
             &installs,
             &misses,
             top_crates,
             targets,
             cli_versions,
-        );
-        match serde_json::to_vec(&stats) {
-            Ok(body) => {
-                if let Err(error) = crate::cache::put_stats(cache, &body).await {
-                    tracing::warn!(%error, "failed to cache usage stats");
-                }
-            }
-            Err(error) => tracing::warn!(%error, "failed to serialize usage stats"),
-        }
-        Ok(stats)
+        ))
     }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use worker::{StatsContext, cached_usage_stats};
+pub use worker::{StatsContext, compute_usage_stats};
 
 #[cfg(test)]
 mod tests {
@@ -348,9 +312,9 @@ mod tests {
                 hit_compile_millis_30d: 3_600_000.0 * 2.5,
             },
             &InstallsRow {
-                install_days_7d: 19.0 * 7.0,
+                install_days_7d: 19 * 7,
             },
-            &MissesRow { misses_24h: 100.6 },
+            &MissesRow { misses_24h: 101 },
             vec![leaderboard("serde", 99.5)],
             vec![leaderboard("x86_64-unknown-linux-gnu", 1_000.0)],
             vec![leaderboard("0.5.0", 42.0)],
@@ -376,9 +340,9 @@ mod tests {
                 hit_compile_millis_30d: 0.0,
             },
             &InstallsRow {
-                install_days_7d: 20.0 * 7.0,
+                install_days_7d: 20 * 7,
             },
-            &MissesRow { misses_24h: 0.0 },
+            &MissesRow { misses_24h: 0 },
             Vec::new(),
             Vec::new(),
             Vec::new(),

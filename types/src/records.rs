@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use crate::api::ArtifactRecord;
 use crate::identity::{TargetTriple, WireRustcVersion};
 use crate::index::ArtifactIndexRow;
+use crate::public_cache::UnitShape;
 use crate::registry::MAX_OCI_TAG_LEN;
 
 /// `artifactType` (and single-layer media type) of a records artifact: a
@@ -48,6 +49,30 @@ pub fn run_title(rustc_version: &str, task_id: &str) -> String {
 pub fn parse_run_title(title: &str) -> Option<(&str, &str)> {
     let (rustc_version, task_id) = title.split_once('-')?;
     (!rustc_version.is_empty() && !task_id.is_empty()).then_some((rustc_version, task_id))
+}
+
+/// The `run-name` `resolve-request.yml` stamps on its run —
+/// `resolve-a<attempt>-<request_id>`.
+///
+/// The `a<attempt>` leg pins the record's dispatch epoch so a stale
+/// run's `workflow_run` events cannot land on a re-request's live
+/// attempt, and the `resolve-` leg keeps the title's first-dash split
+/// disjoint from `build-crate.yml`'s `<rustc>-<task_id>`.
+#[must_use]
+pub fn resolve_run_title(attempt: u32, request_id: &str) -> String {
+    format!("resolve-a{attempt}-{request_id}")
+}
+
+/// The `(attempt, request_id)` a resolve run title names — the inverse
+/// of [`resolve_run_title`].
+///
+/// `None` when the title is not `resolve-a<attempt>-<request_id>`: not
+/// one of our resolve runs, or its name was hand-edited.
+#[must_use]
+pub fn parse_resolve_run_title(title: &str) -> Option<(u32, &str)> {
+    let (attempt, request_id) = title.strip_prefix("resolve-")?.split_once('-')?;
+    let attempt = attempt.strip_prefix('a')?.parse().ok()?;
+    (!request_id.is_empty()).then_some((attempt, request_id))
 }
 
 /// Tag prefix a records artifact publishes under: `records-<rustc>-<task_id hash>`.
@@ -129,20 +154,24 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> Option<ArtifactIndexRow> 
     })
 }
 
+type RowsByIdentity = BTreeMap<(String, Option<UnitShape>), ArtifactIndexRow>;
+
 /// Group records into `(target, rustc_version)` slices of index rows,
 /// ordered by `c_metadata` — the shape `index export` writes and the D1
 /// catalog's `SELECT … ORDER BY c_metadata` produces.
 ///
-/// A `c_metadata` carried by more than one records artifact (a re-run
-/// task that rebuilt the same unit) collapses to the record later in
-/// iteration order; feed records in tag order to keep the outcome
-/// deterministic.
+/// A `(c_metadata, unit_shape)` pair carried by more than one records
+/// artifact (a re-run task that rebuilt the same unit) collapses to the
+/// record later in iteration order; feed records in tag order to keep
+/// the outcome deterministic. The same `c_metadata` under a second
+/// `unit_shape` is not a duplicate: one artifact serves every shape a
+/// real consumer's build computes it under, so each shape keeps its
+/// row (stow#506).
 #[must_use]
 pub fn records_into_slices(
     records: impl IntoIterator<Item = ArtifactRecord>,
 ) -> BTreeMap<(TargetTriple, WireRustcVersion), Vec<ArtifactIndexRow>> {
-    let mut slices: BTreeMap<(TargetTriple, WireRustcVersion), BTreeMap<String, ArtifactIndexRow>> =
-        BTreeMap::new();
+    let mut slices: BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity> = BTreeMap::new();
     for record in records {
         let Some(row) = record_to_index_row(&record) else {
             continue;
@@ -150,7 +179,7 @@ pub fn records_into_slices(
         slices
             .entry((record.target, record.rustc_version))
             .or_default()
-            .insert(row.c_metadata.as_str().to_owned(), row);
+            .insert((row.c_metadata.as_str().to_owned(), row.unit_shape), row);
     }
     slices
         .into_iter()

@@ -1,5 +1,128 @@
 "use strict";
 
+/* crate-name combobox — one component, both fields. An input plus a
+ * keyboard-navigable listbox: ArrowDown/ArrowUp move the active option,
+ * Enter picks it, Escape and blur dismiss the list, and a mouse pick is
+ * `mousedown` because the input's blur would close the list before a
+ * click could land. The caller supplies the hit source (`fetchHits`),
+ * how one hit renders into its <li> (`renderItem`), and what choosing
+ * does (`onChoose`); the component owns the list's open/active-descendant
+ * mechanics and retires a stale fetch so a slower earlier answer cannot
+ * overwrite a faster later one. */
+const createCombobox = ({ input, list, fetchHits, renderItem, onChoose }) => {
+  let hits = [];
+  let activeOption = -1;
+  // Set when the list is dismissed (Escape, blur, or a selection) so an
+  // in-flight fetch cannot pop it back open over the controls below;
+  // cleared by the next keystroke, which is a fresh request for it.
+  let dismissed = false;
+  // Monotonic ticket per fetch — the stale-response rule above.
+  let ticket = 0;
+
+  const close = () => {
+    dismissed = true;
+    ticket += 1;
+    hits = [];
+    list.replaceChildren();
+    list.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+    activeOption = -1;
+  };
+
+  const highlight = (index) => {
+    const items = [...list.children];
+    if (items.length === 0) {
+      return;
+    }
+    activeOption = (index + items.length) % items.length;
+    items.forEach((item, position) => {
+      const selected = position === activeOption;
+      item.setAttribute("aria-selected", selected ? "true" : "false");
+      if (selected) {
+        input.setAttribute("aria-activedescendant", item.id);
+        item.scrollIntoView({ block: "nearest" });
+      }
+    });
+  };
+
+  const choose = (hit) => {
+    input.value = hit.name;
+    close();
+    onChoose(hit);
+  };
+
+  const render = (options) => {
+    if (dismissed) {
+      return;
+    }
+    hits = options;
+    list.replaceChildren();
+    for (const [index, hit] of hits.entries()) {
+      const item = document.createElement("li");
+      item.id = `${list.id}-option-${index}`;
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", "false");
+      renderItem(item, hit);
+      item.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        choose(hit);
+      });
+      list.appendChild(item);
+    }
+    list.hidden = hits.length === 0;
+    input.setAttribute("aria-expanded", hits.length > 0 ? "true" : "false");
+    activeOption = -1;
+  };
+
+  input.addEventListener("input", () => {
+    dismissed = false;
+  });
+
+  input.addEventListener("keydown", (event) => {
+    // Escape lands even with the list closed: a fetch may still be in
+    // flight, and dismissing has to stop it from arriving.
+    if (event.key === "Escape") {
+      close();
+      return;
+    }
+    if (list.hidden) {
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      highlight(activeOption + 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      highlight(activeOption - 1);
+    } else if (event.key === "Enter" && activeOption >= 0) {
+      event.preventDefault();
+      choose(hits[activeOption]);
+    }
+  });
+
+  input.addEventListener("blur", close);
+
+  return {
+    close,
+    update: async (query) => {
+      const current = ++ticket;
+      try {
+        const options = await fetchHits(query);
+        if (current === ticket) {
+          render(options);
+        }
+      } catch {
+        // A failed completion is not a form error: the name the user
+        // typed is still validated by the caller's own path.
+        if (current === ticket) {
+          close();
+        }
+      }
+    },
+  };
+};
+
 (() => {
   // The install box shows one OS's command at a time; the rendered default
   // is POSIX so the page works without JavaScript, and the buttons are the
@@ -53,17 +176,10 @@
 
   // Monotonic ticket per control: a slower earlier response must not
   // overwrite a faster later one when the user keeps typing.
-  let searchTicket = 0;
   let versionTicket = 0;
   let featureTicket = 0;
 
   let searchTimer = null;
-  let activeOption = -1;
-
-  // Set when the list is dismissed (Escape, blur, or a selection) so an
-  // in-flight search cannot pop it back open over the controls below;
-  // cleared by the next keystroke, which is a fresh request for it.
-  let optionsDismissed = false;
 
   // Mirrors `CrateName`'s deserialize rule, so a name the edge would reject
   // is caught before any request goes out.
@@ -95,87 +211,30 @@
 
   /* ---- crate search combobox ---- */
 
-  const closeOptions = () => {
-    optionsDismissed = true;
-    crateOptions.replaceChildren();
-    crateOptions.hidden = true;
-    crateNameInput.setAttribute("aria-expanded", "false");
-    crateNameInput.removeAttribute("aria-activedescendant");
-    activeOption = -1;
-  };
-
-  const highlightOption = (index) => {
-    const items = [...crateOptions.children];
-    if (items.length === 0) {
-      return;
-    }
-    activeOption = (index + items.length) % items.length;
-    items.forEach((item, position) => {
-      const selected = position === activeOption;
-      item.setAttribute("aria-selected", selected ? "true" : "false");
-      if (selected) {
-        crateNameInput.setAttribute("aria-activedescendant", item.id);
-        item.scrollIntoView({ block: "nearest" });
-      }
-    });
-  };
-
-  const renderOptions = (crates) => {
-    if (optionsDismissed) {
-      return;
-    }
-    crateOptions.replaceChildren();
-    for (const [index, hit] of crates.entries()) {
-      const item = document.createElement("li");
-      item.id = `crate-option-${index}`;
-      item.setAttribute("role", "option");
-      item.setAttribute("aria-selected", "false");
-      item.dataset.crate = hit.crate_name;
-
+  const searchCombobox = createCombobox({
+    input: crateNameInput,
+    list: crateOptions,
+    fetchHits: async (query) => {
+      const body = await getJson(`/api/v1/crates/search?q=${encodeURIComponent(query)}`);
+      return body.crates.map((hit) => ({
+        name: hit.crate_name,
+        version: hit.max_version,
+        description: hit.description ?? "",
+      }));
+    },
+    renderItem: (item, hit) => {
       const name = document.createElement("span");
       name.className = "option-name";
-      name.textContent = `${hit.crate_name} ${hit.max_version}`;
+      name.textContent = `${hit.name} ${hit.version}`;
       item.appendChild(name);
 
       const meta = document.createElement("span");
       meta.className = "option-meta";
-      meta.textContent = hit.description ?? "";
+      meta.textContent = hit.description;
       item.appendChild(meta);
-
-      // `mousedown`, not `click`: the input's blur would close the list
-      // before a click could land on it.
-      item.addEventListener("mousedown", (event) => {
-        event.preventDefault();
-        chooseCrate(hit.crate_name);
-      });
-      crateOptions.appendChild(item);
-    }
-    crateOptions.hidden = crates.length === 0;
-    crateNameInput.setAttribute("aria-expanded", crates.length > 0 ? "true" : "false");
-    activeOption = -1;
-  };
-
-  const searchCrates = async (query) => {
-    const ticket = ++searchTicket;
-    try {
-      const body = await getJson(`/api/v1/crates/search?q=${encodeURIComponent(query)}`);
-      if (ticket === searchTicket) {
-        renderOptions(body.crates);
-      }
-    } catch {
-      // A failed completion lookup is not a form error: the name the user
-      // typed is still validated by the version lookup below.
-      if (ticket === searchTicket) {
-        closeOptions();
-      }
-    }
-  };
-
-  const chooseCrate = (crateName) => {
-    crateNameInput.value = crateName;
-    closeOptions();
-    void loadVersions(crateName);
-  };
+    },
+    onChoose: (hit) => void loadVersions(hit.name),
+  });
 
   /* ---- versions ---- */
 
@@ -340,9 +399,30 @@
     return td;
   };
 
+  const PHASE_LABELS = {
+    accepted: "accepted — resolve dispatched",
+    resolving: "resolving on CI",
+    enqueued: "enqueued",
+    failed: "failed",
+  };
+
   const showOutcome = (outcome) => {
     resultTitle.textContent = `${outcome.crate_name} ${outcome.version} · rustc ${outcome.rustc_version}`;
     resultBody.replaceChildren();
+    // The request row always comes first: its phase is the
+    // whole-request answer and its link is the live status page. While
+    // the record is still `accepted`/`resolving` it is the only row —
+    // `targets` lands when the resolve job reports its outcome.
+    const track = document.createElement("tr");
+    cell(track, "request");
+    cell(track, PHASE_LABELS[outcome.status] ?? String(outcome.status));
+    cell(track, "—", "num");
+    const trackCell = cell(track, "");
+    const trackLink = document.createElement("a");
+    trackLink.href = `/requests/${encodeURIComponent(outcome.request_id)}`;
+    trackLink.textContent = "track";
+    trackCell.appendChild(trackLink);
+    resultBody.appendChild(track);
     for (const entry of outcome.targets) {
       const row = document.createElement("tr");
       cell(row, entry.target);
@@ -352,16 +432,11 @@
         typeof entry.human_lane_position === "number" ? `#${entry.human_lane_position}` : "—",
         "num",
       );
-      const taskCell = cell(row, "");
-      if (entry.task_id) {
-        const link = document.createElement("a");
-        link.href = `/requests/${encodeURIComponent(entry.task_id)}`;
-        link.textContent = "status";
-        taskCell.appendChild(link);
-      } else {
-        taskCell.textContent = "—";
-      }
+      cell(row, entry.task_id ?? "—");
       resultBody.appendChild(row);
+    }
+    if (outcome.error) {
+      setStatus(outcome.error, "error");
     }
     result.hidden = false;
     result.scrollIntoView({ block: "nearest" });
@@ -426,59 +501,34 @@
 
   crateNameInput.addEventListener("input", () => {
     const query = crateNameInput.value.trim();
-    optionsDismissed = false;
     resolvedCrate = null;
     // Every request in flight belongs to the name that was in the field a
-    // moment ago. Retiring all three tickets here — not when the debounced
+    // moment ago. Retiring both tickets here — not when the debounced
     // search finally fires — stops a late version listing from re-arming
-    // `resolvedCrate` for a crate the user has already edited away.
-    searchTicket += 1;
+    // `resolvedCrate` for a crate the user has already edited away. The
+    // completion's own ticket lives inside the combobox.
     versionTicket += 1;
     featureTicket += 1;
     window.clearTimeout(searchTimer);
     if (query === "") {
-      closeOptions();
+      searchCombobox.close();
       invalidateCrate("", null);
       return;
     }
     if (!CRATE_NAME.test(query)) {
-      closeOptions();
+      searchCombobox.close();
       invalidateCrate("a crate name is letters, digits, `-` and `_`", "error");
       return;
     }
     searchTimer = window.setTimeout(() => {
       if (query.length >= MIN_SEARCH_LEN) {
-        void searchCrates(query);
+        void searchCombobox.update(query);
       }
       // The name may be exact without being picked from the list, so it is
       // resolved against crates.io either way.
       void loadVersions(query);
     }, SEARCH_DEBOUNCE_MS);
   });
-
-  crateNameInput.addEventListener("keydown", (event) => {
-    // Escape is handled even with the list closed: a search may still be in
-    // flight, and dismissing has to stop it from arriving.
-    if (event.key === "Escape") {
-      closeOptions();
-      return;
-    }
-    if (crateOptions.hidden) {
-      return;
-    }
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      highlightOption(activeOption + 1);
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      highlightOption(activeOption - 1);
-    } else if (event.key === "Enter" && activeOption >= 0) {
-      event.preventDefault();
-      chooseCrate(crateOptions.children[activeOption].dataset.crate);
-    }
-  });
-
-  crateNameInput.addEventListener("blur", closeOptions);
 
   versionSelect.addEventListener("change", () => {
     const version = selectedVersion();
@@ -528,6 +578,7 @@
 (() => {
   const targetSelect = document.getElementById("lookup-target");
   const crateInput = document.getElementById("lookup-crate");
+  const crateOptions = document.getElementById("lookup-crate-options");
   const note = document.getElementById("lookup-note");
   const sliceLabel = document.getElementById("lookup-slice");
   const result = document.getElementById("lookup-result");
@@ -536,7 +587,7 @@
   // Mirrors `CrateName`'s deserialize rule.
   const CRATE_NAME = /^[A-Za-z0-9_-]{1,128}$/;
   // Mirrors `ARTIFACT_INDEX_FORMAT_VERSION` in types/src/index.rs.
-  const INDEX_FORMAT_VERSION = 1;
+  const INDEX_FORMAT_VERSION = 3;
   const LOOKUP_DEBOUNCE_MS = 180;
 
   // Monotonic ticket: a slower earlier load must not overwrite a faster
@@ -704,7 +755,21 @@
     }
 
     if (byVersion.size === 0) {
-      setNote(note, `not cached on ${targetSelect.value} — request it below`, null);
+      // A prefix is not a lookup: while the text starts cached crates the
+      // verdict stays open — "not cached" needs no exact row and no prefix.
+      let prefixes = 0;
+      for (const name of byCrate.keys()) {
+        if (name.startsWith(crateName)) {
+          prefixes += 1;
+        }
+      }
+      setNote(
+        note,
+        prefixes === 0
+          ? `not cached on ${targetSelect.value} — request it below`
+          : `${prefixes} cached crate${prefixes === 1 ? "" : "s"} start${prefixes === 1 ? "s" : ""} with “${crateName}”`,
+        null,
+      );
       return;
     }
 
@@ -728,6 +793,56 @@
     );
   };
 
+  // The combobox completes from the loaded slice's crate names — the same
+  // component the request form points at crates.io search, fed here by a
+  // local filter so a suggestion never costs a request. Prefix matches
+  // sort ahead of mid-name ones, and the list is capped: the slice can
+  // hold thousands of crates.
+  const MAX_LOOKUP_OPTIONS = 12;
+  const latestCachedVersion = (rows) =>
+    [...new Set(rows.map((row) => row.version))].sort((a, b) =>
+      b.localeCompare(a, undefined, { numeric: true }),
+    )[0] ?? "";
+
+  const lookupCombobox = createCombobox({
+    input: crateInput,
+    list: crateOptions,
+    fetchHits: async (query) => {
+      const byCrate = await ensureSlice();
+      const prefix = [];
+      const rest = [];
+      for (const name of byCrate.keys()) {
+        if (name.startsWith(query)) {
+          prefix.push(name);
+        } else if (name.includes(query)) {
+          rest.push(name);
+        }
+      }
+      prefix.sort();
+      rest.sort();
+      return prefix
+        .concat(rest)
+        .slice(0, MAX_LOOKUP_OPTIONS)
+        .map((name) => ({ name, version: latestCachedVersion(byCrate.get(name)) }));
+    },
+    renderItem: (item, hit) => {
+      const name = document.createElement("span");
+      name.className = "option-name";
+      name.textContent = hit.name;
+      item.appendChild(name);
+
+      const meta = document.createElement("span");
+      meta.className = "option-meta";
+      meta.textContent = hit.version;
+      item.appendChild(meta);
+    },
+    onChoose: (hit) => {
+      lookupTicket += 1;
+      window.clearTimeout(lookupTimer);
+      void answer(hit.name, lookupTicket);
+    },
+  });
+
   crateInput.addEventListener("input", () => {
     const query = crateInput.value.trim();
     lookupTicket += 1;
@@ -735,14 +850,18 @@
     result.hidden = true;
     resultBody.replaceChildren();
     if (query === "") {
+      lookupCombobox.close();
       setNote(note, "", null);
       return;
     }
     if (!CRATE_NAME.test(query)) {
+      lookupCombobox.close();
       setNote(note, "a crate name is letters, digits, `-` and `_`", "error");
       return;
     }
     lookupTimer = window.setTimeout(() => {
+      // One slice fetch feeds both: the completion list and the answer.
+      void lookupCombobox.update(query);
       void answer(query, lookupTicket);
     }, LOOKUP_DEBOUNCE_MS);
   });
@@ -753,6 +872,7 @@
     lookupTicket += 1;
     sliceRequest = null;
     sliceLabel.textContent = "slice loads on first query";
+    lookupCombobox.close();
     result.hidden = true;
     resultBody.replaceChildren();
     setNote(note, "", null);

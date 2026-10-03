@@ -14,16 +14,23 @@ CREATE TABLE IF NOT EXISTS queue (
     preserve_lockfile INTEGER NOT NULL DEFAULT 0,
     lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
-    -- Enqueue epoch: bumped every time a re-request resurrects a
-    -- failed/completed row, so a completion report only lands on the
-    -- attempt that was dispatched for it.
+    -- Dispatch generation is the unique claim identity; `attempt` is the
+    -- current retry-cycle counter and may restart when a row is retried.
     attempt INTEGER NOT NULL DEFAULT 1,
+    -- Unique claim identity. It is minted at claim time, so a late
+    -- external response cannot match a purged and recreated task row.
+    generation_id TEXT NOT NULL DEFAULT '',
     not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
     first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    -- GitHub Actions run id recorded when the build's workflow_run
-    -- webhook completed the task; NULL until the webhook lands.
+    -- The GitHub Actions run id bound to the live generation: the
+    -- claim clears it and the dispatch writes it from the
+    -- `workflow_dispatch` response's `workflow_run_id`, so a
+    -- `workflow_run` completion applies only to the run the in-flight
+    -- generation actually dispatched — a stale run's late report is a
+    -- conflict, never a silent overwrite. Terminal rows keep the last
+    -- bound id as evidence (`stow-admin status` renders its URL).
     github_run_id TEXT,
     -- The unit's compile side: 1 for a host-side node (a proc-macro,
     -- build dependency or build-script unit — minted on the runner
@@ -37,12 +44,21 @@ CREATE TABLE IF NOT EXISTS queue (
     -- re-queue is at most once — the rebuild republishes real shapes, so
     -- the missing-shape condition cannot recur.
     shape_requeue INTEGER NOT NULL DEFAULT 0,
+    -- The owner's count of unmet dependency edges — edges whose
+    -- `dep_met` is 0 — maintained as a counter: set at insert, ±1'd by
+    -- slice deltas on the edges they flip, and recounted on edge resync
+    -- (stow#521). The gate never re-evaluates the edge set to know
+    -- whether a row is blocked: `deps_met` is `unpublished_deps = 0`,
+    -- and a publish touches the changed rows' matched edges plus their
+    -- owners, never every dependent's whole edge list.
+    unpublished_deps INTEGER NOT NULL DEFAULT 0,
     -- The dependency gate's answer, persisted: 1 while every edge of this
-    -- row resolves to units the published slice serves. Written at edge
-    -- sync, recomputed by every transition into `pending`, and refreshed
-    -- on pending rows only where an edge or slice write can change the
-    -- answer — the claim reads the flag only on pending rows, so a
-    -- dispatch pass never re-evaluates the dependency EXISTS.
+    -- row resolves to units the published slice serves — the stored form
+    -- of `unpublished_deps = 0`, derived wherever the counter is
+    -- written (insert, edge resync, slice delta, migration) and kept
+    -- current by every transition into `pending` — the claim reads the
+    -- flag only on pending rows, so a dispatch pass never re-evaluates
+    -- the dependency EXISTS.
     deps_met INTEGER NOT NULL DEFAULT 0,
     -- The dependency gate's terminal answer, persisted: 1 while a
     -- pending row owns an edge whose dep failed or was never resolved
@@ -65,11 +81,18 @@ CREATE TABLE IF NOT EXISTS queue (
     -- enqueue — target never changes. Lets the wake-time probes prefix
     -- equality-filter by family instead of scanning.
     dispatch_family TEXT NOT NULL DEFAULT '',
+    -- The number the claim order descends on (stow#442 I6): precedence
+    -- bands over `priority` — two for the human lane, one for the
+    -- Windows family — so lane, family and priority compare inside one
+    -- integer. Refreshed with `dispatch_key` wherever a lane or
+    -- priority operand changes (re-request, promote, revive); the
+    -- family never changes after insert.
+    value INTEGER NOT NULL DEFAULT 0,
     -- The claim ORDER BY tuple encoded as one sortable string:
-    -- lane rank | family rank (Windows first) | first_requested_at |
-    -- inverted priority | created_at | task_id. The claim walk orders by
-    -- it under an index and pages by keyset, so a dispatch pass reads
-    -- rows proportional to the slots it fills, not the queue size.
+    -- inverted `value` | first_requested_at | created_at | task_id.
+    -- The claim walk orders by it under an index and pages by keyset,
+    -- so a dispatch pass reads rows proportional to the slots it
+    -- fills, not the queue size.
     dispatch_key TEXT NOT NULL DEFAULT '',
     UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
 );
@@ -78,6 +101,12 @@ CREATE TABLE IF NOT EXISTS queue (
 -- claim and recover filter on them.
 CREATE INDEX IF NOT EXISTS idx_queue_status_lane
 ON queue (status, lane);
+
+-- Request status positions count a human lane prefix by dispatch key.
+-- Keep lane before the range key so the bounded human-depth walk does not
+-- scan pending miss rows; all selected columns are covered by the index.
+CREATE INDEX IF NOT EXISTS idx_queue_human_position
+ON queue (status, lane, dispatch_key);
 
 -- Dependency edges between queue tasks. The dep_* columns hold the
 -- dependency's semantic identity verbatim so DEPENDENCY_NOT_BLOCKED_SQL
@@ -110,6 +139,14 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     -- the columns existed; it fails closed until resynced.
     dep_invocations INTEGER NOT NULL DEFAULT 0,
     dep_shapes INTEGER NOT NULL DEFAULT 0,
+    -- The edge's own gate answer, persisted: 1 while the live published
+    -- slice for the dep's (dep_target, dep_rustc_version) serves every
+    -- unit shape the mask requires — the row form of
+    -- dep_edge_unpublished_sql. Written at insert, flipped by slice
+    -- deltas on the edges they match, backfilled by the migration — so
+    -- the owner's `unpublished_deps` counter can move by ±1 on a flip
+    -- instead of re-evaluating the slice join per edge.
+    dep_met INTEGER NOT NULL DEFAULT 0,
     -- Whether the edge's required side is established — resolver-written
     -- edges carry 1, legacy rows the side migration derives stamp their
     -- outcome and mark themselves known so it runs once.
@@ -350,6 +387,40 @@ CREATE TABLE IF NOT EXISTS attempt_outcomes (
 CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_finished
 ON attempt_outcomes (finished_at);
 
+-- Generation-keyed failure evidence. This table is additive so an older
+-- Worker may continue inserting the legacy attempt_outcomes columns while
+-- the new code rolls out; freeze evidence reads both tables.
+CREATE TABLE IF NOT EXISTS attempt_outcomes_v2 (
+    task_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    target TEXT NOT NULL,
+    failure_step TEXT,
+    failure_class TEXT,
+    github_run_id TEXT,
+    finished_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, generation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_v2_finished
+ON attempt_outcomes_v2 (finished_at);
+
+-- A verified workflow completion can beat the scheduler's write of the
+-- `workflow_dispatch` response. Keep that event by the run identity until
+-- the exact response binds the same run to the claimed generation. Rows are
+-- bounded by in-flight dispatches and are deleted when the binding applies
+-- or the unbound generation is abandoned.
+CREATE TABLE IF NOT EXISTS pending_run_completions (
+    github_run_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    success INTEGER NOT NULL CHECK (success IN (0, 1)),
+    error TEXT,
+    received_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_run_completions_task
+ON pending_run_completions (task_id);
+
 
 -- The dispatch-freeze transition log the watchdog (#450) turns into the
 -- `incident` issue record: one append-only row per engage/clear so a
@@ -371,4 +442,26 @@ CREATE TABLE IF NOT EXISTS do_meter (
     day TEXT PRIMARY KEY,
     rows_read INTEGER NOT NULL,
     rows_written INTEGER NOT NULL
+);
+
+-- The human request lane's records (stow#428): one row per admitted
+-- `POST /api/v1/requests`, moved `accepted` -> `resolving` ->
+-- `enqueued` | `failed` by the resolve run's outcome report and the
+-- workflow_run backstop. `outcome_json` holds the per-target stored
+-- roots the status read re-probes against the live queue; `dispatched_at`
+-- is the resolve job's dispatch-to-submit timing baseline.
+CREATE TABLE IF NOT EXISTS requests (
+    request_id TEXT PRIMARY KEY,
+    attempt INTEGER NOT NULL,
+    crate_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    rustc_version TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('accepted', 'resolving', 'enqueued', 'failed')),
+    dispatched_at INTEGER, -- unixepoch seconds of the dispatch POST
+    github_run_id TEXT,
+    github_run_url TEXT,
+    outcome_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

@@ -16,7 +16,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::Response,
-    routing::get,
+    routing::{get, post},
 };
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
@@ -457,6 +457,7 @@ fn registry_app_with_probe(
             "/api/v1/bundles/{digest}",
             get(serve_edge_bundle).head(serve_edge_bundle),
         )
+        .route("/analytics_engine/sql", post(analytics_engine_sql))
         .with_state(MockRegistryState {
             registry_root,
             token_realm: format!("http://{listen}/token"),
@@ -1791,6 +1792,29 @@ async fn store_manifest(
         );
     }
     Ok(response)
+}
+
+/// The Analytics Engine SQL API the mock deploy's `STOW_STATS_SQL_URL`
+/// points at. `POST /analytics_engine/sql` takes a `stats_*.sql` body
+/// and answers one union row covering every column alias the edge's
+/// stats queries decode — serde drops the fields a given query does
+/// not name, so one row serves all six. The row keeps Analytics
+/// Engine's real `FORMAT JSON` shape (quoted `UInt64`s) so the public
+/// stats route exercises its genuine SQL-API path end to end.
+async fn analytics_engine_sql() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "success": true,
+        "errors": [],
+        "messages": [],
+        "data": [{
+            "hits_24h": 420.0,
+            "hit_compile_millis_30d": 3_600_000.0,
+            "install_days_7d": "140",
+            "misses_24h": "30",
+            "name": "mock-crate",
+            "hits": 420.0
+        }]
+    }))
 }
 
 /// The edge byte path for hosts that run no worker (the bench lane):
