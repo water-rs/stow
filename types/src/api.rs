@@ -1469,6 +1469,13 @@ pub struct SchedulerBudgetStatement {
     /// `cursor.rowsWritten` — table rows plus index entries and
     /// trigger-made writes.
     pub rows_written: u64,
+    /// Wall milliseconds the statement's own `query`/`execute` awaited
+    /// in local workerd — measured around the inner call by the
+    /// metered backend, so a hot drive's wall can be decomposed per
+    /// statement rather than attributed as one lump. Always `0` on
+    /// host builds (the host lane gates SQL counts, not timing) and
+    /// on statements issued through the uncounted backend.
+    pub elapsed_ms: u64,
 }
 
 /// One drive's workerd measurement against its budget.
@@ -1500,6 +1507,12 @@ pub struct SchedulerBudgetRow {
     pub d1_rows_read: u64,
     /// Σ D1 `meta.rowsWritten` over the same statements.
     pub d1_rows_written: u64,
+    /// Σ of the awaited durations of the counted catalog backend's
+    /// own calls. A sum of operation spans, not a share of drive
+    /// wall: concurrent calls overlap in real time but add up here,
+    /// so it can exceed the drive's measured window. `0` on host and
+    /// on drives that never touch the catalog.
+    pub d1_elapsed_ms: u64,
     /// `true` when any of the four budgets is exceeded.
     pub over_budget: bool,
     /// The per-statement log the totals are summed over.
@@ -1544,6 +1557,65 @@ pub struct SchedulerBudgetReport {
     /// `true` when any row is over budget — `stow-admin scheduler
     /// budget` exits nonzero on it.
     pub over_budget: bool,
+}
+
+/// One node identity a demand batch reports demand for (stow#522).
+///
+/// The Analytics Engine source omits `host_side`, so an entry names
+/// every compile side of the identity at once: all matching unbuilt
+/// queue rows are roots of the demand walk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandEntry {
+    /// Crate name the observed demand names.
+    pub crate_name: CrateName,
+    /// Crate version.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Demand increment this entry contributes once to every task its
+    /// closure touches.
+    pub demand: u64,
+}
+
+/// `POST /api/v1/admin/scheduler/demand` request — one durable demand
+/// batch.
+///
+/// `batch_id` is the replay contract the hourly feed (#523) reuses:
+/// staged contributions fold into `queue.demand` inside the single
+/// `prepared → accepted` acceptance statement, so an accepted batch
+/// has no remainder — a delivery interrupted before acceptance
+/// (`prepared`) recomputes the current graph on retry, and an
+/// accepted-batch replay answers from the stored record and writes
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandRequest {
+    /// The batch's durable identity — the feed's hour window.
+    pub batch_id: String,
+    /// Observed-demand entries. Distinct identities contribute their
+    /// own deltas to a shared closure; an identical entry repeated in
+    /// one batch sums before touching tasks.
+    pub entries: Vec<SchedulerDemandEntry>,
+}
+
+/// What `POST /api/v1/admin/scheduler/demand` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandReport {
+    /// The applied batch's identity, echoed.
+    pub batch_id: String,
+    /// Distinct input identities the batch carried.
+    pub entries: u64,
+    /// Queue tasks the batch's closures named — each took its share of
+    /// every entry whose walk reached it.
+    pub touched_tasks: u64,
+    /// `true` when this call performed the batch's acceptance
+    /// transition — including an empty closure, which accepts like
+    /// any other; `false` on an exact accepted-batch replay, which
+    /// reports the stored count and writes nothing.
+    pub applied: bool,
 }
 
 /// One queue row as `GET /api/v1/admin/queue` reports it.
@@ -1598,6 +1670,15 @@ pub struct QueueTask {
     /// (`EnqueueRequest::host_side`).
     #[serde(default)]
     pub host_side: bool,
+    /// The persisted raw value as an exact decimal string: precedence
+    /// bands over `MAX(0, priority) + MAX(0, demand)` — the undivided
+    /// operand `dispatch_key`'s exact-cost rank divides. The integer
+    /// column legitimately outgrows the JavaScript-safe range
+    /// (human-lane values sit above 2^53), so the Durable Object
+    /// projects `CAST(value AS TEXT)` and this field carries the text
+    /// unchanged — parsing or rounding it would corrupt adjacent
+    /// values (stow#525 I10).
+    pub value: String,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].

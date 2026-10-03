@@ -233,6 +233,12 @@ wait_for "mock registry listener" "$READY_DEADLINE" "$SERVICE_PID" \
     skyzen build --provider cloudflare --manifest Skyzen.mock.toml
 ) >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
+# Wrangler writes its own ISO-timestamped log to WRANGLER_LOG_PATH —
+# pointing it inside the artifact logs dir keeps the native
+# receipt-time channel (which the console output lacks) next to the
+# report it timestamps.
+mkdir -p "$LOG_DIR/wrangler"
+export WRANGLER_LOG_PATH="$LOG_DIR/wrangler"
 wrangler d1 migrations apply stow-mock --local \
     --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
     --persist-to "$WORK_DIR/edge-state" >>"$LOG_DIR/edge-migrate.log" 2>&1 \

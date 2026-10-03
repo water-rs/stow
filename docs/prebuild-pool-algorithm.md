@@ -197,7 +197,7 @@ permanent admission into the pool.
 Instead, misses are turned into prioritized overlay candidates and ranked
 against the rest of the queue.
 
-> **Base ordering implemented in [#442](https://github.com/water-rs/stow/issues/442) I6; overlay ranking not implemented.** A miss enters the queue in the miss lane and dispatches by its persisted `value` (the download/miss `priority` band, FIFO at equal value) once its dependencies are published; turning misses into prioritized overlay candidates ranked against the rest of the queue is the demand application (#522) and the hourly demand feed (#523), tracked separately.
+> **Queue ranking implemented in [#442](https://github.com/water-rs/stow/issues/442)/[#524](https://github.com/water-rs/stow/issues/524), demand application in [#522](https://github.com/water-rs/stow/issues/522), admission floor in [#525](https://github.com/water-rs/stow/issues/525); overlay feed not implemented — it is [#523](https://github.com/water-rs/stow/issues/523).** A miss enters the queue in the miss lane and dispatches by its persisted `dispatch_key` — an explicit human-lane prefix, then the exact rational rank of the row's whole raw `value` (lane/family bands, `priority` and accumulated demand) divided by its `(crate_name, target)` positive expected build cost, then `first_requested_at`/`created_at`/`task_id` FIFO at equal rank — once its dependencies are published. `POST /demand` applies durable demand batches atomically: staged contributions fold into `queue.demand`, `value`, `dispatch_key` and `dispatch_eligible` inside one acceptance statement, so an `accepted` batch is immutable — a same-input replay returns its stored count and writes nothing, a changed input fails — while an unaccepted `prepared` draft may retry the same input only by recomputing the live closure and staging it fresh. The persisted `settings.min_dispatch_value` floor keeps under-floor miss rows queued — the human lane is exempt. Turning misses into the demand batches that feed it is the hourly feed, tracked separately in #523.
 
 ## Candidate Identity
 
@@ -222,7 +222,7 @@ overlay candidates using one common abstraction.
 
 ## Budgeting Model
 
-> **Not implemented.** Dispatch orders ready nodes by a persisted `value` — the human lane band, then the Windows-family band, then `priority` — with `first_requested_at`, `created_at` and `task_id` FIFO ties (#442 I6); nothing below scores or budgets candidates yet — the cost divisor and pool floor are tracked separately in #524/#525.
+> **Not implemented.** Dispatch already orders ready nodes by the persisted `dispatch_key` — an explicit human-lane prefix, then the exact rank of raw `value` (bands, `priority`, accumulated demand) over positive `(crate_name, target)` build cost, with `first_requested_at`/`created_at`/`task_id` FIFO ties — and `POST /demand` folds demand batches into the queue atomically (#442, #522, #524, #525); nothing below scores or budgets candidates yet.
 
 The pool is not allowed to expand indefinitely.
 
@@ -247,7 +247,7 @@ The implementation may use one or more of these simultaneously.
 
 ## Recommended Scoring Signals
 
-> **Not implemented.** Dispatch orders ready nodes by a persisted `value` — the human lane band, then the Windows-family band, then `priority` — with `first_requested_at`, `created_at` and `task_id` FIFO ties (#442 I6); nothing below scores or budgets candidates yet — the demand application/feed, cost divisor and floor are tracked separately in #522/#523/#524/#525.
+> **Not implemented.** Dispatch already orders ready nodes by the persisted `dispatch_key` — an explicit human-lane prefix, then the exact rank of raw `value` (bands, `priority`, accumulated demand) over positive `(crate_name, target)` build cost, with `first_requested_at`/`created_at`/`task_id` FIFO ties — `POST /demand` folds demand batches into the queue atomically, and the persisted `settings.min_dispatch_value` floor keeps under-floor miss rows queued (#442, #522, #524, #525); nothing below scores or budgets candidates yet — the demand feed is tracked separately in #523.
 
 Candidate ranking should combine signals from several sources:
 

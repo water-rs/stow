@@ -7295,7 +7295,7 @@ dependencies = [
 [[package]]
 name = "skyzen"
 version = "0.4.3"
-source = "git+https://github.com/zen-rs/skyzen?rev=a589a326b091c5b0d66b6392e8678a3e820fb8b3#a589a326b091c5b0d66b6392e8678a3e820fb8b3"
+source = "git+https://github.com/zen-rs/skyzen?rev=76f8879eccbf8dff626295dea1da8ef3c7091a55#76f8879eccbf8dff626295dea1da8ef3c7091a55"
 dependencies = [
  "async-channel",
  "async-fs",
@@ -7348,7 +7348,7 @@ dependencies = [
 [[package]]
 name = "skyzen-cloudflare"
 version = "0.4.3"
-source = "git+https://github.com/zen-rs/skyzen?rev=a589a326b091c5b0d66b6392e8678a3e820fb8b3#a589a326b091c5b0d66b6392e8678a3e820fb8b3"
+source = "git+https://github.com/zen-rs/skyzen?rev=76f8879eccbf8dff626295dea1da8ef3c7091a55#76f8879eccbf8dff626295dea1da8ef3c7091a55"
 dependencies = [
  "bytes",
  "futures-core",
@@ -7371,7 +7371,7 @@ dependencies = [
 [[package]]
 name = "skyzen-core"
 version = "0.2.1"
-source = "git+https://github.com/zen-rs/skyzen?rev=a589a326b091c5b0d66b6392e8678a3e820fb8b3#a589a326b091c5b0d66b6392e8678a3e820fb8b3"
+source = "git+https://github.com/zen-rs/skyzen?rev=76f8879eccbf8dff626295dea1da8ef3c7091a55#76f8879eccbf8dff626295dea1da8ef3c7091a55"
 dependencies = [
  "executor-core",
  "http-kit",
@@ -7384,7 +7384,7 @@ dependencies = [
 [[package]]
 name = "skyzen-hyper"
 version = "0.2.1"
-source = "git+https://github.com/zen-rs/skyzen?rev=a589a326b091c5b0d66b6392e8678a3e820fb8b3#a589a326b091c5b0d66b6392e8678a3e820fb8b3"
+source = "git+https://github.com/zen-rs/skyzen?rev=76f8879eccbf8dff626295dea1da8ef3c7091a55#76f8879eccbf8dff626295dea1da8ef3c7091a55"
 dependencies = [
  "async-io",
  "executor-core",
@@ -7400,7 +7400,7 @@ dependencies = [
 [[package]]
 name = "skyzen-macros"
 version = "0.4.3"
-source = "git+https://github.com/zen-rs/skyzen?rev=a589a326b091c5b0d66b6392e8678a3e820fb8b3#a589a326b091c5b0d66b6392e8678a3e820fb8b3"
+source = "git+https://github.com/zen-rs/skyzen?rev=76f8879eccbf8dff626295dea1da8ef3c7091a55#76f8879eccbf8dff626295dea1da8ef3c7091a55"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7411,7 +7411,7 @@ dependencies = [
 [[package]]
 name = "skyzen-manifest"
 version = "0.2.0"
-source = "git+https://github.com/zen-rs/skyzen?rev=a589a326b091c5b0d66b6392e8678a3e820fb8b3#a589a326b091c5b0d66b6392e8678a3e820fb8b3"
+source = "git+https://github.com/zen-rs/skyzen?rev=76f8879eccbf8dff626295dea1da8ef3c7091a55#76f8879eccbf8dff626295dea1da8ef3c7091a55"
 dependencies = [
  "hex",
  "humantime-serde",
@@ -7424,7 +7424,7 @@ dependencies = [
 [[package]]
 name = "skyzen-services"
 version = "0.2.1"
-source = "git+https://github.com/zen-rs/skyzen?rev=a589a326b091c5b0d66b6392e8678a3e820fb8b3#a589a326b091c5b0d66b6392e8678a3e820fb8b3"
+source = "git+https://github.com/zen-rs/skyzen?rev=76f8879eccbf8dff626295dea1da8ef3c7091a55#76f8879eccbf8dff626295dea1da8ef3c7091a55"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -7905,6 +7905,7 @@ dependencies = [
  "async-lock",
  "base64 0.23.1",
  "blake3",
+ "crypto-bigint",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",

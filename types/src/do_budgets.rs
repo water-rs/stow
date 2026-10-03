@@ -104,11 +104,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 100,
     },
     DriveBudget {
+        // The success arm also lands the bounded build-cost sample and
+        // keyed dispatch-key refresh (stow#524): the sample window caps
+        // at BUILD_SAMPLE_WINDOW rows per (crate, target) and the
+        // refresh touches only that key's pending set.
         name: "POST /tasks/complete-run",
-        statements: 10,
-        rows_read: 200,
-        rows_written: 200,
-        wall_ms: 300,
+        statements: 16,
+        rows_read: 300,
+        rows_written: 300,
+        wall_ms: 400,
     },
     DriveBudget {
         // The failure arm: same report resolution plus the dependents'
@@ -235,6 +239,17 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // The route's full statement count is apply (8) + `next_alarm`
+        // (5): the batch probes, ledger write, settings reads and the
+        // plan's freeze/active-count/wake/lease reads — 13 measured at
+        // the 100k native gate (121 reads, 17 writes).
+        name: "POST /demand",
+        statements: 14,
+        rows_read: 300,
+        rows_written: 120,
+        wall_ms: 500,
+    },
+    DriveBudget {
         // The accepted development ceiling is 303 reads — the latest
         // 100k workerd gate measured 157 under it, without wall-time
         // or write headroom.
@@ -283,5 +298,18 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_read: 300,
         rows_written: 8,
         wall_ms: 300,
+    },
+    DriveBudget {
+        // One real dispatch pass over the floored queue — the same
+        // claim/dispatch/plan surface as the hot pass, priced
+        // separately so the gate sees the planner and claim walk
+        // under a positive persisted floor with under-floor bulk
+        // deferred in the flags (stow#525). Setup stamps and teardown
+        // restore live outside the metered window.
+        name: "alarm pass (floor claim)",
+        statements: 120,
+        rows_read: 1_000,
+        rows_written: 700,
+        wall_ms: 3_000,
     },
 ];

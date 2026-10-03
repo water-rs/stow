@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::num::NonZeroU32;
+use std::num::{NonZero, NonZeroU32};
 
-use skyzen_services::durable::{DbValue, DurableDb};
+use skyzen_services::durable::{Alarm, DbValue, DurableDb};
 pub use stow_types::api::task_id;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
@@ -88,6 +88,13 @@ const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 /// parks it `failed` for an operator `retry`, which resets the cycle to 1.
 const MAX_BUILD_ATTEMPTS: u32 = 4;
 
+/// The bounded window of successful-build durations each
+/// `(crate_name, target)` keeps in `crate_build_samples` — newest by
+/// insertion. One completion's median recompute reads at most this
+/// many rows and the cap delete keeps no more, so the statistic
+/// never grows a historical scan (stow#524).
+const BUILD_SAMPLE_WINDOW: i64 = 32;
+
 /// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
 /// miss-lane submits start being refused. The edge handler reads the same
 /// binding for its pre-forward check, so this constant is the shared
@@ -132,7 +139,7 @@ impl Dispatch {
 /// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
 /// `STOW_MAX_CONCURRENT_MACOS_JOBS`, `STOW_DISPATCH_MIN_AGE_MINUTES`,
 /// `STOW_STALE_DISPATCH_MINUTES`, `STOW_MAX_QUEUE_PENDING`,
-/// `STOW_HUMAN_DAILY_TASK_BUDGET`).
+/// `STOW_HUMAN_DAILY_TASK_BUDGET`, `STOW_MIN_DISPATCH_VALUE`).
 ///
 /// Defaults match production; the local mock lowers `dispatch` via `vars`
 /// because miniflare's workerd OOMs under parallel complete
@@ -153,6 +160,17 @@ pub struct SchedulerSettings {
     /// Human-lane tasks accepted per UTC day, counted in the
     /// `human_daily_task_budget` table.
     pub human_daily_task_budget: u32,
+    /// Admission floor on `queue.value` (stow#525 I10): a pending
+    /// miss-lane row claims only while its score reaches this bound —
+    /// under-floor work stays queued and visible rather than being
+    /// built. `0` admits everything. The human lane is exempt: a
+    /// request someone asked for by name is never held by the floor.
+    /// Parsed from `STOW_MIN_DISPATCH_VALUE` as a nonnegative i64 —
+    /// the *operator input* `migrate` stamps into `settings` and
+    /// backfills `dispatch_eligible` from. A changed binding takes
+    /// effect only through that pass: the queue's writers and probes
+    /// read the persisted answer, never this field.
+    pub min_dispatch_value: i64,
 }
 
 impl Default for SchedulerSettings {
@@ -164,6 +182,7 @@ impl Default for SchedulerSettings {
             stale_dispatch_minutes: DEFAULT_STALE_DISPATCH_MINUTES,
             max_queue_pending: DEFAULT_MAX_QUEUE_PENDING,
             human_daily_task_budget: DEFAULT_HUMAN_DAILY_TASK_BUDGET,
+            min_dispatch_value: DEFAULT_MIN_DISPATCH_VALUE,
         }
     }
 }
@@ -186,14 +205,15 @@ fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> 
 const PRIORITY_MAX: i64 = (u64::MAX / 1000 + 10 * u32::MAX as u64).cast_signed();
 
 /// Width of one precedence band in `queue.value`. The persisted value
-/// is `bands × VALUE_BAND + priority`, with the human lane contributing
-/// two bands and the Windows family one — today's "human first, then
-/// Windows, then priority" claim order encoded additively in one
-/// descending number (stow#442 I6). The largest value a row can take is
-/// `3 × VALUE_BAND + PRIORITY_MAX = 4 × PRIORITY_MAX + 3 =
-/// 73,787,148,093,530,007`, below `i64::MAX`, so no operand can
-/// overflow the column.
-const VALUE_BAND: i64 = PRIORITY_MAX + 1;
+/// is `bands × VALUE_BAND + MAX(0, priority) + MAX(0, demand)`, with
+/// the human lane contributing two bands and the Windows family one —
+/// today's "human first, then Windows, then priority" claim order
+/// encoded additively in one descending number (stow#442 I6), with
+/// accumulated demand folding into the same priority band (stow#522).
+/// The largest value a row can take is `3 × VALUE_BAND + PRIORITY_MAX
+/// = 4 × PRIORITY_MAX + 3 = 73,787,148,093,530,007`, below
+/// `i64::MAX`, so no operand can overflow the column.
+pub(super) const VALUE_BAND: i64 = PRIORITY_MAX + 1;
 
 /// The queue-identity columns of one enqueue request.
 struct TaskIdentity {
@@ -250,7 +270,7 @@ const fn resurrects(status: &str, lane: TaskLane) -> bool {
 /// bound parameters at 100 but a bound *string* at 2MB, so a JSON array
 /// sidesteps the parameter ceiling entirely. 2000 identities (~300B
 /// each) or edges (~200B each) stay well under the string limit.
-const ENQUEUE_JSON_BATCH_ROWS: usize = 2000;
+pub const ENQUEUE_JSON_BATCH_ROWS: usize = 2000;
 
 /// Retired slice rows delete in `rowid IN (…)` batches. workerd caps a
 /// statement at ~100 bound variables, so the batch stays under it by
@@ -302,7 +322,9 @@ struct EdgeFlag {
 /// The serialized form the `INSERT INTO queue` payload takes: the
 /// first-occurrence identity plus the readiness flags the per-edge
 /// probe and Rust fold already answered, so the statement never
-/// re-evaluates them.
+/// re-evaluates them — and the rank fields the shared abstraction
+/// derived (`value` as decimal text, the `dispatch_key`, and the two
+/// timestamps the key embeds so column and key agree byte-for-byte).
 #[derive(serde::Serialize)]
 struct InsertRow<'a> {
     #[serde(flatten)]
@@ -310,6 +332,98 @@ struct InsertRow<'a> {
     unpublished_deps: u64,
     deps_met: u8,
     blocked: u8,
+    first_requested_at: String,
+    created_at: String,
+    value: String,
+    dispatch_key: String,
+}
+
+/// The chunk's serialized first-occurrence rows — readiness flags from
+/// the edge probe, rank fields from the shared abstraction on the
+/// event-local cost lookup (absent stats explicitly
+/// `UNMEASURED_COST`).
+fn insert_rows<'a>(
+    chunk: &'a [BatchedInsert],
+    readiness: &std::collections::HashMap<&str, (u64, u64)>,
+    costs: &std::collections::HashMap<(&str, &str), NonZero<i64>>,
+    now: &str,
+) -> Vec<InsertRow<'a>> {
+    chunk
+        .iter()
+        .map(|insert| {
+            let (unmet, blocked) = readiness
+                .get(insert.task_id.as_str())
+                .copied()
+                .unwrap_or_default();
+            InsertRow {
+                insert,
+                unpublished_deps: unmet,
+                deps_met: u8::from(unmet == 0),
+                blocked: u8::from(blocked > 0),
+                first_requested_at: now.to_owned(),
+                created_at: now.to_owned(),
+                value: crate::scheduler::rank::raw_value(
+                    insert.lane,
+                    crate::scheduler::rank::dispatch_family(&insert.target),
+                    insert.priority,
+                    // A fresh row has no accumulated demand yet — a
+                    // demand closure only ever touches existing rows.
+                    0,
+                )
+                .to_string(),
+                dispatch_key: crate::scheduler::rank::dispatch_key(
+                    &crate::scheduler::rank::KeyOperands {
+                        lane: insert.lane,
+                        family: crate::scheduler::rank::dispatch_family(&insert.target),
+                        priority: insert.priority,
+                        demand: 0,
+                        cost_ms: costs
+                            .get(&(insert.crate_name.as_str(), insert.target.as_str()))
+                            .copied()
+                            .unwrap_or(crate::scheduler::rank::UNMEASURED_COST),
+                        first_requested_at: now,
+                        created_at: now,
+                        task_id: &insert.task_id,
+                    },
+                ),
+            }
+        })
+        .collect()
+}
+
+/// A `(crate_name, target)` median as the insert-path cost probe
+/// returns it — `median_ms` NULL for a genuinely unmeasured pair,
+/// TEXT otherwise (the JSON number crossing truncates past `2^53`).
+#[derive(Debug, skyzen::FromRow)]
+struct BuildCostRow {
+    crate_name: String,
+    target: String,
+    median_ms: Option<String>,
+    now: String,
+}
+
+/// One `(crate_name, target)` pair's expected-cost row for the
+/// batch's distinct inputs — the probe starts from the event's own
+/// keys and LEFT JOINs `crate_build_stats` by its primary key, so an
+/// enqueue reads in proportion to the batch's distinct pairs, never
+/// to stored build history.
+const INSERT_COST_PROBE: &str = "SELECT k.crate_name, k.target, CAST(s.median_ms AS TEXT) AS median_ms, \
+            (SELECT datetime('now')) AS now \
+     FROM (SELECT DISTINCT value ->> 'crate_name' AS crate_name, \
+                  value ->> 'target' AS target FROM json_each(?)) AS k \
+     LEFT JOIN crate_build_stats s \
+       ON s.crate_name = k.crate_name AND s.target = k.target";
+
+async fn probe_insert_costs(
+    db: &DurableDb,
+    inserts: &[BatchedInsert],
+) -> Result<Vec<BuildCostRow>, QueueError> {
+    Ok(db
+        .query(INSERT_COST_PROBE)
+        .bind(enqueue_json(inserts)?)
+        .fetch_all::<BuildCostRow>()
+        .await
+        .map_err(|error| format!("probe insert build costs: {error}"))?)
 }
 
 /// One dependency edge, fully resolved for the bulk insert: the dep's
@@ -330,9 +444,47 @@ struct BatchedDepEdge {
 }
 
 /// Serialize one statement's JSON-array payload.
-fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
+pub(super) fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
     serde_json::to_string(rows)
         .map_err(|error| QueueError::Sql(format!("encode enqueue batch json: {error}")))
+}
+
+/// The prospective `priority + demand` bound for every row an update
+/// batch is about to recompute — checked before the write phase so a
+/// refused resubmit leaves the queue, edges and demand state untouched
+/// (stow#522). Written as `new_priority > bound - demand`, every
+/// operand stays inside i64 (demand is already bounded by the same
+/// rule), so the compare can never promote to REAL — and on overflow
+/// the batch errors with the offenders named rather than clamping or
+/// erasing demand.
+async fn check_update_band_bound(
+    db: &DurableDb,
+    updates: &[BatchedUpdate],
+) -> Result<(), QueueError> {
+    let mut offending: Vec<String> = Vec::new();
+    for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        offending.extend(
+            db.query(&format!(
+                "SELECT q.task_id FROM queue q \
+                 JOIN (SELECT value AS e FROM json_each(?)) j \
+                      ON q.task_id = j.e ->> 'task_id' \
+                 WHERE MAX(0, (MAX(q.downloads, CAST(j.e ->> 'downloads' AS INTEGER)) / 1000) \
+                       + q.miss_count * 10) > {PRIORITY_MAX} - q.demand"
+            ))
+            .bind(enqueue_json(chunk)?)
+            .fetch_scalars::<String>()
+            .await
+            .map_err(|error| format!("update band-bound check: {error}"))?,
+        );
+    }
+    if !offending.is_empty() {
+        return Err(QueueError::Invariant(format!(
+            "resubmit would overflow the priority band on {} task(s): {}",
+            offending.len(),
+            offending.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// `UPDATE queue` for every re-requested row in the chunk, one statement
@@ -370,7 +522,8 @@ async fn apply_batched_updates(
                  wake_at = CASE WHEN (e ->> 'redispatch' = 1 OR e ->> 'human' = 1) \
                      THEN {wake} ELSE wake_at END, \
                  updated_at = datetime('now'), \
-                 lane = {next_lane} \
+                 lane = {next_lane}, \
+                 dispatch_eligible = {eligible} \
              FROM (SELECT value AS e FROM json_each(?)) AS j \
              WHERE queue.task_id = j.e ->> 'task_id'",
             deps_met = deps_met_sql("queue.task_id"),
@@ -381,6 +534,11 @@ async fn apply_batched_updates(
                 "not_before",
                 settings.dispatch_min_age_minutes,
             ),
+            // The lane can only move toward 'human' here, and a human
+            // lane is unconditionally floor-eligible; the CASE still
+            // evaluates the stored value so a miss row keeps its
+            // current answer byte-for-byte.
+            eligible = dispatch_eligible_sql(next_lane, "value"),
         ))
         .bind(enqueue_json(chunk)?)
         .execute()
@@ -449,6 +607,28 @@ async fn apply_batched_inserts(
     // flag row: zero unmet proves unblocked — the row is born
     // (unpublished_deps=0, deps_met=1, blocked=0).
     let unpub = "d.dep_met = 0";
+    // Load the batch's build costs once — every first occurrence keys
+    // on the exact `value / median_ms` rank, the unmeasured answer
+    // `UNMEASURED_COST` — and stamp the batch's claim-order
+    // timestamps once so a row's key and columns carry the same
+    // instant. A present stat must decode positive; corruption fails
+    // the batch rather than silently repricing to 1.
+    let stats = probe_insert_costs(db, inserts).await?;
+    // The probe rides its `now` column on the same statement — one
+    // probe per batch, so the batch's key/column timestamps agree.
+    let Some(now) = stats.first().map(|row| row.now.clone()) else {
+        return Ok(0);
+    };
+    let mut costs: std::collections::HashMap<(&str, &str), NonZero<i64>> =
+        std::collections::HashMap::new();
+    for row in &stats {
+        if let Some(median) = row.median_ms.as_deref() {
+            costs.insert(
+                (row.crate_name.as_str(), row.target.as_str()),
+                crate::scheduler::rank::checked_cost(median)?,
+            );
+        }
+    }
     let mut inserted = 0u64;
     for chunk in inserts.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         let owners: Vec<&str> = chunk.iter().map(|insert| insert.task_id.as_str()).collect();
@@ -474,31 +654,19 @@ async fn apply_batched_inserts(
             *unmet += u64::try_from(flag.unpub).unwrap_or(0);
             *blocked += u64::try_from(flag.unpub * flag.blocker).unwrap_or(0);
         }
-        let rows: Vec<InsertRow<'_>> = chunk
-            .iter()
-            .map(|insert| {
-                let (unmet, blocked) = readiness
-                    .get(insert.task_id.as_str())
-                    .copied()
-                    .unwrap_or_default();
-                InsertRow {
-                    insert,
-                    unpublished_deps: unmet,
-                    deps_met: u8::from(unmet == 0),
-                    blocked: u8::from(blocked > 0),
-                }
-            })
-            .collect();
+        let rows = insert_rows(chunk, &readiness, &costs, &now);
         let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
                         e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
-                        1, lower(hex(randomblob(16))), datetime('now'), \
+                        1, lower(hex(randomblob(16))), e ->> 'first_requested_at', \
+                        e ->> 'created_at', \
                         e ->> 'unpublished_deps', e ->> 'deps_met', e ->> 'blocked', \
-                        {wake}, {family}, {value}, {key} \
+                        {wake}, {family}, CAST(e ->> 'value' AS INTEGER), e ->> 'dispatch_key', \
+                        {eligible} \
                  FROM (SELECT value AS e FROM json_each(?)) e \
                  WHERE TRUE \
                  ON CONFLICT DO NOTHING \
@@ -507,25 +675,16 @@ async fn apply_batched_inserts(
                 // the age gate alone for a miss row, epoch for human.
                 wake = wake_at_sql(
                     "e ->> 'lane'",
-                    "datetime('now')",
+                    "e ->> 'first_requested_at'",
                     "'1970-01-01 00:00:00'",
                     settings.dispatch_min_age_minutes,
                 ),
                 family = dispatch_family_sql("e ->> 'target'"),
-                value = value_sql(
+                // The floor CASE evaluates inside SQLite on the same
+                // bound TEXT value — no wire narrowing joins the check.
+                eligible = dispatch_eligible_sql(
                     "e ->> 'lane'",
-                    &dispatch_family_sql("e ->> 'target'"),
-                    "e ->> 'priority'",
-                ),
-                key = dispatch_key_sql(
-                    &value_sql(
-                        "e ->> 'lane'",
-                        &dispatch_family_sql("e ->> 'target'"),
-                        "e ->> 'priority'",
-                    ),
-                    "datetime('now')",
-                    "datetime('now')",
-                    "e ->> 'task_id'",
+                    "CAST(e ->> 'value' AS INTEGER)",
                 ),
             ))
             .bind(enqueue_json(&rows)?)
@@ -739,27 +898,6 @@ async fn enqueue_inner(
             });
         }
     }
-    let human_tasks = u32::try_from(
-        requests
-            .iter()
-            .filter(|request| {
-                request_lane(request.source) == TaskLane::Human
-                    && stow_types::api::is_ci_target(request.target.as_str())
-            })
-            .count(),
-    )
-    .map_err(|_| QueueError::Overflow {
-        field: "human-lane task count",
-        value: requests.len() as u64,
-    })?;
-    if human_tasks > 0
-        && !charge_human_daily_budget(db, human_tasks, settings.human_daily_task_budget).await?
-    {
-        return Err(QueueError::HumanDailyBudgetExhausted {
-            attempted: u64::from(human_tasks),
-            budget: u64::from(settings.human_daily_task_budget),
-        });
-    }
     // Prepare the batch in Rust: queue identity, deterministic task id
     // and lane per request, skipping targets no CI runner builds.
     let mut prepared = Vec::with_capacity(requests.len());
@@ -827,6 +965,38 @@ async fn enqueue_inner(
     // updates so a later occurrence of a just-inserted task lands its
     // `request_count` contribution — the per-request loop applied it
     // through `update_existing_task`.
+    // Resubmits recompute `priority` from the new downloads max —
+    // the prospective `priority + demand` of every updated row must
+    // stay under `PRIORITY_MAX` before a single write lands, or the
+    // persisted demand an accepted batch folded would push value out
+    // of its band (stow#522). Fresh inserts carry `demand = 0` and a
+    // priority that cannot exceed `compute_priority`'s own bound, so
+    // only the update set needs the probe.
+    check_update_band_bound(db, &plan.updates).await?;
+    // The human lane spends from a per-UTC-day budget — a mutating
+    // charge, so it runs only after every read-only preflight above
+    // has passed; a refused resubmit must not consume budget.
+    let human_tasks = u32::try_from(
+        requests
+            .iter()
+            .filter(|request| {
+                request_lane(request.source) == TaskLane::Human
+                    && stow_types::api::is_ci_target(request.target.as_str())
+            })
+            .count(),
+    )
+    .map_err(|_| QueueError::Overflow {
+        field: "human-lane task count",
+        value: requests.len() as u64,
+    })?;
+    if human_tasks > 0
+        && !charge_human_daily_budget(db, human_tasks, settings.human_daily_task_budget).await?
+    {
+        return Err(QueueError::HumanDailyBudgetExhausted {
+            attempted: u64::from(human_tasks),
+            budget: u64::from(settings.human_daily_task_budget),
+        });
+    }
     let resync_ids: Vec<String> = plan.resync.keys().cloned().collect();
     let edges: Vec<BatchedDepEdge> = plan.resync.into_values().flatten().collect();
     apply_batched_dependency_sync(db, &resync_ids, &edges).await?;
@@ -1018,11 +1188,20 @@ struct BuildCompleteReport {
     success: bool,
     error: Option<String>,
     github_run_id: Option<String>,
+    /// The instant the run finished — `None` for a live report
+    /// (completion is now); a completion applied later through
+    /// `pending_run_completions` carries its stored `received_at`, so
+    /// the duration sample measures claim-to-completion, not
+    /// claim-to-deferred-application (stow#524).
+    finished_at: Option<String>,
 }
 
 #[derive(Debug, skyzen::FromRow)]
 struct CompletedTargetRow {
     target: String,
+    crate_name: String,
+    claimed_at: Option<String>,
+    status: String,
 }
 
 /// `window_minutes` bounds the outcome evidence the record keeps: the
@@ -1035,8 +1214,8 @@ async fn complete(
     window_minutes: u32,
 ) -> Result<(), QueueError> {
     let generation_id = report.generation_id.clone();
-    // `RETURNING target` hands the outcome counter the row's target —
-    // the breaker files outcomes under it without a second read.
+    // The `RETURNING` columns feed the outcome counter and the
+    // build-cost sample below without a second read.
     // The report must name the row's live attempt in an in-flight status:
     // without that predicate a late or duplicate report for a superseded
     // attempt would overwrite the state of the attempt the row has since
@@ -1058,7 +1237,7 @@ async fn complete(
              updated_at = datetime('now') \
          WHERE task_id = ? AND generation_id = ? \
            AND status IN ('dispatched', 'running') \
-         RETURNING target"
+         RETURNING target, crate_name, claimed_at, status"
             .to_owned()
     } else {
         format!(
@@ -1071,14 +1250,12 @@ async fn complete(
                  deps_met = CASE WHEN {retry} THEN {deps_met} ELSE deps_met END, \
                  blocked = CASE WHEN {retry} THEN {blocked} ELSE blocked END, \
                  wake_at = CASE WHEN {retry} THEN {wake} ELSE wake_at END, \
-                 dispatch_key = CASE WHEN {retry} THEN {key} ELSE dispatch_key END, \
                  updated_at = datetime('now') \
              WHERE task_id = ? AND generation_id = ? \
                AND status IN ('dispatched', 'running') \
-             RETURNING target",
+             RETURNING target, crate_name, claimed_at, status",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
-            key = dispatch_key_row_sql(),
             wake = wake_at_sql(
                 "lane",
                 "first_requested_at",
@@ -1102,33 +1279,7 @@ async fn complete(
     // logged and answered 409 so the reporter sees the conflict rather
     // than believing it completed the current generation.
     if updated.is_none() {
-        let row = db
-            .query("SELECT attempt, status FROM queue WHERE task_id = ?")
-            .bind(report.task_id.clone())
-            .fetch_optional::<AttemptStatusRow>()
-            .await
-            .map_err(|error| {
-                format!(
-                    "load task {} after rejected report: {error}",
-                    report.task_id
-                )
-            })?;
-        let Some(row) = row else {
-            return Err(QueueError::UnknownTask(report.task_id.clone()));
-        };
-        tracing::warn!(
-            task_id = %report.task_id,
-            attempt = report.attempt,
-            row_attempt = row.attempt,
-            row_status = %row.status,
-            "rejected completion report for a superseded or inactive attempt"
-        );
-        return Err(QueueError::StaleCompletion {
-            task_id: report.task_id.clone(),
-            attempt: report.attempt,
-            row_attempt: row.attempt,
-            row_status: row.status,
-        });
+        return reject_stale_completion(db, report).await;
     }
     // A dep whose attempt just exhausted is the one outside-the-row
     // event that flips a pending dependent's `blocked` flag — refresh
@@ -1143,14 +1294,245 @@ async fn complete(
         )
         .await?;
     }
-
     // The row landed — count the attempt's outcome so the
     // dispatch-freeze breaker's sliding window sees it even after a
     // re-request flips the queue row back to pending.
-    let target = updated.expect("checked above").target;
-    record_attempt_outcome(db, report, &generation_id, &target, window_minutes).await?;
-
+    let completed = updated.expect("checked above");
+    // A failure that re-queued the row owes it a fresh key: the
+    // median may have moved while it was dispatched (the keyed
+    // cost-refresh only touches `pending` rows), and the parked row's
+    // stored key carries the stale cost.
+    if completed.status == "pending" {
+        refresh_dispatch_keys(db, std::slice::from_ref(&report.task_id)).await?;
+    }
+    record_attempt_outcome(
+        db,
+        report,
+        &generation_id,
+        &completed.target,
+        window_minutes,
+    )
+    .await?;
+    // A success is the build cost's only honest measurement, and the
+    // generation fence above is what keeps a late or duplicate report
+    // out of the sample window.
+    if report.success {
+        record_build_sample(
+            db,
+            report,
+            &completed.crate_name,
+            &completed.target,
+            completed.claimed_at.as_deref(),
+        )
+        .await?;
+    }
     Ok(())
+}
+
+/// Diagnose why a completion report matched no row: unknown task id,
+/// or a row whose live generation/status moved past the report.
+async fn reject_stale_completion(
+    db: &DurableDb,
+    report: &BuildCompleteReport,
+) -> Result<(), QueueError> {
+    let row = db
+        .query("SELECT attempt, status FROM queue WHERE task_id = ?")
+        .bind(report.task_id.clone())
+        .fetch_optional::<AttemptStatusRow>()
+        .await
+        .map_err(|error| {
+            format!(
+                "load task {} after rejected report: {error}",
+                report.task_id
+            )
+        })?;
+    let Some(row) = row else {
+        return Err(QueueError::UnknownTask(report.task_id.clone()));
+    };
+    tracing::warn!(
+        task_id = %report.task_id,
+        attempt = report.attempt,
+        row_attempt = row.attempt,
+        row_status = %row.status,
+        "rejected completion report for a superseded or inactive attempt"
+    );
+    Err(QueueError::StaleCompletion {
+        task_id: report.task_id.clone(),
+        attempt: report.attempt,
+        row_attempt: row.attempt,
+        row_status: row.status,
+    })
+}
+
+/// File one successful build's duration in the bounded per-(crate,
+/// target) sample window, recompute the median and refresh the
+/// dispatch keys of the pending rows whose score just moved.
+///
+/// The read/write set is constant in queue size and traffic: the
+/// sample insert keys on the claim generation (a replay of the same
+/// generation inserts nothing and exits — the completion fence above
+/// already rejected any report naming a dead generation), the cap
+/// delete drops the tail past `BUILD_SAMPLE_WINDOW`, the median
+/// recompute reads the window's at-most-`BUILD_SAMPLE_WINDOW` rows,
+/// the stats upsert writes one row, and the dispatch-key refresh —
+/// only when the median actually moved — is a keyed probe touching
+/// the pending rows of exactly this (`crate_name`, `target`).
+///
+/// `claimed_at` `NULL` means the row predates the column or its
+/// completion applied to a generation minted before the stamp existed
+/// — there is no real claim instant to measure from, so no sample is
+/// taken at all. `report.finished_at` is the run's real completion
+/// instant (the pending-completion path's `received_at`), falling
+/// back to now for a live report.
+async fn record_build_sample(
+    db: &DurableDb,
+    report: &BuildCompleteReport,
+    crate_name: &str,
+    target: &str,
+    claimed_at: Option<&str>,
+) -> Result<(), QueueError> {
+    let Some(claimed_at) = claimed_at else {
+        return Ok(());
+    };
+    let inserted = db
+        .query(
+            "INSERT INTO crate_build_samples \
+             (crate_name, target, generation_id, duration_ms) \
+             VALUES (?, ?, ?, \
+                     CAST((julianday(COALESCE(?, datetime('now'))) \
+                           - julianday(?)) * 86400000.0 AS INTEGER)) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(crate_name.to_owned())
+        .bind(target.to_owned())
+        .bind(report.generation_id.clone())
+        .bind(report.finished_at.clone())
+        .bind(claimed_at.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("record build sample: {error}"))?;
+    if inserted.rows_written == 0 {
+        return Ok(());
+    }
+    // Keep only the newest window: rows past it are the samples a
+    // recompute can no longer read anyway.
+    db.query(&format!(
+        "DELETE FROM crate_build_samples \
+         WHERE rowid IN (SELECT rowid FROM crate_build_samples \
+                         WHERE crate_name = ? AND target = ? \
+                         ORDER BY rowid DESC LIMIT -1 OFFSET {BUILD_SAMPLE_WINDOW})",
+    ))
+    .bind(crate_name.to_owned())
+    .bind(target.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("cap build sample window: {error}"))?;
+    let old_median = db
+        .query(
+            "SELECT CAST(median_ms AS TEXT) AS median_ms FROM crate_build_stats \
+             WHERE crate_name = ? AND target = ?",
+        )
+        .bind(crate_name.to_owned())
+        .bind(target.to_owned())
+        .fetch_optional::<BuildStatsRow>()
+        .await
+        .map_err(|error| format!("read build stats: {error}"))?
+        .map(|row| row.median_ms.parse::<i64>())
+        .transpose()
+        .map_err(|_| {
+            QueueError::Invariant(format!(
+                "stored median_ms for {crate_name}/{target} is not an integer"
+            ))
+        })?;
+    // Duration columns cross the wire as TEXT and parse to `i64` — a
+    // `julianday` span can exceed `2^53` and the JSON number crossing
+    // would truncate it.
+    let mut durations = db
+        .query(
+            "SELECT CAST(duration_ms AS TEXT) AS duration_ms FROM crate_build_samples \
+             WHERE crate_name = ? AND target = ? ORDER BY duration_ms",
+        )
+        .bind(crate_name.to_owned())
+        .bind(target.to_owned())
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("read build sample window: {error}"))?
+        .into_iter()
+        .map(|text| {
+            text.parse::<i64>().map_err(|_| {
+                QueueError::Invariant(format!("stored duration_ms {text:?} is not an integer"))
+            })
+        })
+        .collect::<Result<Vec<i64>, _>>()?;
+    durations.sort_unstable();
+    let Some(&median_ms) = durations.get((durations.len() - 1) / 2) else {
+        return Ok(());
+    };
+    // The stored cost domain is positive: a build faster than the
+    // millisecond unit measures 0 and floors at the unit, while a
+    // negative duration can only be clock corruption.
+    let median_ms = if median_ms < 0 {
+        return Err(QueueError::Invariant(format!(
+            "negative build duration median {median_ms}"
+        )));
+    } else {
+        median_ms.max(1)
+    };
+    db.query(
+        "INSERT INTO crate_build_stats (crate_name, target, builds, median_ms) \
+         VALUES (?, ?, 1, CAST(? AS INTEGER)) \
+         ON CONFLICT (crate_name, target) DO UPDATE SET \
+             builds = builds + 1, median_ms = excluded.median_ms",
+    )
+    .bind(crate_name.to_owned())
+    .bind(target.to_owned())
+    .bind(median_ms.to_string())
+    .execute()
+    .await
+    .map_err(|error| format!("upsert build stats: {error}"))?;
+    // The keyed refresh only pays its probe when the median moved:
+    // an unchanged median leaves every key what it was.
+    if Some(median_ms) != old_median {
+        refresh_pending_keys_for_cost(db, crate_name, target, median_ms).await?;
+    }
+    Ok(())
+}
+
+/// Reprice the one `(crate_name, target)` pending set after its median
+/// moved: the SELECT seeks `idx_queue_pending_crate_target` — it reads
+/// precisely this pair's pending rows, never the crate's terminal or
+/// other-target history — and the new median arrives as a bound TEXT
+/// constant, so no stats re-read joins the walk.
+async fn refresh_pending_keys_for_cost(
+    db: &DurableDb,
+    crate_name: &str,
+    target: &str,
+    median_ms: i64,
+) -> Result<(), QueueError> {
+    let rows = db
+        .query(
+            "SELECT q.task_id, q.target, q.lane, q.dispatch_family, \
+                    CAST(q.priority AS TEXT) AS priority, \
+                    CAST(q.demand AS TEXT) AS demand, \
+                    q.first_requested_at, q.created_at, \
+                    CAST(q.value AS TEXT) AS value, q.dispatch_key, \
+                    ? AS median_ms \
+             FROM queue q \
+             WHERE q.status = 'pending' AND q.crate_name = ? AND q.target = ?",
+        )
+        .bind(median_ms.to_string())
+        .bind(crate_name.to_owned())
+        .bind(target.to_owned())
+        .fetch_all::<RankSourceRow>()
+        .await
+        .map_err(|error| format!("load pending rows for cost refresh: {error}"))?;
+    let updates = rank_updates(&rows)?;
+    apply_key_updates(db, &updates).await
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct BuildStatsRow {
+    median_ms: String,
 }
 
 /// The time granularity `attempt_outcome_buckets` counts in — five
@@ -1337,6 +1719,7 @@ pub async fn complete_run(
             success: report.success,
             error: report.error.clone(),
             github_run_id: report.github_run_id.clone(),
+            finished_at: None,
         },
         window_minutes,
     )
@@ -1394,7 +1777,7 @@ async fn persist_pending_completion(
 
     let existing = db
         .query(
-            "SELECT github_run_id, task_id, success, error \
+            "SELECT github_run_id, task_id, success, error, received_at \
              FROM pending_run_completions WHERE github_run_id = ?",
         )
         .bind(github_run_id.to_owned())
@@ -1440,7 +1823,7 @@ async fn apply_pending_completion_for_binding(
 
     let pending = db
         .query(
-            "SELECT github_run_id, task_id, success, error \
+            "SELECT github_run_id, task_id, success, error, received_at \
              FROM pending_run_completions \
              WHERE task_id = ? AND github_run_id = ?",
         )
@@ -1465,6 +1848,7 @@ async fn apply_pending_completion_for_binding(
         success: pending.success != 0,
         error: pending.error,
         github_run_id: Some(pending.github_run_id.clone()),
+        finished_at: Some(pending.received_at),
     };
     match complete(db, settings, &report, window_minutes).await {
         Ok(()) | Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => {
@@ -2384,6 +2768,40 @@ pub(super) fn wake_at_sql(
     )
 }
 
+/// Default for `STOW_MIN_DISPATCH_VALUE`: no admission floor — every
+/// dispatchable row claims, as before the floor existed.
+const DEFAULT_MIN_DISPATCH_VALUE: i64 = 0;
+
+/// The `dispatch_eligible` column's derivation (stow#525 I10):
+/// `lane = 'human' OR value >= floor`. The human lane is exempt by
+/// contract — a request someone asked for by name is never held by the
+/// floor. `floor` is the authoritative `min_dispatch_value` row the
+/// operator migrate stamps into `settings` — decimal text, `CAST` to
+/// SQLite's integer domain in place, so no wide value ever crosses a
+/// JS bind/cursor boundary; an absent row reads as the default `0`
+/// (admit everything), which is also the answer before the first
+/// migrate of a fresh deploy. Every writer that assigns `value` or
+/// `lane` evaluates this expression in the same statement — SET terms
+/// see the pre-update row, so the `value` operand is the expression
+/// being assigned ([`value_sql`]), never the stale column.
+///
+/// The admission expression with an explicit floor operand — the shape
+/// the settings-row formula shares, used only by the operator
+/// migrate's backfill, which must evaluate against the configured
+/// value before the row recording it exists.
+fn dispatch_eligible_at_floor_sql(lane: &str, value: &str, floor: &str) -> String {
+    format!("CASE WHEN ({lane}) = 'human' OR ({value}) >= ({floor}) THEN 1 ELSE 0 END")
+}
+
+pub(super) fn dispatch_eligible_sql(lane: &str, value: &str) -> String {
+    dispatch_eligible_at_floor_sql(
+        lane,
+        value,
+        "COALESCE((SELECT CAST(s.value AS INTEGER) \
+             FROM settings s WHERE s.key = 'min_dispatch_value'), 0)",
+    )
+}
+
 /// The runner family of a `target` column/expression as SQL — persisted
 /// as `dispatch_family` so the alarm's probes equality-filter by family
 /// without carrying the target list into Rust.
@@ -2416,59 +2834,186 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
     }
 }
 
-/// `queue.value` as a SQL expression — the persisted number the claim
-/// order descends on: precedence bands over the baseline `priority`.
-/// `family` is the row's `dispatch_family` (an expression or column):
-/// the family never changes after insert, so reading the derived
-/// column is one operand with the lane and priority the row already
-/// carries. A statement assigning an operand column in the same UPDATE
-/// must pass the assigned expression, since SET terms read the
-/// pre-update row.
-pub(super) fn value_sql(lane: &str, family: &str, priority: &str) -> String {
+/// `queue.value` as a SQL expression — the persisted raw integer the
+/// dispatch rank divides by expected cost: precedence bands over the
+/// baseline `priority` plus accumulated `demand` (stow#522 — kept
+/// inside the priority band by the route's `PRIORITY_MAX` bound).
+/// The writers derive this in Rust through
+/// [`crate::scheduler::rank::raw_value`]; the SQL form survives only
+/// for the fixture's bulk seed, where per-row Rust computation is not
+/// possible inside the `INSERT … SELECT`. A statement assigning an
+/// operand column in the same UPDATE must pass the assigned
+/// expression, since SET terms read the pre-update row.
+pub(super) fn value_sql(lane: &str, family: &str, priority: &str, demand: &str) -> String {
     format!(
         "((CASE WHEN ({lane}) = 'human' THEN 2 ELSE 0 END) + \
           (CASE WHEN ({family}) = 'windows' THEN 1 ELSE 0 END)) * {VALUE_BAND} \
-         + MAX(0, ({priority}))"
+         + MAX(0, ({priority})) + MAX(0, ({demand}))"
     )
 }
 
-/// `value_sql` over the queue's own columns — the in-row form the
-/// backfill and the claim-order refresh share.
-pub(super) fn value_row_sql() -> String {
-    value_sql("lane", "dispatch_family", "priority")
+/// The `(task_id, value, dispatch_key)` pair a keyed rank refresh
+/// binds — `value` travels as decimal text (never a JSON number, whose
+/// IEEE-754 parse would round bands above `2^53`) and the statement
+/// casts it back to the INTEGER column.
+#[derive(serde::Serialize)]
+struct KeyUpdate {
+    task_id: String,
+    lane: String,
+    value: String,
+    dispatch_key: String,
 }
 
-/// The claim `ORDER BY` tuple encoded as one sortable string: the
-/// dispatch `value` descending (stow#442 I6 — lane and family bands
-/// plus priority all compare inside the one number), then FIFO by
-/// `first_requested_at` with creation and id as the tie breakers.
-/// Value is inverted into a full-`i64`-width field
-/// (`i64::MAX - value`), so the text sort is the numeric `DESC` at
-/// every magnitude — no clamp, no tie horizon. The operand is an
-/// expression (usually [`value_sql`]), not the `value` column: a SET
-/// that also writes `value` must see the fresh answer.
-pub(super) fn dispatch_key_sql(value: &str, first: &str, created: &str, task_id: &str) -> String {
-    // Every operand is parenthesized: `->>` and `||` share one
-    // precedence level and associate left, so a bare `x || e ->> 'col'`
-    // would evaluate `(x || e) ->> 'col'` — a JSON operator on the
-    // concatenated string — instead of `x || (e ->> 'col')`.
-    format!(
-        "printf('%019d', 9223372036854775807 - MAX(0, ({value}))) || '|' || \
-         ({first}) || '|' || ({created}) || '|' || ({task_id})"
-    )
+/// The operand columns a rank refresh loads losslessly per touched
+/// row — everything [`crate::scheduler::rank::dispatch_key`] consumes
+/// — plus the row's stored pair for the no-op diff and its
+/// `(crate_name, target)` median via `crate_build_stats` (1 while
+/// unmeasured, matching a fresh insert's answer).
+#[derive(Debug, skyzen::FromRow)]
+struct RankSourceRow {
+    task_id: String,
+    target: String,
+    lane: String,
+    dispatch_family: String,
+    priority: String,
+    demand: String,
+    first_requested_at: String,
+    created_at: String,
+    value: String,
+    dispatch_key: String,
+    median_ms: Option<String>,
 }
 
-/// `dispatch_key_sql` over the queue's own columns — the in-row form the
-/// backfill, the re-request update and the promote refresh share. The
-/// value operand is [`value_row_sql`]'s recomputation, so a key refresh
-/// never reads a stale `value` column.
-pub(super) fn dispatch_key_row_sql() -> String {
-    dispatch_key_sql(
-        &value_row_sql(),
-        "first_requested_at",
-        "created_at",
-        "task_id",
-    )
+/// The SELECT every keyed refresh shares — operand columns plus the
+/// pair's stored state and the keyed cost join. Every potentially
+/// wide INTEGER crosses the wire as TEXT: the Durable Object's JSON
+/// number crossing loses integer precision past `2^53`, the very
+/// range the exact rank exists to preserve.
+const RANK_SOURCE_SELECT: &str = "SELECT q.task_id, q.target, q.lane, q.dispatch_family, \
+            CAST(q.priority AS TEXT) AS priority, \
+            CAST(q.demand AS TEXT) AS demand, \
+            q.first_requested_at, q.created_at, \
+            CAST(q.value AS TEXT) AS value, q.dispatch_key, \
+            CAST(s.median_ms AS TEXT) AS median_ms \
+     FROM queue q LEFT JOIN crate_build_stats s \
+       ON s.crate_name = q.crate_name AND s.target = q.target";
+
+/// The parsed, invariant-checked form of a [`RankSourceRow`]: every
+/// field the rank abstraction consumes as a checked Rust type.
+/// `cost_ms` is [`crate::scheduler::rank::UNMEASURED_COST`] only for a
+/// genuinely absent stat — a present stat that fails `checked_cost`
+/// fails the writer, never silently reverts to 1.
+struct RankRow {
+    task_id: String,
+    target: String,
+    lane: String,
+    dispatch_family: String,
+    priority: i64,
+    demand: i64,
+    first_requested_at: String,
+    created_at: String,
+    value: i64,
+    dispatch_key: String,
+    cost_ms: NonZero<i64>,
+}
+
+impl RankSourceRow {
+    fn checked(&self) -> Result<RankRow, QueueError> {
+        let parse_i64 = |field: &str, text: &str| {
+            text.parse::<i64>().map_err(|_| {
+                QueueError::Invariant(format!(
+                    "queue task {}: {field} {text:?} is not an integer",
+                    self.task_id
+                ))
+            })
+        };
+        let cost_ms = match self.median_ms.as_deref() {
+            None => crate::scheduler::rank::UNMEASURED_COST,
+            Some(median) => crate::scheduler::rank::checked_cost(median)?,
+        };
+        Ok(RankRow {
+            task_id: self.task_id.clone(),
+            target: self.target.clone(),
+            lane: self.lane.clone(),
+            dispatch_family: self.dispatch_family.clone(),
+            priority: parse_i64("priority", &self.priority)?,
+            demand: parse_i64("demand", &self.demand)?,
+            first_requested_at: self.first_requested_at.clone(),
+            created_at: self.created_at.clone(),
+            value: parse_i64("value", &self.value)?,
+            dispatch_key: self.dispatch_key.clone(),
+            cost_ms,
+        })
+    }
+}
+
+/// One row's fresh `(value, dispatch_key)` from its operands —
+/// `None` when the stored pair already agrees, so a refresh writes
+/// only the rows that actually moved.
+fn key_update_for(row: &RankRow) -> Option<KeyUpdate> {
+    let value = crate::scheduler::rank::raw_value(
+        &row.lane,
+        &row.dispatch_family,
+        row.priority,
+        row.demand,
+    );
+    let dispatch_key = crate::scheduler::rank::dispatch_key(&crate::scheduler::rank::KeyOperands {
+        lane: &row.lane,
+        family: &row.dispatch_family,
+        priority: row.priority,
+        demand: row.demand,
+        cost_ms: row.cost_ms,
+        first_requested_at: &row.first_requested_at,
+        created_at: &row.created_at,
+        task_id: &row.task_id,
+    });
+    (value != row.value || dispatch_key != row.dispatch_key).then(|| KeyUpdate {
+        task_id: row.task_id.clone(),
+        lane: row.lane.clone(),
+        value: value.to_string(),
+        dispatch_key,
+    })
+}
+
+/// Checked-parse a batch of loaded [`RankSourceRow`]s and derive the
+/// pairs that moved — the checked form is what the rank abstraction
+/// may consume, and any violated invariant fails the writer rather
+/// than writing a key from clamped data.
+fn rank_updates(rows: &[RankSourceRow]) -> Result<Vec<KeyUpdate>, QueueError> {
+    rows.iter()
+        .map(|row| row.checked().map(|checked| key_update_for(&checked)))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|updates| updates.into_iter().flatten().collect())
+}
+
+/// Write the recomputed pairs the diff produced, keyed by task id —
+/// an empty update list skips the statement entirely.
+async fn apply_key_updates(db: &DurableDb, updates: &[KeyUpdate]) -> Result<(), QueueError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    // One bound JSON operand per chunk — a refresh over an unbounded
+    // pending set must not serialize the whole key list into one
+    // statement, same as every other keyed batch.
+    for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        db.query(&format!(
+            "UPDATE queue \
+             SET value = CAST(j.e ->> 'value' AS INTEGER), \
+                 dispatch_key = j.e ->> 'dispatch_key', \
+                 dispatch_eligible = {eligible} \
+             FROM (SELECT value AS e FROM json_each(?)) AS j \
+             WHERE queue.task_id = j.e ->> 'task_id'",
+            // A moved pair may flip the floor answer (lane or value
+            // changed): it re-derives in the same statement from the
+            // bound row, so eligibility never trails the key it guards.
+            eligible = dispatch_eligible_sql("j.e ->> 'lane'", "CAST(j.e ->> 'value' AS INTEGER)",),
+        ))
+        .bind(enqueue_json(chunk)?)
+        .execute()
+        .await
+        .map_err(|error| format!("write refreshed dispatch keys: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Recount `unpublished_deps` for a task-id set — the only places an
@@ -2559,23 +3104,692 @@ async fn refresh_dependents(
 /// Recompute `value` and `dispatch_key` for a task-id set after a
 /// mutation that may have moved a row's lane or priority (re-request
 /// humanization, revive priority bump) — the two claim-order columns
-/// always refresh together, since the key orders on the value. Rows
-/// already carrying the right pair write nothing.
+/// always refresh together, since the key orders on the exact
+/// `value / expected_cost` rank. The rows and their medians load
+/// losslessly in one keyed probe, the shared Rust abstraction derives
+/// each pair, and the write is a keyed `json_each` update over only
+/// the rows whose pair actually moved — a row already carrying the
+/// right pair writes nothing, and a chunk with none skips the UPDATE.
 async fn refresh_dispatch_keys(db: &DurableDb, task_ids: &[String]) -> Result<(), QueueError> {
     for chunk in task_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
-        db.query(&format!(
-            "UPDATE queue SET value = {value}, dispatch_key = {key} \
-             WHERE task_id IN (SELECT value FROM json_each(?)) \
-               AND (queue.value != {value} OR queue.dispatch_key != {key})",
-            value = value_row_sql(),
-            key = dispatch_key_row_sql()
-        ))
-        .bind(enqueue_json(chunk)?)
-        .execute()
-        .await
-        .map_err(|error| format!("refresh dispatch keys: {error}"))?;
+        let rows = db
+            .query(&format!(
+                "{RANK_SOURCE_SELECT} \
+                 WHERE q.task_id IN (SELECT value FROM json_each(?))"
+            ))
+            .bind(enqueue_json(chunk)?)
+            .fetch_all::<RankSourceRow>()
+            .await
+            .map_err(|error| format!("load rows for dispatch-key refresh: {error}"))?;
+        let updates = rank_updates(&rows)?;
+        apply_key_updates(db, &updates).await?;
     }
     Ok(())
+}
+
+/// The operator migration's rank-column backfill — one paged pass over
+/// the whole queue, legal only inside operations code. Every row's
+/// `dispatch_family`, `value` and `dispatch_key` re-derive through the
+/// same shared Rust abstraction the writers use: the family recomputes
+/// from `target`, never the stored column, so a stale family cannot
+/// bake into the `value` it feeds, and the stored-pair diff writes
+/// only rows whose triple actually moved. Paging by `task_id` keyset
+/// keeps worker memory flat across a million-row queue.
+async fn backfill_rank_pairs(db: &DurableDb) -> Result<(), QueueError> {
+    #[derive(serde::Serialize)]
+    struct BackfillUpdate {
+        task_id: String,
+        lane: String,
+        dispatch_family: String,
+        value: String,
+        dispatch_key: String,
+    }
+    let mut after = String::new();
+    loop {
+        let rows = db
+            .query(&format!(
+                "{RANK_SOURCE_SELECT} \
+                 WHERE q.task_id > ? ORDER BY q.task_id LIMIT 2048"
+            ))
+            .bind(after.clone())
+            .fetch_all::<RankSourceRow>()
+            .await
+            .map_err(|error| format!("page queue rows for backfill: {error}"))?;
+        if rows.is_empty() {
+            break;
+        }
+        after = rows
+            .last()
+            .map(|row| row.task_id.clone())
+            .unwrap_or_default();
+        let mut updates: Vec<BackfillUpdate> = Vec::new();
+        for source in &rows {
+            let row = source.checked()?;
+            let family = crate::scheduler::rank::dispatch_family(&row.target).to_owned();
+            let value =
+                crate::scheduler::rank::raw_value(&row.lane, &family, row.priority, row.demand);
+            let dispatch_key =
+                crate::scheduler::rank::dispatch_key(&crate::scheduler::rank::KeyOperands {
+                    lane: &row.lane,
+                    family: &family,
+                    priority: row.priority,
+                    demand: row.demand,
+                    cost_ms: row.cost_ms,
+                    first_requested_at: &row.first_requested_at,
+                    created_at: &row.created_at,
+                    task_id: &row.task_id,
+                });
+            if family != row.dispatch_family
+                || value != row.value
+                || dispatch_key != row.dispatch_key
+            {
+                updates.push(BackfillUpdate {
+                    task_id: row.task_id.clone(),
+                    lane: row.lane.clone(),
+                    dispatch_family: family,
+                    value: value.to_string(),
+                    dispatch_key,
+                });
+            }
+        }
+        for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+            db.query(&format!(
+                "UPDATE queue \
+                 SET dispatch_family = j.e ->> 'dispatch_family', \
+                     value = CAST(j.e ->> 'value' AS INTEGER), \
+                     dispatch_key = j.e ->> 'dispatch_key', \
+                     dispatch_eligible = {eligible} \
+                 FROM (SELECT value AS e FROM json_each(?)) AS j \
+                 WHERE queue.task_id = j.e ->> 'task_id'",
+                eligible =
+                    dispatch_eligible_sql("j.e ->> 'lane'", "CAST(j.e ->> 'value' AS INTEGER)",),
+            ))
+            .bind(enqueue_json(chunk)?)
+            .execute()
+            .await
+            .map_err(|error| format!("backfill dispatch keys: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The largest `batch_id` a demand request may carry.
+const MAX_DEMAND_BATCH_ID_BYTES: usize = 128;
+
+/// The entry cap one demand batch may carry — each entry is one keyed
+/// closure walk, so the cap also bounds a request's statement count.
+const MAX_DEMAND_BATCH_ENTRIES: usize = 256;
+
+/// The statuses demand may touch: rows that can still dispatch. The
+/// walk stops at `completed` and in-flight (`dispatched`/`running`)
+/// rows — those nodes either are served or already own a runner — and
+/// at edges whose slice answer is `dep_met = 1`.
+const UNBUILT_STATUSES: &str = "'pending', 'failed'";
+
+/// `POST /demand` — a trusted demand batch (stow#522 I7). Every entry
+/// names a host-side-free node identity (the Analytics Engine source
+/// omits the side): the union of its unbuilt root rows — both compile
+/// sides — and their unbuilt dependency closures over unmet edges is
+/// its touched set. The entry's delta lands once per touched task —
+/// the `UNION` walk dedups diamonds and cycles — while distinct
+/// identities contribute their own deltas to a task they share.
+///
+/// Durability is a typed batch record, not a payload blob:
+/// `demand_batches` stores the canonical input's blake3 fingerprint,
+/// the touched count, and a `prepared`/`accepted` state — never the
+/// contribution set itself, which lives relationally as
+/// `demand_contributions` rows keyed by `(task_id, batch_id)` and
+/// staged in JSON chunks bounded well under the workerd string limit.
+/// A delivery whose record says `accepted` answers from the header —
+/// stored count, no writes, no live walk — and a same-id delivery
+/// whose canonical fingerprint differs fails before any write, draft
+/// or accepted. Only a `prepared` record may be retried: staging is
+/// not a promise, so the same input recomputes the CURRENT closure,
+/// clears only this batch's own staged rows, re-stages, and accepts —
+/// a later admission can never wedge an accepted remainder, because
+/// no such state exists.
+///
+/// Acceptance is the last statement, and it is atomic: the guarded
+/// `UPDATE` flipping `prepared` to `accepted` fires the `demand_fold`
+/// trigger, which folds every staged delta into
+/// `demand`/`value`/`dispatch_key` inside that one statement, and a
+/// failure anywhere — including the trigger's own staged-count
+/// `RAISE(ABORT)` — rolls back the transition AND all triggered queue
+/// effects. Once it returns, the batch is complete; nothing accepted
+/// is ever applied again. `value` and `dispatch_key` refresh for the
+/// event's own closure only.
+///
+/// A batch id is a window identity, not a lookup key: the first
+/// accepted payload wins the id. Input order and duplicate identities
+/// are canonicalized by summing per-identity deltas into the sorted
+/// `BTreeMap` below, so two spellings of the same observation share
+/// one fingerprint; a legitimately different hour is a different
+/// batch id (#523 names them).
+///
+/// Validation precedes every mutation: deltas are `u64` checked into
+/// `i64`, per-task sums use checked arithmetic, and the band bound —
+/// `priority + demand <= PRIORITY_MAX`, the guard that keeps demand
+/// inside the priority band so lane/family precedence cannot break —
+/// is verified in SQL over the exact row set this event will fold,
+/// before a single write. An overrun answers as an error, never a
+/// clamp or a REAL promotion.
+pub async fn apply_demand(
+    db: &DurableDb,
+    request: &stow_types::api::SchedulerDemandRequest,
+) -> Result<stow_types::api::SchedulerDemandReport, QueueError> {
+    demand_batch_shape(request)?;
+    let deltas = demand_deltas(&request.entries)?;
+    let input_hash = demand_input_fingerprint(&deltas)?;
+
+    // The durable batch record decides whether this delivery walks or
+    // replays — and a recorded id carrying a different canonical
+    // fingerprint refuses before a single write, draft or accepted.
+    let stored = db
+        .query(
+            "SELECT input_hash, touched_count, state \
+             FROM demand_batches WHERE batch_id = ?",
+        )
+        .bind(request.batch_id.clone())
+        .fetch_optional::<DemandBatchRow>()
+        .await
+        .map_err(|error| format!("probe demand batch record: {error}"))?;
+    if let Some(batch) = &stored {
+        if batch.input_hash != input_hash {
+            return Err(QueueError::Invariant(format!(
+                "demand batch {} already delivered with a different payload",
+                request.batch_id
+            )));
+        }
+        match batch.state.as_str() {
+            "accepted" => {
+                // Fully accepted replay: the stored header answers —
+                // no writes, no live walk, whatever the graph looks
+                // like now.
+                return Ok(stow_types::api::SchedulerDemandReport {
+                    batch_id: request.batch_id.clone(),
+                    entries: u64::try_from(deltas.len()).unwrap_or(u64::MAX),
+                    touched_tasks: u64::try_from(batch.touched_count).unwrap_or(u64::MAX),
+                    applied: false,
+                });
+            }
+            // An unaccepted draft of the same input may retry — its
+            // staging is not a frozen set and is replaced below.
+            "prepared" => {}
+            state => {
+                return Err(QueueError::Invariant(format!(
+                    "demand batch {} in unexpected state {state:?}",
+                    request.batch_id
+                )));
+            }
+        }
+    }
+
+    // New batch or unaccepted retry: recompute the live closure —
+    // union/diamond/cycle semantics exactly as first delivery — and
+    // stage it. Every preflight precedes every mutation: the closure
+    // walk, the stored-floor read, the operand probe and the staged
+    // precompute are all read-only until the first ledger write.
+    let contributions = demand_event_rows(db, &deltas).await?;
+    let floor = db
+        .query(
+            "SELECT CAST(value AS TEXT) AS value FROM settings \
+             WHERE key = 'min_dispatch_value'",
+        )
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read stored dispatch floor: {error}"))?
+        .map(|raw| {
+            raw.parse::<i64>().map_err(|_| {
+                QueueError::Invariant("stored dispatch floor is not an integer".to_owned())
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let rows = prepare_demand_rows(db, &contributions, floor).await?;
+    let chunks = contribution_chunks(&rows)?;
+
+    let touched = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+    demand_commit_batch(
+        db,
+        &request.batch_id,
+        input_hash,
+        touched,
+        &chunks,
+        stored.is_some(),
+    )
+    .await?;
+
+    Ok(stow_types::api::SchedulerDemandReport {
+        batch_id: request.batch_id.clone(),
+        entries: u64::try_from(deltas.len()).unwrap_or(u64::MAX),
+        touched_tasks: u64::try_from(touched).unwrap_or(u64::MAX),
+        applied: true,
+    })
+}
+
+/// `POST /demand`'s full storage pass — the batch apply plus the
+/// alarm plan the caller then arms. Shared by the wasm route and the
+/// cost-gate drive so the metered statement set is the real route
+/// path: the same apply, then the same freeze/settings/family/lease
+/// `next_alarm` probes the route's `schedule_alarm` runs — nothing
+/// read or written outside them (stow#522).
+pub async fn demand_pass(
+    db: &DurableDb,
+    request: &stow_types::api::SchedulerDemandRequest,
+    now_ms: i64,
+    settings: &SchedulerSettings,
+) -> Result<(stow_types::api::SchedulerDemandReport, AlarmPlan), QueueError> {
+    let report = apply_demand(db, request).await?;
+    let plan = next_alarm(db, now_ms, settings).await?;
+    Ok((report, plan))
+}
+
+/// Perform the plan `next_alarm` decided on the real durable-object
+/// alarm — shared by the wasm routes and the budget probe's demand
+/// drive so the drive performs the same set/delete sequence the route
+/// does. Alarm calls are platform operations, not SQL: they sit
+/// outside the statement/rows meter by design (stow#522).
+pub(super) async fn arm_alarm(alarm: &Alarm, plan: AlarmPlan) -> Result<(), QueueError> {
+    match plan {
+        AlarmPlan::Delete => alarm
+            .delete_alarm()
+            .await
+            .map_err(|error| QueueError::Sql(format!("delete scheduler alarm: {error}"))),
+        AlarmPlan::At(next_ms) => alarm
+            .set_alarm(next_ms)
+            .await
+            .map_err(|error| QueueError::Sql(format!("set scheduler alarm {next_ms}: {error}"))),
+    }
+}
+
+/// The write tail of a new or retried delivery: land the `prepared`
+/// header — or clear an unaccepted draft's own staging, which is
+/// replaceable material, never an obligation — stage every chunk
+/// relationally, then flip the state. That last UPDATE is the atomic
+/// acceptance: `demand_fold` folds every staged delta into
+/// `demand`/`value`/`dispatch_key` inside the same statement, the guard's
+/// staged-count keeps a partial set from accepting, and a failure
+/// anywhere — trigger included — aborts the transition AND every
+/// triggered effect.
+async fn demand_commit_batch(
+    db: &DurableDb,
+    batch_id: &str,
+    input_hash: String,
+    touched: i64,
+    chunks: &[String],
+    reprepare: bool,
+) -> Result<(), QueueError> {
+    if reprepare {
+        db.query("DELETE FROM demand_contributions WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .execute()
+            .await
+            .map_err(|error| format!("clear demand staging: {error}"))?;
+    } else {
+        db.query(
+            "INSERT INTO demand_batches \
+             (batch_id, input_hash, touched_count, state) \
+             VALUES (?, ?, ?, 'prepared')",
+        )
+        .bind(batch_id.to_owned())
+        .bind(input_hash)
+        .bind(touched)
+        .execute()
+        .await
+        .map_err(|error| format!("record demand batch: {error}"))?;
+    }
+    // Stage the event's set relationally, in bounded JSON chunks —
+    // deltas cross as decimal text SQLite decodes as INTEGER, so no
+    // value above 2^53 ever rides a JS number.
+    for chunk in chunks {
+        db.query(
+            "INSERT INTO demand_contributions \
+                 (task_id, batch_id, delta, value, dispatch_key, dispatch_eligible) \
+             SELECT j.value ->> 'tid', ?, \
+                    CAST(j.value ->> 'delta' AS INTEGER), \
+                    j.value ->> 'value', j.value ->> 'key', \
+                    j.value ->> 'eligible' \
+             FROM json_each(?) j",
+        )
+        .bind(batch_id.to_owned())
+        .bind(chunk.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("stage demand contributions: {error}"))?;
+    }
+    db.query(
+        "UPDATE demand_batches \
+         SET state = 'accepted', touched_count = ? \
+         WHERE batch_id = ? AND state = 'prepared' \
+           AND (SELECT count(*) FROM demand_contributions c \
+                WHERE c.batch_id = ?) = ?",
+    )
+    .bind(touched)
+    .bind(batch_id.to_owned())
+    .bind(batch_id.to_owned())
+    .bind(touched)
+    .execute()
+    .await
+    .map_err(|error| format!("accept demand batch: {error}"))?;
+    if changes(db).await? == 0 {
+        return Err(QueueError::Invariant(format!(
+            "demand batch {batch_id} staging incomplete at acceptance"
+        )));
+    }
+    Ok(())
+}
+
+/// One staged row of a demand batch's fold payload — the delta plus
+/// the task's post-fold `value`, `dispatch_key` and
+/// `dispatch_eligible`, every one computed in Rust through the shared
+/// rank abstraction at the event's post-fold demand BEFORE any ledger
+/// or header write, so the acceptance trigger is a static
+/// prepared-field copy with no ranking formula in SQL. `value`
+/// serializes as decimal text (the band range exceeds a JS Number's
+/// exact band); the serialization also survives as the batch record's
+/// frozen set, so it must read back identically.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ContributionRow {
+    tid: String,
+    delta: i64,
+    value: String,
+    key: String,
+    eligible: u8,
+}
+
+/// One canonical demand-batch input entry — the five identity fields
+/// plus the summed delta, emitted in sorted order.
+#[derive(serde::Serialize)]
+struct CanonicalEntry {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+    delta: i64,
+}
+
+/// A `demand_batches` row: the canonical input's blake3 fingerprint,
+/// the touched count recorded at acceptance, and the typed state —
+/// `prepared` (unaccepted draft; staging may be replaced on a same-
+/// input retry) or `accepted` (complete, immutable).
+#[derive(Debug, skyzen::FromRow)]
+struct DemandBatchRow {
+    input_hash: String,
+    touched_count: i64,
+    state: String,
+}
+
+/// The request's shape bounds, checked before any read or write: a
+/// bounded batch id and a bounded, non-empty entry list.
+fn demand_batch_shape(request: &stow_types::api::SchedulerDemandRequest) -> Result<(), QueueError> {
+    if request.batch_id.is_empty() || request.batch_id.len() > MAX_DEMAND_BATCH_ID_BYTES {
+        return Err(QueueError::Invariant(format!(
+            "demand batch_id must be 1..={MAX_DEMAND_BATCH_ID_BYTES} bytes"
+        )));
+    }
+    if request.entries.is_empty() || request.entries.len() > MAX_DEMAND_BATCH_ENTRIES {
+        return Err(QueueError::Invariant(format!(
+            "demand batch must carry 1..={MAX_DEMAND_BATCH_ENTRIES} entries"
+        )));
+    }
+    Ok(())
+}
+
+/// One batch's deduped per-identity deltas: an entry repeated under
+/// the same identity is one demand report, and summing before the
+/// walk keeps "once per task" true at identity granularity too. The
+/// `BTreeMap`'s ordering is the canonicalization — the serialized
+/// form below compares equal regardless of entry order or
+/// duplication.
+fn demand_deltas(
+    entries: &[stow_types::api::SchedulerDemandEntry],
+) -> Result<BTreeMap<[String; 5], i64>, QueueError> {
+    let mut deltas: BTreeMap<[String; 5], i64> = BTreeMap::new();
+    for entry in entries {
+        let delta = u64_to_i64(entry.demand, "demand entry delta")?;
+        let key = [
+            entry.crate_name.as_str().to_owned(),
+            entry.version.to_string(),
+            entry.features_json.raw(),
+            entry.target.as_str().to_owned(),
+            entry.rustc_version.as_str().to_owned(),
+        ];
+        let total = deltas
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(delta)
+            .ok_or(QueueError::Overflow {
+                field: "demand entry delta sum",
+                value: u64::MAX,
+            })?;
+        deltas.insert(key, total);
+    }
+    Ok(deltas)
+}
+
+/// The batch id's payload fingerprint: blake3 of the sorted, summed
+/// canonical entry serialization — the identity a redelivery of the
+/// same observation must carry, and the cheap comparison a changed
+/// payload fails (stow#522).
+fn demand_input_fingerprint(deltas: &BTreeMap<[String; 5], i64>) -> Result<String, QueueError> {
+    Ok(blake3::hash(canonical_demand_input(deltas)?.as_bytes())
+        .to_hex()
+        .to_string())
+}
+
+/// The batch id's accepted-payload fingerprint: the summed per-identity
+/// deltas serialized in `BTreeMap` order, so two spellings of the same
+/// observations — any entry order, any duplication — compare equal and
+/// a changed payload compares different (stow#522).
+fn canonical_demand_input(deltas: &BTreeMap<[String; 5], i64>) -> Result<String, QueueError> {
+    enqueue_json(
+        &deltas
+            .iter()
+            .map(|(identity, delta)| CanonicalEntry {
+                crate_name: identity[0].clone(),
+                version: identity[1].clone(),
+                features_json: identity[2].clone(),
+                target: identity[3].clone(),
+                rustc_version: identity[4].clone(),
+                delta: *delta,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The event's contribution set: one keyed walk per distinct identity,
+/// `UNION` deduped — a task reached through two roots or two diamond
+/// paths is visited once, and cycles cannot recur — merged into the
+/// (task, delta) pairs a delivery stages. `BTreeMap` order keeps the
+/// staging order deterministic.
+async fn demand_event_rows(
+    db: &DurableDb,
+    deltas: &BTreeMap<[String; 5], i64>,
+) -> Result<Vec<(String, i64)>, QueueError> {
+    let mut contributions: BTreeMap<String, i64> = BTreeMap::new();
+    for (key, delta) in deltas {
+        for task_id in demand_closure_tasks(db, key).await? {
+            let total = contributions
+                .get(&task_id)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(*delta)
+                .ok_or(QueueError::Overflow {
+                    field: "task demand contribution",
+                    value: u64::MAX,
+                })?;
+            contributions.insert(task_id, total);
+        }
+    }
+    Ok(contributions.into_iter().collect())
+}
+
+/// The event's staged set with every post-fold answer precomputed:
+/// for each touched task the operands load once through
+/// `RANK_SOURCE_SELECT` (task ids cross as TEXT via chunked
+/// `json_each` joins; `priority`/`demand`/`value`/`median_ms` as TEXT
+/// under the same checked parse every writer shares), then the fold
+/// result derives in Rust — `demand + delta` feeds the shared
+/// `raw_value`/`dispatch_key`, and the eligibility answer evaluates
+/// against the STORED floor the other writers' flags were set by.
+/// All of it happens before the first ledger write: a violated cost
+/// or band invariant fails the event while the store is untouched.
+async fn prepare_demand_rows(
+    db: &DurableDb,
+    contributions: &[(String, i64)],
+    floor: i64,
+) -> Result<Vec<ContributionRow>, QueueError> {
+    // One keyed load per tid-chunk — the staged set can far exceed a
+    // single bound JSON operand, so the probe pages exactly like the
+    // ranked-key refreshes.
+    let mut operands: std::collections::HashMap<String, RankRow> =
+        std::collections::HashMap::with_capacity(contributions.len());
+    for tids in contributions.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        let ids = enqueue_json(&tids.iter().map(|(tid, _)| tid.clone()).collect::<Vec<_>>())?;
+        let rows = db
+            .query(&format!(
+                "{RANK_SOURCE_SELECT}                  WHERE q.task_id IN (SELECT value FROM json_each(?))"
+            ))
+            .bind(ids)
+            .fetch_all::<RankSourceRow>()
+            .await
+            .map_err(|error| format!("load demand fold operands: {error}"))?;
+        for source in &rows {
+            let row = source.checked()?;
+            operands.insert(row.task_id.clone(), row);
+        }
+    }
+    // The band bound runs on the typed row BEFORE any rank math —
+    // `MAX(0, priority) + post-fold demand` must stay under
+    // `PRIORITY_MAX`, so a delta too large for the task's headroom
+    // names its offenders as a request error while the store is still
+    // untouched, instead of overflowing `raw_value`'s band addition
+    // mid-derivation (stow#522).
+    let mut offending = Vec::new();
+    let mut staged = Vec::with_capacity(contributions.len());
+    for (tid, delta) in contributions {
+        let row = operands.get(tid).ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "demand closure named queue task {tid} that no longer exists"
+            ))
+        })?;
+        let demand = row.demand.checked_add(*delta).ok_or(QueueError::Overflow {
+            field: "task demand fold",
+            value: u64::MAX,
+        })?;
+        if *delta
+            > PRIORITY_MAX
+                .saturating_sub(row.priority.max(0))
+                .saturating_sub(row.demand.max(0))
+        {
+            offending.push(tid.clone());
+            continue;
+        }
+        let value = crate::scheduler::rank::raw_value(
+            &row.lane,
+            &row.dispatch_family,
+            row.priority,
+            demand,
+        );
+        let key = crate::scheduler::rank::dispatch_key(&crate::scheduler::rank::KeyOperands {
+            lane: &row.lane,
+            family: &row.dispatch_family,
+            priority: row.priority,
+            demand,
+            cost_ms: row.cost_ms,
+            first_requested_at: &row.first_requested_at,
+            created_at: &row.created_at,
+            task_id: &row.task_id,
+        });
+        staged.push(ContributionRow {
+            tid: tid.clone(),
+            delta: *delta,
+            value: value.to_string(),
+            key,
+            eligible: u8::from(row.lane == "human" || value >= floor),
+        });
+    }
+    if !offending.is_empty() {
+        return Err(QueueError::Invariant(format!(
+            "demand would overflow the priority band on {} task(s): {}",
+            offending.len(),
+            offending.join(", ")
+        )));
+    }
+    Ok(staged)
+}
+
+/// The largest serialized JSON one staging or preflight statement may
+/// bind: workerd bounds a bound string (and a stored row) at 2 MiB,
+/// so chunks stay under a quarter of that — tens of thousands of rows
+/// per statement, never a giant bound string or a giant ledger row.
+const DEMAND_STAGE_CHUNK_BYTES: usize = 512 * 1024;
+
+/// A staged set split into JSON arrays each under
+/// `DEMAND_STAGE_CHUNK_BYTES` of serialized text — a closure whose
+/// whole snapshot would exceed the platform string bound still lands,
+/// row by row, with nothing truncated. The partition measures each
+/// row's own serialized length, but every chunk is serde-serialized
+/// from the typed rows themselves. Deltas serialize as decimal text
+/// SQLite decodes as INTEGER — no number binds, so a delta above
+/// 2^53 survives the workerd cursor an i64 parameter could not cross.
+fn contribution_chunks(rows: &[ContributionRow]) -> Result<Vec<String>, QueueError> {
+    let mut chunks = Vec::new();
+    let mut start = 0_usize;
+    let mut size = 2_usize; // "[]"
+    for (index, row) in rows.iter().enumerate() {
+        let encoded = serde_json::to_string(row)
+            .map_err(|error| QueueError::Sql(format!("encode contribution row: {error}")))?;
+        let needed = encoded.len() + usize::from(index > start);
+        if size + needed > DEMAND_STAGE_CHUNK_BYTES && index > start {
+            chunks.push(enqueue_json(&rows[start..index])?);
+            start = index;
+            size = 2 + encoded.len();
+        } else {
+            size += needed;
+        }
+    }
+    if start < rows.len() {
+        chunks.push(enqueue_json(&rows[start..])?);
+    }
+    Ok(chunks)
+}
+
+/// The unbuilt tasks one demand entry's closure touches: roots are
+/// every unbuilt row the identity names regardless of `host_side`, and
+/// the recursive step follows each touched row's unmet edges into
+/// unbuilt dep rows. `UNION` dedups the walk, so a task reached
+/// through two roots or two diamond paths appears once and cycles
+/// cannot recur. Task ids are TEXT, so this set crosses the workerd
+/// cursor losslessly.
+async fn demand_closure_tasks(
+    db: &DurableDb,
+    identity: &[String; 5],
+) -> Result<Vec<String>, QueueError> {
+    db.query(&format!(
+        "WITH RECURSIVE walk(task_id) AS ( \
+             SELECT task_id FROM queue \
+             WHERE crate_name = ? AND version = ? AND features_json = ? \
+               AND target = ? AND rustc_version = ? \
+               AND status IN ({UNBUILT_STATUSES}) \
+             UNION \
+             SELECT d.depends_on_task_id \
+             FROM walk w \
+             JOIN queue_dependencies d ON d.task_id = w.task_id AND d.dep_met = 0 \
+             JOIN queue q ON q.task_id = d.depends_on_task_id \
+                AND q.status IN ({UNBUILT_STATUSES}) \
+         ) SELECT task_id FROM walk"
+    ))
+    .bind(identity[0].clone())
+    .bind(identity[1].clone())
+    .bind(identity[2].clone())
+    .bind(identity[3].clone())
+    .bind(identity[4].clone())
+    .fetch_scalars::<String>()
+    .await
+    .map_err(|error| format!("demand closure walk: {error}").into())
 }
 
 /// Status projection read paths use so a dependent parked behind a
@@ -2618,10 +3832,16 @@ async fn claim_dispatchable_row(
 ) -> Result<Option<QueuedTask>, QueueError> {
     let claimed_generation = db
         .query(
+            // `claimed_at` is the immutable claim instant of the
+            // generation just minted — the one timestamp no in-flight
+            // writer may rewrite, so the completion samples a real
+            // claim-to-completion duration even after re-requests
+            // bumped `updated_at` (stow#524).
             "UPDATE queue \
              SET status = 'dispatched', generation_id = lower(hex(randomblob(16))), \
                  dispatch_attempts = dispatch_attempts + 1, \
-                 github_run_id = NULL, updated_at = datetime('now') \
+                 github_run_id = NULL, claimed_at = datetime('now'), \
+                 updated_at = datetime('now') \
              WHERE task_id = ? AND status = 'pending' \
              RETURNING generation_id",
         )
@@ -2898,11 +4118,11 @@ async fn retire_covered_rows(
 /// Upper bound on a claim page's row count — the actual limit is
 /// `min(CLAIM_PAGE_ROWS, 2 × open slots)`, so a pass reads in
 /// proportion to the slots it fills, not to the frontier depth.
-const CLAIM_PAGE_ROWS: i64 = 256;
+pub(super) const CLAIM_PAGE_ROWS: i64 = 256;
 
 /// Pages per claim pass — a frontier deeper than this defers to the
 /// next alarm tick, which the still-full queue reschedules immediately.
-const CLAIM_MAX_PAGES: usize = 8;
+pub(super) const CLAIM_MAX_PAGES: usize = 8;
 
 /// Dispatchable pending rows in claim order, paged through
 /// `idx_queue_dispatch` — the index ordered `(status, deps_met,
@@ -2925,6 +4145,53 @@ const CLAIM_MAX_PAGES: usize = 8;
 /// its open slots and pages again only while that page came back full,
 /// because a family that fills mid-pass is still skipped in Rust and
 /// the walk must see past it.
+/// The production page selection — WHERE terms, family exclusion,
+/// ORDER BY and LIMIT — shared by the paged claim walk and the
+/// floor probe's bounded frontier so the two can't drift (stow#525).
+fn dispatchable_page_sql(columns: &str, full_family: Option<RunnerFamily>) -> String {
+    let family_filter = full_family.map_or_else(String::new, |family| {
+        format!(
+            "AND q.dispatch_family != '{}'",
+            dispatch_family_label(family)
+        )
+    });
+    format!(
+        "SELECT {columns} FROM queue q \
+         WHERE q.status = 'pending' AND q.deps_met = 1 \
+           AND q.dispatch_eligible = 1 \
+           AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
+           AND q.not_before <= datetime('now') \
+           AND q.dispatch_key > ? \
+           {family_filter} \
+         ORDER BY q.dispatch_key \
+         LIMIT ?",
+    )
+}
+
+/// The bounded eligible frontier one claim pass can touch — the first
+/// `CLAIM_PAGE_ROWS * CLAIM_MAX_PAGES` rows of the production page
+/// selection under the live `full_family` — for the floor probe's
+/// pre-image snapshot (stow#525). The paged walk reads contiguous
+/// keyset slices of exactly this ordered set, so the bound covers
+/// every row the pass can open.
+pub(super) async fn select_dispatchable_frontier(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Vec<String>, QueueError> {
+    let active = count_active_by_family(db).await?;
+    let macos_slots = settings
+        .max_concurrent_macos_jobs
+        .saturating_sub(active.of(RunnerFamily::MacOs));
+    let full_family = (macos_slots == 0).then_some(RunnerFamily::MacOs);
+    db.query(&dispatchable_page_sql("q.task_id", full_family))
+        .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes))
+        .bind(String::new())
+        .bind(CLAIM_PAGE_ROWS * i64::try_from(CLAIM_MAX_PAGES).unwrap_or(i64::MAX))
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("select dispatchable frontier: {error}")))
+}
+
 async fn select_dispatchable_page(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -2932,26 +4199,16 @@ async fn select_dispatchable_page(
     after: &str,
     page_rows: i64,
 ) -> Result<Vec<TaskRow>, QueueError> {
-    let family_filter = full_family.map_or_else(String::new, |family| {
-        format!(
-            "AND q.dispatch_family != '{}'",
-            dispatch_family_label(family)
-        )
-    });
-    let sql = format!(
-        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key \
-         FROM queue q \
-         WHERE q.status = 'pending' AND q.deps_met = 1 \
-           AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
-           AND q.not_before <= datetime('now') \
-           AND q.dispatch_key > ? \
-           {family_filter} \
-         ORDER BY q.dispatch_key \
-         LIMIT ?"
+    let sql = dispatchable_page_sql(
+        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key",
+        full_family,
     );
     let cutoff = dispatch_cutoff_modifier(settings.dispatch_min_age_minutes);
     // The keyset cursor: every real key starts with an inverted-value
-    // digit, so '' orders before all of them.
+    // digit, so '' orders before all of them. The admission floor is
+    // the persisted `dispatch_eligible` equality — an index term ahead
+    // of `dispatch_key`, so under-floor rows are outside the range the
+    // walk opens, not rows it visits and rejects.
     db.query(&sql)
         .bind(cutoff)
         .bind(after.to_owned())
@@ -3005,7 +4262,8 @@ pub async fn mark_dispatch_failed(
              wake_at = {wake}, \
              updated_at = datetime('now') \
          WHERE task_id = ? AND generation_id = ? \
-           AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
+           AND status IN ('dispatched', 'running') AND github_run_id IS NULL \
+         RETURNING task_id",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
             wake = wake_at_sql(
@@ -3021,14 +4279,18 @@ pub async fn mark_dispatch_failed(
         .bind(format!("+{backoff_minutes} minutes"))
         .bind(task_id.to_owned())
         .bind(generation_id.to_owned())
-        .execute()
+        .fetch_scalars::<String>()
         .await
         .map_err(|db_error| {
             format!("mark dispatch failed for {task_id} generation {generation_id}: {db_error}")
         })?;
 
-    if updated.rows_written > 0 {
+    if !updated.is_empty() {
         discard_pending_completions(db, task_id, generation_id).await?;
+        // The row re-entered `pending` carrying the rank written
+        // before the last cost move; refresh it through the shared
+        // abstraction, scoped to the row that transitioned.
+        refresh_dispatch_keys(db, &updated).await?;
     }
 
     Ok(())
@@ -3459,12 +4721,17 @@ struct AdminTaskRow {
     updated_at: String,
     blocked_by: Option<String>,
     host_side: i64,
+    /// The persisted `value` projected as TEXT — the column outgrows
+    /// the JS-safe integer range, so a numeric decode would lose the
+    /// tail (stow#525 I10).
+    value: String,
 }
 
 const ADMIN_TASK_COLUMNS: &str = "task_id, crate_name, version, features_json, target, \
      rustc_version, lane, attempt, error_msg, downloads, miss_count, \
      request_count, dispatch_attempts, preserve_lockfile, \
-     github_run_id, first_requested_at, created_at, updated_at, host_side";
+     github_run_id, first_requested_at, created_at, updated_at, host_side, \
+     CAST(value AS TEXT) AS value";
 
 impl AdminTaskRow {
     fn into_queue_task(self) -> Result<QueueTask, QueueError> {
@@ -3514,6 +4781,7 @@ impl AdminTaskRow {
             updated_at: self.updated_at,
             blocked_by: self.blocked_by,
             host_side: self.host_side != 0,
+            value: self.value,
         })
     }
 }
@@ -3521,7 +4789,14 @@ impl AdminTaskRow {
 /// The `WHERE` clause and bound values a [`QueueSelector`] describes. With
 /// a non-empty `task_ids` the ids select the rows; otherwise the filter
 /// predicates apply.
-fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>), QueueError> {
+/// `qualifier` prefixes every column reference (e.g. `q.` when the
+/// predicate runs against an aliased `queue q LEFT JOIN` scan whose
+/// other table shares column names); pass `""` where the bare names
+/// already bind.
+fn selector_predicate(
+    selector: &QueueSelector,
+    qualifier: &str,
+) -> Result<(String, Vec<DbValue>), QueueError> {
     let mut predicates: Vec<String> = Vec::new();
     let mut values: Vec<DbValue> = Vec::new();
     if selector.task_ids.is_empty() {
@@ -3534,30 +4809,30 @@ fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>)
                 // WHERE status = 'pending'` bounds each arm's listing to
                 // its own group, newest first.
                 QueueTaskStatus::Pending | QueueTaskStatus::Blocked => {
-                    predicates.push("status = 'pending'".to_owned());
-                    predicates.push("blocked = ?".to_owned());
+                    predicates.push(format!("{qualifier}status = 'pending'"));
+                    predicates.push(format!("{qualifier}blocked = ?"));
                     values.push(i64::from(matches!(status, QueueTaskStatus::Blocked)).into());
                 }
                 _ => {
-                    predicates.push("status = ?".to_owned());
+                    predicates.push(format!("{qualifier}status = ?"));
                     values.push(status.as_str().into());
                 }
             }
         }
         if let Some(target) = &selector.target {
-            predicates.push("target = ?".to_owned());
+            predicates.push(format!("{qualifier}target = ?"));
             values.push(target.as_str().into());
         }
         if let Some(rustc_version) = &selector.rustc_version {
-            predicates.push("rustc_version = ?".to_owned());
+            predicates.push(format!("{qualifier}rustc_version = ?"));
             values.push(rustc_version.as_str().into());
         }
         if let Some(crate_name) = &selector.crate_name {
-            predicates.push("crate_name = ?".to_owned());
+            predicates.push(format!("{qualifier}crate_name = ?"));
             values.push(crate_name.as_str().into());
         }
         if let Some(older_than_secs) = selector.older_than_secs {
-            predicates.push("updated_at <= datetime('now', ?)".to_owned());
+            predicates.push(format!("{qualifier}updated_at <= datetime('now', ?)"));
             values.push(format!("-{older_than_secs} seconds").into());
         }
         if predicates.is_empty() {
@@ -3565,7 +4840,7 @@ fn selector_predicate(selector: &QueueSelector) -> Result<(String, Vec<DbValue>)
         }
     } else {
         predicates.push(format!(
-            "task_id IN ({})",
+            "{qualifier}task_id IN ({})",
             crate::sql_batch::placeholders(selector.task_ids.len())
         ));
         for task_id in &selector.task_ids {
@@ -3582,7 +4857,7 @@ pub async fn list_tasks(
 ) -> Result<Vec<QueueTask>, QueueError> {
     // A listing accepts a fully empty selector — it means "everything" —
     // so the EmptySelector refusal a mutation gets cannot apply here.
-    let (predicate, values) = match selector_predicate(selector) {
+    let (predicate, values) = match selector_predicate(selector, "") {
         Ok(pair) => pair,
         Err(QueueError::EmptySelector) => (String::new(), Vec::new()),
         Err(error) => return Err(error),
@@ -3643,7 +4918,22 @@ pub async fn apply_mutation(
     mutation: QueueMutation,
     selector: &QueueSelector,
 ) -> Result<u32, QueueError> {
-    let (predicate, values) = selector_predicate(selector)?;
+    // A promote's SELECT joins the stats probe, so its predicate must
+    // qualify against the `queue q` alias; the other verbs run
+    // `UPDATE queue` statements where SQLite takes only bare names.
+    let qualifier = if mutation == QueueMutation::Promote {
+        "q."
+    } else {
+        ""
+    };
+    let (predicate, values) = selector_predicate(selector, qualifier)?;
+    // A promote moves the lane, and the rank abstraction — not a SQL
+    // SET expression — derives the promoted row's pair, so it prices
+    // the matched rows under the human lane in Rust and applies the
+    // move keyed by task id.
+    if mutation == QueueMutation::Promote {
+        return promote_matched(db, &predicate, values).await;
+    }
     let sql = match mutation {
         QueueMutation::Retry => format!(
             // Rows re-enter `pending`: `deps_met` re-derives from the
@@ -3672,25 +4962,7 @@ pub async fn apply_mutation(
              updated_at = datetime('now') \
              WHERE status IN ('pending', 'dispatched') AND {predicate}"
         ),
-        QueueMutation::Promote => format!(
-            // `value`/`dispatch_key` re-derive from the row — but a SET
-            // expression reads the pre-update row, so the lane operand
-            // is the value this statement assigns, 'human', not the
-            // `lane` column it is about to overwrite. The same goes for
-            // `wake_at`: the human lane pays no age gate, so the
-            // promote's wake is the row's `not_before` as-is.
-            "UPDATE queue SET lane = 'human', updated_at = datetime('now'), \
-                 wake_at = not_before, \
-                 value = {value}, dispatch_key = {key} \
-             WHERE status = 'pending' AND lane = 'miss' AND {predicate}",
-            value = value_sql("'human'", "dispatch_family", "priority"),
-            key = dispatch_key_sql(
-                &value_sql("'human'", "dispatch_family", "priority"),
-                "first_requested_at",
-                "created_at",
-                "task_id",
-            )
-        ),
+        QueueMutation::Promote => unreachable!("handled above"),
         QueueMutation::Purge => {
             // A purge needs a concrete age floor: deleting a row that
             // finished a second ago while its run is still reporting
@@ -3721,24 +4993,122 @@ pub async fn apply_mutation(
     // external await separates the mutation, cleanup and dependent refresh.
     // RETURNING keeps both follow-up writes scoped to precisely changed rows.
     if mutation != QueueMutation::Promote && !mutated.is_empty() {
-        let ids = enqueue_json(&mutated)?;
-        db.query(
-            "DELETE FROM pending_run_completions \
-             WHERE task_id IN (SELECT value FROM json_each(?))",
-        )
-        .bind(ids.clone())
-        .execute()
-        .await
-        .map_err(|error| format!("discard pending completions after mutation: {error}"))?;
-        refresh_dependents(
-            db,
-            "SELECT value AS task_id FROM json_each(?)",
-            &[DbValue::Text(ids)],
-        )
-        .await?;
+        // `Retry` moved failed rows back to `pending`; their stored
+        // rank predates the last cost move, so re-price exactly the
+        // transitioned ids through the shared refresh.
+        if mutation == QueueMutation::Retry {
+            refresh_dispatch_keys(db, &mutated).await?;
+        }
+        // A broad filter (Retry/Purge over a large set) can return
+        // more ids than one bound JSON operand should carry — chunk
+        // the event-local follow-up writes at the shared bound like
+        // every keyed batch.
+        for ids in mutated.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+            let ids = enqueue_json(ids)?;
+            db.query(
+                "DELETE FROM pending_run_completions \
+                 WHERE task_id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(ids.clone())
+            .execute()
+            .await
+            .map_err(|error| format!("discard pending completions after mutation: {error}"))?;
+            refresh_dependents(
+                db,
+                "SELECT value AS task_id FROM json_each(?)",
+                &[DbValue::Text(ids)],
+            )
+            .await?;
+        }
     }
     u64_to_u32(
         u64::try_from(mutated.len()).unwrap_or(u64::MAX),
+        "mutated row count",
+    )
+}
+
+/// The `promote` verb's two-statement form: the matched pending
+/// miss-lane rows load losslessly (operands plus their stored pair and
+/// the keyed cost join), the shared rank abstraction prices each under
+/// the human lane, and one keyed statement applies the lane move, the
+/// `not_before` wake (the human lane pays no age gate) and the fresh
+/// pair. The match is the SELECT: its `pending`/`miss` predicates
+/// bound the write's domain to exactly the rows the selector matched,
+/// so the UPDATE's only term is the `task_id` key — the probe shape
+/// `apply_key_updates` already measures; any extra queue predicate
+/// invites a queue-driven plan that scans the table per batch.
+/// `RETURNING` counts the rows actually moved, as every mutation does.
+async fn promote_matched(
+    db: &DurableDb,
+    predicate: &str,
+    values: Vec<DbValue>,
+) -> Result<u32, QueueError> {
+    let select_sql = format!(
+        "{RANK_SOURCE_SELECT} \
+         WHERE q.status = 'pending' AND q.lane = 'miss' AND {predicate}"
+    );
+    let mut select = db.query(&select_sql);
+    for value in values {
+        select = select.bind(value);
+    }
+    let rows = select
+        .fetch_all::<RankSourceRow>()
+        .await
+        .map_err(|error| format!("load rows for promote: {error}"))?;
+    let mut updates: Vec<KeyUpdate> = Vec::with_capacity(rows.len());
+    for source in &rows {
+        let row = source.checked()?;
+        let value = crate::scheduler::rank::raw_value(
+            "human",
+            &row.dispatch_family,
+            row.priority,
+            row.demand,
+        );
+        updates.push(KeyUpdate {
+            task_id: row.task_id.clone(),
+            lane: "human".to_string(),
+            value: value.to_string(),
+            dispatch_key: crate::scheduler::rank::dispatch_key(
+                &crate::scheduler::rank::KeyOperands {
+                    lane: "human",
+                    family: &row.dispatch_family,
+                    priority: row.priority,
+                    demand: row.demand,
+                    cost_ms: row.cost_ms,
+                    first_requested_at: &row.first_requested_at,
+                    created_at: &row.created_at,
+                    task_id: &row.task_id,
+                },
+            ),
+        });
+    }
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    // Chunked like every keyed batch: a promote selector can match
+    // far more rows than one bound JSON operand should carry.
+    let mut mutated = 0_usize;
+    for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        mutated += db
+            .query(
+                "UPDATE queue \
+                 SET lane = 'human', updated_at = datetime('now'), \
+                     wake_at = not_before, \
+                     value = CAST(j.e ->> 'value' AS INTEGER), \
+                     dispatch_key = j.e ->> 'dispatch_key', \
+                     dispatch_eligible = 1 \
+                 FROM (SELECT value AS e FROM json_each(?)) AS j \
+                 WHERE queue.task_id = j.e ->> 'task_id' \
+                 RETURNING task_id",
+            )
+            .bind(enqueue_json(chunk)?)
+            .fetch_scalars::<String>()
+            .await
+            .map_err(|error| format!("apply queue promote: {error}"))?
+            .len();
+    }
+    u64_to_u32(
+        u64::try_from(mutated).unwrap_or(u64::MAX),
         "mutated row count",
     )
 }
@@ -4010,12 +5380,17 @@ async fn earliest_pending_eligible_ms(
     full_family: Option<RunnerFamily>,
     now_ms: i64,
 ) -> Result<Option<i64>, QueueError> {
-    // Two probes over `idx_queue_wake_eligible (status, deps_met,
-    // dispatch_family, wake_at)`: `wake_at` is the persisted earliest
-    // dispatch instant (the lane-aware later of age gate and backoff),
-    // so eligibility collapses to one ordering — no per-lane arms, no
-    // MIN over a CASE. The claim re-checks the live columns, so a stale
-    // wake_at costs at most one wasted pass, never a wrong dispatch.
+    // Two probes over `idx_queue_wake (status, deps_met,
+    // dispatch_eligible, dispatch_family, wake_at)`: `wake_at` is the
+    // persisted earliest dispatch instant (the lane-aware later of age
+    // gate and backoff), so eligibility collapses to one ordering — no
+    // per-lane arms, no MIN over a CASE. The claim re-checks the live
+    // columns, so a stale wake_at costs at most one wasted pass, never
+    // a wrong dispatch. `dispatch_eligible = 1` is the admission
+    // floor's persisted answer (stow#525): equality ahead of the
+    // `wake_at` range means under-floor rows are outside the index
+    // span the probes walk — a queue of them arms nothing immediate
+    // and contributes nothing to the deferred MIN's read set.
     let family_filter = full_family.map_or_else(String::new, |family| {
         format!("AND dispatch_family != '{}'", dispatch_family_label(family))
     });
@@ -4033,6 +5408,7 @@ async fn earliest_pending_eligible_ms(
     let hit = db
         .query(&format!(
             "SELECT 1 FROM queue WHERE status = 'pending' AND deps_met = 1 \
+               AND dispatch_eligible = 1 \
                AND wake_at <= ? {family_filter} LIMIT 1"
         ))
         .bind(now.clone())
@@ -4049,6 +5425,7 @@ async fn earliest_pending_eligible_ms(
         .query(&format!(
             "SELECT CAST(strftime('%s', MIN(wake_at)) AS INTEGER) \
                FROM queue WHERE status = 'pending' AND deps_met = 1 \
+                 AND dispatch_eligible = 1 \
                  AND wake_at > ? {family_filter}"
         ))
         .bind(now)
@@ -4848,7 +6225,7 @@ async fn apply_slice_gate_delta(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 13;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -4894,36 +6271,22 @@ async fn migrate_dispatch_gate(
         migrate_schema(db).await?;
     }
     // The claim-order columns are derived from columns every row
-    // carries — `value`'s lane/family/priority bands and the
-    // `dispatch_key` that orders on it — so one pass backfills both
-    // (`value` came in the version-10 step; a key written under an
-    // older format rebuilds under the current one through the `!=`
-    // guards). `dep_met` replays each edge's slice EXISTS once — the
-    // seed for the per-owner counter — then `unpublished_deps` counts
-    // those flags, `deps_met` is the `= 0` derivation, and
-    // `blocked`/`wake_at` carry their stored expressions. Queue-wide
-    // passes are legal here and only here — this is operations code.
-    // `value`'s family operand comes from `target`, not the
-    // `dispatch_family` column — a SET term reads the pre-update row,
-    // so reading the column here would bake the stale family into the
-    // value this statement assigns.
-    db.query(&format!(
-        "UPDATE queue \
-         SET dispatch_family = {family}, value = {value}, dispatch_key = {key} \
-         WHERE dispatch_family != {family} OR queue.value != {value} \
-            OR dispatch_key != {key}",
-        family = dispatch_family_sql("target"),
-        value = value_sql("lane", &dispatch_family_sql("target"), "priority"),
-        key = dispatch_key_sql(
-            &value_sql("lane", &dispatch_family_sql("target"), "priority"),
-            "first_requested_at",
-            "created_at",
-            "task_id",
-        ),
-    ))
-    .execute()
-    .await
-    .map_err(|error| format!("backfill dispatch keys: {error}"))?;
+    // carries — `value`'s lane/family/priority/demand bands, the
+    // `dispatch_family` from `target`, and the `dispatch_key` that
+    // ranks the exact value/cost ratio — so one pass backfills all
+    // three (`value` came in the version-10 step; a key written under
+    // an older format rebuilds under the current one through the
+    // stored-pair diff). `dep_met` replays each edge's slice EXISTS
+    // once — the seed for the per-owner counter — then
+    // `unpublished_deps` counts those flags, `deps_met` is the `= 0`
+    // derivation, and `blocked`/`wake_at` carry their stored
+    // expressions. Queue-wide passes are legal here and only here —
+    // this is operations code. The pass pages by task id rather than
+    // holding the queue in memory, and each row's family/value/key
+    // derives in the same shared Rust abstraction the writers use —
+    // `dispatch_family` recomputes from `target`, not the stored
+    // column, so a stale family cannot bake into the value it feeds.
+    backfill_rank_pairs(db).await?;
     // Backfill the edge flags first: the counter recount below reads
     // `dep_met`, so edges must carry real answers before it runs. `f`
     // materializes each edge's fresh answer once (`LIMIT -1`) so the
@@ -5023,6 +6386,8 @@ pub async fn migrate(
     migrate_published_slice_columns(db).await?;
     migrate_dispatch_gate(db, settings).await?;
     migrate_generation_identity(db, settings).await?;
+    migrate_dispatch_eligible(db, settings).await?;
+    migrate_demand_ledger(db).await?;
     // Every `migrate_schema` path has applied `schema.sql`, so `settings`
     // exists here. Its `panic` row belonged to the in-Worker circuit
     // breaker the zone's WAF maintenance rules replaced; nothing reads it.
@@ -5205,8 +6570,17 @@ async fn migrate_queue_columns(
             "ALTER TABLE queue ADD COLUMN value INTEGER NOT NULL DEFAULT 0",
         ),
         (
+            "demand",
+            "ALTER TABLE queue ADD COLUMN demand INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
             "dispatch_key",
             "ALTER TABLE queue ADD COLUMN dispatch_key TEXT NOT NULL DEFAULT ''",
+        ),
+        ("claimed_at", "ALTER TABLE queue ADD COLUMN claimed_at TEXT"),
+        (
+            "dispatch_eligible",
+            "ALTER TABLE queue ADD COLUMN dispatch_eligible INTEGER NOT NULL DEFAULT 1",
         ),
     ] {
         if !columns.contains(column) {
@@ -5256,6 +6630,150 @@ async fn migrate_generation_identity(
     .await
     .map_err(|error| format!("backfill queue generation identities: {error}"))?;
 
+    Ok(())
+}
+
+/// The combined schema's dispatch-eligible step (stow#525 I10): the
+/// admission floor becomes a
+/// persisted `dispatch_eligible` answer — `lane = 'human' OR value >=
+/// floor` — maintained by every writer and equality-indexed ahead of
+/// the claim's `dispatch_key` order and the wake probes' `wake_at`
+/// range. The column itself lands in `migrate_queue_columns` (ahead of
+/// the schema include, which creates the replacement indexes); this
+/// step retires the floor-blind index names once the eligible-aware
+/// ones exist — additive-create then drop, inside this operator pass —
+/// and applies the configured floor: the authoritative value is stored
+/// in `settings` as decimal text (every writer's eligibility
+/// expression reads it there, so a changed env binding cannot produce
+/// mixed flags before its migrate runs), then the queue backfills only
+/// when that stored value differs. Re-runs are no-ops — an unchanged
+/// floor backfills nothing and re-stamps nothing. The cost-gate drive
+/// that floors the probe queue reuses this operator path as its
+/// (unmetered) preparation so floor and flags are always consistent.
+pub(super) async fn migrate_dispatch_eligible(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<(), QueueError> {
+    for statement in [
+        "DROP INDEX IF EXISTS idx_queue_dispatch",
+        "DROP INDEX IF EXISTS idx_queue_wake_eligible",
+    ] {
+        db.query(statement)
+            .execute()
+            .await
+            .map_err(|error| format!("retire floor-blind queue index: {error}"))?;
+    }
+    apply_dispatch_floor(db, settings).await
+}
+
+/// The floor application half of [`migrate_dispatch_eligible`] — pure
+/// row work (a stored-floor read, the conditional backfill, the
+/// stamp), no DDL. The operator migrate calls it after retiring the
+/// floor-blind indexes; the cost-gate's floored-pass fixture calls it
+/// directly from an unmetered setup hook so the probe's floor and
+/// flags take the same code path (stow#525).
+pub(super) async fn apply_dispatch_floor(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<(), QueueError> {
+    let stored = db
+        .query("SELECT value FROM settings WHERE key = 'min_dispatch_value'")
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read applied dispatch floor: {error}"))?
+        .map(|raw| raw.parse::<i64>())
+        .transpose()
+        .map_err(|error| format!("parse applied dispatch floor: {error}"))?;
+    if stored != Some(settings.min_dispatch_value) {
+        // The stamp is the pass's success record, so it writes LAST:
+        // the backfill evaluates against the configured floor as its
+        // operand — an i64 literal, since the settings row it must not
+        // read is the row this same pass is about to write — and only a
+        // completed backfill earns the stamp. A statement failure
+        // leaves the pass unstamped, so a retried migrate sees the old
+        // stored value (or none) and runs the full repair again; a
+        // completed pass needs no re-verification because the writers'
+        // flags stayed consistent with the stored value throughout.
+        // This is the caught-statement-failure contract — an
+        // application-level SQL error aborts this function here, with
+        // no claim that earlier or later calls share a transaction.
+        let eligible = dispatch_eligible_at_floor_sql(
+            "lane",
+            "value",
+            &settings.min_dispatch_value.to_string(),
+        );
+        db.query(&format!(
+            "UPDATE queue SET dispatch_eligible = {eligible} \
+             WHERE dispatch_eligible != {eligible}",
+        ))
+        .execute()
+        .await
+        .map_err(|error| format!("backfill dispatch eligibility: {error}"))?;
+        db.query(
+            "INSERT INTO settings (key, value) VALUES ('min_dispatch_value', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(settings.min_dispatch_value.to_string())
+        .execute()
+        .await
+        .map_err(|error| format!("stamp applied dispatch floor: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The demand ledger's runtime piece (stow#522): `demand_batches` and
+/// `demand_contributions` are pure DDL in `schema.sql`, created by
+/// `migrate_schema`'s `schema.sql` application on every path; the step
+/// that remains is the `demand_fold` trigger. The trigger writes only
+/// the staged prepared fields — `delta`, `value`, `dispatch_key`,
+/// `dispatch_eligible` — all of which the demand route computes in
+/// Rust through the shared rank abstraction before staging, so no SQL
+/// ranking formula exists anywhere. The migrate replaces the
+/// definition outright each run — DROP then CREATE — so a redeploy
+/// always carries the current trigger and an obsolete formula-writing
+/// definition an older deploy left cannot survive an `IF NOT EXISTS`.
+async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
+    // The demand ledger tables are entirely new with this schema — no
+    // released state carries a prior shape, so the only compatibility
+    // work here is replacing a stale `demand_fold` trigger definition
+    // before recreating it.
+    db.query("DROP TRIGGER IF EXISTS demand_fold")
+        .execute()
+        .await
+        .map_err(|error| format!("drop draft demand fold trigger: {error}"))?;
+    // Acceptance is one statement: flipping the batch's state to
+    // `accepted` fires this trigger, which folds the whole staged set
+    // into the queue inside that statement — `demand` accumulates the
+    // staged delta while `value`, `dispatch_key` and
+    // `dispatch_eligible` land the event's precomputed answers — then
+    // verifies the staged count reached the accepted count:
+    // `RAISE(ABORT)` on a shortfall rolls the transition AND every
+    // triggered queue effect back out of the same statement. A staged
+    // row naming no queue task simply matches nothing.
+    db.query(
+        "CREATE TRIGGER demand_fold \
+         AFTER UPDATE OF state ON demand_batches \
+         WHEN NEW.state = 'accepted' AND OLD.state = 'prepared' \
+         BEGIN \
+             UPDATE queue \
+             SET demand = queue.demand + c.delta, \
+                 value = CAST(c.value AS INTEGER), \
+                 dispatch_key = c.dispatch_key, \
+                 dispatch_eligible = c.dispatch_eligible \
+             FROM demand_contributions c \
+             WHERE c.batch_id = NEW.batch_id AND queue.task_id = c.task_id \
+               AND (queue.demand != queue.demand + c.delta \
+                    OR queue.value != CAST(c.value AS INTEGER) \
+                    OR queue.dispatch_key != c.dispatch_key \
+                    OR queue.dispatch_eligible != c.dispatch_eligible); \
+             SELECT RAISE(ABORT, 'demand batch staged set short of accepted count') \
+             WHERE (SELECT count(*) FROM demand_contributions c \
+                    WHERE c.batch_id = NEW.batch_id) != NEW.touched_count; \
+         END",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("create demand fold trigger: {error}"))?;
     Ok(())
 }
 
@@ -5704,26 +7222,33 @@ async fn recover_stale_active_tasks(
     // be stale on a stale in-flight row; both recompute in the same
     // statement. `not_before` is untouched, so `wake_at` re-derives
     // from the live columns.
-    db.query(&format!(
-        "UPDATE queue \
-         SET status = 'pending', error_msg = '', deps_met = {deps_met}, \
-             blocked = {blocked}, wake_at = {wake}, \
-             updated_at = datetime('now') \
-         WHERE status IN ('dispatched', 'running') \
-           AND updated_at <= datetime('now', ?)",
-        deps_met = deps_met_sql("queue.task_id"),
-        blocked = blocked_sql("queue.task_id"),
-        wake = wake_at_sql(
-            "lane",
-            "first_requested_at",
-            "not_before",
-            settings.dispatch_min_age_minutes,
-        ),
-    ))
-    .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
-    .execute()
-    .await
-    .map_err(|error| format!("recover stale active tasks: {error}"))?;
+    let recovered = db
+        .query(&format!(
+            "UPDATE queue \
+             SET status = 'pending', error_msg = '', deps_met = {deps_met}, \
+                 blocked = {blocked}, wake_at = {wake}, \
+                 updated_at = datetime('now') \
+             WHERE status IN ('dispatched', 'running') \
+               AND updated_at <= datetime('now', ?) \
+             RETURNING task_id",
+            deps_met = deps_met_sql("queue.task_id"),
+            blocked = blocked_sql("queue.task_id"),
+            wake = wake_at_sql(
+                "lane",
+                "first_requested_at",
+                "not_before",
+                settings.dispatch_min_age_minutes,
+            ),
+        ))
+        .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("recover stale active tasks: {error}"))?;
+    if !recovered.is_empty() {
+        // Re-entered `pending` rows carry the rank written before the
+        // last cost move; re-price exactly the transitioned ids.
+        refresh_dispatch_keys(db, &recovered).await?;
+    }
     Ok(())
 }
 
@@ -5758,10 +7283,11 @@ async fn requeue_incomplete_shape_deps(
     // stale on a completed row; both recompute in the same statement,
     // alongside the `not_before` bump's `wake_at`.
     let next_not_before = "MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes'))";
-    db.query(&format!(
-        "UPDATE queue \
-         SET status = 'pending', \
-             attempt = attempt + 1, \
+    let requeued = db
+        .query(&format!(
+            "UPDATE queue \
+             SET status = 'pending', \
+                 attempt = attempt + 1, \
              error_msg = '', \
              request_count = request_count + 1, \
              deps_met = {deps_met}, \
@@ -5778,19 +7304,25 @@ async fn requeue_incomplete_shape_deps(
                WHERE d.depends_on_task_id = queue.task_id \
                  AND d.dep_crate_name != '' AND d.dep_host_side >= 0 \
                  AND d.dep_met = 0 \
-           )",
-        deps_met = deps_met_sql("queue.task_id"),
-        blocked = blocked_sql("queue.task_id"),
-        wake = wake_at_sql(
-            "lane",
-            "first_requested_at",
-            next_not_before,
-            settings.dispatch_min_age_minutes,
-        ),
-    ))
-    .execute()
-    .await
-    .map_err(|error| format!("requeue shape-incomplete dependencies: {error}"))?;
+           ) \
+         RETURNING task_id",
+            deps_met = deps_met_sql("queue.task_id"),
+            blocked = blocked_sql("queue.task_id"),
+            wake = wake_at_sql(
+                "lane",
+                "first_requested_at",
+                next_not_before,
+                settings.dispatch_min_age_minutes,
+            ),
+        ))
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("requeue shape-incomplete dependencies: {error}"))?;
+    if !requeued.is_empty() {
+        // Re-entered `pending` rows carry the rank written before the
+        // last cost move; re-price exactly the transitioned ids.
+        refresh_dispatch_keys(db, &requeued).await?;
+    }
     Ok(())
 }
 
@@ -5836,7 +7368,7 @@ async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueE
     Ok(ActiveByFamily { total, by_family })
 }
 
-fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
+pub(super) fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
     format!("-{dispatch_min_age_minutes} minutes")
 }
 
@@ -5923,6 +7455,7 @@ struct PendingCompletionRow {
     task_id: String,
     success: i64,
     error: Option<String>,
+    received_at: String,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -6176,7 +7709,9 @@ mod sqlite_tests {
         task_id,
     };
     use crate::errors::QueueError;
-    use crate::scheduler::test_db::{counting_memory_db, memory_db, memory_db_raw};
+    use crate::scheduler::test_db::{
+        StatementLog, counting_memory_db, counting_memory_db_raw, memory_db, memory_db_raw,
+    };
     use skyzen_services::durable::DurableDb;
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
@@ -6233,6 +7768,7 @@ mod sqlite_tests {
             stale_dispatch_minutes: STALE_DISPATCH_MINUTES,
             max_queue_pending: 2_000,
             human_daily_task_budget: 2_000,
+            min_dispatch_value: 0,
         }
     }
 
@@ -6803,8 +8339,10 @@ mod sqlite_tests {
     async fn value_extremes_stay_within_i64_and_order() {
         #[derive(skyzen::FromRow)]
         struct ValueRow {
-            value: i64,
+            value: String,
             key: String,
+            first_requested_at: String,
+            created_at: String,
         }
         let db = memory_db().await.expect("memory db");
         enqueue(
@@ -6819,8 +8357,8 @@ mod sqlite_tests {
         )
         .await
         .expect("enqueue");
-        db.query("UPDATE queue SET priority = ? WHERE task_id = ?")
-            .bind(super::PRIORITY_MAX)
+        db.query("UPDATE queue SET priority = CAST(? AS INTEGER) WHERE task_id = ?")
+            .bind(super::PRIORITY_MAX.to_string())
             .bind(task_id_on("max", WINDOWS_TARGET))
             .execute()
             .await
@@ -6829,23 +8367,665 @@ mod sqlite_tests {
             .await
             .expect("refresh claim order");
         let row = db
-            .query("SELECT value, dispatch_key AS key FROM queue WHERE task_id = ?")
+            .query(
+                "SELECT CAST(value AS TEXT) AS value, dispatch_key AS key, \
+                        first_requested_at, created_at \
+                 FROM queue WHERE task_id = ?",
+            )
             .bind(task_id_on("max", WINDOWS_TARGET))
             .fetch_one::<ValueRow>()
             .await
             .expect("value row");
         assert_eq!(
-            row.value,
+            row.value.parse::<i64>().expect("integer value"),
             3 * super::VALUE_BAND + super::PRIORITY_MAX,
             "human + windows + PRIORITY_MAX is the largest legal value"
         );
-        // The persisted key's inverted field stays non-negative, so the
-        // text sort is still the numeric descent.
-        assert!(row.key.starts_with('9'));
+        // The stored key is byte-exact the shared abstraction's output
+        // for the same operands — human lane prefix first.
+        assert_eq!(
+            row.key,
+            crate::scheduler::rank::dispatch_key(&crate::scheduler::rank::KeyOperands {
+                lane: "human",
+                family: "windows",
+                priority: super::PRIORITY_MAX,
+                demand: 0,
+                cost_ms: crate::scheduler::rank::UNMEASURED_COST,
+                first_requested_at: &row.first_requested_at,
+                created_at: &row.created_at,
+                task_id: &task_id_on("max", WINDOWS_TARGET),
+            },)
+        );
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         assert_eq!(claimed[0].crate_name, "max");
+    }
+
+    #[derive(skyzen::FromRow)]
+    struct KeyOrder {
+        crate_name: String,
+    }
+
+    /// The claimed rows' crate names, sorted — floor tests compare
+    /// sets where the persisted order is separately covered.
+    async fn claimed_names(db: &DurableDb, settings: &SchedulerSettings) -> Vec<String> {
+        let mut names: Vec<String> = super::claim_dispatchable_tasks(db, settings, &NoCoverage)
+            .await
+            .expect("claim")
+            .iter()
+            .map(|task| task.crate_name.as_str().to_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Write the authoritative floor the writers' eligibility
+    /// expression reads — the `settings` row the operator migrate
+    /// stamps (stow#525 I10).
+    async fn set_floor(db: &DurableDb, floor: i64) {
+        db.query(
+            "INSERT INTO settings (key, value) VALUES ('min_dispatch_value', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(floor.to_string())
+        .execute()
+        .await
+        .expect("set dispatch floor");
+    }
+
+    /// The persisted admission answer on one row.
+    async fn flag_of(db: &DurableDb, crate_name: &str) -> i64 {
+        db.query("SELECT dispatch_eligible FROM queue WHERE crate_name = ?")
+            .bind(crate_name.to_owned())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("dispatch_eligible")
+    }
+
+    /// The claim admits only rows whose persisted eligibility the floor
+    /// passed: at `floor = VALUE_BAND` a Windows miss (one band) claims
+    /// while a zero-value Linux miss stays under, and a floor one over
+    /// the band writes `dispatch_eligible = 0` onto every miss row
+    /// (stow#525 I10).
+    #[tokio::test]
+    async fn floor_admits_only_scored_rows() {
+        let db = memory_db().await.expect("memory db");
+        set_floor(&db, super::VALUE_BAND).await;
+        enqueue(
+            &db,
+            &[
+                request("lin", Vec::new()),
+                request_on("win", WINDOWS_TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        set_first_requested_at(&db, "lin", PAST_TS).await;
+        set_first_requested_at_on(
+            &db,
+            "win",
+            WINDOWS_TARGET,
+            PAST_TS,
+            settings().dispatch_min_age_minutes,
+        )
+        .await;
+        assert_eq!(claimed_names(&db, &claim_settings()).await, ["win"]);
+        assert_eq!(flag_of(&db, "lin").await, 0);
+        // `win` is dispatched now; with only the value-0 `lin` left,
+        // even a fresh claim page admits nothing.
+        assert_eq!(
+            claimed_names(&db, &claim_settings()).await,
+            Vec::<String>::new()
+        );
+
+        // One band over the floor: a second queue floors every
+        // miss-lane row, including the Windows band.
+        let db = memory_db().await.expect("memory db");
+        set_floor(&db, super::VALUE_BAND + 1).await;
+        enqueue(
+            &db,
+            &[
+                request("lin", Vec::new()),
+                request_on("win", WINDOWS_TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        set_first_requested_at(&db, "lin", PAST_TS).await;
+        set_first_requested_at_on(
+            &db,
+            "win",
+            WINDOWS_TARGET,
+            PAST_TS,
+            settings().dispatch_min_age_minutes,
+        )
+        .await;
+        assert_eq!(flag_of(&db, "win").await, 0);
+        assert_eq!(
+            claimed_names(&db, &claim_settings()).await,
+            Vec::<String>::new()
+        );
+    }
+
+    /// A human-lane row is exempt from any floor — even `i64::MAX` —
+    /// because the flag's lane clause wins before the score compares,
+    /// while the miss lane is held entirely below it (stow#525 I10).
+    #[tokio::test]
+    async fn floor_never_blocks_the_human_lane() {
+        let db = memory_db().await.expect("memory db");
+        set_floor(&db, i64::MAX).await;
+        enqueue(
+            &db,
+            &[
+                EnqueueRequest {
+                    source: EnqueueSource::HumanRequest,
+                    ..request("human", Vec::new())
+                },
+                request("miss", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        let names = claimed
+            .iter()
+            .map(|task| task.crate_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["human"], "only the exempt lane clears i64::MAX");
+        assert_eq!(flag_of(&db, "miss").await, 0);
+    }
+
+    /// Equal scores tie on the persisted tuple exactly as before the
+    /// floor existed: admitted rows claim in stored `dispatch_key`
+    /// order, and an under-floor row does not stretch or reorder them
+    /// (stow#525 I10).
+    #[tokio::test]
+    async fn floor_preserves_the_tie_order() {
+        let db = memory_db().await.expect("memory db");
+        // Three Windows misses share one band — the three-way value
+        // tie — beside one Linux miss the floor excludes.
+        set_floor(&db, super::VALUE_BAND).await;
+        enqueue(
+            &db,
+            &[
+                request_on("cee", WINDOWS_TARGET, Vec::new()),
+                request_on("aye", WINDOWS_TARGET, Vec::new()),
+                request_on("bee", WINDOWS_TARGET, Vec::new()),
+                request("lin", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        for name in ["cee", "aye", "bee"] {
+            set_first_requested_at_on(
+                &db,
+                name,
+                WINDOWS_TARGET,
+                PAST_TS,
+                settings().dispatch_min_age_minutes,
+            )
+            .await;
+        }
+
+        let expected = db
+            .query(
+                "SELECT crate_name FROM queue WHERE status = 'pending' \
+                 ORDER BY dispatch_key LIMIT 3",
+            )
+            .fetch_all::<KeyOrder>()
+            .await
+            .expect("stored key order")
+            .into_iter()
+            .map(|row| row.crate_name)
+            .collect::<Vec<_>>();
+
+        let page = SchedulerSettings {
+            dispatch_min_age_minutes: 0,
+            ..settings()
+        };
+        let claimed = super::claim_dispatchable_tasks(&db, &page, &NoCoverage)
+            .await
+            .expect("claim");
+        let names = claimed
+            .iter()
+            .map(|task| task.crate_name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected, "claims arrive in the stored key order");
+        assert_eq!(names.len(), 3, "the Linux miss stays under the floor");
+    }
+
+    /// An under-floor row is no wake's reason to arm: the ready probe
+    /// and the deferred `MIN(wake_at)` probe both exclude it, so a
+    /// queue of only under-floor rows leaves the alarm disarmed instead
+    /// of spinning an empty dispatch loop (stow#525 I10).
+    #[tokio::test]
+    async fn under_floor_rows_never_arm_the_alarm() {
+        // Without a floor the row is eligible now — the alarm arms at
+        // `now`.
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("low", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "low", PAST_TS).await;
+        let armed = next_alarm(&db, ROW_TS_MS, &claim_settings())
+            .await
+            .expect("next_alarm unfloored");
+        assert_eq!(armed, AlarmPlan::At(ROW_TS_MS));
+
+        // Under a floor the same row admits nothing and defers
+        // nothing: both wake probes exclude it, and no stale lease or
+        // requeue arm exists either.
+        let db = memory_db().await.expect("memory db");
+        set_floor(&db, 1).await;
+        enqueue(&db, &[request("low", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "low", PAST_TS).await;
+        let plan = next_alarm(&db, ROW_TS_MS, &claim_settings())
+            .await
+            .expect("next_alarm floored");
+        assert_eq!(plan, AlarmPlan::Delete);
+        assert!(
+            super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+                .await
+                .expect("claim")
+                .is_empty()
+        );
+    }
+
+    /// A bulk of under-floor rows — immediate and deferred wakes
+    /// alike — contributes no candidate to the claim page and arms no
+    /// alarm, and the one eligible row that lands among them still
+    /// claims: the equality predicate excludes the bulk inside the
+    /// index span, never as page entries the walk visits and rejects
+    /// (stow#525 I10).
+    #[tokio::test]
+    async fn under_floor_bulk_arms_no_wake_and_starves_no_page() {
+        let db = memory_db().await.expect("memory db");
+        set_floor(&db, 1).await;
+        let bulk = (0..300)
+            .map(|n| request(&format!("under{n}"), Vec::new()))
+            .collect::<Vec<_>>();
+        enqueue(&db, &bulk).await.expect("enqueue under-floor bulk");
+        // Half the bulk parks behind a future wake — immediate and
+        // deferred under-floor rows alike must leave the probes' span.
+        db.query(
+            "UPDATE queue SET wake_at = datetime('now', '+30 minutes') \
+             WHERE crate_name >= 'under2'",
+        )
+        .execute()
+        .await
+        .expect("defer part of the bulk");
+        assert_eq!(
+            next_alarm(&db, ROW_TS_MS, &claim_settings())
+                .await
+                .expect("next_alarm over the bulk"),
+            AlarmPlan::Delete,
+            "300 under-floor rows arm nothing"
+        );
+        assert_eq!(
+            claimed_names(&db, &claim_settings()).await,
+            Vec::<String>::new()
+        );
+        // The one row over the floor claims on the first page —
+        // the floor is an index equality, not a scan the bulk can starve.
+        enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
+            .await
+            .expect("enqueue the eligible row");
+        set_first_requested_at_on(
+            &db,
+            "win",
+            WINDOWS_TARGET,
+            PAST_TS,
+            settings().dispatch_min_age_minutes,
+        )
+        .await;
+        assert_eq!(claimed_names(&db, &claim_settings()).await, ["win"]);
+    }
+
+    /// Demand that raises a row's score across the floor flips the
+    /// persisted flag with it: the batched update's `priority`
+    /// recomputation flows through the claim-order refresh, which
+    /// rewrites `value`, `dispatch_key` and `dispatch_eligible`
+    /// together (stow#525 I10).
+    #[tokio::test]
+    async fn demand_can_cross_the_floor() {
+        let db = memory_db().await.expect("memory db");
+        set_floor(&db, 1).await;
+        enqueue(&db, &[request("rise", Vec::new())])
+            .await
+            .expect("enqueue");
+        set_first_requested_at(&db, "rise", PAST_TS).await;
+        assert_eq!(flag_of(&db, "rise").await, 0);
+
+        super::apply_batched_updates(
+            &db,
+            &settings(),
+            &[super::BatchedUpdate {
+                task_id: task_id_on("rise", TARGET),
+                occurrences: 1,
+                // `priority = downloads / 1000` reaches 1 — exactly the
+                // floor, the boundary the flag must take.
+                downloads: 1_000,
+                redispatch: 0,
+                human: 0,
+            }],
+        )
+        .await
+        .expect("demand update");
+        assert_eq!(flag_of(&db, "rise").await, 1);
+        assert_eq!(claimed_names(&db, &claim_settings()).await, ["rise"]);
+    }
+
+    /// A promoted row gains the human lane's exemption in the same
+    /// statement that moves its lane — an under-floor miss claims the
+    /// moment it is human (stow#525 I10).
+    #[tokio::test]
+    async fn promotion_grants_the_human_exemption() {
+        let db = memory_db().await.expect("memory db");
+        set_floor(&db, 1).await;
+        enqueue(&db, &[request("prom", Vec::new())])
+            .await
+            .expect("enqueue");
+        assert_eq!(flag_of(&db, "prom").await, 0);
+
+        let mutated = super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Promote,
+            &super::QueueSelector {
+                task_ids: vec![task_id_on("prom", TARGET)],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("promote");
+        assert_eq!(mutated, 1);
+        assert_eq!(flag_of(&db, "prom").await, 1);
+        set_first_requested_at(&db, "prom", PAST_TS).await;
+        assert_eq!(claimed_names(&db, &claim_settings()).await, ["prom"]);
+    }
+
+    /// A retried row keeps its persisted answer — retry rewrites
+    /// status, `not_before` and `wake_at`, never the flag (stow#525
+    /// I10).
+    #[tokio::test]
+    async fn retry_preserves_the_eligibility_flag() {
+        let db = memory_db().await.expect("memory db");
+        set_floor(&db, 1).await;
+        enqueue(
+            &db,
+            &[
+                request("low", Vec::new()),
+                request_on("win", WINDOWS_TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        for name in ["low", "win"] {
+            db.query("UPDATE queue SET status = 'failed' WHERE crate_name = ?")
+                .bind(name.to_owned())
+                .execute()
+                .await
+                .expect("park the row failed");
+        }
+        let selector = super::QueueSelector {
+            task_ids: vec![task_id_on("low", TARGET), task_id_on("win", WINDOWS_TARGET)],
+            ..Default::default()
+        };
+        assert_eq!(
+            super::apply_mutation(&db, &settings(), super::QueueMutation::Retry, &selector)
+                .await
+                .expect("retry"),
+            2
+        );
+        assert_eq!(flag_of(&db, "low").await, 0);
+        assert_eq!(flag_of(&db, "win").await, 1);
+        set_first_requested_at_on(
+            &db,
+            "win",
+            WINDOWS_TARGET,
+            PAST_TS,
+            settings().dispatch_min_age_minutes,
+        )
+        .await;
+        assert_eq!(claimed_names(&db, &claim_settings()).await, ["win"]);
+    }
+
+    /// The operator floor move: `migrate` stamps the configured value
+    /// into `settings` and backfills `dispatch_eligible` — under-floor
+    /// rows lose the flag, the boundary and the exempt lane keep it,
+    /// and the stamped row is the value every writer reads from then
+    /// on (stow#525 I10).
+    #[tokio::test]
+    async fn operator_floor_change_backfills_eligibility() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        super::migrate(&db, &settings()).await.expect("migrate");
+        enqueue(
+            &db,
+            &[
+                request("lin", Vec::new()),
+                request_on("win", WINDOWS_TARGET, Vec::new()),
+                EnqueueRequest {
+                    source: EnqueueSource::HumanRequest,
+                    ..request("human", Vec::new())
+                },
+            ],
+        )
+        .await
+        .expect("enqueue");
+        assert_eq!(flag_of(&db, "lin").await, 1, "no floor admits all");
+
+        let floor = |min_dispatch_value| SchedulerSettings {
+            min_dispatch_value,
+            ..settings()
+        };
+        // Raise the floor to one band: the Linux miss drops out, the
+        // band row sits exactly at the floor, the human row is exempt.
+        super::migrate_dispatch_eligible(&db, &floor(super::VALUE_BAND))
+            .await
+            .expect("apply floor");
+        assert_eq!(flag_of(&db, "lin").await, 0);
+        assert_eq!(flag_of(&db, "win").await, 1);
+        assert_eq!(flag_of(&db, "human").await, 1);
+        // A second pass with the same floor is a no-op — and a higher
+        // floor floors the band too while the human stays.
+        super::migrate_dispatch_eligible(&db, &floor(super::VALUE_BAND))
+            .await
+            .expect("idempotent pass");
+        super::migrate_dispatch_eligible(&db, &floor(super::VALUE_BAND + 1))
+            .await
+            .expect("raise floor");
+        assert_eq!(flag_of(&db, "win").await, 0);
+        assert_eq!(flag_of(&db, "human").await, 1);
+    }
+
+    /// A caught mid-pass failure leaves no stamp, so a retried
+    /// operator migrate at the same floor still repairs: the backfill
+    /// must not have committed flags against a floor the settings row
+    /// was allowed to skip (stow#525 I10).
+    #[tokio::test]
+    async fn failed_backfill_retries_under_the_same_floor() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        super::migrate(&db, &settings()).await.expect("migrate");
+        enqueue(
+            &db,
+            &[
+                request("lin", Vec::new()),
+                request_on("win", WINDOWS_TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        // Kill every queue UPDATE — the backfill's statement fails
+        // before the stamp it was supposed to earn.
+        db.query(
+            "CREATE TRIGGER fail_backfill BEFORE UPDATE ON queue \
+             BEGIN SELECT RAISE(ABORT, 'injected backfill failure'); END",
+        )
+        .execute()
+        .await
+        .expect("install failure trigger");
+        let floored = SchedulerSettings {
+            min_dispatch_value: 1,
+            ..settings()
+        };
+        super::migrate_dispatch_eligible(&db, &floored)
+            .await
+            .expect_err("injected failure must abort the pass");
+        // The pass recorded no stamp for the floor it was applying —
+        // the last-applied floor ("0", from the schema-building
+        // migrate) survives, so a retry still sees floor 1 as
+        // unapplied rather than skipping the backfill over stale flags.
+        let stamped: Option<String> = db
+            .query("SELECT value FROM settings WHERE key = 'min_dispatch_value'")
+            .fetch_scalar_optional::<String>()
+            .await
+            .expect("read stamped floor");
+        assert_eq!(
+            stamped.as_deref(),
+            Some("0"),
+            "a failed pass must not stamp"
+        );
+        db.query("DROP TRIGGER fail_backfill")
+            .execute()
+            .await
+            .expect("remove failure trigger");
+        // Same-floor retry converges: backfill repairs flags, then the
+        // stamp lands.
+        super::migrate_dispatch_eligible(&db, &floored)
+            .await
+            .expect("retried migrate");
+        assert_eq!(flag_of(&db, "lin").await, 0);
+        assert_eq!(flag_of(&db, "win").await, 1);
+        let stamped: Option<String> = db
+            .query("SELECT value FROM settings WHERE key = 'min_dispatch_value'")
+            .fetch_scalar_optional::<String>()
+            .await
+            .expect("read stamped floor");
+        assert_eq!(stamped.as_deref(), Some("1"));
+    }
+
+    /// A queue at the prior schema version — `dispatch_eligible`
+    /// missing and the floor-blind index names live — gains the
+    /// column, the eligible-aware indexes and the stamped floor in one
+    /// operator pass (stow#525 I10).
+    #[tokio::test]
+    async fn migrate_recovers_the_prior_schema() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        super::migrate(&db, &settings()).await.expect("migrate");
+        enqueue(
+            &db,
+            &[
+                request("lin", Vec::new()),
+                request_on("win", WINDOWS_TARGET, Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        // Roll the database back to the pre-12 shape: no column, the
+        // old index names on their old column lists, the old stamp.
+        for statement in [
+            "DROP INDEX idx_queue_claim",
+            "DROP INDEX idx_queue_wake",
+            // The pre-13 trigger carried no eligibility write — drop
+            // it rather than leave a definition that references the
+            // column being removed.
+            "DROP TRIGGER demand_fold",
+            "ALTER TABLE queue DROP COLUMN dispatch_eligible",
+            "CREATE INDEX idx_queue_dispatch ON queue \
+             (status, deps_met, dispatch_key, dispatch_family, lane, first_requested_at, not_before)",
+            "CREATE INDEX idx_queue_wake_eligible ON queue \
+             (status, deps_met, dispatch_family, wake_at)",
+            "UPDATE scheduler_schema_version SET version = 11",
+        ] {
+            db.query(statement)
+                .execute()
+                .await
+                .expect("stage the prior schema");
+        }
+        let floored = SchedulerSettings {
+            min_dispatch_value: 1,
+            ..settings()
+        };
+        let report = super::migrate(&db, &floored).await.expect("migrate");
+        assert_eq!((report.before, report.after), (11, super::SCHEMA_VERSION));
+        assert_eq!(flag_of(&db, "lin").await, 0);
+        assert_eq!(flag_of(&db, "win").await, 1);
+        let names = db
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND name LIKE 'idx_queue_%'",
+            )
+            .fetch_scalars::<String>()
+            .await
+            .expect("index names");
+        assert!(names.iter().any(|name| name == "idx_queue_claim"));
+        assert!(names.iter().any(|name| name == "idx_queue_wake"));
+        assert!(!names.iter().any(|name| name == "idx_queue_dispatch"));
+        assert!(!names.iter().any(|name| name == "idx_queue_wake_eligible"));
+    }
+
+    /// `QueueTask.value` is the column's exact decimal text — adjacent
+    /// scores above the JS-safe integer range round-trip through the
+    /// row projection and out over the JSON wire without rounding,
+    /// clamping, or a trailing `.0` (stow#525 I10).
+    #[tokio::test]
+    async fn list_tasks_reports_value_as_exact_decimal() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("wide-a", Vec::new()), request("wide-b", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        // Literals inside the statement text parse as i64 in SQLite —
+        // the only wide-integer channel, since a bound parameter would
+        // cross the lossy numeric transport.
+        for (name, literal) in [
+            ("wide-a", "36893574046765006"),
+            ("wide-b", "36893574046765007"),
+        ] {
+            db.query(&format!(
+                "UPDATE queue SET value = {literal} WHERE task_id = ?"
+            ))
+            .bind(task_id_on(name, TARGET))
+            .execute()
+            .await
+            .expect("set wide value");
+        }
+
+        let tasks = super::list_tasks(&db, &super::QueueSelector::default())
+            .await
+            .expect("list tasks");
+        let mut values = tasks
+            .iter()
+            .map(|task| (task.crate_name.as_str(), task.value.as_str()))
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            [
+                ("wide-a", "36893574046765006"),
+                ("wide-b", "36893574046765007")
+            ],
+            "adjacent >2^53 scores arrive digit-for-digit"
+        );
+        // The wire shape is a JSON string, not a number an f64 decoder
+        // could truncate.
+        let wide_b = tasks
+            .iter()
+            .find(|task| task.crate_name.as_str() == "wide-b")
+            .expect("wide-b listed");
+        let serialized = serde_json::to_string(wide_b).expect("serialize task");
+        assert!(
+            serialized.contains("\"value\":\"36893574046765007\""),
+            "the score serializes as decimal text: {serialized}"
+        );
     }
 
     /// A row migrated from a pre-`value` queue (the column still at its
@@ -6881,16 +9061,1350 @@ mod sqlite_tests {
         super::migrate(&db, &settings()).await.expect("migrate");
 
         let drifted = db
-            .query(&format!(
-                "SELECT count(*) AS n FROM queue \
-                 WHERE value != ({}) OR dispatch_key != ({})",
-                super::value_row_sql(),
-                super::dispatch_key_row_sql()
-            ))
+            .query(super::RANK_SOURCE_SELECT)
+            .fetch_all::<super::RankSourceRow>()
+            .await
+            .expect("load migrated rows")
+            .iter()
+            .map(|row| row.checked().expect("checked rank row"))
+            .filter(|row| {
+                let family = crate::scheduler::rank::dispatch_family(&row.target);
+                family != row.dispatch_family
+                    || crate::scheduler::rank::raw_value(
+                        &row.lane,
+                        family,
+                        row.priority,
+                        row.demand,
+                    ) != row.value
+                    || crate::scheduler::rank::dispatch_key(&crate::scheduler::rank::KeyOperands {
+                        lane: &row.lane,
+                        family,
+                        priority: row.priority,
+                        demand: row.demand,
+                        cost_ms: row.cost_ms,
+                        first_requested_at: &row.first_requested_at,
+                        created_at: &row.created_at,
+                        task_id: &row.task_id,
+                    }) != row.dispatch_key
+            })
+            .count();
+        assert_eq!(
+            drifted, 0,
+            "every row carries the shared abstraction's pair"
+        );
+    }
+
+    // stow#522 I7 — keyed demand application.
+
+    fn demand_entry_on(
+        crate_name: &str,
+        target: &str,
+        delta: u64,
+    ) -> stow_types::api::SchedulerDemandEntry {
+        stow_types::api::SchedulerDemandEntry {
+            crate_name: crate_name.parse().expect("demand crate"),
+            version: VERSION.parse().expect("demand version"),
+            features_json: FeaturesJson::default(),
+            target: target.parse().expect("demand target"),
+            rustc_version: RUSTC.parse().expect("demand rustc"),
+            demand: delta,
+        }
+    }
+
+    fn demand_entry(crate_name: &str, delta: u64) -> stow_types::api::SchedulerDemandEntry {
+        demand_entry_on(crate_name, TARGET, delta)
+    }
+
+    fn demand_batch(
+        batch_id: &str,
+        entries: Vec<stow_types::api::SchedulerDemandEntry>,
+    ) -> stow_types::api::SchedulerDemandRequest {
+        stow_types::api::SchedulerDemandRequest {
+            batch_id: batch_id.to_owned(),
+            entries,
+        }
+    }
+
+    async fn apply(
+        db: &DurableDb,
+        batch_id: &str,
+        entries: Vec<stow_types::api::SchedulerDemandEntry>,
+    ) -> Result<stow_types::api::SchedulerDemandReport, QueueError> {
+        super::apply_demand(db, &demand_batch(batch_id, entries)).await
+    }
+
+    async fn demand_of(db: &DurableDb, task_id: &str) -> i64 {
+        db.query("SELECT demand FROM queue WHERE task_id = ?")
+            .bind(task_id.to_owned())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("demand read")
+    }
+
+    async fn contribution_rows(db: &DurableDb, batch_id: &str) -> u64 {
+        db.query("SELECT count(*) FROM demand_contributions WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
             .fetch_scalar::<u64>()
             .await
-            .expect("count drifted rows");
-        assert_eq!(drifted, 0, "every row carries the current formula");
+            .expect("contribution count")
+    }
+
+    /// Demand lands on the named node and walks its whole unbuilt
+    /// dependency closure; unrelated rows stay at zero (stow#522).
+    #[tokio::test]
+    async fn demand_walks_the_unbuilt_dependency_closure() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("mid", vec![dependency("leaf")]),
+                request("root", vec![dependency("mid")]),
+                request("other", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        let report = apply(&db, "h0", vec![demand_entry("root", 5)])
+            .await
+            .expect("demand");
+        assert!(report.applied);
+        assert_eq!(report.touched_tasks, 3);
+        for name in ["root", "mid", "leaf"] {
+            assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 5, "{name}");
+        }
+        assert_eq!(demand_of(&db, &task_id_on("other", TARGET)).await, 0);
+        // The closure's value rows carry the delta — the ordering
+        // operand, not a side column.
+        let value = db
+            .query("SELECT value FROM queue WHERE task_id = ?")
+            .bind(task_id_on("leaf", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("value read");
+        assert_eq!(value, 5, "miss row: bands and priority are 0");
+    }
+
+    /// A diamond — root reaches `c` through both `a` and `b` — applies
+    /// the delta once per task, and the walk dedup is visible in the
+    /// contribution rows too (stow#522).
+    #[tokio::test]
+    async fn demand_dedupes_diamond_paths() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("c", Vec::new()),
+                request("a", vec![dependency("c")]),
+                request("b", vec![dependency("c")]),
+                request("root", vec![dependency("a"), dependency("b")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        let report = apply(&db, "h0", vec![demand_entry("root", 7)])
+            .await
+            .expect("demand");
+        assert_eq!(report.touched_tasks, 4);
+        assert_eq!(demand_of(&db, &task_id_on("c", TARGET)).await, 7);
+        assert_eq!(contribution_rows(&db, "h0").await, 4);
+    }
+
+    /// One entry names a node identity without its side: both the
+    /// target-side and the host-side queue rows of that identity are
+    /// touched (stow#522).
+    #[tokio::test]
+    async fn demand_touches_both_compile_sides_of_one_identity() {
+        let db = memory_db().await.expect("memory db");
+        let host = EnqueueRequest {
+            host_side: true,
+            ..request("dual", Vec::new())
+        };
+        enqueue(&db, &[request("dual", Vec::new()), host])
+            .await
+            .expect("enqueue");
+
+        let report = apply(&db, "h0", vec![demand_entry("dual", 3)])
+            .await
+            .expect("demand");
+        assert_eq!(report.touched_tasks, 2);
+        for host_side in [false, true] {
+            let id = task_id("dual", VERSION, FEATURES, TARGET, RUSTC, host_side);
+            assert_eq!(demand_of(&db, &id).await, 3, "host_side={host_side}");
+        }
+    }
+
+    /// The walk stops at nodes that are done or in flight — completed
+    /// and running deps are not touched — and at edges whose slice
+    /// answer is already `dep_met = 1` (stow#522).
+    #[tokio::test]
+    async fn demand_stops_at_built_in_flight_and_met_edges() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("done", Vec::new()),
+                request("live", Vec::new()),
+                request("leaf", Vec::new()),
+                request("met-dep", Vec::new()),
+                request(
+                    "root",
+                    vec![
+                        dependency("done"),
+                        dependency("live"),
+                        dependency("met-dep"),
+                    ],
+                ),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "done", TARGET, "completed").await;
+        mark_active(&db, "live", TARGET, "running").await;
+        // An edge whose dep the index already answered: met edges are
+        // not part of the unbuilt closure even when the row behind
+        // them is still pending.
+        db.query(
+            "UPDATE queue_dependencies SET dep_met = 1 \
+                  WHERE task_id = ? AND dep_crate_name = 'met-dep'",
+        )
+        .bind(task_id_on("root", TARGET))
+        .execute()
+        .await
+        .expect("met edge");
+        // A failed dep is unbuilt — demand still flows to it.
+        mark_active(&db, "leaf", TARGET, "failed").await;
+        db.query("INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_met, dep_side_known) \
+                  VALUES (?, ?, 'leaf', ?, '[]', ?, ?, 0, 1, 2, 0, 1)")
+            .bind(task_id_on("root", TARGET))
+            .bind(task_id_on("leaf", TARGET))
+            .bind(VERSION)
+            .bind(TARGET)
+            .bind(RUSTC)
+            .execute()
+            .await
+            .expect("leaf edge");
+
+        let report = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("demand");
+        assert_eq!(report.touched_tasks, 2, "root and the failed dep only");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 4);
+        assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 4);
+        for name in ["done", "live", "met-dep"] {
+            assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 0, "{name}");
+        }
+    }
+
+    /// Distinct input identities contribute their own deltas to a
+    /// shared dependency — and a cycle terminates with each node
+    /// touched once (stow#522).
+    #[tokio::test]
+    async fn demand_sums_distinct_identities_and_survives_cycles() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("shared", Vec::new()),
+                request("r1", vec![dependency("shared")]),
+                request("r2", vec![dependency("shared")]),
+            ],
+        )
+        .await
+        .expect("enqueue shared");
+        let report = apply(
+            &db,
+            "h0",
+            vec![demand_entry("r1", 3), demand_entry("r2", 4)],
+        )
+        .await
+        .expect("demand");
+        assert_eq!(report.touched_tasks, 3);
+        assert_eq!(demand_of(&db, &task_id_on("shared", TARGET)).await, 7);
+
+        // a ↔ b: the UNION dedup closes the cycle; each side gets the
+        // delta once.
+        enqueue(
+            &db,
+            &[
+                request("cyc-a", vec![dependency("cyc-b")]),
+                request("cyc-b", vec![dependency("cyc-a")]),
+            ],
+        )
+        .await
+        .expect("enqueue cycle");
+        let report = apply(&db, "h1", vec![demand_entry("cyc-a", 2)])
+            .await
+            .expect("cycle demand");
+        assert_eq!(report.touched_tasks, 2);
+        for name in ["cyc-a", "cyc-b"] {
+            assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 2, "{name}");
+        }
+    }
+
+    /// The replay contract: re-delivering the same `batch_id` applies
+    /// nothing and reports `applied = false`; a distinct batch is a
+    /// distinct hour and adds on top (stow#522).
+    #[tokio::test]
+    async fn demand_replay_is_idempotent_and_batches_accumulate() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        let first = apply(&db, "hour-1", vec![demand_entry("root", 5)])
+            .await
+            .expect("first");
+        assert!(first.applied);
+        let replay = apply(&db, "hour-1", vec![demand_entry("root", 5)])
+            .await
+            .expect("replay");
+        assert!(!replay.applied);
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
+        assert_eq!(contribution_rows(&db, "hour-1").await, 1);
+
+        // The shared pass still returns the planner's answer on an
+        // exact replay — the route arms it, repairing a schedule a
+        // previously lost response never set (stow#522).
+        let (_report, plan) = super::demand_pass(
+            &db,
+            &demand_batch("hour-1", vec![demand_entry("root", 5)]),
+            0,
+            &settings(),
+        )
+        .await
+        .expect("demand pass on replay");
+        assert!(
+            matches!(plan, super::AlarmPlan::At(_)),
+            "a replay must still yield the alarm plan, got {plan:?}"
+        );
+
+        let next = apply(&db, "hour-2", vec![demand_entry("root", 5)])
+            .await
+            .expect("next hour");
+        assert!(next.applied);
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 10);
+    }
+
+    /// A delivery's cost is proportional to its own rows, not the
+    /// stored ledger: the same batch run against 3 vs 300 recorded
+    /// contribution batches issues identical statements with identical
+    /// counted rows, the batch predicate plans as an index search, and
+    /// a crashed earlier delivery converges by folding only its own
+    /// unmarked rows (stow#522).
+    #[tokio::test]
+    async fn demand_cost_stays_proportional_with_preexisting_history() {
+        async fn seeded(history: u64) -> (DurableDb, StatementLog) {
+            let (db, log) = counting_memory_db().await.expect("counting db");
+            enqueue(&db, &[request("root", Vec::new())])
+                .await
+                .expect("enqueue");
+            // A long ledger built by real deliveries — every row
+            // already folded through the same path under test.
+            for hour in 0..history {
+                apply(&db, &format!("old-{hour}"), vec![demand_entry("root", 2)])
+                    .await
+                    .expect("history batch");
+            }
+            (db, log)
+        }
+
+        async fn issued_new_batch(db: &DurableDb, log: &StatementLog) -> Vec<String> {
+            let base = log.lock().expect("log").len();
+            let report = apply(db, "new-hour", vec![demand_entry("root", 3)])
+                .await
+                .expect("new batch");
+            assert!(report.applied);
+            let issued = log.lock().expect("log")[base..].to_vec();
+            // (sql, rows_read, rows_written) — the observable cost.
+            issued
+                .iter()
+                .map(|s| format!("{}|{}|{}", s.sql, s.rows_read, s.rows_written))
+                .collect()
+        }
+
+        let (small, small_log) = seeded(3).await;
+        let (large, large_log) = seeded(300).await;
+        let root = task_id_on("root", TARGET);
+        assert_eq!(demand_of(&small, &root).await, 6);
+        assert_eq!(demand_of(&large, &root).await, 600);
+
+        let small_issued = issued_new_batch(&small, &small_log).await;
+        let large_issued = issued_new_batch(&large, &large_log).await;
+        assert_eq!(
+            small_issued, large_issued,
+            "history never enters the request"
+        );
+        assert_eq!(demand_of(&small, &root).await, 9);
+        assert_eq!(demand_of(&large, &root).await, 603);
+
+        // Every batch-keyed predicate is an index probe, not a ledger
+        // scan — on reprepare's staging clear and on the acceptance
+        // guard's staged count.
+        for sql in [
+            "DELETE FROM demand_contributions WHERE batch_id = ?",
+            "SELECT count(*) FROM demand_contributions c WHERE c.batch_id = ?",
+        ] {
+            let details = db_plan(&small, sql, &["new-hour"]).await;
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("SEARCH") && d.contains("demand_contributions")),
+                "keyed predicate expected for `{sql}`: {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|d| d.contains("SCAN") && d.contains("demand_contributions")),
+                "ledger scan on the demand path: {details:?}"
+            );
+        }
+
+        // A delivery that failed after preparing — a `prepared` record
+        // with staged rows — reserves nothing and folds nothing: the
+        // same-input retry recomputes and accepts, and a different
+        // batch never sees the draft's rows.
+        let crashed = vec![demand_entry("root", 7)];
+        db_insert_batch_record(
+            &small,
+            "crashed",
+            &planted_input_hash(&crashed),
+            1,
+            "prepared",
+        )
+        .await;
+        db_insert_contribution(&small, &root, "crashed", 7).await;
+        let report = apply(&small, "crashed", crashed)
+            .await
+            .expect("re-deliver crashed batch");
+        assert!(report.applied, "the reprepare accepts");
+        assert_eq!(demand_of(&small, &root).await, 16, "6 + 3 + 7");
+        assert_eq!(batch_state(&small, "crashed").await, "accepted");
+    }
+
+    /// One staged row under a planted `prepared` draft — prepared the
+    /// same way the route prepares it, so the crashed delivery the
+    /// row models carried real post-fold fields when it died.
+    async fn db_insert_contribution(db: &DurableDb, task_id: &str, batch_id: &str, delta: i64) {
+        let staged = super::prepare_demand_rows(db, &[(task_id.to_owned(), delta)], 0)
+            .await
+            .expect("prepare draft row")
+            .remove(0);
+        db.query(
+            "INSERT INTO demand_contributions \
+             (task_id, batch_id, delta, value, dispatch_key, dispatch_eligible) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(task_id.to_owned())
+        .bind(batch_id.to_owned())
+        .bind(delta)
+        .bind(staged.value)
+        .bind(staged.key)
+        .bind(i64::from(staged.eligible))
+        .execute()
+        .await
+        .expect("stage contribution");
+    }
+
+    /// One `demand_batches` row with an explicit state — how a test
+    /// plants the unaccepted `prepared` state a failed delivery leaves.
+    async fn db_insert_batch_record(
+        db: &DurableDb,
+        batch_id: &str,
+        input_hash: &str,
+        touched_count: i64,
+        state: &str,
+    ) {
+        db.query(
+            "INSERT INTO demand_batches (batch_id, input_hash, touched_count, state) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(batch_id.to_owned())
+        .bind(input_hash.to_owned())
+        .bind(touched_count)
+        .bind(state.to_owned())
+        .execute()
+        .await
+        .expect("record batch");
+    }
+
+    /// The real canonical-input fingerprint for a batch id — how a
+    /// test's planted `prepared` record carries the input the retry
+    /// will compute, so the retry is a genuine same-input reprepare.
+    fn planted_input_hash(entries: &[stow_types::api::SchedulerDemandEntry]) -> String {
+        super::demand_input_fingerprint(&super::demand_deltas(entries).expect("deltas"))
+            .expect("fingerprint")
+    }
+
+    /// A batch record's current state string, for lifecycle assertions.
+    async fn batch_state(db: &DurableDb, batch_id: &str) -> String {
+        db.query("SELECT state FROM demand_batches WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .fetch_scalar::<String>()
+            .await
+            .expect("batch state")
+    }
+
+    async fn batch_rows(db: &DurableDb, batch_id: &str) -> u64 {
+        db.query("SELECT count(*) FROM demand_batches WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .fetch_scalar::<u64>()
+            .await
+            .expect("batch count")
+    }
+
+    async fn db_plan(db: &DurableDb, sql: &str, binds: &[&str]) -> Vec<String> {
+        #[derive(skyzen::FromRow)]
+        struct PlanRow {
+            detail: String,
+        }
+        let explained = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut query = db.query(&explained);
+        for bind in binds {
+            query = query.bind((*bind).to_owned());
+        }
+        query
+            .fetch_all::<PlanRow>()
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.detail)
+            .collect()
+    }
+
+    /// Demand is a queue operand, not a side channel: an ordinary
+    /// re-request and a lane promotion recompute `value`/`dispatch_key`
+    /// through the same formula and keep the contribution (stow#522).
+    #[tokio::test]
+    async fn demand_survives_resubmit_and_promotion() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+        apply(&db, "h0", vec![demand_entry("root", 9)])
+            .await
+            .expect("demand");
+
+        // Re-request: the enqueue path's key refresh recomputes value
+        // with the demand operand.
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("resubmit");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 9);
+        let value = db
+            .query("SELECT value FROM queue WHERE task_id = ?")
+            .bind(task_id_on("root", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("value read");
+        assert_eq!(value, 9);
+
+        // Promote recomputes lane/family bands and keeps demand.
+        super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Promote,
+            &filter_selector(stow_types::api::QueueSelector {
+                crate_name: Some("root".parse().expect("crate name")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("promote");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 9);
+        let value = db
+            .query("SELECT value FROM queue WHERE task_id = ?")
+            .bind(task_id_on("root", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("value read");
+        assert_eq!(value, 2 * super::VALUE_BAND + 9, "human band + demand");
+    }
+
+    /// A delta that would push `priority + demand` past `PRIORITY_MAX`
+    /// is an error before any write — no clamp, no REAL promotion, and
+    /// the queue plus the contribution ledger are untouched
+    /// (stow#522).
+    #[tokio::test]
+    async fn demand_over_band_bound_fails_without_writes() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        let over = (super::PRIORITY_MAX as u64) + 1;
+        let error = apply(&db, "h0", vec![demand_entry("root", over)])
+            .await
+            .expect_err("over-bound demand must fail");
+        assert!(error.to_string().contains("priority band"), "{error}");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
+
+        // Exactly at the bound is admissible.
+        apply(
+            &db,
+            "h1",
+            vec![demand_entry("root", super::PRIORITY_MAX as u64)],
+        )
+        .await
+        .expect("at-bound demand");
+        assert_eq!(
+            demand_of(&db, &task_id_on("root", TARGET)).await,
+            super::PRIORITY_MAX
+        );
+
+        // A human-lane Windows root at the maximum wire delta: bands +
+        // MAX(0,priority) + i64::MAX could not fit i64, so the typed
+        // per-row bound must reject it *before* `raw_value` is
+        // computed — never on the overflowed sum.
+        let mut human = request_on("hwin", WINDOWS_TARGET, Vec::new());
+        human.source = EnqueueSource::HumanRequest;
+        enqueue(&db, &[human]).await.expect("enqueue human root");
+        let error = apply(
+            &db,
+            "h2",
+            vec![demand_entry_on(
+                "hwin",
+                WINDOWS_TARGET,
+                u64::try_from(i64::MAX).expect("i64::MAX fits u64"),
+            )],
+        )
+        .await
+        .expect_err("i64::MAX delta must fail the band bound");
+        assert!(error.to_string().contains("priority band"), "{error}");
+        assert_eq!(demand_of(&db, &task_id_on("hwin", WINDOWS_TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h2").await, 0);
+    }
+
+    /// The stored batch record pins the accepted canonical input: a
+    /// redelivery naming the same id with ANY different payload — a
+    /// changed delta or a different identity set — fails before a
+    /// single write, so a mistaken retry can never reshape the frozen
+    /// contribution set (stow#522).
+    #[tokio::test]
+    async fn demand_conflicting_same_id_payload_fails_before_writes() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("root", vec![dependency("mid")]),
+                request("mid", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        apply(&db, "h0", vec![demand_entry("root", 5)])
+            .await
+            .expect("first delivery");
+
+        // Same id, changed delta — refused.
+        let error = apply(&db, "h0", vec![demand_entry("root", 7)])
+            .await
+            .expect_err("conflicting delta must fail");
+        assert!(
+            error.to_string().contains("different payload"),
+            "conflict error: {error}"
+        );
+        // Same id, different identity — refused.
+        apply(&db, "h0", vec![demand_entry("mid", 5)])
+            .await
+            .expect_err("conflicting identity must fail");
+
+        // Nothing moved: demands, contribution rows and the batch
+        // record are exactly what the first delivery established.
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
+        assert_eq!(demand_of(&db, &task_id_on("mid", TARGET)).await, 5);
+        assert_eq!(contribution_rows(&db, "h0").await, 2);
+        assert_eq!(batch_rows(&db, "h0").await, 1);
+    }
+
+    /// An exact replay folds the frozen set, not the live closure:
+    /// after the graph moves on — the root completes, a new task and
+    /// edge arrive that a fresh walk would reach — the replay applies
+    /// nothing the first delivery did not record (stow#522).
+    #[tokio::test]
+    async fn demand_replay_uses_the_frozen_set_not_the_live_closure() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("root", vec![dependency("leaf")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        let first = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("first delivery");
+        assert_eq!(first.touched_tasks, 2);
+
+        // The graph moves on: the root completes (a fresh walk would
+        // find no roots), and a new unbuilt task enters the closure —
+        // `extra` is now a live `dep_met = 0` dep of `leaf`.
+        mark_active(&db, "root", TARGET, "completed").await;
+        enqueue(&db, &[request("extra", Vec::new())])
+            .await
+            .expect("enqueue extra");
+        db.query(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_met) VALUES (?, ?, 0)",
+        )
+        .bind(task_id_on("leaf", TARGET))
+        .bind(task_id_on("extra", TARGET))
+        .execute()
+        .await
+        .expect("new edge");
+
+        let replay = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("replay");
+        assert!(!replay.applied);
+        assert_eq!(replay.touched_tasks, 2);
+        assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 2);
+    }
+
+    /// An accepted batch that froze an empty contribution set keeps
+    /// its id claimed: replays still apply nothing, and a conflicting
+    /// payload on the same id is still a conflict — an unknown root at
+    /// first delivery does not make the id reusable (stow#522).
+    #[tokio::test]
+    async fn demand_empty_accepted_batch_stays_empty() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("other", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        let first = apply(&db, "h0", vec![demand_entry("absent", 9)])
+            .await
+            .expect("first delivery");
+        assert!(first.applied, "an empty accepted set still accepts");
+        assert_eq!(first.touched_tasks, 0);
+        assert_eq!(batch_rows(&db, "h0").await, 1);
+
+        // The root becoming eligible later does not retro-apply: the
+        // frozen empty set is what replays.
+        enqueue(&db, &[request("absent", Vec::new())])
+            .await
+            .expect("enqueue late root");
+        let replay = apply(&db, "h0", vec![demand_entry("absent", 9)])
+            .await
+            .expect("replay");
+        assert!(!replay.applied);
+        assert_eq!(replay.touched_tasks, 0);
+        assert_eq!(demand_of(&db, &task_id_on("absent", TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
+
+        apply(&db, "h0", vec![demand_entry("absent", 8)])
+            .await
+            .expect_err("conflicting payload must fail");
+    }
+
+    /// An unaccepted draft is not a frozen set: a same-input retry on
+    /// a `prepared` record recomputes the CURRENT closure — staging
+    /// from the failed attempt is cleared, tasks the graph no longer
+    /// shows (a completed dep) contribute nothing, and a task that
+    /// entered the closure meanwhile joins the accepted set. The
+    /// draft's own staged rows never fold before acceptance and never
+    /// reserve band (stow#522).
+    #[tokio::test]
+    async fn demand_unaccepted_draft_retry_recomputes_the_live_closure() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("root", vec![dependency("leaf")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        // A delivery that failed after preparing: the record and one
+        // staged row exist, nothing accepted, nothing folded.
+        let entries = vec![demand_entry("root", 9)];
+        db_insert_batch_record(&db, "h0", &planted_input_hash(&entries), 2, "prepared").await;
+        db_insert_contribution(&db, &task_id_on("root", TARGET), "h0", 9).await;
+        db_insert_contribution(&db, &task_id_on("leaf", TARGET), "h0", 9).await;
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+        assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 0);
+
+        // The graph moves before the retry: `leaf` completes (out of
+        // the live closure) and `extra` joins it — while another
+        // legitimate batch accepts against the same nodes, proof the
+        // draft's staging reserved no demand.
+        mark_active(&db, "leaf", TARGET, "completed").await;
+        enqueue(&db, &[request("extra", Vec::new())])
+            .await
+            .expect("enqueue extra");
+        db.query(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_met) VALUES (?, ?, 0)",
+        )
+        .bind(task_id_on("root", TARGET))
+        .bind(task_id_on("extra", TARGET))
+        .execute()
+        .await
+        .expect("new edge");
+        apply(&db, "h1", vec![demand_entry("root", 3)])
+            .await
+            .expect("another batch");
+
+        let retry = apply(&db, "h0", entries).await.expect("retry");
+        assert!(retry.applied);
+        assert_eq!(retry.touched_tasks, 2, "root + extra, not leaf");
+        let root = task_id_on("root", TARGET);
+        assert_eq!(demand_of(&db, &root).await, 12, "9 + 3 from h1");
+        assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 12);
+        // `leaf` completed before either acceptance: h1's live closure
+        // skipped it, and the draft's staged row for it was cleared —
+        // its demand is 0, not the staged 9.
+        assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 2, "restaged set");
+        assert_eq!(batch_state(&db, "h0").await, "accepted");
+    }
+
+    /// A failed staging statement leaves only unaccepted material: the
+    /// `prepared` record and its partial rows fold nothing and block
+    /// nothing — the same-input retry clears them and accepts the
+    /// recomputed set exactly once (stow#522).
+    #[tokio::test]
+    async fn demand_failed_staging_leaves_no_fold_and_retries_cleanly() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("root", vec![dependency("leaf")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        // The stage INSERT failed mid-chunk: the record is prepared
+        // and only part of the event's rows landed.
+        let entries = vec![demand_entry("root", 5)];
+        db_insert_batch_record(&db, "h0", &planted_input_hash(&entries), 2, "prepared").await;
+        db_insert_contribution(&db, &task_id_on("root", TARGET), "h0", 5).await;
+
+        // No acceptance happened, so no queue row moved and no demand
+        // was reserved — a whole different batch accepts freely.
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+        apply(&db, "h1", vec![demand_entry("root", 2)])
+            .await
+            .expect("independent batch");
+
+        let retry = apply(&db, "h0", entries).await.expect("retry");
+        assert!(retry.applied);
+        assert_eq!(retry.touched_tasks, 2);
+        let root = task_id_on("root", TARGET);
+        assert_eq!(demand_of(&db, &root).await, 7, "5 recomputed + 2 from h1");
+        assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 7);
+        assert_eq!(contribution_rows(&db, "h0").await, 2);
+    }
+
+    /// An accepted batch's replay is a pure header read: after the
+    /// response is lost and the graph changes — a completed root, a
+    /// new task and side — the redelivery reports the stored count and
+    /// issues zero writes (stow#522).
+    #[tokio::test]
+    async fn demand_accepted_replay_writes_nothing_after_graph_changes() {
+        let (db, log) = counting_memory_db().await.expect("counting db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("root", vec![dependency("leaf")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        let first = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("first delivery");
+        assert_eq!(first.touched_tasks, 2);
+
+        mark_active(&db, "root", TARGET, "completed").await;
+        enqueue(&db, &[request("extra", Vec::new())])
+            .await
+            .expect("enqueue extra");
+
+        let base = log.lock().expect("log").len();
+        let replay = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("replay");
+        assert!(!replay.applied);
+        assert_eq!(replay.touched_tasks, 2, "the stored count answers");
+        let issued = log.lock().expect("log")[base..].to_vec();
+        assert!(
+            issued.iter().all(|s| s.rows_written == 0),
+            "an accepted replay must not write: {issued:?}"
+        );
+        assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 0);
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 4);
+    }
+
+    /// The acceptance statement is statement-atomic: force the
+    /// trigger's staged-count verification to fail after the fold has
+    /// already written a queue row (the raw UPDATE bypasses the
+    /// caller's own count guard), and the abort rolls back the queue
+    /// fold, the staged rows, and the accepted transition alike —
+    /// the batch stays `prepared` and the queue untouched (stow#522).
+    #[tokio::test]
+    async fn demand_acceptance_trigger_failure_rolls_back_everything() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+        let root = task_id_on("root", TARGET);
+
+        // Record says two staged rows; only one landed — the partial
+        // prepared set the guard exists to refuse. A direct state
+        // flip reaches the trigger: the fold writes root's demand,
+        // then the count check aborts the whole statement.
+        let entries = vec![demand_entry("root", 9)];
+        db_insert_batch_record(&db, "h0", &planted_input_hash(&entries), 2, "prepared").await;
+        db_insert_contribution(&db, &root, "h0", 9).await;
+        let error = db
+            .query("UPDATE demand_batches SET state = 'accepted' WHERE batch_id = ?")
+            .bind("h0".to_owned())
+            .execute()
+            .await
+            .expect_err("short staged set must abort acceptance");
+        assert!(
+            error.to_string().contains("staged set short"),
+            "abort reason: {error}"
+        );
+
+        assert_eq!(batch_state(&db, "h0").await, "prepared");
+        assert_eq!(demand_of(&db, &root).await, 0, "the fold rolled back");
+        assert_eq!(contribution_rows(&db, "h0").await, 1);
+
+        // And the retry path still works on the rolled-back draft.
+        let report = apply(&db, "h0", entries).await.expect("retry");
+        assert!(report.applied);
+        assert_eq!(demand_of(&db, &root).await, 9);
+    }
+
+    /// A closure whose serialized set would exceed the workerd 2 MiB
+    /// bound lands whole: staging splits into chunks each under
+    /// `DEMAND_STAGE_CHUNK_BYTES`, every row survives, and acceptance
+    /// folds the complete set — no truncation, no giant bound string
+    /// or ledger row (stow#522).
+    #[tokio::test]
+    async fn demand_stages_large_closures_in_bounded_chunks() {
+        // 60k rows of realistic 64-char task ids serialize to ~6 MiB —
+        // far past the 2 MiB bound a single snapshot would hit.
+        let rows: Vec<super::ContributionRow> = (0..60_000)
+            .map(|i| super::ContributionRow {
+                tid: format!("{i:064x}"),
+                delta: 1,
+                value: "0".to_owned(),
+                key: format!("0{i:064x}|now|now|{i:064x}"),
+                eligible: 1,
+            })
+            .collect();
+        let chunks = super::contribution_chunks(&rows).expect("chunks");
+        assert!(chunks.len() > 1, "the set must split");
+        let mut seen = 0_usize;
+        for chunk in &chunks {
+            assert!(
+                chunk.len() < super::DEMAND_STAGE_CHUNK_BYTES,
+                "chunk over bound: {} bytes",
+                chunk.len()
+            );
+            let parsed: Vec<super::ContributionRow> =
+                serde_json::from_str(chunk).expect("chunk parses");
+            seen += parsed.len();
+        }
+        assert_eq!(seen, rows.len(), "no row truncated or lost");
+    }
+
+    /// The end-to-end bound the serialized-snapshot path could never
+    /// cross: a real closure whose staged set exceeds the platform's
+    /// 2 MiB row/binding bound folds through multiple staging chunks
+    /// and still accepts atomically — full touched/ledger counts and
+    /// the last task's demand included. A delivery that dies after an
+    /// earlier staging chunk leaves only unaccepted draft material —
+    /// no header acceptance, no queue fold — and the same-input retry
+    /// recomputes, restages and converges exactly once (stow#522).
+    #[tokio::test]
+    async fn demand_multi_chunk_closure_is_atomic_end_to_end() {
+        // 30k real queue tasks, one dependency chain — the closure
+        // from the root touches all of them through the unmet-edge
+        // walk, with the queue's own 64-hex task ids. The migration
+        // permit stays open on this database: the failure-injection
+        // trigger below is the same class of schema DDL the operator
+        // migrate path issues — installing it is fixture preparation,
+        // while every production statement the test drives is DML.
+        const CHAIN: usize = 30_000;
+        let (db, _log) = counting_memory_db_raw().await.expect("counting db");
+        let mut requests: Vec<EnqueueRequest> = Vec::with_capacity(CHAIN);
+        for i in 0..CHAIN {
+            let deps = if i + 1 < CHAIN {
+                vec![dependency(&format!("chain-{}", i + 1))]
+            } else {
+                Vec::new()
+            };
+            requests.push(request(&format!("chain-{i}"), deps));
+        }
+        enqueue(&db, &requests).await.expect("enqueue chain");
+
+        // The staged set this event would produce: one serialized
+        // snapshot of it measures past the 2 MiB bound the old
+        // blob-column path bound as a single string, while the real
+        // staging splits it into several bounded chunks.
+        let contributions = super::demand_event_rows(
+            &db,
+            &super::demand_deltas(&[demand_entry("chain-0", 2)]).expect("deltas"),
+        )
+        .await
+        .expect("closure rows");
+        assert_eq!(contributions.len(), CHAIN, "the closure is the chain");
+        let staged = super::prepare_demand_rows(&db, &contributions, 0)
+            .await
+            .expect("prepared rows");
+        let snapshot = serde_json::to_string(&staged).expect("snapshot encodes");
+        assert!(
+            snapshot.len() > 2 * 1024 * 1024,
+            "serialized staged set must cross the old 2 MiB bound: {} bytes",
+            snapshot.len()
+        );
+        let chunks = super::contribution_chunks(&staged).expect("chunks");
+        assert!(
+            chunks.len() > 1,
+            "the staged set must land as multiple chunks, got {}",
+            chunks.len()
+        );
+
+        // The *old* minimal snapshot — `{tid, delta}` per row, the
+        // shape the blob-column path staged — also crosses the 2 MiB
+        // bound on its own: this fixture's proof doesn't depend on the
+        // wider prepared payload.
+        let minimal = serde_json::to_string(
+            &contributions
+                .iter()
+                .map(|(task_id, delta)| serde_json::json!({"tid": task_id, "delta": delta}))
+                .collect::<Vec<_>>(),
+        )
+        .expect("minimal snapshot encodes");
+        assert!(
+            minimal.len() > 2 * 1024 * 1024,
+            "minimal tid/delta snapshot must cross the old 2 MiB bound: {} bytes",
+            minimal.len()
+        );
+
+        sabotage_later_chunk_then_recover(&db, &chunks, CHAIN).await;
+    }
+
+    /// The failure half of
+    /// [`demand_multi_chunk_closure_is_atomic_end_to_end`]: installs a
+    /// `RAISE(ABORT)` trigger on one task id known to land in the last
+    /// staging chunk, runs the production `apply_demand` into it, and
+    /// asserts the landed prefix, the `prepared` header and the empty
+    /// queue fold — then drops the trigger and asserts the same-input
+    /// retry converges once and an exact replay writes nothing.
+    async fn sabotage_later_chunk_then_recover(db: &DurableDb, chunks: &[String], chain: usize) {
+        let last_chunk: Vec<serde_json::Value> =
+            serde_json::from_str(&chunks[chunks.len() - 1]).expect("last chunk decodes");
+        let sabotage_tid = last_chunk[0]["tid"]
+            .as_str()
+            .expect("chunk row carries tid")
+            .to_owned();
+        db.query(&format!(
+            "CREATE TRIGGER sabotage_demand_stage \
+             AFTER INSERT ON demand_contributions \
+             WHEN NEW.task_id = '{sabotage_tid}' \
+             BEGIN SELECT RAISE(ABORT, 'injected staging failure'); END"
+        ))
+        .execute()
+        .await
+        .expect("install sabotage trigger");
+        let entries = vec![demand_entry("chain-0", 2)];
+        let failed = apply(db, "big", entries.clone())
+            .await
+            .expect_err("sabotaged staging must fail");
+        let message = failed.to_string();
+        assert!(
+            message.contains("injected staging failure"),
+            "the failure must be the injected abort, got: {message}"
+        );
+        let staged_so_far = contribution_rows(db, "big").await;
+        assert!(
+            staged_so_far > 0 && staged_so_far < chain as u64,
+            "earlier chunks landed, the sabotaged one did not: {staged_so_far}"
+        );
+        assert_eq!(batch_state(db, "big").await, "prepared");
+        assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 0);
+        assert_eq!(
+            demand_of(db, &task_id_on(&format!("chain-{}", chain - 1), TARGET)).await,
+            0,
+            "no queue fold without acceptance"
+        );
+
+        // Remove the failure, then the same-input retry recomputes the
+        // live closure, replaces the partial staging and accepts once —
+        // every task touched, full ledger count, the last task's demand
+        // folded.
+        db.query("DROP TRIGGER sabotage_demand_stage")
+            .execute()
+            .await
+            .expect("drop sabotage trigger");
+        let report = apply(db, "big", entries).await.expect("retry converges");
+        assert!(report.applied);
+        assert_eq!(report.touched_tasks, chain as u64);
+        assert_eq!(contribution_rows(db, "big").await, chain as u64);
+        assert_eq!(batch_state(db, "big").await, "accepted");
+        assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 2);
+        assert_eq!(
+            demand_of(db, &task_id_on(&format!("chain-{}", chain - 1), TARGET)).await,
+            2
+        );
+
+        // And an exact replay of the accepted batch writes nothing:
+        // the stored header answers, the demand stays folded once.
+        let replay = apply(db, "big", vec![demand_entry("chain-0", 2)])
+            .await
+            .expect("accepted replay");
+        assert!(!replay.applied);
+        assert_eq!(replay.touched_tasks, chain as u64);
+        assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 2);
+    }
+
+    /// Persisted demand counts against the resubmit writer's band:
+    /// demand exactly at `PRIORITY_MAX` is legal while priority stays
+    /// 0, but a resubmit that would raise priority must be refused
+    /// before any write — queue, edges and demand untouched — while a
+    /// sibling below the bound still resubmits normally (stow#522).
+    #[tokio::test]
+    async fn demand_at_bound_then_rising_resubmit_is_refused() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("bound", Vec::new()), request("fine", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        apply(
+            &db,
+            "h0",
+            vec![demand_entry("bound", super::PRIORITY_MAX as u64)],
+        )
+        .await
+        .expect("at-bound demand");
+
+        // downloads 1000 → new priority 1 > PRIORITY_MAX - demand = 0.
+        let mut resubmit = request("bound", Vec::new());
+        resubmit.downloads = 1000;
+        let error = enqueue(&db, &[resubmit])
+            .await
+            .expect_err("resubmit past the band must fail");
+        assert!(
+            error.to_string().contains("priority band"),
+            "band error: {error}"
+        );
+
+        // Nothing changed: demand, downloads and request count are the
+        // pre-resubmit values.
+        assert_eq!(
+            demand_of(&db, &task_id_on("bound", TARGET)).await,
+            super::PRIORITY_MAX
+        );
+        let downloads: i64 = db
+            .query("SELECT downloads FROM queue WHERE task_id = ?")
+            .bind(task_id_on("bound", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("downloads");
+        let request_count: i64 = db
+            .query("SELECT request_count FROM queue WHERE task_id = ?")
+            .bind(task_id_on("bound", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("request_count");
+        assert_eq!((downloads, request_count), (0, 1));
+
+        // Below the bound the same resubmit is ordinary: the sibling
+        // takes downloads 5000 → priority 5, demand still folded.
+        let mut ok = request("fine", Vec::new());
+        ok.downloads = 5000;
+        enqueue(&db, &[ok]).await.expect("below-bound resubmit");
+        let priority: i64 = db
+            .query("SELECT priority FROM queue WHERE task_id = ?")
+            .bind(task_id_on("fine", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("priority");
+        assert_eq!(priority, 5);
+    }
+
+    /// The same refusal precedes the human-lane budget charge: a human
+    /// resubmit that would overflow the band is rejected before any
+    /// mutation, so `human_daily_task_budget` stays byte-identical —
+    /// on both the untrusted and the trusted entry path (stow#522).
+    #[tokio::test]
+    async fn demand_at_bound_human_resubmit_spends_no_budget() {
+        async fn spent(db: &DurableDb) -> i64 {
+            db.query(
+                "SELECT task_count FROM human_daily_task_budget \
+                 WHERE day = date('now')",
+            )
+            .fetch_scalar::<i64>()
+            .await
+            .expect("budget spend")
+        }
+
+        let db = memory_db().await.expect("memory db");
+        let mut human = request("bound", Vec::new());
+        human.source = EnqueueSource::HumanRequest;
+        enqueue(&db, &[human.clone()]).await.expect("human enqueue");
+        assert_eq!(spent(&db).await, 1, "the first submit charged once");
+        apply(
+            &db,
+            "h0",
+            vec![demand_entry("bound", super::PRIORITY_MAX as u64)],
+        )
+        .await
+        .expect("at-bound demand");
+
+        // downloads 1000 → new priority 1 > PRIORITY_MAX - demand = 0:
+        // refused before the budget charge, through both entries.
+        let mut resubmit = human;
+        resubmit.downloads = 1000;
+        enqueue(&db, &[resubmit.clone()])
+            .await
+            .expect_err("untrusted resubmit past the band must fail");
+        assert_eq!(spent(&db).await, 1, "a refused resubmit spends nothing");
+        super::enqueue_trusted(&db, &[resubmit], &settings())
+            .await
+            .expect_err("trusted resubmit past the band must fail");
+        assert_eq!(spent(&db).await, 1, "trusted path spends nothing either");
+
+        // Queue state is the pre-resubmit truth.
+        assert_eq!(
+            demand_of(&db, &task_id_on("bound", TARGET)).await,
+            super::PRIORITY_MAX
+        );
+        let downloads: i64 = db
+            .query("SELECT downloads FROM queue WHERE task_id = ?")
+            .bind(task_id_on("bound", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("downloads");
+        assert_eq!(downloads, 0);
+        let edges: i64 = db
+            .query("SELECT count(*) FROM queue_dependencies")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("edges");
+        assert_eq!(edges, 0);
+    }
+
+    /// Demand magnitudes above the JS safe-integer bound stay exact:
+    /// the persisted `value` differs by exactly one for adjacent deltas
+    /// above 2^53 and the claim order follows it — the JSON-decimal
+    /// transport never became a float (stow#522).
+    #[tokio::test]
+    async fn demand_orders_exactly_above_the_js_safe_integer() {
+        #[derive(skyzen::FromRow)]
+        struct ValuePair {
+            task_id: String,
+            value: i64,
+        }
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("less", Vec::new()), request("more", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        let js_safe = 9_007_199_254_740_992_u64; // 2^53
+        assert!(js_safe + 2 <= super::PRIORITY_MAX as u64);
+        apply(
+            &db,
+            "h0",
+            vec![
+                demand_entry("less", js_safe + 1),
+                demand_entry("more", js_safe + 2),
+            ],
+        )
+        .await
+        .expect("demand");
+
+        let values = db
+            .query("SELECT task_id, value FROM queue ORDER BY task_id")
+            .fetch_all::<ValuePair>()
+            .await
+            .expect("values");
+        let less = values
+            .iter()
+            .find(|row| row.task_id == task_id_on("less", TARGET))
+            .expect("less row")
+            .value;
+        let more = values
+            .iter()
+            .find(|row| row.task_id == task_id_on("more", TARGET))
+            .expect("more row")
+            .value;
+        assert_eq!(more - less, 1, "adjacent deltas stay adjacent");
+        assert!(less > js_safe.cast_signed(), "values are above 2^53");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed[0].crate_name, "more");
+    }
+
+    /// An entry whose identity names no queue row is an accepted
+    /// zero-count batch — the id is claimed, the queue untouched
+    /// (stow#522).
+    #[tokio::test]
+    async fn demand_on_an_unknown_identity_is_a_noop() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+        let report = apply(&db, "h0", vec![demand_entry("absent", 5)])
+            .await
+            .expect("demand");
+        assert!(report.applied, "an empty closure still accepts");
+        assert_eq!(report.touched_tasks, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
+        assert_eq!(batch_state(&db, "h0").await, "accepted");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+    }
+
+    /// Malformed batches fail at validation, before any queue read or
+    /// write: an empty or oversized `batch_id`, an empty entry list,
+    /// and a delta that cannot fit `i64` (stow#522).
+    #[tokio::test]
+    async fn demand_rejects_malformed_batches() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        for bad in ["", &"x".repeat(129)] {
+            apply(&db, bad, vec![demand_entry("root", 1)])
+                .await
+                .expect_err("bad batch_id must fail");
+        }
+        apply(&db, "h0", Vec::new())
+            .await
+            .expect_err("empty entries must fail");
+        let entries = (0..=256)
+            .map(|i| demand_entry(&format!("e{i}"), 1))
+            .collect();
+        apply(&db, "h0", entries)
+            .await
+            .expect_err("over-cap entries must fail");
+        apply(&db, "h0", vec![demand_entry("root", u64::MAX)])
+            .await
+            .expect_err("u64 delta must fail");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
     }
 
     /// With the macOS slot count spent mid-pass, the pass skips the
@@ -7271,6 +10785,7 @@ mod sqlite_tests {
                 attempt: claimed[0].attempt,
                 success: false,
                 error: Some("boom".to_owned()),
+                finished_at: None,
                 github_run_id: None,
             },
             TEST_WINDOW_MINUTES,
@@ -7385,6 +10900,7 @@ mod sqlite_tests {
                 attempt: claimed[0].attempt,
                 success: true,
                 error: None,
+                finished_at: None,
                 github_run_id: None,
             },
             TEST_WINDOW_MINUTES,
@@ -7937,6 +11453,7 @@ mod sqlite_tests {
                 attempt: claimed[0].attempt,
                 success: true,
                 error: None,
+                finished_at: None,
                 github_run_id: None,
             },
             TEST_WINDOW_MINUTES,
@@ -7962,6 +11479,7 @@ mod sqlite_tests {
                 attempt: 1,
                 success: true,
                 error: None,
+                finished_at: None,
                 github_run_id: None,
             },
             TEST_WINDOW_MINUTES,
@@ -9171,6 +12689,7 @@ mod sqlite_tests {
             attempt,
             success,
             error: None,
+            finished_at: None,
             github_run_id: None,
         }
     }
@@ -9222,6 +12741,7 @@ mod sqlite_tests {
                     success: false,
                     error: Some(format!("cycle-{cycle}-{attempt}")),
                     github_run_id: Some(format!("run-{cycle}-{attempt}")),
+                    finished_at: None,
                 },
                 TEST_WINDOW_MINUTES,
             )
@@ -9577,6 +13097,7 @@ mod sqlite_tests {
                 attempt: 4,
                 success: false,
                 error: Some("cycle A".to_owned()),
+                finished_at: None,
                 github_run_id: Some("run-a".to_owned()),
             },
             TEST_WINDOW_MINUTES,
@@ -9608,6 +13129,7 @@ mod sqlite_tests {
                 attempt: second.attempt,
                 success: false,
                 error: Some("cycle B".to_owned()),
+                finished_at: None,
                 github_run_id: Some("run-b".to_owned()),
             },
             TEST_WINDOW_MINUTES,
@@ -11050,16 +14572,21 @@ mod sqlite_tests {
         // Order the macOS backlog strictly ahead of the Linux row in
         // claim order — persisted `dispatch_key` bakes the row's
         // `first_requested_at`, so recompute it in the same update.
-        db.query(&format!(
-            "UPDATE queue SET first_requested_at = ?, dispatch_key = {} \
-             WHERE target = ?",
-            super::dispatch_key_row_sql()
-        ))
-        .bind(PAST_TS)
-        .bind(MACOS_TARGET)
-        .execute()
-        .await
-        .expect("backdate macos backlog");
+        db.query("UPDATE queue SET first_requested_at = ? WHERE target = ?")
+            .bind(PAST_TS)
+            .bind(MACOS_TARGET)
+            .execute()
+            .await
+            .expect("backdate macos backlog");
+        let mac_ids = db
+            .query("SELECT task_id FROM queue WHERE target = ?")
+            .bind(MACOS_TARGET)
+            .fetch_scalars::<String>()
+            .await
+            .expect("macos ids");
+        super::refresh_dispatch_keys(&db, &mac_ids)
+            .await
+            .expect("recompute backdated keys");
 
         let settings = SchedulerSettings {
             max_concurrent_macos_jobs: 0,
@@ -11701,6 +15228,7 @@ mod sqlite_tests {
                     attempt: claimed[0].attempt,
                     success: false,
                     error: Some("boom".to_owned()),
+                    finished_at: None,
                     github_run_id: Some("run-live".to_owned()),
                 },
                 TEST_WINDOW_MINUTES,
@@ -12019,5 +15547,918 @@ mod sqlite_tests {
         .await
         .expect_err("attempt 2 is stale");
         assert!(matches!(error, QueueError::RequestAttemptSuperseded { .. }));
+    }
+
+    // ---- stow#524: expected build cost ----
+
+    /// Claim, pin the claim instant `minutes_ago` back, bind a run and
+    /// complete it successfully — one honest sample of the path a real
+    /// build takes. `claimed_at` is pinned by raw UPDATE for the same
+    /// reason `mark_active` writes `updated_at` directly: no public
+    /// function produces a past claim stamp, and the pin must be exact
+    /// for a deterministic duration assertion.
+    async fn complete_success_at_minutes(
+        db: &DurableDb,
+        task_id: &str,
+        run: &str,
+        minutes_ago: u32,
+    ) {
+        let claimed = super::claim_dispatchable_tasks(db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        db.query("UPDATE queue SET claimed_at = datetime('now', ?) WHERE task_id = ?")
+            .bind(format!("-{minutes_ago} minutes"))
+            .bind(task_id.to_owned())
+            .execute()
+            .await
+            .expect("pin claim instant");
+        super::bind_dispatch_run(db, task_id, &claimed.generation_id, run)
+            .await
+            .expect("bind run");
+        super::complete_run(
+            db,
+            &settings(),
+            &report_with_run(task_id, true, run),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete");
+    }
+
+    #[derive(skyzen::FromRow)]
+    struct BuildStatRow {
+        builds: i64,
+        median_ms: i64,
+    }
+
+    /// `EXPLAIN QUERY PLAN` detail rows — only the plan text matters.
+    #[derive(skyzen::FromRow)]
+    struct PlanRow {
+        detail: String,
+    }
+
+    async fn build_stats(db: &DurableDb, crate_name: &str) -> Option<BuildStatRow> {
+        db.query(
+            "SELECT builds, median_ms FROM crate_build_stats \
+             WHERE crate_name = ? AND target = ?",
+        )
+        .bind(crate_name.to_owned())
+        .bind(TARGET)
+        .fetch_optional::<BuildStatRow>()
+        .await
+        .expect("build stats")
+    }
+
+    async fn sample_count(db: &DurableDb, crate_name: &str) -> i64 {
+        db.query("SELECT count(*) FROM crate_build_samples WHERE crate_name = ?")
+            .bind(crate_name.to_owned())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("sample count")
+    }
+
+    /// The in-flight re-request writer rewrites `updated_at` even on an
+    /// active task — a resubmitted build's duration must still measure
+    /// from the claim's immutable `claimed_at`, not the mutable stamp.
+    #[tokio::test]
+    async fn build_duration_samples_the_immutable_claim_instant() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("durable", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("durable", TARGET);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-1")
+            .await
+            .expect("bind");
+        // Pin the claim instant BEFORE the resubmission so a writer
+        // that clobbered `claimed_at` would be caught rather than
+        // masked: the pin must survive the in-flight writer verbatim.
+        db.query("UPDATE queue SET claimed_at = datetime('now', '-1 hour') WHERE task_id = ?")
+            .bind(id.clone())
+            .execute()
+            .await
+            .expect("pin claim instant");
+        let pinned = row_column(&db, "durable", "claimed_at").await;
+        // The resubmission: `apply_batched_updates` rewrites
+        // `updated_at` on the in-flight row.
+        enqueue(&db, &[request("durable", Vec::new())])
+            .await
+            .expect("in-flight resubmission");
+        let claimed_at = row_column(&db, "durable", "claimed_at").await;
+        let updated_at = row_column(&db, "durable", "updated_at").await;
+        assert_eq!(claimed_at, pinned, "the resubmit rewrote claimed_at");
+        assert_ne!(claimed_at, updated_at, "the resubmit moved updated_at");
+
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, true, "run-1"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete");
+
+        let duration = db
+            .query("SELECT duration_ms FROM crate_build_samples WHERE crate_name = 'durable'")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("duration sample");
+        assert!(
+            (3_500_000..=3_700_000).contains(&duration),
+            "claim-to-completion ~1h, not resubmit-to-completion ~0: {duration}"
+        );
+        let stats = build_stats(&db, "durable").await.expect("stats row exists");
+        assert_eq!(stats.builds, 1);
+        assert_eq!(stats.median_ms, duration);
+    }
+
+    /// A deferred completion — the webhook landed while the row's
+    /// `github_run_id` was still `NULL`, so it parked in
+    /// `pending_run_completions` — measures claim-to-`received_at`, the
+    /// instant the run actually finished, not the later binding moment.
+    #[tokio::test]
+    async fn deferred_completion_measures_duration_at_received_at() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("deferred", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("deferred", TARGET);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        db.query("UPDATE queue SET claimed_at = datetime('now', '-1 hour') WHERE task_id = ?")
+            .bind(id.clone())
+            .execute()
+            .await
+            .expect("pin claim instant");
+        // The report arrives with no run bound yet — it parks, stamping
+        // `received_at` at arrival.
+        assert!(
+            super::persist_pending_completion(&db, &report_with_run(&id, true, "run-def"))
+                .await
+                .expect("park completion")
+        );
+        super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-def")
+            .await
+            .expect("bind run");
+        super::apply_pending_completion_for_binding(
+            &db,
+            &settings(),
+            &id,
+            &claimed.generation_id,
+            "run-def",
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("apply bound completion");
+
+        let duration = db
+            .query("SELECT duration_ms FROM crate_build_samples WHERE crate_name = 'deferred'")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("duration sample");
+        assert!(
+            (3_500_000..=3_700_000).contains(&duration),
+            "claim-to-received_at ~1h: {duration}"
+        );
+    }
+
+    /// A measured claim-to-completion span is nonnegative by
+    /// construction; a report whose finish precedes its claim (skewed
+    /// `finished_at`, a future `claimed_at`) must fail the sample
+    /// insert through the column's `CHECK (duration_ms >= 0)` — the
+    /// span is never clamped into a bogus zero. The failed statement
+    /// must leave no trace: no sample, no stats row, no median and no
+    /// key refresh off it. A legitimately zero-length span (sub-ms
+    /// build) still records and floors its median to the 1ms unit.
+    #[tokio::test]
+    async fn backward_completion_span_fails_without_polluting_stats() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("skewed", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("skewed", TARGET);
+        let report = super::BuildCompleteReport {
+            task_id: id,
+            generation_id: "gen-skew".to_owned(),
+            attempt: 1,
+            success: true,
+            error: None,
+            github_run_id: Some("run-skew".to_owned()),
+            finished_at: Some(ROW_TS.to_owned()),
+        };
+        // Claim stamped after the reported finish — a negative span.
+        let error =
+            super::record_build_sample(&db, &report, "skewed", TARGET, Some("2099-01-01 00:00:00"))
+                .await
+                .expect_err("negative measured span fails");
+        assert!(
+            error.to_string().contains("record build sample"),
+            "statement error, not a silent write: {error}"
+        );
+        let count = db
+            .query(
+                "SELECT (SELECT count(*) FROM crate_build_samples) + \
+                 (SELECT count(*) FROM crate_build_stats) AS n",
+            )
+            .fetch_scalar::<i64>()
+            .await
+            .expect("cost state count");
+        assert_eq!(count, 0, "no sample/stats/window pollution");
+
+        // The legitimate zero-length span records and floors to the
+        // 1ms unit at the stats write.
+        let same = super::BuildCompleteReport {
+            finished_at: Some(ROW_TS.to_owned()),
+            ..report
+        };
+        super::record_build_sample(&db, &same, "skewed", TARGET, Some(ROW_TS))
+            .await
+            .expect("zero-length span records");
+        let median = db
+            .query("SELECT median_ms FROM crate_build_stats WHERE crate_name = 'skewed'")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("median");
+        assert_eq!(median, 1, "0ms span floors to the 1ms unit");
+    }
+
+    /// One task's stored key prefix — the 65-char lane+score field the
+    /// rank assertions compare.
+    async fn prefix_of(db: &DurableDb, name: &str) -> String {
+        db.query("SELECT substr(dispatch_key, 1, 65) AS p FROM queue WHERE crate_name = ?")
+            .bind(name.to_owned())
+            .fetch_scalar::<String>()
+            .await
+            .expect("prefix")
+    }
+
+    async fn status_of(db: &DurableDb, name: &str) -> String {
+        db.query("SELECT status FROM queue WHERE crate_name = ?")
+            .bind(name.to_owned())
+            .fetch_scalar::<String>()
+            .await
+            .expect("status")
+    }
+
+    /// The key prefix the same operands derive at the moved cost —
+    /// what every repriced row must carry.
+    fn repriced_prefix() -> String {
+        crate::scheduler::rank::rank_prefix("miss", 100, std::num::NonZero::new(1000).unwrap())
+    }
+
+    /// The shared fixture: five fresh-keyed rows whose stored keys go
+    /// stale the moment a cost lands underneath them — each named for
+    /// the re-entry path it exercises, `waiter` the non-transitioned
+    /// control.
+    async fn reentry_fixture() -> (DurableDb, String) {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("retried", Vec::new()),
+                request("failed-dispatch", Vec::new()),
+                request("stale", Vec::new()),
+                request("shaped", Vec::new()),
+                request("waiter", vec![dependency("shaped")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        // Fresh keys at cost 1 (no stats yet); then the cost moves
+        // underneath them — each row's stored key is now stale.
+        for name in ["retried", "failed-dispatch", "stale", "shaped", "waiter"] {
+            db.query(
+                "INSERT INTO crate_build_stats \
+                 (crate_name, target, builds, median_ms) \
+                 VALUES (?, ?, 3, 1000)",
+            )
+            .bind(name.to_owned())
+            .bind(TARGET)
+            .execute()
+            .await
+            .expect("move cost");
+            db.query("UPDATE queue SET priority = 100 WHERE crate_name = ?")
+                .bind(name.to_owned())
+                .execute()
+                .await
+                .expect("set priority");
+        }
+        let stale_prefix = prefix_of(&db, "retried").await;
+        for name in ["failed-dispatch", "stale", "shaped", "waiter"] {
+            assert_eq!(
+                prefix_of(&db, name).await,
+                stale_prefix,
+                "{name} starts on the cost-1 key"
+            );
+        }
+        (db, stale_prefix)
+    }
+
+    /// Every nonpending→pending re-entry reprices through the shared
+    /// refresh: a row whose key was written before a cost move must
+    /// leave the transition carrying the new cost's rank — on the
+    /// operator `Retry` and on `mark_dispatch_failed` here, on the
+    /// stale-lease recovery and the incomplete-shape requeue in the
+    /// sibling test — while rows that did not transition keep their
+    /// keys byte-for-byte.
+    #[tokio::test]
+    async fn retry_and_dispatch_failure_reprice_against_moved_cost() {
+        let (db, _stale) = reentry_fixture().await;
+        let priced = repriced_prefix;
+
+        // Operator Retry: failed → pending.
+        db.query("UPDATE queue SET status = 'failed' WHERE crate_name = 'retried'")
+            .execute()
+            .await
+            .expect("park failed");
+        let selector = super::QueueSelector {
+            task_ids: vec![task_id_on("retried", TARGET)],
+            ..Default::default()
+        };
+        super::apply_mutation(&db, &settings(), super::QueueMutation::Retry, &selector)
+            .await
+            .expect("retry");
+        assert_eq!(status_of(&db, "retried").await, "pending");
+        assert_eq!(prefix_of(&db, "retried").await, priced());
+
+        // mark_dispatch_failed: dispatched (run unbound) → pending.
+        db.query(
+            "UPDATE queue SET status = 'dispatched', generation_id = 'gen-fd' \
+             WHERE crate_name = 'failed-dispatch'",
+        )
+        .execute()
+        .await
+        .expect("mark dispatched");
+        super::mark_dispatch_failed(
+            &db,
+            &settings(),
+            &task_id_on("failed-dispatch", TARGET),
+            "gen-fd",
+            "workflow_dispatch failed",
+        )
+        .await
+        .expect("dispatch failure");
+        assert_eq!(status_of(&db, "failed-dispatch").await, "pending");
+        assert_eq!(prefix_of(&db, "failed-dispatch").await, priced());
+    }
+
+    /// The other two nonpending→pending paths — see
+    /// [`retry_and_dispatch_failure_reprice_against_moved_cost`].
+    #[tokio::test]
+    async fn stale_recovery_and_shape_requeue_reprice_against_moved_cost() {
+        let (db, stale_prefix) = reentry_fixture().await;
+        let priced = repriced_prefix;
+
+        // Stale-lease recovery: running, past the stale window → pending.
+        db.query(
+            "UPDATE queue SET status = 'running', updated_at = datetime('now', '-2 days') \
+             WHERE crate_name = 'stale'",
+        )
+        .execute()
+        .await
+        .expect("mark stale");
+        super::recover_stale_active_tasks(&db, &settings())
+            .await
+            .expect("recover stale");
+        assert_eq!(status_of(&db, "stale").await, "pending");
+        assert_eq!(prefix_of(&db, "stale").await, priced());
+
+        // Incomplete-shape requeue: completed dep → pending once.
+        db.query("UPDATE queue SET status = 'completed' WHERE crate_name = 'shaped'")
+            .execute()
+            .await
+            .expect("mark completed");
+        db.query(
+            "UPDATE queue_dependencies SET dep_crate_name = 'shaped', \
+                 dep_host_side = 0, dep_met = 0 \
+             WHERE task_id = ? AND depends_on_task_id = ?",
+        )
+        .bind(task_id_on("waiter", TARGET))
+        .bind(task_id_on("shaped", TARGET))
+        .execute()
+        .await
+        .expect("resolve edge identity");
+        super::requeue_incomplete_shape_deps(&db, &settings())
+            .await
+            .expect("shape requeue");
+        assert_eq!(status_of(&db, "shaped").await, "pending");
+        assert_eq!(prefix_of(&db, "shaped").await, priced());
+
+        // The non-transitioned row keeps its stale key byte-for-byte:
+        // only the refresh's own cost-move path may reprice it.
+        assert_eq!(prefix_of(&db, "waiter").await, stale_prefix);
+    }
+
+    /// The statistic is the window's lower median — durations 1, 2,
+    /// and 100 minutes report 2 minutes, where a moving mean would
+    /// report ~34 — and the window never grows past
+    /// `BUILD_SAMPLE_WINDOW` however many samples land.
+    #[tokio::test]
+    async fn build_stats_median_is_a_real_median_over_a_bounded_window() {
+        let db = memory_db().await.expect("memory db");
+        let versions = ["1.0.0", "1.1.0", "1.2.0"];
+        let minutes = [1, 2, 100];
+        for (version, minutes_ago) in versions.iter().zip(minutes) {
+            let mut request = request_on("median", TARGET, Vec::new());
+            request.version = version.parse().expect("semver");
+            enqueue(&db, &[request]).await.expect("enqueue");
+            let id = stow_types::api::task_id("median", version, FEATURES, TARGET, RUSTC, false);
+            complete_success_at_minutes(&db, &id, &format!("run-{version}"), minutes_ago).await;
+        }
+        let stats = build_stats(&db, "median").await.expect("stats row");
+        assert_eq!(stats.builds, 3);
+        assert!(
+            (110_000..=130_000).contains(&stats.median_ms),
+            "lower median of 1/2/100 min is 2 min, not the ~34-min mean: {}",
+            stats.median_ms
+        );
+
+        // The window caps at BUILD_SAMPLE_WINDOW: enough further
+        // completions to overflow it leave exactly the bound.
+        for round in 0..(super::BUILD_SAMPLE_WINDOW + 3) {
+            let version = format!("2.0.{round}");
+            let mut request = request_on("median", TARGET, Vec::new());
+            request.version = version.parse().expect("semver");
+            enqueue(&db, &[request]).await.expect("enqueue");
+            let id = stow_types::api::task_id("median", &version, FEATURES, TARGET, RUSTC, false);
+            complete_success_at_minutes(&db, &id, &format!("run-b{round}"), 3).await;
+        }
+        assert_eq!(
+            sample_count(&db, "median").await,
+            super::BUILD_SAMPLE_WINDOW
+        );
+        assert_eq!(
+            build_stats(&db, "median").await.expect("stats row").builds,
+            3 + super::BUILD_SAMPLE_WINDOW + 3
+        );
+    }
+
+    /// The generation fence reaches the sample path: a replayed report
+    /// for a consumed generation and a report naming a generation that
+    /// was never live are both rejected before they can record a
+    /// duration, and a failure never samples at all.
+    #[tokio::test]
+    async fn stale_duplicate_and_failed_reports_never_sample() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("fenced", Vec::new())])
+            .await
+            .expect("enqueue");
+        let id = task_id_on("fenced", TARGET);
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-f")
+            .await
+            .expect("bind");
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, true, "run-f"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete");
+        assert_eq!(sample_count(&db, "fenced").await, 1);
+
+        let replay = super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&id, true, "run-f"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("replayed completion conflicts");
+        assert!(matches!(replay, QueueError::StaleCompletion { .. }));
+        let ghost = super::complete(
+            &db,
+            &settings(),
+            &report(&id, "never-live-generation", 1, true),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect_err("old-generation report conflicts");
+        assert!(matches!(ghost, QueueError::StaleCompletion { .. }));
+        assert_eq!(
+            sample_count(&db, "fenced").await,
+            1,
+            "rejected reports added no samples"
+        );
+
+        enqueue(&db, &[request("failonly", Vec::new())])
+            .await
+            .expect("enqueue");
+        let fail_id = task_id_on("failonly", TARGET);
+        let failed_claim = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim")[0]
+            .clone();
+        super::bind_dispatch_run(&db, &fail_id, &failed_claim.generation_id, "run-x")
+            .await
+            .expect("bind");
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&fail_id, false, "run-x"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("failure completes");
+        assert_eq!(
+            sample_count(&db, "failonly").await,
+            0,
+            "a truncated failure run prices no build"
+        );
+    }
+
+    /// Cost divides the demand operand inside a band: at equal
+    /// priority the crate the stats call cheaper claims first, while
+    /// the bands stay absolute — an unmeasured cheap miss can never
+    /// outrank a measured expensive human task.
+    #[tokio::test]
+    async fn cheaper_expected_build_claims_first_inside_a_band() {
+        let db = memory_db().await.expect("memory db");
+        db.query(
+            "INSERT INTO crate_build_stats (crate_name, target, builds, median_ms) \
+             VALUES ('pricey', ?, 5, 3600000)",
+        )
+        .bind(TARGET)
+        .execute()
+        .await
+        .expect("seed pricey stats");
+        let expensive = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            ..request("pricey", Vec::new())
+        };
+        let cheap = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            ..request("cheap", Vec::new())
+        };
+        enqueue(&db, &[expensive, cheap]).await.expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed[0].crate_name, "cheap", "cost-divided rank");
+
+        // Bands still win: a pricey human-lane task claims ahead of an
+        // unmeasured miss however cheap the miss looks.
+        let db = memory_db().await.expect("memory db");
+        db.query(
+            "INSERT INTO crate_build_stats (crate_name, target, builds, median_ms) \
+             VALUES ('hpricey', ?, 5, 3600000)",
+        )
+        .bind(TARGET)
+        .execute()
+        .await
+        .expect("seed pricey stats");
+        let human = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            source: EnqueueSource::HumanRequest,
+            ..request("hpricey", Vec::new())
+        };
+        let miss = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            ..request("mcheap", Vec::new())
+        };
+        super::enqueue_trusted(&db, &[human, miss], &settings())
+            .await
+            .expect("enqueue");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(
+            claimed[0].crate_name, "hpricey",
+            "band precedence is undivided"
+        );
+    }
+
+    /// Equal score operands keep `value`'s FIFO: same band, same
+    /// priority, same cost answer → `first_requested_at` decides.
+    #[tokio::test]
+    async fn equal_scores_keep_fifo_order() {
+        let db = memory_db().await.expect("memory db");
+        let first = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            ..request("fifo-first", Vec::new())
+        };
+        let second = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            ..request("fifo-second", Vec::new())
+        };
+        enqueue(&db, &[first, second]).await.expect("enqueue");
+        db.query(
+            "UPDATE queue SET first_requested_at = '2025-01-01 00:00:00' \
+             WHERE crate_name = 'fifo-first'",
+        )
+        .execute()
+        .await
+        .expect("age the first request");
+        // The instant is baked into the key — the same keyed refresh
+        // every operand move takes rewrites it.
+        super::refresh_dispatch_keys(&db, &[task_id_on("fifo-first", TARGET)])
+            .await
+            .expect("refresh aged key");
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed[0].crate_name, "fifo-first");
+    }
+
+    /// The stats probe correlates to the outer row on every recompute
+    /// path: two crates with different medians must each price by
+    /// their own (`crate_name`, `target`) row through a resubmit's key
+    /// refresh, a promote and a median move — not whatever stats row
+    /// the table yields first (stow#524 review: an unqualified probe
+    /// collapses to `s.crate_name = s.crate_name` and answers one
+    /// median for every row).
+    #[tokio::test]
+    async fn refreshed_scores_price_their_own_crate_target() {
+        let db = memory_db().await.expect("memory db");
+        // 'dear' lands in the table first, so a broken probe hands its
+        // median to every row and makes 'cheap' indistinguishable.
+        db.query(
+            "INSERT INTO crate_build_stats (crate_name, target, builds, median_ms) \
+             VALUES ('dear', ?, 5, 3600000), ('cheap', ?, 5, 36000), ('cheap', ?, 5, 999999)",
+        )
+        .bind(TARGET)
+        .bind(TARGET)
+        .bind(MACOS_TARGET)
+        .execute()
+        .await
+        .expect("seed stats");
+        let dear = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            ..request("dear", Vec::new())
+        };
+        let cheap = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            ..request("cheap", Vec::new())
+        };
+        let mac = stow_types::api::EnqueueRequest {
+            downloads: 5_000_000,
+            ..request_on("cheap", MACOS_TARGET, Vec::new())
+        };
+        enqueue(&db, &[dear, cheap, mac]).await.expect("enqueue");
+
+        let prefix = async |db: &DurableDb, name: &str, target: &str| -> String {
+            db.query(
+                "SELECT substr(dispatch_key, 1, 65) AS p FROM queue \
+                 WHERE crate_name = ? AND target = ?",
+            )
+            .bind(name.to_owned())
+            .bind(target.to_owned())
+            .fetch_scalar::<String>()
+            .await
+            .expect("score prefix")
+        };
+        // A resubmit recomputes each touched row's key: a broken probe
+        // leaves every row at 'dear''s cost and the prefixes tie.
+        enqueue(
+            &db,
+            &[request("dear", Vec::new()), request("cheap", Vec::new())],
+        )
+        .await
+        .expect("resubmit");
+        assert!(
+            prefix(&db, "cheap", TARGET).await < prefix(&db, "dear", TARGET).await,
+            "refreshed keys price each row's own cost"
+        );
+        // Target discriminates too: 'cheap' on macOS has its own
+        // (crate, target) median, not the Linux row's.
+        assert!(
+            prefix(&db, "cheap", MACOS_TARGET).await > prefix(&db, "cheap", TARGET).await,
+            "same crate on a pricier target scores lower"
+        );
+
+        // Promote recomputes the key under the 'human' operand: the
+        // cost probe still has to bind to the outer row.
+        for name in ["dear", "cheap"] {
+            super::apply_mutation(
+                &db,
+                &settings(),
+                super::QueueMutation::Promote,
+                &filter_selector(stow_types::api::QueueSelector {
+                    crate_name: Some(name.parse().expect("crate name")),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("promote");
+        }
+        assert!(
+            prefix(&db, "cheap", TARGET).await < prefix(&db, "dear", TARGET).await,
+            "promoted keys price each row's own cost"
+        );
+
+        // A median move refreshes only that key's pending set: 'cheap'
+        // reprices, 'dear' keeps its key byte-for-byte.
+        let dear_key = prefix(&db, "dear", TARGET).await;
+        super::record_build_sample(
+            &db,
+            &super::BuildCompleteReport {
+                task_id: task_id_on("cheap", TARGET),
+                generation_id: "gen-cost-move".to_owned(),
+                attempt: 1,
+                success: true,
+                error: None,
+                github_run_id: None,
+                finished_at: None,
+            },
+            "cheap",
+            TARGET,
+            Some("2025-01-01 00:00:00"),
+        )
+        .await
+        .expect("cost move sample");
+        assert_ne!(
+            prefix(&db, "cheap", TARGET).await,
+            prefix(&db, "dear", TARGET).await,
+            "median move repriced the moved key"
+        );
+        assert_eq!(
+            prefix(&db, "dear", TARGET).await,
+            dear_key,
+            "an unrelated key is untouched"
+        );
+    }
+
+    /// The keyed refresh's probe is served by its partial index, not
+    /// a crate-wide walk — it reads the same-(crate, target) pending
+    /// set, never the crate's terminal or other-target history.
+    #[tokio::test]
+    async fn cost_move_refresh_uses_the_pending_crate_target_index() {
+        let db = memory_db().await.expect("memory db");
+        let plan = db
+            .query(
+                "EXPLAIN QUERY PLAN \
+                 SELECT q.task_id FROM queue q \
+                 WHERE q.status = 'pending' AND q.crate_name = ? AND q.target = ?",
+            )
+            .bind("crate0".to_owned())
+            .bind(TARGET.to_owned())
+            .fetch_all::<PlanRow>()
+            .await
+            .expect("explain refresh");
+        let detail = plan
+            .iter()
+            .map(|row| row.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            detail.contains("idx_queue_pending_crate_target"),
+            "refresh probe should seek the partial index: {detail}"
+        );
+    }
+
+    /// The insert cost probe starts from the event's distinct
+    /// `(crate_name, target)` keys and seeks `crate_build_stats` by
+    /// its primary key — stored build history of any size stays out
+    /// of an enqueue's read set (stow#524 review).
+    #[tokio::test]
+    async fn insert_cost_probe_seeks_stats_by_pk_only() {
+        let db = memory_db().await.expect("memory db");
+        // Seed stored history far larger than the batch's distinct
+        // keys — a stats-first probe would read all of it.
+        db.query(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 \
+                                     FROM seq WHERE n < 10000) \
+             INSERT INTO crate_build_stats (crate_name, target, builds, median_ms) \
+             SELECT 'old' || n, 'x86_64-unknown-linux-gnu', n, n FROM seq",
+        )
+        .execute()
+        .await
+        .expect("seed stats history");
+        let plan = db
+            .query(&format!("EXPLAIN QUERY PLAN {}", super::INSERT_COST_PROBE))
+            .bind(super::enqueue_json(&[request("probe", Vec::new())]).expect("json"))
+            .fetch_all::<PlanRow>()
+            .await
+            .expect("explain cost probe");
+        let detail = plan
+            .iter()
+            .map(|row| row.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(
+            detail.contains("SEARCH s") && !detail.contains("SCAN s"),
+            "cost probe should PK-seek stats per event key: {detail}"
+        );
+    }
+
+    /// The refresh writer itself — not only the pure helper —
+    /// preserves exactness past `2^53`: adjacent priorities that
+    /// collapsed under REAL keep distinct exact keys, and an extreme
+    /// stored median prices through the same writer byte-for-byte as
+    /// the shared abstraction derives it (stow#524 review).
+    #[tokio::test]
+    async fn refresh_writer_preserves_exactness_beyond_f64() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("priced", Vec::new()), request("plain", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        let near = 9_007_199_254_740_992_i64;
+        // Wide operands bind as TEXT with a CAST — an i64 bind would
+        // itself cross the JSON number boundary and truncate.
+        for (name, priority) in [("priced", near), ("plain", near + 1)] {
+            db.query("UPDATE queue SET priority = CAST(? AS INTEGER) WHERE task_id = ?")
+                .bind(priority.to_string())
+                .bind(task_id_on(name, TARGET))
+                .execute()
+                .await
+                .expect("set priority");
+        }
+        db.query(
+            "INSERT INTO crate_build_stats \
+             (crate_name, target, builds, median_ms) \
+             VALUES ('priced', ?, 3, CAST(? AS INTEGER))",
+        )
+        .bind(TARGET)
+        .bind(i64::MAX.to_string())
+        .execute()
+        .await
+        .expect("seed extreme cost");
+
+        super::refresh_dispatch_keys(
+            &db,
+            &[task_id_on("priced", TARGET), task_id_on("plain", TARGET)],
+        )
+        .await
+        .expect("refresh keys");
+
+        let prefix = async |db: &DurableDb, name: &str| -> String {
+            db.query(
+                "SELECT substr(dispatch_key, 1, 65) AS p FROM queue \
+                 WHERE crate_name = ? AND target = ?",
+            )
+            .bind(name.to_owned())
+            .bind(TARGET.to_owned())
+            .fetch_scalar::<String>()
+            .await
+            .expect("prefix")
+        };
+        let priced = prefix(&db, "priced").await;
+        let plain = prefix(&db, "plain").await;
+        // 'priced' ranks near/(2^63-1) ≈ 1 against 'plain''s near+1 —
+        // distinct keys, and each byte-exact the abstraction's output
+        // for the row's own operands.
+        assert_eq!(
+            priced,
+            crate::scheduler::rank::rank_prefix(
+                "miss",
+                near,
+                std::num::NonZero::new(i64::MAX).unwrap()
+            ),
+            "extreme stored median prices exactly through the writer"
+        );
+        assert_eq!(
+            plain,
+            crate::scheduler::rank::rank_prefix(
+                "miss",
+                near + 1,
+                crate::scheduler::rank::UNMEASURED_COST
+            ),
+            "adjacent >2^53 priority keeps its exact key"
+        );
+        assert!(plain < priced, "the larger exact ratio claims first");
+    }
+
+    /// The additive migration grows `claimed_at` and the build-cost
+    /// tables on a dev-era queue — the operator route's only schema
+    /// work — while rows migrated before the column carry no claim
+    /// stamp and sample nothing.
+    #[tokio::test]
+    async fn migration_adds_claim_stamp_and_cost_tables() {
+        let db = memory_db_raw().await.expect("raw memory db");
+        for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
+            db.query(statement).execute().await.expect("dev-era schema");
+        }
+        super::migrate(&db, &settings()).await.expect("migrate");
+        let queue_columns = db
+            .query("PRAGMA table_info(queue)")
+            .fetch_all::<super::QueueTableInfoRow>()
+            .await
+            .expect("queue columns")
+            .into_iter()
+            .map(|column| column.name)
+            .collect::<Vec<_>>();
+        assert!(queue_columns.iter().any(|name| name == "claimed_at"));
+        for table in ["crate_build_samples", "crate_build_stats"] {
+            let columns = db
+                .query(&format!("PRAGMA table_info({table})"))
+                .fetch_all::<super::QueueTableInfoRow>()
+                .await
+                .expect("cost table columns");
+            assert!(!columns.is_empty(), "{table} exists");
+        }
     }
 }

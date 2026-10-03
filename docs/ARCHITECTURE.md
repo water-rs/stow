@@ -138,9 +138,15 @@ scripted CLI redemption and is unchanged.
 
 Accepted work lands in the scheduler's `human` lane, which dispatches
 ahead of the `miss` lane: `claim_dispatchable_tasks` orders by a
-persisted `value` — the human lane band, then the Windows-family band,
-then `priority` — with `first_requested_at`, `created_at` and `task_id`
-as stable FIFO tie-breakers at equal value, so no miss queueing
+persisted dispatch key — an explicit human-lane prefix, then an exact
+rational rank of the row's whole `value` (precedence and family bands
+plus `priority` and accumulated demand) divided by the
+`(crate_name, target)` expected build cost
+(`crate_build_stats.median_ms`, the bounded-window median of real
+claim-to-completion durations; a positive measured cost, with
+unmeasured crates dividing by 1 and keeping full demand value) — with
+`first_requested_at`, `created_at` and `task_id`
+as stable FIFO tie-breakers at equal rank, so no miss queueing
 ahead of time can starve a human request, and human rows are exempt
 from `STOW_DISPATCH_MIN_AGE_MINUTES` (the coalescing hold exists to
 batch identical misses; a human already said exactly what they want).

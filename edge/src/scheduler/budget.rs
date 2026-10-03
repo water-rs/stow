@@ -36,6 +36,23 @@ struct StatementMetric {
     rows_returned: u64,
     rows_read: u64,
     rows_written: u64,
+    /// The statement's own awaited wall — timed around the inner
+    /// `query`/`execute` on wasm, `0` on host.
+    elapsed_ms: u64,
+}
+
+/// `Date.now()` under wasm; `0.0` on host — the host lane gates SQL
+/// counts, not timing, so it never pays the clock read.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn clock_ms() -> f64 {
+    js_sys::Date::now()
+}
+
+/// The host clock is always zero — `elapsed_ms` is a probe-only
+/// measurement and host builds must not pretend timing exists.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn clock_ms() -> f64 {
+    0.0
 }
 
 /// A `DurableDbBackend` that forwards to another `DurableDb` and logs
@@ -53,13 +70,19 @@ impl MeteredBackend {
         result: &Result<DbExecResult, DurableDbError>,
         log: &Arc<Mutex<Vec<StatementMetric>>>,
         sql: &str,
+        started_ms: f64,
     ) {
         if let Ok(result) = result {
+            // `Date::now()` is milliseconds well below 2^53; the delta
+            // is exactly representable and non-negative.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let elapsed_ms = (clock_ms() - started_ms).max(0.0) as u64;
             log.lock().expect("statement log").push(StatementMetric {
                 sql: sql.to_owned(),
                 rows_returned: result.rows.len() as u64,
                 rows_read: result.rows_read,
                 rows_written: result.rows_written,
+                elapsed_ms,
             });
         }
     }
@@ -77,8 +100,9 @@ impl DurableDbBackend for MeteredBackend {
         let params = params.to_vec();
         async move {
             let mut source = &inner;
+            let started_ms = clock_ms();
             let result = QuerySource::query(&mut source, &sql, &params).await;
-            Self::record(&result, &log, &sql);
+            Self::record(&result, &log, &sql, started_ms);
             result
         }
     }
@@ -94,8 +118,9 @@ impl DurableDbBackend for MeteredBackend {
         let params = params.to_vec();
         async move {
             let mut source = &inner;
+            let started_ms = clock_ms();
             let result = QuerySource::execute(&mut source, &sql, &params).await;
-            Self::record(&result, &log, &sql);
+            Self::record(&result, &log, &sql, started_ms);
             result
         }
     }
@@ -103,6 +128,11 @@ impl DurableDbBackend for MeteredBackend {
     fn database_size(&self) -> impl Future<Output = Result<u64, DurableDbError>> + Send {
         let inner = self.inner.clone();
         async move { inner.database_size().await }
+    }
+
+    fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send {
+        let inner = self.inner.clone();
+        async move { inner.sync().await }
     }
 }
 
@@ -115,15 +145,30 @@ impl DurableDbBackend for MeteredBackend {
 #[derive(Clone)]
 pub struct CountedBackend<B> {
     inner: B,
-    rows: Arc<Mutex<(u64, u64)>>,
+    /// `(rows_read, rows_written, elapsed_ms)` — the trailing counter
+    /// is the Σ awaited wall over the backend's own calls, so a hot
+    /// drive's catalog-lookup time is attributable separately from
+    /// its object-statement time.
+    rows: Arc<Mutex<(u64, u64, u64)>>,
 }
 
 impl<B: DbBackend> CountedBackend<B> {
-    fn record(result: &Result<DbExecResult, DbError>, rows: &Arc<Mutex<(u64, u64)>>) {
+    fn record(
+        result: &Result<DbExecResult, DbError>,
+        rows: &Arc<Mutex<(u64, u64, u64)>>,
+        started_ms: f64,
+    ) {
+        // One synchronous tracing line per counted call, success or
+        // failure — the Σ collector keeps no per-call split.
+        d1_call_trace(result.is_ok(), started_ms);
         if let Ok(result) = result {
             let mut counts = rows.lock().expect("d1 counter");
             counts.0 += result.rows_read;
             counts.1 += result.rows_written;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                counts.2 += (clock_ms() - started_ms).max(0.0) as u64;
+            }
         }
     }
 }
@@ -141,8 +186,9 @@ impl<B: DbBackend> DbBackend for CountedBackend<B> {
         let inner = self.inner.clone();
         let rows = self.rows.clone();
         async move {
+            let started_ms = clock_ms();
             let result = inner.query(query, params).await;
-            Self::record(&result, &rows);
+            Self::record(&result, &rows, started_ms);
             result
         }
     }
@@ -155,8 +201,9 @@ impl<B: DbBackend> DbBackend for CountedBackend<B> {
         let inner = self.inner.clone();
         let rows = self.rows.clone();
         async move {
+            let started_ms = clock_ms();
             let result = inner.execute(query, params).await;
-            Self::record(&result, &rows);
+            Self::record(&result, &rows, started_ms);
             result
         }
     }
@@ -166,7 +213,7 @@ impl<B: DbBackend> DbBackend for CountedBackend<B> {
 /// `STOW_DB` binding wrapped so every statement's rows land in `rows`.
 pub fn counted_d1(
     env: &skyzen::runtime::wasm::WasmEnv,
-    rows: Arc<Mutex<(u64, u64)>>,
+    rows: Arc<Mutex<(u64, u64, u64)>>,
 ) -> Result<skyzen_services::Db, String> {
     let inner = CfD1::from_env(env.as_js(), super::object::STOW_DB_BINDING)
         .map_err(|error| format!("load D1 binding: {error}"))?;
@@ -497,6 +544,7 @@ pub async fn run(
     db: &DurableDb,
     settings: &queue::SchedulerSettings,
     env: &skyzen::runtime::wasm::WasmEnv,
+    alarm: &skyzen_services::durable::Alarm,
     request: &SchedulerBudgetRequest,
 ) -> Result<SchedulerBudgetReport, QueueError> {
     let mut settings = *settings;
@@ -507,7 +555,7 @@ pub async fn run(
         queue::Dispatch::Limited(limit) => u64::from(limit.get()),
         queue::Dispatch::Paused => 0,
     };
-    let ctx = drives::DriveContext::worker(env).map_err(QueueError::Sql)?;
+    let ctx = drives::DriveContext::worker(env, alarm).map_err(QueueError::Sql)?;
     // Seed the cached installation token once, outside any measured
     // window: the probe dispatches to the local-CI endpoint, so no real
     // credential exists — without this row the pass drive's credential
@@ -553,52 +601,9 @@ pub async fn run(
     let mut rows = Vec::with_capacity(drives::DRIVES.len());
     let mut over_budget = false;
     for drive in drives::DRIVES {
-        log.lock().expect("statement log").clear();
-        let d1_before = ctx.d1_counts();
-        let started_ms = js_sys::Date::now();
-        (drive.run)(&metered, shape, &settings, &ctx)
-            .await
-            .map_err(|error| QueueError::Sql(format!("drive {}: {error}", drive.name)))?;
-        // `Date::now()` is milliseconds well below 2^53; the delta is
-        // exactly representable and non-negative.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let wall_ms = (js_sys::Date::now() - started_ms).max(0.0) as u64;
-        let (d1_rows_read, d1_rows_written) = ctx.d1_counts();
-        let statements = std::mem::take(&mut *log.lock().expect("statement log"));
-        let totals = (
-            statements.len() as u64,
-            statements.iter().map(|s| s.rows_read).sum::<u64>(),
-            statements.iter().map(|s| s.rows_written).sum::<u64>(),
-        );
-        let budget = budget_of(drive.name)?;
-        let over = totals.0 > budget.statements
-            || totals.1 > budget.rows_read
-            || totals.2 > budget.rows_written
-            || wall_ms > budget.wall_ms;
-        over_budget |= over;
-        rows.push(SchedulerBudgetRow {
-            name: drive.name.to_owned(),
-            statements: totals.0,
-            rows_read: totals.1,
-            rows_written: totals.2,
-            wall_ms,
-            statement_budget: budget.statements,
-            read_budget: budget.rows_read,
-            write_budget: budget.rows_written,
-            wall_budget: budget.wall_ms,
-            d1_rows_read: d1_rows_read.saturating_sub(d1_before.0),
-            d1_rows_written: d1_rows_written.saturating_sub(d1_before.1),
-            over_budget: over,
-            log: statements
-                .into_iter()
-                .map(|metric| SchedulerBudgetStatement {
-                    sql: metric.sql,
-                    rows_returned: metric.rows_returned,
-                    rows_read: metric.rows_read,
-                    rows_written: metric.rows_written,
-                })
-                .collect(),
-        });
+        let row = run_drive(drive, db, &metered, shape, &settings, &ctx, &log).await?;
+        over_budget |= row.over_budget;
+        rows.push(row);
     }
     // The pass's claim record for the next run's re-arm — written on
     // `db` directly, so like the re-arm it lands outside the metered
@@ -612,6 +617,216 @@ pub async fn run(
         rows,
         over_budget,
     })
+}
+
+/// The probe's per-drive measurements, fed one [`drives::PhaseMark`]
+/// at a time by [`drives::drive_lifecycle`]: the measured wall opens
+/// at the run's starting mark — the fixture barrier has already
+/// resolved, so every earlier write was confirmed durable — and
+/// closes at the in-window barrier's finished mark, so the drive's
+/// own write confirmation is priced as its work. Statement and D1
+/// deltas bracket the same window.
+struct WindowMeasure<'a> {
+    drive: &'a str,
+    ctx: &'a drives::DriveContext,
+    log: &'a Arc<Mutex<Vec<StatementMetric>>>,
+    phase_started_ms: f64,
+    started_ms: f64,
+    wall_ms: u64,
+    d1_before: (u64, u64, u64),
+    d1_after: (u64, u64, u64),
+    statements: Vec<StatementMetric>,
+}
+
+impl WindowMeasure<'_> {
+    const fn new<'a>(
+        drive: &'a str,
+        ctx: &'a drives::DriveContext,
+        log: &'a Arc<Mutex<Vec<StatementMetric>>>,
+    ) -> WindowMeasure<'a> {
+        WindowMeasure {
+            drive,
+            ctx,
+            log,
+            phase_started_ms: 0.0,
+            started_ms: 0.0,
+            wall_ms: 0,
+            d1_before: (0, 0, 0),
+            d1_after: (0, 0, 0),
+            statements: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, mark: drives::PhaseMark) {
+        match mark {
+            drives::PhaseMark::Starting(phase) => {
+                if phase == drives::LifecyclePhase::Run {
+                    self.started_ms = clock_ms();
+                } else {
+                    self.phase_started_ms = clock_ms();
+                }
+            }
+            drives::PhaseMark::Finished(phase) => match phase {
+                drives::LifecyclePhase::Setup | drives::LifecyclePhase::Cleanup => {
+                    phase_trace(self.drive, phase.name(), self.phase_started_ms);
+                }
+                drives::LifecyclePhase::PreSync => {
+                    phase_trace(self.drive, phase.name(), self.phase_started_ms);
+                    self.log.lock().expect("statement log").clear();
+                    self.d1_before = self.ctx.d1_counts();
+                }
+                drives::LifecyclePhase::Run => {}
+                drives::LifecyclePhase::PostSync => {
+                    // `Date::now()` is milliseconds well below 2^53;
+                    // the delta is exactly representable and
+                    // non-negative.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        self.wall_ms = (clock_ms() - self.started_ms).max(0.0) as u64;
+                    }
+                    // The "run" trace brackets the whole measured
+                    // window — the pass plus its in-window barrier.
+                    phase_trace(self.drive, "run", self.started_ms);
+                    phase_trace(self.drive, phase.name(), self.phase_started_ms);
+                    self.d1_after = self.ctx.d1_counts();
+                    self.statements = std::mem::take(&mut *self.log.lock().expect("statement log"));
+                }
+            },
+        }
+    }
+}
+
+/// The report row a finished window produces, or the budget table's
+/// own error.
+fn budget_row(drive: &str, measure: WindowMeasure) -> Result<SchedulerBudgetRow, String> {
+    let totals = (
+        measure.statements.len() as u64,
+        measure.statements.iter().map(|s| s.rows_read).sum::<u64>(),
+        measure
+            .statements
+            .iter()
+            .map(|s| s.rows_written)
+            .sum::<u64>(),
+    );
+    match budget_of(drive) {
+        Err(error) => Err(format!("budget {drive}: {error}")),
+        Ok(budget) => Ok(SchedulerBudgetRow {
+            name: drive.to_owned(),
+            statements: totals.0,
+            rows_read: totals.1,
+            rows_written: totals.2,
+            wall_ms: measure.wall_ms,
+            statement_budget: budget.statements,
+            read_budget: budget.rows_read,
+            write_budget: budget.rows_written,
+            wall_budget: budget.wall_ms,
+            d1_rows_read: measure.d1_after.0.saturating_sub(measure.d1_before.0),
+            d1_rows_written: measure.d1_after.1.saturating_sub(measure.d1_before.1),
+            d1_elapsed_ms: measure.d1_after.2.saturating_sub(measure.d1_before.2),
+            over_budget: totals.0 > budget.statements
+                || totals.1 > budget.rows_read
+                || totals.2 > budget.rows_written
+                || measure.wall_ms > budget.wall_ms,
+            log: measure
+                .statements
+                .into_iter()
+                .map(|metric| SchedulerBudgetStatement {
+                    sql: metric.sql,
+                    rows_returned: metric.rows_returned,
+                    rows_read: metric.rows_read,
+                    rows_written: metric.rows_written,
+                    elapsed_ms: metric.elapsed_ms,
+                })
+                .collect(),
+        }),
+    }
+}
+
+/// One drive's unmetered hooks plus its metered pass, yielding the
+/// budget row the report compares against [`DO_BUDGETS`]. The phase
+/// ordering and error retention live in [`drives::drive_lifecycle`] —
+/// shared with the host gate — while [`WindowMeasure`] owns the
+/// probe's measurements.
+async fn run_drive(
+    drive: &drives::Drive,
+    db: &DurableDb,
+    metered: &DurableDb,
+    shape: FixtureShape,
+    settings: &queue::SchedulerSettings,
+    ctx: &drives::DriveContext,
+    log: &Arc<Mutex<Vec<StatementMetric>>>,
+) -> Result<SchedulerBudgetRow, QueueError> {
+    let mut measure = WindowMeasure::new(drive.name, ctx, log);
+    let outcome = drives::drive_lifecycle(drive, db, metered, shape, settings, ctx, &mut |mark| {
+        measure.mark(mark);
+    })
+    .await;
+    if let Err(error) = outcome.setup {
+        return Err(QueueError::Sql(format!(
+            "drive {} setup: {error}",
+            drive.name
+        )));
+    }
+    // Every failure the measured window produced rides together — a
+    // run error never swallows either barrier's own.
+    let failures: Vec<String> = [&outcome.pre_sync, &outcome.run, &outcome.post_sync]
+        .into_iter()
+        .filter_map(|phase| {
+            phase
+                .as_ref()
+                .and_then(|result| result.as_ref().err().cloned())
+        })
+        .collect();
+    let result = if failures.is_empty() {
+        budget_row(drive.name, measure)
+    } else {
+        Err(format!("drive {}: {}", drive.name, failures.join("; ")))
+    };
+    let cleanup_result = match &outcome.cleanup {
+        Some(Err(error)) => Err(format!("drive {} cleanup: {error}", drive.name)),
+        _ => Ok(()),
+    };
+    match (result, cleanup_result) {
+        (Ok(row), Ok(())) => Ok(row),
+        (Ok(_), Err(cleanup_error)) => Err(QueueError::Sql(cleanup_error)),
+        (Err(run_error), Ok(())) => Err(QueueError::Sql(run_error)),
+        // Both failed — report the drive's own error first, the
+        // cleanup's second, so neither diagnostic is lost.
+        (Err(run_error), Err(cleanup_error)) => Err(QueueError::Sql(format!(
+            "{run_error}; cleanup also failed: {cleanup_error}"
+        ))),
+    }
+}
+
+/// Probe-only per-call timing: one synchronous `tracing` line per
+/// counted D1 operation — its own awaited elapsed and whether it
+/// succeeded, never the statement's bound parameters. Same
+/// synchronous-logging rule as [`phase_trace`]; silent on host, where
+/// the clock is `0`.
+fn d1_call_trace(ok: bool, started_ms: f64) {
+    if clock_ms() != 0.0 {
+        tracing::info!(
+            "budget d1 call ok={ok} elapsed_ms={}",
+            clock_ms() - started_ms
+        );
+    }
+}
+
+/// Probe-only phase timing: emits one synchronous `tracing` line per
+/// `run_drive` boundary — drive name, phase (`setup`/`run`/`cleanup`)
+/// and the phase's `Date::now` elapsed — so the native wrangler
+/// persisted log locates fixture setup and cleanup separately from
+/// metered work. No I/O and no awaits: the line is pure synchronous
+/// logging, so it cannot refresh the worker clock, flush the storage
+/// output gate, or alter the span it measures. Durations are `0` on
+/// host (the host lane gates SQL counts only).
+fn phase_trace(drive: &str, phase: &str, phase_started_ms: f64) {
+    if clock_ms() != 0.0 {
+        tracing::info!(
+            "budget phase drive={drive} phase={phase} elapsed_ms={}",
+            clock_ms() - phase_started_ms
+        );
+    }
 }
 
 #[cfg(test)]

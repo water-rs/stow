@@ -877,6 +877,7 @@ mod tests {
                         wall_ms: (budget.wall_ms as f64 * factor) as u64,
                         d1_rows_read: 0,
                         d1_rows_written: 0,
+                        d1_elapsed_ms: 0,
                         statement_budget: budget.statements,
                         read_budget: budget.rows_read,
                         write_budget: budget.rows_written,

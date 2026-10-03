@@ -81,19 +81,50 @@ CREATE TABLE IF NOT EXISTS queue (
     -- enqueue — target never changes. Lets the wake-time probes prefix
     -- equality-filter by family instead of scanning.
     dispatch_family TEXT NOT NULL DEFAULT '',
-    -- The number the claim order descends on (stow#442 I6): precedence
-    -- bands over `priority` — two for the human lane, one for the
-    -- Windows family — so lane, family and priority compare inside one
-    -- integer. Refreshed with `dispatch_key` wherever a lane or
-    -- priority operand changes (re-request, promote, revive); the
-    -- family never changes after insert.
+    -- The demand the claim order descends on before cost (stow#442
+    -- I6): precedence bands over `priority` and `demand` — two bands
+    -- for the human lane, one for the Windows family — so lane,
+    -- family and the banded operands compare inside one integer. The
+    -- dispatch key orders on the whole value divided by expected
+    -- build cost; this column keeps the undivided value. Refreshed
+    -- with `dispatch_key` wherever a lane, priority or demand operand
+    -- changes (re-request, promote, revive, demand fold); the family
+    -- never changes after insert.
     value INTEGER NOT NULL DEFAULT 0,
+    -- Accumulated observed demand (stow#522): the sum of this task's
+    -- `demand_contributions` rows, written only by the demand route.
+    -- It is a `value` operand inside the priority band — the band
+    -- bound keeps `priority + demand <= PRIORITY_MAX` — so every key
+    -- refresh and re-request carries it forward instead of wiping it.
+    demand INTEGER NOT NULL DEFAULT 0,
     -- The claim ORDER BY tuple encoded as one sortable string:
-    -- inverted `value` | first_requested_at | created_at | task_id.
-    -- The claim walk orders by it under an index and pages by keyset,
-    -- so a dispatch pass reads rows proportional to the slots it
-    -- fills, not the queue size.
+    -- lane prefix (0 human / 1 other) | fixed-64 lowercase hex of the
+    -- inverted exact rank quotient U256::MAX - floor((value << 128) /
+    -- expected_cost) | first_requested_at | created_at | task_id.
+    -- The quotient preserves the full rational order of
+    -- value / (crate_name, target) median build cost (stow#524 —
+    -- cheap expected builds claim first at equal value); the lane
+    -- prefix keeps human precedence literal, and equal quotients fall
+    -- through to the FIFO tie-breakers. The claim walk orders by it
+    -- under an index and pages by keyset, so a dispatch pass reads
+    -- rows proportional to the slots it fills, not the queue size.
     dispatch_key TEXT NOT NULL DEFAULT '',
+    -- The instant this row's live generation was claimed — written
+    -- only by the claim UPDATE, so it is immutable for the generation
+    -- while `updated_at` is rewritten by every in-flight writer (a
+    -- re-request bumps it even on an active row). `NULL` until first
+    -- claim and on rows migrated from before the column: a completion
+    -- only samples duration against a real claim stamp (stow#524).
+    claimed_at TEXT,
+    -- The admission floor's persisted answer (stow#525 I10):
+    -- `lane = 'human' OR value >= floor`, with `floor` the
+    -- `min_dispatch_value` row `settings` carries — the value the last
+    -- operator migrate stamped, never a request-time read. Maintained
+    -- by every writer that touches `value` or `lane`, and equality-
+    -- indexed ahead of the order/range fields so a positive floor
+    -- excludes the under-floor bulk before any rank or wake walk
+    -- reaches it.
+    dispatch_eligible INTEGER NOT NULL DEFAULT 1,
     UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
 );
 
@@ -155,23 +186,88 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     PRIMARY KEY (task_id, depends_on_task_id)
 );
 
+-- One demand batch's durable record (stow#522): the batch/window
+-- identity and payload contract the hourly demand feed (#523) replays
+-- against. `input_hash` is the blake3 fingerprint of the canonical
+-- (sorted, summed) entry set — a redelivery naming this id must carry
+-- the same fingerprint or fail, draft or accepted — and `state` is the
+-- typed lifecycle: `prepared` is an unaccepted draft whose staging a
+-- same-input retry may replace, `accepted` is a complete batch whose
+-- replay answers from this header and writes nothing. The
+-- contribution set itself is never stored here — it lives
+-- relationally in demand_contributions, so no row approaches the
+-- platform's string/row size bound.
+CREATE TABLE IF NOT EXISTS demand_batches (
+    batch_id TEXT PRIMARY KEY,
+    input_hash TEXT NOT NULL,
+    -- The staged (task, delta) count recorded at acceptance: the
+    -- trigger's staged-count verification and the replay report's
+    -- touched count.
+    touched_count INTEGER NOT NULL CHECK (touched_count >= 0),
+    state TEXT NOT NULL DEFAULT 'prepared'
+        CHECK (state IN ('prepared', 'accepted')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One demand batch's contribution to one task (stow#522): the
+-- event-local staging set — relational rows, never a serialized blob.
+-- Rows under a `prepared` batch are unaccepted draft material a
+-- reprepare may clear wholesale; the guarded `prepared → accepted`
+-- UPDATE on demand_batches fires the `demand_fold` trigger (created at
+-- migrate), which folds every staged row into the queue inside that
+-- one statement — statement-atomic acceptance, so an accepted batch
+-- has no unapplied remainder and a replay writes nothing. The staged
+-- `value`, `dispatch_key` and `dispatch_eligible` are the event's
+-- PRECOMPUTED answers — derived in Rust through the shared rank
+-- abstraction at the post-fold demand before a single ledger write —
+-- so the trigger is a static prepared-field copy and no ranking
+-- formula exists in SQL anywhere.
+CREATE TABLE IF NOT EXISTS demand_contributions (
+    task_id TEXT NOT NULL,
+    -- The batch's durable window identity (e.g. the feed hour).
+    batch_id TEXT NOT NULL,
+    -- This batch's total contribution to the task — the sum of every
+    -- entry in the batch whose closure reached it.
+    delta INTEGER NOT NULL CHECK (delta >= 0),
+    -- The task's post-fold raw value, as decimal text (the integer
+    -- range exceeds a JS Number's exact band).
+    value TEXT NOT NULL,
+    -- The task's post-fold dispatch key — exact-rank prefix plus the
+    -- FIFO fields the queue row already carries.
+    dispatch_key TEXT NOT NULL,
+    -- The task's post-fold admission answer under the stored floor.
+    dispatch_eligible INTEGER NOT NULL CHECK (dispatch_eligible IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, batch_id)
+);
+
+-- The demand path reads only a batch's own rows — the fold and the
+-- bound probe are driven by this index, never the stored ledger.
+CREATE INDEX IF NOT EXISTS idx_demand_contributions_batch
+ON demand_contributions (batch_id);
+
 -- The claim walk: pending + deps-met rows in dispatch order. The alarm's
 -- dispatch pass reads the first page of this index, never the queue.
 -- `dispatch_key` is unique within a status group, so the trailing
 -- residual-filter columns (`dispatch_family`, `lane`,
 -- `first_requested_at`, `not_before`) do not disturb the ORDER BY — they
 -- let a skipped index entry answer the family/lane/age checks without
--- fetching the row.
-CREATE INDEX IF NOT EXISTS idx_queue_dispatch
-ON queue (status, deps_met, dispatch_key, dispatch_family, lane, first_requested_at, not_before);
+-- fetching the row. `dispatch_eligible` leads the ordering fields so a
+-- positive admission floor excludes the under-floor bulk before the
+-- `dispatch_key` walk reads it (stow#525).
+CREATE INDEX IF NOT EXISTS idx_queue_claim
+ON queue (status, deps_met, dispatch_eligible, dispatch_key, dispatch_family, lane, first_requested_at, not_before);
 
 -- The alarm's wake probes: `SELECT 1 … wake_at <= now LIMIT 1` (already
 -- dispatchable) and `MIN(wake_at) … wake_at > now` (earliest deferred
 -- wake) — both bounded by the `wake_at` ordering, with
 -- `dispatch_family` before it so a saturated family's deferred rows do
 -- not stand ahead of another family's earliest wake in the same walk.
-CREATE INDEX IF NOT EXISTS idx_queue_wake_eligible
-ON queue (status, deps_met, dispatch_family, wake_at);
+-- `dispatch_eligible` precedes the range field, so a queue of
+-- under-floor rows is excluded by equality before the `wake_at` walk —
+-- no bulk read against the floor (stow#525).
+CREATE INDEX IF NOT EXISTS idx_queue_wake
+ON queue (status, deps_met, dispatch_eligible, dispatch_family, wake_at);
 
 -- Admin's oldest-pending MIN and the 24h outcome window.
 CREATE INDEX IF NOT EXISTS idx_queue_status_first
@@ -465,3 +561,44 @@ CREATE TABLE IF NOT EXISTS requests (
     error TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- One successful build's claim-to-completion duration, bound to the
+-- claim generation that ran it (stow#524): a late, duplicate or
+-- old-generation report can never re-land a sample — the generation
+-- is consumed by the completion fence before sampling runs, and the
+-- PRIMARY KEY dedups any replay that still arrives. The window per
+-- (crate_name, target) is the newest BUILD_SAMPLE_WINDOW samples by
+-- insertion; each completion deletes the tail past it, so a key
+-- never outgrows the window and the median below never scans history.
+CREATE TABLE IF NOT EXISTS crate_build_samples (
+    crate_name TEXT NOT NULL,
+    target TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+    PRIMARY KEY (crate_name, target, generation_id)
+);
+
+-- The per-(crate, target) expected build cost the rank divides the
+-- row's whole `value` by — precedence and family bands included,
+-- so a cheaper build moves its lane peers ahead only within the
+-- same value: `builds` counts every accepted sample, `median_ms` is
+-- the lower median of the live sample window, recomputed from at
+-- most BUILD_SAMPLE_WINDOW rows per completion — never a historical
+-- scan. The dispatch_key score probes this table once per row a
+-- write touches; a key absent here costs 1, so unmeasured crates
+-- keep their full demand value.
+CREATE TABLE IF NOT EXISTS crate_build_stats (
+    crate_name TEXT NOT NULL,
+    target TEXT NOT NULL,
+    builds INTEGER NOT NULL,
+    median_ms INTEGER NOT NULL,
+    PRIMARY KEY (crate_name, target)
+);
+
+-- The cost-move refresh's exact probe: `WHERE status = 'pending'
+-- AND crate_name = ? AND target = ?`. Without it the refresh falls
+-- back to `idx_queue_crate_updated` (crate_name only) and reads the
+-- crate's whole history — every completed, failed and other-target
+-- row — instead of just the pending set it may rewrite.
+CREATE INDEX IF NOT EXISTS idx_queue_pending_crate_target
+ON queue (crate_name, target) WHERE status = 'pending';

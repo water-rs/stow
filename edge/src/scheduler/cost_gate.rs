@@ -163,10 +163,16 @@ const BUDGETS: &[RouteBudget] = &[
     // Mutation routes — one keyed statement each against a bounded
     // selector.
     RouteBudget {
+        // The success arm also prices the build-cost bookkeeping
+        // (stow#524): one generation-keyed sample insert, the
+        // newest-BUILD_SAMPLE_WINDOW cap delete, the window's
+        // ≤-window read, the stats upsert and — only when the median
+        // moved — a keyed refresh over exactly the same-(crate, target)
+        // pending rows.
         name: "POST /tasks/complete-run",
-        statements: 7,
-        rows_read: 70,
-        rows_written: 20,
+        statements: 14,
+        rows_read: 120,
+        rows_written: 60,
         scan_allowlist: &[],
         ddl_permitted: false,
     },
@@ -180,7 +186,7 @@ const BUDGETS: &[RouteBudget] = &[
     },
     RouteBudget {
         name: "POST /tasks/retry",
-        statements: 3,
+        statements: 4,
         rows_read: 10,
         rows_written: 4,
         scan_allowlist: &[],
@@ -297,6 +303,16 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
+    RouteBudget {
+        name: "POST /demand",
+        statements: 14,
+        rows_read: 200,
+        rows_written: 60,
+        // The recursive walk's working table and the json_each payload
+        // scan are keyed-by-construction, not table scans.
+        scan_allowlist: &["SCAN walk", "SCAN json_each"],
+        ddl_permitted: false,
+    },
     // The explicit full report — first publish and `index report --full`
     // resyncs — whose server-side diff reads the live slice (a
     // legitimate bound: the report body names every row).
@@ -343,6 +359,18 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 12,
         rows_read: 80,
         rows_written: 4,
+        scan_allowlist: &["idx_queue_shape_requeue"],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // One real dispatch pass over the floored queue — the same
+        // claim/plan surface as the hot pass, priced separately so
+        // the gate sees planner and claim cost under a positive
+        // persisted floor (stow#525).
+        name: "alarm pass (floor claim)",
+        statements: 90,
+        rows_read: 500,
+        rows_written: 150,
         scan_allowlist: &["idx_queue_shape_requeue"],
         ddl_permitted: false,
     },
@@ -688,13 +716,83 @@ async fn run_drives(
     log: &Arc<Mutex<Vec<LoggedStatement>>>,
 ) {
     for drive in drives::DRIVES {
-        let base = log.lock().expect("statement log").len();
-        (drive.run)(db, shape, settings, ctx)
+        run_one_drive(db, shape, settings, ctx, log, drive)
             .await
-            .unwrap_or_else(|error| panic!("{} failed: {error}", drive.name));
-        let statements = log.lock().expect("statement log")[base..].to_vec();
-        let measurement = Measurement::of(statements);
-        check(db, budget_of(drive.name), &measurement).await;
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+}
+
+/// One drive's unmetered hooks plus its metered pass and budget check.
+/// The phase ordering and error retention live in
+/// [`drives::drive_lifecycle`] — shared with the workerd probe — while
+/// this observer owns the gate's bookkeeping: setup/cleanup statements
+/// are fixture work, not the priced event, so the log truncates back
+/// to the mark each phase opened at (stow#525).
+async fn run_one_drive(
+    db: &DurableDb,
+    shape: fixture::FixtureShape,
+    settings: &SchedulerSettings,
+    ctx: &drives::DriveContext,
+    log: &Arc<Mutex<Vec<LoggedStatement>>>,
+    drive: &drives::Drive,
+) -> Result<(), String> {
+    let mut keep = 0;
+    let mut base = 0;
+    let outcome =
+        drives::drive_lifecycle(
+            drive,
+            db,
+            db,
+            shape,
+            settings,
+            ctx,
+            &mut |mark| match mark {
+                drives::PhaseMark::Starting(
+                    drives::LifecyclePhase::Setup | drives::LifecyclePhase::Cleanup,
+                ) => keep = log.lock().expect("statement log").len(),
+                drives::PhaseMark::Finished(
+                    drives::LifecyclePhase::Setup | drives::LifecyclePhase::Cleanup,
+                ) => log.lock().expect("statement log").truncate(keep),
+                drives::PhaseMark::Finished(drives::LifecyclePhase::PreSync) => {
+                    base = log.lock().expect("statement log").len();
+                }
+                _ => {}
+            },
+        )
+        .await;
+    if let Err(error) = outcome.setup {
+        return Err(format!("{} setup failed: {error}", drive.name));
+    }
+    let failures: Vec<String> = [&outcome.pre_sync, &outcome.run, &outcome.post_sync]
+        .into_iter()
+        .filter_map(|phase| {
+            phase
+                .as_ref()
+                .and_then(|result| result.as_ref().err().cloned())
+        })
+        .collect();
+    let run_result = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    };
+    let cleanup_result = match &outcome.cleanup {
+        Some(Err(error)) => Err(format!("{} cleanup failed: {error}", drive.name)),
+        _ => Ok(()),
+    };
+    match (run_result, cleanup_result) {
+        (Ok(()), Ok(())) => {
+            let statements = log.lock().expect("statement log")[base..].to_vec();
+            let measurement = Measurement::of(statements);
+            check(db, budget_of(drive.name), &measurement).await;
+            Ok(())
+        }
+        (Err(run_error), Ok(())) => Err(format!("{} failed: {run_error}", drive.name)),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(run_error), Err(cleanup_error)) => Err(format!(
+            "{} failed: {run_error}; cleanup also failed: {cleanup_error}",
+            drive.name
+        )),
     }
 }
 
@@ -993,5 +1091,79 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
         "each pass completes a fresh attempt epoch: {} then {}",
         first.attempt,
         second.attempt,
+    );
+}
+
+/// A drive that fails mid-pass must still see its cleanup run — the
+/// isolation promise holds on the error path too — and when the
+/// cleanup itself also fails, the error names both failures.
+fn injected_run_failure<'a>(
+    _db: &'a DurableDb,
+    _shape: fixture::FixtureShape,
+    _settings: &'a SchedulerSettings,
+    _ctx: &'a drives::DriveContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async { Err("injected run failure".to_owned()) })
+}
+
+fn marking_cleanup<'a>(
+    db: &'a DurableDb,
+    _shape: fixture::FixtureShape,
+    _settings: &'a SchedulerSettings,
+    _ctx: &'a drives::DriveContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        db.query("INSERT INTO settings (key, value) VALUES ('cleanup-marker', '1')")
+            .execute()
+            .await
+            .map_err(|error| error.to_string())
+            .map(|_| ())
+    })
+}
+
+fn injected_cleanup_failure<'a>(
+    _db: &'a DurableDb,
+    _shape: fixture::FixtureShape,
+    _settings: &'a SchedulerSettings,
+    _ctx: &'a drives::DriveContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async { Err("injected cleanup failure".to_owned()) })
+}
+
+#[tokio::test]
+async fn cleanup_still_runs_after_a_failing_drive() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let ctx = drives::DriveContext::host();
+    let settings = SchedulerSettings::default();
+    let drive = drives::Drive {
+        name: "probe-isolation",
+        setup: None,
+        run: injected_run_failure,
+        cleanup: Some(marking_cleanup),
+    };
+    let error = run_one_drive(&db, fixture::GATE, &settings, &ctx, &log, &drive)
+        .await
+        .expect_err("the failing drive must propagate its error");
+    assert_eq!(error, "probe-isolation failed: injected run failure");
+    let marked = db
+        .query("SELECT COUNT(*) FROM settings WHERE key = 'cleanup-marker'")
+        .fetch_scalar::<u64>()
+        .await
+        .expect("marker read");
+    assert_eq!(marked, 1, "cleanup ran after the failed run");
+
+    let drive = drives::Drive {
+        name: "probe-double-failure",
+        setup: None,
+        run: injected_run_failure,
+        cleanup: Some(injected_cleanup_failure),
+    };
+    let error = run_one_drive(&db, fixture::GATE, &settings, &ctx, &log, &drive)
+        .await
+        .expect_err("both failures must propagate");
+    assert_eq!(
+        error,
+        "probe-double-failure failed: injected run failure; \
+         cleanup also failed: probe-double-failure cleanup failed: injected cleanup failure"
     );
 }
