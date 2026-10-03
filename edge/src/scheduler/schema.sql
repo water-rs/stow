@@ -82,14 +82,14 @@ CREATE TABLE IF NOT EXISTS queue (
     -- equality-filter by family instead of scanning.
     dispatch_family TEXT NOT NULL DEFAULT '',
     -- The demand the claim order descends on before cost (stow#442
-    -- I6): precedence bands over `priority` — two for the human lane,
-    -- one for the Windows family — so lane, family and priority
-    -- compare inside one integer. The dispatch score `dispatch_key`
-    -- orders on divides the priority operand by expected build cost;
-    -- this column keeps the undivided value. Refreshed with
-    -- `dispatch_key` wherever a lane or priority operand changes
-    -- (re-request, promote, revive); the family never changes after
-    -- insert.
+    -- I6): precedence bands over `priority` and `demand` — two bands
+    -- for the human lane, one for the Windows family — so lane,
+    -- family and the banded operands compare inside one integer. The
+    -- dispatch key orders on the whole value divided by expected
+    -- build cost; this column keeps the undivided value. Refreshed
+    -- with `dispatch_key` wherever a lane, priority or demand operand
+    -- changes (re-request, promote, revive, demand fold); the family
+    -- never changes after insert.
     value INTEGER NOT NULL DEFAULT 0,
     -- Accumulated observed demand (stow#522): the sum of this task's
     -- `demand_contributions` rows, written only by the demand route.

@@ -248,6 +248,7 @@ async fn scheduler_budget_seed(
 async fn scheduler_budget(
     env: WasmEnv,
     db: DurableDb,
+    alarm: Alarm,
     Json(request): Json<stow_types::api::SchedulerBudgetRequest>,
 ) -> Result<Json<stow_types::api::SchedulerBudgetReport>> {
     if !budget_probe_enabled(&env) {
@@ -258,7 +259,7 @@ async fn scheduler_budget(
     }
     let settings = scheduler_settings(&env)?;
     Ok(Json(
-        budget::run(&db, &settings, &env, &request)
+        budget::run(&db, &settings, &env, &alarm, &request)
             .await
             .map_err(to_error)?,
     ))
@@ -277,21 +278,24 @@ async fn scheduler_demand(
     alarm: Alarm,
     Json(request): Json<stow_types::api::SchedulerDemandRequest>,
 ) -> Result<Json<stow_types::api::SchedulerDemandReport>> {
-    let report = queue::apply_demand(&db, &request).await.map_err(|error| {
-        let status = match &error {
-            crate::errors::QueueError::Invariant(_)
-            | crate::errors::QueueError::Overflow { .. } => StatusCode::BAD_REQUEST,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        to_error(error).set_status(status)
-    })?;
+    let (now_ms, settings) = alarm_inputs(&env)?;
+    let (report, plan) = queue::demand_pass(&db, &request, now_ms, &settings)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                crate::errors::QueueError::Invariant(_)
+                | crate::errors::QueueError::Overflow { .. } => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
     // A folded batch can raise a queue row over the admission floor
-    // (or clear its age gate) — re-arm the wake unconditionally, an
-    // exact replay included: the indexed next-alarm probe costs the
-    // same one read it always costs, and a replay repairs a schedule a
-    // previously lost response never armed. An under-floor queue arms
-    // nothing (stow#525).
-    schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
+    // (or clear its age gate) — arm the plan the shared pass decided,
+    // an exact replay included: a replay repairs a schedule a
+    // previously lost response never armed, and an under-floor queue
+    // arms nothing (stow#525).
+    queue::arm_alarm(&alarm, plan).await.map_err(|error| {
+        let error = to_error(error);
         tracing::error!(%error, "scheduler demand schedule_alarm failed");
         error
     })?;
@@ -1213,28 +1217,25 @@ async fn persist_dispatch_outcome(
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {
+    let (now_ms, settings) = alarm_inputs(env)?;
+    let plan = queue::next_alarm(db, now_ms, &settings)
+        .await
+        .map_err(to_error)?;
+    queue::arm_alarm(alarm, plan).await.map_err(|error| {
+        let error = to_error(error);
+        tracing::error!(%error, "failed to perform scheduler alarm plan");
+        error
+    })
+}
+
+/// The instant and settings every alarm plan is decided under — read
+/// once per pass so a route's plan and its arm see one clock.
+fn alarm_inputs(env: &WasmEnv) -> Result<(i64, SchedulerSettings)> {
     // `Date::now()` returns whole milliseconds well below 2^53; the value is
     // exactly representable and always fits i64.
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = js_sys::Date::now() as i64;
-    let settings = scheduler_settings(env)?;
-    match queue::next_alarm(db, now_ms, &settings)
-        .await
-        .map_err(to_error)?
-    {
-        queue::AlarmPlan::Delete => alarm.delete_alarm().await.map_err(|error| {
-            let error = to_error(error);
-            tracing::error!(%error, "failed to delete scheduler alarm");
-            error
-        })?,
-        queue::AlarmPlan::At(next_ms) => alarm.set_alarm(next_ms).await.map_err(|error| {
-            let error = to_error(error);
-            tracing::error!(%error, next_ms, "failed to set scheduler alarm");
-            error
-        })?,
-    }
-
-    Ok(())
+    Ok((now_ms, scheduler_settings(env)?))
 }
 
 fn read_string_binding(env: &WasmEnv, binding_name: &str) -> Result<String> {

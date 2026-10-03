@@ -305,7 +305,7 @@ const BUDGETS: &[RouteBudget] = &[
     },
     RouteBudget {
         name: "POST /demand",
-        statements: 9,
+        statements: 14,
         rows_read: 200,
         rows_written: 60,
         // The recursive walk's working table and the json_each payload
@@ -359,6 +359,18 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 12,
         rows_read: 80,
         rows_written: 4,
+        scan_allowlist: &["idx_queue_shape_requeue"],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // One real dispatch pass over the floored queue — the same
+        // claim/plan surface as the hot pass, priced separately so
+        // the gate sees planner and claim cost under a positive
+        // persisted floor (stow#525).
+        name: "alarm pass (floor)",
+        statements: 90,
+        rows_read: 500,
+        rows_written: 150,
         scan_allowlist: &["idx_queue_shape_requeue"],
         ddl_permitted: false,
     },
@@ -704,6 +716,16 @@ async fn run_drives(
     log: &Arc<Mutex<Vec<LoggedStatement>>>,
 ) {
     for drive in drives::DRIVES {
+        // Fixture preparation is setup, not the event being priced —
+        // run it unmetered and drop its statements from the log
+        // (stow#525).
+        if let Some(setup) = drive.setup {
+            let keep = log.lock().expect("statement log").len();
+            setup(db, shape, settings, ctx)
+                .await
+                .unwrap_or_else(|error| panic!("{} setup failed: {error}", drive.name));
+            log.lock().expect("statement log").truncate(keep);
+        }
         let base = log.lock().expect("statement log").len();
         (drive.run)(db, shape, settings, ctx)
             .await
@@ -711,6 +733,13 @@ async fn run_drives(
         let statements = log.lock().expect("statement log")[base..].to_vec();
         let measurement = Measurement::of(statements);
         check(db, budget_of(drive.name), &measurement).await;
+        if let Some(cleanup) = drive.cleanup {
+            let keep = log.lock().expect("statement log").len();
+            cleanup(db, shape, settings, ctx)
+                .await
+                .unwrap_or_else(|error| panic!("{} cleanup failed: {error}", drive.name));
+            log.lock().expect("statement log").truncate(keep);
+        }
     }
 }
 

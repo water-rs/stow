@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::{NonZero, NonZeroU32};
 
-use skyzen_services::durable::{DbValue, DurableDb};
+use skyzen_services::durable::{Alarm, DbValue, DurableDb};
 pub use stow_types::api::task_id;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
@@ -205,13 +205,14 @@ fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> 
 const PRIORITY_MAX: i64 = (u64::MAX / 1000 + 10 * u32::MAX as u64).cast_signed();
 
 /// Width of one precedence band in `queue.value`. The persisted value
-/// is `bands × VALUE_BAND + priority`, with the human lane contributing
-/// two bands and the Windows family one — today's "human first, then
-/// Windows, then priority" claim order encoded additively in one
-/// descending number (stow#442 I6). The largest value a row can take is
-/// `3 × VALUE_BAND + PRIORITY_MAX = 4 × PRIORITY_MAX + 3 =
-/// 73,787,148,093,530,007`, below `i64::MAX`, so no operand can
-/// overflow the column.
+/// is `bands × VALUE_BAND + MAX(0, priority) + MAX(0, demand)`, with
+/// the human lane contributing two bands and the Windows family one —
+/// today's "human first, then Windows, then priority" claim order
+/// encoded additively in one descending number (stow#442 I6), with
+/// accumulated demand folding into the same priority band (stow#522).
+/// The largest value a row can take is `3 × VALUE_BAND + PRIORITY_MAX
+/// = 4 × PRIORITY_MAX + 3 = 73,787,148,093,530,007`, below
+/// `i64::MAX`, so no operand can overflow the column.
 pub(super) const VALUE_BAND: i64 = PRIORITY_MAX + 1;
 
 /// The queue-identity columns of one enqueue request.
@@ -269,7 +270,7 @@ const fn resurrects(status: &str, lane: TaskLane) -> bool {
 /// bound parameters at 100 but a bound *string* at 2MB, so a JSON array
 /// sidesteps the parameter ceiling entirely. 2000 identities (~300B
 /// each) or edges (~200B each) stay well under the string limit.
-const ENQUEUE_JSON_BATCH_ROWS: usize = 2000;
+pub const ENQUEUE_JSON_BATCH_ROWS: usize = 2000;
 
 /// Retired slice rows delete in `rowid IN (…)` batches. workerd caps a
 /// statement at ~100 bound variables, so the batch stays under it by
@@ -443,7 +444,7 @@ struct BatchedDepEdge {
 }
 
 /// Serialize one statement's JSON-array payload.
-fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
+pub(super) fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
     serde_json::to_string(rows)
         .map_err(|error| QueueError::Sql(format!("encode enqueue batch json: {error}")))
 }
@@ -3346,9 +3347,6 @@ pub async fn apply_demand(
         .unwrap_or(0);
     let rows = prepare_demand_rows(db, &contributions, floor).await?;
     let chunks = contribution_chunks(&rows)?;
-    for chunk in &chunks {
-        check_demand_band_bound(db, chunk).await?;
-    }
 
     let touched = i64::try_from(rows.len()).unwrap_or(i64::MAX);
     demand_commit_batch(
@@ -3367,6 +3365,41 @@ pub async fn apply_demand(
         touched_tasks: u64::try_from(touched).unwrap_or(u64::MAX),
         applied: true,
     })
+}
+
+/// `POST /demand`'s full storage pass — the batch apply plus the
+/// alarm plan the caller then arms. Shared by the wasm route and the
+/// cost-gate drive so the metered statement set is the real route
+/// path: the same apply, then the same freeze/settings/family/lease
+/// `next_alarm` probes the route's `schedule_alarm` runs — nothing
+/// read or written outside them (stow#522).
+pub async fn demand_pass(
+    db: &DurableDb,
+    request: &stow_types::api::SchedulerDemandRequest,
+    now_ms: i64,
+    settings: &SchedulerSettings,
+) -> Result<(stow_types::api::SchedulerDemandReport, AlarmPlan), QueueError> {
+    let report = apply_demand(db, request).await?;
+    let plan = next_alarm(db, now_ms, settings).await?;
+    Ok((report, plan))
+}
+
+/// Perform the plan `next_alarm` decided on the real durable-object
+/// alarm — shared by the wasm routes and the budget probe's demand
+/// drive so the drive performs the same set/delete sequence the route
+/// does. Alarm calls are platform operations, not SQL: they sit
+/// outside the statement/rows meter by design (stow#522).
+pub(super) async fn arm_alarm(alarm: &Alarm, plan: AlarmPlan) -> Result<(), QueueError> {
+    match plan {
+        AlarmPlan::Delete => alarm
+            .delete_alarm()
+            .await
+            .map_err(|error| QueueError::Sql(format!("delete scheduler alarm: {error}"))),
+        AlarmPlan::At(next_ms) => alarm
+            .set_alarm(next_ms)
+            .await
+            .map_err(|error| QueueError::Sql(format!("set scheduler alarm {next_ms}: {error}"))),
+    }
 }
 
 /// The write tail of a new or retried delivery: land the `prepared`
@@ -3628,6 +3661,13 @@ async fn prepare_demand_rows(
             operands.insert(row.task_id.clone(), row);
         }
     }
+    // The band bound runs on the typed row BEFORE any rank math —
+    // `MAX(0, priority) + post-fold demand` must stay under
+    // `PRIORITY_MAX`, so a delta too large for the task's headroom
+    // names its offenders as a request error while the store is still
+    // untouched, instead of overflowing `raw_value`'s band addition
+    // mid-derivation (stow#522).
+    let mut offending = Vec::new();
     let mut staged = Vec::with_capacity(contributions.len());
     for (tid, delta) in contributions {
         let row = operands.get(tid).ok_or_else(|| {
@@ -3639,6 +3679,14 @@ async fn prepare_demand_rows(
             field: "task demand fold",
             value: u64::MAX,
         })?;
+        if *delta
+            > PRIORITY_MAX
+                .saturating_sub(row.priority.max(0))
+                .saturating_sub(row.demand.max(0))
+        {
+            offending.push(tid.clone());
+            continue;
+        }
         let value = crate::scheduler::rank::raw_value(
             &row.lane,
             &row.dispatch_family,
@@ -3662,6 +3710,13 @@ async fn prepare_demand_rows(
             key,
             eligible: u8::from(row.lane == "human" || value >= floor),
         });
+    }
+    if !offending.is_empty() {
+        return Err(QueueError::Invariant(format!(
+            "demand would overflow the priority band on {} task(s): {}",
+            offending.len(),
+            offending.join(", ")
+        )));
     }
     Ok(staged)
 }
@@ -3735,38 +3790,6 @@ async fn demand_closure_tasks(
     .fetch_scalars::<String>()
     .await
     .map_err(|error| format!("demand closure walk: {error}").into())
-}
-
-/// The demand band bound, checked over exactly the rows this event
-/// will fold — the chunk about to stage — before any write: `MAX(0,
-/// priority) + demand + delta` must stay under `PRIORITY_MAX` so
-/// demand cannot outrank a lane or family band. Written as `delta >
-/// bound - priority - demand`, every operand stays inside i64, so the
-/// compare can never promote to REAL — and on overflow the request
-/// errors with the offenders named rather than clamping.
-async fn check_demand_band_bound(db: &DurableDb, payload: &str) -> Result<(), QueueError> {
-    let offending: Vec<String> = db
-        .query(&format!(
-            "SELECT f.tid FROM ( \
-                 SELECT j.value ->> 'tid' AS tid, \
-                        CAST(j.value ->> 'delta' AS INTEGER) AS delta \
-                 FROM json_each(?) j \
-             ) f \
-             JOIN queue q ON q.task_id = f.tid \
-             WHERE f.delta > {PRIORITY_MAX} - MAX(0, q.priority) - q.demand"
-        ))
-        .bind(payload.to_owned())
-        .fetch_scalars::<String>()
-        .await
-        .map_err(|error| format!("demand band-bound check: {error}"))?;
-    if !offending.is_empty() {
-        return Err(QueueError::Invariant(format!(
-            "demand would overflow the priority band on {} task(s): {}",
-            offending.len(),
-            offending.join(", ")
-        )));
-    }
-    Ok(())
 }
 
 /// Status projection read paths use so a dependent parked behind a
@@ -6589,8 +6612,10 @@ async fn migrate_generation_identity(
 /// expression reads it there, so a changed env binding cannot produce
 /// mixed flags before its migrate runs), then the queue backfills only
 /// when that stored value differs. Re-runs are no-ops — an unchanged
-/// floor backfills nothing and re-stamps nothing.
-async fn migrate_dispatch_eligible(
+/// floor backfills nothing and re-stamps nothing. The cost-gate drive
+/// that floors the probe queue reuses this operator path as its
+/// (unmetered) preparation so floor and flags are always consistent.
+pub(super) async fn migrate_dispatch_eligible(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<(), QueueError> {
@@ -6603,6 +6628,19 @@ async fn migrate_dispatch_eligible(
             .await
             .map_err(|error| format!("retire floor-blind queue index: {error}"))?;
     }
+    apply_dispatch_floor(db, settings).await
+}
+
+/// The floor application half of [`migrate_dispatch_eligible`] — pure
+/// row work (a stored-floor read, the conditional backfill, the
+/// stamp), no DDL. The operator migrate calls it after retiring the
+/// floor-blind indexes; the cost-gate's floored-pass fixture calls it
+/// directly from an unmetered setup hook so the probe's floor and
+/// flags take the same code path (stow#525).
+pub(super) async fn apply_dispatch_floor(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<(), QueueError> {
     let stored = db
         .query("SELECT value FROM settings WHERE key = 'min_dispatch_value'")
         .fetch_scalar_optional::<String>()
@@ -6660,44 +6698,10 @@ async fn migrate_dispatch_eligible(
 /// always carries the current trigger and an obsolete formula-writing
 /// definition an older deploy left cannot survive an `IF NOT EXISTS`.
 async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
-    // Dev-era `demand_contributions` tables predate the prepared
-    // fields — `CREATE TABLE IF NOT EXISTS` never adds a column, so
-    // the three staging columns land additively here. Orphaned draft
-    // rows keep the defaults; a reprepare clears and restages them
-    // wholesale before any acceptance can read them.
-    let columns = db
-        .query("PRAGMA table_info(demand_contributions)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load demand staging table_info: {error}"))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-    for (column, statement) in [
-        (
-            "value",
-            "ALTER TABLE demand_contributions \
-             ADD COLUMN value TEXT NOT NULL DEFAULT ''",
-        ),
-        (
-            "dispatch_key",
-            "ALTER TABLE demand_contributions \
-             ADD COLUMN dispatch_key TEXT NOT NULL DEFAULT ''",
-        ),
-        (
-            "dispatch_eligible",
-            "ALTER TABLE demand_contributions \
-             ADD COLUMN dispatch_eligible INTEGER NOT NULL DEFAULT 0 \
-             CHECK (dispatch_eligible IN (0, 1))",
-        ),
-    ] {
-        if !columns.contains(column) {
-            db.query(statement)
-                .execute()
-                .await
-                .map_err(|error| format!("add demand staging column {column}: {error}"))?;
-        }
-    }
+    // The demand ledger tables are entirely new with this schema — no
+    // released state carries a prior shape, so the only compatibility
+    // work here is replacing a stale `demand_fold` trigger definition
+    // before recreating it.
     db.query("DROP TRIGGER IF EXISTS demand_fold")
         .execute()
         .await
@@ -7670,7 +7674,9 @@ mod sqlite_tests {
         task_id,
     };
     use crate::errors::QueueError;
-    use crate::scheduler::test_db::{StatementLog, counting_memory_db, memory_db, memory_db_raw};
+    use crate::scheduler::test_db::{
+        StatementLog, counting_memory_db, counting_memory_db_raw, memory_db, memory_db_raw,
+    };
     use skyzen_services::durable::DurableDb;
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
@@ -9324,6 +9330,22 @@ mod sqlite_tests {
         assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
         assert_eq!(contribution_rows(&db, "hour-1").await, 1);
 
+        // The shared pass still returns the planner's answer on an
+        // exact replay — the route arms it, repairing a schedule a
+        // previously lost response never set (stow#522).
+        let (_report, plan) = super::demand_pass(
+            &db,
+            &demand_batch("hour-1", vec![demand_entry("root", 5)]),
+            0,
+            &settings(),
+        )
+        .await
+        .expect("demand pass on replay");
+        assert!(
+            matches!(plan, super::AlarmPlan::At(_)),
+            "a replay must still yield the alarm plan, got {plan:?}"
+        );
+
         let next = apply(&db, "hour-2", vec![demand_entry("root", 5)])
             .await
             .expect("next hour");
@@ -9597,6 +9619,28 @@ mod sqlite_tests {
             demand_of(&db, &task_id_on("root", TARGET)).await,
             super::PRIORITY_MAX
         );
+
+        // A human-lane Windows root at the maximum wire delta: bands +
+        // MAX(0,priority) + i64::MAX could not fit i64, so the typed
+        // per-row bound must reject it *before* `raw_value` is
+        // computed — never on the overflowed sum.
+        let mut human = request_on("hwin", WINDOWS_TARGET, Vec::new());
+        human.source = EnqueueSource::HumanRequest;
+        enqueue(&db, &[human]).await.expect("enqueue human root");
+        let error = apply(
+            &db,
+            "h2",
+            vec![demand_entry_on(
+                "hwin",
+                WINDOWS_TARGET,
+                u64::try_from(i64::MAX).expect("i64::MAX fits u64"),
+            )],
+        )
+        .await
+        .expect_err("i64::MAX delta must fail the band bound");
+        assert!(error.to_string().contains("priority band"), "{error}");
+        assert_eq!(demand_of(&db, &task_id_on("hwin", WINDOWS_TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h2").await, 0);
     }
 
     /// The stored batch record pins the accepted canonical input: a
@@ -9956,9 +10000,13 @@ mod sqlite_tests {
     async fn demand_multi_chunk_closure_is_atomic_end_to_end() {
         // 30k real queue tasks, one dependency chain — the closure
         // from the root touches all of them through the unmet-edge
-        // walk, with the queue's own 64-hex task ids.
+        // walk, with the queue's own 64-hex task ids. The migration
+        // permit stays open on this database: the failure-injection
+        // trigger below is the same class of schema DDL the operator
+        // migrate path issues — installing it is fixture preparation,
+        // while every production statement the test drives is DML.
         const CHAIN: usize = 30_000;
-        let db = memory_db().await.expect("memory db");
+        let (db, _log) = counting_memory_db_raw().await.expect("counting db");
         let mut requests: Vec<EnqueueRequest> = Vec::with_capacity(CHAIN);
         for i in 0..CHAIN {
             let deps = if i + 1 < CHAIN {
@@ -9997,67 +10045,98 @@ mod sqlite_tests {
             chunks.len()
         );
 
-        // A delivery interrupted after an earlier staging chunk: the
-        // `prepared` header plus all-but-the-last chunks — exactly the
-        // material a failed stage INSERT leaves behind. Nothing is
-        // accepted, so nothing folded.
-        let entries = vec![demand_entry("chain-0", 2)];
-        db_insert_batch_record(
-            &db,
-            "big",
-            &planted_input_hash(&entries),
-            i64::try_from(CHAIN).expect("chain count"),
-            "prepared",
+        // The *old* minimal snapshot — `{tid, delta}` per row, the
+        // shape the blob-column path staged — also crosses the 2 MiB
+        // bound on its own: this fixture's proof doesn't depend on the
+        // wider prepared payload.
+        let minimal = serde_json::to_string(
+            &contributions
+                .iter()
+                .map(|(task_id, delta)| serde_json::json!({"tid": task_id, "delta": delta}))
+                .collect::<Vec<_>>(),
         )
-        .await;
-        for chunk in &chunks[..chunks.len() - 1] {
-            db.query(
-                "INSERT INTO demand_contributions \
-                 (task_id, batch_id, delta, value, dispatch_key, dispatch_eligible) \
-                 SELECT j.value ->> 'tid', ?, \
-                        CAST(j.value ->> 'delta' AS INTEGER), \
-                        j.value ->> 'value', j.value ->> 'key', \
-                        j.value ->> 'eligible' \
-                 FROM json_each(?) j",
-            )
-            .bind("big".to_owned())
-            .bind(chunk.clone())
-            .execute()
+        .expect("minimal snapshot encodes");
+        assert!(
+            minimal.len() > 2 * 1024 * 1024,
+            "minimal tid/delta snapshot must cross the old 2 MiB bound: {} bytes",
+            minimal.len()
+        );
+
+        sabotage_later_chunk_then_recover(&db, &chunks, CHAIN).await;
+    }
+
+    /// The failure half of
+    /// [`demand_multi_chunk_closure_is_atomic_end_to_end`]: installs a
+    /// `RAISE(ABORT)` trigger on one task id known to land in the last
+    /// staging chunk, runs the production `apply_demand` into it, and
+    /// asserts the landed prefix, the `prepared` header and the empty
+    /// queue fold — then drops the trigger and asserts the same-input
+    /// retry converges once and an exact replay writes nothing.
+    async fn sabotage_later_chunk_then_recover(db: &DurableDb, chunks: &[String], chain: usize) {
+        let last_chunk: Vec<serde_json::Value> =
+            serde_json::from_str(&chunks[chunks.len() - 1]).expect("last chunk decodes");
+        let sabotage_tid = last_chunk[0]["tid"]
+            .as_str()
+            .expect("chunk row carries tid")
+            .to_owned();
+        db.query(&format!(
+            "CREATE TRIGGER sabotage_demand_stage \
+             AFTER INSERT ON demand_contributions \
+             WHEN NEW.task_id = '{sabotage_tid}' \
+             BEGIN SELECT RAISE(ABORT, 'injected staging failure'); END"
+        ))
+        .execute()
+        .await
+        .expect("install sabotage trigger");
+        let entries = vec![demand_entry("chain-0", 2)];
+        let failed = apply(db, "big", entries.clone())
             .await
-            .expect("stage partial chunk");
-        }
-        let staged_so_far = contribution_rows(&db, "big").await;
-        assert!(staged_so_far > 0 && staged_so_far < CHAIN as u64);
-        assert_eq!(batch_state(&db, "big").await, "prepared");
-        assert_eq!(demand_of(&db, &task_id_on("chain-0", TARGET)).await, 0);
+            .expect_err("sabotaged staging must fail");
+        let message = failed.to_string();
+        assert!(
+            message.contains("injected staging failure"),
+            "the failure must be the injected abort, got: {message}"
+        );
+        let staged_so_far = contribution_rows(db, "big").await;
+        assert!(
+            staged_so_far > 0 && staged_so_far < chain as u64,
+            "earlier chunks landed, the sabotaged one did not: {staged_so_far}"
+        );
+        assert_eq!(batch_state(db, "big").await, "prepared");
+        assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 0);
         assert_eq!(
-            demand_of(&db, &task_id_on(&format!("chain-{}", CHAIN - 1), TARGET)).await,
+            demand_of(db, &task_id_on(&format!("chain-{}", chain - 1), TARGET)).await,
             0,
             "no queue fold without acceptance"
         );
 
-        // The same-input retry recomputes the live closure, replaces
-        // the partial staging and accepts once — every task touched,
-        // full ledger count, the last task's demand folded.
-        let report = apply(&db, "big", entries).await.expect("retry converges");
+        // Remove the failure, then the same-input retry recomputes the
+        // live closure, replaces the partial staging and accepts once —
+        // every task touched, full ledger count, the last task's demand
+        // folded.
+        db.query("DROP TRIGGER sabotage_demand_stage")
+            .execute()
+            .await
+            .expect("drop sabotage trigger");
+        let report = apply(db, "big", entries).await.expect("retry converges");
         assert!(report.applied);
-        assert_eq!(report.touched_tasks, CHAIN as u64);
-        assert_eq!(contribution_rows(&db, "big").await, CHAIN as u64);
-        assert_eq!(batch_state(&db, "big").await, "accepted");
-        assert_eq!(demand_of(&db, &task_id_on("chain-0", TARGET)).await, 2);
+        assert_eq!(report.touched_tasks, chain as u64);
+        assert_eq!(contribution_rows(db, "big").await, chain as u64);
+        assert_eq!(batch_state(db, "big").await, "accepted");
+        assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 2);
         assert_eq!(
-            demand_of(&db, &task_id_on(&format!("chain-{}", CHAIN - 1), TARGET)).await,
+            demand_of(db, &task_id_on(&format!("chain-{}", chain - 1), TARGET)).await,
             2
         );
 
         // And an exact replay of the accepted batch writes nothing:
         // the stored header answers, the demand stays folded once.
-        let replay = apply(&db, "big", vec![demand_entry("chain-0", 2)])
+        let replay = apply(db, "big", vec![demand_entry("chain-0", 2)])
             .await
             .expect("accepted replay");
         assert!(!replay.applied);
-        assert_eq!(replay.touched_tasks, CHAIN as u64);
-        assert_eq!(demand_of(&db, &task_id_on("chain-0", TARGET)).await, 2);
+        assert_eq!(replay.touched_tasks, chain as u64);
+        assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 2);
     }
 
     /// Persisted demand counts against the resubmit writer's band:

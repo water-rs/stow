@@ -497,6 +497,7 @@ pub async fn run(
     db: &DurableDb,
     settings: &queue::SchedulerSettings,
     env: &skyzen::runtime::wasm::WasmEnv,
+    alarm: &skyzen_services::durable::Alarm,
     request: &SchedulerBudgetRequest,
 ) -> Result<SchedulerBudgetReport, QueueError> {
     let mut settings = *settings;
@@ -507,7 +508,7 @@ pub async fn run(
         queue::Dispatch::Limited(limit) => u64::from(limit.get()),
         queue::Dispatch::Paused => 0,
     };
-    let ctx = drives::DriveContext::worker(env).map_err(QueueError::Sql)?;
+    let ctx = drives::DriveContext::worker(env, alarm).map_err(QueueError::Sql)?;
     // Seed the cached installation token once, outside any measured
     // window: the probe dispatches to the local-CI endpoint, so no real
     // credential exists — without this row the pass drive's credential
@@ -553,52 +554,9 @@ pub async fn run(
     let mut rows = Vec::with_capacity(drives::DRIVES.len());
     let mut over_budget = false;
     for drive in drives::DRIVES {
-        log.lock().expect("statement log").clear();
-        let d1_before = ctx.d1_counts();
-        let started_ms = js_sys::Date::now();
-        (drive.run)(&metered, shape, &settings, &ctx)
-            .await
-            .map_err(|error| QueueError::Sql(format!("drive {}: {error}", drive.name)))?;
-        // `Date::now()` is milliseconds well below 2^53; the delta is
-        // exactly representable and non-negative.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let wall_ms = (js_sys::Date::now() - started_ms).max(0.0) as u64;
-        let (d1_rows_read, d1_rows_written) = ctx.d1_counts();
-        let statements = std::mem::take(&mut *log.lock().expect("statement log"));
-        let totals = (
-            statements.len() as u64,
-            statements.iter().map(|s| s.rows_read).sum::<u64>(),
-            statements.iter().map(|s| s.rows_written).sum::<u64>(),
-        );
-        let budget = budget_of(drive.name)?;
-        let over = totals.0 > budget.statements
-            || totals.1 > budget.rows_read
-            || totals.2 > budget.rows_written
-            || wall_ms > budget.wall_ms;
-        over_budget |= over;
-        rows.push(SchedulerBudgetRow {
-            name: drive.name.to_owned(),
-            statements: totals.0,
-            rows_read: totals.1,
-            rows_written: totals.2,
-            wall_ms,
-            statement_budget: budget.statements,
-            read_budget: budget.rows_read,
-            write_budget: budget.rows_written,
-            wall_budget: budget.wall_ms,
-            d1_rows_read: d1_rows_read.saturating_sub(d1_before.0),
-            d1_rows_written: d1_rows_written.saturating_sub(d1_before.1),
-            over_budget: over,
-            log: statements
-                .into_iter()
-                .map(|metric| SchedulerBudgetStatement {
-                    sql: metric.sql,
-                    rows_returned: metric.rows_returned,
-                    rows_read: metric.rows_read,
-                    rows_written: metric.rows_written,
-                })
-                .collect(),
-        });
+        let row = run_drive(drive, db, &metered, shape, &settings, &ctx, &log).await?;
+        over_budget |= row.over_budget;
+        rows.push(row);
     }
     // The pass's claim record for the next run's re-arm — written on
     // `db` directly, so like the re-arm it lands outside the metered
@@ -612,6 +570,80 @@ pub async fn run(
         rows,
         over_budget,
     })
+}
+
+/// One drive's unmetered hooks plus its metered pass, yielding the
+/// budget row the report compares against [`DO_BUDGETS`].
+async fn run_drive(
+    drive: &drives::Drive,
+    db: &DurableDb,
+    metered: &DurableDb,
+    shape: FixtureShape,
+    settings: &queue::SchedulerSettings,
+    ctx: &drives::DriveContext,
+    log: &Arc<Mutex<Vec<StatementMetric>>>,
+) -> Result<SchedulerBudgetRow, QueueError> {
+    // A drive's fixture preparation is setup, not the event being
+    // priced — it runs on the uncounted `db`, outside the metered
+    // window (stow#525).
+    if let Some(setup) = drive.setup {
+        setup(db, shape, settings, ctx)
+            .await
+            .map_err(|error| QueueError::Sql(format!("drive {} setup: {error}", drive.name)))?;
+    }
+    log.lock().expect("statement log").clear();
+    let d1_before = ctx.d1_counts();
+    let started_ms = js_sys::Date::now();
+    (drive.run)(metered, shape, settings, ctx)
+        .await
+        .map_err(|error| QueueError::Sql(format!("drive {}: {error}", drive.name)))?;
+    // `Date::now()` is milliseconds well below 2^53; the delta is
+    // exactly representable and non-negative.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let wall_ms = (js_sys::Date::now() - started_ms).max(0.0) as u64;
+    let (d1_rows_read, d1_rows_written) = ctx.d1_counts();
+    let statements = std::mem::take(&mut *log.lock().expect("statement log"));
+    let totals = (
+        statements.len() as u64,
+        statements.iter().map(|s| s.rows_read).sum::<u64>(),
+        statements.iter().map(|s| s.rows_written).sum::<u64>(),
+    );
+    let budget = budget_of(drive.name)?;
+    let over = totals.0 > budget.statements
+        || totals.1 > budget.rows_read
+        || totals.2 > budget.rows_written
+        || wall_ms > budget.wall_ms;
+    let row = SchedulerBudgetRow {
+        name: drive.name.to_owned(),
+        statements: totals.0,
+        rows_read: totals.1,
+        rows_written: totals.2,
+        wall_ms,
+        statement_budget: budget.statements,
+        read_budget: budget.rows_read,
+        write_budget: budget.rows_written,
+        wall_budget: budget.wall_ms,
+        d1_rows_read: d1_rows_read.saturating_sub(d1_before.0),
+        d1_rows_written: d1_rows_written.saturating_sub(d1_before.1),
+        over_budget: over,
+        log: statements
+            .into_iter()
+            .map(|metric| SchedulerBudgetStatement {
+                sql: metric.sql,
+                rows_returned: metric.rows_returned,
+                rows_read: metric.rows_read,
+                rows_written: metric.rows_written,
+            })
+            .collect(),
+    };
+    // Symmetric unmetered teardown — a drive restores the flags or
+    // rows its preparation/pass moved, outside the metered window.
+    if let Some(cleanup) = drive.cleanup {
+        cleanup(db, shape, settings, ctx)
+            .await
+            .map_err(|error| QueueError::Sql(format!("drive {} cleanup: {error}", drive.name)))?;
+    }
+    Ok(row)
 }
 
 #[cfg(test)]

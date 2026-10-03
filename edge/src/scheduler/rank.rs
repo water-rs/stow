@@ -3,8 +3,9 @@
 //! coordinator value-stack contract).
 //!
 //! `queue.value` stays the persisted I6 integer: precedence bands
-//! over the nonnegative priority (`bands × VALUE_BAND + priority`,
-//! human contributing two bands and Windows one). `dispatch_key`
+//! over the nonnegative priority plus accumulated demand
+//! (`bands × VALUE_BAND + MAX(0, priority) + MAX(0, demand)`, human
+//! contributing two bands and Windows one — stow#522). `dispatch_key`
 //! orders on the exact rational `value / expected_cost`: the leading
 //! field is a lane prefix (`0` human / `1` other — human sorts first
 //! under any cost) followed by the fixed-width lowercase hex of
@@ -96,7 +97,10 @@ pub fn dispatch_family(target: &str) -> &'static str {
 /// its four `u64` limbs to 16 digits, so the field is always exactly
 /// 64 hex characters.
 pub fn rank_prefix(lane: &str, value: i64, cost_ms: NonZero<i64>) -> String {
-    debug_assert!(value >= 0, "raw value bands over a clamped priority");
+    debug_assert!(
+        value >= 0,
+        "raw value bands over clamped priority and demand"
+    );
     debug_assert!(cost_ms.get() > 0, "invalid costs fail at checked_cost");
     let inverted = U256::MAX.wrapping_sub(&rank_quotient(value.cast_unsigned(), cost_ms));
     let lane_prefix = u8::from(lane != "human");

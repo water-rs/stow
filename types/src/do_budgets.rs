@@ -295,4 +295,17 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_written: 8,
         wall_ms: 300,
     },
+    DriveBudget {
+        // One real dispatch pass over the floored queue — the same
+        // claim/dispatch/plan surface as the hot pass, priced
+        // separately so the gate sees the planner and claim walk
+        // under a positive persisted floor with under-floor bulk
+        // deferred in the flags (stow#525). Setup stamps and teardown
+        // restore live outside the metered window.
+        name: "alarm pass (floor)",
+        statements: 120,
+        rows_read: 1_000,
+        rows_written: 700,
+        wall_ms: 3_000,
+    },
 ];

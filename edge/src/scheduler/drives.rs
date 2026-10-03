@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 
-use skyzen_services::durable::DurableDb;
+use skyzen_services::durable::{Alarm, DurableDb};
 use stow_types::api::{
     EnqueueDependency, EnqueueRequest, EnqueueSource, PublishedSliceRow, QueueSelector,
     QueueTaskStatus,
@@ -54,6 +54,11 @@ pub struct DriveContext {
     /// wasm32 probe.
     #[cfg(target_arch = "wasm32")]
     pub d1: Option<skyzen_services::Db>,
+    /// The durable-object alarm the `scheduler_budget` route extracted
+    /// — the real handle the demand drive's arm helper writes and
+    /// reads back (stow#522). `None` on the host gate, which has no
+    /// platform alarm and asserts the `AlarmPlan` instead.
+    pub alarm: Option<Alarm>,
     /// Σ D1 `meta` rows the counted backend observed — read back into
     /// the report row after each drive.
     pub d1_rows: std::sync::Arc<std::sync::Mutex<(u64, u64)>>,
@@ -62,8 +67,13 @@ pub struct DriveContext {
     /// hot-minus-idle delta by their count — never by a checked-in
     /// slots assumption — and the re-arm's restore set is exactly
     /// these rows rather than any predicate over row state that could
-    /// name a row another lane moved.
+    /// name a row another lane moved. A focused probe that claims
+    /// without being the measured hot pass keeps its ids in
+    /// `probe_claimed` instead so this divisor stays honest.
     pub claimed_tasks: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Ids a focused claim probe moved — restored by the drive's
+    /// unmetered cleanup, never counted in `claimed_tasks` (stow#525).
+    pub probe_claimed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl DriveContext {
@@ -77,22 +87,27 @@ impl DriveContext {
             env: None,
             #[cfg(target_arch = "wasm32")]
             d1: None,
+            alarm: None,
             d1_rows: std::sync::Arc::new(std::sync::Mutex::new((0, 0))),
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            probe_claimed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
     /// The workerd probe's context: the Worker env plus the catalog D1
-    /// on the counted backend whose totals feed `d1_rows`.
+    /// on the counted backend whose totals feed `d1_rows`, and the
+    /// real durable-object alarm the demand drive's arm writes.
     #[cfg(target_arch = "wasm32")]
-    pub fn worker(env: &skyzen::runtime::wasm::WasmEnv) -> Result<Self, String> {
+    pub fn worker(env: &skyzen::runtime::wasm::WasmEnv, alarm: &Alarm) -> Result<Self, String> {
         let d1_rows = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64)));
         let d1 = super::budget::counted_d1(env, std::sync::Arc::clone(&d1_rows))?;
         Ok(Self {
             env: Some(env.clone()),
             d1: Some(d1),
+            alarm: Some(alarm.clone()),
             d1_rows,
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            probe_claimed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -115,6 +130,22 @@ impl DriveContext {
             .extend(task_ids);
     }
 
+    /// Append the ids a focused (non-hot-pass) claim probe moved —
+    /// kept out of `claimed_tasks` so the launch gate's marginal
+    /// divisor counts only the measured pass's claims (stow#525).
+    fn record_probe_claimed(&self, task_ids: &[String]) {
+        self.probe_claimed
+            .lock()
+            .expect("probe claim record")
+            .extend(task_ids.iter().cloned());
+    }
+
+    /// Take the ids the focused probes claimed so far — their cleanup
+    /// restore set.
+    pub fn take_probe_claimed(&self) -> Vec<String> {
+        std::mem::take(&mut *self.probe_claimed.lock().expect("probe claim record"))
+    }
+
     /// Every task id the pass drives claimed so far, in claim order.
     pub fn claimed_ids(&self) -> Vec<String> {
         self.claimed_tasks.lock().expect("claim record").clone()
@@ -125,8 +156,19 @@ impl DriveContext {
 pub struct Drive {
     /// The route label — the budget table's row key.
     pub name: &'static str,
+    /// Fixture preparation run *outside* the metered window — for a
+    /// drive whose measurement must see a state the production path
+    /// being priced doesn't create itself (a persisted floor's
+    /// operator stamp/backfill, stow#525). Setup SQL is not the event
+    /// cost, so the harnesses never count it against the budget row.
+    pub setup: Option<DriveRun>,
     /// Run the route's queue-layer calls exactly once against `db`.
     pub run: DriveRun,
+    /// Fixture restoration run *outside* the metered window — undoes
+    /// whatever `setup`/the focused pass moved (flags, floor stamp,
+    /// claimed rows) so later drives and repeat probes see canonical
+    /// fixture state.
+    pub cleanup: Option<DriveRun>,
 }
 
 /// The drives, in budget-table order. Read routes first, then the
@@ -136,6 +178,7 @@ pub struct Drive {
 pub const DRIVES: &[Drive] = &[
     Drive {
         name: "GET /status",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::status(db)
@@ -144,6 +187,7 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // Bounded by held quantities: the outcomes walk is the last
@@ -152,6 +196,7 @@ pub const DRIVES: &[Drive] = &[
         // the dispatch cap (`FixtureShape::IN_FLIGHT_ROWS`) — neither
         // tracks the stored queue bulk.
         name: "GET /admin/status",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::admin_status(db)
@@ -160,9 +205,11 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "GET /tasks",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::list_tasks(db, &QueueSelector::default())
@@ -171,9 +218,11 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "GET /tasks?status=failed",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::list_tasks(
@@ -188,9 +237,11 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "GET /tasks?status=pending",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::list_tasks(
@@ -205,9 +256,11 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "GET /tasks?status=blocked",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::list_tasks(
@@ -222,9 +275,11 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "GET /tasks?target=…",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::list_tasks(
@@ -243,12 +298,14 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // The crate selector seeks `queue`'s identity index on
         // `crate_name`, so the read is the name's own version set —
         // pinned at `fixture::CRATE_NAME_ROWS` rows across sizes.
         name: "GET /tasks?crate=…",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::list_tasks(
@@ -267,12 +324,14 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // The age selector walks `idx_queue_updated_at` — the rows it
         // reads are bounded by the page limit, and the 24 h window it
         // lands in is held at `FixtureShape::LAST_24H_ROWS`.
         name: "GET /tasks?older_than=86400",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::list_tasks(
@@ -287,6 +346,7 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // The score-visibility wire check (stow#525): two seeded human
@@ -295,6 +355,7 @@ pub const DRIVES: &[Drive] = &[
         // side of the Durable Object cursor, where a numeric read
         // would decode through f64 and lose the tail.
         name: "GET /tasks?task_ids=…",
+        setup: None,
         run: |db, shape, _settings, _ctx| {
             Box::pin(async move {
                 let tasks = queue::list_tasks(
@@ -333,12 +394,14 @@ pub const DRIVES: &[Drive] = &[
                 Ok(())
             })
         },
+        cleanup: None,
     },
     Drive {
         // The fixture's in-flight rows carry a bound `github_run_id`
         // (`run-{n}`) as a claimed generation does — the report must
         // name it or the run-binding gate rejects it.
         name: "POST /tasks/complete-run",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::complete_run(
@@ -356,6 +419,7 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // The failure arm: the row re-queues `pending` behind its
@@ -363,6 +427,7 @@ pub const DRIVES: &[Drive] = &[
         // heavier of the two failure writes — the cap arm only parks
         // the row `failed`.
         name: "POST /tasks/complete-run (failure)",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::complete_run(
@@ -380,9 +445,11 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /tasks/retry",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -409,9 +476,11 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /tasks/cancel",
+        setup: None,
         run: |db, _shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -435,9 +504,11 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /tasks/promote",
+        setup: None,
         run: |db, _shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -462,9 +533,11 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /tasks/purge",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -488,6 +561,7 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
+        cleanup: None,
     },
     Drive {
         // A settled `enqueued` record: the row read, the stored-roots
@@ -495,6 +569,7 @@ pub const DRIVES: &[Drive] = &[
         // root pays the lane-position walk, bounded by the held lane
         // depth.
         name: "GET /requests/{id}",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::crate_request_status(db, stow_types::fixture::REQUEST_FIXTURE_ENQUEUED)
@@ -503,6 +578,7 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // The request lane's admission end to end — on wasm the real
@@ -512,15 +588,18 @@ pub const DRIVES: &[Drive] = &[
         // read is the same cached row the alarm pass pays). On host the
         // queue-layer calls only — dedup read, budget probe, insert.
         name: "POST /requests",
+        setup: None,
         run: |db, _shape, settings, ctx| {
             Box::pin(async move { admit_request_drive(db, settings, ctx).await })
         },
+        cleanup: None,
     },
     Drive {
         // `in_progress` on the record the admit drive just inserted:
         // the row read plus the conditional `accepted -> resolving`
         // update that stamps the run id.
         name: "POST /requests/{id}/run-update (in_progress)",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::record_request_run_update(
@@ -540,6 +619,7 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // A `Resolved` report on the live record: the pre/post
@@ -547,6 +627,7 @@ pub const DRIVES: &[Drive] = &[
         // the conditional `enqueued` write — the same insert machinery
         // the submit drives price, at the request batch's size.
         name: "POST /requests/{id}/outcome",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_request_outcome(db, settings, DRIVE_REQUEST_ID, &request_report(shape))
@@ -555,6 +636,7 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // `completed` on the now-`enqueued` record — the single
@@ -562,6 +644,7 @@ pub const DRIVES: &[Drive] = &[
         // overwrite the backstop must never perform (stow#428 review):
         // the real event costs the row read plus one no-op write.
         name: "POST /requests/{id}/run-update (completed)",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 queue::record_request_run_update(
@@ -581,6 +664,7 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         // The pending-depth check is a `queue_status_counts` row read;
@@ -588,6 +672,7 @@ pub const DRIVES: &[Drive] = &[
         // (`FixtureShape::HUMAN_LANE_ROWS`, held across sizes), not by
         // the queue.
         name: "POST /enqueue (untrusted)",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 // A zero cap turns any queue depth into a refusal, so
@@ -603,6 +688,7 @@ pub const DRIVES: &[Drive] = &[
                 }
             })
         },
+        cleanup: None,
     },
     Drive {
         // The accept half of the untrusted route: the cap is lifted so
@@ -612,6 +698,7 @@ pub const DRIVES: &[Drive] = &[
         // redemption pays the insert, not the refusal, and pricing it
         // on the refusal row underreads the DO writes admissions cost.
         name: "POST /enqueue (untrusted accept)",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             let mut lifted = *settings;
             lifted.max_queue_pending = u32::MAX;
@@ -629,9 +716,11 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /admin/enqueue (trusted)",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 // One resync + two new identities — the returned count
@@ -646,9 +735,11 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /admin/enqueue (resubmit)",
+        setup: None,
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 // The same batch again lands nothing — the count must
@@ -663,16 +754,26 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /demand",
-        run: |db, _shape, _settings, _ctx| {
+        setup: None,
+        run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 // One durable batch on one keyed root — fixture row 101's
                 // identity, pending with seeded unmet edges — so the
-                // measure covers the identity probe, the closure walk,
-                // the contribution inserts, and the demand/key refresh,
-                // all bounded by the touched set.
+                // measure covers the whole route pass: identity probe,
+                // closure walk, contribution inserts, the demand/key
+                // fold, and the `next_alarm` planner the route then
+                // arms — all bounded by the touched set (stow#522).
+                // Event-size law: this drive holds a one-entry/
+                // small-closure batch, so its budget is the small-event
+                // constant — real cost scales with distinct identities,
+                // operand/staged chunks and touched rows; the 30k
+                // closure regression exercises the chunked boundary on
+                // the host, and no maximum-request drive is added
+                // unless it proves a distinct unmeasured native cost.
                 let n = 101_u32;
                 let (crate_name, version) = crate_identity(n);
                 let request = stow_types::api::SchedulerDemandRequest {
@@ -689,24 +790,56 @@ pub const DRIVES: &[Drive] = &[
                         demand: 100,
                     }],
                 };
-                queue::apply_demand(db, &request)
+                let (report, plan) = queue::demand_pass(db, &request, 0, settings)
                     .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|report| {
-                        (report.applied && report.touched_tasks > 0)
-                            .then_some(())
-                            .ok_or_else(|| {
-                                format!(
-                                    "demand batch touched {} tasks, applied={}",
-                                    report.touched_tasks, report.applied
-                                )
-                            })
-                    })
+                    .map_err(|error| error.to_string())?;
+                if !(report.applied && report.touched_tasks > 0) {
+                    return Err(format!(
+                        "demand batch touched {} tasks, applied={}",
+                        report.touched_tasks, report.applied
+                    ));
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let alarm = ctx
+                        .alarm
+                        .as_ref()
+                        .ok_or_else(|| "demand drive needs the durable-object alarm".to_owned())?;
+                    // Real arm + real read-back on the probe's
+                    // durable-object alarm: a genuine future timestamp
+                    // cannot have fired, so `get_alarm` must return
+                    // exactly what the shared helper set — the same
+                    // `set_alarm` call the route makes. Platform calls
+                    // sit outside the SQL meter by design (stow#522).
+                    #[allow(clippy::cast_possible_truncation)]
+                    let future_ms = js_sys::Date::now() as i64 + 600_000;
+                    queue::arm_alarm(alarm, queue::AlarmPlan::At(future_ms))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let armed = alarm.get_alarm().await.map_err(|error| error.to_string())?;
+                    if armed != Some(future_ms) {
+                        return Err(format!("alarm reads {armed:?} after arm at {future_ms}"));
+                    }
+                    // The route's own arm for this pass's plan.
+                    queue::arm_alarm(alarm, plan)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = ctx;
+                    if !matches!(plan, queue::AlarmPlan::At(_)) {
+                        return Err(format!("demand pass planned {plan:?}, expected At"));
+                    }
+                }
+                Ok(())
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /index/published (full)",
+        setup: None,
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 // A full report (`base_generation: None`) — the
@@ -728,9 +861,11 @@ pub const DRIVES: &[Drive] = &[
                 .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
     },
     Drive {
         name: "POST /index/published (delta)",
+        setup: None,
         run: |db, shape, _settings, _ctx| {
             Box::pin(async move {
                 // A routine per-wave report: `added`/`retired` carry only
@@ -755,6 +890,98 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
+        cleanup: None,
+    },
+    Drive {
+        // One real dispatch pass over a *floored* queue (stow#525):
+        // the setup stamps `min_dispatch_value` at one band through the
+        // operator migrate path — unmetered, setup is not the event —
+        // so the persisted flags put the under-floor miss bulk outside
+        // the eligible index span while the human lane and the one-band
+        // windows family stay ready. The metered pass then pays the
+        // real production queries: the planner's freeze/settings/
+        // lease/family probes and the claim walk over the eligible
+        // span only. The pass claims ready rows — non-empty proves the
+        // ready side exists at scale — and its ids stay out of
+        // `claimed_tasks` (the launch gate's marginal divisor counts
+        // only the hot pass's claims), restored by the unmetered
+        // cleanup instead. Under-floor bulk contributes nothing to
+        // either probe — the cleanup asserts every claim was flagged
+        // eligible, and the under-floor-arms-nothing direction is
+        // pinned by `under_floor_bulk_arms_no_wake_and_starves_no_page`
+        // on the host.
+        name: "alarm pass (floor)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                // The floor application's DML half — the same stored-
+                // floor read, conditional backfill and stamp the
+                // operator migrate runs — no index DDL, which belongs
+                // to the migrate route alone.
+                queue::apply_dispatch_floor(
+                    db,
+                    &queue::SchedulerSettings {
+                        min_dispatch_value: queue::VALUE_BAND,
+                        ..*settings
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())
+            })
+        }),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let claimed = dispatch_pass_drive(db, settings, ctx, false, false).await?;
+                if claimed.is_empty() {
+                    return Err(
+                        "floored pass claimed nothing — no eligible row reached the claim"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let claimed = ctx.take_probe_claimed();
+                // Every claim the floored pass made must be a flagged
+                // row — a leak means the eligible span admitted
+                // under-floor bulk.
+                for ids in claimed.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
+                    let leaked = db
+                        .query(
+                            "SELECT COUNT(*) FROM queue \
+                             WHERE task_id IN (SELECT value FROM json_each(?)) \
+                               AND dispatch_eligible != 1",
+                        )
+                        .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
+                        .fetch_scalar::<u64>()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if leaked > 0 {
+                        return Err(format!("floored pass claimed {leaked} under-floor row(s)"));
+                    }
+                }
+                // Re-pend exactly the ids this pass claimed: the same
+                // re-entry state a lease reclaim leaves — generation
+                // and claim stamp kept for fencing — keyed chunks like
+                // every id-bounded write, outside the meter.
+                for ids in claimed.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
+                    db.query(
+                        "UPDATE queue SET status = 'pending', github_run_id = NULL \
+                         WHERE task_id IN (SELECT value FROM json_each(?))",
+                    )
+                    .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
+                    .execute()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                }
+                // Restore the fixture's floor through the same
+                // operator path — flags and stamp consistent again.
+                queue::apply_dispatch_floor(db, settings)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        }),
     },
     Drive {
         // One dispatch pass end to end — on wasm the real
@@ -766,9 +993,15 @@ pub const DRIVES: &[Drive] = &[
         // same queue code against the empty-catalog oracle — the host
         // gate checks statements and counters only.
         name: "alarm pass",
+        setup: None,
         run: |db, _shape, settings, ctx| {
-            Box::pin(async move { dispatch_pass_drive(db, settings, ctx, false).await })
+            Box::pin(async move {
+                dispatch_pass_drive(db, settings, ctx, false, true)
+                    .await
+                    .map(|_| ())
+            })
         },
+        cleanup: None,
     },
     Drive {
         // The same pass with dispatch paused: the claim returns early,
@@ -779,68 +1012,90 @@ pub const DRIVES: &[Drive] = &[
         // row and the claims inside a pass as the marginal cost
         // between it and the hot pass above.
         name: "alarm pass (idle)",
+        setup: None,
         run: |db, _shape, settings, ctx| {
-            Box::pin(async move { dispatch_pass_drive(db, settings, ctx, true).await })
+            Box::pin(async move {
+                dispatch_pass_drive(db, settings, ctx, true, true)
+                    .await
+                    .map(|_| ())
+            })
         },
+        cleanup: None,
     },
 ];
 
 /// One dispatch pass exactly as `run_alarm` runs it, minus the metering
 /// tail. `idle` pauses dispatch inside the pass — the claim early-outs
-/// after the stale-recovery and freeze probes every wake owes.
+/// after the stale-recovery and freeze probes every wake owes. Returns
+/// the pass's claimed ids: with `record` they also enter the launch
+/// gate's claim record, while a focused probe (the floored pass)
+/// restores them from its own list so the gate's marginal divisor
+/// keeps counting only the hot pass's claims (stow#525).
 async fn dispatch_pass_drive(
     db: &DurableDb,
     settings: &SchedulerSettings,
     ctx: &DriveContext,
     idle: bool,
-) -> Result<(), String> {
+    record: bool,
+) -> Result<Vec<String>, String> {
     let mut pass_settings = *settings;
     if idle {
         pass_settings.dispatch = queue::Dispatch::Paused;
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let env = ctx
-            .env
-            .as_ref()
-            .ok_or_else(|| "dispatch pass drive needs a Worker env".to_owned())?;
-        let d1 = ctx
-            .d1
-            .as_ref()
-            .ok_or_else(|| "dispatch pass drive needs the counted D1".to_owned())?;
-        let coverage = super::object::CatalogCoverage { db: d1.clone() };
-        let task_ids = super::object::dispatch_pass(env, db, &pass_settings, &coverage)
-            .await
-            .map_err(|error| error.to_string())?;
-        ctx.record_claimed(task_ids);
-        if !idle {
-            // Under `LocalCi` `dispatch_pass` resolves no credential,
-            // but a production claiming pass pays
-            // `github_app::installation_token` — the cached-token
-            // storage read, with a mint only on expiry. The probe seeds
-            // the cache row (`budget::run`), so this call returns on the
-            // read and the drive prices the step the GitHub arm pays.
-            let config = crate::github_app::AppConfig {
-                app_id: "stow-budget-probe".to_owned(),
-                installation_id: "0".to_owned(),
-                private_key_pem: String::new(),
-            };
-            let _ = crate::github_app::installation_token(db, &config)
+    let task_ids = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let env = ctx
+                .env
+                .as_ref()
+                .ok_or_else(|| "dispatch pass drive needs a Worker env".to_owned())?;
+            let d1 = ctx
+                .d1
+                .as_ref()
+                .ok_or_else(|| "dispatch pass drive needs the counted D1".to_owned())?;
+            let coverage = super::object::CatalogCoverage { db: d1.clone() };
+            let task_ids = super::object::dispatch_pass(env, db, &pass_settings, &coverage)
                 .await
                 .map_err(|error| error.to_string())?;
+            if record {
+                ctx.record_claimed(task_ids.clone());
+            }
+            ctx.record_probe_claimed(&task_ids);
+            if !idle {
+                // Under `LocalCi` `dispatch_pass` resolves no credential,
+                // but a production claiming pass pays
+                // `github_app::installation_token` — the cached-token
+                // storage read, with a mint only on expiry. The probe seeds
+                // the cache row (`budget::run`), so this call returns on the
+                // read and the drive prices the step the GitHub arm pays.
+                let config = crate::github_app::AppConfig {
+                    app_id: "stow-budget-probe".to_owned(),
+                    installation_id: "0".to_owned(),
+                    private_key_pem: String::new(),
+                };
+                let _ = crate::github_app::installation_token(db, &config)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            task_ids
         }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let claimed = queue::claim_dispatchable_tasks(db, &pass_settings, &NoCoverage)
-            .await
-            .map_err(|error| error.to_string())?;
-        ctx.record_claimed(claimed.iter().map(|task| task.task_id.clone()).collect());
-    }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let claimed = queue::claim_dispatchable_tasks(db, &pass_settings, &NoCoverage)
+                .await
+                .map_err(|error| error.to_string())?;
+            let task_ids: Vec<String> = claimed.iter().map(|task| task.task_id.clone()).collect();
+            if record {
+                ctx.record_claimed(task_ids.clone());
+            }
+            ctx.record_probe_claimed(&task_ids);
+            task_ids
+        }
+    };
     queue::next_alarm(db, 0, &pass_settings)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(task_ids)
 }
 
 /// Slice rows a delta report moves — retired from the live set plus the

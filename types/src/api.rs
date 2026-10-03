@@ -1657,12 +1657,14 @@ pub struct QueueTask {
     /// (`EnqueueRequest::host_side`).
     #[serde(default)]
     pub host_side: bool,
-    /// The persisted dispatch score as an exact decimal string. The
-    /// integer column legitimately outgrows the JavaScript-safe range
+    /// The persisted raw value as an exact decimal string: precedence
+    /// bands over `MAX(0, priority) + MAX(0, demand)` — the undivided
+    /// operand `dispatch_key`'s exact-cost rank divides. The integer
+    /// column legitimately outgrows the JavaScript-safe range
     /// (human-lane values sit above 2^53), so the Durable Object
     /// projects `CAST(value AS TEXT)` and this field carries the text
     /// unchanged — parsing or rounding it would corrupt adjacent
-    /// scores (stow#525 I10).
+    /// values (stow#525 I10).
     pub value: String,
 }
 
