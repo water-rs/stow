@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use semver::Version;
 use skyzen_services::{BatchStatement, Db};
 use stow_types::api::{ArtifactRecord, EnqueueRequest};
@@ -737,9 +738,19 @@ pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<
 /// see `required_unit_shapes`: a host-side identity is covered only when
 /// the slice serves both the native-shape and the `--target`-shape host
 /// units its consumers' builds look up. One `IN (VALUES ...)` statement
-/// per batch of five identities keeps every statement under D1's
-/// bound-parameter ceiling; the floor and shape filters apply in memory,
-/// on the rows the semantic match returned.
+/// per batch of twenty identities keeps every statement at D1's
+/// 100-bound-parameter ceiling (five params per identity); the floor and
+/// shape filters apply in memory, on the rows the semantic match
+/// returned.
+///
+/// The batches are independent reads, so they issue concurrently under
+/// the invocation's outbound ceiling
+/// ([`crate::fetch_guard::MAX_OUTBOUND_INFLIGHT`]) rather than serially:
+/// a claim page over twenty identities would otherwise pay one catalog
+/// round trip per batch while its invocation sits open, on a latency its
+/// frontier size alone sets. Each batch's covered set unions into the
+/// result — `buffer_unordered` completion order cannot leak into a
+/// `BTreeSet` merge.
 ///
 /// A measured glibc floor above [`stow_types::glibc::GLIBC_BASELINE`]
 /// breaks servability on a baseline host — the row publishes, but the
@@ -755,89 +766,112 @@ pub async fn covered_semantic_identities(
 ) -> Result<BTreeSet<SemanticTaskIdentity>, DbError> {
     const PARAMS_PER_IDENTITY: usize = 5;
     const BATCH: usize = sql_batch::D1_MAX_BOUND_PARAMS / PARAMS_PER_IDENTITY;
-    let mut covered = BTreeSet::new();
-    for batch in identities.chunks(BATCH) {
-        let sql = format!(
-            "SELECT crate_name, version, features_json, target, rustc_version, min_glibc, \
-                    unit_side, unit_invocation, unit_linked \
-             FROM artifacts \
-             WHERE bundle_digest != '' \
-               AND (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
-            sql_batch::values_rows("(?, ?, ?, ?, ?)", batch.len())
-        );
-        let mut query = db.query(&sql);
-        for identity in batch {
-            query = query
-                .bind(identity.crate_name.as_str())
-                .bind(identity.version.as_str())
-                .bind(identity.features_json.as_str())
-                .bind(identity.target.as_str())
-                .bind(identity.rustc_version.as_str());
+    // Each batch future owns its `Db` clone and `Vec` of identities, so
+    // the oracle's `impl Future + Send` proof rests on owned data and
+    // never on the chunk borrows' lifetimes. Ownership stays bounded:
+    // the stream materializes one chunk at a time, so live owned data
+    // never exceeds the buffer's active futures.
+    stream::iter(
+        identities
+            .chunks(BATCH)
+            .map(<[SemanticTaskIdentity]>::to_vec),
+    )
+    .map(|batch| covered_batch(db.clone(), batch))
+    .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+    .try_fold(BTreeSet::new(), |mut covered, batch_covered| async move {
+        covered.extend(batch_covered);
+        Ok::<BTreeSet<SemanticTaskIdentity>, DbError>(covered)
+    })
+    .await
+}
+
+/// One coverage batch, run as a unit of
+/// [`covered_semantic_identities`]' bounded fan-out: query, fetch and
+/// the pure fold are per-batch independent, so each future yields the
+/// subset of `batch` the catalog covers.
+async fn covered_batch(
+    db: Db,
+    batch: Vec<SemanticTaskIdentity>,
+) -> Result<BTreeSet<SemanticTaskIdentity>, DbError> {
+    let sql = format!(
+        "SELECT crate_name, version, features_json, target, rustc_version, min_glibc, \
+                unit_side, unit_invocation, unit_linked \
+         FROM artifacts \
+         WHERE bundle_digest != '' \
+           AND (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
+        sql_batch::values_rows("(?, ?, ?, ?, ?)", batch.len())
+    );
+    let mut query = db.query(&sql);
+    for identity in &batch {
+        query = query
+            .bind(identity.crate_name.as_str())
+            .bind(identity.version.as_str())
+            .bind(identity.features_json.as_str())
+            .bind(identity.target.as_str())
+            .bind(identity.rustc_version.as_str());
+    }
+    let rows = query
+        .fetch_all::<CoveredIdentityRow>()
+        .await
+        .map_err(|error| DbError::Query(format!("db query: {error}")))?;
+    // Rows are the semantic matches; coverage requires every shape
+    // the identity's side needs, and every contributing row must be
+    // loadable on a baseline host — an over-floor row serves nothing.
+    let mut shapes_by_identity =
+        BTreeMap::<(String, String, String, String, String), BTreeSet<UnitShape>>::new();
+    for row in rows {
+        let floor = decode_min_glibc(row.min_glibc.as_deref()).map_err(|error| {
+            DbError::Invariant(format!(
+                "artifact row {}/{}: min_glibc: {error}",
+                row.target, row.rustc_version
+            ))
+        })?;
+        if floor.is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE) {
+            continue;
         }
-        let rows = query
-            .fetch_all::<CoveredIdentityRow>()
-            .await
-            .map_err(|error| DbError::Query(format!("db query: {error}")))?;
-        // Rows are the semantic matches; coverage requires every shape
-        // the identity's side needs, and every contributing row must be
-        // loadable on a baseline host — an over-floor row serves nothing.
-        let mut shapes_by_identity =
-            BTreeMap::<(String, String, String, String, String), BTreeSet<UnitShape>>::new();
-        for row in rows {
-            let floor = decode_min_glibc(row.min_glibc.as_deref()).map_err(|error| {
+        if let Some(shape) = decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
+            .map_err(|error| {
                 DbError::Invariant(format!(
-                    "artifact row {}/{}: min_glibc: {error}",
+                    "artifact row {}/{}: {error}",
                     row.target, row.rustc_version
                 ))
-            })?;
-            if floor.is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE) {
-                continue;
-            }
-            if let Some(shape) =
-                decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked).map_err(
-                    |error| {
-                        DbError::Invariant(format!(
-                            "artifact row {}/{}: {error}",
-                            row.target, row.rustc_version
-                        ))
-                    },
-                )?
-            {
-                shapes_by_identity
-                    .entry((
-                        row.crate_name,
-                        row.version,
-                        row.features_json,
-                        row.target,
-                        row.rustc_version,
-                    ))
-                    .or_default()
-                    .insert(shape);
-            }
+            })?
+        {
+            shapes_by_identity
+                .entry((
+                    row.crate_name,
+                    row.version,
+                    row.features_json,
+                    row.target,
+                    row.rustc_version,
+                ))
+                .or_default()
+                .insert(shape);
         }
-        for identity in batch {
-            // The invocation the identity's own task spells: native on
-            // the runner family's host triple, `--target` otherwise. A
-            // host-side identity needs every consumer shape regardless.
-            let invocation = stow_types::api::runner_family(identity.target.as_str())
-                .map_or(UnitInvocation::Target, |family| {
-                    UnitInvocation::for_task(identity.target.as_str(), family.host_triple())
-                });
-            let required = required_unit_shapes(identity.host_side, invocation);
-            let covered_all = required.iter().all(|shape| {
-                shapes_by_identity
-                    .get(&(
-                        identity.crate_name.clone(),
-                        identity.version.clone(),
-                        identity.features_json.clone(),
-                        identity.target.clone(),
-                        identity.rustc_version.clone(),
-                    ))
-                    .is_some_and(|shapes| shapes.contains(shape))
+    }
+    let mut covered = BTreeSet::new();
+    for identity in batch {
+        // The invocation the identity's own task spells: native on
+        // the runner family's host triple, `--target` otherwise. A
+        // host-side identity needs every consumer shape regardless.
+        let invocation = stow_types::api::runner_family(identity.target.as_str())
+            .map_or(UnitInvocation::Target, |family| {
+                UnitInvocation::for_task(identity.target.as_str(), family.host_triple())
             });
-            if covered_all {
-                covered.insert(identity.clone());
-            }
+        let required = required_unit_shapes(identity.host_side, invocation);
+        let covered_all = required.iter().all(|shape| {
+            shapes_by_identity
+                .get(&(
+                    identity.crate_name.clone(),
+                    identity.version.clone(),
+                    identity.features_json.clone(),
+                    identity.target.clone(),
+                    identity.rustc_version.clone(),
+                ))
+                .is_some_and(|shapes| shapes.contains(shape))
+        });
+        if covered_all {
+            covered.insert(identity);
         }
     }
     Ok(covered)
@@ -1715,5 +1749,258 @@ mod sqlite_tests {
             vec!["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"],
             "pages must cover each servable row exactly once, in order"
         );
+    }
+}
+/// Coverage-batch concurrency tests against a scripted `DbBackend`. The
+/// question this module answers — do independent batches overlap, and is
+/// the overlap bounded — is about when statements enter the backend,
+/// which only a controlled fake reports deterministically: it counts
+/// admissions and holds every query at one yield point, so a serial
+/// caller peaks at one in-flight statement while the bounded fan-out
+/// fills its ceiling — no timers, no network.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod coverage_concurrency_tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use skyzen_services::sql::{
+        DbBackend, DbDialect, DbError as BackendError, DbExecResult, DbValue,
+    };
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitSide};
+
+    use crate::errors::DbError;
+    use crate::fetch_guard::MAX_OUTBOUND_INFLIGHT;
+    use crate::scheduler::queue::SemanticTaskIdentity;
+
+    use super::covered_semantic_identities;
+
+    /// A `DbBackend` that measures overlap: `in_flight` is bumped when
+    /// a statement enters and released only after a yield point, so
+    /// `max_in_flight` is the count of statements the caller held open
+    /// at one instant.
+    #[derive(Clone)]
+    struct HeldBackend {
+        state: Arc<HeldState>,
+        response: HeldResponse,
+    }
+
+    #[derive(Default)]
+    struct HeldState {
+        /// Statements the caller issued.
+        issued: AtomicUsize,
+        /// Statements inside the backend right now.
+        in_flight: AtomicUsize,
+        /// The peak `in_flight` ever observed.
+        max_in_flight: AtomicUsize,
+    }
+
+    /// What a held query answers once released.
+    #[derive(Clone)]
+    enum HeldResponse {
+        /// Fail every query with a backend error.
+        Fail,
+        /// Answer every query with these rows verbatim.
+        Rows(Vec<serde_json::Value>),
+        /// Answer every bound identity with its covering shape pair —
+        /// the unlinked and linked target-side rows a native
+        /// invocation requires, synthesized per five-param tuple.
+        ServeBound,
+    }
+
+    impl DbBackend for HeldBackend {
+        fn dialect(&self) -> DbDialect {
+            DbDialect::Sqlite
+        }
+
+        async fn query(
+            &self,
+            _query: &str,
+            params: &[DbValue],
+        ) -> Result<DbExecResult, BackendError> {
+            let in_flight = self.state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state
+                .max_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            self.state.issued.fetch_add(1, Ordering::SeqCst);
+            // Suspend so sibling batches reach admission before this
+            // one completes — under a serial caller the next batch
+            // cannot exist yet, so `in_flight` never passes 1.
+            tokio::task::yield_now().await;
+            self.state.in_flight.fetch_sub(1, Ordering::SeqCst);
+            match &self.response {
+                HeldResponse::Fail => Err(BackendError::Backend {
+                    message: "d1 unavailable".to_owned(),
+                    source: None,
+                }),
+                HeldResponse::Rows(rows) => Ok(DbExecResult {
+                    rows: rows.clone(),
+                    ..DbExecResult::default()
+                }),
+                HeldResponse::ServeBound => Ok(DbExecResult {
+                    rows: covering_rows(params),
+                    ..DbExecResult::default()
+                }),
+            }
+        }
+
+        fn execute(
+            &self,
+            _query: &str,
+            _params: &[DbValue],
+        ) -> impl std::future::Future<Output = Result<DbExecResult, BackendError>> + Send {
+            std::future::ready(Err(BackendError::Backend {
+                message: "coverage reads never execute".to_owned(),
+                source: None,
+            }))
+        }
+    }
+
+    /// The two rows that cover one bound identity: a target-side
+    /// identity's native invocation requires the unlinked and linked
+    /// target shapes, so every five-param tuple maps to both.
+    fn covering_rows(params: &[DbValue]) -> Vec<serde_json::Value> {
+        let text = |value: &DbValue| match value {
+            DbValue::Text(text) => text.clone(),
+            _ => panic!("identity params bind as text"),
+        };
+        params
+            .chunks(5)
+            .flat_map(|bound| {
+                [UnitKind::Unlinked, UnitKind::Linked].map(|kind| {
+                    serde_json::json!({
+                        "crate_name": text(&bound[0]),
+                        "version": text(&bound[1]),
+                        "features_json": text(&bound[2]),
+                        "target": text(&bound[3]),
+                        "rustc_version": text(&bound[4]),
+                        "unit_side": UnitSide::Target.to_int(),
+                        "unit_invocation": UnitInvocation::Native.to_int(),
+                        "unit_linked": kind.to_int(),
+                        "min_glibc": null,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    fn held_db(response: HeldResponse) -> (skyzen_services::Db, Arc<HeldState>) {
+        let backend = HeldBackend {
+            state: Arc::new(HeldState::default()),
+            response,
+        };
+        let state = Arc::clone(&backend.state);
+        (skyzen_services::Db::new(backend), state)
+    }
+
+    fn identity(index: usize) -> SemanticTaskIdentity {
+        SemanticTaskIdentity {
+            crate_name: format!("crate{index}"),
+            version: "1.0.0".to_owned(),
+            features_json: "[]".to_owned(),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            rustc_version: "1.85.0".to_owned(),
+            host_side: false,
+        }
+    }
+
+    /// Twenty identities fit one batch; twenty-one force a second. Both
+    /// batches must be inside the backend together — `max_in_flight`
+    /// bumps on admission and releases only after the held query
+    /// completes, so 2 proves overlap where a serial loop peaks at 1.
+    /// Both batch results still merge into one covered set.
+    #[tokio::test]
+    async fn independent_batches_overlap_admission() {
+        let (db, state) = held_db(HeldResponse::ServeBound);
+        let identities: Vec<SemanticTaskIdentity> = (0..21).map(identity).collect();
+        let covered = covered_semantic_identities(&db, &identities)
+            .await
+            .expect("coverage");
+        assert_eq!(covered, identities.iter().cloned().collect::<BTreeSet<_>>());
+        assert_eq!(
+            state.issued.load(Ordering::SeqCst),
+            2,
+            "21 identities is exactly two 20-identity statements"
+        );
+        assert_eq!(
+            state.max_in_flight.load(Ordering::SeqCst),
+            2,
+            "both batches were admitted before either completed"
+        );
+    }
+
+    /// One hundred and one identities fan out to six batches: the peak
+    /// admission equals the outbound ceiling — never more — and every
+    /// batch's covered identities still merge into the result.
+    #[tokio::test]
+    async fn concurrency_stays_at_the_outbound_bound() {
+        let (db, state) = held_db(HeldResponse::ServeBound);
+        let identities: Vec<SemanticTaskIdentity> = (0..101).map(identity).collect();
+        let covered = covered_semantic_identities(&db, &identities)
+            .await
+            .expect("coverage");
+        assert_eq!(covered.len(), 101, "every served identity covers");
+        assert_eq!(state.issued.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            state.max_in_flight.load(Ordering::SeqCst),
+            MAX_OUTBOUND_INFLIGHT,
+            "peak in-flight statements hit the bound and never pass it"
+        );
+    }
+
+    /// A backend failure still fails the whole lookup — the fan-out
+    /// does not swallow the first error it meets.
+    #[tokio::test]
+    async fn a_failed_batch_fails_the_lookup() {
+        let (db, _state) = held_db(HeldResponse::Fail);
+        let identities: Vec<SemanticTaskIdentity> = (0..21).map(identity).collect();
+        let error = covered_semantic_identities(&db, &identities)
+            .await
+            .expect_err("a failed query must fail the lookup");
+        assert!(
+            matches!(&error, DbError::Query(message) if message.contains("d1 unavailable")),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A corrupt unit-shape triplet stays an invariant error on
+    /// whatever batch it lands in — the concurrent fold keeps the same
+    /// failure contract the serial loop had.
+    #[tokio::test]
+    async fn a_corrupt_shape_row_fails_the_lookup() {
+        let corrupt = serde_json::json!({
+            "crate_name": "crate0",
+            "version": "1.0.0",
+            "features_json": "[]",
+            "target": "x86_64-unknown-linux-gnu",
+            "rustc_version": "1.85.0",
+            "unit_side": 9,
+            "unit_invocation": 0,
+            "unit_linked": 0,
+            "min_glibc": null,
+        });
+        let (db, _state) = held_db(HeldResponse::Rows(vec![corrupt]));
+        let identities: Vec<SemanticTaskIdentity> = (0..21).map(identity).collect();
+        let error = covered_semantic_identities(&db, &identities)
+            .await
+            .expect_err("a corrupt shape must fail the lookup");
+        assert!(
+            matches!(&error, DbError::Invariant(message) if message.contains("corrupt unit shape")),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Batches that answer no rows leave every identity uncovered —
+    /// merging empty batch sets stays empty, and the statement count
+    /// is still one per batch.
+    #[tokio::test]
+    async fn empty_batches_merge_to_no_coverage() {
+        let (db, state) = held_db(HeldResponse::Rows(Vec::new()));
+        let identities: Vec<SemanticTaskIdentity> = (0..41).map(identity).collect();
+        let covered = covered_semantic_identities(&db, &identities)
+            .await
+            .expect("coverage");
+        assert!(covered.is_empty());
+        assert_eq!(state.issued.load(Ordering::SeqCst), 3);
     }
 }
