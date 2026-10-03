@@ -1469,6 +1469,13 @@ pub struct SchedulerBudgetStatement {
     /// `cursor.rowsWritten` — table rows plus index entries and
     /// trigger-made writes.
     pub rows_written: u64,
+    /// Wall milliseconds the statement's own `query`/`execute` awaited
+    /// in local workerd — measured around the inner call by the
+    /// metered backend, so a hot drive's wall can be decomposed per
+    /// statement rather than attributed as one lump. Always `0` on
+    /// host builds (the host lane gates SQL counts, not timing) and
+    /// on statements issued through the uncounted backend.
+    pub elapsed_ms: u64,
 }
 
 /// One drive's workerd measurement against its budget.
@@ -1500,6 +1507,12 @@ pub struct SchedulerBudgetRow {
     pub d1_rows_read: u64,
     /// Σ D1 `meta.rowsWritten` over the same statements.
     pub d1_rows_written: u64,
+    /// Σ of the awaited durations of the counted catalog backend's
+    /// own calls. A sum of operation spans, not a share of drive
+    /// wall: concurrent calls overlap in real time but add up here,
+    /// so it can exceed the drive's measured window. `0` on host and
+    /// on drives that never touch the catalog.
+    pub d1_elapsed_ms: u64,
     /// `true` when any of the four budgets is exceeded.
     pub over_budget: bool,
     /// The per-statement log the totals are summed over.

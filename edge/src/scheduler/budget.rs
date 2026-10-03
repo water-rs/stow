@@ -36,6 +36,23 @@ struct StatementMetric {
     rows_returned: u64,
     rows_read: u64,
     rows_written: u64,
+    /// The statement's own awaited wall — timed around the inner
+    /// `query`/`execute` on wasm, `0` on host.
+    elapsed_ms: u64,
+}
+
+/// `Date.now()` under wasm; `0.0` on host — the host lane gates SQL
+/// counts, not timing, so it never pays the clock read.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn clock_ms() -> f64 {
+    js_sys::Date::now()
+}
+
+/// The host clock is always zero — `elapsed_ms` is a probe-only
+/// measurement and host builds must not pretend timing exists.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn clock_ms() -> f64 {
+    0.0
 }
 
 /// A `DurableDbBackend` that forwards to another `DurableDb` and logs
@@ -53,13 +70,19 @@ impl MeteredBackend {
         result: &Result<DbExecResult, DurableDbError>,
         log: &Arc<Mutex<Vec<StatementMetric>>>,
         sql: &str,
+        started_ms: f64,
     ) {
         if let Ok(result) = result {
+            // `Date::now()` is milliseconds well below 2^53; the delta
+            // is exactly representable and non-negative.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let elapsed_ms = (clock_ms() - started_ms).max(0.0) as u64;
             log.lock().expect("statement log").push(StatementMetric {
                 sql: sql.to_owned(),
                 rows_returned: result.rows.len() as u64,
                 rows_read: result.rows_read,
                 rows_written: result.rows_written,
+                elapsed_ms,
             });
         }
     }
@@ -77,8 +100,9 @@ impl DurableDbBackend for MeteredBackend {
         let params = params.to_vec();
         async move {
             let mut source = &inner;
+            let started_ms = clock_ms();
             let result = QuerySource::query(&mut source, &sql, &params).await;
-            Self::record(&result, &log, &sql);
+            Self::record(&result, &log, &sql, started_ms);
             result
         }
     }
@@ -94,8 +118,9 @@ impl DurableDbBackend for MeteredBackend {
         let params = params.to_vec();
         async move {
             let mut source = &inner;
+            let started_ms = clock_ms();
             let result = QuerySource::execute(&mut source, &sql, &params).await;
-            Self::record(&result, &log, &sql);
+            Self::record(&result, &log, &sql, started_ms);
             result
         }
     }
@@ -115,15 +140,27 @@ impl DurableDbBackend for MeteredBackend {
 #[derive(Clone)]
 pub struct CountedBackend<B> {
     inner: B,
-    rows: Arc<Mutex<(u64, u64)>>,
+    /// `(rows_read, rows_written, elapsed_ms)` — the trailing counter
+    /// is the Σ awaited wall over the backend's own calls, so a hot
+    /// drive's catalog-lookup time is attributable separately from
+    /// its object-statement time.
+    rows: Arc<Mutex<(u64, u64, u64)>>,
 }
 
 impl<B: DbBackend> CountedBackend<B> {
-    fn record(result: &Result<DbExecResult, DbError>, rows: &Arc<Mutex<(u64, u64)>>) {
+    fn record(
+        result: &Result<DbExecResult, DbError>,
+        rows: &Arc<Mutex<(u64, u64, u64)>>,
+        started_ms: f64,
+    ) {
         if let Ok(result) = result {
             let mut counts = rows.lock().expect("d1 counter");
             counts.0 += result.rows_read;
             counts.1 += result.rows_written;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                counts.2 += (clock_ms() - started_ms).max(0.0) as u64;
+            }
         }
     }
 }
@@ -141,8 +178,9 @@ impl<B: DbBackend> DbBackend for CountedBackend<B> {
         let inner = self.inner.clone();
         let rows = self.rows.clone();
         async move {
+            let started_ms = clock_ms();
             let result = inner.query(query, params).await;
-            Self::record(&result, &rows);
+            Self::record(&result, &rows, started_ms);
             result
         }
     }
@@ -155,8 +193,9 @@ impl<B: DbBackend> DbBackend for CountedBackend<B> {
         let inner = self.inner.clone();
         let rows = self.rows.clone();
         async move {
+            let started_ms = clock_ms();
             let result = inner.execute(query, params).await;
-            Self::record(&result, &rows);
+            Self::record(&result, &rows, started_ms);
             result
         }
     }
@@ -166,7 +205,7 @@ impl<B: DbBackend> DbBackend for CountedBackend<B> {
 /// `STOW_DB` binding wrapped so every statement's rows land in `rows`.
 pub fn counted_d1(
     env: &skyzen::runtime::wasm::WasmEnv,
-    rows: Arc<Mutex<(u64, u64)>>,
+    rows: Arc<Mutex<(u64, u64, u64)>>,
 ) -> Result<skyzen_services::Db, String> {
     let inner = CfD1::from_env(env.as_js(), super::object::STOW_DB_BINDING)
         .map_err(|error| format!("load D1 binding: {error}"))?;
@@ -586,11 +625,13 @@ async fn run_drive(
     // A drive's fixture preparation is setup, not the event being
     // priced — it runs on the uncounted `db`, outside the metered
     // window (stow#525).
+    let setup_started_ms = clock_ms();
     if let Some(setup) = drive.setup {
         setup(db, shape, settings, ctx)
             .await
             .map_err(|error| QueueError::Sql(format!("drive {} setup: {error}", drive.name)))?;
     }
+    phase_trace(drive.name, "setup", setup_started_ms);
     log.lock().expect("statement log").clear();
     let d1_before = ctx.d1_counts();
     let started_ms = js_sys::Date::now();
@@ -599,12 +640,14 @@ async fn run_drive(
     // exactly representable and non-negative.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let wall_ms = (js_sys::Date::now() - started_ms).max(0.0) as u64;
-    let (d1_rows_read, d1_rows_written) = ctx.d1_counts();
+    phase_trace(drive.name, "run", started_ms);
+    let (d1_rows_read, d1_rows_written, d1_elapsed_ms) = ctx.d1_counts();
     let statements = std::mem::take(&mut *log.lock().expect("statement log"));
     // Cleanup is unconditional once the drive's pass has started: a
     // failing run can still have moved fixture state (armed alarms,
     // claimed rows, a stamped floor), and the isolation promise must
     // hold on the error path exactly as on success.
+    let cleanup_started_ms = clock_ms();
     let cleanup_result = if let Some(cleanup) = drive.cleanup {
         cleanup(db, shape, settings, ctx)
             .await
@@ -612,6 +655,7 @@ async fn run_drive(
     } else {
         Ok(())
     };
+    phase_trace(drive.name, "cleanup", cleanup_started_ms);
     let outcome = if let Err(error) = run_result {
         Err(format!("drive {}: {error}", drive.name))
     } else {
@@ -640,6 +684,7 @@ async fn run_drive(
                         wall_budget: budget.wall_ms,
                         d1_rows_read: d1_rows_read.saturating_sub(d1_before.0),
                         d1_rows_written: d1_rows_written.saturating_sub(d1_before.1),
+                        d1_elapsed_ms: d1_elapsed_ms.saturating_sub(d1_before.2),
                         over_budget: over,
                         log: statements
                             .into_iter()
@@ -648,6 +693,7 @@ async fn run_drive(
                                 rows_returned: metric.rows_returned,
                                 rows_read: metric.rows_read,
                                 rows_written: metric.rows_written,
+                                elapsed_ms: metric.elapsed_ms,
                             })
                             .collect(),
                     })
@@ -664,6 +710,23 @@ async fn run_drive(
         (Err(run_error), Err(cleanup_error)) => Err(QueueError::Sql(format!(
             "{run_error}; cleanup also failed: {cleanup_error}"
         ))),
+    }
+}
+
+/// Probe-only phase timing: emits one synchronous `tracing` line per
+/// `run_drive` boundary — drive name, phase (`setup`/`run`/`cleanup`)
+/// and the phase's `Date::now` elapsed — so the native wrangler
+/// persisted log locates fixture setup and cleanup separately from
+/// metered work. No I/O and no awaits: the line is pure synchronous
+/// logging, so it cannot refresh the worker clock, flush the storage
+/// output gate, or alter the span it measures. Durations are `0` on
+/// host (the host lane gates SQL counts only).
+fn phase_trace(drive: &str, phase: &str, phase_started_ms: f64) {
+    if clock_ms() != 0.0 {
+        tracing::info!(
+            "budget phase drive={drive} phase={phase} elapsed_ms={}",
+            clock_ms() - phase_started_ms
+        );
     }
 }
 

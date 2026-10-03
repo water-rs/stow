@@ -112,9 +112,10 @@ pub struct DriveContext {
     /// reads back (stow#522). `None` on the host gate, which has no
     /// platform alarm and asserts the `AlarmPlan` instead.
     pub alarm: Option<Alarm>,
-    /// Σ D1 `meta` rows the counted backend observed — read back into
-    /// the report row after each drive.
-    pub d1_rows: std::sync::Arc<std::sync::Mutex<(u64, u64)>>,
+    /// Σ D1 `meta` rows and Σ awaited wall the counted backend
+    /// observed — read back into the report row after each drive.
+    /// `(rows_read, rows_written, elapsed_ms)`.
+    pub d1_rows: std::sync::Arc<std::sync::Mutex<(u64, u64, u64)>>,
     /// The claimed task ids, in claim order — the pass's own outcome.
     /// The launch gate's per-claim marginal price divides the
     /// hot-minus-idle delta by their count — never by a checked-in
@@ -147,7 +148,7 @@ impl DriveContext {
             #[cfg(target_arch = "wasm32")]
             d1: None,
             alarm: None,
-            d1_rows: std::sync::Arc::new(std::sync::Mutex::new((0, 0))),
+            d1_rows: std::sync::Arc::new(std::sync::Mutex::new((0, 0, 0))),
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
@@ -159,7 +160,7 @@ impl DriveContext {
     /// real durable-object alarm the demand drive's arm writes.
     #[cfg(target_arch = "wasm32")]
     pub fn worker(env: &skyzen::runtime::wasm::WasmEnv, alarm: &Alarm) -> Result<Self, String> {
-        let d1_rows = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64)));
+        let d1_rows = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64)));
         let d1 = super::budget::counted_d1(env, std::sync::Arc::clone(&d1_rows))?;
         Ok(Self {
             env: Some(env.clone()),
@@ -173,7 +174,7 @@ impl DriveContext {
     }
 
     /// Read the counted D1 totals so far.
-    pub fn d1_counts(&self) -> (u64, u64) {
+    pub fn d1_counts(&self) -> (u64, u64, u64) {
         *self.d1_rows.lock().expect("d1 counter")
     }
 
@@ -1415,9 +1416,14 @@ async fn dispatch_pass_drive(
                 .as_ref()
                 .ok_or_else(|| "dispatch pass drive needs the counted D1".to_owned())?;
             let coverage = super::object::CatalogCoverage { db: d1.clone() };
+            let pass_started_ms = super::budget::clock_ms();
             let task_ids = super::object::dispatch_pass(env, db, &pass_settings, &coverage)
                 .await
                 .map_err(|error| error.to_string())?;
+            tracing::info!(
+                "budget span pass=dispatch_pass idle={idle} elapsed_ms={}",
+                super::budget::clock_ms() - pass_started_ms
+            );
             // Only a non-recording focused probe files its claims for
             // restore — the canonical hot/idle pass owns
             // `claimed_tasks`, and mixing its ids into the probe list
@@ -1435,9 +1441,14 @@ async fn dispatch_pass_drive(
                     installation_id: "0".to_owned(),
                     private_key_pem: String::new(),
                 };
+                let token_started_ms = super::budget::clock_ms();
                 let _ = crate::github_app::installation_token(db, &config)
                     .await
                     .map_err(|error| error.to_string())?;
+                tracing::info!(
+                    "budget span pass=installation_token elapsed_ms={}",
+                    super::budget::clock_ms() - token_started_ms
+                );
             }
             task_ids
         }
@@ -1451,9 +1462,15 @@ async fn dispatch_pass_drive(
             task_ids
         }
     };
-    queue::next_alarm(db, 0, &pass_settings)
-        .await
-        .map_err(|error| error.to_string())?;
+    #[cfg(target_arch = "wasm32")]
+    let alarm_started_ms = super::budget::clock_ms();
+    let result = queue::next_alarm(db, 0, &pass_settings).await;
+    #[cfg(target_arch = "wasm32")]
+    tracing::info!(
+        "budget span pass=next_alarm elapsed_ms={}",
+        super::budget::clock_ms() - alarm_started_ms
+    );
+    result.map_err(|error| error.to_string())?;
     Ok(task_ids)
 }
 
