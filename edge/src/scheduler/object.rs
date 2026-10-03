@@ -185,6 +185,9 @@ impl DurableObject for Scheduler {
             // carry; production requests hit the guard and 404.
             "/budget".post(scheduler_budget),
             "/budget/seed".post(scheduler_budget_seed),
+            // Trusted demand batches — #522's demand input; reached
+            // from `POST /api/v1/admin/scheduler/demand`.
+            "/demand".post(scheduler_demand),
             // A nested Route under the root — the outer tuple caps at
             // 15 nodes.
             Route::new(("/dispatch-freeze"
@@ -261,6 +264,25 @@ async fn scheduler_budget(
 fn budget_probe_enabled(env: &WasmEnv) -> bool {
     read_optional_string_binding(env, budget::BUDGET_PROBE_BINDING)
         .is_some_and(|value| value == "1")
+}
+
+/// `POST /demand` — trusted demand batches (stow#522 I7). Reached only
+/// through `POST /api/v1/admin/scheduler/demand`; never a request path.
+async fn scheduler_demand(
+    db: DurableDb,
+    Json(request): Json<stow_types::api::SchedulerDemandRequest>,
+) -> Result<Json<stow_types::api::SchedulerDemandReport>> {
+    queue::apply_demand(&db, &request)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            let status = match &error {
+                crate::errors::QueueError::Invariant(_)
+                | crate::errors::QueueError::Overflow { .. } => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })
 }
 
 /// `POST /tasks/submit` — the anonymous-lane submit. The pending-depth

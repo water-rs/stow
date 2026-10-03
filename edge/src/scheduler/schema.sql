@@ -88,6 +88,12 @@ CREATE TABLE IF NOT EXISTS queue (
     -- priority operand changes (re-request, promote, revive); the
     -- family never changes after insert.
     value INTEGER NOT NULL DEFAULT 0,
+    -- Accumulated observed demand (stow#522): the sum of this task's
+    -- `demand_contributions` rows, written only by the demand route.
+    -- It is a `value` operand inside the priority band — the band
+    -- bound keeps `priority + demand <= PRIORITY_MAX` — so every key
+    -- refresh and re-request carries it forward instead of wiping it.
+    demand INTEGER NOT NULL DEFAULT 0,
     -- The claim ORDER BY tuple encoded as one sortable string:
     -- inverted `value` | first_requested_at | created_at | task_id.
     -- The claim walk orders by it under an index and pages by keyset,
@@ -154,6 +160,33 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
 );
+
+-- One demand batch's contribution to one task (stow#522): the durable
+-- replay record the hourly demand feed (#523) relies on. Applying a
+-- batch inserts keyed rows `OR IGNORE` with `applied = 0`, then flips
+-- them in one statement; the `demand_fold` trigger (created at migrate
+-- from the shared value/key expressions) folds each flipped row's
+-- delta into queue.demand/value/dispatch_key inside that same
+-- statement, so an exact replay applies nothing twice and an
+-- interrupted delivery converges on redelivery — never a partial
+-- increment, never a discarded legitimate batch.
+CREATE TABLE IF NOT EXISTS demand_contributions (
+    task_id TEXT NOT NULL,
+    -- The batch's durable window identity (e.g. the feed hour).
+    batch_id TEXT NOT NULL,
+    -- This batch's total contribution to the task — the sum of every
+    -- entry in the batch whose closure reached it.
+    delta INTEGER NOT NULL,
+    -- Whether this row's delta has been folded into the queue row.
+    applied INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, batch_id)
+);
+
+-- The demand path reads only a batch's own rows — the fold and the
+-- bound probe are driven by this index, never the stored ledger.
+CREATE INDEX IF NOT EXISTS idx_demand_contributions_batch
+ON demand_contributions (batch_id);
 
 -- The claim walk: pending + deps-met rows in dispatch order. The alarm's
 -- dispatch pass reads the first page of this index, never the queue.

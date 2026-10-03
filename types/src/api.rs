@@ -1546,6 +1546,61 @@ pub struct SchedulerBudgetReport {
     pub over_budget: bool,
 }
 
+/// One node identity a demand batch reports demand for (stow#522).
+///
+/// The Analytics Engine source omits `host_side`, so an entry names
+/// every compile side of the identity at once: all matching unbuilt
+/// queue rows are roots of the demand walk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandEntry {
+    /// Crate name the observed demand names.
+    pub crate_name: CrateName,
+    /// Crate version.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Demand increment this entry contributes once to every task its
+    /// closure touches.
+    pub demand: u64,
+}
+
+/// `POST /api/v1/admin/scheduler/demand` request — one durable demand
+/// batch.
+///
+/// `batch_id` is the replay contract the hourly feed (#523) reuses:
+/// contributions are keyed `(task_id, batch_id)` and each folds its
+/// delta into `queue.demand` exactly once, so redelivering a batch
+/// applies nothing twice and a batch interrupted mid-application
+/// converges on the next delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandRequest {
+    /// The batch's durable identity — the feed's hour window.
+    pub batch_id: String,
+    /// Observed-demand entries. Distinct identities contribute their
+    /// own deltas to a shared closure; an identical entry repeated in
+    /// one batch sums before touching tasks.
+    pub entries: Vec<SchedulerDemandEntry>,
+}
+
+/// What `POST /api/v1/admin/scheduler/demand` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandReport {
+    /// The applied batch's identity, echoed.
+    pub batch_id: String,
+    /// Distinct input identities the batch carried.
+    pub entries: u64,
+    /// Queue tasks the batch's closures named — each took its share of
+    /// every entry whose walk reached it.
+    pub touched_tasks: u64,
+    /// `true` when the call recorded new contribution rows — `false`
+    /// on an exact replay or a batch whose closure was empty.
+    pub applied: bool,
+}
+
 /// One queue row as `GET /api/v1/admin/queue` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueueTask {

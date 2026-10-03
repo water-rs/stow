@@ -17,6 +17,7 @@ const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_MIGRATE_URL: &str = "https://scheduler.internal/migrate";
 const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
 const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
+const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -199,6 +200,18 @@ pub async fn scheduler_budget(
     request: &stow_types::api::SchedulerBudgetRequest,
 ) -> Result<stow_types::api::SchedulerBudgetReport, SchedulerClientError> {
     post_json(namespace, SCHEDULER_BUDGET_URL, request).await
+}
+
+/// `POST /demand` — apply one durable demand batch (stow#522 I7):
+/// each entry's delta lands on every unbuilt queue row its identity
+/// names — either compile side — and that row's unbuilt dependency
+/// closure, deduplicated per task and keyed on `batch_id` so a replay
+/// is a no-op.
+pub async fn scheduler_demand(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::SchedulerDemandRequest,
+) -> Result<stow_types::api::SchedulerDemandReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_DEMAND_URL, request).await
 }
 
 /// Admin queue listing behind `stow-admin queue list` and the mutation

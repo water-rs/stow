@@ -481,6 +481,21 @@ pub async fn admin_scheduler_budget(
     ))
 }
 
+/// `POST /api/v1/admin/scheduler/demand`
+///
+/// Apply one demand batch to the scheduler's unbuilt closure
+/// (stow#522): the trusted input the hourly demand feed (#523)
+/// delivers. Operator-only — `SchedulerCaller`, like every route here.
+pub async fn admin_scheduler_demand(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::SchedulerDemandRequest>,
+) -> Result<Json<stow_types::api::SchedulerDemandReport>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::scheduler_demand(&scheduler, &request).await?,
+    ))
+}
+
 /// `GET /api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=`
 ///
 /// Queue rows matching the selector, newest transition first — the

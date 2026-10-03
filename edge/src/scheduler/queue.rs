@@ -516,12 +516,14 @@ async fn apply_batched_inserts(
                     "e ->> 'lane'",
                     &dispatch_family_sql("e ->> 'target'"),
                     "e ->> 'priority'",
+                    "0",
                 ),
                 key = dispatch_key_sql(
                     &value_sql(
                         "e ->> 'lane'",
                         &dispatch_family_sql("e ->> 'target'"),
                         "e ->> 'priority'",
+                        "0",
                     ),
                     "datetime('now')",
                     "datetime('now')",
@@ -2417,25 +2419,33 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
 }
 
 /// `queue.value` as a SQL expression — the persisted number the claim
-/// order descends on: precedence bands over the baseline `priority`.
-/// `family` is the row's `dispatch_family` (an expression or column):
-/// the family never changes after insert, so reading the derived
-/// column is one operand with the lane and priority the row already
-/// carries. A statement assigning an operand column in the same UPDATE
-/// must pass the assigned expression, since SET terms read the
-/// pre-update row.
-pub(super) fn value_sql(lane: &str, family: &str, priority: &str) -> String {
+/// order descends on: precedence bands over the baseline `priority`,
+/// plus accumulated `demand` (stow#522). `family` is the row's
+/// `dispatch_family` (an expression or column): the family never
+/// changes after insert, so reading the derived column is one operand
+/// with the lane and priority the row already carries. `demand` is
+/// the row's persisted contribution sum (or a fresher expression when
+/// the statement assigns `demand` in the same UPDATE): it stays
+/// inside the priority band — the demand route refuses a batch that
+/// would push `priority + demand` past `PRIORITY_MAX`, so a demand
+/// bump can never outrank a lane or family band. A statement
+/// assigning an operand column in the same UPDATE must pass the
+/// assigned expression, since SET terms read the pre-update row.
+pub(super) fn value_sql(lane: &str, family: &str, priority: &str, demand: &str) -> String {
     format!(
         "((CASE WHEN ({lane}) = 'human' THEN 2 ELSE 0 END) + \
           (CASE WHEN ({family}) = 'windows' THEN 1 ELSE 0 END)) * {VALUE_BAND} \
-         + MAX(0, ({priority}))"
+         + MAX(0, ({priority})) + MAX(0, ({demand}))"
     )
 }
 
 /// `value_sql` over the queue's own columns — the in-row form the
-/// backfill and the claim-order refresh share.
+/// backfill and the claim-order refresh share. `demand` is a plain
+/// operand: every lane/priority refresh recomputes value with the
+/// row's accumulated demand, so re-requests, promotions and revives
+/// keep the demand contribution instead of wiping it (stow#522).
 pub(super) fn value_row_sql() -> String {
-    value_sql("lane", "dispatch_family", "priority")
+    value_sql("lane", "dispatch_family", "priority", "demand")
 }
 
 /// The claim `ORDER BY` tuple encoded as one sortable string: the
@@ -2574,6 +2584,260 @@ async fn refresh_dispatch_keys(db: &DurableDb, task_ids: &[String]) -> Result<()
         .execute()
         .await
         .map_err(|error| format!("refresh dispatch keys: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The largest `batch_id` a demand request may carry.
+const MAX_DEMAND_BATCH_ID_BYTES: usize = 128;
+
+/// The entry cap one demand batch may carry — each entry is one keyed
+/// closure walk, so the cap also bounds a request's statement count.
+const MAX_DEMAND_BATCH_ENTRIES: usize = 256;
+
+/// The statuses demand may touch: rows that can still dispatch. The
+/// walk stops at `completed` and in-flight (`dispatched`/`running`)
+/// rows — those nodes either are served or already own a runner — and
+/// at edges whose slice answer is `dep_met = 1`.
+const UNBUILT_STATUSES: &str = "'pending', 'failed'";
+
+/// `POST /demand` — a trusted demand batch (stow#522 I7). Every entry
+/// names a host-side-free node identity (the Analytics Engine source
+/// omits the side): the union of its unbuilt root rows — both compile
+/// sides — and their unbuilt dependency closures over unmet edges is
+/// its touched set. The entry's delta lands once per touched task —
+/// the `UNION` walk dedups diamonds and cycles — while distinct
+/// identities contribute their own deltas to a task they share.
+///
+/// Durability is keyed on the batch: contribution rows are
+/// `(task_id, batch_id)` `INSERT OR IGNORE`s carrying an `applied`
+/// marker, and the fold is driven only by the batch's own rows —
+/// `applied = 0` under the batch index — never by a task's stored
+/// history, so a delivery's cost stays proportional to what it
+/// delivered. The queue fold runs inside the `demand_fold` trigger on
+/// the mark statement itself: claim and increment are one atomic
+/// statement, so a replay folds exactly the pending remainder — a
+/// delivered batch writes nothing, an interrupted one converges, and
+/// a different batch contributes once. `value` and `dispatch_key`
+/// refresh for the event's own closure only.
+///
+/// Validation precedes every mutation: deltas are `u64` checked into
+/// `i64`, per-task sums use checked arithmetic, and the band bound —
+/// `priority + demand <= PRIORITY_MAX`, the guard that keeps demand
+/// inside the priority band so lane/family precedence cannot break —
+/// is verified in SQL over the exact row set this event will fold,
+/// before a single write. An overrun answers as an error, never a
+/// clamp or a REAL promotion.
+pub async fn apply_demand(
+    db: &DurableDb,
+    request: &stow_types::api::SchedulerDemandRequest,
+) -> Result<stow_types::api::SchedulerDemandReport, QueueError> {
+    if request.batch_id.is_empty() || request.batch_id.len() > MAX_DEMAND_BATCH_ID_BYTES {
+        return Err(QueueError::Invariant(format!(
+            "demand batch_id must be 1..={MAX_DEMAND_BATCH_ID_BYTES} bytes"
+        )));
+    }
+    if request.entries.is_empty() || request.entries.len() > MAX_DEMAND_BATCH_ENTRIES {
+        return Err(QueueError::Invariant(format!(
+            "demand batch must carry 1..={MAX_DEMAND_BATCH_ENTRIES} entries"
+        )));
+    }
+
+    // Dedupe input identities first: an entry repeated under the same
+    // identity is one demand report, and summing before the walk keeps
+    // "once per task" true at identity granularity too.
+    let mut deltas: BTreeMap<[String; 5], i64> = BTreeMap::new();
+    for entry in &request.entries {
+        let delta = u64_to_i64(entry.demand, "demand entry delta")?;
+        let key = [
+            entry.crate_name.as_str().to_owned(),
+            entry.version.to_string(),
+            entry.features_json.raw(),
+            entry.target.as_str().to_owned(),
+            entry.rustc_version.as_str().to_owned(),
+        ];
+        let total = deltas
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(delta)
+            .ok_or(QueueError::Overflow {
+                field: "demand entry delta sum",
+                value: u64::MAX,
+            })?;
+        deltas.insert(key, total);
+    }
+
+    // One keyed walk per distinct identity; UNION dedups — a task
+    // reached through two roots or two diamond paths is visited once,
+    // and cycles cannot recur.
+    let mut contributions: BTreeMap<String, i64> = BTreeMap::new();
+    for (key, delta) in &deltas {
+        for task_id in demand_closure_tasks(db, key).await? {
+            let total = contributions
+                .get(&task_id)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(*delta)
+                .ok_or(QueueError::Overflow {
+                    field: "task demand contribution",
+                    value: u64::MAX,
+                })?;
+            contributions.insert(task_id, total);
+        }
+    }
+    if contributions.is_empty() {
+        return Ok(stow_types::api::SchedulerDemandReport {
+            batch_id: request.batch_id.clone(),
+            entries: u64::try_from(deltas.len()).unwrap_or(u64::MAX),
+            touched_tasks: 0,
+            applied: false,
+        });
+    }
+
+    // The JSON payload is the lossless channel: deltas serialize as
+    // decimal text and SQLite's own parser decodes them as INTEGER —
+    // no number binds, so a delta above 2^53 survives the workerd
+    // cursor that an i64 parameter could never cross.
+    let rows: Vec<ContributionRow> = contributions
+        .iter()
+        .map(|(task_id, delta)| ContributionRow {
+            tid: task_id.clone(),
+            delta: *delta,
+        })
+        .collect();
+    let payload = enqueue_json(&rows)?;
+
+    // The band bound is checked over exactly the rows this event will
+    // fold, before any write.
+    check_demand_band_bound(db, &payload, &request.batch_id).await?;
+
+    // The durable record — idempotent by key; first-write-wins if a
+    // replayed batch's payload ever differs. Rows land `applied = 0`:
+    // recorded, not yet folded.
+    db.query(
+        "INSERT OR IGNORE INTO demand_contributions \
+             (task_id, batch_id, delta, applied) \
+         SELECT j.value ->> 'tid', ?, \
+                CAST(j.value ->> 'delta' AS INTEGER), 0 \
+         FROM json_each(?) j",
+    )
+    .bind(request.batch_id.clone())
+    .bind(payload)
+    .execute()
+    .await
+    .map_err(|error| format!("record demand contributions: {error}"))?;
+
+    // Claim and fold in one statement: the `demand_fold` trigger
+    // increments `queue.demand`/`value`/`dispatch_key` per row the mark
+    // flips, inside the same statement — an interrupted delivery
+    // leaves `applied = 0` rows the replay folds, a delivered batch
+    // flips nothing and writes nothing, and cost never leaves the
+    // batch's own index-bounded rows.
+    db.query(
+        "UPDATE demand_contributions SET applied = 1 \
+         WHERE batch_id = ? AND applied = 0",
+    )
+    .bind(request.batch_id.clone())
+    .execute()
+    .await
+    .map_err(|error| format!("fold demand contributions: {error}"))?;
+    let applied = changes(db).await? > 0;
+
+    Ok(stow_types::api::SchedulerDemandReport {
+        batch_id: request.batch_id.clone(),
+        entries: u64::try_from(deltas.len()).unwrap_or(u64::MAX),
+        touched_tasks: u64::try_from(contributions.len()).unwrap_or(u64::MAX),
+        applied,
+    })
+}
+
+/// One (task, delta) row of a demand batch's fold payload.
+#[derive(serde::Serialize)]
+struct ContributionRow {
+    tid: String,
+    delta: i64,
+}
+
+/// The unbuilt tasks one demand entry's closure touches: roots are
+/// every unbuilt row the identity names regardless of `host_side`, and
+/// the recursive step follows each touched row's unmet edges into
+/// unbuilt dep rows. `UNION` dedups the walk, so a task reached
+/// through two roots or two diamond paths appears once and cycles
+/// cannot recur. Task ids are TEXT, so this set crosses the workerd
+/// cursor losslessly.
+async fn demand_closure_tasks(
+    db: &DurableDb,
+    identity: &[String; 5],
+) -> Result<Vec<String>, QueueError> {
+    db.query(&format!(
+        "WITH RECURSIVE walk(task_id) AS ( \
+             SELECT task_id FROM queue \
+             WHERE crate_name = ? AND version = ? AND features_json = ? \
+               AND target = ? AND rustc_version = ? \
+               AND status IN ({UNBUILT_STATUSES}) \
+             UNION \
+             SELECT d.depends_on_task_id \
+             FROM walk w \
+             JOIN queue_dependencies d ON d.task_id = w.task_id AND d.dep_met = 0 \
+             JOIN queue q ON q.task_id = d.depends_on_task_id \
+                AND q.status IN ({UNBUILT_STATUSES}) \
+         ) SELECT task_id FROM walk"
+    ))
+    .bind(identity[0].clone())
+    .bind(identity[1].clone())
+    .bind(identity[2].clone())
+    .bind(identity[3].clone())
+    .bind(identity[4].clone())
+    .fetch_scalars::<String>()
+    .await
+    .map_err(|error| format!("demand closure walk: {error}").into())
+}
+
+/// The demand band bound, checked over exactly the rows this event
+/// will fold — payload rows with no recorded contribution plus the
+/// batch's stored `applied = 0` remainder (the pending part of an
+/// interrupted earlier delivery) — before any write: `MAX(0,
+/// priority) + demand + delta` must stay under `PRIORITY_MAX` so
+/// demand cannot outrank a lane or family band. Written as `delta >
+/// bound - priority - demand`, every operand stays inside i64, so the
+/// compare can never promote to REAL — and on overflow the request
+/// errors with the offenders named rather than clamping.
+async fn check_demand_band_bound(
+    db: &DurableDb,
+    payload: &str,
+    batch_id: &str,
+) -> Result<(), QueueError> {
+    let offending: Vec<String> = db
+        .query(&format!(
+            "SELECT f.tid FROM ( \
+                 SELECT j.value ->> 'tid' AS tid, \
+                        CAST(j.value ->> 'delta' AS INTEGER) AS delta \
+                 FROM json_each(?) j \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM demand_contributions c \
+                     WHERE c.task_id = j.value ->> 'tid' \
+                       AND c.batch_id = ?) \
+                 UNION ALL \
+                 SELECT c.task_id AS tid, c.delta \
+                 FROM demand_contributions c \
+                 WHERE c.batch_id = ? AND c.applied = 0 \
+             ) f \
+             JOIN queue q ON q.task_id = f.tid \
+             WHERE f.delta > {PRIORITY_MAX} - MAX(0, q.priority) - q.demand"
+        ))
+        .bind(payload.to_owned())
+        .bind(batch_id.to_owned())
+        .bind(batch_id.to_owned())
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("demand band-bound check: {error}"))?;
+    if !offending.is_empty() {
+        return Err(QueueError::Invariant(format!(
+            "demand would overflow the priority band on {} task(s): {}",
+            offending.len(),
+            offending.join(", ")
+        )));
     }
     Ok(())
 }
@@ -3683,9 +3947,9 @@ pub async fn apply_mutation(
                  wake_at = not_before, \
                  value = {value}, dispatch_key = {key} \
              WHERE status = 'pending' AND lane = 'miss' AND {predicate}",
-            value = value_sql("'human'", "dispatch_family", "priority"),
+            value = value_sql("'human'", "dispatch_family", "priority", "demand"),
             key = dispatch_key_sql(
-                &value_sql("'human'", "dispatch_family", "priority"),
+                &value_sql("'human'", "dispatch_family", "priority", "demand"),
                 "first_requested_at",
                 "created_at",
                 "task_id",
@@ -4848,7 +5112,7 @@ async fn apply_slice_gate_delta(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -4913,9 +5177,9 @@ async fn migrate_dispatch_gate(
          WHERE dispatch_family != {family} OR queue.value != {value} \
             OR dispatch_key != {key}",
         family = dispatch_family_sql("target"),
-        value = value_sql("lane", &dispatch_family_sql("target"), "priority"),
+        value = value_sql("lane", &dispatch_family_sql("target"), "priority", "demand"),
         key = dispatch_key_sql(
-            &value_sql("lane", &dispatch_family_sql("target"), "priority"),
+            &value_sql("lane", &dispatch_family_sql("target"), "priority", "demand"),
             "first_requested_at",
             "created_at",
             "task_id",
@@ -5023,6 +5287,7 @@ pub async fn migrate(
     migrate_published_slice_columns(db).await?;
     migrate_dispatch_gate(db, settings).await?;
     migrate_generation_identity(db, settings).await?;
+    migrate_demand_ledger(db).await?;
     // Every `migrate_schema` path has applied `schema.sql`, so `settings`
     // exists here. Its `panic` row belonged to the in-Worker circuit
     // breaker the zone's WAF maintenance rules replaced; nothing reads it.
@@ -5205,6 +5470,10 @@ async fn migrate_queue_columns(
             "ALTER TABLE queue ADD COLUMN value INTEGER NOT NULL DEFAULT 0",
         ),
         (
+            "demand",
+            "ALTER TABLE queue ADD COLUMN demand INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
             "dispatch_key",
             "ALTER TABLE queue ADD COLUMN dispatch_key TEXT NOT NULL DEFAULT ''",
         ),
@@ -5256,6 +5525,62 @@ async fn migrate_generation_identity(
     .await
     .map_err(|error| format!("backfill queue generation identities: {error}"))?;
 
+    Ok(())
+}
+
+/// The version-11 demand ledger's runtime piece (stow#522): the
+/// `demand_contributions` table and its batch index are pure DDL in
+/// `schema.sql`, but the `applied` marker needs an additive ALTER on
+/// dev-era tables created without it (`CREATE TABLE IF NOT EXISTS`
+/// never adds a column), and the `demand_fold` trigger must be built
+/// here rather than written into `schema.sql` — its body is generated
+/// from the same `value_sql`/`dispatch_key_sql` expressions every
+/// other writer uses, so the scoring formula has exactly one source.
+async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
+    let has_applied = db
+        .query("PRAGMA table_info(demand_contributions)")
+        .fetch_all::<QueueTableInfoRow>()
+        .await
+        .map_err(|error| format!("inspect demand ledger shape: {error}"))?
+        .iter()
+        .any(|column| column.name == "applied");
+    if !has_applied {
+        db.query(
+            "ALTER TABLE demand_contributions \
+             ADD COLUMN applied INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("add demand ledger applied marker: {error}"))?;
+    }
+    let demand = "(queue.demand + NEW.delta)";
+    let value = value_sql(
+        "queue.lane",
+        "queue.dispatch_family",
+        "queue.priority",
+        demand,
+    );
+    db.query(&format!(
+        "CREATE TRIGGER IF NOT EXISTS demand_fold \
+         AFTER UPDATE OF applied ON demand_contributions \
+         WHEN NEW.applied = 1 AND OLD.applied = 0 \
+         BEGIN \
+             UPDATE queue \
+             SET demand = {demand}, value = {value}, dispatch_key = {key} \
+             WHERE queue.task_id = NEW.task_id \
+               AND (queue.demand != {demand} OR queue.value != {value} \
+                    OR queue.dispatch_key != {key}); \
+         END",
+        key = dispatch_key_sql(
+            &value,
+            "queue.first_requested_at",
+            "queue.created_at",
+            "queue.task_id",
+        ),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("create demand fold trigger: {error}"))?;
     Ok(())
 }
 
@@ -6176,7 +6501,7 @@ mod sqlite_tests {
         task_id,
     };
     use crate::errors::QueueError;
-    use crate::scheduler::test_db::{counting_memory_db, memory_db, memory_db_raw};
+    use crate::scheduler::test_db::{StatementLog, counting_memory_db, memory_db, memory_db_raw};
     use skyzen_services::durable::DurableDb;
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
@@ -6891,6 +7216,584 @@ mod sqlite_tests {
             .await
             .expect("count drifted rows");
         assert_eq!(drifted, 0, "every row carries the current formula");
+    }
+
+    // stow#522 I7 — keyed demand application.
+
+    fn demand_entry_on(
+        crate_name: &str,
+        target: &str,
+        delta: u64,
+    ) -> stow_types::api::SchedulerDemandEntry {
+        stow_types::api::SchedulerDemandEntry {
+            crate_name: crate_name.parse().expect("demand crate"),
+            version: VERSION.parse().expect("demand version"),
+            features_json: FeaturesJson::default(),
+            target: target.parse().expect("demand target"),
+            rustc_version: RUSTC.parse().expect("demand rustc"),
+            demand: delta,
+        }
+    }
+
+    fn demand_entry(crate_name: &str, delta: u64) -> stow_types::api::SchedulerDemandEntry {
+        demand_entry_on(crate_name, TARGET, delta)
+    }
+
+    fn demand_batch(
+        batch_id: &str,
+        entries: Vec<stow_types::api::SchedulerDemandEntry>,
+    ) -> stow_types::api::SchedulerDemandRequest {
+        stow_types::api::SchedulerDemandRequest {
+            batch_id: batch_id.to_owned(),
+            entries,
+        }
+    }
+
+    async fn apply(
+        db: &DurableDb,
+        batch_id: &str,
+        entries: Vec<stow_types::api::SchedulerDemandEntry>,
+    ) -> Result<stow_types::api::SchedulerDemandReport, QueueError> {
+        super::apply_demand(db, &demand_batch(batch_id, entries)).await
+    }
+
+    async fn demand_of(db: &DurableDb, task_id: &str) -> i64 {
+        db.query("SELECT demand FROM queue WHERE task_id = ?")
+            .bind(task_id.to_owned())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("demand read")
+    }
+
+    async fn contribution_rows(db: &DurableDb, batch_id: &str) -> u64 {
+        db.query("SELECT count(*) FROM demand_contributions WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .fetch_scalar::<u64>()
+            .await
+            .expect("contribution count")
+    }
+
+    /// Demand lands on the named node and walks its whole unbuilt
+    /// dependency closure; unrelated rows stay at zero (stow#522).
+    #[tokio::test]
+    async fn demand_walks_the_unbuilt_dependency_closure() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("mid", vec![dependency("leaf")]),
+                request("root", vec![dependency("mid")]),
+                request("other", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        let report = apply(&db, "h0", vec![demand_entry("root", 5)])
+            .await
+            .expect("demand");
+        assert!(report.applied);
+        assert_eq!(report.touched_tasks, 3);
+        for name in ["root", "mid", "leaf"] {
+            assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 5, "{name}");
+        }
+        assert_eq!(demand_of(&db, &task_id_on("other", TARGET)).await, 0);
+        // The closure's value rows carry the delta — the ordering
+        // operand, not a side column.
+        let value = db
+            .query("SELECT value FROM queue WHERE task_id = ?")
+            .bind(task_id_on("leaf", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("value read");
+        assert_eq!(value, 5, "miss row: bands and priority are 0");
+    }
+
+    /// A diamond — root reaches `c` through both `a` and `b` — applies
+    /// the delta once per task, and the walk dedup is visible in the
+    /// contribution rows too (stow#522).
+    #[tokio::test]
+    async fn demand_dedupes_diamond_paths() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("c", Vec::new()),
+                request("a", vec![dependency("c")]),
+                request("b", vec![dependency("c")]),
+                request("root", vec![dependency("a"), dependency("b")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        let report = apply(&db, "h0", vec![demand_entry("root", 7)])
+            .await
+            .expect("demand");
+        assert_eq!(report.touched_tasks, 4);
+        assert_eq!(demand_of(&db, &task_id_on("c", TARGET)).await, 7);
+        assert_eq!(contribution_rows(&db, "h0").await, 4);
+    }
+
+    /// One entry names a node identity without its side: both the
+    /// target-side and the host-side queue rows of that identity are
+    /// touched (stow#522).
+    #[tokio::test]
+    async fn demand_touches_both_compile_sides_of_one_identity() {
+        let db = memory_db().await.expect("memory db");
+        let host = EnqueueRequest {
+            host_side: true,
+            ..request("dual", Vec::new())
+        };
+        enqueue(&db, &[request("dual", Vec::new()), host])
+            .await
+            .expect("enqueue");
+
+        let report = apply(&db, "h0", vec![demand_entry("dual", 3)])
+            .await
+            .expect("demand");
+        assert_eq!(report.touched_tasks, 2);
+        for host_side in [false, true] {
+            let id = task_id("dual", VERSION, FEATURES, TARGET, RUSTC, host_side);
+            assert_eq!(demand_of(&db, &id).await, 3, "host_side={host_side}");
+        }
+    }
+
+    /// The walk stops at nodes that are done or in flight — completed
+    /// and running deps are not touched — and at edges whose slice
+    /// answer is already `dep_met = 1` (stow#522).
+    #[tokio::test]
+    async fn demand_stops_at_built_in_flight_and_met_edges() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("done", Vec::new()),
+                request("live", Vec::new()),
+                request("leaf", Vec::new()),
+                request("met-dep", Vec::new()),
+                request(
+                    "root",
+                    vec![
+                        dependency("done"),
+                        dependency("live"),
+                        dependency("met-dep"),
+                    ],
+                ),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        mark_active(&db, "done", TARGET, "completed").await;
+        mark_active(&db, "live", TARGET, "running").await;
+        // An edge whose dep the index already answered: met edges are
+        // not part of the unbuilt closure even when the row behind
+        // them is still pending.
+        db.query(
+            "UPDATE queue_dependencies SET dep_met = 1 \
+                  WHERE task_id = ? AND dep_crate_name = 'met-dep'",
+        )
+        .bind(task_id_on("root", TARGET))
+        .execute()
+        .await
+        .expect("met edge");
+        // A failed dep is unbuilt — demand still flows to it.
+        mark_active(&db, "leaf", TARGET, "failed").await;
+        db.query("INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_met, dep_side_known) \
+                  VALUES (?, ?, 'leaf', ?, '[]', ?, ?, 0, 1, 2, 0, 1)")
+            .bind(task_id_on("root", TARGET))
+            .bind(task_id_on("leaf", TARGET))
+            .bind(VERSION)
+            .bind(TARGET)
+            .bind(RUSTC)
+            .execute()
+            .await
+            .expect("leaf edge");
+
+        let report = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("demand");
+        assert_eq!(report.touched_tasks, 2, "root and the failed dep only");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 4);
+        assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 4);
+        for name in ["done", "live", "met-dep"] {
+            assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 0, "{name}");
+        }
+    }
+
+    /// Distinct input identities contribute their own deltas to a
+    /// shared dependency — and a cycle terminates with each node
+    /// touched once (stow#522).
+    #[tokio::test]
+    async fn demand_sums_distinct_identities_and_survives_cycles() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("shared", Vec::new()),
+                request("r1", vec![dependency("shared")]),
+                request("r2", vec![dependency("shared")]),
+            ],
+        )
+        .await
+        .expect("enqueue shared");
+        let report = apply(
+            &db,
+            "h0",
+            vec![demand_entry("r1", 3), demand_entry("r2", 4)],
+        )
+        .await
+        .expect("demand");
+        assert_eq!(report.touched_tasks, 3);
+        assert_eq!(demand_of(&db, &task_id_on("shared", TARGET)).await, 7);
+
+        // a ↔ b: the UNION dedup closes the cycle; each side gets the
+        // delta once.
+        enqueue(
+            &db,
+            &[
+                request("cyc-a", vec![dependency("cyc-b")]),
+                request("cyc-b", vec![dependency("cyc-a")]),
+            ],
+        )
+        .await
+        .expect("enqueue cycle");
+        let report = apply(&db, "h1", vec![demand_entry("cyc-a", 2)])
+            .await
+            .expect("cycle demand");
+        assert_eq!(report.touched_tasks, 2);
+        for name in ["cyc-a", "cyc-b"] {
+            assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 2, "{name}");
+        }
+    }
+
+    /// The replay contract: re-delivering the same `batch_id` applies
+    /// nothing and reports `applied = false`; a distinct batch is a
+    /// distinct hour and adds on top (stow#522).
+    #[tokio::test]
+    async fn demand_replay_is_idempotent_and_batches_accumulate() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        let first = apply(&db, "hour-1", vec![demand_entry("root", 5)])
+            .await
+            .expect("first");
+        assert!(first.applied);
+        let replay = apply(&db, "hour-1", vec![demand_entry("root", 5)])
+            .await
+            .expect("replay");
+        assert!(!replay.applied);
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
+        assert_eq!(contribution_rows(&db, "hour-1").await, 1);
+
+        let next = apply(&db, "hour-2", vec![demand_entry("root", 5)])
+            .await
+            .expect("next hour");
+        assert!(next.applied);
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 10);
+    }
+
+    /// A delivery's cost is proportional to its own rows, not the
+    /// stored ledger: the same batch run against 3 vs 300 recorded
+    /// contribution batches issues identical statements with identical
+    /// counted rows, the batch predicate plans as an index search, and
+    /// a crashed earlier delivery converges by folding only its own
+    /// unmarked rows (stow#522).
+    #[tokio::test]
+    async fn demand_cost_stays_proportional_with_preexisting_history() {
+        async fn seeded(history: u64) -> (DurableDb, StatementLog) {
+            let (db, log) = counting_memory_db().await.expect("counting db");
+            enqueue(&db, &[request("root", Vec::new())])
+                .await
+                .expect("enqueue");
+            // A long ledger built by real deliveries — every row
+            // already folded through the same path under test.
+            for hour in 0..history {
+                apply(&db, &format!("old-{hour}"), vec![demand_entry("root", 2)])
+                    .await
+                    .expect("history batch");
+            }
+            (db, log)
+        }
+
+        async fn issued_new_batch(db: &DurableDb, log: &StatementLog) -> Vec<String> {
+            let base = log.lock().expect("log").len();
+            let report = apply(db, "new-hour", vec![demand_entry("root", 3)])
+                .await
+                .expect("new batch");
+            assert!(report.applied);
+            let issued = log.lock().expect("log")[base..].to_vec();
+            // (sql, rows_read, rows_written) — the observable cost.
+            issued
+                .iter()
+                .map(|s| format!("{}|{}|{}", s.sql, s.rows_read, s.rows_written))
+                .collect()
+        }
+
+        let (small, small_log) = seeded(3).await;
+        let (large, large_log) = seeded(300).await;
+        let root = task_id_on("root", TARGET);
+        assert_eq!(demand_of(&small, &root).await, 6);
+        assert_eq!(demand_of(&large, &root).await, 600);
+
+        let small_issued = issued_new_batch(&small, &small_log).await;
+        let large_issued = issued_new_batch(&large, &large_log).await;
+        assert_eq!(
+            small_issued, large_issued,
+            "history never enters the request"
+        );
+        assert_eq!(demand_of(&small, &root).await, 9);
+        assert_eq!(demand_of(&large, &root).await, 603);
+
+        // The batch predicate is an index probe, not a ledger scan —
+        // on the fold mark and on both arms of the bound probe.
+        for sql in [
+            "UPDATE demand_contributions SET applied = 1 \
+             WHERE batch_id = ? AND applied = 0",
+            "SELECT c.task_id AS tid, c.delta FROM demand_contributions c \
+             WHERE c.batch_id = ? AND c.applied = 0",
+        ] {
+            let details = db_plan(&small, sql, &["new-hour"]).await;
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("SEARCH") && d.contains("demand_contributions")),
+                "keyed predicate expected for `{sql}`: {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|d| d.contains("SCAN") && d.contains("demand_contributions")),
+                "ledger scan on the demand path: {details:?}"
+            );
+        }
+
+        // A crashed delivery — recorded `applied = 0` rows never
+        // folded — converges on redelivery through the same path.
+        db_insert_contribution(&small, &root, "crashed", 7).await;
+        let report = apply(&small, "crashed", vec![demand_entry("root", 7)])
+            .await
+            .expect("re-deliver crashed batch");
+        assert!(report.applied, "the pending remainder folds");
+        assert_eq!(demand_of(&small, &root).await, 16, "3 + 3 + 7 + recorded 3");
+    }
+
+    async fn db_insert_contribution(db: &DurableDb, task_id: &str, batch_id: &str, delta: i64) {
+        db.query(
+            "INSERT INTO demand_contributions (task_id, batch_id, delta, applied) \
+             VALUES (?, ?, ?, 0)",
+        )
+        .bind(task_id.to_owned())
+        .bind(batch_id.to_owned())
+        .bind(delta)
+        .execute()
+        .await
+        .expect("record unapplied contribution");
+    }
+
+    async fn db_plan(db: &DurableDb, sql: &str, binds: &[&str]) -> Vec<String> {
+        #[derive(skyzen::FromRow)]
+        struct PlanRow {
+            detail: String,
+        }
+        let explained = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut query = db.query(&explained);
+        for bind in binds {
+            query = query.bind((*bind).to_owned());
+        }
+        query
+            .fetch_all::<PlanRow>()
+            .await
+            .expect("explain")
+            .into_iter()
+            .map(|row| row.detail)
+            .collect()
+    }
+
+    /// Demand is a queue operand, not a side channel: an ordinary
+    /// re-request and a lane promotion recompute `value`/`dispatch_key`
+    /// through the same formula and keep the contribution (stow#522).
+    #[tokio::test]
+    async fn demand_survives_resubmit_and_promotion() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+        apply(&db, "h0", vec![demand_entry("root", 9)])
+            .await
+            .expect("demand");
+
+        // Re-request: the enqueue path's key refresh recomputes value
+        // with the demand operand.
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("resubmit");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 9);
+        let value = db
+            .query("SELECT value FROM queue WHERE task_id = ?")
+            .bind(task_id_on("root", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("value read");
+        assert_eq!(value, 9);
+
+        // Promote recomputes lane/family bands and keeps demand.
+        super::apply_mutation(
+            &db,
+            &settings(),
+            super::QueueMutation::Promote,
+            &filter_selector(stow_types::api::QueueSelector {
+                crate_name: Some("root".parse().expect("crate name")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("promote");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 9);
+        let value = db
+            .query("SELECT value FROM queue WHERE task_id = ?")
+            .bind(task_id_on("root", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("value read");
+        assert_eq!(value, 2 * super::VALUE_BAND + 9, "human band + demand");
+    }
+
+    /// A delta that would push `priority + demand` past `PRIORITY_MAX`
+    /// is an error before any write — no clamp, no REAL promotion, and
+    /// the queue plus the contribution ledger are untouched
+    /// (stow#522).
+    #[tokio::test]
+    async fn demand_over_band_bound_fails_without_writes() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        let over = (super::PRIORITY_MAX as u64) + 1;
+        let error = apply(&db, "h0", vec![demand_entry("root", over)])
+            .await
+            .expect_err("over-bound demand must fail");
+        assert!(error.to_string().contains("priority band"), "{error}");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
+
+        // Exactly at the bound is admissible.
+        apply(
+            &db,
+            "h1",
+            vec![demand_entry("root", super::PRIORITY_MAX as u64)],
+        )
+        .await
+        .expect("at-bound demand");
+        assert_eq!(
+            demand_of(&db, &task_id_on("root", TARGET)).await,
+            super::PRIORITY_MAX
+        );
+    }
+
+    /// Demand magnitudes above the JS safe-integer bound stay exact:
+    /// the persisted `value` differs by exactly one for adjacent deltas
+    /// above 2^53 and the claim order follows it — the JSON-decimal
+    /// transport never became a float (stow#522).
+    #[tokio::test]
+    async fn demand_orders_exactly_above_the_js_safe_integer() {
+        #[derive(skyzen::FromRow)]
+        struct ValuePair {
+            task_id: String,
+            value: i64,
+        }
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("less", Vec::new()), request("more", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        let js_safe = 9_007_199_254_740_992_u64; // 2^53
+        assert!(js_safe + 2 <= super::PRIORITY_MAX as u64);
+        apply(
+            &db,
+            "h0",
+            vec![
+                demand_entry("less", js_safe + 1),
+                demand_entry("more", js_safe + 2),
+            ],
+        )
+        .await
+        .expect("demand");
+
+        let values = db
+            .query("SELECT task_id, value FROM queue ORDER BY task_id")
+            .fetch_all::<ValuePair>()
+            .await
+            .expect("values");
+        let less = values
+            .iter()
+            .find(|row| row.task_id == task_id_on("less", TARGET))
+            .expect("less row")
+            .value;
+        let more = values
+            .iter()
+            .find(|row| row.task_id == task_id_on("more", TARGET))
+            .expect("more row")
+            .value;
+        assert_eq!(more - less, 1, "adjacent deltas stay adjacent");
+        assert!(less > js_safe.cast_signed(), "values are above 2^53");
+
+        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert_eq!(claimed[0].crate_name, "more");
+    }
+
+    /// An entry whose identity names no queue row is a no-op report —
+    /// `applied` stays false and nothing is written (stow#522).
+    #[tokio::test]
+    async fn demand_on_an_unknown_identity_is_a_noop() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+        let report = apply(&db, "h0", vec![demand_entry("absent", 5)])
+            .await
+            .expect("demand");
+        assert!(!report.applied);
+        assert_eq!(report.touched_tasks, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
+    }
+
+    /// Malformed batches fail at validation, before any queue read or
+    /// write: an empty or oversized `batch_id`, an empty entry list,
+    /// and a delta that cannot fit `i64` (stow#522).
+    #[tokio::test]
+    async fn demand_rejects_malformed_batches() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        for bad in ["", &"x".repeat(129)] {
+            apply(&db, bad, vec![demand_entry("root", 1)])
+                .await
+                .expect_err("bad batch_id must fail");
+        }
+        apply(&db, "h0", Vec::new())
+            .await
+            .expect_err("empty entries must fail");
+        let entries = (0..=256)
+            .map(|i| demand_entry(&format!("e{i}"), 1))
+            .collect();
+        apply(&db, "h0", entries)
+            .await
+            .expect_err("over-cap entries must fail");
+        apply(&db, "h0", vec![demand_entry("root", u64::MAX)])
+            .await
+            .expect_err("u64 delta must fail");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
     }
 
     /// With the macOS slot count spent mid-pass, the pass skips the

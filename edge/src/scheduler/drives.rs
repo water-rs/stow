@@ -20,7 +20,7 @@ use stow_types::api::{
     EnqueueDependency, EnqueueRequest, EnqueueSource, PublishedSliceRow, QueueSelector,
     QueueTaskStatus,
 };
-use stow_types::identity::FeaturesJson;
+use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::{UnitInvocation, UnitShape};
 
 use super::fixture::FixtureShape;
@@ -634,6 +634,47 @@ pub const DRIVES: &[Drive] = &[
                         (inserted == 0)
                             .then_some(())
                             .ok_or_else(|| format!("resubmit inserted {inserted}, expected 0"))
+                    })
+            })
+        },
+    },
+    Drive {
+        name: "POST /demand",
+        run: |db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                // One durable batch on one keyed root — fixture row 101's
+                // identity, pending with seeded unmet edges — so the
+                // measure covers the identity probe, the closure walk,
+                // the contribution inserts, and the demand/key refresh,
+                // all bounded by the touched set.
+                let n = 101_u32;
+                let (crate_name, version) = crate_identity(n);
+                let request = stow_types::api::SchedulerDemandRequest {
+                    batch_id: "costgate-demand".to_owned(),
+                    entries: vec![stow_types::api::SchedulerDemandEntry {
+                        crate_name: CrateName::parse(crate_name).map_err(|e| e.to_string())?,
+                        version: CrateVersion::new(
+                            semver::Version::parse(&version).map_err(|e| e.to_string())?,
+                        ),
+                        features_json: FeaturesJson::default(),
+                        target: TargetTriple::parse(dep_target(n)).map_err(|e| e.to_string())?,
+                        rustc_version: WireRustcVersion::parse("1.86.0")
+                            .map_err(|e| e.to_string())?,
+                        demand: 100,
+                    }],
+                };
+                queue::apply_demand(db, &request)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|report| {
+                        (report.applied && report.touched_tasks > 0)
+                            .then_some(())
+                            .ok_or_else(|| {
+                                format!(
+                                    "demand batch touched {} tasks, applied={}",
+                                    report.touched_tasks, report.applied
+                                )
+                            })
                     })
             })
         },

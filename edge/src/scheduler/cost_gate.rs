@@ -297,6 +297,16 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
+    RouteBudget {
+        name: "POST /demand",
+        statements: 8,
+        rows_read: 200,
+        rows_written: 60,
+        // The recursive walk's working table and the json_each payload
+        // scan are keyed-by-construction, not table scans.
+        scan_allowlist: &["SCAN walk", "SCAN json_each"],
+        ddl_permitted: false,
+    },
     // The explicit full report — first publish and `index report --full`
     // resyncs — whose server-side diff reads the live slice (a
     // legitimate bound: the report body names every row).

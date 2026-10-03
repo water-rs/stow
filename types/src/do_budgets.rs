@@ -235,6 +235,13 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        name: "POST /demand",
+        statements: 10,
+        rows_read: 300,
+        rows_written: 120,
+        wall_ms: 500,
+    },
+    DriveBudget {
         // The accepted development ceiling is 303 reads — the latest
         // 100k workerd gate measured 157 under it, without wall-time
         // or write headroom.
