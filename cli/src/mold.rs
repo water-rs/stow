@@ -31,11 +31,12 @@
 //! consult it for `ld.mold`, so only `COMPILER_PATH` survives both shapes.
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use sha2::Digest as _;
 use stow_types::error::Context;
+use tracing::Instrument as _;
 
 use crate::rustc_args::detect_rustc_host_target;
 
@@ -72,15 +73,98 @@ const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 /// # Errors
 ///
 /// Fails when the mold install fails — the error says which step.
-pub async fn provision(target: &str, cargo_dir: &Path) -> stow_types::error::Result<Vec<String>> {
-    if !cfg!(target_os = "linux") || !linux_target(target) {
+pub async fn provision(
+    target: impl std::future::Future<Output = Result<String, String>> + Send,
+    explicit_target: Option<&str>,
+    cargo_dir: &Path,
+) -> stow_types::error::Result<Vec<String>> {
+    if !cfg!(target_os = "linux") || explicit_target.is_some_and(|target| !linux_target(target)) {
         return Ok(Vec::new());
     }
-    let link = resolve_link(target, cargo_dir).await;
-    if link.selects_mold && link.unavailable_reason().await.is_none() {
+    // The cfg probe and the availability probe are both process spawns,
+    // and they are independent unless a `cfg()` target table changes the
+    // probe's inputs: the conservative read — every cfg table a
+    // candidate, the same read `matching_target_tables` gives an
+    // unanswered cfg probe — launches the probe the config asks for while
+    // rustc is still answering. When the answered cfgs leave the probe
+    // inputs untouched the speculative answer stands; when they change
+    // it the probe reruns on the real inputs. The read is made before
+    // the target triple resolves, too: an explicit `--target` already
+    // names it, and without one the probe asks rustc for the host's own
+    // cfgs — the build's target is the host. A `target.<triple>` table
+    // cannot be matched either way until the triple arrives, so a
+    // resolution that turns out to need one reruns on the real inputs
+    // like a changed cfg answer does (stow#517).
+    let cfgs = tokio::spawn({
+        let target = explicit_target.map(str::to_owned);
+        async move {
+            rustc_target_cfgs(target.as_deref())
+                .instrument(tracing::debug_span!("stow.precargo.mold_cfg_probe"))
+                .await
+        }
+    });
+    let config = CargoConfig::load(cargo_dir, &process_env).await;
+    let candidate = resolve_link_from(
+        &config,
+        explicit_target.unwrap_or_default(),
+        None,
+        &process_env,
+    );
+    let speculative = match (candidate.selects_mold, candidate.probe()) {
+        (true, probe @ MoldProbe::Driver { .. }) => {
+            let task = tokio::spawn({
+                let probe = probe.clone();
+                async move {
+                    probe_unavailable_reason(&probe)
+                        .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
+                        .await
+                }
+            });
+            Some((probe, task))
+        }
+        _ => None,
+    };
+    let target = target
+        .await
+        .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    if !linux_target(&target) {
+        cfgs.abort();
+        if let Some((_, task)) = speculative {
+            task.abort();
+        }
         return Ok(Vec::new());
     }
-    let bin_dir = ensure_mold_install().await?;
+    let cfgs = cfgs
+        .await
+        .map_err(|error| stow_types::stow_error!("join rustc cfg probe task: {error}"))?;
+    let link = resolve_link_from(&config, &target, cfgs.as_ref(), &process_env);
+    if link.selects_mold {
+        let real = link.probe();
+        let reason = match speculative {
+            Some((probe, task)) if probe == real => task
+                .await
+                .map_err(|error| stow_types::stow_error!("join mold probe task: {error}"))?,
+            Some((_, task)) => {
+                task.abort();
+                probe_unavailable_reason(&real)
+                    .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
+                    .await
+            }
+            None => {
+                probe_unavailable_reason(&real)
+                    .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
+                    .await
+            }
+        };
+        if reason.is_none() {
+            return Ok(Vec::new());
+        }
+    } else if let Some((_, task)) = speculative {
+        task.abort();
+    }
+    let bin_dir = ensure_mold_install()
+        .instrument(tracing::debug_span!("stow.precargo.mold_install"))
+        .await?;
     selection_args(&bin_dir)
 }
 
@@ -128,7 +212,7 @@ fn compiler_path_value(bin_dir: &Path) -> stow_types::error::Result<&str> {
 /// global setup must read it, from `$CARGO_HOME/config.toml` plus the
 /// environment, so the answer never depends on the directory setup ran
 /// in. The project-level walk belongs to `stow` builds, which run inside
-/// a project and resolve through [`resolve_link`] instead.
+/// a project and resolve through [`resolve_link_from`] instead.
 ///
 /// `None` means the config needs no linker selection written — not a
 /// Linux host, or the configuration already selects mold *and can reach a
@@ -150,21 +234,12 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
     let host = detect_rustc_host_target(OsStr::new("rustc"))
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
-    let (config, cfgs) =
-        futures_util::future::join(CargoConfig::load_global(), rustc_target_cfgs(&host)).await;
-    let tables = config.matching_target_tables(&host, cfgs.as_ref());
-    let rustflags = effective_rustflags(&config, &tables);
-    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(&host, &tables));
-    let selects_mold = linker
-        .as_deref()
-        .is_some_and(|linker| linker.contains("mold"))
-        || rustflags.iter().any(|flag| flag_mentions_mold(flag));
-    let link = LinkResolution {
-        linker,
-        rustflags,
-        selects_mold,
-        compiler_path: effective_compiler_path(&config),
-    };
+    let (config, cfgs) = futures_util::future::join(
+        CargoConfig::load_global(&process_env),
+        rustc_target_cfgs(Some(&host)),
+    )
+    .await;
+    let link = resolve_link_from(&config, &host, cfgs.as_ref(), &process_env);
     if link.selects_mold && link.unavailable_reason().await.is_none() {
         return Ok(None);
     }
@@ -287,15 +362,29 @@ struct LinkResolution {
     compiler_path: Option<std::ffi::OsString>,
 }
 
-/// Resolve `target`'s link configuration: the config chain walk and the
-/// `rustc --print cfg` probe are independent — file I/O and a process
-/// spawn — so they run at the same time instead of one after the other.
-async fn resolve_link(target: &str, cargo_dir: &Path) -> LinkResolution {
-    let (config, cfgs) =
-        futures_util::future::join(CargoConfig::load(cargo_dir), rustc_target_cfgs(target)).await;
-    let tables = config.matching_target_tables(target, cfgs.as_ref());
-    let rustflags = effective_rustflags(&config, &tables);
-    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(target, &tables));
+/// The environment a link resolution reads — `std::env::var_os` on a
+/// real build, a fixture's map in tests, so a test never mutates the
+/// process's shared environment.
+type EnvLookup<'a> = &'a (dyn Fn(&str) -> Option<OsString> + Sync);
+
+/// The process's environment — the [`EnvLookup`] real code reads.
+fn process_env(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
+}
+
+/// Resolve `target`'s link configuration over an already-loaded config
+/// chain: which `target.*` tables match (cfg tables only when `cfgs` was
+/// answered — `None` keeps them all candidates), the effective rustflags
+/// and linker they resolve to, and whether the selection picks mold.
+fn resolve_link_from(
+    config: &CargoConfig,
+    target: &str,
+    cfgs: Option<&HashSet<String>>,
+    env: EnvLookup<'_>,
+) -> LinkResolution {
+    let tables = config.matching_target_tables(target, cfgs);
+    let rustflags = effective_rustflags(config, &tables, env);
+    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(target, &tables, env));
     let selects_mold = linker
         .as_deref()
         .is_some_and(|linker| linker.contains("mold"))
@@ -304,15 +393,15 @@ async fn resolve_link(target: &str, cargo_dir: &Path) -> LinkResolution {
         linker,
         rustflags,
         selects_mold,
-        compiler_path: effective_compiler_path(&config),
+        compiler_path: effective_compiler_path(config, env),
     }
 }
 
 /// The `COMPILER_PATH` a build at this config would run under, per
 /// cargo's `env` precedence: `force` entries beat the ambient variable,
 /// plain entries lose to it and apply only when it is unset.
-fn effective_compiler_path(config: &CargoConfig) -> Option<std::ffi::OsString> {
-    let ambient = std::env::var_os("COMPILER_PATH");
+fn effective_compiler_path(config: &CargoConfig, env: EnvLookup<'_>) -> Option<OsString> {
+    let ambient = env("COMPILER_PATH");
     match config.env_setting("COMPILER_PATH") {
         Some((value, true)) => Some(value.into()),
         Some((value, false)) => ambient.or_else(|| Some(value.into())),
@@ -320,27 +409,61 @@ fn effective_compiler_path(config: &CargoConfig) -> Option<std::ffi::OsString> {
     }
 }
 
+/// What asking the machine "is this link's mold reachable" looks like:
+/// a configured `linker` naming mold must itself resolve to an
+/// executable, while `-fuse-ld=mold` asks the compiler driver to find an
+/// `ld.mold`. The value is everything the probe reads — driver, `-B`
+/// prefixes, `COMPILER_PATH` — so two resolutions with the same probe
+/// answer the same question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MoldProbe {
+    /// The configured linker resolves to an executable itself.
+    Linker(String),
+    /// A `-fuse-ld=mold` link probe through a compiler driver.
+    Driver {
+        driver: String,
+        b_dirs: Vec<PathBuf>,
+        compiler_path: Option<OsString>,
+    },
+}
+
 impl LinkResolution {
-    /// Why mold cannot run for this link, or `None` when it can. Both
-    /// selection shapes are checked against the machine: a `linker` naming
-    /// mold must itself resolve to an executable, while `-fuse-ld=mold`
-    /// asks the compiler driver to find an `ld.mold`.
-    async fn unavailable_reason(&self) -> Option<String> {
-        if let Some(linker) = self.linker.as_deref()
-            && linker.contains("mold")
-        {
-            return (!program_resolves(linker)).then(|| {
-                format!("the configured linker `{linker}` does not resolve to an executable")
-            });
+    /// The probe this resolution's availability answer depends on.
+    fn probe(&self) -> MoldProbe {
+        match self.linker.as_deref() {
+            Some(linker) if linker.contains("mold") => MoldProbe::Linker(linker.to_owned()),
+            // With no mold-naming linker configured the link goes through
+            // a compiler driver; probe `cc`, the platform's C driver.
+            other => MoldProbe::Driver {
+                driver: other.unwrap_or("cc").to_owned(),
+                b_dirs: b_dirs(&self.rustflags),
+                compiler_path: self.compiler_path.clone(),
+            },
         }
-        // With no linker configured the link goes through a compiler
-        // driver; probe `cc`, the platform's C driver.
-        let driver = self.linker.as_deref().unwrap_or("cc");
-        (!ld_mold_resolves(driver, &self.rustflags, self.compiler_path.as_deref()).await).then(|| {
+    }
+
+    /// Why mold cannot run for this link, or `None` when it can.
+    async fn unavailable_reason(&self) -> Option<String> {
+        probe_unavailable_reason(&self.probe()).await
+    }
+}
+
+/// Runs `probe` against the machine and reports why mold cannot run for
+/// it, or `None` when it can.
+async fn probe_unavailable_reason(probe: &MoldProbe) -> Option<String> {
+    match probe {
+        MoldProbe::Linker(linker) => (!program_resolves(linker)).then(|| {
+            format!("the configured linker `{linker}` does not resolve to an executable")
+        }),
+        MoldProbe::Driver {
+            driver,
+            b_dirs,
+            compiler_path,
+        } => (!ld_mold_resolves(driver, b_dirs, compiler_path.as_deref()).await).then(|| {
             format!(
                 "`{driver}` finds no `ld.mold` for `-fuse-ld=mold` — run `stow setup` to install mold"
             )
-        })
+        }),
     }
 }
 
@@ -352,13 +475,9 @@ impl LinkResolution {
 /// exercises exactly the lookup and nothing else. The configured `-B`
 /// prefixes and the effective `COMPILER_PATH` are passed through so the
 /// probe sees the environment the build would.
-async fn ld_mold_resolves(
-    driver: &str,
-    rustflags: &[String],
-    compiler_path: Option<&OsStr>,
-) -> bool {
+async fn ld_mold_resolves(driver: &str, b_dirs: &[PathBuf], compiler_path: Option<&OsStr>) -> bool {
     let mut probe = async_process::Command::new(driver);
-    for dir in b_dirs(rustflags) {
+    for dir in b_dirs {
         probe.arg(format!("-B{}", dir.display()));
     }
     probe.args([
@@ -399,11 +518,16 @@ fn path_contains(name: &str) -> bool {
 
 /// Whether `target`'s effective linker configuration selects mold: the
 /// linker cargo selects for the triple, or any `-C` link option in the
-/// effective rustflags. The gate reads the fuller [`resolve_link`] answer
-/// itself; this stays the question the tests ask.
+/// effective rustflags. The gate reads the fuller [`resolve_link_from`]
+/// answer itself; this stays the question the tests ask.
 #[cfg(test)]
-async fn uses_mold(target: &str, cargo_dir: &Path) -> bool {
-    resolve_link(target, cargo_dir).await.selects_mold
+async fn uses_mold(target: &str, cargo_dir: &Path, env: EnvLookup<'_>) -> bool {
+    let (config, cfgs) = futures_util::future::join(
+        CargoConfig::load(cargo_dir, env),
+        rustc_target_cfgs(Some(target)),
+    )
+    .await;
+    resolve_link_from(&config, target, cfgs.as_ref(), env).selects_mold
 }
 
 /// A rustflag selects mold when a `-C` link option's value names it —
@@ -487,8 +611,9 @@ fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
 fn effective_rustflags(
     config: &CargoConfig,
     tables: &[(String, &toml_edit::Table)],
+    env: EnvLookup<'_>,
 ) -> Vec<String> {
-    if let Some(encoded) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
+    if let Some(encoded) = env("CARGO_ENCODED_RUSTFLAGS") {
         return encoded
             .to_string_lossy()
             .split('\x1f')
@@ -496,7 +621,7 @@ fn effective_rustflags(
             .map(str::to_owned)
             .collect();
     }
-    if let Ok(flags) = std::env::var("RUSTFLAGS") {
+    if let Some(flags) = env("RUSTFLAGS").and_then(|flags| flags.into_string().ok()) {
         return shell_words::split(&flags).unwrap_or_default();
     }
     config.rustflags(tables)
@@ -504,12 +629,16 @@ fn effective_rustflags(
 
 /// The linker cargo selects for `target`: `CARGO_TARGET_<TRIPLE>_LINKER`,
 /// then `target.<triple>.linker`, then a matching `target.<cfg>.linker`.
-fn effective_linker(target: &str, tables: &[(String, &toml_edit::Table)]) -> Option<String> {
+fn effective_linker(
+    target: &str,
+    tables: &[(String, &toml_edit::Table)],
+    env: EnvLookup<'_>,
+) -> Option<String> {
     let env_key = format!(
         "CARGO_TARGET_{}_LINKER",
         target.to_uppercase().replace('-', "_")
     );
-    if let Some(linker) = std::env::var_os(&env_key) {
+    if let Some(linker) = env(&env_key) {
         return Some(linker.to_string_lossy().into_owned());
     }
     let mut cfg_linker = None;
@@ -543,9 +672,9 @@ fn is_executable(path: &Path) -> bool {
 /// ordered lowest → highest precedence: `$CARGO_HOME/config.toml` first,
 /// then every `.cargo/config` and `.cargo/config.toml` from the filesystem
 /// root down to `cargo_dir` (the same walk cargo performs).
-fn cargo_config_paths(cargo_dir: &Path) -> Vec<PathBuf> {
+fn cargo_config_paths(cargo_dir: &Path, env: EnvLookup<'_>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(cargo_home) = crate::config::cargo_home() {
+    if let Some(cargo_home) = crate::config::cargo_home_with(env) {
         paths.push(cargo_home.join("config.toml"));
     }
     let ancestors: Vec<PathBuf> = cargo_dir.ancestors().map(Path::to_path_buf).collect();
@@ -565,8 +694,8 @@ struct CargoConfig {
 impl CargoConfig {
     /// Only the global `$CARGO_HOME/config.toml` — the read a global
     /// `stow setup` makes, where project-level files must not answer.
-    async fn load_global() -> Self {
-        let config = match crate::config::cargo_home() {
+    async fn load_global(env: EnvLookup<'_>) -> Self {
+        let config = match crate::config::cargo_home_with(env) {
             Some(cargo_home) => {
                 let path = cargo_home.join("config.toml");
                 async_fs::read_to_string(&path)
@@ -581,8 +710,8 @@ impl CargoConfig {
         }
     }
 
-    async fn load(cargo_dir: &Path) -> Self {
-        let paths = cargo_config_paths(cargo_dir);
+    async fn load(cargo_dir: &Path, env: EnvLookup<'_>) -> Self {
+        let paths = cargo_config_paths(cargo_dir, env);
         // Most of these paths do not exist, and none of the reads depends on
         // another, so the whole chain is read in one round rather than one
         // `await` per directory up the tree. `join_all` keeps the results in
@@ -704,15 +833,18 @@ impl CargoConfig {
 }
 
 /// `rustc --print cfg --target <triple>` — the truth about which `cfg()`
-/// predicates match. `None` when rustc cannot answer, in which case every
-/// cfg table stays a candidate (favoring a read that errs toward mold
-/// being selected over one that refuses a working build).
-async fn rustc_target_cfgs(target: &str) -> Option<HashSet<String>> {
-    let output = async_process::Command::new("rustc")
-        .args(["--print", "cfg", "--target", target])
-        .output()
-        .await
-        .ok()?;
+/// predicates match; a `None` triple asks rustc about the host, which a
+/// build without `--target` links for. `None` when rustc cannot answer,
+/// in which case every cfg table stays a candidate (favoring a read that
+/// errs toward mold being selected over one that refuses a working
+/// build).
+async fn rustc_target_cfgs(target: Option<&str>) -> Option<HashSet<String>> {
+    let mut command = async_process::Command::new("rustc");
+    command.args(["--print", "cfg"]);
+    if let Some(target) = target {
+        command.arg("--target").arg(target);
+    }
+    let output = command.output().await.ok()?;
     if !output.status.success() {
         return None;
     }
@@ -856,24 +988,86 @@ async fn ensure_mold_install() -> stow_types::error::Result<PathBuf> {
     Ok(bin_dir)
 }
 
+/// What one download attempt produced: the archive bytes, or a failure
+/// classified the way the shared retry policy classifies it — retried
+/// with any `Retry-After` hint it carried, or returned to the caller.
+enum DownloadOutcome {
+    Bytes(Vec<u8>),
+    Retryable {
+        error: stow_types::error::Error,
+        retry_after: Option<std::time::Duration>,
+    },
+    Fatal(stow_types::error::Error),
+}
+
 /// Download `url`, following redirects, into memory — the pinned sha256 is
-/// checked before a byte reaches disk.
+/// checked before a byte reaches disk. A transient failure — a request
+/// that never completed or a [`stow_types::transient::is_transient_status`]
+/// answer — is retried under the shared [`stow_types::transient::Backoff`]
+/// budget: the release fetch crosses two hosts (github.com's 302 to the
+/// release-assets CDN), and one transport error failing a user's `stow
+/// setup` is the failure this retry exists to prevent.
 async fn download(url: &str) -> stow_types::error::Result<Vec<u8>> {
+    let mut backoff = stow_types::transient::Backoff::new();
+    loop {
+        let wait = match download_once(url).await {
+            DownloadOutcome::Bytes(bytes) => return Ok(bytes),
+            DownloadOutcome::Retryable { error, retry_after } => {
+                let Some(wait) = backoff.next_wait(retry_after) else {
+                    return Err(error);
+                };
+                tracing::warn!(url, %error, "mold download failed; retrying");
+                wait
+            }
+            DownloadOutcome::Fatal(error) => return Err(error),
+        };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// One attempt at [`download`]: build the request, send it, and read the
+/// whole body — a connection lost mid-body leaves nothing usable, so a
+/// transport error at any stage retries the whole GET. The GET is a plain
+/// read with no side effects, so replaying it is safe.
+async fn download_once(url: &str) -> DownloadOutcome {
     use zenwave::Client as _;
     let mut client = zenwave::client()
         .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
         .follow_redirect();
-    let response = client
-        .get(url)
-        .map_err(|error| stow_types::stow_error!("build mold download request: {error}"))?
-        .await
-        .map_err(|error| stow_types::stow_error!("download {url}: {error}"))?;
-    let bytes = response
-        .into_body()
-        .into_bytes()
-        .await
-        .map_err(|error| stow_types::stow_error!("read {url} body: {error}"))?;
-    Ok(bytes.to_vec())
+    let request = match client.get(url) {
+        Ok(request) => request,
+        Err(error) => {
+            return DownloadOutcome::Fatal(stow_types::stow_error!(
+                "build mold download request: {error}"
+            ));
+        }
+    };
+    let response = match request.await {
+        Ok(response) => response,
+        Err(error) => {
+            return DownloadOutcome::Retryable {
+                error: stow_types::stow_error!("download {url}: {error}"),
+                retry_after: None,
+            };
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = stow_types::transient::retry_after_hint(response.headers());
+        let error = stow_types::stow_error!("download {url}: HTTP {status}");
+        return if stow_types::transient::is_transient_status(status.as_u16()) {
+            DownloadOutcome::Retryable { error, retry_after }
+        } else {
+            DownloadOutcome::Fatal(error)
+        };
+    }
+    match response.into_body().into_bytes().await {
+        Ok(bytes) => DownloadOutcome::Bytes(bytes.to_vec()),
+        Err(error) => DownloadOutcome::Retryable {
+            error: stow_types::stow_error!("read {url} body: {error}"),
+            retry_after: None,
+        },
+    }
 }
 
 /// Extract `bin/mold` and `bin/ld.mold` from a release tarball into
@@ -989,29 +1183,44 @@ mod tests {
     const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 
     /// A project directory whose cargo config chain is exactly `config`:
-    /// `CARGO_HOME` points at an empty directory and every env source cargo
-    /// would consult ahead of the config files is cleared, so the walk under
-    /// test is the only thing that can answer.
-    fn isolated_project(config: &str) -> tempfile::TempDir {
+    /// the fixture's own environment answers `CARGO_HOME` with an empty
+    /// directory and nothing else — injected into the walk under test, so
+    /// no test ever touches the process environment its siblings share.
+    struct IsolatedProject {
+        _tempdir: tempfile::TempDir,
+        project: PathBuf,
+        env: std::collections::HashMap<String, OsString>,
+    }
+
+    impl IsolatedProject {
+        /// The injected environment: `CARGO_HOME` alone.
+        fn env(&self) -> impl Fn(&str) -> Option<OsString> + '_ {
+            |key| self.env.get(key).cloned()
+        }
+    }
+
+    fn isolated_project(config: &str) -> IsolatedProject {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let project = tempdir.path().join("project");
         std::fs::create_dir_all(project.join(".cargo")).expect("project .cargo");
         std::fs::write(project.join(".cargo").join("config.toml"), config).expect("write config");
         let cargo_home = tempdir.path().join("cargo-home");
         std::fs::create_dir_all(&cargo_home).expect("cargo home");
-        // Safe here because nextest runs each test in its own process.
-        unsafe {
-            std::env::set_var("CARGO_HOME", &cargo_home);
-            std::env::remove_var("RUSTFLAGS");
-            std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
-            std::env::remove_var("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER");
+        let env = std::collections::HashMap::from([(
+            "CARGO_HOME".to_owned(),
+            cargo_home.into_os_string(),
+        )]);
+        IsolatedProject {
+            _tempdir: tempdir,
+            project,
+            env,
         }
-        tempdir
     }
 
     fn detects_mold(config: &str) -> bool {
-        let tempdir = isolated_project(config);
-        smol::block_on(uses_mold(LINUX_TARGET, &tempdir.path().join("project")))
+        let fixture = isolated_project(config);
+        let env = fixture.env();
+        smol::block_on(uses_mold(LINUX_TARGET, &fixture.project, &env))
     }
 
     fn written_rustflags(config: &str, bin_dir: &str) -> Vec<String> {
@@ -1130,14 +1339,10 @@ mod tests {
     }
 
     /// The rustflags a config produces for `target`, resolved the way the
-    /// model resolves them — the piece under test is `CargoConfig::
-    /// rustflags`, so env sources must not answer.
+    /// model resolves them — the pieces under test are `CargoConfig::
+    /// matching_target_tables` and `CargoConfig::rustflags`, which answer
+    /// from the parsed documents alone and never consult an environment.
     fn config_rustflags(config: &str, target: &str, cfgs: Option<&HashSet<String>>) -> Vec<String> {
-        // Safe here because nextest runs each test in its own process.
-        unsafe {
-            std::env::remove_var("RUSTFLAGS");
-            std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
-        }
         let chain = CargoConfig {
             files: vec![
                 config
@@ -1217,10 +1422,11 @@ mod tests {
     /// not leak into `prepare_global`'s read.
     #[test]
     fn global_load_ignores_project_config_files() {
-        let _tempdir = isolated_project(
+        let fixture = isolated_project(
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
         );
-        let global = smol::block_on(CargoConfig::load_global());
+        let env = fixture.env();
+        let global = smol::block_on(CargoConfig::load_global(&env));
         let cfgs: HashSet<String> = std::iter::once("target_os=\"linux\"".to_owned()).collect();
         assert!(
             global
@@ -1236,9 +1442,10 @@ mod tests {
 
     #[test]
     fn env_settings_resolve_both_shapes_and_force() {
-        let tempdir =
+        let fixture =
             isolated_project("[env.A]\nvalue = \"table\"\nforce = true\n\n[env]\nB = \"string\"\n");
-        let config = smol::block_on(CargoConfig::load(&tempdir.path().join("project")));
+        let env = fixture.env();
+        let config = smol::block_on(CargoConfig::load(&fixture.project, &env));
         assert_eq!(config.env_setting("A"), Some(("table".to_owned(), true)));
         assert_eq!(config.env_setting("B"), Some(("string".to_owned(), false)));
         assert_eq!(config.env_setting("MISSING"), None);
@@ -1332,5 +1539,93 @@ mod tests {
             parts,
             vec!["target_os=\"linux\"", "any(unix, target_family=\"gnu\")"]
         );
+    }
+
+    /// A stub release server: `refusal` decides the first connection's
+    /// fate — `None` drops it unanswered (a transport failure),
+    /// `Some(status)` answers that status; every later connection gets a
+    /// `200 OK` carrying `body`. Returns the URL and a count of how many
+    /// requests the server has seen.
+    fn serve_fail_then_ok(
+        refusal: Option<&'static str>,
+        body: &[u8],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<usize>>) {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let seen = std::sync::Arc::clone(&requests);
+        let refused = refusal.map(|status| {
+            format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+        });
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let body = body.to_vec();
+        std::thread::spawn(move || {
+            for (index, accepted) in listener.incoming().enumerate() {
+                let Ok(mut stream) = accepted else {
+                    return;
+                };
+                *seen.lock().expect("request count") = index + 1;
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).expect("read request") == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                if index == 0 {
+                    // `None` leaves the stream to drop unanswered — the
+                    // client sees a transport failure, not a response.
+                    let Some(ref answer) = refused else {
+                        continue;
+                    };
+                    stream.write_all(answer.as_bytes()).expect("write refusal");
+                } else {
+                    stream.write_all(ok.as_bytes()).expect("write head");
+                    stream.write_all(&body).expect("write body");
+                }
+                stream.flush().expect("flush");
+            }
+        });
+        (url, requests)
+    }
+
+    /// The release fetch crossing a transport failure: the first
+    /// connection is closed unanswered — the failure the merge queue hit
+    /// — and the shared policy's retry is what serves the archive.
+    #[test]
+    fn a_transport_failure_on_the_download_is_retried() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let body = b"the tarball bytes the server serves second";
+            let (url, requests) = serve_fail_then_ok(None, body);
+            let bytes = download(&url).await.expect("the retried download succeeds");
+            assert_eq!(bytes, body);
+            assert_eq!(*requests.lock().expect("request count"), 2);
+        });
+    }
+
+    /// A transient status answer — the other half of the shared policy —
+    /// is retried the same way.
+    #[test]
+    fn a_transient_status_on_the_download_is_retried() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let body = b"the tarball bytes the server serves second";
+            let (url, requests) = serve_fail_then_ok(Some("503 Service Unavailable"), body);
+            let bytes = download(&url).await.expect("the retried download succeeds");
+            assert_eq!(bytes, body);
+            assert_eq!(*requests.lock().expect("request count"), 2);
+        });
     }
 }

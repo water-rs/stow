@@ -67,13 +67,22 @@ pub async fn warm_exact_artifacts(
     let started = Instant::now();
     let (already_local, missing_local) =
         partition_local_requests(config, requests, &rustc_version).await?;
+    let missing_count = missing_local.len();
     let mut summary = PrefetchSummary {
         already_local,
         ..PrefetchSummary::default()
     };
     merge_summary(
         &mut summary,
-        drain_prefetch(config, &target, &rustc_version, &missing_local, budget).await?,
+        drain_prefetch(
+            config,
+            &target,
+            &rustc_version,
+            missing_local,
+            missing_count,
+            budget,
+        )
+        .await?,
     );
 
     tracing::info!(
@@ -129,11 +138,11 @@ fn validate_prefetch_requests(
 /// to answer it (file lock + LRU write + five SELECTs, serially) dominated
 /// the whole prefetch phase on a warm cache. Returns the count already
 /// local and the parsed identities still to fetch.
-async fn partition_local_requests<'a>(
+async fn partition_local_requests(
     config: &StowConfig,
-    requests: &'a [PrefetchArtifact],
+    requests: &[PrefetchArtifact],
     rustc_version: &str,
-) -> stow_types::error::Result<(usize, Vec<&'a PrefetchArtifact>)> {
+) -> stow_types::error::Result<(usize, Vec<PrefetchArtifact>)> {
     let cache_keys = requests
         .iter()
         .map(|request| artifact_cache_key(&request.target, &request.c_metadata))
@@ -147,7 +156,7 @@ async fn partition_local_requests<'a>(
             already_local += 1;
             continue;
         }
-        missing_local.push(request);
+        missing_local.push(request.clone());
     }
     Ok((already_local, missing_local))
 }
@@ -158,19 +167,22 @@ async fn partition_local_requests<'a>(
 /// parallelism. The shared budget — not a private timer — is what keeps the
 /// resolver, graph analysis, and prefetch from outlasting the build they
 /// accelerate together.
+/// `missing_count` rides separately: `missing_local` is consumed into the
+/// stream before the loop needs the total for the deadline warning.
 async fn drain_prefetch(
     config: &StowConfig,
     target: &str,
     rustc_version: &str,
-    missing_local: &[&PrefetchArtifact],
+    missing_local: Vec<PrefetchArtifact>,
+    missing_count: usize,
     budget: &CacheBudget,
 ) -> stow_types::error::Result<PrefetchSummary> {
-    let mut results = stream::iter(missing_local.iter().map(|request| {
+    let mut results = stream::iter(missing_local.into_iter().map(|request| {
         process_prefetched_artifact(
             config.clone(),
             target.to_owned(),
             rustc_version.to_owned(),
-            (*request).clone(),
+            request,
         )
     }))
     .buffer_unordered(PREFETCH_CONCURRENCY);
@@ -182,7 +194,7 @@ async fn drain_prefetch(
         // CPU saturation (dozens of verify/unpack tasks) the timer wheel can
         // fire late, but the wall clock cannot.
         if tokio::time::Instant::now() >= deadline {
-            warn_deadline(&summary, missing_local.len(), budget);
+            warn_deadline(&summary, missing_count, budget);
             break;
         }
         match tokio::time::timeout_at(deadline, results.next()).await {
@@ -204,7 +216,7 @@ async fn drain_prefetch(
             }
             Ok(None) => break,
             Err(_elapsed) => {
-                warn_deadline(&summary, missing_local.len(), budget);
+                warn_deadline(&summary, missing_count, budget);
                 break;
             }
         }

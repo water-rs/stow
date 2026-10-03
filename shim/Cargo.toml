@@ -19,6 +19,11 @@ zstd = { version = "0.14", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dirs = "7"
 
+[target.'cfg(windows)'.dependencies]
+# is_same_file: hard-linked wrapper shims skip the byte-for-byte
+# comparison against the runtime executable.
+same-file = "1"
+
 [features]
 default = []
 # Enables `STOW_ZSTD_COMPRESSION_LEVEL` and any zstd-related helpers. Off by

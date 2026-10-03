@@ -1,8 +1,9 @@
 //! The digest-addressed index-slice contract the site answers "is this
 //! crate cached?" from (water-rs/stow#288): how `Accept-Encoding` picks
-//! a `Content-Encoding`, what a layer digest must look like, the Cache
-//! API key a slice lives under, and the zstd→gzip transcode for clients
-//! that cannot read zstd.
+//! a `Content-Encoding`, what a layer digest must look like, and the
+//! zstd→gzip transcode for clients that cannot read zstd. Caching lives
+//! on the response's own `Cache-Control`/`Vary` — Workers Cache keys
+//! each encoding variant itself.
 //!
 //! Target-agnostic so the negotiation and digest handling unit-test on
 //! the host; the wasm handlers in `api.rs` are their only callers.
@@ -27,17 +28,6 @@ impl SliceEncoding {
     /// The `Content-Encoding` header value the response carries.
     #[must_use]
     pub const fn content_encoding(self) -> &'static str {
-        match self {
-            Self::Zstd => "zstd",
-            Self::Gzip => "gzip",
-        }
-    }
-
-    /// The last path segment of the slice's Cache API key: the two
-    /// encodings hold different bytes for one digest, so they can never
-    /// share an entry.
-    #[must_use]
-    const fn key_variant(self) -> &'static str {
         match self {
             Self::Zstd => "zstd",
             Self::Gzip => "gzip",
@@ -97,15 +87,6 @@ pub fn parse_layer_digest(digest: &str) -> Result<&str, SliceError> {
     } else {
         Err(SliceError::MalformedDigest(digest.to_owned()))
     }
-}
-
-/// The Cache API key under which the slice's bytes live. The layer
-/// digest is content-addressed — `(target, rustc)` tags move at every
-/// index publish while the digest pins the bytes — so the key is the
-/// digest plus the served encoding variant.
-#[must_use]
-pub fn slice_cache_key(digest: &str, encoding: SliceEncoding) -> String {
-    format!("index-slice-v1/{digest}/{}", encoding.key_variant())
 }
 
 /// Pull the index layer out of an `index.<target>.<rustc>` manifest.
@@ -265,18 +246,6 @@ mod tests {
                 "{bad} must not parse as a layer digest"
             );
         }
-    }
-
-    #[test]
-    fn cache_key_is_content_addressed_per_encoding() {
-        assert_eq!(
-            slice_cache_key("sha256:0123", SliceEncoding::Zstd),
-            "index-slice-v1/sha256:0123/zstd"
-        );
-        assert_eq!(
-            slice_cache_key("sha256:0123", SliceEncoding::Gzip),
-            "index-slice-v1/sha256:0123/gzip"
-        );
     }
 
     #[test]

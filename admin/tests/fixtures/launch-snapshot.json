@@ -1,0 +1,21 @@
+{
+  "window_days": 7,
+  "window_end": "2026-09-27",
+  "install_days": 289,
+  "cli_fetches": 6069,
+  "miss_nodes": 304,
+  "requests": {
+    "GET /api/v1/index/*": 4046,
+    "GET /api/v1/bundles/*": 6069,
+    "POST /api/v1/admissions": 243,
+    "POST /api/v1/enqueue": 182,
+    "POST /api/v1/requests": 30,
+    "GET /api/v1/requests/*": 132,
+    "GET /site/*": 303,
+    "GET /stats": 91,
+    "POST /api/v1/github/workflow-run": 342,
+    "POST /api/v1/admin/index/*": 28,
+    "POST /api/v1/scheduler/tasks/submit": 10,
+    "* /api/v1/(admin|scheduler)/*": 200
+  }
+}

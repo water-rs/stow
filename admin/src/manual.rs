@@ -66,6 +66,12 @@ pub struct ManualArgs {
     /// `[[project]] repo = "https://github.com/<owner>/<name>"`.
     #[arg(long)]
     projects: Option<PathBuf>,
+    /// Comma-separated local project directories — resolved like a
+    /// `--projects` entry (cargo's own resolver, the tree's `Cargo.lock`
+    /// dropped). Each directory is mutated: pass a disposable copy.
+    /// The mock lane seeds the wave with a consumer project's own graph.
+    #[arg(long, conflicts_with_all = ["crates", "projects"], value_delimiter = ',')]
+    dirs: Option<Vec<PathBuf>>,
     /// The stable rustc every task pins — `1.85.0`-style.
     #[arg(long)]
     rustc_version: String,
@@ -111,6 +117,7 @@ struct NodeRun {
     /// `Some(url)` once a run exists for the task — absent while the
     /// dispatch is still inside GitHub's registration grace.
     run_url: Option<String>,
+    workflow_run_id: Option<u64>,
     dispatched: bool,
     /// This node's own dispatch time — `RUN_GRACE_MINUTES` applies per
     /// node, not per layer.
@@ -147,6 +154,7 @@ enum Dispatch {
 #[derive(Debug)]
 struct RunState {
     task_id: String,
+    workflow_run_id: u64,
     status: String,
     conclusion: Option<String>,
     url: String,
@@ -170,25 +178,31 @@ impl RunState {
     }
 }
 
-/// Entry point — registry sessions need a Tokio reactor, so the driver
-/// runs on its own current-thread runtime like `index` does.
-pub fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| stow_error!("install ring CryptoProvider"))?;
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| stow_error!("build tokio runtime: {error}"))?
-        .block_on(run_inner(args))
+fn retain_latest_run(
+    latest: &mut BTreeMap<String, RunState>,
+    state: RunState,
+    tracked_workflow_run_id: Option<u64>,
+) {
+    if tracked_workflow_run_id.is_some_and(|id| id != state.workflow_run_id) {
+        return;
+    }
+    let replace = latest
+        .get(&state.task_id)
+        .is_none_or(|current| state.workflow_run_id > current.workflow_run_id);
+    if replace {
+        latest.insert(state.task_id.clone(), state);
+    }
 }
 
-async fn run_inner(args: ManualArgs) -> stow_types::error::Result<()> {
+/// Entry point — `stow-admin preheat manual`.
+pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result<()> {
     if args.in_flight == 0 {
         return Err(stow_error!("--in-flight must be at least 1"));
     }
-    if args.crates.is_none() && args.projects.is_none() {
-        return Err(stow_error!("one of --crates or --projects is required"));
+    if args.crates.is_none() && args.projects.is_none() && args.dirs.is_none() {
+        return Err(stow_error!(
+            "one of --crates, --projects or --dirs is required"
+        ));
     }
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
@@ -324,6 +338,7 @@ fn build_graph(
         nodes.entry(id).or_insert(NodeRun {
             request,
             run_url: None,
+            workflow_run_id: None,
             dispatched: false,
             dispatched_at: None,
             done: false,
@@ -430,28 +445,38 @@ async fn resolve_sources(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<Vec<EnqueueRequest>> {
-    let pool = crate::resolve::ResolvePool::new(rustc_version)?;
-    let mut requests = Vec::new();
+    // Version lookup runs sequentially (crates.io's pace gate); the
+    // resolves then fan out on the pool.
+    let mut jobs: Vec<(String, semver::Version)> = Vec::new();
     let mut failures = Vec::new();
     if let Some(path) = &args.crates {
-        let entries = load_crate_list(path)?;
-        // Version lookup runs sequentially (crates.io's pace gate); the
-        // resolves then fan out on the pool.
-        let mut jobs: Vec<(String, semver::Version)> = Vec::with_capacity(entries.len());
-        for (name, pinned) in entries {
-            let release = match resolve_named_release(name.as_str(), pinned).await {
-                Ok(release) => release,
-                Err(error) => {
-                    failures.push(format!("{name}: {error}"));
-                    continue;
-                }
-            };
-            jobs.push((name.as_str().to_owned(), release));
+        for (name, pinned) in load_crate_list(path).await? {
+            match resolve_named_release(name.as_str(), pinned).await {
+                Ok(release) => jobs.push((name.as_str().to_owned(), release)),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
         }
-        pool.run(
-            &jobs,
-            |resolver, (name, version)| {
-                crate::resolve::resolve_crate(resolver, name, version, targets, rustc_version, 0)
+    }
+    let targets = targets.to_vec();
+    let rustc_version = rustc_version.clone();
+    let projects = args.projects.clone();
+    let dirs = args.dirs.clone();
+    let (requests, failures) = tokio::task::spawn_blocking(move || {
+        let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
+        let mut requests = Vec::new();
+        if !jobs.is_empty() {
+            pool.run(
+                &jobs,
+                |resolver, runtime, (name, version)| {
+                    crate::resolve::resolve_crate(
+                        resolver,
+                        runtime,
+                        name,
+                        version,
+                        &targets,
+                        &rustc_version,
+                        0,
+                    )
                     .map(|source| {
                         source
                             .targets
@@ -459,26 +484,43 @@ async fn resolve_sources(
                             .flat_map(|(_target, tasks)| tasks)
                             .collect::<Vec<EnqueueRequest>>()
                     })
-            },
-            |_, (name, version), result| match result {
-                Ok(tasks) => requests.extend(tasks),
-                Err(error) => failures.push(format!("{name}@{version}: {error}")),
-            },
-        );
-    }
-    if let Some(path) = &args.projects {
-        let repos = crate::projects::load_projects_file(path)?;
-        pool.run(
-            &repos,
-            |resolver, repo| {
-                crate::projects::resolve_repository(resolver, repo, targets, rustc_version)
-            },
-            |_, repo, result| match result {
-                Ok(tasks) => requests.extend(tasks),
-                Err(error) => failures.push(format!("{repo}: {error}")),
-            },
-        );
-    }
+                },
+                |_, (name, version), result| match result {
+                    Ok(tasks) => requests.extend(tasks),
+                    Err(error) => failures.push(format!("{name}@{version}: {error}")),
+                },
+            );
+        }
+        if let Some(path) = &projects {
+            let repos = tokio::runtime::Handle::current()
+                .block_on(crate::projects::load_projects_file(path))?;
+            pool.run(
+                &repos,
+                |resolver, _runtime, repo| {
+                    crate::projects::resolve_repository(resolver, repo, &targets, &rustc_version)
+                },
+                |_, repo, result| match result {
+                    Ok(tasks) => requests.extend(tasks),
+                    Err(error) => failures.push(format!("{repo}: {error}")),
+                },
+            );
+        }
+        if let Some(dirs) = &dirs {
+            pool.run(
+                dirs,
+                |resolver, _runtime, dir| {
+                    crate::projects::resolve_project_dir(resolver, dir, &targets, &rustc_version)
+                },
+                |_, dir, result| match result {
+                    Ok(tasks) => requests.extend(tasks),
+                    Err(error) => failures.push(format!("{}: {error}", dir.display())),
+                },
+            );
+        }
+        Ok::<_, stow_types::error::Error>((requests, failures))
+    })
+    .await
+    .expect("resolve pool panicked")?;
     if !failures.is_empty() {
         return Err(stow_error!(
             "resolve failed for {} source(s):\n{}",
@@ -514,11 +556,12 @@ async fn resolve_named_release(
 
 /// Parse a crate list file: `name` or `name@version` per line, `#`
 /// comments and blanks ignored.
-fn load_crate_list(
+async fn load_crate_list(
     path: &Path,
 ) -> stow_types::error::Result<Vec<(CrateName, Option<CrateVersion>)>> {
-    let raw =
-        std::fs::read(path).map_err(|error| stow_error!("read {}: {error}", path.display()))?;
+    let raw = tokio::fs::read(path)
+        .await
+        .map_err(|error| stow_error!("read {}: {error}", path.display()))?;
     let text = String::from_utf8(raw)
         .map_err(|error| stow_error!("{} is not UTF-8: {error}", path.display()))?;
     let mut entries = Vec::new();
@@ -574,8 +617,9 @@ fn host_triple(target: &TargetTriple) -> String {
 /// The set of task ids the published slices already serve — semantic
 /// identity coverage per the queue gate's shape rules: a host-side node
 /// needs both invocation spellings' linked rows; a target-side node the
-/// linked+unlinked pair of its own spelling.
-async fn covered_nodes(
+/// linked+unlinked pair of its own spelling. `pub` for the request
+/// lane, which reports its `cached` roots off this set.
+pub async fn covered_nodes(
     index: &Index<'_>,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
@@ -646,17 +690,18 @@ async fn covered_nodes(
     Ok(covered)
 }
 
-/// The three handles the index-slice pulls share.
-struct Index<'a> {
-    session: &'a stow_oci::RegistrySession,
-    base: &'a stow_oci::RegistryBase,
-    trust: &'a stow_oci::verify::Trust,
+/// The three handles the index-slice pulls share — `pub` so the
+/// request lane pulls the same verified slices.
+pub struct Index<'a> {
+    pub session: &'a stow_oci::RegistrySession,
+    pub base: &'a stow_oci::RegistryBase,
+    pub trust: &'a stow_oci::verify::Trust,
 }
 
 /// Pull and verify the published `index.<target>.<rustc>` slice —
 /// `None` when the tag does not exist (a fresh registry serves an empty
 /// catalog, not an error).
-async fn published_slice_rows(
+pub async fn published_slice_rows(
     index: &Index<'_>,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
@@ -731,6 +776,20 @@ fn task_payload(task_id: &str, request: &EnqueueRequest) -> BuildTaskPayload {
     }
 }
 
+/// Dispatch a node and bind it to the exact run returned by the transport.
+async fn dispatch_node(
+    dispatch: &Dispatch,
+    task_id: &str,
+    node: &mut NodeRun,
+) -> stow_types::error::Result<()> {
+    let payload = task_payload(task_id, &node.request);
+    let workflow_run_id = dispatch.send(&payload).await?;
+    node.dispatched = true;
+    node.workflow_run_id = Some(workflow_run_id);
+    node.dispatched_at = Some(std::time::Instant::now());
+    Ok(())
+}
+
 /// Drive one layer to completion: adopt runs already on the tracker,
 /// dispatch the rest bounded by `in_flight`, and poll until every node
 /// resolves. Nodes whose runs never materialize inside the grace window
@@ -759,10 +818,17 @@ async fn drive_layer(
     // adopted, so they cannot be mistaken for the wave's.
     let mut created_since = adopt_since;
     loop {
+        let mut latest = BTreeMap::<String, RunState>::new();
         for state in dispatch
             .list_runs(&open, created_since, rustc_version)
             .await?
         {
+            let Some(node) = nodes.get(&state.task_id) else {
+                continue;
+            };
+            retain_latest_run(&mut latest, state, node.workflow_run_id);
+        }
+        for state in latest.into_values() {
             let Some(node) = nodes.get_mut(&state.task_id) else {
                 continue;
             };
@@ -771,6 +837,7 @@ async fn drive_layer(
                 // older code: drop it, so the node dispatches afresh.
                 if node.run_url.as_deref() == Some(state.url.as_str()) {
                     node.run_url = None;
+                    node.workflow_run_id = None;
                     node.dispatched = false;
                 }
                 continue;
@@ -781,6 +848,7 @@ async fn drive_layer(
                 created_since = created_since.min(created);
             }
             node.run_url = Some(state.url);
+            node.workflow_run_id = Some(state.workflow_run_id);
             // An adopted run is a dispatch, whichever invocation sent it:
             // it counts against `in_flight` and is never sent twice.
             node.dispatched = true;
@@ -809,15 +877,11 @@ async fn drive_layer(
             if running >= in_flight {
                 break;
             }
-            let node = nodes.get(id).expect("open node");
+            let node = nodes.get_mut(id).expect("open node");
             if node.dispatched {
                 continue;
             }
-            let payload = task_payload(id, &node.request);
-            dispatch.send(&payload).await?;
-            let node = nodes.get_mut(id).expect("open node");
-            node.dispatched = true;
-            node.dispatched_at = Some(std::time::Instant::now());
+            dispatch_node(dispatch, id, node).await?;
             created_since = created_since.min(time::OffsetDateTime::now_utc());
             running += 1;
         }
@@ -1002,7 +1066,7 @@ async fn local_index_publish(rustc_version: &WireRustcVersion) -> stow_types::er
         return Err(stow_error!("stow-admin index export exited {status}"));
     }
     let slices: Vec<SliceFile> = serde_json::from_slice(
-        &smol::fs::read(out_dir.join("slices.json"))
+        &tokio::fs::read(out_dir.join("slices.json"))
             .await
             .map_err(|error| stow_error!("read slices.json: {error}"))?,
     )
@@ -1032,19 +1096,21 @@ impl Dispatch {
     /// Send the build-crate dispatch: GitHub's `workflow_dispatch` under
     /// the operator token, or the local server's `/dispatch` POST — the
     /// same payload the scheduler emits either way.
-    async fn send(&self, payload: &BuildTaskPayload) -> stow_types::error::Result<()> {
+    async fn send(&self, payload: &BuildTaskPayload) -> stow_types::error::Result<u64> {
         match self {
             Self::GitHub { token } => {
                 let task_json = serde_json::to_string(payload)?;
-                crate::github::post_empty(
+                let response: WorkflowDispatchResponse = crate::github::post(
                     token,
                     &format!("actions/workflows/{WORKFLOW_FILE}/dispatches"),
                     &serde_json::json!({
                         "ref": BRANCH,
                         "inputs": { "task": task_json },
+                        "return_run_details": true,
                     }),
                 )
-                .await
+                .await?;
+                Ok(response.workflow_run_id)
             }
             Self::Local { base } => {
                 let url = format!("{base}/dispatch");
@@ -1053,14 +1119,16 @@ impl Dispatch {
                     "client_payload": payload,
                 });
                 let mut client = zenwave::client();
-                client
+                let response: WorkflowDispatchResponse = client
                     .post(&url)?
                     .header("Content-Type", "application/json")?
                     .bytes_body(serde_json::to_vec(&body)?)
                     .await?
                     .error_for_status()
+                    .await?
+                    .into_json()
                     .await?;
-                Ok(())
+                Ok(response.workflow_run_id)
             }
         }
     }
@@ -1115,6 +1183,7 @@ impl Dispatch {
                         (rustc == rustc_version.as_str() && open.contains(task_id)).then(|| {
                             RunState {
                                 task_id: task_id.to_owned(),
+                                workflow_run_id: run.id,
                                 status: run.status,
                                 conclusion: run.conclusion,
                                 url: run.html_url,
@@ -1149,6 +1218,7 @@ impl Dispatch {
                         (rustc == rustc_version.as_str() && open.contains(task_id)).then(|| {
                             RunState {
                                 task_id: task_id.to_owned(),
+                                workflow_run_id: run.workflow_run_id,
                                 status: run.status,
                                 conclusion: run.conclusion,
                                 url: run.html_url,
@@ -1171,6 +1241,7 @@ struct WorkflowRunsPage {
 
 #[derive(serde::Deserialize)]
 struct WorkflowRunRow {
+    id: u64,
     display_title: String,
     head_sha: String,
     status: String,
@@ -1197,7 +1268,13 @@ struct LocalTasksResponse {
 }
 
 #[derive(serde::Deserialize)]
+struct WorkflowDispatchResponse {
+    workflow_run_id: u64,
+}
+
+#[derive(serde::Deserialize)]
 struct LocalTaskRun {
+    workflow_run_id: u64,
     display_title: String,
     status: String,
     conclusion: Option<String>,
@@ -1209,11 +1286,21 @@ mod tests {
     use super::*;
 
     fn run_state(status: &str, conclusion: Option<&str>, ran_current_code: bool) -> RunState {
+        run_state_with_id(1, status, conclusion, ran_current_code)
+    }
+
+    fn run_state_with_id(
+        workflow_run_id: u64,
+        status: &str,
+        conclusion: Option<&str>,
+        ran_current_code: bool,
+    ) -> RunState {
         RunState {
             task_id: "task".to_owned(),
+            workflow_run_id,
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
-            url: "https://github.com/water-rs/stow/actions/runs/1".to_owned(),
+            url: format!("https://github.com/water-rs/stow/actions/runs/{workflow_run_id}"),
             created_at: None,
             ran_current_code,
         }
@@ -1228,6 +1315,53 @@ mod tests {
         assert!(!run_state("completed", Some("failure"), true).stale_failure());
         assert!(!run_state("completed", Some("success"), false).stale_failure());
         assert!(!run_state("in_progress", None, false).stale_failure());
+    }
+
+    #[test]
+    fn numeric_latest_run_wins_over_unordered_old_failure() {
+        let mut latest = BTreeMap::new();
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(10, "in_progress", None, true),
+            None,
+        );
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(9, "completed", Some("failure"), false),
+            None,
+        );
+        let selected = latest.remove("task").expect("latest run");
+        assert_eq!(selected.workflow_run_id, 10);
+        assert_eq!(selected.status, "in_progress");
+    }
+
+    #[test]
+    fn numeric_latest_run_wins_over_unordered_old_success() {
+        let mut latest = BTreeMap::new();
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(9, "completed", Some("success"), true),
+            None,
+        );
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(10, "in_progress", None, true),
+            None,
+        );
+        let selected = latest.remove("task").expect("latest run");
+        assert_eq!(selected.workflow_run_id, 10);
+        assert_eq!(selected.status, "in_progress");
+    }
+
+    #[test]
+    fn returned_run_id_rejects_old_visibility_until_new_run_appears() {
+        let mut latest = BTreeMap::new();
+        retain_latest_run(
+            &mut latest,
+            run_state_with_id(9, "completed", Some("success"), true),
+            Some(10),
+        );
+        assert!(latest.is_empty());
     }
 
     /// The smallest `EnqueueRequest` `build_graph` can fold — the test
@@ -1299,7 +1433,10 @@ mod tests {
         // A node that already ran is never re-marked.
         nodes.get_mut(&other).expect("other").done = true;
         let blocked = mark_blocked(std::slice::from_ref(&other), &mut nodes, &edges);
-        assert!(blocked.is_empty());
+        assert_eq!(
+            blocked,
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// One published row for `request` at `shape`.

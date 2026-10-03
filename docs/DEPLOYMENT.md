@@ -82,8 +82,9 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    per-`rustc` wrapper fetches on demand under cargo's own job
    parallelism, so one address legitimately sends tens of bundle
    requests per second, and a block there turns a cache hit into a
-   local compile mid-build. That path is the cheap one — a Cache API hit
-   costs one Worker request and no D1 or Durable Object work — and its
+   local compile mid-build. That path is the cheap one — a Workers Cache
+   hit is billed as a request but the Worker never runs: no CPU,
+   subrequests, D1 or Durable Object work — and its
    volume is bounded by the DDoS managed ruleset, the billing
    notifications below, and the zone maintenance rules rather than by
    this rule. The Free plan allows exactly one rate-limiting rule, which is
@@ -222,6 +223,15 @@ and Durable Object requests — with the alert threshold at $8/month; the
 project budget is $10/month. See the
 [Cloudflare notifications docs](https://developers.cloudflare.com/notifications/notification-available/)
 for the alert type.
+
+Per-metric alerts lag posted spend — #439 showed usage notifications
+staying at 0% while cost accrued — so they are paired with an
+account-wide budget alert: *Billing → Notifications → Budget Alerts →
+Add budget alert*, a **spend** alert on the account at $8/month (and a
+50% warning at $4). The budget alert meters whole-account invoiced
+usage and catches metrics no per-service alert names. See the
+[Cloudflare budget alerts docs](https://developers.cloudflare.com/billing/manage/budget-alerts/).
+The #450 watchdog remains the outer circuit.
 
 ## Automated deploys
 

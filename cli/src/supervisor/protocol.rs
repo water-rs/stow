@@ -25,6 +25,29 @@ pub enum Request {
     Plan(Plan),
     /// The result of a compile the supervisor asked for.
     Compiled(Compiled),
+    /// A compile the facade already decided on its own — the local-build
+    /// mark before rustc starts and the report after it ends. One-way:
+    /// the supervisor never answers it.
+    Observed(Observed),
+    /// A facade whose unit a `pending` serve map does not cover asks the
+    /// supervisor to answer only once the build's final map has landed —
+    /// or at once when it already has. The wait moves off the file
+    /// system so every platform speaks it over the transport it already
+    /// carries (stow#347).
+    AwaitServeMap(AwaitServeMap),
+}
+
+impl Request {
+    /// Parse the JSON body of one request frame — the deserialize half
+    /// of [`read_frame`], for a peer reading frames on a blocking
+    /// transport.
+    ///
+    /// # Errors
+    ///
+    /// Malformed JSON.
+    pub fn from_frame_body(body: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(body).map_err(|error| format!("decode frame: {error}"))
+    }
 }
 
 /// One rustc invocation as the facade received it.
@@ -46,11 +69,95 @@ pub struct Plan {
 /// The facade reporting the compile the supervisor asked for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Compiled {
+    /// Proves the sender is part of this build; checked on every frame.
     pub token: String,
     /// The ticket the [`Answer::Compile`] carried.
     pub ticket: u64,
     /// Whether rustc exited successfully.
     pub success: bool,
+}
+
+/// The facade telling the supervisor about a compile it ran without
+/// asking first.
+///
+/// A unit the build's serve map already ruled out needs no plan round
+/// trip, but the build still has to mark it as locally built before
+/// rustc starts and observe how it ended afterwards.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Observed {
+    /// Proves the sender is part of this build; checked on every frame.
+    pub token: String,
+    /// The real rustc cargo asked for.
+    pub executable: Vec<u8>,
+    /// Everything after the executable, in order.
+    pub args: Vec<Vec<u8>>,
+    /// The `OUT_DIR` cargo exported on this invocation's environment, for
+    /// a crate with a build script.
+    pub build_script_out_dir: Option<Vec<u8>>,
+    /// `None` marks the unit as compiling locally — the bookkeeping
+    /// [`crate::provenance::record_local_build`] does inside a `Compile`
+    /// decision, carried as a frame because this unit never asked for a
+    /// decision. `Some` reports the finished compile's exit status.
+    pub success: Option<bool>,
+}
+
+impl Observed {
+    /// Build an observation for this invocation.
+    #[must_use]
+    pub fn new(
+        token: String,
+        executable: &std::ffi::OsStr,
+        args: &[OsString],
+        build_script_out_dir: Option<&std::ffi::OsStr>,
+        success: Option<bool>,
+    ) -> Self {
+        Self {
+            token,
+            executable: os_bytes::encode(executable),
+            args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
+            build_script_out_dir: build_script_out_dir.map(os_bytes::encode),
+            success,
+        }
+    }
+
+    /// The real rustc this invocation wrapped.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn executable(&self) -> Result<OsString, String> {
+        os_bytes::decode(&self.executable)
+    }
+
+    /// The wrapped arguments, in order.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn args(&self) -> Result<Vec<OsString>, String> {
+        self.args.iter().map(|arg| os_bytes::decode(arg)).collect()
+    }
+
+    /// The `OUT_DIR` this invocation's environment carried, when cargo
+    /// exported one.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn build_script_out_dir(&self) -> Result<Option<OsString>, String> {
+        self.build_script_out_dir
+            .as_ref()
+            .map(|encoded| os_bytes::decode(encoded))
+            .transpose()
+    }
+}
+
+/// The serve-map wait is the whole request — the token is its only
+/// payload, since the answer's timing, not its contents, is the signal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AwaitServeMap {
+    /// Proves the sender is part of this build; checked on every frame.
+    pub token: String,
 }
 
 /// What the supervisor answers.
@@ -61,13 +168,22 @@ pub enum Answer {
     Served,
     /// Nothing serves this unit. The facade runs the real rustc and then
     /// sends [`Compiled`] carrying `ticket`.
-    Compile { ticket: u64 },
+    Compile {
+        /// The ticket the [`Compiled`] report carries back.
+        ticket: u64,
+    },
     /// The report was applied; the facade exits with the compile's own
     /// status.
     Recorded,
+    /// The build's serve map is final: the facade re-reads the map file
+    /// and decides on what it finds (stow#347).
+    ServeMapReady,
     /// The supervisor could not answer. The facade fails the build with
     /// this message rather than quietly compiling without the cache.
-    Failed { message: String },
+    Failed {
+        /// Why the supervisor could not answer.
+        message: String,
+    },
 }
 
 impl Plan {

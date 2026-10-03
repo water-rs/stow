@@ -46,6 +46,9 @@ pub struct SelectorArgs {
     /// Compilation target to match.
     #[arg(long)]
     target: Option<String>,
+    /// Rustc version to match (e.g. `1.99.0`).
+    #[arg(long)]
+    rustc: Option<String>,
     /// Crate name to match.
     #[arg(long = "crate")]
     crate_name: Option<String>,
@@ -107,6 +110,14 @@ impl SelectorArgs {
                         .map_err(|error| stow_error!("--crate: {error}"))
                 })
                 .transpose()?,
+            rustc_version: self
+                .rustc
+                .as_deref()
+                .map(|raw| {
+                    stow_types::identity::WireRustcVersion::parse(raw.to_owned())
+                        .map_err(|error| stow_error!("--rustc: {error}"))
+                })
+                .transpose()?,
             older_than_secs: self.older_than,
             limit,
         })
@@ -135,6 +146,7 @@ async fn list(edge: &Edge, args: ListArgs, output: Output) -> stow_types::error:
             "lane",
             "status",
             "blocked by",
+            "value",
             "attempt",
             "updated",
         ]);
@@ -149,6 +161,7 @@ async fn list(edge: &Edge, args: ListArgs, output: Output) -> stow_types::error:
                 task.blocked_by
                     .as_deref()
                     .map_or_else(|| "—".to_owned(), short_id),
+                task.value.clone(),
                 task.attempt.to_string(),
                 task.updated_at.clone(),
             ]);
@@ -202,6 +215,7 @@ async fn mutate(
                 "crate",
                 "status",
                 "blocked by",
+                "value",
                 "lane",
                 "target",
                 "applies",
@@ -214,6 +228,7 @@ async fn mutate(
                     task.blocked_by
                         .as_deref()
                         .map_or_else(|| "—".to_owned(), short_id),
+                    task.value.clone(),
                     task.lane.as_str().to_owned(),
                     task.target.as_str().to_owned(),
                     if in_domain(plan.verb, task) {

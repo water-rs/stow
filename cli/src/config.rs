@@ -291,7 +291,13 @@ pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
 /// when set, else `~/.cargo` — the same resolution cargo performs. `None`
 /// when neither source can produce a path.
 pub fn cargo_home() -> Option<PathBuf> {
-    std::env::var_os("CARGO_HOME")
+    cargo_home_with(|key| std::env::var_os(key))
+}
+
+/// [`cargo_home`] with the environment injected, so a caller — or a test —
+/// answers `CARGO_HOME` from its own lookup instead of the process's.
+pub fn cargo_home_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
 }

@@ -20,7 +20,7 @@
 //! cache into a failed build rather than a slower one.
 //!
 //! The markers live beside the cache-policy allow markers, in the
-//! per-build directory the wrapper already receives through
+//! per-build directory the driver hands its supervisor and wrappers as
 //! `STOW_CACHE_POLICY_PATH`. Cargo runs a unit only after its
 //! dependencies, so a dependency's marker is on disk before any consumer
 //! asks about it. Without that directory (a bare `stow rustc` outside
@@ -31,8 +31,6 @@ use std::path::{Path, PathBuf};
 
 use stow_types::rustc::ParsedExternCrate;
 
-use crate::cache_policy;
-
 /// Subdirectory of the per-build policy directory holding one marker per
 /// locally compiled crate.
 const LOCAL_BUILD_DIR: &str = "local-build";
@@ -42,8 +40,12 @@ const LOCAL_BUILD_DIR: &str = "local-build";
 ///
 /// Silently does nothing when the invocation carries no per-build policy
 /// directory: there is no build-wide view to record into.
-pub async fn record_local_build(target: &str, crate_name: &str) -> stow_types::error::Result<()> {
-    let Some(dir) = local_build_dir(target) else {
+pub async fn record_local_build(
+    policy_dir: Option<&Path>,
+    target: &str,
+    crate_name: &str,
+) -> stow_types::error::Result<()> {
+    let Some(dir) = policy_dir.map(|policy_dir| marker_dir(policy_dir, target)) else {
         return Ok(());
     };
     async_fs::create_dir_all(&dir)
@@ -67,13 +69,14 @@ pub async fn record_local_build(target: &str, crate_name: &str) -> stow_types::e
 /// unit has no dependencies, and when the invocation has no per-build
 /// policy directory to consult.
 pub fn locally_built_dependency(
+    policy_dir: Option<&Path>,
     target: &str,
     extern_crates: &[ParsedExternCrate],
 ) -> Option<String> {
     if extern_crates.is_empty() {
         return None;
     }
-    let dir = local_build_dir(target)?;
+    let dir = marker_dir(policy_dir?, target);
     locally_built_dependency_in(&dir, extern_crates)
 }
 
@@ -83,12 +86,6 @@ fn locally_built_dependency_in(dir: &Path, extern_crates: &[ParsedExternCrate]) 
         .map(|dependency| dependency.crate_name.as_str())
         .find(|crate_name| dir.join(marker_name(crate_name)).exists())
         .map(ToOwned::to_owned)
-}
-
-/// The per-build directory holding this target's local-build markers.
-fn local_build_dir(target: &str) -> Option<PathBuf> {
-    let policy_dir = cache_policy::policy_dir()?;
-    Some(marker_dir(&policy_dir, target))
 }
 
 fn marker_dir(policy_dir: &Path, target: &str) -> PathBuf {

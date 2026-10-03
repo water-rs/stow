@@ -92,9 +92,9 @@ fn artifact_url(bundle: &BundleRef<'_>, edge_url: &str) -> String {
 }
 
 /// Stream one bundle through the edge byte path and require the bytes to
-/// hash to the digest the signed index pins — the edge (and the Cache API
-/// copy it serves from) is untrusted, so the index is what vouches for
-/// the bytes before the cosign verification inside them even runs.
+/// hash to the digest the signed index pins — the edge (and the Workers
+/// Cache copy it serves from) is untrusted, so the index is what vouches
+/// for the bytes before the cosign verification inside them even runs.
 ///
 /// # Errors
 ///

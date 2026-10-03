@@ -137,9 +137,16 @@ person the lane exists for, while the miss path's PoW stays sized for
 scripted CLI redemption and is unchanged.
 
 Accepted work lands in the scheduler's `human` lane, which dispatches
-ahead of the `miss` lane: `claim_dispatchable_tasks` orders by lane
-first, then Windows-family targets, then `first_requested_at` within a
-lane, so no miss queueing
+ahead of the `miss` lane: `claim_dispatchable_tasks` orders by a
+persisted dispatch key — an explicit human-lane prefix, then an exact
+rational rank of the row's whole `value` (precedence and family bands
+plus `priority` and accumulated demand) divided by the
+`(crate_name, target)` expected build cost
+(`crate_build_stats.median_ms`, the bounded-window median of real
+claim-to-completion durations; a positive measured cost, with
+unmeasured crates dividing by 1 and keeping full demand value) — with
+`first_requested_at`, `created_at` and `task_id`
+as stable FIFO tie-breakers at equal rank, so no miss queueing
 ahead of time can starve a human request, and human rows are exempt
 from `STOW_DISPATCH_MIN_AGE_MINUTES` (the coalescing hold exists to
 batch identical misses; a human already said exactly what they want).
@@ -158,13 +165,14 @@ the dropped package, so the request for a binary enqueues exactly what
 `closure_queued` rather than a task state.
 
 Two hard caps bound what one Turnstile token can spend:
-`STOW_HUMAN_MAX_CLOSURE` refuses a request whose dependency closure
-exceeds it (per target) with 422, and `STOW_HUMAN_DAILY_TASK_BUDGET`
-limits human-lane tasks enqueued per UTC day — the scheduler Durable
-Object keeps the counter (`human_daily_task_budget`, one row per UTC
-date, charged atomically in `enqueue`) and refuses an overspending
-submit with 429; the edge answers `Retry-After` in seconds until 00:00
-UTC.
+`STOW_HUMAN_MAX_CLOSURE` caps a request whose largest single-target
+uncovered closure exceeds it — checked in the resolve job, where an
+overspending request lands as a `failed` record naming the limit — and
+`STOW_HUMAN_DAILY_TASK_BUDGET` limits human-lane tasks enqueued per UTC
+day — the scheduler Durable Object keeps the counter
+(`human_daily_task_budget`, one row per UTC date, charged atomically in
+`enqueue`) and refuses an overspending submit with 429; the edge answers
+`Retry-After` in seconds until 00:00 UTC.
 
 Dispatch is additionally capped per GitHub Actions runner family —
 `stow_types::api::runner_family` maps each `CI_TARGET_TRIPLES` member
@@ -180,18 +188,38 @@ stay pending, and the alarm then wakes at the earliest in-flight lease
 expiry rather than re-firing immediately.
 
 The handler resolves the requested version (newest non-prerelease,
-non-yanked release when the body omits it), expands the crate's
-dependency closure over crates.io metadata — normal and build edges,
-optional-dependency feature activation, `cfg(...)` target restrictions —
-and submits every uncovered node as an `EnqueueSource::HumanRequest`
-task for each of `stow_types::api::CI_TARGET_TRIPLES`. `rustc_version`
+non-yanked release when the body omits it) and the current stable rustc,
+then hands the request to the scheduler's `POST /requests` — the
+request record (`requests` table) is born `accepted` and dispatched
+there to `resolve-request.yml` on `main` through the same GitHub App
+`workflow_dispatch` arm `trigger_build` uses for `build-crate.yml`.
+`resolve-request.yml` runs `stow-admin request resolve`: `stow-resolver`
+expands the crate's dependency closure over crates.io metadata — normal
+and build edges, optional-dependency feature activation, `cfg(...)`
+target restrictions — for each of
+`stow_types::api::CI_TARGET_TRIPLES`, prunes it against the published
+`index.<target>.<rustc>` slices (the queue gate's own coverage truth),
+and posts the plan to the trusted
+`POST /api/v1/scheduler/requests/{id}/outcome`, which enqueues every
+uncovered node as an `EnqueueSource::HumanRequest` task in the `human`
+lane and flips the record `enqueued` in the same call. `rustc_version`
 is the current stable channel release, parsed from
 `channel-rust-stable.toml` and cached in the Worker's Cache API for 60
 minutes (`edge/src/rust_channel.rs`), so the lane never wakes the
-scheduler Durable Object to resolve it. `GET
-/api/v1/requests/{task_id}` returns the task's `RequestStatus` — lane,
-queue status, and its 1-based `human_lane_position` while it is still
-pending in the human lane.
+scheduler Durable Object to resolve it.
+
+`GET /api/v1/requests/{request_id}` returns the request's
+`CrateRequestStatus` — `accepted` → `resolving` → `enqueued` /
+`failed`. The platform-native signal drives it: the HMAC-verified
+`workflow_run` webhook at `POST /api/v1/github/workflow-run` matches the
+resolve run by its `resolve-a<attempt>-<request_id>` run name and posts
+`in_progress` (record → `resolving`, run id/url stamped) and `completed`
+(a one-statement conditional `failed` backstop that can never overwrite
+`enqueued`) to `/requests/{id}/run-update` inside the object. An
+`enqueued` record re-reads its stored roots against the queue on each
+fetch, so per-target `state`/`human_lane_position` keep moving until
+every target is cached — task ids on a `queued` row and the request's
+`task_id` link shape are gone: `request_id` is the lookup.
 
 ### Task dependencies and claim-time coverage
 
@@ -226,10 +254,12 @@ edge resolves to a row the latest report for that dependency's own
 `(target, rustc_version)` serves. Ordering here is correctness, not a
 cache-locality optimization — a dependent dispatched before its
 dependency is servable compiles the dependency itself. A failed
-dependency keeps its dependents waiting while it retries; if it
-fails for good the read paths report the dependents as `blocked`,
-naming the failed task id, until a retry or a later successful build
-plus publish releases them back to `pending`. An edge whose dependency
+dependency keeps its dependents waiting while it retries — each
+failure report re-queues it under an exponential `not_before` backoff
+until the attempt cap, where it parks `failed`. From there the read
+paths report the dependents as `blocked`, naming the failed task
+id, until the operator's `queue retry` (or a later successful build
+plus publish) releases them back to `pending`. An edge whose dependency
 identity was never resolved reports `blocked` too, named `unknown
 dependency identity` — it can never resolve to a published row, so
 pending would hide a wait that no build can end.
@@ -270,8 +300,10 @@ config, the signature materials, and the layers byte-for-byte, and the CLI
 verifies that material after download. The task's records artifact
 carries the bundle layer's digest and size (`bundle_digest`,
 `bundle_size`), republished verbatim into the index row; the CLI asks the
-edge for `GET /api/v1/bundles/{bundle_digest}`, which serves the blob
-Cache-API-first and tees a GHCR miss into the cache, and the CLI requires
+edge for `GET /api/v1/bundles/{bundle_digest}`, which streams the blob
+from GHCR behind Workers Cache (the answer's immutable `Cache-Control`
+lets the platform serve later reads without the Worker running), and the
+CLI requires
 the bytes to hash to the index row's `bundle_digest` — no intermediary
 ever assembles, buffers or inspects it. The publish stage validated the tar
 (`stow_types::bundle_schema`) before pushing it.
@@ -403,6 +435,13 @@ What each hop is allowed to do:
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>` artifacts); sigstore signatures |
 | `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
+
+The edge's remaining crates.io reads are the request route's version and
+rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,
+`crates/{name}/{version}/features`), and the admissions coverage diff —
+none of them resolves a dependency graph: every lane that posts tasks
+(preheat via `stow-resolver`, the request lane via its outcome route)
+submits resolver-canonical requests, which land verbatim.
 
 The build and publish jobs never share a process or an environment. The build job's
 `GITHUB_TOKEN` is `contents: read` and it has no `id-token` grant, so a
@@ -571,8 +610,8 @@ Four workflows keep it warm:
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat top` for
   the top-N library crates and `preheat top-binaries` for the top-N
-  binaries — each `.crate` tarball fetched by the edge and resolved by
-  cargo's own resolver (`stow-resolve`) into ordinary crate tasks
+  binaries — each `.crate` tarball resolved in-process by
+  `stow-resolver` into ordinary crate tasks
   carrying `depends_on` edges, exactly the way the projects lane
   resolves a repository's codeload tarball — plus the projects lane
   itself: `preheat projects submit` resolves every repository the
@@ -589,7 +628,7 @@ Four workflows keep it warm:
   failed dispatch simply retries on the next tick. Re-submitting the
   whole list is cheap: `enqueue` deduplicates on task identity and
   leaves a completed task completed, so a wave builds only what is
-  missing or previously failed.
+  missing — a failed build retries on its own `not_before` backoff.
 - `preheat-missed.yml` (weekly, Mondays 06:00 UTC, plus manual) promotes
   observed demand: `stow-admin preheat missed` queries the
   `stow_cache_misses` Analytics Engine dataset for the top-K
@@ -623,8 +662,8 @@ argument, so the opt-out is honoured by construction).
 `GET /api/v1/stats` answers `UsageStats` by running the
 `edge/src/sql/stats_*.sql` queries against the Analytics Engine SQL API
 (`POST …/accounts/{CF_ACCOUNT_ID}/analytics_engine/sql`, authorized by
-the `CF_ANALYTICS_TOKEN` secret) and caches the response in the Cache
-API for one hour per colo. The hit-side queries read `stow_events`, the
+the `CF_ANALYTICS_TOKEN` secret); the answer's one-hour `Cache-Control`
+lets Workers Cache replay it between runs. The hit-side queries read `stow_events`, the
 retired hit dataset: the digest-addressed byte path carries no artifact
 identity and writes nothing, so its points drain under the 90-day
 retention and the derived figures decay to zero. `GET /stats`
@@ -644,25 +683,25 @@ deserialization.
 |---|---|---|---|---|
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
-| GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Cache-API-cached for one hour |
-| GET `/api/v1/bundles/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Digest-addressed byte fetch — the only artifact-serving route; the `sha256:<64 hex>` path segment is the index row's `bundle_digest`, served Cache-API-first over GHCR |
+| GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Workers-Cached for one hour |
+| GET `/api/v1/bundles/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Digest-addressed byte fetch — the only artifact-serving route; the `sha256:<64 hex>` path segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | POST `/api/v1/admin/artifacts/sync` | Bearer: repo push user | `Vec<ArtifactRecord>` chunk | `OkResponse` | Mirror the GHCR records into the D1 catalog — `stow-admin index sync` inside `index-publish.yml` |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|clear`) |
 | GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
-| GET `/api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
+| GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: repo-workflow OIDC or push user | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
 | POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows; GHCR tags are not deleted — `artifacts prune` |
-| POST `/api/v1/admin/preheat/plan` | Bearer: repo-workflow OIDC or push user | `PreheatPlanRequest` | `PreheatPlanResponse` | Dry-run closure expansion for a crate request — `preheat plan` |
 | POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for the posted graph's uncovered nodes — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
-| POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestOutcome` | Human request: enqueue a crate's closure on every CI target in the human lane |
-| GET `/api/v1/requests/{task_id}` | none | — | `RequestStatus` | Task status + human-lane position |
-| GET `/requests/{task_id}` | none | — | HTML | The same `RequestStatus` rendered as a page, the link the request form returns |
+| POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |
+| GET `/api/v1/requests/{request_id}` | none | — | `CrateRequestStatus` | Live request record: `accepted` → `resolving` → `enqueued`/`failed` plus per-target states |
+| GET `/requests/{request_id}` | none | — | HTML | The same `CrateRequestStatus` rendered as a page, the link the request form returns |
+| POST `/api/v1/scheduler/requests/{request_id}/outcome` | Bearer: repo-workflow OIDC or push user | `RequestOutcomeReport` | `CrateRequestStatus` | The `resolve-request.yml` job's submission — enqueues the resolved tasks and settles the request record |
 | GET `/api/v1/crates/search?q=&limit=` | none | — | `CrateSearchResponse` | crates.io search, proxied for the request form's completions; query must be ≥2 chars, limit clamps to 1–25 (default 10), response cached 5 min |
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
@@ -678,8 +717,9 @@ per 10 seconds per source IP over the API prefix, not per route. The
 `/api/v1/bundles/` byte path is carved out of it: a warm build streams
 its closure at the CLI's prefetch concurrency and the per-`rustc` wrapper
 fetches on demand under cargo's job parallelism, so one address
-legitimately sends tens of bundle requests a second, and a Cache API hit
-there costs one Worker request and no D1 or Durable Object work. The trusted
+legitimately sends tens of bundle requests a second, and a Workers Cache
+hit there spends only the billed request itself — no Worker CPU,
+subrequests, D1 or Durable Object work. The trusted
 write endpoints (`admin/artifacts/sync`, `scheduler/tasks/submit`,
 `github/workflow-run`) are inside the limited prefix, which is fine at
 their request rate: a wave makes one sync batch per slice and GitHub
@@ -727,7 +767,7 @@ object writes a `dispatch_freeze` record into `settings` — a different
 flag, storage key, and purpose from the WAF maintenance rules — and `dispatch_pending`
 gates on it, so the queue keeps accepting misses while nothing more is
 handed to runners. While frozen, the work-submitting routes
-(`tasks/submit/trusted`, `admin/preheat`, `admin/resolve/*`) answer 503
+(`scheduler/tasks/submit`, `scheduler/requests/{id}/outcome`) answer 503
 naming the trigger; the `tasks/complete-run` webhook stays open so
 in-flight builds still land. Recovery is manual only:
 `POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
@@ -757,7 +797,6 @@ is unset or malformed.
 
 | Binding | Default | Purpose |
 |---|---|---|
-| `STOW_BATCH_FETCH_CONCURRENCY` | 32 | Concurrent crates.io metadata fetches while `/api/v1/admissions` resolves a graph's cold direct entries |
 | `STOW_MAX_EXPANDED_TASKS` | 4096 | Cap on the size of an expanded transitive graph |
 | `STOW_DB` (D1 binding) | required | Artifact catalog database |
 | `SCHEDULER` (Durable Object binding) | required | Build scheduler |

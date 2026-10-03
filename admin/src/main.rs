@@ -15,14 +15,17 @@ mod coverage;
 mod crates_io;
 mod deploy;
 mod github;
-mod http_retry;
 mod index_cmd;
+mod launch_gate;
+mod launch_load;
+mod launch_model;
 mod maintenance;
 mod manual;
 mod preheat;
 mod projects;
 mod queue;
 mod render;
+mod request;
 mod resolve;
 mod runs;
 mod rust_channel;
@@ -110,6 +113,20 @@ enum Command {
     DispatchFreeze(DispatchFreezeArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
+    /// Regenerate the checked-in launch traffic model from production
+    /// analytics (stow#452).
+    LaunchModel(launch_model::LaunchModelArgs),
+    /// The launch-cost gate: project the measured scheduler-budget
+    /// report against the launch model and fail on an over-allowance
+    /// dimension (stow#452).
+    LaunchGate(launch_gate::LaunchGateArgs),
+    /// The stow#452 mock-stack load test: drive a running edge at the
+    /// launch model's peak rates and report per-lane p50/p99, error
+    /// and overload signals.
+    LaunchLoad(launch_load::LaunchLoadArgs),
+    /// The human request lane's Actions leg: `request resolve` turns an
+    /// admitted request's dispatch input into its outcome report.
+    Request(request::RequestArgs),
     /// Submit one build task batch to the scheduler.
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
@@ -178,75 +195,55 @@ fn main() -> stow_types::error::Result<()> {
         stow_resolver::shim::run();
     }
     install_tracing();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| stow_error!("install ring CryptoProvider"))?;
     let cli = Cli::parse();
     let output = if cli.json {
         Output::Json
     } else {
         Output::Table
     };
-    match cli.command {
-        Command::Status => with_edge(|edge| async move { status(&edge, output).await }),
-        Command::Queue(args) => {
-            with_edge(|edge| async move { queue::run(&edge, args, output).await })
-        }
-        Command::Scheduler(args) => {
-            with_edge(|edge| async move { scheduler::run(&edge, args, output).await })
-        }
-        Command::Coverage(args) => {
-            with_edge(|edge| async move { coverage::run(&edge, args, output).await })
-        }
-        // `preheat` picks its own executor like `index` does: the
-        // projects lane needs GitHub for `generate` and the edge for
-        // `submit`; the other lanes run against the edge.
-        Command::Preheat(args) => preheat::run(args, output),
-        Command::Runs(args) => {
-            with_github(|token| async move { runs::run(&token, args, output).await })
-        }
-        Command::Artifacts(args) => {
-            with_edge(|edge| async move { artifacts::run(&edge, args, output).await })
-        }
-        Command::Cache(args) => {
-            with_github(|token| async move { cache::run(&token, args, output).await })
-        }
-        Command::Maintenance(args) => smol::block_on(maintenance::run(args, output)),
-        Command::Watchdog(args) => {
-            with_edge(|edge| async move { watchdog::run(&edge, args, output).await })
-        }
+    run(dispatch(cli.command, output))?
+}
+
+/// Drive `future` on the binary's single executor — one multi-thread
+/// Tokio runtime every command dispatches onto. `stow-oci`'s reqwest
+/// session, the sigstore trust root (`tough` reads through
+/// `tokio::fs`), and every `tokio::{fs,process,time}` call need that
+/// reactor; issue #530 was the watchdog panicking "there is no reactor
+/// running" when dispatch ran under `smol::block_on`. Tests share this
+/// entry so a mixed-executor regression fails `cargo test`, not
+/// production.
+fn run<F: std::future::Future>(future: F) -> stow_types::error::Result<F::Output> {
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| stow_error!("build tokio runtime: {error}"))?;
+    Ok(runtime.block_on(future))
+}
+
+async fn dispatch(command: Command, output: Output) -> stow_types::error::Result<()> {
+    match command {
+        Command::Status => status(&Edge::connect().await?, output).await,
+        Command::Queue(args) => queue::run(&Edge::connect().await?, args, output).await,
+        Command::Scheduler(args) => scheduler::run(&Edge::connect().await?, args, output).await,
+        Command::Coverage(args) => coverage::run(&Edge::connect().await?, args, output).await,
+        Command::Preheat(args) => preheat::run(args, output).await,
+        Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
+        Command::Artifacts(args) => artifacts::run(&Edge::connect().await?, args, output).await,
+        Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
+        Command::Maintenance(args) => maintenance::run(args, output).await,
+        Command::Watchdog(args) => watchdog::run(&Edge::connect().await?, args, output).await,
         Command::DispatchFreeze(args) => {
-            with_edge(|edge| async move { dispatch_freeze_switch(&edge, args, output).await })
+            dispatch_freeze_switch(&Edge::connect().await?, args, output).await
         }
-        // The index commands pick their own executor: `publish` drives
-        // `RegistrySession`'s reqwest client (hyper, so a Tokio reactor),
-        // the rest run on smol like every other command.
-        Command::Index(args) => index_cmd::run(args),
-        Command::Submit(args) => {
-            with_edge(|edge| async move { submit_command(&edge, args, output).await })
-        }
-        // The verdict reads Cloudflare's GraphQL API, not the edge and not
-        // GitHub — its credential is CLOUDFLARE_API_TOKEN, so it runs its
-        // own executor like `preheat` and `index` do.
-        Command::Deploy(args) => smol::block_on(deploy::run(args, output)),
+        Command::Index(args) => index_cmd::run(args).await,
+        Command::LaunchModel(args) => launch_model::run(args, output).await,
+        Command::LaunchGate(args) => launch_gate::run(&args, output).await,
+        Command::LaunchLoad(args) => launch_load::run(&Edge::connect().await?, &args, output).await,
+        Command::Request(args) => request::run(args, output).await,
+        Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
+        Command::Deploy(args) => deploy::run(args, output).await,
     }
-}
-
-/// Run one edge-backed command on the smol executor: connect, then hand
-/// the connection to the command.
-fn with_edge<F, Fut>(command: F) -> stow_types::error::Result<()>
-where
-    F: FnOnce(Edge) -> Fut,
-    Fut: std::future::Future<Output = stow_types::error::Result<()>>,
-{
-    smol::block_on(async move { command(Edge::connect().await?).await })
-}
-
-/// Run one GitHub-backed command on the smol executor with the operator
-/// token.
-fn with_github<F, Fut>(command: F) -> stow_types::error::Result<()>
-where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = stow_types::error::Result<()>>,
-{
-    smol::block_on(async move { command(github_token().await?).await })
 }
 
 /// Authenticated access to the edge's `/api/v1/admin/*` and
@@ -736,7 +733,7 @@ pub(crate) async fn github_token() -> stow_types::error::Result<String> {
             return Ok(token);
         }
     }
-    let output = smol::process::Command::new("gh")
+    let output = tokio::process::Command::new("gh")
         .args(["auth", "token"])
         .output()
         .await
@@ -771,4 +768,25 @@ fn install_tracing() {
         // stderr, never stdout: keep diagnostics off the data stream.
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    /// #510 made `run` the one executor entry; #530 was the watchdog
+    /// panicking "there is no reactor running" the moment a dispatched
+    /// future touched Tokio machinery (`tokio::fs`, `tokio::spawn` —
+    /// what reqwest and the sigstore trust root call). Drive the same
+    /// entry the binary does so a non-Tokio executor fails here.
+    #[test]
+    fn run_provides_the_tokio_reactor() {
+        let path = std::env::temp_dir().join(format!("stow-admin-run-{}", std::process::id()));
+        std::fs::write(&path, b"x").expect("write probe file");
+        super::run(async {
+            let bytes = tokio::fs::read(&path).await.expect("tokio::fs::read");
+            assert_eq!(bytes, b"x");
+            tokio::spawn(async {}).await.expect("tokio::spawn join");
+        })
+        .expect("run drives the future");
+        std::fs::remove_file(&path).expect("remove probe file");
+    }
 }

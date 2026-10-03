@@ -6,6 +6,9 @@
 
 pub mod meter;
 pub mod queue;
+/// The exact `value`/`dispatch_key` rank — one shared Rust derivation
+/// every queue writer binds from (stow#524).
+pub mod rank;
 
 /// The production-shaped fixture: host tests and the workerd budget
 /// probe both seed it, so the module builds on both targets.
@@ -34,4 +37,4 @@ pub mod budget;
 #[cfg(target_arch = "wasm32")]
 pub mod dispatch;
 #[cfg(target_arch = "wasm32")]
-mod object;
+pub mod object;

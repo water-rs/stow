@@ -1,10 +1,11 @@
 //! Durable Object glue: routes scheduler HTTP/alarm events into the queue
 //! state machine and GitHub dispatch.
 
+use futures_util::stream::{self, StreamExt as _};
 use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
-use skyzen::routing::{CreateRouteNode, Route, Router};
+use skyzen::routing::{CreateRouteNode, Params, Route, Router};
 use skyzen::runtime::wasm::WasmEnv;
 use skyzen::utils::Json;
 use skyzen::{Error, Result, StatusCode};
@@ -27,13 +28,16 @@ use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{dispatch, queue};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
-const STOW_DB_BINDING: &str = "STOW_DB";
+/// The catalog D1 binding — `pub(super)` so the budget probe's counted
+/// backend wraps the same binding the dispatch path reads.
+pub(super) const STOW_DB_BINDING: &str = "STOW_DB";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_MACOS_JOBS";
 const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
+const STOW_MIN_DISPATCH_VALUE_BINDING: &str = "STOW_MIN_DISPATCH_VALUE";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -44,6 +48,18 @@ const STOW_FREEZE_FAIL_PERCENT_BINDING: &str = "STOW_FREEZE_FAIL_PERCENT";
 const STOW_COST_BUDGET_MULTIPLIER_BINDING: &str = "STOW_COST_BUDGET_MULTIPLIER";
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
+    // The local-CI dispatcher only exists beside the budget probe: a
+    // deploy carrying `STOW_LOCAL_CI_URL` without the probe marker is
+    // misconfigured — every scheduler route fails on it here rather
+    // than let one pass reach the unauthenticated credential arm.
+    if read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING).is_some()
+        && !budget_probe_enabled(env)
+    {
+        return Err(Error::msg(
+            "STOW_LOCAL_CI_URL is set without STOW_SCHEDULER_BUDGET — \
+             local-CI dispatch exists only on the mock budget-probe deploy",
+        ));
+    }
     let defaults = SchedulerSettings::default();
     Ok(SchedulerSettings {
         dispatch: read_optional_u32_binding(env, STOW_MAX_CONCURRENT_JOBS_BINDING)?
@@ -70,6 +86,8 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
             STOW_HUMAN_DAILY_TASK_BUDGET_BINDING,
         )?
         .unwrap_or(defaults.human_daily_task_budget),
+        min_dispatch_value: read_optional_i64_binding(env, STOW_MIN_DISPATCH_VALUE_BINDING)?
+            .unwrap_or(defaults.min_dispatch_value),
     })
 }
 
@@ -127,7 +145,7 @@ type EdgeAlerter = crate::email::EdgeAlerter;
 pub struct Scheduler;
 
 impl DurableObject for Scheduler {
-    fn fetch(&mut self) -> Router {
+    fn fetch(&self) -> Router {
         // The Durable Object runs in its own isolate; the exported fetch
         // goes through this method before the router responds, so this is
         // where its logging gets installed.
@@ -140,7 +158,6 @@ impl DurableObject for Scheduler {
                 "".at(list_tasks),
                 "/submit".post(submit_tasks),
                 "/submit/trusted".post(submit_tasks_trusted),
-                "/status".post(tasks_status),
                 "/retry".post(queue_retry),
                 "/cancel".post(queue_cancel),
                 "/promote".post(queue_promote),
@@ -150,6 +167,18 @@ impl DurableObject for Scheduler {
             // carries task id + outcome and no attempt, which
             // `queue::complete_run` resolves against the live row.
             "/tasks/complete-run".post(complete_run),
+            // The human request lane (stow#428): admit deduplicates on
+            // the request id and dispatches `resolve-request.yml`;
+            // `outcome` is the resolve job's report channel and
+            // `run-update` the webhook's `workflow_run` lifecycle events
+            // for that run — the record's status is what
+            // `GET /api/v1/requests/{id}` serves.
+            "/requests".route((
+                "".post(admit_request),
+                "/{request_id}".at(read_request),
+                "/{request_id}/outcome".post(apply_request_outcome),
+                "/{request_id}/run-update".post(apply_request_run_update),
+            )),
             "/status".at(status),
             "/admin/status".at(admin_status),
             "/index/published".post(record_published_index),
@@ -159,6 +188,9 @@ impl DurableObject for Scheduler {
             // carry; production requests hit the guard and 404.
             "/budget".post(scheduler_budget),
             "/budget/seed".post(scheduler_budget_seed),
+            // Trusted demand batches — #522's demand input; reached
+            // from `POST /api/v1/admin/scheduler/demand`.
+            "/demand".post(scheduler_demand),
             // A nested Route under the root — the outer tuple caps at
             // 15 nodes.
             Route::new(("/dispatch-freeze"
@@ -216,6 +248,8 @@ async fn scheduler_budget_seed(
 async fn scheduler_budget(
     env: WasmEnv,
     db: DurableDb,
+    alarm: Alarm,
+    Json(request): Json<stow_types::api::SchedulerBudgetRequest>,
 ) -> Result<Json<stow_types::api::SchedulerBudgetReport>> {
     if !budget_probe_enabled(&env) {
         return Err(
@@ -224,12 +258,48 @@ async fn scheduler_budget(
         );
     }
     let settings = scheduler_settings(&env)?;
-    Ok(Json(budget::run(&db, &settings).await.map_err(to_error)?))
+    Ok(Json(
+        budget::run(&db, &settings, &env, &alarm, &request)
+            .await
+            .map_err(to_error)?,
+    ))
 }
 
 fn budget_probe_enabled(env: &WasmEnv) -> bool {
     read_optional_string_binding(env, budget::BUDGET_PROBE_BINDING)
         .is_some_and(|value| value == "1")
+}
+
+/// `POST /demand` — trusted demand batches (stow#522 I7). Reached only
+/// through `POST /api/v1/admin/scheduler/demand`; never a request path.
+async fn scheduler_demand(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(request): Json<stow_types::api::SchedulerDemandRequest>,
+) -> Result<Json<stow_types::api::SchedulerDemandReport>> {
+    let (now_ms, settings) = alarm_inputs(&env)?;
+    let (report, plan) = queue::demand_pass(&db, &request, now_ms, &settings)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                crate::errors::QueueError::Invariant(_)
+                | crate::errors::QueueError::Overflow { .. } => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    // A folded batch can raise a queue row over the admission floor
+    // (or clear its age gate) — arm the plan the shared pass decided,
+    // an exact replay included: a replay repairs a schedule a
+    // previously lost response never armed, and an under-floor queue
+    // arms nothing (stow#525).
+    queue::arm_alarm(&alarm, plan).await.map_err(|error| {
+        let error = to_error(error);
+        tracing::error!(%error, "scheduler demand schedule_alarm failed");
+        error
+    })?;
+    Ok(Json(report))
 }
 
 /// `POST /tasks/submit` — the anonymous-lane submit. The pending-depth
@@ -282,12 +352,14 @@ async fn submit(
         };
         to_error(error).set_status(status)
     })?;
-    // Dispatch is not this request's work: pointing the alarm at now lets
-    // `run_alarm`'s dispatch pass run it, so the submit answers once the
-    // queue write lands instead of holding the client — and burning the
-    // DO's per-request CPU budget — through claim plus a fan-out of
-    // GitHub calls.
-    arm_dispatch_alarm(alarm).await?;
+    // Dispatch is not this request's work: the alarm's dispatch pass
+    // runs it, so the submit answers once the queue write lands instead
+    // of holding the client — and burning the DO's per-request CPU
+    // budget — through claim plus a fan-out of GitHub calls. `next_alarm`
+    // decides whether a wake can make progress at all: a submit whose
+    // rows all sit behind unmet gates arms nothing, while a stale
+    // in-flight lease still arms at its expiry (stow#444).
+    schedule_alarm(env, db, alarm).await?;
     Ok(Json(InsertedResponse { inserted }))
 }
 
@@ -307,25 +379,6 @@ async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
     Ok(())
 }
 
-/// Point the DO alarm at now: `run_alarm` then performs the dispatch
-/// pass (`dispatch_pending` plus `schedule_alarm`) that a mutating
-/// handler used to run inline. `setAlarm` overrides any existing
-/// scheduled alarm rather than keeping the earliest
-/// (<https://developers.cloudflare.com/durable-objects/api/alarms/#setalarm>),
-/// which is correct here: `run_alarm` re-arms via `schedule_alarm`, so
-/// moving an earlier wake-up up to now only dispatches sooner.
-async fn arm_dispatch_alarm(alarm: &Alarm) -> Result<()> {
-    // `Date::now()` returns whole milliseconds well below 2^53; the value
-    // is exactly representable and always fits i64.
-    #[allow(clippy::cast_possible_truncation)]
-    let now_ms = js_sys::Date::now() as i64;
-    alarm.set_alarm(now_ms).await.map_err(|error| {
-        let error = to_error(error);
-        tracing::error!(%error, "failed to arm scheduler dispatch alarm");
-        error
-    })
-}
-
 /// `POST /tasks/complete-run` — the edge's webhook route forwards GitHub's
 /// `workflow_run` event here; the report carries the task id and outcome
 /// but no attempt, which `complete_run` resolves against the live row.
@@ -342,16 +395,21 @@ async fn complete_run(
     Json(report): Json<stow_types::api::WorkflowRunComplete>,
 ) -> Result<Json<OkResponse>> {
     let freeze = freeze_settings(&env)?;
-    queue::complete_run(&db, &report, freeze.window_minutes)
-        .await
-        .map_err(|error| {
-            let status = match &error {
-                crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-                crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
+    queue::complete_run(
+        &db,
+        &scheduler_settings(&env)?,
+        &report,
+        freeze.window_minutes,
+    )
+    .await
+    .map_err(|error| {
+        let status = match &error {
+            crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
+            crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        to_error(error).set_status(status)
+    })?;
     // A failed attempt may have closed the window's trip condition —
     // evaluate while this request still holds the outcome row's write
     // context. The freeze then eats the dispatch the alarm was about
@@ -361,8 +419,10 @@ async fn complete_run(
     }
     // Same handoff as submit: the run's report is acknowledged as soon
     // as the queue row lands, and the alarm's dispatch pass — not this
-    // request — runs claim plus the GitHub fan-out.
-    arm_dispatch_alarm(&alarm).await?;
+    // request — runs claim plus the GitHub fan-out. The completion may
+    // leave nothing dispatchable (a failure with an empty queue, a
+    // finished backlog): `schedule_alarm` arms no wake then (stow#444).
+    schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -456,14 +516,198 @@ async fn queue_purge(
     apply_queue_mutation(env, db, alarm, queue::QueueMutation::Purge, selector).await
 }
 
-async fn tasks_status(
+/// `POST /requests` — the human request lane's admission, reached from
+/// the edge's `POST /api/v1/requests` after Turnstile. The work itself
+/// is [`admit_request_pass`], shared with the budget probe's drive.
+async fn admit_request(
+    env: WasmEnv,
     db: DurableDb,
-    Json(task_ids): Json<Vec<String>>,
-) -> Result<Json<Vec<stow_types::api::RequestStatus>>> {
-    let statuses = queue::tasks_status(&db, &task_ids)
+    Json(admission): Json<stow_types::api::RequestAdmission>,
+) -> Result<Json<stow_types::api::CrateRequestStatus>> {
+    let settings = scheduler_settings(&env)?;
+    // `Date::now()` returns whole milliseconds well below 2^53; the
+    // payload's `dispatched_at` wants unix seconds.
+    #[allow(clippy::cast_possible_truncation)]
+    let dispatched_at = (js_sys::Date::now() / 1_000.0) as i64;
+    admit_request_pass(&env, &db, &settings, &admission, dispatched_at)
         .await
-        .map_err(to_error)?;
-    Ok(Json(statuses))
+        .map(Json)
+}
+
+/// The admission's work: insert the record (or answer the live one for
+/// a dedup hit), probe the human-lane daily budget, and dispatch
+/// `resolve-request.yml` through the same credential arm the alarm's
+/// dispatch pass uses.
+///
+/// The dispatch runs inline — unlike a queued task it is not a row the
+/// alarm can pick up later; the request id only exists in `requests`,
+/// so nothing else would ever trigger the run. A dispatch failure marks
+/// the record `failed` naming the error, so the caller's 5xx and a
+/// later re-request's re-attempt stay consistent. The dispatch freeze
+/// refuses admission outright: a cost trip means no new dispatches, and
+/// a resolve run is one.
+pub(super) async fn admit_request_pass(
+    env: &WasmEnv,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    admission: &stow_types::api::RequestAdmission,
+    dispatched_at: i64,
+) -> Result<stow_types::api::CrateRequestStatus> {
+    refuse_if_frozen(db).await?;
+    let step = queue::admit_request(db, admission, dispatched_at, settings)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::HumanDailyBudgetExhausted { .. } => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    let queue::RequestAdmissionStep::Dispatch { attempt } = step else {
+        // A live record already serves this request — answer it.
+        return queue::crate_request_status(db, &admission.request_id)
+            .await
+            .map_err(to_error)?
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "request {} admitted no record",
+                    admission.request_id
+                ))
+            });
+    };
+    let credential_source = credential_source(env)?;
+    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+    let dispatch_payload = stow_types::api::RequestDispatch {
+        request_id: admission.request_id.clone(),
+        attempt,
+        run_title: stow_types::records::resolve_run_title(attempt, &admission.request_id),
+        crate_name: admission.crate_name.clone(),
+        version: admission.version.clone(),
+        features_json: admission.features_json.clone(),
+        rustc_version: admission.rustc_version.clone(),
+        max_closure: admission.max_closure,
+        dispatched_at,
+    };
+    // The same credential arm as `dispatch_pass`: the cached installation
+    // token — minted inline on expiry — or the mock stack's local-CI URL.
+    let credential = match credential_source {
+        CredentialSource::LocalCi(url) => dispatch::DispatchCredential::LocalCi(url),
+        CredentialSource::GitHub(config) => match github_app::installation_token(db, &config).await
+        {
+            Ok(token) => dispatch::DispatchCredential::GitHub(token),
+            Err(error) => {
+                let error = dispatch::DispatchError::TokenMint(error.to_string());
+                queue::fail_request_dispatch(
+                    db,
+                    &admission.request_id,
+                    attempt,
+                    &error.to_string(),
+                )
+                .await
+                .map_err(to_error)?;
+                return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
+            }
+        },
+    };
+    let pool = crate::fetch_guard::OutboundPool::new();
+    if let Err(error) =
+        dispatch::trigger_resolve(&dispatch_payload, &credential, &github_repo, &pool).await
+    {
+        queue::fail_request_dispatch(db, &admission.request_id, attempt, &error.to_string())
+            .await
+            .map_err(to_error)?;
+        return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
+    }
+    queue::crate_request_status(db, &admission.request_id)
+        .await
+        .map_err(to_error)?
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "request {} admitted no record",
+                admission.request_id
+            ))
+        })
+}
+
+/// `GET /requests/{request_id}` — the request record's live status.
+async fn read_request(
+    db: DurableDb,
+    params: Params,
+) -> Result<Json<stow_types::api::CrateRequestStatus>> {
+    let request_id = request_id_param(&params)?;
+    queue::crate_request_status(&db, request_id)
+        .await
+        .map_err(to_error)?
+        .map(Json)
+        .ok_or_else(|| {
+            Error::msg(format!("unknown request `{request_id}`")).set_status(StatusCode::NOT_FOUND)
+        })
+}
+
+/// `POST /requests/{request_id}/outcome` — the resolve job's report
+/// channel (stow#428): the trusted enqueue, the per-target roots and
+/// the `enqueued`/`failed` transition apply in one call, then the
+/// alarm handoff runs the dispatch pass the new tasks wait on. A report
+/// for an unknown record answers 404; one naming a superseded attempt,
+/// 409 — the webhook logs both rather than propagating them.
+async fn apply_request_outcome(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    params: Params,
+    Json(report): Json<stow_types::api::RequestOutcomeReport>,
+) -> Result<Json<stow_types::api::CrateRequestStatus>> {
+    let request_id = request_id_param(&params)?;
+    let status = queue::apply_request_outcome(&db, &scheduler_settings(&env)?, request_id, &report)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
+                QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
+                QueueError::HumanDailyBudgetExhausted { .. } => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    // Same handoff as submit: the report answers once the rows land, and
+    // the alarm's dispatch pass — not this request — fans them out. An
+    // outcome whose batch is fully gated arms nothing (stow#444).
+    schedule_alarm(&env, &db, &alarm).await?;
+    Ok(Json(status))
+}
+
+/// `POST /requests/{request_id}/run-update` — the `workflow_run`
+/// webhook's lifecycle events for a `resolve-request.yml` run.
+/// `in_progress` flips `accepted` → `resolving`; `completed` is the
+/// backstop that fails a still-live attempt without overwriting a
+/// record its outcome route already settled. Unknown record → 404,
+/// superseded attempt → 409, and an event on an already-settled record
+/// is an applied no-op.
+async fn apply_request_run_update(
+    db: DurableDb,
+    params: Params,
+    Json(update): Json<stow_types::api::RequestRunUpdate>,
+) -> Result<Json<OkResponse>> {
+    let request_id = request_id_param(&params)?;
+    queue::record_request_run_update(&db, request_id, &update)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
+                QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// The `{request_id}` path parameter — verbatim, the id is opaque to the
+/// DO (`req-` prefix and hash legs are the edge's concern).
+fn request_id_param(params: &Params) -> Result<&str> {
+    params
+        .get("request_id")
+        .map_err(|_| Error::msg("request id is required").set_status(StatusCode::BAD_REQUEST))
 }
 
 /// `GET /dispatch-freeze` — the dispatch freeze's current state: the
@@ -731,10 +975,37 @@ enum CredentialSource {
     GitHub(github_app::AppConfig),
 }
 
+/// Validate an endpoint override the mock harness sets: `STOW_LOCAL_CI_URL`
+/// (the dispatcher the credential arm posts builds to) and
+/// `STOW_STATS_SQL_URL` (the Analytics Engine stub the stats route posts
+/// its API token to) only ever live on the same host, so both are pinned
+/// to loopback and can never redirect traffic — or the token — to a
+/// remote endpoint. Rejected URLs fail before any request uses them.
+pub fn loopback_url(binding: &str, url: &str) -> Result<String> {
+    let authority = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|authority| authority.rsplit('@').next())
+        .unwrap_or_default();
+    let host = authority.strip_prefix('[').map_or_else(
+        || authority.split(':').next().unwrap_or_default(),
+        |v6| v6.split(']').next().unwrap_or_default(),
+    );
+    match host {
+        "127.0.0.1" | "localhost" | "0.0.0.0" | "::1" => Ok(url.to_owned()),
+        _ => Err(Error::msg(format!(
+            "{binding} must name a loopback host, got {url:?}"
+        ))),
+    }
+}
+
 /// The artifact catalog in D1, asked at claim time which pending tasks an
 /// already-landed publish covered.
-struct CatalogCoverage {
-    db: Db,
+pub(super) struct CatalogCoverage {
+    /// The catalog handle — plain `CfD1` on a real pass, the counted
+    /// backend under the budget probe so the lookup's rows are priced.
+    pub(super) db: Db,
 }
 
 impl queue::CoverageOracle for CatalogCoverage {
@@ -758,26 +1029,57 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         tracing::info!("dispatch frozen — skipping dispatch pass");
         return Ok(());
     }
-    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let settings = scheduler_settings(env)?;
-    // Binding resolution precedes claiming: a misconfigured binding fails
-    // the pass with every row still `pending` instead of burned as a
-    // dispatch attempt.
-    let credential_source = match read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING) {
-        Some(url) => CredentialSource::LocalCi(url),
-        None => CredentialSource::GitHub(github_app::AppConfig {
-            app_id: read_string_binding(env, GITHUB_APP_ID_BINDING)?,
-            installation_id: read_string_binding(env, GITHUB_APP_INSTALLATION_ID_BINDING)?,
-            private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
-        }),
-    };
     let coverage = CatalogCoverage {
         db: Db::new(
             CfD1::from_env(env.as_js(), STOW_DB_BINDING)
                 .map_err(|error| Error::msg(format!("load D1 binding: {error}")))?,
         ),
     };
-    let tasks = queue::claim_dispatchable_tasks(db, &settings, &coverage)
+    dispatch_pass(env, db, &settings, &coverage)
+        .await
+        .map(|_| ())
+}
+
+/// The credential arm a dispatch resolves — `STOW_LOCAL_CI_URL` for the
+/// mock stack, the GitHub App bindings otherwise. Shared by the alarm's
+/// dispatch pass and the request lane's inline admit dispatch.
+fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
+    Ok(
+        match read_optional_string_binding(env, STOW_LOCAL_CI_URL_BINDING) {
+            Some(url) => CredentialSource::LocalCi(loopback_url("STOW_LOCAL_CI_URL", &url)?),
+            None => CredentialSource::GitHub(github_app::AppConfig {
+                app_id: read_string_binding(env, GITHUB_APP_ID_BINDING)?,
+                installation_id: read_string_binding(env, GITHUB_APP_INSTALLATION_ID_BINDING)?,
+                private_key_pem: read_string_binding(env, GITHUB_APP_PRIVATE_KEY_BINDING)?,
+            }),
+        },
+    )
+}
+
+/// The claim-plus-fan-out half of a dispatch pass, shared with the
+/// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
+/// `wall_ms` covers the concurrent `trigger_build` fan-out and the
+/// counted-D1 coverage lookups a real wake pays. Returns the claimed
+/// task ids — the probe's claim record and the launch gate's claim
+/// count both derive from the pass's own set.
+pub(super) async fn dispatch_pass(
+    env: &WasmEnv,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    coverage: &impl queue::CoverageOracle,
+) -> Result<Vec<String>> {
+    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+    let freeze = freeze_settings(env)?;
+    queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
+        .await
+        .map_err(to_error)?;
+    evaluate_dispatch_freeze(env, db, &freeze).await?;
+    // Binding resolution precedes claiming: a misconfigured binding fails
+    // the pass with every row still `pending` instead of burned as a
+    // dispatch attempt.
+    let credential_source = credential_source(env)?;
+    let tasks = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
         .map_err(to_error)?;
     tracing::info!(
@@ -785,8 +1087,9 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
         "scheduler dispatch_pending selected tasks"
     );
     if tasks.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let task_ids: Vec<String> = tasks.iter().map(|task| task.task_id.clone()).collect();
 
     // The credential resolves once per pass, only when tasks exist: the
     // local-CI branch carries no Authorization; the GitHub branch reuses
@@ -807,59 +1110,132 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
                     for task in &tasks {
                         queue::mark_dispatch_failed(
                             db,
-                            &settings,
+                            settings,
                             &task.task_id,
+                            &task.generation_id,
                             &error.to_string(),
                         )
                         .await
                         .map_err(to_error)?;
                         tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
                     }
-                    return Ok(());
+                    return Ok(task_ids);
                 }
             }
         }
     };
 
-    // One bound for the whole DO fetch invocation: dispatch is a
-    // sequential loop, so a slot is always free — the pool exists so a
-    // future parallel fan-out cannot exceed the invocation's budget.
+    // The fan-out runs concurrently, bounded twice at the invocation's
+    // outbound ceiling: the stream's `buffer_unordered` admits at most
+    // `MAX_OUTBOUND_INFLIGHT` (4) `workflow_dispatch` calls at once, and
+    // the pool slot `trigger_workflow` waits on enforces the same bound
+    // before any request posts.
     let pool = crate::fetch_guard::OutboundPool::new();
-    for task in tasks {
-        if let Err(error) = dispatch::trigger_build(&task, &credential, &github_repo, &pool).await {
-            queue::mark_dispatch_failed(db, &settings, &task.task_id, &error.to_string())
-                .await
-                .map_err(to_error)?;
-            tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
-        }
+    let mut results = stream::iter(tasks.into_iter().enumerate())
+        .map(|(index, task)| {
+            // Each future owns its task and shares the credential,
+            // repo and pool by reference — copied per call so
+            // `async move` moves nothing out of the map closure.
+            let (credential, github_repo, pool) = (&credential, github_repo.as_str(), &pool);
+            async move {
+                let task_id = task.task_id.clone();
+                let generation_id = task.generation_id.clone();
+                (
+                    index,
+                    task_id,
+                    generation_id,
+                    dispatch::trigger_build(&task, credential, github_repo, pool).await,
+                )
+            }
+        })
+        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    // A failed dispatch still marks exactly its own task, in the claim
+    // order the sequential loop wrote.
+    results.sort_unstable_by_key(|(index, _, _, _)| *index);
+    for (_, task_id, generation_id, result) in results {
+        persist_dispatch_outcome(db, settings, &task_id, &generation_id, result).await?;
     }
 
+    // A completion may have been persisted while this pass was waiting for
+    // the dispatch response. Consume it now that all returned identities are
+    // bound; the same join also makes this path restart-safe.
+    queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
+        .await
+        .map_err(to_error)?;
+    evaluate_dispatch_freeze(env, db, &freeze).await?;
+
+    Ok(task_ids)
+}
+
+async fn persist_dispatch_outcome(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    task_id: &str,
+    generation_id: &str,
+    outcome: std::result::Result<dispatch::DispatchedRun, dispatch::DispatchError>,
+) -> Result<()> {
+    match outcome {
+        Ok(run) => match queue::bind_dispatch_run(
+            db,
+            task_id,
+            generation_id,
+            &run.workflow_run_id.to_string(),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = run.workflow_run_id,
+                    "dispatch run binding skipped — the claimed generation moved on"
+                );
+            }
+            Err(error) => {
+                queue::mark_dispatch_failed(
+                    db,
+                    settings,
+                    task_id,
+                    generation_id,
+                    &error.to_string(),
+                )
+                .await
+                .map_err(to_error)?;
+                tracing::error!(task_id = %task_id, %error, "failed to bind dispatch run");
+            }
+        },
+        Err(error) => {
+            queue::mark_dispatch_failed(db, settings, task_id, generation_id, &error.to_string())
+                .await
+                .map_err(to_error)?;
+            tracing::error!(task_id = %task_id, error = %error, "failed to dispatch build");
+        }
+    }
     Ok(())
 }
 
 async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {
+    let (now_ms, settings) = alarm_inputs(env)?;
+    let plan = queue::next_alarm(db, now_ms, &settings)
+        .await
+        .map_err(to_error)?;
+    queue::arm_alarm(alarm, plan).await.map_err(|error| {
+        let error = to_error(error);
+        tracing::error!(%error, "failed to perform scheduler alarm plan");
+        error
+    })
+}
+
+/// The instant and settings every alarm plan is decided under — read
+/// once per pass so a route's plan and its arm see one clock.
+fn alarm_inputs(env: &WasmEnv) -> Result<(i64, SchedulerSettings)> {
     // `Date::now()` returns whole milliseconds well below 2^53; the value is
     // exactly representable and always fits i64.
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = js_sys::Date::now() as i64;
-    let settings = scheduler_settings(env)?;
-    match queue::next_alarm(db, now_ms, &settings)
-        .await
-        .map_err(to_error)?
-    {
-        queue::AlarmPlan::Delete => alarm.delete_alarm().await.map_err(|error| {
-            let error = to_error(error);
-            tracing::error!(%error, "failed to delete scheduler alarm");
-            error
-        })?,
-        queue::AlarmPlan::At(next_ms) => alarm.set_alarm(next_ms).await.map_err(|error| {
-            let error = to_error(error);
-            tracing::error!(%error, next_ms, "failed to set scheduler alarm");
-            error
-        })?,
-    }
-
-    Ok(())
+    Ok((now_ms, scheduler_settings(env)?))
 }
 
 fn read_string_binding(env: &WasmEnv, binding_name: &str) -> Result<String> {
@@ -894,6 +1270,33 @@ fn read_optional_u32_binding(env: &WasmEnv, binding_name: &str) -> Result<Option
     let parsed = raw
         .parse::<u32>()
         .map_err(|error| Error::msg(format!("parse binding '{binding_name}' as u32: {error}")))?;
+    Ok(Some(parsed))
+}
+
+/// An optional decimal-integer binding parsed as `i64`. The text form
+/// is what crosses the env-binding boundary — a JavaScript number
+/// property could not carry the wide values this is meant to hold, and
+/// `i64::from_str` is what rejects overflow/rounding rather than
+/// admitting a `f64`-decoded tail.
+fn read_optional_i64_binding(env: &WasmEnv, binding_name: &str) -> Result<Option<i64>> {
+    let value = Reflect::get(env.as_js(), &JsValue::from_str(binding_name))
+        .map_err(|error| Error::msg(format!("{error:?}")))?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let raw = value.as_string().ok_or_else(|| {
+        Error::msg(format!(
+            "Cloudflare Workers binding '{binding_name}' must be a string when set"
+        ))
+    })?;
+    let parsed = raw
+        .parse::<i64>()
+        .map_err(|error| Error::msg(format!("parse binding '{binding_name}' as i64: {error}")))?;
+    if parsed < 0 {
+        return Err(Error::msg(format!(
+            "Cloudflare Workers binding '{binding_name}' must be nonnegative"
+        )));
+    }
     Ok(Some(parsed))
 }
 

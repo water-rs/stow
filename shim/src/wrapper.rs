@@ -224,25 +224,62 @@ fn materialize_in(
     runtime_executable: &Path,
     capture_executable: &Path,
 ) -> stow_types::error::Result<WrapperShimPaths> {
-    place_executable(base, RUNTIME_LINK_PATH, runtime_executable)?;
-    place_executable(base, CAPTURE_LINK_PATH, capture_executable)?;
+    // Five of the six placements share one source; each `fs::read` of a
+    // ~50MB executable runs the antivirus scan again, so the source bytes
+    // are read at most once per call.
+    let mut runtime_bytes = None;
+    let mut capture_bytes = None;
+    place_executable(
+        base,
+        RUNTIME_LINK_PATH,
+        runtime_executable,
+        &mut runtime_bytes,
+    )?;
+    place_executable(
+        base,
+        CAPTURE_LINK_PATH,
+        capture_executable,
+        &mut capture_bytes,
+    )?;
     Ok(WrapperShimPaths {
-        rustc_wrapper: place_executable(base, RUSTC_WRAPPER_PATH, runtime_executable)?,
-        cc_launcher: place_executable(base, CC_LAUNCHER_PATH, runtime_executable)?,
-        cc_compiler: place_executable(base, CC_COMPILER_PATH, runtime_executable)?,
-        cxx_compiler: place_executable(base, CXX_COMPILER_PATH, runtime_executable)?,
+        rustc_wrapper: place_executable(
+            base,
+            RUSTC_WRAPPER_PATH,
+            runtime_executable,
+            &mut runtime_bytes,
+        )?,
+        cc_launcher: place_executable(
+            base,
+            CC_LAUNCHER_PATH,
+            runtime_executable,
+            &mut runtime_bytes,
+        )?,
+        cc_compiler: place_executable(
+            base,
+            CC_COMPILER_PATH,
+            runtime_executable,
+            &mut runtime_bytes,
+        )?,
+        cxx_compiler: place_executable(
+            base,
+            CXX_COMPILER_PATH,
+            runtime_executable,
+            &mut runtime_bytes,
+        )?,
     })
 }
 
 /// Put `executable` at `<base>/<name>.exe`, leaving an identical file alone.
+/// `source_bytes` caches the source read across placements of one executable.
 #[cfg(windows)]
 fn place_executable(
     base: &Path,
     name: &str,
     executable: &Path,
+    source_bytes: &mut Option<Vec<u8>>,
 ) -> stow_types::error::Result<PathBuf> {
     let destination = base.join(executable_file_name(name));
-    if same_contents(&destination, executable)? {
+    if same_contents(&destination, executable, source_bytes)? {
         return Ok(destination);
     }
     let temp_path = staging_path(&destination)?;
@@ -266,9 +303,16 @@ fn place_executable(
 }
 
 /// Whether `destination` already holds the bytes of `source`. A missing
-/// destination is simply not identical.
+/// destination is simply not identical. A destination placed by hard link
+/// shares the source's file index — the same file by construction — so the
+/// byte-for-byte comparison (and its antivirus re-scan of both executables)
+/// only runs for a destination that is a real copy.
 #[cfg(windows)]
-fn same_contents(destination: &Path, source: &Path) -> stow_types::error::Result<bool> {
+fn same_contents(
+    destination: &Path,
+    source: &Path,
+    source_bytes: &mut Option<Vec<u8>>,
+) -> stow_types::error::Result<bool> {
     let Ok(destination_meta) = fs::metadata(destination) else {
         return Ok(false);
     };
@@ -277,11 +321,29 @@ fn same_contents(destination: &Path, source: &Path) -> stow_types::error::Result
     if destination_meta.len() != source_meta.len() {
         return Ok(false);
     }
+    // A destination placed by hard link shares the source's volume and file
+    // index — the same file by construction — so the byte-for-byte
+    // comparison (and its antivirus re-scan of both executables) only runs
+    // for a destination that is a real copy.
+    if same_file::is_same_file(destination, source).wrap_err_with(|| {
+        format!(
+            "compare wrapper executable {} with source {}",
+            destination.display(),
+            source.display()
+        )
+    })? {
+        return Ok(true);
+    }
     let destination_bytes = fs::read(destination)
         .wrap_err_with(|| format!("read wrapper executable {}", destination.display()))?;
-    let source_bytes = fs::read(source)
-        .wrap_err_with(|| format!("read wrapper executable source {}", source.display()))?;
-    Ok(destination_bytes == source_bytes)
+    let source_bytes = match source_bytes {
+        Some(bytes) => bytes,
+        None => source_bytes
+            .insert(fs::read(source).wrap_err_with(|| {
+                format!("read wrapper executable source {}", source.display())
+            })?),
+    };
+    Ok(destination_bytes == *source_bytes)
 }
 
 #[cfg(unix)]

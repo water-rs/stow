@@ -4,9 +4,14 @@ name: toolchain-publish
 # the runner that also builds the task's crate — up to ~17 minutes per
 # run, once per target leg of the wave. This workflow compiles them once
 # per main commit per host platform and publishes the toolchain (stow-build,
-# stow-cli, stow-admin) to GHCR as a digest-addressed, cosign-signed OCI
-# artifact; build-crate and the deploy/watchdog jobs pull it by `github.sha`
-# instead of compiling or hunting Test-run artifacts (stow#431).
+# stow-cli, and on Linux stow-admin) to GHCR as a digest-addressed,
+# cosign-signed OCI artifact; build-crate and the deploy/watchdog jobs pull it
+# by `github.sha` instead of compiling or hunting Test-run artifacts
+# (stow#431).
+#
+# stow-admin ships only in the Linux toolchain: every job that pulls it runs
+# on ubuntu, and it is the one binary that links stow-resolver — cargo itself
+# — which dominated the Windows and macOS legs' cold release build.
 #
 # It runs on `merge_group`, not `push`: GitHub fast-forwards `main` to the
 # merge-group head it tested, so `github.sha` here is exactly the future
@@ -53,9 +58,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, key: linux-x64 }
-          - { os: windows-latest, key: windows-x64 }
-          - { os: macos-14, key: macos-arm64 }
+          - { os: ubuntu-latest, key: linux-x64, bins: stow-build stow-cli stow-admin }
+          - { os: windows-latest, key: windows-x64, bins: stow-build stow-cli }
+          - { os: macos-14, key: macos-arm64, bins: stow-build stow-cli }
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -69,8 +74,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
-      - name: Build stow-build, stow-cli and stow-admin
-        run: cargo build --release -p stow-build -p stow-cli -p stow-admin
+      - name: Build ${{ matrix.bins }}
+        shell: bash
+        env:
+          BINS: ${{ matrix.bins }}
+        run: |
+          set -euo pipefail
+          packages=()
+          for bin in $BINS; do packages+=(-p "$bin"); done
+          cargo build --release "${packages[@]}"
       - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Publish the toolchain artifact
@@ -78,12 +90,15 @@ jobs:
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PLATFORM_KEY: ${{ matrix.key }}
+          BINS: ${{ matrix.bins }}
         run: |
           set -euo pipefail
-          bins=(stow-build stow-cli stow-admin)
+          suffix=""
           if [ "$RUNNER_OS" = "Windows" ]; then
-            bins=(stow-build.exe stow-cli.exe stow-admin.exe)
+            suffix=".exe"
           fi
+          bins=()
+          for bin in $BINS; do bins+=("${bin}${suffix}"); done
           tar -C target/release -czf stow-toolchain.tar.gz "${bins[@]}"
 
           ref="ghcr.io/water-rs/stow-toolchain:${GITHUB_SHA}-${PLATFORM_KEY}"

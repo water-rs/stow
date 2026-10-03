@@ -1166,7 +1166,7 @@ mod tests {
         let (baseline, candidate) = canary_samples();
         let report = evaluate_canary(&args(), &baseline, &candidate);
         assert!(report.pass, "{report:?}");
-        assert!(report.breaches.is_empty());
+        assert_eq!(report.breaches, [] as [std::string::String; 0]);
         // 7 metric rows, no signal row.
         assert_eq!(report.metrics.len(), CANARY_THRESHOLDS.len());
     }
@@ -1438,6 +1438,6 @@ mod tests {
             "new",
         );
         assert!(report.pass);
-        assert!(report.breaches.is_empty());
+        assert_eq!(report.breaches, [] as [std::string::String; 0]);
     }
 }

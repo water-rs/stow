@@ -10,13 +10,12 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-skyzen = { version = "0.3.0", default-features = false, features = ["json", "query"] }
+skyzen = { version = "0.4.3", default-features = false, features = ["json", "query"] }
 skyzen-core = "0.2"
-skyzen-cloudflare = "0.3.0"
+skyzen-cloudflare = "0.4.3"
 skyzen-services = { version = "0.2.1", default-features = false }
 stow-types.workspace = true
 stow-shim.workspace = true
-stow-resolve.workspace = true
 http = "1"
 anyhow = "1"
 thiserror.workspace = true
@@ -60,6 +59,11 @@ hmac = "0.13"
 sha2 = "0.11"
 hex.workspace = true
 rsa = "0.9"
+# Exact U256 arithmetic for the dispatch rank quotient — the locked
+# RustCrypto bignum (no_std, no `rand` needed for fixed-width
+# shift/div/hex). `cargo` keeps it on the pinned 0.5.5 the lockfile
+# already carries transitively.
+crypto-bigint = { version = "0.5.5", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The wasm subscriber bridge in console_log.rs is the only consumer; a

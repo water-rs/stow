@@ -930,9 +930,7 @@ pub enum QueueTaskStatus {
 }
 
 impl QueueTaskStatus {
-    /// The stable string a queue row's `status` carries on the wire —
-    /// `blocked` only ever appears as that derived read-time value, never
-    /// in the stored column.
+    /// The stable string a queue row's `status` carries on the wire.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -978,7 +976,7 @@ pub enum CrateRequestState {
     ClosureQueued,
 }
 
-/// Per-target outcome inside a [`CrateRequestOutcome`].
+/// Per-target outcome inside a [`CrateRequestStatus`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CrateRequestTarget {
     /// Compilation target triple — one of [`CI_TARGET_TRIPLES`].
@@ -995,23 +993,216 @@ pub struct CrateRequestTarget {
     pub human_lane_position: Option<u32>,
 }
 
-/// Response of `POST /api/v1/requests`: what the edge resolved and where
-/// each supported target stands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct CrateRequestOutcome {
-    /// Echoed crate name.
-    pub crate_name: CrateName,
-    /// The resolved version — the requested one, or the newest
-    /// non-prerelease, non-yanked crates.io release.
-    pub version: CrateVersion,
-    /// Current stable rustc version the enqueued tasks target.
-    pub rustc_version: WireRustcVersion,
-    /// Per-target outcomes in [`CI_TARGET_TRIPLES`] order.
-    pub targets: Vec<CrateRequestTarget>,
+/// Deterministic human-request id — `req-<crate>-<version>-<blake3
+/// (features_json)>-<rustc>`.
+///
+/// The request record's primary key and the `resolve-request.yml`
+/// run-name's correlation tail. Unlike a task id it carries no target:
+/// a request asks for every CI target's outcome and dedupes by
+/// identity alone.
+#[must_use]
+pub fn request_id(
+    crate_name: &str,
+    version: &str,
+    features_json: &str,
+    rustc_version: &str,
+) -> String {
+    let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
+    format!(
+        "req-{}-{}-{}-{}",
+        crate_name,
+        version,
+        features_hash,
+        rustc_version.replace('-', "_")
+    )
 }
 
-/// Point-in-time view of one scheduler task, returned by
-/// `GET /api/v1/requests/{task_id}`.
+/// The request record's lifecycle — `POST /api/v1/requests` returns it
+/// `accepted`, and `GET /api/v1/requests/{request_id}` tracks it to
+/// `enqueued` or `failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CrateRequestPhase {
+    /// Turnstile admission and the daily-budget probe passed and the
+    /// `resolve-request.yml` run was dispatched.
+    Accepted,
+    /// The run reported `in_progress` — the resolve is executing.
+    Resolving,
+    /// The job's outcome report landed: `targets` carries the per-target
+    /// outcome the request lane used to answer inline.
+    Enqueued,
+    /// Dispatch, resolve or submission failed — `error` says which.
+    Failed,
+}
+
+/// `POST /api/v1/requests` response and `GET /api/v1/requests/{id}` for a
+/// `req-` id — the request record's point-in-time state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CrateRequestStatus {
+    /// The request's deterministic id ([`request_id`]).
+    pub request_id: String,
+    /// Echoed crate name.
+    pub crate_name: CrateName,
+    /// The resolved version.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Stable rustc the resolve targets.
+    pub rustc_version: WireRustcVersion,
+    /// Where the request stands.
+    pub status: CrateRequestPhase,
+    /// Per-target outcomes in [`CI_TARGET_TRIPLES`] order — populated
+    /// once `status` is [`CrateRequestPhase::Enqueued`].
+    pub targets: Vec<CrateRequestTarget>,
+    /// What failed when `status` is [`CrateRequestPhase::Failed`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The Actions run id serving the record's live attempt, once the
+    /// run's `workflow_run` event has reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_run_id: Option<String>,
+    /// The run's URL, reported on the same event — the status page
+    /// links it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_run_url: Option<String>,
+}
+
+/// The edge's admission → the scheduler Durable Object's `POST /requests`
+/// route, which checks the human budget, deduplicates and dispatches the
+/// resolve run in one call.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestAdmission {
+    /// Deterministic request id ([`request_id`]).
+    pub request_id: String,
+    /// The requested crate.
+    pub crate_name: CrateName,
+    /// The resolved version.
+    pub version: CrateVersion,
+    /// Canonical features JSON.
+    pub features_json: FeaturesJson,
+    /// Stable rustc the resolve targets.
+    pub rustc_version: WireRustcVersion,
+    /// The `STOW_HUMAN_MAX_CLOSURE` the edge admitted under — the job's
+    /// closure cap.
+    pub max_closure: u32,
+}
+
+/// The `request` `workflow_dispatch` input `resolve-request.yml` reads
+/// (`stow-admin request resolve --request` parses it verbatim).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestDispatch {
+    /// The request record's id — also the webhook's run correlation.
+    pub request_id: String,
+    /// The record's dispatch epoch — a failed record's re-request bumps
+    /// it, and the run-name carries it so a stale run's webhook events
+    /// cannot land on the live attempt.
+    pub attempt: u32,
+    /// The GitHub run-name to stamp — `resolve-a{attempt}-{request_id}`,
+    /// built here so the title format has a single owner (the webhook
+    /// parses it back).
+    pub run_title: String,
+    /// The requested crate.
+    pub crate_name: CrateName,
+    /// The resolved version.
+    pub version: CrateVersion,
+    /// Canonical features JSON the seed set resolves from.
+    pub features_json: FeaturesJson,
+    /// Stable rustc the resolve targets.
+    pub rustc_version: WireRustcVersion,
+    /// The closure cap the edge admitted under.
+    pub max_closure: u32,
+    /// Unix seconds at which the edge dispatched the run — the job's
+    /// dispatch-to-submit timing baseline.
+    pub dispatched_at: i64,
+}
+
+/// One CI target's root facts in the resolve job's outcome report.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestRootOutcome {
+    /// The CI target the entry describes.
+    pub target: TargetTriple,
+    /// The lib-root task id; `None` when the crate publishes no library —
+    /// the target's outcome then reads
+    /// [`CrateRequestState::ClosureQueued`].
+    pub task_id: Option<String>,
+    /// The published `index.<target>.<rustc>` slice already serves the
+    /// lib root — the target reads [`CrateRequestState::Cached`] and its
+    /// closure was not enqueued.
+    pub cached: bool,
+}
+
+/// `POST /api/v1/scheduler/requests/{request_id}/outcome` — the resolve
+/// job's report.
+///
+/// Either the resolved batch plus the per-target roots the record's
+/// outcome table is assembled from, or the failure it hit — exclusive
+/// by type: a failed resolve submits no tasks, and a resolve that
+/// produced tasks is not a failure.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestOutcomeReport {
+    /// The record attempt this report serves — the DO refuses reports
+    /// naming a superseded attempt.
+    pub attempt: u32,
+    /// What the resolve produced.
+    pub outcome: RequestOutcome,
+}
+
+/// One arm of a [`RequestOutcomeReport`].
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RequestOutcome {
+    /// The resolve completed: the batch of uncovered tasks across every
+    /// target's closure — forwarded to the trusted enqueue verbatim —
+    /// plus the per-target root facts in [`CI_TARGET_TRIPLES`] order.
+    Resolved {
+        /// The uncovered human-lane tasks across every target's closure.
+        tasks: Vec<EnqueueRequest>,
+        /// Per-target root facts in [`CI_TARGET_TRIPLES`] order.
+        roots: Vec<RequestRootOutcome>,
+    },
+    /// The resolve failed — `error` names the step, and the record is
+    /// marked `failed` with it.
+    Failed {
+        /// What the resolve died on.
+        error: String,
+    },
+}
+
+/// The `workflow_run` lifecycle event the webhook forwards to the DO's
+/// `/requests/{id}/run-update` route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestRunAction {
+    /// `in_progress` — the resolve run started.
+    InProgress,
+    /// `completed` — the run finished; the record fails unless the job's
+    /// outcome report already marked it `enqueued`.
+    Completed,
+}
+
+/// The `workflow_run` webhook's delivery for a `resolve-request.yml` run
+/// → the DO's `/requests/{id}/run-update` route, correlated by
+/// `request_id` + `attempt` parsed from the run-name.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestRunUpdate {
+    /// The attempt the run serves, from the `a{attempt}` run-name leg.
+    pub attempt: u32,
+    /// Which lifecycle event the delivery carries.
+    pub action: RequestRunAction,
+    /// `workflow_run.conclusion` on a `completed` delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<String>,
+    /// The Actions run id — recorded on the record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The run's `html_url` — carried into `error` on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_url: Option<String>,
+}
+
+/// Point-in-time view of one scheduler task — what the DO's `tasks_status`
+/// query returns for a request record's re-probe and for task-row
+/// inspection inside the object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RequestStatus {
     /// Canonical scheduler task id (blake3-derived identity string).
@@ -1185,6 +1376,9 @@ pub struct QueueSelector {
     /// Compilation target to match.
     #[serde(default)]
     pub target: Option<TargetTriple>,
+    /// Rustc version to match (`rustc` on the wire).
+    #[serde(default, rename = "rustc", alias = "rustc_version")]
+    pub rustc_version: Option<WireRustcVersion>,
     /// Crate name to match (`crate` on the wire).
     #[serde(default, rename = "crate", alias = "crate_name")]
     pub crate_name: Option<CrateName>,
@@ -1199,8 +1393,8 @@ pub struct QueueSelector {
     pub limit: Option<u32>,
 }
 
-/// Response of the `queue retry|cancel|promote|purge` endpoints: how many
-/// rows the transition touched.
+/// Response of the `queue retry|cancel|promote|purge` endpoints:
+/// how many rows the transition touched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueueMutationResult {
     /// Rows the transition affected.
@@ -1275,6 +1469,13 @@ pub struct SchedulerBudgetStatement {
     /// `cursor.rowsWritten` — table rows plus index entries and
     /// trigger-made writes.
     pub rows_written: u64,
+    /// Wall milliseconds the statement's own `query`/`execute` awaited
+    /// in local workerd — measured around the inner call by the
+    /// metered backend, so a hot drive's wall can be decomposed per
+    /// statement rather than attributed as one lump. Always `0` on
+    /// host builds (the host lane gates SQL counts, not timing) and
+    /// on statements issued through the uncounted backend.
+    pub elapsed_ms: u64,
 }
 
 /// One drive's workerd measurement against its budget.
@@ -1288,16 +1489,48 @@ pub struct SchedulerBudgetRow {
     pub rows_read: u64,
     /// Σ `rowsWritten` over the drive's statements.
     pub rows_written: u64,
+    /// Wall-clock milliseconds the drive's queue calls took — the
+    /// serialized-Duration number the launch gate projects (stow#452).
+    pub wall_ms: u64,
     /// Budgeted statement count.
     pub statement_budget: u64,
     /// Budgeted `rowsRead` total.
     pub read_budget: u64,
     /// Budgeted `rowsWritten` total.
     pub write_budget: u64,
-    /// `true` when any of the three budgets is exceeded.
+    /// Budgeted wall milliseconds.
+    pub wall_budget: u64,
+    /// Σ D1 `meta.rowsRead` over statements the drive issued through
+    /// the counted catalog backend — the coverage lookups a claim pays
+    /// per page, carried separately because D1 bills a different
+    /// product than the object's own rows.
+    pub d1_rows_read: u64,
+    /// Σ D1 `meta.rowsWritten` over the same statements.
+    pub d1_rows_written: u64,
+    /// Σ of the awaited durations of the counted catalog backend's
+    /// own calls. A sum of operation spans, not a share of drive
+    /// wall: concurrent calls overlap in real time but add up here,
+    /// so it can exceed the drive's measured window. `0` on host and
+    /// on drives that never touch the catalog.
+    pub d1_elapsed_ms: u64,
+    /// `true` when any of the four budgets is exceeded.
     pub over_budget: bool,
     /// The per-statement log the totals are summed over.
     pub log: Vec<SchedulerBudgetStatement>,
+}
+
+/// `POST /api/v1/admin/scheduler/budget` request — the knobs the
+/// probe's own pass needs that the deploy's bindings do not already
+/// set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerBudgetRequest {
+    /// The dispatch cap the pass drives claim against, overriding the
+    /// deploy's `STOW_MAX_CONCURRENT_JOBS`. The mock deploys a tiny cap
+    /// for its own stability, so the harness passes the production cap
+    /// here — a pass that cannot claim measures nothing the gate can
+    /// price. `0` pauses dispatch; absent uses the deploy's setting.
+    #[serde(default)]
+    pub dispatch_limit: Option<u32>,
 }
 
 /// What `POST /api/v1/admin/scheduler/budget` returns: every route and
@@ -1309,11 +1542,80 @@ pub struct SchedulerBudgetReport {
     pub queue_rows: u64,
     /// The schema version the queue reports.
     pub schema_version: i64,
+    /// The dispatch cap the pass ran under — the run's own setting
+    /// after any request override, so the per-claim marginal price
+    /// divides by what the pass could actually claim.
+    pub dispatch_limit: u64,
+    /// Tasks the pass drives claimed (the hot pass under the dispatch
+    /// cap; the idle pass claims none). The launch gate divides the
+    /// hot-minus-idle marginal cost by this — never by a checked-in
+    /// assumption — and refuses a report that claims nothing while
+    /// build traffic is nonzero.
+    pub claimed_tasks: u64,
     /// Per-drive measurements, in drive order.
     pub rows: Vec<SchedulerBudgetRow>,
     /// `true` when any row is over budget — `stow-admin scheduler
     /// budget` exits nonzero on it.
     pub over_budget: bool,
+}
+
+/// One node identity a demand batch reports demand for (stow#522).
+///
+/// The Analytics Engine source omits `host_side`, so an entry names
+/// every compile side of the identity at once: all matching unbuilt
+/// queue rows are roots of the demand walk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandEntry {
+    /// Crate name the observed demand names.
+    pub crate_name: CrateName,
+    /// Crate version.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Demand increment this entry contributes once to every task its
+    /// closure touches.
+    pub demand: u64,
+}
+
+/// `POST /api/v1/admin/scheduler/demand` request — one durable demand
+/// batch.
+///
+/// `batch_id` is the replay contract the hourly feed (#523) reuses:
+/// staged contributions fold into `queue.demand` inside the single
+/// `prepared → accepted` acceptance statement, so an accepted batch
+/// has no remainder — a delivery interrupted before acceptance
+/// (`prepared`) recomputes the current graph on retry, and an
+/// accepted-batch replay answers from the stored record and writes
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandRequest {
+    /// The batch's durable identity — the feed's hour window.
+    pub batch_id: String,
+    /// Observed-demand entries. Distinct identities contribute their
+    /// own deltas to a shared closure; an identical entry repeated in
+    /// one batch sums before touching tasks.
+    pub entries: Vec<SchedulerDemandEntry>,
+}
+
+/// What `POST /api/v1/admin/scheduler/demand` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerDemandReport {
+    /// The applied batch's identity, echoed.
+    pub batch_id: String,
+    /// Distinct input identities the batch carried.
+    pub entries: u64,
+    /// Queue tasks the batch's closures named — each took its share of
+    /// every entry whose walk reached it.
+    pub touched_tasks: u64,
+    /// `true` when this call performed the batch's acceptance
+    /// transition — including an empty closure, which accepts like
+    /// any other; `false` on an exact accepted-batch replay, which
+    /// reports the stored count and writes nothing.
+    pub applied: bool,
 }
 
 /// One queue row as `GET /api/v1/admin/queue` reports it.
@@ -1368,6 +1670,15 @@ pub struct QueueTask {
     /// (`EnqueueRequest::host_side`).
     #[serde(default)]
     pub host_side: bool,
+    /// The persisted raw value as an exact decimal string: precedence
+    /// bands over `MAX(0, priority) + MAX(0, demand)` — the undivided
+    /// operand `dispatch_key`'s exact-cost rank divides. The integer
+    /// column legitimately outgrows the JavaScript-safe range
+    /// (human-lane values sit above 2^53), so the Durable Object
+    /// projects `CAST(value AS TEXT)` and this field carries the text
+    /// unchanged — parsing or rounding it would corrupt adjacent
+    /// values (stow#525 I10).
+    pub value: String,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].
@@ -1482,30 +1793,8 @@ pub struct CoverageArtifact {
     pub bundle_size: u64,
 }
 
-/// Request body for `POST /api/v1/admin/preheat/plan` — a dry run of the
-/// resolver's closure expansion and dominance pruning for one crate
-/// request. Nothing is enqueued.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PreheatPlanRequest {
-    /// Crate name to plan for.
-    pub crate_name: CrateName,
-    /// Exact version; absent resolves the newest non-prerelease,
-    /// non-yanked published release.
-    #[serde(default)]
-    pub version: Option<CrateVersion>,
-    /// Seed features (`[]` = `--no-default-features` semantics).
-    pub features_json: FeaturesJson,
-    /// One compilation target, or absent for every [`CI_TARGET_TRIPLES`]
-    /// target.
-    #[serde(default)]
-    pub target: Option<TargetTriple>,
-    /// Rustc version; absent resolves the scheduler's stable channel
-    /// version.
-    #[serde(default)]
-    pub rustc_version: Option<WireRustcVersion>,
-}
-
-/// Response of `POST /api/v1/admin/preheat/plan`.
+/// Output of `stow-admin preheat plan` — the dry-run enqueue plan for one
+/// crate request, computed in-process by `stow-resolver`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PreheatPlanResponse {
     /// Crate the plan was computed for.
@@ -1529,70 +1818,6 @@ pub struct PreheatPlanTarget {
     /// names its own dependencies — the row dispatches once every dep is
     /// servable — so tasks with an empty `depends_on` are the wave's
     /// roots.
-    pub tasks: Vec<EnqueueRequest>,
-}
-
-/// Request body for `POST /api/v1/admin/resolve/crate`.
-///
-/// Resolves one published `.crate` into the task batch its crates.io
-/// dependency graph produces. The tarball's bundled `Cargo.lock` is
-/// dropped before the resolve, so the resolve lands on the latest
-/// semver-compatible versions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AdminResolveCrateRequest {
-    /// Crate name on crates.io.
-    pub crate_name: CrateName,
-    /// Exact published version.
-    pub version: CrateVersion,
-    /// Compilation targets to resolve (CI triples).
-    pub targets: Vec<TargetTriple>,
-    /// Stable rustc version the tasks key on.
-    pub rustc_version: WireRustcVersion,
-    /// Download count carried into each task's priority.
-    #[serde(default)]
-    pub downloads: u64,
-}
-
-/// Request body for `POST /api/v1/admin/resolve/project`.
-///
-/// Resolves a GitHub repository's workspace into crate tasks. The
-/// committed `Cargo.lock` is dropped: a project contributes names and
-/// feature sets, never version pins.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AdminResolveProjectRequest {
-    /// Repository in `owner/name` form (codeload host).
-    pub repo: String,
-    /// Ref to fetch — a branch, tag, sha, or `HEAD` for the default branch.
-    pub git_ref: String,
-    /// Compilation targets to resolve (CI triples).
-    pub targets: Vec<TargetTriple>,
-    /// Stable rustc version the tasks key on.
-    pub rustc_version: WireRustcVersion,
-    /// Download count carried into each task's priority.
-    #[serde(default)]
-    pub downloads: u64,
-}
-
-/// Response of the admin resolve endpoints: publish-shape flags plus the
-/// task batch per requested target.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AdminResolveResponse {
-    /// Whether the resolved source ships a `[[bin]]` target — the binaries
-    /// lane's skip condition, read from cargo's own target knowledge.
-    pub has_binary: bool,
-    /// Whether the resolved root package ships a library target.
-    pub has_library: bool,
-    /// One task batch per requested target, in request order.
-    pub targets: Vec<AdminResolveTarget>,
-}
-
-/// One target's task batch inside [`AdminResolveResponse`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct AdminResolveTarget {
-    /// Compilation target the batch was resolved for.
-    pub target: TargetTriple,
-    /// Tasks for every node in the resolved graph; each node's
-    /// `depends_on` names the dependencies that must publish first.
     pub tasks: Vec<EnqueueRequest>,
 }
 
@@ -1766,10 +1991,10 @@ pub mod scheduler_lanes {
     pub const ENQUEUE: &str = "/api/v1/enqueue";
     /// `POST /api/v1/requests` — the human request lane submits to the DO.
     pub const REQUESTS: &str = "/api/v1/requests";
-    /// `GET /api/v1/requests/{task_id}` — the JSON status read hits the DO.
-    pub const REQUEST: &str = "/api/v1/requests/{task_id}";
-    /// `GET /requests/{task_id}` — the request-status page reads the DO.
-    pub const REQUEST_PAGE: &str = "/requests/{task_id}";
+    /// `GET /api/v1/requests/{request_id}` — the JSON status read hits the DO.
+    pub const REQUEST: &str = "/api/v1/requests/{request_id}";
+    /// `GET /requests/{request_id}` — the request-status page reads the DO.
+    pub const REQUEST_PAGE: &str = "/requests/{request_id}";
 
     /// Every scheduler-lane path — the router's mount list and the WAF
     /// rule's block list are both built from this.

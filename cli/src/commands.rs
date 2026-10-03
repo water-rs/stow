@@ -390,6 +390,14 @@ pub async fn update_self() -> stow_types::error::Result<()> {
              installer, so it cannot update itself ({error})"
         )
     })?;
+    update_with(updater).await
+}
+
+/// The update proper once a receipt is loaded, split from the updater's
+/// construction so a test can drive it with the state a receipt would
+/// produce — a foreign `install_prefix` via `set_install_dir` — without
+/// mutating the process environment axoupdater reads its paths from.
+async fn update_with(mut updater: axoupdater::AxoUpdater) -> stow_types::error::Result<()> {
     if !updater
         .check_receipt_is_for_this_executable()
         .map_err(|error| stow_types::stow_error!("check the install receipt: {error}"))?
@@ -799,15 +807,24 @@ fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
 /// recorded), then `<base>_<target>`, `<base>_<target_underscored>`,
 /// `TARGET_<base>`, `HOST_<base>`, `<base>`. `None` means no toolchain was
 /// configured — the shim then resolves the platform's compiler itself.
-fn configured_compiler(real_env: &str, base_env: &str, target: &str) -> Option<String> {
+///
+/// The environment is an injected lookup — `std::env::var_os` on the real
+/// path — so a test answers it from a fixture instead of mutating the
+/// process environment its siblings share.
+fn configured_compiler(
+    real_env: &str,
+    base_env: &str,
+    target: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
     let scoped = target.replace(['-', '.'], "_");
-    std::env::var(real_env)
-        .ok()
-        .or_else(|| std::env::var(format!("{base_env}_{target}")).ok())
-        .or_else(|| std::env::var(format!("{base_env}_{scoped}")).ok())
-        .or_else(|| std::env::var(format!("TARGET_{base_env}")).ok())
-        .or_else(|| std::env::var(format!("HOST_{base_env}")).ok())
-        .or_else(|| std::env::var(base_env).ok())
+    let lookup = |key: &str| env(key).and_then(|value| value.into_string().ok());
+    lookup(real_env)
+        .or_else(|| lookup(&format!("{base_env}_{target}")))
+        .or_else(|| lookup(&format!("{base_env}_{scoped}")))
+        .or_else(|| lookup(&format!("TARGET_{base_env}")))
+        .or_else(|| lookup(&format!("HOST_{base_env}")))
+        .or_else(|| lookup(base_env))
         .filter(|value| !value.trim().is_empty())
 }
 
@@ -815,13 +832,13 @@ fn configured_compiler(real_env: &str, base_env: &str, target: &str) -> Option<S
 /// is — setup records it as `STOW_REAL_CC`; with no entry the shim
 /// resolves per invocation the way the `cc` crate does.
 pub fn configured_c_compiler(target: &str) -> Option<String> {
-    configured_compiler("STOW_REAL_CC", "CC", target)
+    configured_compiler("STOW_REAL_CC", "CC", target, |key| std::env::var_os(key))
 }
 
 /// The C++ compiler the caller configured for `target`; see
 /// [`configured_c_compiler`].
 pub fn configured_cxx_compiler(target: &str) -> Option<String> {
-    configured_compiler("STOW_REAL_CXX", "CXX", target)
+    configured_compiler("STOW_REAL_CXX", "CXX", target, |key| std::env::var_os(key))
 }
 
 /// `.cargo/config.toml` files in `dir`'s ancestors that still carry stow's
@@ -1103,16 +1120,13 @@ mod tests {
     /// same precedence order the `cc` crate resolves it.
     #[test]
     fn configured_compiler_prefers_the_scoped_key() {
-        // SAFETY: nextest runs every test in its own process.
-        unsafe {
-            std::env::set_var("CC_armv7_unknown_linux_gnueabihf", "arm-gcc");
-            std::env::set_var("CC", "cc");
-        }
-        let resolved = super::configured_c_compiler("armv7-unknown-linux-gnueabihf");
-        unsafe {
-            std::env::remove_var("CC_armv7_unknown_linux_gnueabihf");
-            std::env::remove_var("CC");
-        }
+        let env = |key: &str| match key {
+            "CC_armv7_unknown_linux_gnueabihf" => Some(std::ffi::OsString::from("arm-gcc")),
+            "CC" => Some(std::ffi::OsString::from("cc")),
+            _ => None,
+        };
+        let resolved =
+            super::configured_compiler("STOW_REAL_CC", "CC", "armv7-unknown-linux-gnueabihf", env);
         assert_eq!(resolved.as_deref(), Some("arm-gcc"));
     }
 
@@ -1120,20 +1134,10 @@ mod tests {
     /// the platform toolchain per invocation instead of a stale snapshot.
     #[test]
     fn configured_compiler_is_none_without_any_cc_env() {
-        // SAFETY: nextest runs every test in its own process.
-        unsafe {
-            for key in [
-                "STOW_REAL_CC",
-                "CC_riscv64gc_unknown_linux_gnu",
-                "TARGET_CC",
-                "HOST_CC",
-                "CC",
-            ] {
-                std::env::remove_var(key);
-            }
-        }
         assert_eq!(
-            super::configured_c_compiler("riscv64gc-unknown-linux-gnu"),
+            super::configured_compiler("STOW_REAL_CC", "CC", "riscv64gc-unknown-linux-gnu", |_| {
+                None
+            },),
             None
         );
     }
@@ -1283,23 +1287,22 @@ mod tests {
     }
 
     /// `stow update` refuses a receipt recorded for a different install
-    /// prefix instead of reporting "already up to date".
+    /// prefix instead of reporting "already up to date". `set_install_dir`
+    /// writes the field `load_receipt` fills from the receipt, so the test
+    /// drives the same check without touching the environment axoupdater
+    /// reads its search paths from.
     #[tokio::test]
     async fn update_refuses_a_receipt_from_another_prefix() {
-        let receipt_dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            receipt_dir.path().join("stow-cli-receipt.json"),
-            r#"{"binaries":["stow","stow-cc","stow-cxx","stow-cc-launcher","stow-rustc-wrapper","stow-runtime","stow-capture"],"cdylibs":[],"install_prefix":"/elsewhere/bin","provider":{"source":"cargo-dist","version":"0.30.2"},"source":{"app_name":"stow-cli","name":"stow","owner":"water-rs","release_type":"github"},"version":"0.5.0","modify_path":false}"#,
-        )
-        .expect("write receipt");
-        // SAFETY: nextest runs every test in its own process.
-        unsafe {
-            std::env::set_var("AXOUPDATER_CONFIG_PATH", receipt_dir.path());
-        }
-        let error = super::update_self().await.expect_err("must refuse");
+        let mut updater = axoupdater::AxoUpdater::new_for("stow-cli");
+        updater.set_install_dir("/elsewhere/bin");
+        let error = super::update_with(updater).await.expect_err("must refuse");
         assert!(
             format!("{error}").contains("different install prefix"),
             "unexpected error: {error}"
+        );
+        assert!(
+            format!("{error}").contains("/elsewhere"),
+            "the refusal names the foreign prefix: {error}"
         );
     }
 

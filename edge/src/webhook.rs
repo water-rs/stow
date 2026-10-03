@@ -173,63 +173,111 @@ struct ActionOnly {
     action: String,
 }
 
-/// Decode a signed delivery into the event worth completing. `None`
-/// covers everything this hook does not consume — non-`workflow_run`
-/// events (`ping`) and `workflow_run` actions other than `completed`
-/// (`requested`, `in_progress`) all answer 200 so GitHub's delivery log
-/// stays clean. `Err` is a 400: the signature was fine but the payload
-/// is not the shape GitHub documented.
+/// Decode a signed delivery into the `workflow_run` event plus its
+/// action. `None` covers everything this hook does not consume —
+/// non-`workflow_run` events (`ping`) answer 200 so GitHub's delivery
+/// log stays clean; the action is returned for the caller to gate per
+/// workflow (a build run is consumed on `completed`, a resolve run on
+/// `in_progress` and `completed`). `Err` is a 400: the signature was
+/// fine but the payload is not the shape GitHub documented.
 fn decode_delivery(
     delivery: &VerifiedDelivery,
-) -> Result<Option<WorkflowRunEvent>, GetArtifactError> {
+) -> Result<Option<(String, WorkflowRunEvent)>, GetArtifactError> {
     if delivery.event != "workflow_run" {
         return Ok(None);
     }
     let ActionOnly { action } = serde_json::from_slice(&delivery.body).map_err(|error| {
         GetArtifactError::BadRequestWithMessage(format!("malformed workflow_run payload: {error}"))
     })?;
-    if action != "completed" {
+    // The two lifecycle actions any trusted workflow consumes: a build
+    // run reports on `completed`, a resolve run on `in_progress` and
+    // `completed`. `requested`/`queued`/`waiting` deliveries carry the
+    // run but nothing to apply — answer 200 without parsing further.
+    if action != "in_progress" && action != "completed" {
         return Ok(None);
     }
-    // `in_progress`/`requested` runs carry a different shape than
-    // `completed`; the full event is required only for what we consume.
     let event: WorkflowRunEvent = serde_json::from_slice(&delivery.body).map_err(|error| {
         GetArtifactError::BadRequestWithMessage(format!("malformed workflow_run payload: {error}"))
     })?;
-    Ok(Some(event))
+    Ok(Some((action, event)))
 }
 
-/// The authority boundary a completion must sit inside — a fork or a
+/// The subject a pinned run's `run-name` decodes to — each trusted
+/// workflow stamps its own shape.
+#[derive(Debug)]
+enum RunSubject<'a> {
+    /// `build-crate.yml`'s `<rustc>-<task_id>` — a build task's
+    /// completion report.
+    Task {
+        /// The rustc the task targeted.
+        rustc_version: &'a str,
+        /// The task id the run reported on.
+        task_id: &'a str,
+    },
+    /// `resolve-request.yml`'s `resolve-a<attempt>-<request_id>` — the
+    /// human request record's lifecycle signal (stow#428).
+    Request {
+        /// The record's dispatch epoch the run served.
+        attempt: u32,
+        /// The request record the run served.
+        request_id: &'a str,
+    },
+}
+
+/// The authority boundary a run event must sit inside — a fork or a
 /// feature-branch run's signature still verifies, so the run's own
-/// fields are what make it ours: the build workflow's file, on `main`,
-/// dispatched by `workflow_dispatch`, in the trusted repository (its
-/// head repo equal to the event repo, so a fork's delivery cannot
-/// pose as upstream's).
+/// fields are what make it ours: a trusted workflow's file
+/// (`build-crate.yml` or `resolve-request.yml`), on `main`, dispatched
+/// by `workflow_dispatch`, in the trusted repository (its head repo
+/// equal to the event repo, so a fork's delivery cannot pose as
+/// upstream's).
 ///
-/// Returns the run with its title parsed back into `(rustc_version,
-/// task_id)`. A pinned run whose title does not parse is a 400 — the
-/// workflow stamps every run-name itself, so a shapeless title can only
-/// mean a hand-edited dispatch.
+/// Returns the run with its title decoded into its [`RunSubject`]. A
+/// pinned run whose title does not parse is a 400 — the workflow stamps
+/// every run-name itself, so a shapeless title can only mean a
+/// hand-edited dispatch.
 fn authorized_run(
     event: &WorkflowRunEvent,
-) -> Result<Option<(&WorkflowRunFields, &str, &str)>, GetArtifactError> {
+) -> Result<Option<(&WorkflowRunFields, RunSubject<'_>)>, GetArtifactError> {
     let run = &event.workflow_run;
-    let pinned = run.path.strip_prefix(".github/workflows/")
-        == Some(stow_types::trusted_builder::WORKFLOW_FILE)
-        && run.head_branch == stow_types::trusted_builder::BRANCH
+    let pinned = run.head_branch == stow_types::trusted_builder::BRANCH
         && run.event == "workflow_dispatch"
         && run.head_repository.full_name == event.repository.full_name
         && event.repository.full_name == stow_types::trusted_builder::REPOSITORY;
     if !pinned {
         return Ok(None);
     }
-    let Some((rustc_version, task_id)) = parse_run_title(&run.display_title) else {
-        return Err(GetArtifactError::BadRequestWithMessage(format!(
-            "run {}'s display_title {:?} is not <rustc>-<task_id>",
-            run.id, run.display_title
-        )));
+    let subject = match run.path.strip_prefix(".github/workflows/") {
+        Some(stow_types::trusted_builder::WORKFLOW_FILE) => {
+            let Some((rustc_version, task_id)) = parse_run_title(&run.display_title) else {
+                return Err(GetArtifactError::BadRequestWithMessage(format!(
+                    "run {}'s display_title {:?} is not <rustc>-<task_id>",
+                    run.id, run.display_title
+                )));
+            };
+            RunSubject::Task {
+                rustc_version,
+                task_id,
+            }
+        }
+        Some(stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE) => {
+            let Some((attempt, request_id)) =
+                stow_types::records::parse_resolve_run_title(&run.display_title)
+            else {
+                return Err(GetArtifactError::BadRequestWithMessage(format!(
+                    "run {}'s display_title {:?} is not resolve-a<attempt>-<request_id>",
+                    run.id, run.display_title
+                )));
+            };
+            RunSubject::Request {
+                attempt,
+                request_id,
+            }
+        }
+        // Any other workflow in the trusted repo.
+        _ => return Ok(None),
     };
-    Ok(Some((run, rustc_version, task_id)))
+    Ok(Some((run, subject)))
 }
 
 /// Constant-time check of `sha256=<hex>` against the HMAC of `body` under
@@ -251,32 +299,64 @@ fn verify_signature(secret: &str, signature: &str, body: &[u8]) -> Result<(), Ge
 /// `POST /api/v1/github/workflow-run`.
 ///
 /// Everything this hook does not consume answers 200 — a `ping`, a
-/// `requested`/`in_progress` action, and a run outside the authority
-/// boundary are deliveries, not failures, and GitHub retries non-2xx.
-/// Consumed completions always answer 200 too: a retried delivery
-/// changes nothing about an already-completed or unknown task, so the
-/// scheduler's 404/409 answers are logged, not propagated. Only a
-/// malformed payload (400), a bad signature (401), and an upstream
-/// failure (500, worth a GitHub retry) leave the 2xx path.
+/// `requested` action, a resolve run's non-lifecycle action, and a run
+/// outside the authority boundary are deliveries, not failures, and
+/// GitHub retries non-2xx. Consumed events always answer 200 too: a
+/// retried delivery changes nothing about an already-completed task or
+/// settled request record, so the scheduler's 404/409 answers are
+/// logged, not propagated. Only a malformed payload (400), a bad
+/// signature (401), and an upstream failure (500, worth a GitHub
+/// retry) leave the 2xx path.
 #[cfg(target_arch = "wasm32")]
 pub async fn github_workflow_run(
     delivery: VerifiedDelivery,
     State(ghcr): State<GhcrConfig>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let Some(event) = decode_delivery(&delivery)? else {
-        tracing::debug!(event = %delivery.event, "ignoring non-completed webhook delivery");
+    let Some((action, event)) = decode_delivery(&delivery)? else {
+        tracing::debug!(event = %delivery.event, "ignoring non-workflow_run delivery");
         return Ok(Json(OkResponse { ok: true }));
     };
-    let Some((run, rustc_version, task_id)) = authorized_run(&event)? else {
+    let Some((run, subject)) = authorized_run(&event)? else {
         tracing::debug!("ignoring workflow_run outside the authority boundary");
         return Ok(Json(OkResponse { ok: true }));
     };
+    match subject {
+        RunSubject::Task {
+            rustc_version,
+            task_id,
+        } if action == "completed" => {
+            complete_build_task(&ghcr, &scheduler, run, rustc_version, task_id).await?;
+        }
+        RunSubject::Request {
+            attempt,
+            request_id,
+        } if action == "in_progress" || action == "completed" => {
+            update_request_run(&scheduler, run, &action, attempt, request_id).await?;
+        }
+        // A build run's `requested`/`in_progress` and a resolve run's
+        // `requested`/`waiting`: the task's lifecycle starts at
+        // `completed` and the request's record is `accepted` at
+        // dispatch — neither event carries anything to apply.
+        _ => {}
+    }
+    Ok(Json(OkResponse { ok: true }))
+}
 
+/// `build-crate.yml` `completed` — verify the records artifact and
+/// report the task's conclusion to the scheduler.
+#[cfg(target_arch = "wasm32")]
+async fn complete_build_task(
+    ghcr: &GhcrConfig,
+    scheduler: &CfDurableNamespace,
+    run: &WorkflowRunFields,
+    rustc_version: &str,
+    task_id: &str,
+) -> Result<(), GetArtifactError> {
     let mut success = run.conclusion.as_deref() == Some("success");
     let mut error = None;
     if success {
-        match records_artifact_exists(&ghcr, rustc_version, task_id).await {
+        match records_artifact_exists(ghcr, rustc_version, task_id).await {
             Ok(true) => {}
             Ok(false) => {
                 success = false;
@@ -311,7 +391,7 @@ pub async fn github_workflow_run(
         error,
         github_run_id: Some(run.id.to_string()),
     };
-    match scheduler_client::send_run_complete(&scheduler, &completion).await {
+    match scheduler_client::send_run_complete(scheduler, &completion).await {
         Ok(()) => {
             tracing::info!(task_id, success, "workflow_run completion applied");
         }
@@ -330,7 +410,56 @@ pub async fn github_workflow_run(
             });
         }
     }
-    Ok(Json(OkResponse { ok: true }))
+    Ok(())
+}
+
+/// `resolve-request.yml` `in_progress`/`completed` — the request
+/// record's lifecycle channel (`accepted` → `resolving`, and the
+/// backstop that fails a run which finished without an outcome).
+#[cfg(target_arch = "wasm32")]
+async fn update_request_run(
+    scheduler: &CfDurableNamespace,
+    run: &WorkflowRunFields,
+    action: &str,
+    attempt: u32,
+    request_id: &str,
+) -> Result<(), GetArtifactError> {
+    let update = stow_types::api::RequestRunUpdate {
+        attempt,
+        action: if action == "completed" {
+            stow_types::api::RequestRunAction::Completed
+        } else {
+            stow_types::api::RequestRunAction::InProgress
+        },
+        conclusion: run.conclusion.clone(),
+        run_id: Some(run.id.to_string()),
+        run_url: run.html_url.clone(),
+    };
+    match scheduler_client::send_request_run_update(scheduler, request_id, &update).await {
+        Ok(()) => {
+            tracing::info!(request_id, attempt, %action, "request run update applied");
+        }
+        // Unknown record or a superseded attempt — consumed, never an
+        // error back to GitHub: a stale run's events cannot apply to
+        // the record's live attempt by design.
+        Err(crate::errors::SchedulerClientError::Http {
+            status: 404 | 409,
+            body,
+            ..
+        }) => {
+            tracing::warn!(
+                request_id,
+                %body,
+                "request run update did not match the live attempt"
+            );
+        }
+        Err(other) => {
+            return Err(GetArtifactError::from(other)).inspect_err(|error| {
+                tracing::error!(request_id, %error, "forward request run update");
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Whether GHCR holds the task's records artifact — the manifest's
@@ -492,11 +621,12 @@ mod tests {
         assert!(decode_delivery(&delivery).expect("ping decodes").is_none());
     }
 
-    /// `requested`/`in_progress`/`queued` deliveries on the
-    /// `workflow_run` subscription are lifecycle noise — ignored, 200.
+    /// `requested`/`queued`/`waiting` deliveries on the `workflow_run`
+    /// subscription are lifecycle noise — ignored, 200, before the run
+    /// payload is ever parsed.
     #[tokio::test]
-    async fn a_non_completed_action_is_ignored() {
-        for action in ["requested", "in_progress", "queued", "waiting"] {
+    async fn a_non_lifecycle_action_is_ignored() {
+        for action in ["requested", "queued", "waiting"] {
             let body =
                 format!("{{\"action\":\"{action}\",\"repository\":{{}},\"workflow_run\":{{}}}}");
             let delivery = verified("workflow_run", body.as_bytes())
@@ -539,7 +669,7 @@ mod tests {
             let delivery = verified("workflow_run", &body)
                 .await
                 .expect("signed delivery verifies");
-            let event = decode_delivery(&delivery)
+            let (_action, event) = decode_delivery(&delivery)
                 .expect("decodes")
                 .expect("completed action");
             assert!(authorized_run(&event).expect("checks").is_none());
@@ -554,14 +684,77 @@ mod tests {
         let delivery = verified("workflow_run", &body)
             .await
             .expect("signed delivery verifies");
-        let event = decode_delivery(&delivery)
+        let (_action, event) = decode_delivery(&delivery)
             .expect("decodes")
             .expect("completed action");
-        let (run, rustc_version, task_id) =
-            authorized_run(&event).expect("checks").expect("authorized");
+        let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+        let RunSubject::Task {
+            rustc_version,
+            task_id,
+        } = subject
+        else {
+            panic!("build-crate.yml decodes a task subject");
+        };
         assert_eq!(rustc_version, "1.99.0");
         assert_eq!(task_id, "serde-1.0.0-abc123");
         assert_eq!(run.id, 987_654_321_u64);
+    }
+
+    /// A `resolve-request.yml` run on both lifecycle actions decodes
+    /// `resolve-a<attempt>-<request_id>` into the request subject.
+    #[tokio::test]
+    async fn a_resolve_run_decodes_its_request_subject() {
+        for action in ["in_progress", "completed"] {
+            let body = completed_event(|event| {
+                event["action"] = serde_json::json!(action);
+                event["workflow_run"]["path"] = serde_json::json!(format!(
+                    ".github/workflows/{}",
+                    stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE
+                ));
+                event["workflow_run"]["display_title"] = serde_json::json!(
+                    stow_types::records::resolve_run_title(2, "req-serde-1.0.0-ab12")
+                );
+            });
+            let delivery = verified("workflow_run", &body)
+                .await
+                .expect("signed delivery verifies");
+            let (decoded, event) = decode_delivery(&delivery)
+                .expect("decodes")
+                .unwrap_or_else(|| unreachable!("{action} decodes"));
+            assert_eq!(decoded, action);
+            let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+            let RunSubject::Request {
+                attempt,
+                request_id,
+            } = subject
+            else {
+                panic!("resolve-request.yml decodes a request subject");
+            };
+            assert_eq!((attempt, request_id), (2, "req-serde-1.0.0-ab12"));
+            assert_eq!(run.id, 987_654_321_u64);
+        }
+    }
+
+    /// A pinned resolve run whose title is not
+    /// `resolve-a<attempt>-<request_id>` is a 400 — same rule as a
+    /// build run's.
+    #[tokio::test]
+    async fn a_resolve_run_with_a_shapeless_title_is_a_400() {
+        let body = completed_event(|event| {
+            event["workflow_run"]["path"] = serde_json::json!(format!(
+                ".github/workflows/{}",
+                stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE
+            ));
+            event["workflow_run"]["display_title"] = serde_json::json!("not-a-resolve-title");
+        });
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let (_action, event) = decode_delivery(&delivery)
+            .expect("decodes")
+            .expect("completed action");
+        let error = authorized_run(&event).expect_err("shapeless title rejects");
+        assert!(matches!(error, GetArtifactError::BadRequestWithMessage(_)));
     }
 
     /// A pinned run whose title is not `<rustc>-<task_id>` is a 400 —
@@ -575,7 +768,7 @@ mod tests {
         let delivery = verified("workflow_run", &body)
             .await
             .expect("signed delivery verifies");
-        let event = decode_delivery(&delivery)
+        let (_action, event) = decode_delivery(&delivery)
             .expect("decodes")
             .expect("completed action");
         let error = authorized_run(&event).expect_err("shapeless title rejects");
