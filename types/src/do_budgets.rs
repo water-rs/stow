@@ -302,7 +302,7 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // under a positive persisted floor with under-floor bulk
         // deferred in the flags (stow#525). Setup stamps and teardown
         // restore live outside the metered window.
-        name: "alarm pass (floor)",
+        name: "alarm pass (floor claim)",
         statements: 120,
         rows_read: 1_000,
         rows_written: 700,

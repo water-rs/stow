@@ -37,6 +37,59 @@ type DriveRun = for<'a> fn(
     &'a DriveContext,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
+/// The alarm state a drive found on entry — three real states the
+/// cleanup distinguishes: platform alarm never read, nothing armed,
+/// or an alarm armed at a unix-ms timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorAlarm {
+    NotCaptured,
+    Unarmed,
+    Armed(i64),
+}
+
+/// The queue fields a focused claim probe must put back exactly —
+/// the union of every column the pass's writers touch:
+/// `claim_dispatchable_row` (`status`, `generation_id`, `dispatch_attempts`,
+/// `github_run_id`, `claimed_at`, `updated_at`), `retire_covered_rows`
+/// (`status`, `error_msg`), `recover_stale_active_tasks` (`status`,
+/// `error_msg`, `deps_met`, `blocked`, `wake_at`),
+/// `requeue_incomplete_shape_deps` (`status`, `attempt`, `error_msg`,
+/// `request_count`, `deps_met`, `blocked`, `not_before`, `wake_at`,
+/// `shape_requeue`), and `apply_key_updates` (`value`, `dispatch_key`,
+/// `dispatch_eligible`) on the transitioned ids (stow#525).
+#[derive(Debug, Clone, skyzen::FromRow)]
+pub struct RestoreQueueRow {
+    task_id: String,
+    status: String,
+    attempt: i64,
+    error_msg: Option<String>,
+    request_count: i64,
+    deps_met: i64,
+    blocked: i64,
+    not_before: Option<String>,
+    wake_at: Option<String>,
+    /// The raw value as TEXT — values above the JS safe integer range
+    /// (any banded human/Windows score) round-trip losslessly only
+    /// through the `CAST AS TEXT` contract `RANK_SOURCE_SELECT` uses
+    /// (stow#524).
+    value: String,
+    dispatch_key: String,
+    dispatch_eligible: i64,
+    generation_id: String,
+    dispatch_attempts: i64,
+    github_run_id: Option<String>,
+    claimed_at: Option<String>,
+    updated_at: Option<String>,
+    shape_requeue: i64,
+}
+
+/// The `RestoreQueueRow` column list, kept beside the struct so the
+/// snapshot queries and the restore UPDATE can't drift apart.
+const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, request_count, \
+     deps_met, blocked, not_before, wake_at, CAST(value AS TEXT) AS value, dispatch_key, \
+     dispatch_eligible, \
+     generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue";
+
 /// What a drive may reach besides the metered queue `DurableDb`.
 ///
 /// The host gate's context is empty. The workerd probe's carries the
@@ -68,12 +121,18 @@ pub struct DriveContext {
     /// slots assumption — and the re-arm's restore set is exactly
     /// these rows rather than any predicate over row state that could
     /// name a row another lane moved. A focused probe that claims
-    /// without being the measured hot pass keeps its ids in
-    /// `probe_claimed` instead so this divisor stays honest.
+    /// without being the measured hot pass restores from its
+    /// `restore_rows` snapshot instead so this divisor stays honest.
     pub claimed_tasks: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    /// Ids a focused claim probe moved — restored by the drive's
-    /// unmetered cleanup, never counted in `claimed_tasks` (stow#525).
-    pub probe_claimed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The claim-mutable fields every claimable row held before a
+    /// focused probe's pass — captured in the unmetered setup so the
+    /// cleanup restores the exact generation, stamps and counters the
+    /// claim moved, not just `status`/`github_run_id` (stow#525).
+    restore_rows: std::sync::Arc<std::sync::Mutex<Vec<RestoreQueueRow>>>,
+    /// The alarm state a drive found on entry — so the cleanup
+    /// restores exactly the pre-drive state instead of leaving a
+    /// probe arm behind.
+    prior_alarm: std::sync::Arc<std::sync::Mutex<PriorAlarm>>,
 }
 
 impl DriveContext {
@@ -90,7 +149,8 @@ impl DriveContext {
             alarm: None,
             d1_rows: std::sync::Arc::new(std::sync::Mutex::new((0, 0))),
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            probe_claimed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
         }
     }
 
@@ -107,7 +167,8 @@ impl DriveContext {
             alarm: Some(alarm.clone()),
             d1_rows,
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            probe_claimed: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
         })
     }
 
@@ -130,20 +191,29 @@ impl DriveContext {
             .extend(task_ids);
     }
 
-    /// Append the ids a focused (non-hot-pass) claim probe moved —
-    /// kept out of `claimed_tasks` so the launch gate's marginal
-    /// divisor counts only the measured pass's claims (stow#525).
-    fn record_probe_claimed(&self, task_ids: &[String]) {
-        self.probe_claimed
-            .lock()
-            .expect("probe claim record")
-            .extend(task_ids.iter().cloned());
+    /// Record the pre-claim field set the setup snapshot read.
+    fn set_restore_rows(&self, rows: Vec<RestoreQueueRow>) {
+        *self.restore_rows.lock().expect("restore snapshot") = rows;
     }
 
-    /// Take the ids the focused probes claimed so far — their cleanup
-    /// restore set.
-    pub fn take_probe_claimed(&self) -> Vec<String> {
-        std::mem::take(&mut *self.probe_claimed.lock().expect("probe claim record"))
+    /// Take the recorded pre-claim field set for the cleanup's exact
+    /// restore.
+    pub fn take_restore_rows(&self) -> Vec<RestoreQueueRow> {
+        std::mem::take(&mut *self.restore_rows.lock().expect("restore snapshot"))
+    }
+
+    /// Record the alarm state a drive found on entry.
+    fn set_prior_alarm(&self, armed: Option<i64>) {
+        *self.prior_alarm.lock().expect("prior alarm") =
+            armed.map_or(PriorAlarm::Unarmed, PriorAlarm::Armed);
+    }
+
+    /// Take the recorded entry alarm state for the cleanup's restore.
+    pub fn take_prior_alarm(&self) -> PriorAlarm {
+        std::mem::replace(
+            &mut *self.prior_alarm.lock().expect("prior alarm"),
+            PriorAlarm::NotCaptured,
+        )
     }
 
     /// Every task id the pass drives claimed so far, in claim order.
@@ -758,7 +828,23 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         name: "POST /demand",
-        setup: None,
+        setup: Some(|_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                // Capture the alarm state before the drive arms its
+                // probe timestamps — the cleanup restores exactly this
+                // (or deletes the probe's arm when none was set), so a
+                // real armed alarm never leaks past the drive into
+                // later measurements.
+                #[cfg(target_arch = "wasm32")]
+                if let Some(alarm) = ctx.alarm.as_ref() {
+                    let prior = alarm.get_alarm().await.map_err(|error| error.to_string())?;
+                    ctx.set_prior_alarm(prior);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = ctx;
+                Ok(())
+            })
+        }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 // One durable batch on one keyed root — fixture row 101's
@@ -790,7 +876,15 @@ pub const DRIVES: &[Drive] = &[
                         demand: 100,
                     }],
                 };
-                let (report, plan) = queue::demand_pass(db, &request, 0, settings)
+                // The route's own clock on wasm (`alarm_inputs` reads
+                // `Date::now` there); the deterministic epoch only on
+                // the host gate.
+                #[cfg(target_arch = "wasm32")]
+                #[allow(clippy::cast_possible_truncation)]
+                let now_ms = js_sys::Date::now() as i64;
+                #[cfg(not(target_arch = "wasm32"))]
+                let now_ms = 0_i64;
+                let (report, plan) = queue::demand_pass(db, &request, now_ms, settings)
                     .await
                     .map_err(|error| error.to_string())?;
                 if !(report.applied && report.touched_tasks > 0) {
@@ -820,7 +914,9 @@ pub const DRIVES: &[Drive] = &[
                     if armed != Some(future_ms) {
                         return Err(format!("alarm reads {armed:?} after arm at {future_ms}"));
                     }
-                    // The route's own arm for this pass's plan.
+                    // The route's own arm for this pass's plan — the
+                    // cleanup restores the alarm captured on entry, so
+                    // nothing armed survives the drive.
                     queue::arm_alarm(alarm, plan)
                         .await
                         .map_err(|error| error.to_string())?;
@@ -835,7 +931,29 @@ pub const DRIVES: &[Drive] = &[
                 Ok(())
             })
         },
-        cleanup: None,
+        cleanup: Some(|_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                // Put the pre-drive alarm state back: re-arm the
+                // captured timestamp, or delete the probe's arm when
+                // nothing was set — a real armed alarm must not leak
+                // into later drives.
+                #[cfg(target_arch = "wasm32")]
+                if let Some(alarm) = ctx.alarm.as_ref() {
+                    match ctx.take_prior_alarm() {
+                        PriorAlarm::Armed(ms) => {
+                            alarm.set_alarm(ms).await.map_err(|e| e.to_string())?;
+                        }
+                        PriorAlarm::Unarmed => {
+                            alarm.delete_alarm().await.map_err(|e| e.to_string())?;
+                        }
+                        PriorAlarm::NotCaptured => {}
+                    }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                let _ = ctx;
+                Ok(())
+            })
+        }),
     },
     Drive {
         name: "POST /index/published (full)",
@@ -910,8 +1028,8 @@ pub const DRIVES: &[Drive] = &[
         // eligible, and the under-floor-arms-nothing direction is
         // pinned by `under_floor_bulk_arms_no_wake_and_starves_no_page`
         // on the host.
-        name: "alarm pass (floor)",
-        setup: Some(|db, _shape, settings, _ctx| {
+        name: "alarm pass (floor claim)",
+        setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
                 // The floor application's DML half — the same stored-
                 // floor read, conditional backfill and stamp the
@@ -925,15 +1043,211 @@ pub const DRIVES: &[Drive] = &[
                     },
                 )
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+                // The fixture must hold BOTH under-floor directions —
+                // ready-now rows the floor defers, and rows whose own
+                // wake is already deferred — or the probe proves
+                // nothing about the eligible span's boundary. Ready =
+                // the page predicate's wake terms true; deferred =
+                // `not_before` still ahead (the fixture's +30min
+                // rows).
+                let ready = db
+                    .query(
+                        "SELECT COUNT(*) FROM queue \
+                         WHERE status = 'pending' AND deps_met = 1 \
+                           AND dispatch_eligible != 1 \
+                           AND (lane = 'human' OR first_requested_at <= datetime('now', ?)) \
+                           AND not_before <= datetime('now')",
+                    )
+                    .bind(queue::dispatch_cutoff_modifier(
+                        settings.dispatch_min_age_minutes,
+                    ))
+                    .fetch_scalar::<u64>()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let deferred = db
+                    .query(
+                        "SELECT COUNT(*) FROM queue \
+                         WHERE status = 'pending' AND deps_met = 1 \
+                           AND dispatch_eligible != 1 \
+                           AND not_before > datetime('now')",
+                    )
+                    .fetch_scalar::<u64>()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if ready == 0 || deferred == 0 {
+                    return Err(format!(
+                        "floored fixture must hold ready and deferred under-floor bulk: \
+                         ready={ready} deferred={deferred}"
+                    ));
+                }
+                // Bound the snapshot to exactly the writers the pass
+                // can touch (stow#525):
+                // - claim/retire touch rows inside the claim pages —
+                //   `select_dispatchable_frontier` returns the first
+                //   `CLAIM_PAGE_ROWS * CLAIM_MAX_PAGES` rows of the
+                //   production page selection under the live family
+                //   exclusion, the only rows the paged walk can open;
+                // - stale-lease recovery touches active rows past the
+                //   stale window;
+                // - shape requeue touches `completed` rows whose
+                //   dependents are still unmet.
+                // The candidate sets are hard-capped so a fixture that
+                // outgrows the bound fails loudly instead of mutating
+                // rows the restore can't reach.
+                let frontier_ids = queue::select_dispatchable_frontier(db, settings)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if frontier_ids.is_empty() {
+                    return Err(
+                        "floored fixture has no claimable row — nothing for the probe to measure"
+                            .to_owned(),
+                    );
+                }
+                let mut rows = Vec::new();
+                for ids in frontier_ids.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
+                    rows.extend(
+                        db.query(&format!(
+                            "SELECT {RESTORE_COLUMNS} FROM queue \
+                             WHERE task_id IN (SELECT value FROM json_each(?))"
+                        ))
+                        .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
+                        .fetch_all::<RestoreQueueRow>()
+                        .await
+                        .map_err(|error| error.to_string())?,
+                    );
+                }
+                // The snapshot must actually hold a banded value —
+                // above the JS safe integer the TEXT cast is the only
+                // lossless decode, so a fixture without one can't prove
+                // the restore's wide path (stow#525).
+                let has_wide = rows.iter().any(|row| {
+                    row.value
+                        .parse::<u64>()
+                        .expect("queue.value TEXT must be a nonnegative integer")
+                        > 9_007_199_254_740_992
+                });
+                if !has_wide {
+                    return Err(
+                        "floored snapshot holds no value above the JS safe integer — \
+                         the wide-value restore path is unproven"
+                            .to_owned(),
+                    );
+                }
+                // Recovery precondition: stale-lease recovery runs
+                // inside the claim BEFORE paging, so a fixture-holding
+                // stale row would both escape the eligible-frontier
+                // snapshot and change the `full_family` the frontier
+                // was computed under. Assert the production candidate
+                // set is empty — the fixture's in-flight leases run a
+                // day out (stow#525).
+                let stale = db
+                    .query(
+                        "SELECT COUNT(*) FROM queue \
+                         WHERE status IN ('dispatched', 'running') \
+                           AND updated_at <= datetime('now', ?)",
+                    )
+                    .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
+                    .fetch_scalar::<u64>()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if stale > 0 {
+                    return Err(format!(
+                        "floored fixture holds {stale} stale-lease candidate(s) — \
+                         the snapshot can't cover recovery or its capacity shift"
+                    ));
+                }
+                // The shape-requeue writer is a real fixture case (the
+                // canonical seed has one): include its candidates in
+                // the snapshot, hard-capped so an oversized set fails
+                // loudly instead of mutating rows the restore can't
+                // reach.
+                let candidates = db
+                    .query(&format!(
+                        "SELECT {RESTORE_COLUMNS} FROM queue c \
+                         WHERE c.status = 'completed' AND c.shape_requeue = 0 \
+                           AND EXISTS ( \
+                               SELECT 1 FROM queue_dependencies d \
+                               WHERE d.depends_on_task_id = c.task_id \
+                                 AND d.dep_crate_name != '' AND d.dep_host_side >= 0 \
+                                 AND d.dep_met = 0) LIMIT 256"
+                    ))
+                    .fetch_all::<RestoreQueueRow>()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if candidates.len() == 256 {
+                    return Err("shape requeue candidate set reached the snapshot bound — \
+                         fixture contract broken"
+                        .to_owned());
+                }
+                rows.extend(candidates);
+                // Coverage precondition: `retire_covered_rows` is the
+                // pass's one writer the queue snapshot can't see — it
+                // consults the catalog oracle. Run the real
+                // `CatalogCoverage` over the bounded frontier's
+                // identities and assert it covers none — a silent
+                // retire would corrupt the "claims only" cost reading
+                // (stow#525).
+                #[cfg(target_arch = "wasm32")]
+                {
+                    #[derive(skyzen::FromRow)]
+                    struct FrontierIdentity {
+                        crate_name: String,
+                        version: String,
+                        features_json: String,
+                        target: String,
+                        rustc_version: String,
+                        host_side: i64,
+                    }
+                    let d1 = ctx
+                        .d1
+                        .as_ref()
+                        .ok_or_else(|| "floor claim probe needs the counted D1".to_owned())?;
+                    let mut identities = Vec::new();
+                    for ids in frontier_ids.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
+                        identities.extend(
+                            db.query(
+                                "SELECT crate_name, version, features_json, target, \
+                                        rustc_version, host_side FROM queue \
+                                 WHERE task_id IN (SELECT value FROM json_each(?))",
+                            )
+                            .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
+                            .fetch_all::<FrontierIdentity>()
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .into_iter()
+                            .map(|row| queue::SemanticTaskIdentity {
+                                crate_name: row.crate_name,
+                                version: row.version,
+                                features_json: row.features_json,
+                                target: row.target,
+                                rustc_version: row.rustc_version,
+                                host_side: row.host_side != 0,
+                            }),
+                        );
+                    }
+                    let coverage = super::object::CatalogCoverage { db: d1.clone() };
+                    let covered = queue::CoverageOracle::covered(&coverage, &identities)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if !covered.is_empty() {
+                        return Err(format!(
+                            "catalog covers {} frontier identity(s) — \
+                             the pass could retire rows the snapshot can't distinguish",
+                            covered.len()
+                        ));
+                    }
+                }
+                ctx.set_restore_rows(rows);
+                Ok(())
             })
         }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                let claimed = dispatch_pass_drive(db, settings, ctx, false, false).await?;
+                let claimed = floor_claim_probe(db, settings, ctx).await?;
                 if claimed.is_empty() {
                     return Err(
-                        "floored pass claimed nothing — no eligible row reached the claim"
+                        "floored claim probe claimed nothing — no eligible row reached the claim"
                             .to_owned(),
                     );
                 }
@@ -942,44 +1256,91 @@ pub const DRIVES: &[Drive] = &[
         },
         cleanup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
-                let claimed = ctx.take_probe_claimed();
-                // Every claim the floored pass made must be a flagged
-                // row — a leak means the eligible span admitted
-                // under-floor bulk.
-                for ids in claimed.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
-                    let leaked = db
+                let mut errors: Vec<String> = Vec::new();
+                // Leak check FIRST, on the live post-pass flags: every
+                // row the pass left `dispatched` must carry
+                // `dispatch_eligible = 1`, or the eligible span
+                // admitted under-floor bulk. A shape-requeued
+                // under-floor row re-enters `pending` — legitimate,
+                // not a claim — so the predicate reads `dispatched`
+                // only. Done before the restore resets flags.
+                let snapshot = ctx.take_restore_rows();
+                let ids: Vec<String> = snapshot.iter().map(|row| row.task_id.clone()).collect();
+                for chunk in ids.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
+                    match db
                         .query(
                             "SELECT COUNT(*) FROM queue \
                              WHERE task_id IN (SELECT value FROM json_each(?)) \
-                               AND dispatch_eligible != 1",
+                               AND status = 'dispatched' AND dispatch_eligible != 1",
                         )
-                        .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
+                        .bind(queue::enqueue_json(chunk).map_err(|e| e.to_string())?)
                         .fetch_scalar::<u64>()
                         .await
-                        .map_err(|error| error.to_string())?;
-                    if leaked > 0 {
-                        return Err(format!("floored pass claimed {leaked} under-floor row(s)"));
+                    {
+                        Ok(leaked) if leaked > 0 => {
+                            errors.push(format!("floored pass claimed {leaked} under-floor row(s)"));
+                        }
+                        Ok(_) => {}
+                        Err(error) => errors.push(format!("leak check: {error}")),
                     }
                 }
-                // Re-pend exactly the ids this pass claimed: the same
-                // re-entry state a lease reclaim leaves — generation
-                // and claim stamp kept for fencing — keyed chunks like
-                // every id-bounded write, outside the meter.
-                for ids in claimed.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
-                    db.query(
-                        "UPDATE queue SET status = 'pending', github_run_id = NULL \
-                         WHERE task_id IN (SELECT value FROM json_each(?))",
-                    )
-                    .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
-                    .execute()
-                    .await
-                    .map_err(|error| error.to_string())?;
+                // Restore EVERY snapshot row unconditionally, full
+                // preimage — a row recovered to `pending` and reclaimed
+                // `dispatched` in one pass ends with its original
+                // status but a fresh generation/stamp, which a status
+                // diff would miss; only the whole mutable field set is
+                // exact (stow#525).
+                for row in &snapshot {
+                    match db
+                        .query(
+                            "UPDATE queue SET status = ?, attempt = ?, error_msg = ?, \
+                                 request_count = ?, deps_met = ?, blocked = ?, \
+                                 not_before = ?, wake_at = ?, value = CAST(? AS INTEGER), \
+                                 dispatch_key = ?, dispatch_eligible = ?, \
+                                 generation_id = ?, dispatch_attempts = ?, \
+                                 github_run_id = ?, claimed_at = ?, updated_at = ?, \
+                                 shape_requeue = ? \
+                             WHERE task_id = ?",
+                        )
+                        .bind(row.status.clone())
+                        .bind(row.attempt)
+                        .bind(row.error_msg.clone())
+                        .bind(row.request_count)
+                        .bind(row.deps_met)
+                        .bind(row.blocked)
+                        .bind(row.not_before.clone())
+                        .bind(row.wake_at.clone())
+                        .bind(row.value.clone())
+                        .bind(row.dispatch_key.clone())
+                        .bind(row.dispatch_eligible)
+                        .bind(row.generation_id.clone())
+                        .bind(row.dispatch_attempts)
+                        .bind(row.github_run_id.clone())
+                        .bind(row.claimed_at.clone())
+                        .bind(row.updated_at.clone())
+                        .bind(row.shape_requeue)
+                        .bind(row.task_id.clone())
+                        .execute()
+                        .await
+                    {
+                        Ok(result) if result.rows_written == 0 => {
+                            errors.push(format!("snapshot row {} vanished", row.task_id));
+                        }
+                        Ok(_) => {}
+                        Err(error) => errors.push(format!("restore {}: {error}", row.task_id)),
+                    }
                 }
                 // Restore the fixture's floor through the same
-                // operator path — flags and stamp consistent again.
-                queue::apply_dispatch_floor(db, settings)
-                    .await
-                    .map_err(|error| error.to_string())
+                // operator path — flags and stamp consistent again —
+                // then surface every collected error.
+                if let Err(error) = queue::apply_dispatch_floor(db, settings).await {
+                    errors.push(format!("floor restore: {error}"));
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
             })
         }),
     },
@@ -996,7 +1357,7 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                dispatch_pass_drive(db, settings, ctx, false, true)
+                dispatch_pass_drive(db, settings, ctx, false)
                     .await
                     .map(|_| ())
             })
@@ -1015,7 +1376,7 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                dispatch_pass_drive(db, settings, ctx, true, true)
+                dispatch_pass_drive(db, settings, ctx, true)
                     .await
                     .map(|_| ())
             })
@@ -1036,7 +1397,6 @@ async fn dispatch_pass_drive(
     settings: &SchedulerSettings,
     ctx: &DriveContext,
     idle: bool,
-    record: bool,
 ) -> Result<Vec<String>, String> {
     let mut pass_settings = *settings;
     if idle {
@@ -1057,10 +1417,11 @@ async fn dispatch_pass_drive(
             let task_ids = super::object::dispatch_pass(env, db, &pass_settings, &coverage)
                 .await
                 .map_err(|error| error.to_string())?;
-            if record {
-                ctx.record_claimed(task_ids.clone());
-            }
-            ctx.record_probe_claimed(&task_ids);
+            // Only a non-recording focused probe files its claims for
+            // restore — the canonical hot/idle pass owns
+            // `claimed_tasks`, and mixing its ids into the probe list
+            // would let a cleanup re-pend rows it never owned.
+            ctx.record_claimed(task_ids.clone());
             if !idle {
                 // Under `LocalCi` `dispatch_pass` resolves no credential,
                 // but a production claiming pass pays
@@ -1085,14 +1446,70 @@ async fn dispatch_pass_drive(
                 .await
                 .map_err(|error| error.to_string())?;
             let task_ids: Vec<String> = claimed.iter().map(|task| task.task_id.clone()).collect();
-            if record {
-                ctx.record_claimed(task_ids.clone());
-            }
-            ctx.record_probe_claimed(&task_ids);
+            ctx.record_claimed(task_ids.clone());
             task_ids
         }
     };
     queue::next_alarm(db, 0, &pass_settings)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(task_ids)
+}
+
+/// The planner + claim half of a dispatch pass, with no workflow
+/// fan-out: the real `claim_dispatchable_tasks` — stale-lease
+/// recovery, shape requeue, freeze probe, capacity reads and the
+/// paged eligible walk with its coverage oracle — then `next_alarm`
+/// over the post-claim queue. A focused floor probe prices what an
+/// alarm wake pays to plan and claim under the floor; running the
+/// pass's `trigger_build` fan-out instead would dispatch unrecorded
+/// workflows and contaminate the run/outcome/median state later
+/// drives measure (stow#525). The rows it moves restore from the
+/// drive's unmetered `restore_rows` snapshot — the claim ids never
+/// enter `claimed_tasks`, so the launch gate's marginal divisor
+/// counts only the measured hot pass.
+async fn floor_claim_probe(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    #[allow(unused_variables)] ctx: &DriveContext,
+) -> Result<Vec<String>, String> {
+    let task_ids = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let d1 = ctx
+                .d1
+                .as_ref()
+                .ok_or_else(|| "floor claim probe needs the counted D1".to_owned())?;
+            let coverage = super::object::CatalogCoverage { db: d1.clone() };
+            queue::claim_dispatchable_tasks(db, settings, &coverage)
+                .await
+                .map_err(|error| error.to_string())?
+                .iter()
+                .map(|task| task.task_id.clone())
+                .collect::<Vec<String>>()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            queue::claim_dispatchable_tasks(db, settings, &NoCoverage)
+                .await
+                .map_err(|error| error.to_string())?
+                .iter()
+                .map(|task| task.task_id.clone())
+                .collect::<Vec<String>>()
+        }
+    };
+    // The drive's unmetered cleanup restores every touched row from
+    // the setup snapshot — the claim ids stay out of `claimed_tasks`
+    // (the launch gate's marginal divisor counts the hot pass only)
+    // and out of the probe restore list the drain walks.
+    // The real current time on wasm — the plan the pass would arm —
+    // and the deterministic clock the host gate always uses.
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::cast_possible_truncation)]
+    let now_ms = js_sys::Date::now() as i64;
+    #[cfg(not(target_arch = "wasm32"))]
+    let now_ms = 0_i64;
+    queue::next_alarm(db, now_ms, settings)
         .await
         .map_err(|error| error.to_string())?;
     Ok(task_ids)

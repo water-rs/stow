@@ -4118,11 +4118,11 @@ async fn retire_covered_rows(
 /// Upper bound on a claim page's row count — the actual limit is
 /// `min(CLAIM_PAGE_ROWS, 2 × open slots)`, so a pass reads in
 /// proportion to the slots it fills, not to the frontier depth.
-const CLAIM_PAGE_ROWS: i64 = 256;
+pub(super) const CLAIM_PAGE_ROWS: i64 = 256;
 
 /// Pages per claim pass — a frontier deeper than this defers to the
 /// next alarm tick, which the still-full queue reschedules immediately.
-const CLAIM_MAX_PAGES: usize = 8;
+pub(super) const CLAIM_MAX_PAGES: usize = 8;
 
 /// Dispatchable pending rows in claim order, paged through
 /// `idx_queue_dispatch` — the index ordered `(status, deps_met,
@@ -4145,22 +4145,18 @@ const CLAIM_MAX_PAGES: usize = 8;
 /// its open slots and pages again only while that page came back full,
 /// because a family that fills mid-pass is still skipped in Rust and
 /// the walk must see past it.
-async fn select_dispatchable_page(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-    full_family: Option<RunnerFamily>,
-    after: &str,
-    page_rows: i64,
-) -> Result<Vec<TaskRow>, QueueError> {
+/// The production page selection — WHERE terms, family exclusion,
+/// ORDER BY and LIMIT — shared by the paged claim walk and the
+/// floor probe's bounded frontier so the two can't drift (stow#525).
+fn dispatchable_page_sql(columns: &str, full_family: Option<RunnerFamily>) -> String {
     let family_filter = full_family.map_or_else(String::new, |family| {
         format!(
             "AND q.dispatch_family != '{}'",
             dispatch_family_label(family)
         )
     });
-    let sql = format!(
-        "SELECT q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key \
-         FROM queue q \
+    format!(
+        "SELECT {columns} FROM queue q \
          WHERE q.status = 'pending' AND q.deps_met = 1 \
            AND q.dispatch_eligible = 1 \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
@@ -4169,6 +4165,43 @@ async fn select_dispatchable_page(
            {family_filter} \
          ORDER BY q.dispatch_key \
          LIMIT ?",
+    )
+}
+
+/// The bounded eligible frontier one claim pass can touch — the first
+/// `CLAIM_PAGE_ROWS * CLAIM_MAX_PAGES` rows of the production page
+/// selection under the live `full_family` — for the floor probe's
+/// pre-image snapshot (stow#525). The paged walk reads contiguous
+/// keyset slices of exactly this ordered set, so the bound covers
+/// every row the pass can open.
+pub(super) async fn select_dispatchable_frontier(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<Vec<String>, QueueError> {
+    let active = count_active_by_family(db).await?;
+    let macos_slots = settings
+        .max_concurrent_macos_jobs
+        .saturating_sub(active.of(RunnerFamily::MacOs));
+    let full_family = (macos_slots == 0).then_some(RunnerFamily::MacOs);
+    db.query(&dispatchable_page_sql("q.task_id", full_family))
+        .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes))
+        .bind(String::new())
+        .bind(CLAIM_PAGE_ROWS * i64::try_from(CLAIM_MAX_PAGES).unwrap_or(i64::MAX))
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| QueueError::Sql(format!("select dispatchable frontier: {error}")))
+}
+
+async fn select_dispatchable_page(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    full_family: Option<RunnerFamily>,
+    after: &str,
+    page_rows: i64,
+) -> Result<Vec<TaskRow>, QueueError> {
+    let sql = dispatchable_page_sql(
+        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key",
+        full_family,
     );
     let cutoff = dispatch_cutoff_modifier(settings.dispatch_min_age_minutes);
     // The keyset cursor: every real key starts with an inverted-value
@@ -7333,7 +7366,7 @@ async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueE
     Ok(ActiveByFamily { total, by_family })
 }
 
-fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
+pub(super) fn dispatch_cutoff_modifier(dispatch_min_age_minutes: u32) -> String {
     format!("-{dispatch_min_age_minutes} minutes")
 }
 

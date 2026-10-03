@@ -367,7 +367,7 @@ const BUDGETS: &[RouteBudget] = &[
         // claim/plan surface as the hot pass, priced separately so
         // the gate sees planner and claim cost under a positive
         // persisted floor (stow#525).
-        name: "alarm pass (floor)",
+        name: "alarm pass (floor claim)",
         statements: 90,
         rows_read: 500,
         rows_written: 150,
@@ -716,30 +716,60 @@ async fn run_drives(
     log: &Arc<Mutex<Vec<LoggedStatement>>>,
 ) {
     for drive in drives::DRIVES {
-        // Fixture preparation is setup, not the event being priced —
-        // run it unmetered and drop its statements from the log
-        // (stow#525).
-        if let Some(setup) = drive.setup {
-            let keep = log.lock().expect("statement log").len();
-            setup(db, shape, settings, ctx)
-                .await
-                .unwrap_or_else(|error| panic!("{} setup failed: {error}", drive.name));
-            log.lock().expect("statement log").truncate(keep);
-        }
-        let base = log.lock().expect("statement log").len();
-        (drive.run)(db, shape, settings, ctx)
+        run_one_drive(db, shape, settings, ctx, log, drive)
             .await
-            .unwrap_or_else(|error| panic!("{} failed: {error}", drive.name));
-        let statements = log.lock().expect("statement log")[base..].to_vec();
-        let measurement = Measurement::of(statements);
-        check(db, budget_of(drive.name), &measurement).await;
-        if let Some(cleanup) = drive.cleanup {
-            let keep = log.lock().expect("statement log").len();
-            cleanup(db, shape, settings, ctx)
-                .await
-                .unwrap_or_else(|error| panic!("{} cleanup failed: {error}", drive.name));
-            log.lock().expect("statement log").truncate(keep);
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+}
+
+/// One drive's unmetered hooks plus its metered pass and budget check.
+/// Cleanup runs unconditionally once the pass has started — a failing
+/// run can still have moved fixture state, so the isolation promise
+/// holds on the error path exactly as on success — then the drive's
+/// error propagates, with the cleanup's own error appended when both
+/// fail (stow#525).
+async fn run_one_drive(
+    db: &DurableDb,
+    shape: fixture::FixtureShape,
+    settings: &SchedulerSettings,
+    ctx: &drives::DriveContext,
+    log: &Arc<Mutex<Vec<LoggedStatement>>>,
+    drive: &drives::Drive,
+) -> Result<(), String> {
+    // Fixture preparation is setup, not the event being priced — run
+    // it unmetered and drop its statements from the log (stow#525).
+    if let Some(setup) = drive.setup {
+        let keep = log.lock().expect("statement log").len();
+        setup(db, shape, settings, ctx)
+            .await
+            .map_err(|error| format!("{} setup failed: {error}", drive.name))?;
+        log.lock().expect("statement log").truncate(keep);
+    }
+    let base = log.lock().expect("statement log").len();
+    let run_result = (drive.run)(db, shape, settings, ctx).await;
+    let cleanup_result = if let Some(cleanup) = drive.cleanup {
+        let keep = log.lock().expect("statement log").len();
+        let result = cleanup(db, shape, settings, ctx)
+            .await
+            .map_err(|error| format!("{} cleanup failed: {error}", drive.name));
+        log.lock().expect("statement log").truncate(keep);
+        result
+    } else {
+        Ok(())
+    };
+    match (run_result, cleanup_result) {
+        (Ok(()), Ok(())) => {
+            let statements = log.lock().expect("statement log")[base..].to_vec();
+            let measurement = Measurement::of(statements);
+            check(db, budget_of(drive.name), &measurement).await;
+            Ok(())
         }
+        (Err(run_error), Ok(())) => Err(format!("{} failed: {run_error}", drive.name)),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(run_error), Err(cleanup_error)) => Err(format!(
+            "{} failed: {run_error}; cleanup also failed: {cleanup_error}",
+            drive.name
+        )),
     }
 }
 
@@ -1038,5 +1068,79 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
         "each pass completes a fresh attempt epoch: {} then {}",
         first.attempt,
         second.attempt,
+    );
+}
+
+/// A drive that fails mid-pass must still see its cleanup run — the
+/// isolation promise holds on the error path too — and when the
+/// cleanup itself also fails, the error names both failures.
+fn injected_run_failure<'a>(
+    _db: &'a DurableDb,
+    _shape: fixture::FixtureShape,
+    _settings: &'a SchedulerSettings,
+    _ctx: &'a drives::DriveContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async { Err("injected run failure".to_owned()) })
+}
+
+fn marking_cleanup<'a>(
+    db: &'a DurableDb,
+    _shape: fixture::FixtureShape,
+    _settings: &'a SchedulerSettings,
+    _ctx: &'a drives::DriveContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        db.query("INSERT INTO settings (key, value) VALUES ('cleanup-marker', '1')")
+            .execute()
+            .await
+            .map_err(|error| error.to_string())
+            .map(|_| ())
+    })
+}
+
+fn injected_cleanup_failure<'a>(
+    _db: &'a DurableDb,
+    _shape: fixture::FixtureShape,
+    _settings: &'a SchedulerSettings,
+    _ctx: &'a drives::DriveContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async { Err("injected cleanup failure".to_owned()) })
+}
+
+#[tokio::test]
+async fn cleanup_still_runs_after_a_failing_drive() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let ctx = drives::DriveContext::host();
+    let settings = SchedulerSettings::default();
+    let drive = drives::Drive {
+        name: "probe-isolation",
+        setup: None,
+        run: injected_run_failure,
+        cleanup: Some(marking_cleanup),
+    };
+    let error = run_one_drive(&db, fixture::GATE, &settings, &ctx, &log, &drive)
+        .await
+        .expect_err("the failing drive must propagate its error");
+    assert_eq!(error, "probe-isolation failed: injected run failure");
+    let marked = db
+        .query("SELECT COUNT(*) FROM settings WHERE key = 'cleanup-marker'")
+        .fetch_scalar::<u64>()
+        .await
+        .expect("marker read");
+    assert_eq!(marked, 1, "cleanup ran after the failed run");
+
+    let drive = drives::Drive {
+        name: "probe-double-failure",
+        setup: None,
+        run: injected_run_failure,
+        cleanup: Some(injected_cleanup_failure),
+    };
+    let error = run_one_drive(&db, fixture::GATE, &settings, &ctx, &log, &drive)
+        .await
+        .expect_err("both failures must propagate");
+    assert_eq!(
+        error,
+        "probe-double-failure failed: injected run failure; \
+         cleanup also failed: probe-double-failure cleanup failed: injected cleanup failure"
     );
 }

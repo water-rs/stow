@@ -594,56 +594,77 @@ async fn run_drive(
     log.lock().expect("statement log").clear();
     let d1_before = ctx.d1_counts();
     let started_ms = js_sys::Date::now();
-    (drive.run)(metered, shape, settings, ctx)
-        .await
-        .map_err(|error| QueueError::Sql(format!("drive {}: {error}", drive.name)))?;
+    let run_result = (drive.run)(metered, shape, settings, ctx).await;
     // `Date::now()` is milliseconds well below 2^53; the delta is
     // exactly representable and non-negative.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let wall_ms = (js_sys::Date::now() - started_ms).max(0.0) as u64;
     let (d1_rows_read, d1_rows_written) = ctx.d1_counts();
     let statements = std::mem::take(&mut *log.lock().expect("statement log"));
-    let totals = (
-        statements.len() as u64,
-        statements.iter().map(|s| s.rows_read).sum::<u64>(),
-        statements.iter().map(|s| s.rows_written).sum::<u64>(),
-    );
-    let budget = budget_of(drive.name)?;
-    let over = totals.0 > budget.statements
-        || totals.1 > budget.rows_read
-        || totals.2 > budget.rows_written
-        || wall_ms > budget.wall_ms;
-    let row = SchedulerBudgetRow {
-        name: drive.name.to_owned(),
-        statements: totals.0,
-        rows_read: totals.1,
-        rows_written: totals.2,
-        wall_ms,
-        statement_budget: budget.statements,
-        read_budget: budget.rows_read,
-        write_budget: budget.rows_written,
-        wall_budget: budget.wall_ms,
-        d1_rows_read: d1_rows_read.saturating_sub(d1_before.0),
-        d1_rows_written: d1_rows_written.saturating_sub(d1_before.1),
-        over_budget: over,
-        log: statements
-            .into_iter()
-            .map(|metric| SchedulerBudgetStatement {
-                sql: metric.sql,
-                rows_returned: metric.rows_returned,
-                rows_read: metric.rows_read,
-                rows_written: metric.rows_written,
-            })
-            .collect(),
-    };
-    // Symmetric unmetered teardown — a drive restores the flags or
-    // rows its preparation/pass moved, outside the metered window.
-    if let Some(cleanup) = drive.cleanup {
+    // Cleanup is unconditional once the drive's pass has started: a
+    // failing run can still have moved fixture state (armed alarms,
+    // claimed rows, a stamped floor), and the isolation promise must
+    // hold on the error path exactly as on success.
+    let cleanup_result = if let Some(cleanup) = drive.cleanup {
         cleanup(db, shape, settings, ctx)
             .await
-            .map_err(|error| QueueError::Sql(format!("drive {} cleanup: {error}", drive.name)))?;
+            .map_err(|error| format!("drive {} cleanup: {error}", drive.name))
+    } else {
+        Ok(())
+    };
+    let outcome = if let Err(error) = run_result {
+        Err(format!("drive {}: {error}", drive.name))
+    } else {
+        {
+            let totals = (
+                statements.len() as u64,
+                statements.iter().map(|s| s.rows_read).sum::<u64>(),
+                statements.iter().map(|s| s.rows_written).sum::<u64>(),
+            );
+            match budget_of(drive.name) {
+                Err(error) => Err(format!("budget {}: {error}", drive.name)),
+                Ok(budget) => {
+                    let over = totals.0 > budget.statements
+                        || totals.1 > budget.rows_read
+                        || totals.2 > budget.rows_written
+                        || wall_ms > budget.wall_ms;
+                    Ok(SchedulerBudgetRow {
+                        name: drive.name.to_owned(),
+                        statements: totals.0,
+                        rows_read: totals.1,
+                        rows_written: totals.2,
+                        wall_ms,
+                        statement_budget: budget.statements,
+                        read_budget: budget.rows_read,
+                        write_budget: budget.rows_written,
+                        wall_budget: budget.wall_ms,
+                        d1_rows_read: d1_rows_read.saturating_sub(d1_before.0),
+                        d1_rows_written: d1_rows_written.saturating_sub(d1_before.1),
+                        over_budget: over,
+                        log: statements
+                            .into_iter()
+                            .map(|metric| SchedulerBudgetStatement {
+                                sql: metric.sql,
+                                rows_returned: metric.rows_returned,
+                                rows_read: metric.rows_read,
+                                rows_written: metric.rows_written,
+                            })
+                            .collect(),
+                    })
+                }
+            }
+        }
+    };
+    match (outcome, cleanup_result) {
+        (Ok(row), Ok(())) => Ok(row),
+        (Ok(_), Err(cleanup_error)) => Err(QueueError::Sql(cleanup_error)),
+        (Err(run_error), Ok(())) => Err(QueueError::Sql(run_error)),
+        // Both failed — report the drive's own error first, the
+        // cleanup's second, so neither diagnostic is lost.
+        (Err(run_error), Err(cleanup_error)) => Err(QueueError::Sql(format!(
+            "{run_error}; cleanup also failed: {cleanup_error}"
+        ))),
     }
-    Ok(row)
 }
 
 #[cfg(test)]
