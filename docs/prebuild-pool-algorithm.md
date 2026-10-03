@@ -197,7 +197,7 @@ permanent admission into the pool.
 Instead, misses are turned into prioritized overlay candidates and ranked
 against the rest of the queue.
 
-> **Base ordering implemented in [#442](https://github.com/water-rs/stow/issues/442) I6; demand application implemented in [#522](https://github.com/water-rs/stow/issues/522); overlay feed not implemented.** A miss enters the queue in the miss lane and dispatches by its persisted `value` (the download/miss `priority` band plus accumulated demand, FIFO at equal value) once its dependencies are published; `POST /demand` applies durable demand batches that raise unbuilt nodes and their unbuilt closures. Turning misses into the demand batches that feed it is the hourly feed, tracked separately in #523.
+> **Base ordering implemented in [#442](https://github.com/water-rs/stow/issues/442) I6; demand application implemented in [#522](https://github.com/water-rs/stow/issues/522); overlay feed not implemented.** A miss enters the queue in the miss lane and dispatches by its persisted `value` (the download/miss `priority` band plus accumulated demand, FIFO at equal value) once its dependencies are published; `POST /demand` applies durable demand batches that raise unbuilt nodes and their unbuilt closures. Each batch id claims one canonical input: an `accepted` batch is immutable — a same-input replay returns its stored count and writes nothing, a changed input fails — while an unaccepted `prepared` draft may retry the same input only by recomputing the live closure and staging it fresh. Turning misses into the demand batches that feed it is the hourly feed, tracked separately in #523.
 
 ## Candidate Identity
 

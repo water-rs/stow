@@ -2658,29 +2658,37 @@ const UNBUILT_STATUSES: &str = "'pending', 'failed'";
 /// the `UNION` walk dedups diamonds and cycles — while distinct
 /// identities contribute their own deltas to a task they share.
 ///
-/// Durability is keyed on the batch: `demand_batches` durably records
-/// each accepted batch's canonical input and the frozen contribution
-/// set established on first delivery, and `demand_contributions` rows
-/// — `(task_id, batch_id)` `INSERT OR IGNORE`s carrying an `applied`
-/// marker — materialize exactly that set. The fold is driven only by
-/// the batch's own rows — `applied = 0` under the batch index — never
-/// by a task's stored history, so a delivery's cost stays proportional
-/// to what it delivered. The queue fold runs inside the `demand_fold`
-/// trigger on the mark statement itself: claim and increment are one
-/// atomic statement, so a replay folds exactly the pending remainder —
-/// a delivered batch writes nothing, an interrupted one converges from
-/// its stored set even when the live closure has moved on, and a
-/// different batch contributes once. `value` and `dispatch_key`
-/// refresh for the event's own closure only.
+/// Durability is a typed batch record, not a payload blob:
+/// `demand_batches` stores the canonical input's blake3 fingerprint,
+/// the touched count, and a `prepared`/`accepted` state — never the
+/// contribution set itself, which lives relationally as
+/// `demand_contributions` rows keyed by `(task_id, batch_id)` and
+/// staged in JSON chunks bounded well under the workerd string limit.
+/// A delivery whose record says `accepted` answers from the header —
+/// stored count, no writes, no live walk — and a same-id delivery
+/// whose canonical fingerprint differs fails before any write, draft
+/// or accepted. Only a `prepared` record may be retried: staging is
+/// not a promise, so the same input recomputes the CURRENT closure,
+/// clears only this batch's own staged rows, re-stages, and accepts —
+/// a later admission can never wedge an accepted remainder, because
+/// no such state exists.
+///
+/// Acceptance is the last statement, and it is atomic: the guarded
+/// `UPDATE` flipping `prepared` to `accepted` fires the `demand_fold`
+/// trigger, which folds every staged delta into
+/// `demand`/`value`/`dispatch_key` inside that one statement, and a
+/// failure anywhere — including the trigger's own staged-count
+/// `RAISE(ABORT)` — rolls back the transition AND all triggered queue
+/// effects. Once it returns, the batch is complete; nothing accepted
+/// is ever applied again. `value` and `dispatch_key` refresh for the
+/// event's own closure only.
 ///
 /// A batch id is a window identity, not a lookup key: the first
-/// accepted payload wins the id, and a redelivery carrying a
-/// different canonical input fails before any write rather than
-/// silently keeping old deltas beside new ones. Input order and
-/// duplicate identities are canonicalized by summing per-identity
-/// deltas into the sorted `BTreeMap` below, so two spellings of the
-/// same observation share one batch record; a legitimately different
-/// hour is a different batch id (#523 names them).
+/// accepted payload wins the id. Input order and duplicate identities
+/// are canonicalized by summing per-identity deltas into the sorted
+/// `BTreeMap` below, so two spellings of the same observation share
+/// one fingerprint; a legitimately different hour is a different
+/// batch id (#523 names them).
 ///
 /// Validation precedes every mutation: deltas are `u64` checked into
 /// `i64`, per-task sums use checked arithmetic, and the band bound —
@@ -2693,139 +2701,153 @@ pub async fn apply_demand(
     db: &DurableDb,
     request: &stow_types::api::SchedulerDemandRequest,
 ) -> Result<stow_types::api::SchedulerDemandReport, QueueError> {
-    if request.batch_id.is_empty() || request.batch_id.len() > MAX_DEMAND_BATCH_ID_BYTES {
-        return Err(QueueError::Invariant(format!(
-            "demand batch_id must be 1..={MAX_DEMAND_BATCH_ID_BYTES} bytes"
-        )));
-    }
-    if request.entries.is_empty() || request.entries.len() > MAX_DEMAND_BATCH_ENTRIES {
-        return Err(QueueError::Invariant(format!(
-            "demand batch must carry 1..={MAX_DEMAND_BATCH_ENTRIES} entries"
-        )));
-    }
-
-    // Dedupe input identities first: an entry repeated under the same
-    // identity is one demand report, and summing before the walk keeps
-    // "once per task" true at identity granularity too. The BTreeMap's
-    // ordering is the canonicalization — `input` below serializes it
-    // verbatim, so two deliveries of the same observations compare
-    // equal regardless of entry order or duplication.
-    let mut deltas: BTreeMap<[String; 5], i64> = BTreeMap::new();
-    for entry in &request.entries {
-        let delta = u64_to_i64(entry.demand, "demand entry delta")?;
-        let key = [
-            entry.crate_name.as_str().to_owned(),
-            entry.version.to_string(),
-            entry.features_json.raw(),
-            entry.target.as_str().to_owned(),
-            entry.rustc_version.as_str().to_owned(),
-        ];
-        let total = deltas
-            .get(&key)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(delta)
-            .ok_or(QueueError::Overflow {
-                field: "demand entry delta sum",
-                value: u64::MAX,
-            })?;
-        deltas.insert(key, total);
-    }
-    let input = canonical_demand_input(&deltas)?;
+    demand_batch_shape(request)?;
+    let deltas = demand_deltas(&request.entries)?;
+    let input_hash = demand_input_fingerprint(&deltas)?;
 
     // The durable batch record decides whether this delivery walks or
-    // replays — and a recorded id carrying a different canonical input
-    // refuses before a single write.
+    // replays — and a recorded id carrying a different canonical
+    // fingerprint refuses before a single write, draft or accepted.
     let stored = db
-        .query("SELECT input, contributions FROM demand_batches WHERE batch_id = ?")
+        .query(
+            "SELECT input_hash, touched_count, state \
+             FROM demand_batches WHERE batch_id = ?",
+        )
         .bind(request.batch_id.clone())
         .fetch_optional::<DemandBatchRow>()
         .await
         .map_err(|error| format!("probe demand batch record: {error}"))?;
-    let (payload, touched_tasks, acceptance) = if let Some(batch) = stored {
-        if batch.input != input {
+    if let Some(batch) = &stored {
+        if batch.input_hash != input_hash {
             return Err(QueueError::Invariant(format!(
-                "demand batch {} already accepted with a different payload",
+                "demand batch {} already delivered with a different payload",
                 request.batch_id
             )));
         }
-        // Exact replay: the frozen set, not today's closure — a
-        // graph that moved on (roots dispatched, edges met, sides
-        // added) cannot change what this batch means.
-        let rows: Vec<ContributionRow> = serde_json::from_str(&batch.contributions)
-            .map_err(|error| format!("stored demand batch payload: {error}"))?;
-        (
-            batch.contributions,
-            u64::try_from(rows.len()).unwrap_or(u64::MAX),
-            false,
-        )
-    } else {
-        let (payload, touched_tasks) = demand_first_delivery(db, &deltas).await?;
-        (payload, touched_tasks, true)
-    };
-
-    // The band bound is checked over exactly the rows this event will
-    // fold — payload rows with no recorded contribution plus the
-    // batch's stored `applied = 0` remainder — before any write.
-    check_demand_band_bound(db, &payload, &request.batch_id).await?;
-
-    if acceptance {
-        // The acceptance is durable the moment the record lands — an
-        // empty accepted set is a real acceptance, recorded as `[]`
-        // so the id stays claimed. Landing it before the contribution
-        // rows keeps the invariant that a contribution row never
-        // exists without its frozen record: a crash after this
-        // statement replays the stored set into `applied = 0` rows.
-        db.query(
-            "INSERT INTO demand_batches (batch_id, input, contributions) \
-             VALUES (?, ?, ?)",
-        )
-        .bind(request.batch_id.clone())
-        .bind(input)
-        .bind(payload.clone())
-        .execute()
-        .await
-        .map_err(|error| format!("record demand batch: {error}"))?;
+        match batch.state.as_str() {
+            "accepted" => {
+                // Fully accepted replay: the stored header answers —
+                // no writes, no live walk, whatever the graph looks
+                // like now.
+                return Ok(stow_types::api::SchedulerDemandReport {
+                    batch_id: request.batch_id.clone(),
+                    entries: u64::try_from(deltas.len()).unwrap_or(u64::MAX),
+                    touched_tasks: u64::try_from(batch.touched_count).unwrap_or(u64::MAX),
+                    applied: false,
+                });
+            }
+            // An unaccepted draft of the same input may retry — its
+            // staging is not a frozen set and is replaced below.
+            "prepared" => {}
+            state => {
+                return Err(QueueError::Invariant(format!(
+                    "demand batch {} in unexpected state {state:?}",
+                    request.batch_id
+                )));
+            }
+        }
     }
 
-    // Materialize the frozen set — idempotent by key; an interrupted
-    // first delivery's missing rows land here with their stored
-    // deltas. Rows land `applied = 0`: recorded, not yet folded.
-    db.query(
-        "INSERT OR IGNORE INTO demand_contributions \
-             (task_id, batch_id, delta, applied) \
-         SELECT j.value ->> 'tid', ?, \
-                CAST(j.value ->> 'delta' AS INTEGER), 0 \
-         FROM json_each(?) j",
-    )
-    .bind(request.batch_id.clone())
-    .bind(payload)
-    .execute()
-    .await
-    .map_err(|error| format!("record demand contributions: {error}"))?;
+    // New batch or unaccepted retry: recompute the live closure —
+    // union/diamond/cycle semantics exactly as first delivery — and
+    // stage it. Every preflight precedes every mutation.
+    let rows = demand_event_rows(db, &deltas).await?;
+    let chunks = contribution_chunks(&rows)?;
+    for chunk in &chunks {
+        check_demand_band_bound(db, chunk).await?;
+    }
 
-    // Claim and fold in one statement: the `demand_fold` trigger
-    // increments `queue.demand`/`value`/`dispatch_key` per row the mark
-    // flips, inside the same statement — an interrupted delivery
-    // leaves `applied = 0` rows the replay folds, a delivered batch
-    // flips nothing and writes nothing, and cost never leaves the
-    // batch's own index-bounded rows.
-    db.query(
-        "UPDATE demand_contributions SET applied = 1 \
-         WHERE batch_id = ? AND applied = 0",
+    let touched = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+    demand_commit_batch(
+        db,
+        &request.batch_id,
+        input_hash,
+        touched,
+        &chunks,
+        stored.is_some(),
     )
-    .bind(request.batch_id.clone())
-    .execute()
-    .await
-    .map_err(|error| format!("fold demand contributions: {error}"))?;
-    let applied = changes(db).await? > 0;
+    .await?;
 
     Ok(stow_types::api::SchedulerDemandReport {
         batch_id: request.batch_id.clone(),
         entries: u64::try_from(deltas.len()).unwrap_or(u64::MAX),
-        touched_tasks,
-        applied,
+        touched_tasks: u64::try_from(touched).unwrap_or(u64::MAX),
+        applied: true,
     })
+}
+
+/// The write tail of a new or retried delivery: land the `prepared`
+/// header — or clear an unaccepted draft's own staging, which is
+/// replaceable material, never an obligation — stage every chunk
+/// relationally, then flip the state. That last UPDATE is the atomic
+/// acceptance: `demand_fold` folds every staged delta into
+/// `demand`/`value`/`dispatch_key` inside the same statement, the guard's
+/// staged-count keeps a partial set from accepting, and a failure
+/// anywhere — trigger included — aborts the transition AND every
+/// triggered effect.
+async fn demand_commit_batch(
+    db: &DurableDb,
+    batch_id: &str,
+    input_hash: String,
+    touched: i64,
+    chunks: &[String],
+    reprepare: bool,
+) -> Result<(), QueueError> {
+    if reprepare {
+        db.query("DELETE FROM demand_contributions WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .execute()
+            .await
+            .map_err(|error| format!("clear demand staging: {error}"))?;
+    } else {
+        db.query(
+            "INSERT INTO demand_batches \
+             (batch_id, input_hash, touched_count, state) \
+             VALUES (?, ?, ?, 'prepared')",
+        )
+        .bind(batch_id.to_owned())
+        .bind(input_hash)
+        .bind(touched)
+        .execute()
+        .await
+        .map_err(|error| format!("record demand batch: {error}"))?;
+    }
+    // Stage the event's set relationally, in bounded JSON chunks —
+    // deltas cross as decimal text SQLite decodes as INTEGER, so no
+    // value above 2^53 ever rides a JS number.
+    for chunk in chunks {
+        db.query(
+            "INSERT INTO demand_contributions (task_id, batch_id, delta) \
+             SELECT j.value ->> 'tid', ?, \
+                    CAST(j.value ->> 'delta' AS INTEGER) \
+             FROM json_each(?) j",
+        )
+        .bind(batch_id.to_owned())
+        .bind(chunk.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("stage demand contributions: {error}"))?;
+    }
+    db.query(
+        "UPDATE demand_batches \
+         SET state = 'accepted', touched_count = ? \
+         WHERE batch_id = ? AND state = 'prepared' \
+           AND (SELECT count(*) FROM demand_contributions c \
+                WHERE c.batch_id = ?) = ?",
+    )
+    .bind(touched)
+    .bind(batch_id.to_owned())
+    .bind(batch_id.to_owned())
+    .bind(touched)
+    .execute()
+    .await
+    .map_err(|error| format!("accept demand batch: {error}"))?;
+    if changes(db).await? == 0 {
+        return Err(QueueError::Invariant(format!(
+            "demand batch {batch_id} staging incomplete at acceptance"
+        )));
+    }
+    Ok(())
 }
 
 /// One (task, delta) row of a demand batch's fold payload — the
@@ -2849,12 +2871,74 @@ struct CanonicalEntry {
     delta: i64,
 }
 
-/// A `demand_batches` row: the accepted canonical input and the
-/// frozen contribution set it established.
+/// A `demand_batches` row: the canonical input's blake3 fingerprint,
+/// the touched count recorded at acceptance, and the typed state —
+/// `prepared` (unaccepted draft; staging may be replaced on a same-
+/// input retry) or `accepted` (complete, immutable).
 #[derive(Debug, skyzen::FromRow)]
 struct DemandBatchRow {
-    input: String,
-    contributions: String,
+    input_hash: String,
+    touched_count: i64,
+    state: String,
+}
+
+/// The request's shape bounds, checked before any read or write: a
+/// bounded batch id and a bounded, non-empty entry list.
+fn demand_batch_shape(request: &stow_types::api::SchedulerDemandRequest) -> Result<(), QueueError> {
+    if request.batch_id.is_empty() || request.batch_id.len() > MAX_DEMAND_BATCH_ID_BYTES {
+        return Err(QueueError::Invariant(format!(
+            "demand batch_id must be 1..={MAX_DEMAND_BATCH_ID_BYTES} bytes"
+        )));
+    }
+    if request.entries.is_empty() || request.entries.len() > MAX_DEMAND_BATCH_ENTRIES {
+        return Err(QueueError::Invariant(format!(
+            "demand batch must carry 1..={MAX_DEMAND_BATCH_ENTRIES} entries"
+        )));
+    }
+    Ok(())
+}
+
+/// One batch's deduped per-identity deltas: an entry repeated under
+/// the same identity is one demand report, and summing before the
+/// walk keeps "once per task" true at identity granularity too. The
+/// `BTreeMap`'s ordering is the canonicalization — the serialized
+/// form below compares equal regardless of entry order or
+/// duplication.
+fn demand_deltas(
+    entries: &[stow_types::api::SchedulerDemandEntry],
+) -> Result<BTreeMap<[String; 5], i64>, QueueError> {
+    let mut deltas: BTreeMap<[String; 5], i64> = BTreeMap::new();
+    for entry in entries {
+        let delta = u64_to_i64(entry.demand, "demand entry delta")?;
+        let key = [
+            entry.crate_name.as_str().to_owned(),
+            entry.version.to_string(),
+            entry.features_json.raw(),
+            entry.target.as_str().to_owned(),
+            entry.rustc_version.as_str().to_owned(),
+        ];
+        let total = deltas
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(delta)
+            .ok_or(QueueError::Overflow {
+                field: "demand entry delta sum",
+                value: u64::MAX,
+            })?;
+        deltas.insert(key, total);
+    }
+    Ok(deltas)
+}
+
+/// The batch id's payload fingerprint: blake3 of the sorted, summed
+/// canonical entry serialization — the identity a redelivery of the
+/// same observation must carry, and the cheap comparison a changed
+/// payload fails (stow#522).
+fn demand_input_fingerprint(deltas: &BTreeMap<[String; 5], i64>) -> Result<String, QueueError> {
+    Ok(blake3::hash(canonical_demand_input(deltas)?.as_bytes())
+        .to_hex()
+        .to_string())
 }
 
 /// The batch id's accepted-payload fingerprint: the summed per-identity
@@ -2877,15 +2961,15 @@ fn canonical_demand_input(deltas: &BTreeMap<[String; 5], i64>) -> Result<String,
     )
 }
 
-/// A first delivery's payload: one keyed walk per distinct identity,
+/// The event's contribution set: one keyed walk per distinct identity,
 /// `UNION` deduped — a task reached through two roots or two diamond
-/// paths is visited once, and cycles cannot recur — folded into the
-/// serialized (task, delta) set the batch record freezes. Returns the
-/// JSON payload and the touched-task count.
-async fn demand_first_delivery(
+/// paths is visited once, and cycles cannot recur — merged into the
+/// (task, delta) rows a delivery stages. `BTreeMap` order keeps the
+/// staging order deterministic.
+async fn demand_event_rows(
     db: &DurableDb,
     deltas: &BTreeMap<[String; 5], i64>,
-) -> Result<(String, u64), QueueError> {
+) -> Result<Vec<ContributionRow>, QueueError> {
     let mut contributions: BTreeMap<String, i64> = BTreeMap::new();
     for (key, delta) in deltas {
         for task_id in demand_closure_tasks(db, key).await? {
@@ -2901,23 +2985,49 @@ async fn demand_first_delivery(
             contributions.insert(task_id, total);
         }
     }
-    // The JSON payload is the lossless channel: deltas serialize as
-    // decimal text and SQLite's own parser decodes them as INTEGER —
-    // no number binds, so a delta above 2^53 survives the workerd
-    // cursor that an i64 parameter could never cross.
-    let payload = enqueue_json(
-        &contributions
-            .iter()
-            .map(|(task_id, delta)| ContributionRow {
-                tid: task_id.clone(),
-                delta: *delta,
-            })
-            .collect::<Vec<_>>(),
-    )?;
-    Ok((
-        payload,
-        u64::try_from(contributions.len()).unwrap_or(u64::MAX),
-    ))
+    Ok(contributions
+        .iter()
+        .map(|(task_id, delta)| ContributionRow {
+            tid: task_id.clone(),
+            delta: *delta,
+        })
+        .collect())
+}
+
+/// The largest serialized JSON one staging or preflight statement may
+/// bind: workerd bounds a bound string (and a stored row) at 2 MiB,
+/// so chunks stay under a quarter of that — tens of thousands of rows
+/// per statement, never a giant bound string or a giant ledger row.
+const DEMAND_STAGE_CHUNK_BYTES: usize = 512 * 1024;
+
+/// A staged set split into JSON arrays each under
+/// `DEMAND_STAGE_CHUNK_BYTES` of serialized text — a closure whose
+/// whole snapshot would exceed the platform string bound still lands,
+/// row by row, with nothing truncated. The partition measures each
+/// row's own serialized length, but every chunk is serde-serialized
+/// from the typed rows themselves. Deltas serialize as decimal text
+/// SQLite decodes as INTEGER — no number binds, so a delta above
+/// 2^53 survives the workerd cursor an i64 parameter could not cross.
+fn contribution_chunks(rows: &[ContributionRow]) -> Result<Vec<String>, QueueError> {
+    let mut chunks = Vec::new();
+    let mut start = 0_usize;
+    let mut size = 2_usize; // "[]"
+    for (index, row) in rows.iter().enumerate() {
+        let encoded = serde_json::to_string(row)
+            .map_err(|error| QueueError::Sql(format!("encode contribution row: {error}")))?;
+        let needed = encoded.len() + usize::from(index > start);
+        if size + needed > DEMAND_STAGE_CHUNK_BYTES && index > start {
+            chunks.push(enqueue_json(&rows[start..index])?);
+            start = index;
+            size = 2 + encoded.len();
+        } else {
+            size += needed;
+        }
+    }
+    if start < rows.len() {
+        chunks.push(enqueue_json(&rows[start..])?);
+    }
+    Ok(chunks)
 }
 
 /// The unbuilt tasks one demand entry's closure touches: roots are
@@ -2956,40 +3066,24 @@ async fn demand_closure_tasks(
 }
 
 /// The demand band bound, checked over exactly the rows this event
-/// will fold — payload rows with no recorded contribution plus the
-/// batch's stored `applied = 0` remainder (the pending part of an
-/// interrupted earlier delivery) — before any write: `MAX(0,
+/// will fold — the chunk about to stage — before any write: `MAX(0,
 /// priority) + demand + delta` must stay under `PRIORITY_MAX` so
 /// demand cannot outrank a lane or family band. Written as `delta >
 /// bound - priority - demand`, every operand stays inside i64, so the
 /// compare can never promote to REAL — and on overflow the request
 /// errors with the offenders named rather than clamping.
-async fn check_demand_band_bound(
-    db: &DurableDb,
-    payload: &str,
-    batch_id: &str,
-) -> Result<(), QueueError> {
+async fn check_demand_band_bound(db: &DurableDb, payload: &str) -> Result<(), QueueError> {
     let offending: Vec<String> = db
         .query(&format!(
             "SELECT f.tid FROM ( \
                  SELECT j.value ->> 'tid' AS tid, \
                         CAST(j.value ->> 'delta' AS INTEGER) AS delta \
                  FROM json_each(?) j \
-                 WHERE NOT EXISTS ( \
-                     SELECT 1 FROM demand_contributions c \
-                     WHERE c.task_id = j.value ->> 'tid' \
-                       AND c.batch_id = ?) \
-                 UNION ALL \
-                 SELECT c.task_id AS tid, c.delta \
-                 FROM demand_contributions c \
-                 WHERE c.batch_id = ? AND c.applied = 0 \
              ) f \
              JOIN queue q ON q.task_id = f.tid \
              WHERE f.delta > {PRIORITY_MAX} - MAX(0, q.priority) - q.demand"
         ))
         .bind(payload.to_owned())
-        .bind(batch_id.to_owned())
-        .bind(batch_id.to_owned())
         .fetch_scalars::<String>()
         .await
         .map_err(|error| format!("demand band-bound check: {error}"))?;
@@ -5698,28 +5792,46 @@ async fn migrate_generation_identity(
 /// from the same `value_sql`/`dispatch_key_sql` expressions every
 /// other writer uses, so the scoring formula has exactly one source.
 /// The demand ledger's only migration-time work: `demand_batches` and
-/// `demand_contributions` — `applied` column included — are created by
-/// `migrate_schema`'s `schema.sql` application on every path, so the
-/// step that remains is the `demand_fold` trigger built from the same
-/// Rust value/key expressions the writers use (stow#522).
+/// `demand_contributions` are created by `migrate_schema`'s
+/// `schema.sql` application on every path, so the step that remains is
+/// the `demand_fold` trigger built from the same Rust value/key
+/// expressions the writers use (stow#522). The migrate step replaces
+/// the definition outright each run — DROP then CREATE — so a
+/// redeploy always carries the trigger built from the current shared
+/// expressions rather than whichever definition an older deploy left.
 async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
-    let demand = "(queue.demand + NEW.delta)";
+    db.query("DROP TRIGGER IF EXISTS demand_fold")
+        .execute()
+        .await
+        .map_err(|error| format!("drop draft demand fold trigger: {error}"))?;
+    let demand = "(queue.demand + c.delta)";
     let value = value_sql(
         "queue.lane",
         "queue.dispatch_family",
         "queue.priority",
         demand,
     );
+    // Acceptance is one statement: flipping the batch's state to
+    // `accepted` fires this trigger, which folds the whole staged set
+    // into the queue inside that statement, then verifies the staged
+    // count reached the accepted count — `RAISE(ABORT)` on a
+    // shortfall, which rolls the transition AND every triggered queue
+    // effect back out of the same statement. A staged row naming no
+    // queue task simply matches nothing.
     db.query(&format!(
-        "CREATE TRIGGER IF NOT EXISTS demand_fold \
-         AFTER UPDATE OF applied ON demand_contributions \
-         WHEN NEW.applied = 1 AND OLD.applied = 0 \
+        "CREATE TRIGGER demand_fold \
+         AFTER UPDATE OF state ON demand_batches \
+         WHEN NEW.state = 'accepted' AND OLD.state = 'prepared' \
          BEGIN \
              UPDATE queue \
              SET demand = {demand}, value = {value}, dispatch_key = {key} \
-             WHERE queue.task_id = NEW.task_id \
+             FROM demand_contributions c \
+             WHERE c.batch_id = NEW.batch_id AND queue.task_id = c.task_id \
                AND (queue.demand != {demand} OR queue.value != {value} \
                     OR queue.dispatch_key != {key}); \
+             SELECT RAISE(ABORT, 'demand batch staged set short of accepted count') \
+             WHERE (SELECT count(*) FROM demand_contributions c \
+                    WHERE c.batch_id = NEW.batch_id) != NEW.touched_count; \
          END",
         key = dispatch_key_sql(
             &value,
@@ -7698,13 +7810,12 @@ mod sqlite_tests {
         assert_eq!(demand_of(&small, &root).await, 9);
         assert_eq!(demand_of(&large, &root).await, 603);
 
-        // The batch predicate is an index probe, not a ledger scan —
-        // on the fold mark and on both arms of the bound probe.
+        // Every batch-keyed predicate is an index probe, not a ledger
+        // scan — on reprepare's staging clear and on the acceptance
+        // guard's staged count.
         for sql in [
-            "UPDATE demand_contributions SET applied = 1 \
-             WHERE batch_id = ? AND applied = 0",
-            "SELECT c.task_id AS tid, c.delta FROM demand_contributions c \
-             WHERE c.batch_id = ? AND c.applied = 0",
+            "DELETE FROM demand_contributions WHERE batch_id = ?",
+            "SELECT count(*) FROM demand_contributions c WHERE c.batch_id = ?",
         ] {
             let details = db_plan(&small, sql, &["new-hour"]).await;
             assert!(
@@ -7721,47 +7832,78 @@ mod sqlite_tests {
             );
         }
 
-        // A crashed delivery — recorded `applied = 0` rows never
-        // folded — converges on redelivery through the same path.
+        // A delivery that failed after preparing — a `prepared` record
+        // with staged rows — reserves nothing and folds nothing: the
+        // same-input retry recomputes and accepts, and a different
+        // batch never sees the draft's rows.
+        let crashed = vec![demand_entry("root", 7)];
+        db_insert_batch_record(
+            &small,
+            "crashed",
+            &planted_input_hash(&crashed),
+            1,
+            "prepared",
+        )
+        .await;
         db_insert_contribution(&small, &root, "crashed", 7).await;
-        let report = apply(&small, "crashed", vec![demand_entry("root", 7)])
+        let report = apply(&small, "crashed", crashed)
             .await
             .expect("re-deliver crashed batch");
-        assert!(report.applied, "the pending remainder folds");
-        assert_eq!(demand_of(&small, &root).await, 16, "3 + 3 + 7 + recorded 3");
+        assert!(report.applied, "the reprepare accepts");
+        assert_eq!(demand_of(&small, &root).await, 16, "6 + 3 + 7");
+        assert_eq!(batch_state(&small, "crashed").await, "accepted");
     }
 
     async fn db_insert_contribution(db: &DurableDb, task_id: &str, batch_id: &str, delta: i64) {
         db.query(
-            "INSERT INTO demand_contributions (task_id, batch_id, delta, applied) \
-             VALUES (?, ?, ?, 0)",
+            "INSERT INTO demand_contributions (task_id, batch_id, delta) \
+             VALUES (?, ?, ?)",
         )
         .bind(task_id.to_owned())
         .bind(batch_id.to_owned())
         .bind(delta)
         .execute()
         .await
-        .expect("record unapplied contribution");
+        .expect("stage contribution");
     }
 
-    /// One `demand_batches` row with explicit stored payloads — how a
-    /// test plants the half-delivered state a crashed mark leaves.
+    /// One `demand_batches` row with an explicit state — how a test
+    /// plants the unaccepted `prepared` state a failed delivery leaves.
     async fn db_insert_batch_record(
         db: &DurableDb,
         batch_id: &str,
-        input: &str,
-        contributions: &str,
+        input_hash: &str,
+        touched_count: i64,
+        state: &str,
     ) {
         db.query(
-            "INSERT INTO demand_batches (batch_id, input, contributions) \
-             VALUES (?, ?, ?)",
+            "INSERT INTO demand_batches (batch_id, input_hash, touched_count, state) \
+             VALUES (?, ?, ?, ?)",
         )
         .bind(batch_id.to_owned())
-        .bind(input.to_owned())
-        .bind(contributions.to_owned())
+        .bind(input_hash.to_owned())
+        .bind(touched_count)
+        .bind(state.to_owned())
         .execute()
         .await
         .expect("record batch");
+    }
+
+    /// The real canonical-input fingerprint for a batch id — how a
+    /// test's planted `prepared` record carries the input the retry
+    /// will compute, so the retry is a genuine same-input reprepare.
+    fn planted_input_hash(entries: &[stow_types::api::SchedulerDemandEntry]) -> String {
+        super::demand_input_fingerprint(&super::demand_deltas(entries).expect("deltas"))
+            .expect("fingerprint")
+    }
+
+    /// A batch record's current state string, for lifecycle assertions.
+    async fn batch_state(db: &DurableDb, batch_id: &str) -> String {
+        db.query("SELECT state FROM demand_batches WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .fetch_scalar::<String>()
+            .await
+            .expect("batch state")
     }
 
     async fn batch_rows(db: &DurableDb, batch_id: &str) -> u64 {
@@ -7976,7 +8118,7 @@ mod sqlite_tests {
         let first = apply(&db, "h0", vec![demand_entry("absent", 9)])
             .await
             .expect("first delivery");
-        assert!(!first.applied);
+        assert!(first.applied, "an empty accepted set still accepts");
         assert_eq!(first.touched_tasks, 0);
         assert_eq!(batch_rows(&db, "h0").await, 1);
 
@@ -7998,51 +8140,245 @@ mod sqlite_tests {
             .expect_err("conflicting payload must fail");
     }
 
-    /// The recorded-unapplied remainder resumes from the frozen set:
-    /// a batch record plus an `applied = 0` contribution whose mark
-    /// never ran folds on replay even when the live root is no longer
-    /// eligible — the stored set, not the current walk, decides
-    /// (stow#522).
+    /// An unaccepted draft is not a frozen set: a same-input retry on
+    /// a `prepared` record recomputes the CURRENT closure — staging
+    /// from the failed attempt is cleared, tasks the graph no longer
+    /// shows (a completed dep) contribute nothing, and a task that
+    /// entered the closure meanwhile joins the accepted set. The
+    /// draft's own staged rows never fold before acceptance and never
+    /// reserve band (stow#522).
     #[tokio::test]
-    async fn demand_unapplied_remainder_folds_the_frozen_set() {
+    async fn demand_unaccepted_draft_retry_recomputes_the_live_closure() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("root", vec![dependency("leaf")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        // A delivery that failed after preparing: the record and one
+        // staged row exist, nothing accepted, nothing folded.
+        let entries = vec![demand_entry("root", 9)];
+        db_insert_batch_record(&db, "h0", &planted_input_hash(&entries), 2, "prepared").await;
+        db_insert_contribution(&db, &task_id_on("root", TARGET), "h0", 9).await;
+        db_insert_contribution(&db, &task_id_on("leaf", TARGET), "h0", 9).await;
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+        assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 0);
+
+        // The graph moves before the retry: `leaf` completes (out of
+        // the live closure) and `extra` joins it — while another
+        // legitimate batch accepts against the same nodes, proof the
+        // draft's staging reserved no demand.
+        mark_active(&db, "leaf", TARGET, "completed").await;
+        enqueue(&db, &[request("extra", Vec::new())])
+            .await
+            .expect("enqueue extra");
+        db.query(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_met) VALUES (?, ?, 0)",
+        )
+        .bind(task_id_on("root", TARGET))
+        .bind(task_id_on("extra", TARGET))
+        .execute()
+        .await
+        .expect("new edge");
+        apply(&db, "h1", vec![demand_entry("root", 3)])
+            .await
+            .expect("another batch");
+
+        let retry = apply(&db, "h0", entries).await.expect("retry");
+        assert!(retry.applied);
+        assert_eq!(retry.touched_tasks, 2, "root + extra, not leaf");
+        let root = task_id_on("root", TARGET);
+        assert_eq!(demand_of(&db, &root).await, 12, "9 + 3 from h1");
+        assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 12);
+        // `leaf` completed before either acceptance: h1's live closure
+        // skipped it, and the draft's staged row for it was cleared —
+        // its demand is 0, not the staged 9.
+        assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 2, "restaged set");
+        assert_eq!(batch_state(&db, "h0").await, "accepted");
+    }
+
+    /// A failed staging statement leaves only unaccepted material: the
+    /// `prepared` record and its partial rows fold nothing and block
+    /// nothing — the same-input retry clears them and accepts the
+    /// recomputed set exactly once (stow#522).
+    #[tokio::test]
+    async fn demand_failed_staging_leaves_no_fold_and_retries_cleanly() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("root", vec![dependency("leaf")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+
+        // The stage INSERT failed mid-chunk: the record is prepared
+        // and only part of the event's rows landed.
+        let entries = vec![demand_entry("root", 5)];
+        db_insert_batch_record(&db, "h0", &planted_input_hash(&entries), 2, "prepared").await;
+        db_insert_contribution(&db, &task_id_on("root", TARGET), "h0", 5).await;
+
+        // No acceptance happened, so no queue row moved and no demand
+        // was reserved — a whole different batch accepts freely.
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+        apply(&db, "h1", vec![demand_entry("root", 2)])
+            .await
+            .expect("independent batch");
+
+        let retry = apply(&db, "h0", entries).await.expect("retry");
+        assert!(retry.applied);
+        assert_eq!(retry.touched_tasks, 2);
+        let root = task_id_on("root", TARGET);
+        assert_eq!(demand_of(&db, &root).await, 7, "5 recomputed + 2 from h1");
+        assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 7);
+        assert_eq!(contribution_rows(&db, "h0").await, 2);
+    }
+
+    /// An accepted batch's replay is a pure header read: after the
+    /// response is lost and the graph changes — a completed root, a
+    /// new task and side — the redelivery reports the stored count and
+    /// issues zero writes (stow#522).
+    #[tokio::test]
+    async fn demand_accepted_replay_writes_nothing_after_graph_changes() {
+        let (db, log) = counting_memory_db().await.expect("counting db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("root", vec![dependency("leaf")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        let first = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("first delivery");
+        assert_eq!(first.touched_tasks, 2);
+
+        mark_active(&db, "root", TARGET, "completed").await;
+        enqueue(&db, &[request("extra", Vec::new())])
+            .await
+            .expect("enqueue extra");
+
+        let base = log.lock().expect("log").len();
+        let replay = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("replay");
+        assert!(!replay.applied);
+        assert_eq!(replay.touched_tasks, 2, "the stored count answers");
+        let issued = log.lock().expect("log")[base..].to_vec();
+        assert!(
+            issued.iter().all(|s| s.rows_written == 0),
+            "an accepted replay must not write: {issued:?}"
+        );
+        assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 0);
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 4);
+    }
+
+    /// The acceptance statement is statement-atomic: force the
+    /// trigger's staged-count verification to fail after the fold has
+    /// already written a queue row (the raw UPDATE bypasses the
+    /// caller's own count guard), and the abort rolls back the queue
+    /// fold, the staged rows, and the accepted transition alike —
+    /// the batch stays `prepared` and the queue untouched (stow#522).
+    #[tokio::test]
+    async fn demand_acceptance_trigger_failure_rolls_back_everything() {
         let db = memory_db().await.expect("memory db");
         enqueue(&db, &[request("root", Vec::new())])
             .await
             .expect("enqueue");
-        apply(&db, "h0", vec![demand_entry("root", 9)])
-            .await
-            .expect("first delivery");
+        let root = task_id_on("root", TARGET);
 
-        // Simulate a delivery that crashed after recording: the batch
-        // record (same canonical input under a new id) and its
-        // contribution row exist, but the mark never flipped it. The
-        // frozen row is serialized through `ContributionRow` — the same
-        // type the writer freezes — so the planted state is exactly
-        // what a real crash leaves: canonical delta and stored row
-        // delta both 9.
-        let canonical: String = db
-            .query("SELECT input FROM demand_batches WHERE batch_id = ?")
+        // Record says two staged rows; only one landed — the partial
+        // prepared set the guard exists to refuse. A direct state
+        // flip reaches the trigger: the fold writes root's demand,
+        // then the count check aborts the whole statement.
+        let entries = vec![demand_entry("root", 9)];
+        db_insert_batch_record(&db, "h0", &planted_input_hash(&entries), 2, "prepared").await;
+        db_insert_contribution(&db, &root, "h0", 9).await;
+        let error = db
+            .query("UPDATE demand_batches SET state = 'accepted' WHERE batch_id = ?")
             .bind("h0".to_owned())
-            .fetch_scalar::<String>()
+            .execute()
             .await
-            .expect("stored input");
-        let frozen = serde_json::to_string(&[super::ContributionRow {
-            tid: task_id_on("root", TARGET),
-            delta: 9,
-        }])
-        .expect("serialize frozen set");
-        db_insert_batch_record(&db, "h0r", &canonical, &frozen).await;
-        db_insert_contribution(&db, &task_id_on("root", TARGET), "h0r", 9).await;
+            .expect_err("short staged set must abort acceptance");
+        assert!(
+            error.to_string().contains("staged set short"),
+            "abort reason: {error}"
+        );
 
-        // The live root is no longer eligible — a fresh walk would
-        // touch nothing — but the frozen remainder still folds.
-        mark_active(&db, "root", TARGET, "completed").await;
-        let replay = apply(&db, "h0r", vec![demand_entry("root", 9)])
+        assert_eq!(batch_state(&db, "h0").await, "prepared");
+        assert_eq!(demand_of(&db, &root).await, 0, "the fold rolled back");
+        assert_eq!(contribution_rows(&db, "h0").await, 1);
+
+        // And the retry path still works on the rolled-back draft.
+        let report = apply(&db, "h0", entries).await.expect("retry");
+        assert!(report.applied);
+        assert_eq!(demand_of(&db, &root).await, 9);
+    }
+
+    /// A closure whose serialized set would exceed the workerd 2 MiB
+    /// bound lands whole: staging splits into chunks each under
+    /// `DEMAND_STAGE_CHUNK_BYTES`, every row survives, and acceptance
+    /// folds the complete set — no truncation, no giant bound string
+    /// or ledger row (stow#522).
+    #[tokio::test]
+    async fn demand_stages_large_closures_in_bounded_chunks() {
+        const CHAIN: usize = 1_200;
+        // 60k rows of realistic 64-char task ids serialize to ~6 MiB —
+        // far past the 2 MiB bound a single snapshot would hit.
+        let rows: Vec<super::ContributionRow> = (0..60_000)
+            .map(|i| super::ContributionRow {
+                tid: format!("{i:064x}"),
+                delta: 1,
+            })
+            .collect();
+        let chunks = super::contribution_chunks(&rows).expect("chunks");
+        assert!(chunks.len() > 1, "the set must split");
+        let mut seen = 0_usize;
+        for chunk in &chunks {
+            assert!(
+                chunk.len() < super::DEMAND_STAGE_CHUNK_BYTES,
+                "chunk over bound: {} bytes",
+                chunk.len()
+            );
+            let parsed: Vec<super::ContributionRow> =
+                serde_json::from_str(chunk).expect("chunk parses");
+            seen += parsed.len();
+        }
+        assert_eq!(seen, rows.len(), "no row truncated or lost");
+
+        // The end-to-end path on a smaller multi-chunk boundary case:
+        // a closure over a chain long enough to span chunks accepts
+        // with its full count. Sizes of tid strings keep this real —
+        // the staged rows are the queue's own.
+        let db = memory_db().await.expect("memory db");
+        let mut requests: Vec<EnqueueRequest> = Vec::new();
+        for i in 0..CHAIN {
+            let deps = if i + 1 < CHAIN {
+                vec![dependency(&format!("chain-{}", i + 1))]
+            } else {
+                Vec::new()
+            };
+            requests.push(request(&format!("chain-{i}"), deps));
+        }
+        enqueue(&db, &requests).await.expect("enqueue chain");
+        let report = apply(&db, "big", vec![demand_entry("chain-0", 2)])
             .await
-            .expect("replay");
-        assert!(replay.applied);
-        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 18);
-        assert_eq!(contribution_rows(&db, "h0r").await, 1);
+            .expect("large closure");
+        assert!(report.applied);
+        assert_eq!(report.touched_tasks, CHAIN as u64);
+        assert_eq!(contribution_rows(&db, "big").await, CHAIN as u64);
+        assert_eq!(demand_of(&db, &task_id_on("chain-1199", TARGET)).await, 2);
     }
 
     /// Persisted demand counts against the resubmit writer's band:
@@ -8229,8 +8565,9 @@ mod sqlite_tests {
         assert_eq!(claimed[0].crate_name, "more");
     }
 
-    /// An entry whose identity names no queue row is a no-op report —
-    /// `applied` stays false and nothing is written (stow#522).
+    /// An entry whose identity names no queue row is an accepted
+    /// zero-count batch — the id is claimed, the queue untouched
+    /// (stow#522).
     #[tokio::test]
     async fn demand_on_an_unknown_identity_is_a_noop() {
         let db = memory_db().await.expect("memory db");
@@ -8240,9 +8577,11 @@ mod sqlite_tests {
         let report = apply(&db, "h0", vec![demand_entry("absent", 5)])
             .await
             .expect("demand");
-        assert!(!report.applied);
+        assert!(report.applied, "an empty closure still accepts");
         assert_eq!(report.touched_tasks, 0);
         assert_eq!(contribution_rows(&db, "h0").await, 0);
+        assert_eq!(batch_state(&db, "h0").await, "accepted");
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
     }
 
     /// Malformed batches fail at validation, before any queue read or

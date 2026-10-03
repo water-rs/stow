@@ -161,39 +161,45 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     PRIMARY KEY (task_id, depends_on_task_id)
 );
 
--- One accepted demand batch (stow#522): the durable batch/window
+-- One demand batch's durable record (stow#522): the batch/window
 -- identity and payload contract the hourly demand feed (#523) replays
--- against. `input` is the canonical serialized entry set — a
--- redelivery naming this id must carry it byte-identically or fail —
--- and `contributions` freezes the (task, delta) set the first accepted
--- delivery established, so a replay folds exactly that set even after
--- the live closure has moved on. An empty accepted set is stored as
--- `[]`: the id is claimed either way.
+-- against. `input_hash` is the blake3 fingerprint of the canonical
+-- (sorted, summed) entry set — a redelivery naming this id must carry
+-- the same fingerprint or fail, draft or accepted — and `state` is the
+-- typed lifecycle: `prepared` is an unaccepted draft whose staging a
+-- same-input retry may replace, `accepted` is a complete batch whose
+-- replay answers from this header and writes nothing. The
+-- contribution set itself is never stored here — it lives
+-- relationally in demand_contributions, so no row approaches the
+-- platform's string/row size bound.
 CREATE TABLE IF NOT EXISTS demand_batches (
     batch_id TEXT PRIMARY KEY,
-    input TEXT NOT NULL,
-    contributions TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    -- The staged (task, delta) count recorded at acceptance: the
+    -- trigger's staged-count verification and the replay report's
+    -- touched count.
+    touched_count INTEGER NOT NULL CHECK (touched_count >= 0),
+    state TEXT NOT NULL DEFAULT 'prepared'
+        CHECK (state IN ('prepared', 'accepted')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- One demand batch's contribution to one task (stow#522): the durable
--- replay record the hourly demand feed (#523) relies on. Applying a
--- batch inserts keyed rows `OR IGNORE` with `applied = 0`, then flips
--- them in one statement; the `demand_fold` trigger (created at migrate
--- from the shared value/key expressions) folds each flipped row's
--- delta into queue.demand/value/dispatch_key inside that same
--- statement, so an exact replay applies nothing twice and an
--- interrupted delivery converges on redelivery — never a partial
--- increment, never a discarded legitimate batch.
+-- One demand batch's contribution to one task (stow#522): the
+-- event-local staging set — relational rows, never a serialized blob.
+-- Rows under a `prepared` batch are unaccepted draft material a
+-- reprepare may clear wholesale; the guarded `prepared → accepted`
+-- UPDATE on demand_batches fires the `demand_fold` trigger (created at
+-- migrate from the shared value/key expressions), which folds every
+-- staged delta into queue.demand/value/dispatch_key inside that one
+-- statement — statement-atomic acceptance, so an accepted batch has
+-- no unapplied remainder and a replay writes nothing.
 CREATE TABLE IF NOT EXISTS demand_contributions (
     task_id TEXT NOT NULL,
     -- The batch's durable window identity (e.g. the feed hour).
     batch_id TEXT NOT NULL,
     -- This batch's total contribution to the task — the sum of every
     -- entry in the batch whose closure reached it.
-    delta INTEGER NOT NULL,
-    -- Whether this row's delta has been folded into the queue row.
-    applied INTEGER NOT NULL DEFAULT 0,
+    delta INTEGER NOT NULL CHECK (delta >= 0),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, batch_id)
 );
