@@ -155,6 +155,11 @@ impl DurableDbBackend for MeteringBackend {
         let inner = Arc::clone(&self.inner);
         async move { inner.database_size().await }
     }
+
+    fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send {
+        let inner = Arc::clone(&self.inner);
+        async move { inner.sync().await }
+    }
 }
 
 /// One operation's metering session: [`Meter::wrap`] returns the

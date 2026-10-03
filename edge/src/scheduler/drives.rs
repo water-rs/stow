@@ -223,6 +223,139 @@ impl DriveContext {
     }
 }
 
+/// A phase of [`drive_lifecycle`], in execution order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecyclePhase {
+    /// The unmetered fixture hook.
+    Setup,
+    /// The durability barrier confirming all earlier fixture writes
+    /// before the measured window opens.
+    PreSync,
+    /// The metered pass itself.
+    Run,
+    /// The barrier confirming this drive's own writes — inside the
+    /// measured window, so the drive pays its real commit cost.
+    PostSync,
+    /// The unconditional isolation hook.
+    Cleanup,
+}
+
+impl LifecyclePhase {
+    /// The phase's native log label — the exact token the probe's
+    /// `phase=` traces and both harnesses' diagnostics share.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::PreSync => "pre_sync",
+            Self::Run => "run",
+            Self::PostSync => "post_sync",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+/// A boundary of [`drive_lifecycle`], delivered to the observer
+/// immediately before (`Starting`) or after (`Finished`) the phase's
+/// await resolves — the points a probe reads its clock and snapshots
+/// its counters. The callback is synchronous and never awaits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseMark {
+    /// The phase's await is about to begin.
+    Starting(LifecyclePhase),
+    /// The phase's await resolved.
+    Finished(LifecyclePhase),
+}
+
+/// One drive's per-phase outcomes, kept separate so each caller
+/// decides how to price or report the measured window. `None` marks
+/// a phase that never ran: everything after `setup` stays `None` when
+/// setup failed, and `run`/`post_sync` stay `None` when the pre-sync
+/// barrier failed. The barrier errors carry their `pre_sync:`/
+/// `post_sync:` phase labels; the hooks' errors are the drive's own.
+#[derive(Debug)]
+pub struct DriveOutcome {
+    /// The unmetered fixture hook. `Err` aborts the lifecycle —
+    /// neither barrier, the run, nor cleanup ran.
+    pub setup: Result<(), String>,
+    /// The fixture barrier — always attempted once setup succeeded.
+    pub pre_sync: Option<Result<(), String>>,
+    /// The measured pass — `None` when the pre-sync barrier failed.
+    pub run: Option<Result<(), String>>,
+    /// The in-window barrier — attempted whenever the run was, even
+    /// when it failed.
+    pub post_sync: Option<Result<(), String>>,
+    /// The isolation hook — unconditional once setup succeeded,
+    /// including when an earlier phase failed.
+    pub cleanup: Option<Result<(), String>>,
+}
+
+/// The drive lifecycle every harness shares — the workerd probe's
+/// `budget::run_drive` and the host gate's `cost_gate::run_one_drive`
+/// call this one orchestration so the ordering contract exists once:
+/// unmetered `setup` on `db`; `db.sync()` confirming every earlier
+/// fixture write; the measured `run` against `run_db`; a second
+/// `db.sync()` inside the window so the drive's own write
+/// confirmation is part of its cost; then `cleanup` unconditionally.
+/// A failed setup aborts the whole lifecycle; a failed barrier skips
+/// the run but never cleanup; a failed run still post-syncs and
+/// cleans up. `mark` fires at each phase boundary — where a probe
+/// reads its clock — and is synchronous: it must not await, so it
+/// cannot refresh the worker clock or move the span it measures.
+pub async fn drive_lifecycle(
+    drive: &Drive,
+    db: &DurableDb,
+    run_db: &DurableDb,
+    shape: FixtureShape,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+    mark: &mut (dyn FnMut(PhaseMark) + Send),
+) -> DriveOutcome {
+    let mut outcome = DriveOutcome {
+        setup: Ok(()),
+        pre_sync: None,
+        run: None,
+        post_sync: None,
+        cleanup: None,
+    };
+    if let Some(setup) = drive.setup {
+        mark(PhaseMark::Starting(LifecyclePhase::Setup));
+        let result = setup(db, shape, settings, ctx).await;
+        mark(PhaseMark::Finished(LifecyclePhase::Setup));
+        if let Err(error) = result {
+            // Setup's own contract is unchanged: its failure aborts
+            // the drive — no run, no barriers, no cleanup.
+            outcome.setup = Err(error);
+            return outcome;
+        }
+    }
+    mark(PhaseMark::Starting(LifecyclePhase::PreSync));
+    let pre_sync = db
+        .sync()
+        .await
+        .map_err(|error| format!("pre_sync: {error}"));
+    mark(PhaseMark::Finished(LifecyclePhase::PreSync));
+    if pre_sync.is_ok() {
+        mark(PhaseMark::Starting(LifecyclePhase::Run));
+        outcome.run = Some((drive.run)(run_db, shape, settings, ctx).await);
+        mark(PhaseMark::Finished(LifecyclePhase::Run));
+        mark(PhaseMark::Starting(LifecyclePhase::PostSync));
+        outcome.post_sync = Some(
+            db.sync()
+                .await
+                .map_err(|error| format!("post_sync: {error}")),
+        );
+        mark(PhaseMark::Finished(LifecyclePhase::PostSync));
+    }
+    outcome.pre_sync = Some(pre_sync);
+    if let Some(cleanup) = drive.cleanup {
+        mark(PhaseMark::Starting(LifecyclePhase::Cleanup));
+        outcome.cleanup = Some(cleanup(db, shape, settings, ctx).await);
+        mark(PhaseMark::Finished(LifecyclePhase::Cleanup));
+    }
+    outcome
+}
+
 /// One route (or the alarm pass) driven against the seeded queue.
 pub struct Drive {
     /// The route label — the budget table's row key.
@@ -1814,4 +1947,268 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
         );
     }
     (added, retired)
+}
+
+/// The durability-boundary contract of [`drive_lifecycle`], exercised
+/// on the real orchestration against the scripted-sync backend: a
+/// failed pre-sync skips the run but still cleans up, a failed run
+/// still post-syncs and cleans up, a failed post-sync still cleans
+/// up, and every phase failure lands in its own outcome slot. Host
+/// coverage of the exact phase ordering the probe's measured window
+/// brackets on wasm (stow#522).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lifecycle_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{Drive, DriveContext, DriveOutcome, FixtureShape, SchedulerSettings};
+    use crate::scheduler::fixture;
+    use crate::scheduler::test_db::{BackendEvent, scripted_sync_db};
+
+    async fn mark(db: &skyzen_services::durable::DurableDb, key: &str) -> Result<(), String> {
+        db.query(&format!(
+            "INSERT INTO settings (key, value) VALUES ('{key}', '1')"
+        ))
+        .execute()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    fn marking_setup<'a>(
+        db: &'a skyzen_services::durable::DurableDb,
+        _shape: FixtureShape,
+        _settings: &'a SchedulerSettings,
+        _ctx: &'a DriveContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { mark(db, "setup-marker").await })
+    }
+
+    fn marking_run<'a>(
+        db: &'a skyzen_services::durable::DurableDb,
+        _shape: FixtureShape,
+        _settings: &'a SchedulerSettings,
+        _ctx: &'a DriveContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { mark(db, "run-marker").await })
+    }
+
+    fn marking_cleanup<'a>(
+        db: &'a skyzen_services::durable::DurableDb,
+        _shape: FixtureShape,
+        _settings: &'a SchedulerSettings,
+        _ctx: &'a DriveContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { mark(db, "cleanup-marker").await })
+    }
+
+    fn failing_run<'a>(
+        _db: &'a skyzen_services::durable::DurableDb,
+        _shape: FixtureShape,
+        _settings: &'a SchedulerSettings,
+        _ctx: &'a DriveContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("injected run failure".to_owned()) })
+    }
+
+    fn failing_cleanup<'a>(
+        _db: &'a skyzen_services::durable::DurableDb,
+        _shape: FixtureShape,
+        _settings: &'a SchedulerSettings,
+        _ctx: &'a DriveContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("injected cleanup failure".to_owned()) })
+    }
+
+    struct Rig {
+        db: skyzen_services::durable::DurableDb,
+        events: Arc<Mutex<Vec<BackendEvent>>>,
+        ctx: DriveContext,
+        settings: SchedulerSettings,
+    }
+
+    impl Rig {
+        async fn open(syncs: Vec<Result<(), String>>) -> Self {
+            let (db, events) = scripted_sync_db(syncs).await.expect("scripted db");
+            // Construction runs migrate + the permit gate — the log
+            // the tests assert on starts at the drive itself.
+            events.lock().expect("events").clear();
+            Self {
+                db,
+                events,
+                ctx: DriveContext::host(),
+                settings: SchedulerSettings::default(),
+            }
+        }
+
+        async fn drive(&self, drive: &Drive) -> DriveOutcome {
+            super::drive_lifecycle(
+                drive,
+                &self.db,
+                &self.db,
+                fixture::GATE,
+                &self.settings,
+                &self.ctx,
+                &mut |_| {},
+            )
+            .await
+        }
+
+        fn events(&self) -> Vec<BackendEvent> {
+            self.events.lock().expect("events").clone()
+        }
+    }
+
+    async fn marked(db: &skyzen_services::durable::DurableDb, key: &str) -> bool {
+        db.query("SELECT value FROM settings WHERE key = ?")
+            .bind(key.to_owned())
+            .fetch_scalar_optional::<String>()
+            .await
+            .expect("marker read")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_failed_pre_sync_skips_the_run_but_still_cleans_up() {
+        let rig = Rig::open(vec![Err("fixture barrier refused".to_owned())]).await;
+        let drive = Drive {
+            name: "lifecycle probe",
+            setup: None,
+            run: marking_run,
+            cleanup: Some(marking_cleanup),
+        };
+        let outcome = rig.drive(&drive).await;
+        let events = rig.events();
+        let pre_sync = outcome
+            .pre_sync
+            .expect("the fixture barrier ran")
+            .expect_err("the barrier's own failure is retained");
+        assert!(pre_sync.contains("pre_sync"), "{pre_sync}");
+        assert!(outcome.run.is_none(), "the run was skipped");
+        assert!(outcome.post_sync.is_none(), "no in-window barrier");
+        assert!(
+            outcome.cleanup.expect("cleanup ran").is_ok(),
+            "cleanup succeeded",
+        );
+        assert!(!marked(&rig.db, "run-marker").await, "no run write");
+        assert!(marked(&rig.db, "cleanup-marker").await, "cleanup wrote");
+        assert_eq!(
+            &[BackendEvent::Sync, BackendEvent::Execute],
+            events.as_slice(),
+            "only the fixture barrier fired, then cleanup's write",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_still_post_syncs_and_cleans_up() {
+        let rig = Rig::open(vec![Ok(()), Ok(())]).await;
+        let drive = Drive {
+            name: "lifecycle probe",
+            setup: None,
+            run: failing_run,
+            cleanup: Some(marking_cleanup),
+        };
+        let outcome = rig.drive(&drive).await;
+        let events = rig.events();
+        assert_eq!(
+            outcome
+                .run
+                .expect("the run ran")
+                .expect_err("the run's failure is retained"),
+            "injected run failure",
+        );
+        assert!(
+            outcome.post_sync.expect("in-window barrier ran").is_ok(),
+            "the post-sync still ran after the run failed",
+        );
+        assert!(outcome.cleanup.expect("cleanup ran").is_ok());
+        assert!(marked(&rig.db, "cleanup-marker").await, "cleanup wrote");
+        assert_eq!(
+            &[
+                BackendEvent::Sync,
+                BackendEvent::Sync,
+                BackendEvent::Execute,
+            ],
+            events.as_slice(),
+            "both barriers fired around the failed run, then cleanup's write",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_post_sync_still_cleans_up() {
+        let rig = Rig::open(vec![Ok(()), Err("drive barrier refused".to_owned())]).await;
+        let drive = Drive {
+            name: "lifecycle probe",
+            setup: None,
+            run: marking_run,
+            cleanup: Some(marking_cleanup),
+        };
+        let outcome = rig.drive(&drive).await;
+        let post_sync = outcome
+            .post_sync
+            .expect("the in-window barrier ran")
+            .expect_err("the barrier's own failure is retained");
+        assert!(post_sync.contains("post_sync"), "{post_sync}");
+        assert!(outcome.run.expect("the run ran").is_ok());
+        assert!(outcome.cleanup.expect("cleanup ran").is_ok());
+        assert!(marked(&rig.db, "run-marker").await, "the run landed");
+        assert!(marked(&rig.db, "cleanup-marker").await, "cleanup wrote");
+    }
+
+    #[tokio::test]
+    async fn every_phase_failure_is_retained_in_its_own_slot() {
+        let rig = Rig::open(vec![Ok(()), Err("drive barrier refused".to_owned())]).await;
+        let drive = Drive {
+            name: "lifecycle probe",
+            setup: None,
+            run: failing_run,
+            cleanup: Some(failing_cleanup),
+        };
+        let outcome = rig.drive(&drive).await;
+        assert_eq!(
+            outcome
+                .run
+                .expect("the run ran")
+                .expect_err("run failure retained"),
+            "injected run failure",
+        );
+        assert!(
+            outcome
+                .post_sync
+                .expect("in-window barrier ran")
+                .expect_err("post-sync failure retained")
+                .contains("post_sync"),
+        );
+        assert_eq!(
+            outcome
+                .cleanup
+                .expect("cleanup ran")
+                .expect_err("cleanup failure retained"),
+            "injected cleanup failure",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_barriers_bracket_the_measured_window() {
+        let rig = Rig::open(vec![Ok(()), Ok(())]).await;
+        let drive = Drive {
+            name: "lifecycle probe",
+            setup: Some(marking_setup),
+            run: marking_run,
+            cleanup: Some(marking_cleanup),
+        };
+        let outcome = rig.drive(&drive).await;
+        assert!(outcome.setup.is_ok());
+        assert!(outcome.run.expect("the run ran").is_ok());
+        assert_eq!(
+            &[
+                BackendEvent::Execute,
+                BackendEvent::Sync,
+                BackendEvent::Execute,
+                BackendEvent::Sync,
+                BackendEvent::Execute,
+            ],
+            rig.events().as_slice(),
+            "setup writes, fixture barrier, run write, in-window barrier, cleanup",
+        );
+    }
 }

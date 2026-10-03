@@ -723,11 +723,11 @@ async fn run_drives(
 }
 
 /// One drive's unmetered hooks plus its metered pass and budget check.
-/// Cleanup runs unconditionally once the pass has started — a failing
-/// run can still have moved fixture state, so the isolation promise
-/// holds on the error path exactly as on success — then the drive's
-/// error propagates, with the cleanup's own error appended when both
-/// fail (stow#525).
+/// The phase ordering and error retention live in
+/// [`drives::drive_lifecycle`] — shared with the workerd probe — while
+/// this observer owns the gate's bookkeeping: setup/cleanup statements
+/// are fixture work, not the priced event, so the log truncates back
+/// to the mark each phase opened at (stow#525).
 async fn run_one_drive(
     db: &DurableDb,
     shape: fixture::FixtureShape,
@@ -736,26 +736,49 @@ async fn run_one_drive(
     log: &Arc<Mutex<Vec<LoggedStatement>>>,
     drive: &drives::Drive,
 ) -> Result<(), String> {
-    // Fixture preparation is setup, not the event being priced — run
-    // it unmetered and drop its statements from the log (stow#525).
-    if let Some(setup) = drive.setup {
-        let keep = log.lock().expect("statement log").len();
-        setup(db, shape, settings, ctx)
-            .await
-            .map_err(|error| format!("{} setup failed: {error}", drive.name))?;
-        log.lock().expect("statement log").truncate(keep);
+    let mut keep = 0;
+    let mut base = 0;
+    let outcome =
+        drives::drive_lifecycle(
+            drive,
+            db,
+            db,
+            shape,
+            settings,
+            ctx,
+            &mut |mark| match mark {
+                drives::PhaseMark::Starting(
+                    drives::LifecyclePhase::Setup | drives::LifecyclePhase::Cleanup,
+                ) => keep = log.lock().expect("statement log").len(),
+                drives::PhaseMark::Finished(
+                    drives::LifecyclePhase::Setup | drives::LifecyclePhase::Cleanup,
+                ) => log.lock().expect("statement log").truncate(keep),
+                drives::PhaseMark::Finished(drives::LifecyclePhase::PreSync) => {
+                    base = log.lock().expect("statement log").len();
+                }
+                _ => {}
+            },
+        )
+        .await;
+    if let Err(error) = outcome.setup {
+        return Err(format!("{} setup failed: {error}", drive.name));
     }
-    let base = log.lock().expect("statement log").len();
-    let run_result = (drive.run)(db, shape, settings, ctx).await;
-    let cleanup_result = if let Some(cleanup) = drive.cleanup {
-        let keep = log.lock().expect("statement log").len();
-        let result = cleanup(db, shape, settings, ctx)
-            .await
-            .map_err(|error| format!("{} cleanup failed: {error}", drive.name));
-        log.lock().expect("statement log").truncate(keep);
-        result
-    } else {
+    let failures: Vec<String> = [&outcome.pre_sync, &outcome.run, &outcome.post_sync]
+        .into_iter()
+        .filter_map(|phase| {
+            phase
+                .as_ref()
+                .and_then(|result| result.as_ref().err().cloned())
+        })
+        .collect();
+    let run_result = if failures.is_empty() {
         Ok(())
+    } else {
+        Err(failures.join("; "))
+    };
+    let cleanup_result = match &outcome.cleanup {
+        Some(Err(error)) => Err(format!("{} cleanup failed: {error}", drive.name)),
+        _ => Ok(()),
     };
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => {

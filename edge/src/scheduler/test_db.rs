@@ -2,6 +2,7 @@
 //! scheduler's SQL (queue schema, eligibility predicates, lease arithmetic)
 //! is exercised by unit tests instead of only the pure `plan_alarm` policy.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use skyzen_services::durable::{
@@ -192,6 +193,102 @@ impl DurableDbBackend for CountingBackend {
     async fn database_size(&self) -> Result<u64, DurableDbError> {
         self.inner.database_size().await
     }
+
+    async fn sync(&self) -> Result<(), DurableDbError> {
+        self.inner.sync().await
+    }
+}
+
+/// One operation the [`ScriptedSyncBackend`] observed — the
+/// drive-lifecycle tests read the event order to place each `sync`
+/// barrier relative to the statements around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendEvent {
+    /// A read statement ran.
+    Query,
+    /// A write statement ran.
+    Execute,
+    /// The durability barrier was awaited.
+    Sync,
+}
+
+/// A [`SqliteBackend`] wrapper whose `sync` barrier consumes one
+/// scripted result per call: the lifecycle tests script which barrier
+/// fails — first call for the pre-run sync, second for the post-run
+/// one — and read the event log for where each barrier landed relative
+/// to statements. Once the script runs out the barrier resolves `Ok`.
+#[derive(Clone)]
+pub struct ScriptedSyncBackend {
+    inner: SqliteBackend,
+    syncs: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Result<(), String>>>>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<BackendEvent>>>,
+}
+
+impl ScriptedSyncBackend {
+    fn event(&self, event: BackendEvent) {
+        self.events.lock().expect("backend events").push(event);
+    }
+}
+
+impl DurableDbBackend for ScriptedSyncBackend {
+    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        self.event(BackendEvent::Query);
+        self.inner.query(query, params).await
+    }
+
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, DurableDbError> {
+        self.event(BackendEvent::Execute);
+        self.inner.execute(query, params).await
+    }
+
+    async fn database_size(&self) -> Result<u64, DurableDbError> {
+        self.inner.database_size().await
+    }
+
+    fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send {
+        self.event(BackendEvent::Sync);
+        let next = self
+            .syncs
+            .lock()
+            .expect("sync script")
+            .pop_front()
+            .unwrap_or(Ok(()));
+        std::future::ready(next.map_err(backend_error))
+    }
+}
+
+/// Open a fresh in-memory queue database (schema applied) on a
+/// [`ScriptedSyncBackend`]: `syncs` is the barrier's scripted result
+/// queue and the returned event log records each operation in order —
+/// the drive-lifecycle tests' programmable durability barrier.
+///
+/// # Errors
+///
+/// Returns `QueueError::Sql` if the pool cannot be opened or `migrate`
+/// fails.
+pub async fn scripted_sync_db(
+    syncs: Vec<Result<(), String>>,
+) -> Result<
+    (
+        DurableDb,
+        std::sync::Arc<std::sync::Mutex<Vec<BackendEvent>>>,
+    ),
+    QueueError,
+> {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let inner = memory_backend().await?;
+    let db = DurableDb::new(ScriptedSyncBackend {
+        inner: inner.clone(),
+        syncs: std::sync::Arc::new(std::sync::Mutex::new(syncs.into_iter().collect())),
+        events: events.clone(),
+    });
+    queue::migrate(&db, &SchedulerSettings::default()).await?;
+    inner.close_migration();
+    Ok((db, events))
 }
 
 /// The PRAGMA names the Durable Object SQL authorizer accepts — the set
@@ -356,6 +453,15 @@ impl DurableDbBackend for SqliteBackend {
         page_count
             .checked_mul(page_size)
             .ok_or_else(|| backend_error("sqlite database size overflow"))
+    }
+
+    /// The in-memory pool carries no pending persistence I/O: its
+    /// state is volatile for the backend's own lifetime — nothing here
+    /// claims durability across process exit, so there is nothing the
+    /// barrier could wait for.
+    fn sync(&self) -> impl Future<Output = Result<(), DurableDbError>> + Send {
+        let _ = self;
+        std::future::ready(Ok(()))
     }
 }
 
