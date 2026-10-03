@@ -1278,7 +1278,8 @@ pub const DRIVES: &[Drive] = &[
                         .await
                     {
                         Ok(leaked) if leaked > 0 => {
-                            errors.push(format!("floored pass claimed {leaked} under-floor row(s)"));
+                            errors
+                                .push(format!("floored pass claimed {leaked} under-floor row(s)"));
                         }
                         Ok(_) => {}
                         Err(error) => errors.push(format!("leak check: {error}")),
