@@ -855,6 +855,7 @@ pub async fn rearm(
     min_age_minutes: u32,
 ) -> Result<(), QueueError> {
     for statement in [
+        "DELETE FROM demand_batches",
         "DELETE FROM demand_contributions",
         "DELETE FROM queue_dependencies WHERE task_id LIKE '%-%'",
         "DELETE FROM queue WHERE task_id LIKE '%-%'",

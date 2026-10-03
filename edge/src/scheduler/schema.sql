@@ -161,6 +161,21 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     PRIMARY KEY (task_id, depends_on_task_id)
 );
 
+-- One accepted demand batch (stow#522): the durable batch/window
+-- identity and payload contract the hourly demand feed (#523) replays
+-- against. `input` is the canonical serialized entry set — a
+-- redelivery naming this id must carry it byte-identically or fail —
+-- and `contributions` freezes the (task, delta) set the first accepted
+-- delivery established, so a replay folds exactly that set even after
+-- the live closure has moved on. An empty accepted set is stored as
+-- `[]`: the id is claimed either way.
+CREATE TABLE IF NOT EXISTS demand_batches (
+    batch_id TEXT PRIMARY KEY,
+    input TEXT NOT NULL,
+    contributions TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- One demand batch's contribution to one task (stow#522): the durable
 -- replay record the hourly demand feed (#523) relies on. Applying a
 -- batch inserts keyed rows `OR IGNORE` with `applied = 0`, then flips

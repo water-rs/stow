@@ -335,6 +335,44 @@ fn enqueue_json<T: serde::Serialize>(rows: &[T]) -> Result<String, QueueError> {
         .map_err(|error| QueueError::Sql(format!("encode enqueue batch json: {error}")))
 }
 
+/// The prospective `priority + demand` bound for every row an update
+/// batch is about to recompute — checked before the write phase so a
+/// refused resubmit leaves the queue, edges and demand state untouched
+/// (stow#522). Written as `new_priority > bound - demand`, every
+/// operand stays inside i64 (demand is already bounded by the same
+/// rule), so the compare can never promote to REAL — and on overflow
+/// the batch errors with the offenders named rather than clamping or
+/// erasing demand.
+async fn check_update_band_bound(
+    db: &DurableDb,
+    updates: &[BatchedUpdate],
+) -> Result<(), QueueError> {
+    let mut offending: Vec<String> = Vec::new();
+    for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        offending.extend(
+            db.query(&format!(
+                "SELECT q.task_id FROM queue q \
+                 JOIN (SELECT value AS e FROM json_each(?)) j \
+                      ON q.task_id = j.e ->> 'task_id' \
+                 WHERE MAX(0, (MAX(q.downloads, CAST(j.e ->> 'downloads' AS INTEGER)) / 1000) \
+                       + q.miss_count * 10) > {PRIORITY_MAX} - q.demand"
+            ))
+            .bind(enqueue_json(chunk)?)
+            .fetch_scalars::<String>()
+            .await
+            .map_err(|error| format!("update band-bound check: {error}"))?,
+        );
+    }
+    if !offending.is_empty() {
+        return Err(QueueError::Invariant(format!(
+            "resubmit would overflow the priority band on {} task(s): {}",
+            offending.len(),
+            offending.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// `UPDATE queue` for every re-requested row in the chunk, one statement
 /// per slice. Semantics of the old per-request `update_existing_task`,
 /// carried per JSON entry: downloads keep the max, `request_count`
@@ -741,27 +779,6 @@ async fn enqueue_inner(
             });
         }
     }
-    let human_tasks = u32::try_from(
-        requests
-            .iter()
-            .filter(|request| {
-                request_lane(request.source) == TaskLane::Human
-                    && stow_types::api::is_ci_target(request.target.as_str())
-            })
-            .count(),
-    )
-    .map_err(|_| QueueError::Overflow {
-        field: "human-lane task count",
-        value: requests.len() as u64,
-    })?;
-    if human_tasks > 0
-        && !charge_human_daily_budget(db, human_tasks, settings.human_daily_task_budget).await?
-    {
-        return Err(QueueError::HumanDailyBudgetExhausted {
-            attempted: u64::from(human_tasks),
-            budget: u64::from(settings.human_daily_task_budget),
-        });
-    }
     // Prepare the batch in Rust: queue identity, deterministic task id
     // and lane per request, skipping targets no CI runner builds.
     let mut prepared = Vec::with_capacity(requests.len());
@@ -829,6 +846,38 @@ async fn enqueue_inner(
     // updates so a later occurrence of a just-inserted task lands its
     // `request_count` contribution — the per-request loop applied it
     // through `update_existing_task`.
+    // Resubmits recompute `priority` from the new downloads max —
+    // the prospective `priority + demand` of every updated row must
+    // stay under `PRIORITY_MAX` before a single write lands, or the
+    // persisted demand an accepted batch folded would push value out
+    // of its band (stow#522). Fresh inserts carry `demand = 0` and a
+    // priority that cannot exceed `compute_priority`'s own bound, so
+    // only the update set needs the probe.
+    check_update_band_bound(db, &plan.updates).await?;
+    // The human lane spends from a per-UTC-day budget — a mutating
+    // charge, so it runs only after every read-only preflight above
+    // has passed; a refused resubmit must not consume budget.
+    let human_tasks = u32::try_from(
+        requests
+            .iter()
+            .filter(|request| {
+                request_lane(request.source) == TaskLane::Human
+                    && stow_types::api::is_ci_target(request.target.as_str())
+            })
+            .count(),
+    )
+    .map_err(|_| QueueError::Overflow {
+        field: "human-lane task count",
+        value: requests.len() as u64,
+    })?;
+    if human_tasks > 0
+        && !charge_human_daily_budget(db, human_tasks, settings.human_daily_task_budget).await?
+    {
+        return Err(QueueError::HumanDailyBudgetExhausted {
+            attempted: u64::from(human_tasks),
+            budget: u64::from(settings.human_daily_task_budget),
+        });
+    }
     let resync_ids: Vec<String> = plan.resync.keys().cloned().collect();
     let edges: Vec<BatchedDepEdge> = plan.resync.into_values().flatten().collect();
     apply_batched_dependency_sync(db, &resync_ids, &edges).await?;
@@ -2609,17 +2658,29 @@ const UNBUILT_STATUSES: &str = "'pending', 'failed'";
 /// the `UNION` walk dedups diamonds and cycles — while distinct
 /// identities contribute their own deltas to a task they share.
 ///
-/// Durability is keyed on the batch: contribution rows are
-/// `(task_id, batch_id)` `INSERT OR IGNORE`s carrying an `applied`
-/// marker, and the fold is driven only by the batch's own rows —
-/// `applied = 0` under the batch index — never by a task's stored
-/// history, so a delivery's cost stays proportional to what it
-/// delivered. The queue fold runs inside the `demand_fold` trigger on
-/// the mark statement itself: claim and increment are one atomic
-/// statement, so a replay folds exactly the pending remainder — a
-/// delivered batch writes nothing, an interrupted one converges, and
-/// a different batch contributes once. `value` and `dispatch_key`
+/// Durability is keyed on the batch: `demand_batches` durably records
+/// each accepted batch's canonical input and the frozen contribution
+/// set established on first delivery, and `demand_contributions` rows
+/// — `(task_id, batch_id)` `INSERT OR IGNORE`s carrying an `applied`
+/// marker — materialize exactly that set. The fold is driven only by
+/// the batch's own rows — `applied = 0` under the batch index — never
+/// by a task's stored history, so a delivery's cost stays proportional
+/// to what it delivered. The queue fold runs inside the `demand_fold`
+/// trigger on the mark statement itself: claim and increment are one
+/// atomic statement, so a replay folds exactly the pending remainder —
+/// a delivered batch writes nothing, an interrupted one converges from
+/// its stored set even when the live closure has moved on, and a
+/// different batch contributes once. `value` and `dispatch_key`
 /// refresh for the event's own closure only.
+///
+/// A batch id is a window identity, not a lookup key: the first
+/// accepted payload wins the id, and a redelivery carrying a
+/// different canonical input fails before any write rather than
+/// silently keeping old deltas beside new ones. Input order and
+/// duplicate identities are canonicalized by summing per-identity
+/// deltas into the sorted `BTreeMap` below, so two spellings of the
+/// same observation share one batch record; a legitimately different
+/// hour is a different batch id (#523 names them).
 ///
 /// Validation precedes every mutation: deltas are `u64` checked into
 /// `i64`, per-task sums use checked arithmetic, and the band bound —
@@ -2645,7 +2706,10 @@ pub async fn apply_demand(
 
     // Dedupe input identities first: an entry repeated under the same
     // identity is one demand report, and summing before the walk keeps
-    // "once per task" true at identity granularity too.
+    // "once per task" true at identity granularity too. The BTreeMap's
+    // ordering is the canonicalization — `input` below serializes it
+    // verbatim, so two deliveries of the same observations compare
+    // equal regardless of entry order or duplication.
     let mut deltas: BTreeMap<[String; 5], i64> = BTreeMap::new();
     for entry in &request.entries {
         let delta = u64_to_i64(entry.demand, "demand entry delta")?;
@@ -2667,54 +2731,66 @@ pub async fn apply_demand(
             })?;
         deltas.insert(key, total);
     }
+    let input = canonical_demand_input(&deltas)?;
 
-    // One keyed walk per distinct identity; UNION dedups — a task
-    // reached through two roots or two diamond paths is visited once,
-    // and cycles cannot recur.
-    let mut contributions: BTreeMap<String, i64> = BTreeMap::new();
-    for (key, delta) in &deltas {
-        for task_id in demand_closure_tasks(db, key).await? {
-            let total = contributions
-                .get(&task_id)
-                .copied()
-                .unwrap_or(0)
-                .checked_add(*delta)
-                .ok_or(QueueError::Overflow {
-                    field: "task demand contribution",
-                    value: u64::MAX,
-                })?;
-            contributions.insert(task_id, total);
+    // The durable batch record decides whether this delivery walks or
+    // replays — and a recorded id carrying a different canonical input
+    // refuses before a single write.
+    let stored = db
+        .query("SELECT input, contributions FROM demand_batches WHERE batch_id = ?")
+        .bind(request.batch_id.clone())
+        .fetch_optional::<DemandBatchRow>()
+        .await
+        .map_err(|error| format!("probe demand batch record: {error}"))?;
+    let (payload, touched_tasks, acceptance) = if let Some(batch) = stored {
+        if batch.input != input {
+            return Err(QueueError::Invariant(format!(
+                "demand batch {} already accepted with a different payload",
+                request.batch_id
+            )));
         }
-    }
-    if contributions.is_empty() {
-        return Ok(stow_types::api::SchedulerDemandReport {
-            batch_id: request.batch_id.clone(),
-            entries: u64::try_from(deltas.len()).unwrap_or(u64::MAX),
-            touched_tasks: 0,
-            applied: false,
-        });
-    }
-
-    // The JSON payload is the lossless channel: deltas serialize as
-    // decimal text and SQLite's own parser decodes them as INTEGER —
-    // no number binds, so a delta above 2^53 survives the workerd
-    // cursor that an i64 parameter could never cross.
-    let rows: Vec<ContributionRow> = contributions
-        .iter()
-        .map(|(task_id, delta)| ContributionRow {
-            tid: task_id.clone(),
-            delta: *delta,
-        })
-        .collect();
-    let payload = enqueue_json(&rows)?;
+        // Exact replay: the frozen set, not today's closure — a
+        // graph that moved on (roots dispatched, edges met, sides
+        // added) cannot change what this batch means.
+        let rows: Vec<ContributionRow> = serde_json::from_str(&batch.contributions)
+            .map_err(|error| format!("stored demand batch payload: {error}"))?;
+        (
+            batch.contributions,
+            u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            false,
+        )
+    } else {
+        let (payload, touched_tasks) = demand_first_delivery(db, &deltas).await?;
+        (payload, touched_tasks, true)
+    };
 
     // The band bound is checked over exactly the rows this event will
-    // fold, before any write.
+    // fold — payload rows with no recorded contribution plus the
+    // batch's stored `applied = 0` remainder — before any write.
     check_demand_band_bound(db, &payload, &request.batch_id).await?;
 
-    // The durable record — idempotent by key; first-write-wins if a
-    // replayed batch's payload ever differs. Rows land `applied = 0`:
-    // recorded, not yet folded.
+    if acceptance {
+        // The acceptance is durable the moment the record lands — an
+        // empty accepted set is a real acceptance, recorded as `[]`
+        // so the id stays claimed. Landing it before the contribution
+        // rows keeps the invariant that a contribution row never
+        // exists without its frozen record: a crash after this
+        // statement replays the stored set into `applied = 0` rows.
+        db.query(
+            "INSERT INTO demand_batches (batch_id, input, contributions) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(request.batch_id.clone())
+        .bind(input)
+        .bind(payload.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("record demand batch: {error}"))?;
+    }
+
+    // Materialize the frozen set — idempotent by key; an interrupted
+    // first delivery's missing rows land here with their stored
+    // deltas. Rows land `applied = 0`: recorded, not yet folded.
     db.query(
         "INSERT OR IGNORE INTO demand_contributions \
              (task_id, batch_id, delta, applied) \
@@ -2747,16 +2823,101 @@ pub async fn apply_demand(
     Ok(stow_types::api::SchedulerDemandReport {
         batch_id: request.batch_id.clone(),
         entries: u64::try_from(deltas.len()).unwrap_or(u64::MAX),
-        touched_tasks: u64::try_from(contributions.len()).unwrap_or(u64::MAX),
+        touched_tasks,
         applied,
     })
 }
 
-/// One (task, delta) row of a demand batch's fold payload.
-#[derive(serde::Serialize)]
+/// One (task, delta) row of a demand batch's fold payload — the
+/// serialization also survives as the batch record's frozen set, so
+/// it must read back identically.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ContributionRow {
     tid: String,
     delta: i64,
+}
+
+/// One canonical demand-batch input entry — the five identity fields
+/// plus the summed delta, emitted in sorted order.
+#[derive(serde::Serialize)]
+struct CanonicalEntry {
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+    delta: i64,
+}
+
+/// A `demand_batches` row: the accepted canonical input and the
+/// frozen contribution set it established.
+#[derive(Debug, skyzen::FromRow)]
+struct DemandBatchRow {
+    input: String,
+    contributions: String,
+}
+
+/// The batch id's accepted-payload fingerprint: the summed per-identity
+/// deltas serialized in `BTreeMap` order, so two spellings of the same
+/// observations — any entry order, any duplication — compare equal and
+/// a changed payload compares different (stow#522).
+fn canonical_demand_input(deltas: &BTreeMap<[String; 5], i64>) -> Result<String, QueueError> {
+    enqueue_json(
+        &deltas
+            .iter()
+            .map(|(identity, delta)| CanonicalEntry {
+                crate_name: identity[0].clone(),
+                version: identity[1].clone(),
+                features_json: identity[2].clone(),
+                target: identity[3].clone(),
+                rustc_version: identity[4].clone(),
+                delta: *delta,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// A first delivery's payload: one keyed walk per distinct identity,
+/// `UNION` deduped — a task reached through two roots or two diamond
+/// paths is visited once, and cycles cannot recur — folded into the
+/// serialized (task, delta) set the batch record freezes. Returns the
+/// JSON payload and the touched-task count.
+async fn demand_first_delivery(
+    db: &DurableDb,
+    deltas: &BTreeMap<[String; 5], i64>,
+) -> Result<(String, u64), QueueError> {
+    let mut contributions: BTreeMap<String, i64> = BTreeMap::new();
+    for (key, delta) in deltas {
+        for task_id in demand_closure_tasks(db, key).await? {
+            let total = contributions
+                .get(&task_id)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(*delta)
+                .ok_or(QueueError::Overflow {
+                    field: "task demand contribution",
+                    value: u64::MAX,
+                })?;
+            contributions.insert(task_id, total);
+        }
+    }
+    // The JSON payload is the lossless channel: deltas serialize as
+    // decimal text and SQLite's own parser decodes them as INTEGER —
+    // no number binds, so a delta above 2^53 survives the workerd
+    // cursor that an i64 parameter could never cross.
+    let payload = enqueue_json(
+        &contributions
+            .iter()
+            .map(|(task_id, delta)| ContributionRow {
+                tid: task_id.clone(),
+                delta: *delta,
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    Ok((
+        payload,
+        u64::try_from(contributions.len()).unwrap_or(u64::MAX),
+    ))
 }
 
 /// The unbuilt tasks one demand entry's closure touches: roots are
@@ -5536,23 +5697,12 @@ async fn migrate_generation_identity(
 /// here rather than written into `schema.sql` — its body is generated
 /// from the same `value_sql`/`dispatch_key_sql` expressions every
 /// other writer uses, so the scoring formula has exactly one source.
+/// The demand ledger's only migration-time work: `demand_batches` and
+/// `demand_contributions` — `applied` column included — are created by
+/// `migrate_schema`'s `schema.sql` application on every path, so the
+/// step that remains is the `demand_fold` trigger built from the same
+/// Rust value/key expressions the writers use (stow#522).
 async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
-    let has_applied = db
-        .query("PRAGMA table_info(demand_contributions)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("inspect demand ledger shape: {error}"))?
-        .iter()
-        .any(|column| column.name == "applied");
-    if !has_applied {
-        db.query(
-            "ALTER TABLE demand_contributions \
-             ADD COLUMN applied INTEGER NOT NULL DEFAULT 0",
-        )
-        .execute()
-        .await
-        .map_err(|error| format!("add demand ledger applied marker: {error}"))?;
-    }
     let demand = "(queue.demand + NEW.delta)";
     let value = value_sql(
         "queue.lane",
@@ -7594,6 +7744,34 @@ mod sqlite_tests {
         .expect("record unapplied contribution");
     }
 
+    /// One `demand_batches` row with explicit stored payloads — how a
+    /// test plants the half-delivered state a crashed mark leaves.
+    async fn db_insert_batch_record(
+        db: &DurableDb,
+        batch_id: &str,
+        input: &str,
+        contributions: &str,
+    ) {
+        db.query(
+            "INSERT INTO demand_batches (batch_id, input, contributions) \
+             VALUES (?, ?, ?)",
+        )
+        .bind(batch_id.to_owned())
+        .bind(input.to_owned())
+        .bind(contributions.to_owned())
+        .execute()
+        .await
+        .expect("record batch");
+    }
+
+    async fn batch_rows(db: &DurableDb, batch_id: &str) -> u64 {
+        db.query("SELECT count(*) FROM demand_batches WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .fetch_scalar::<u64>()
+            .await
+            .expect("batch count")
+    }
+
     async fn db_plan(db: &DurableDb, sql: &str, binds: &[&str]) -> Vec<String> {
         #[derive(skyzen::FromRow)]
         struct PlanRow {
@@ -7693,6 +7871,307 @@ mod sqlite_tests {
             demand_of(&db, &task_id_on("root", TARGET)).await,
             super::PRIORITY_MAX
         );
+    }
+
+    /// The stored batch record pins the accepted canonical input: a
+    /// redelivery naming the same id with ANY different payload — a
+    /// changed delta or a different identity set — fails before a
+    /// single write, so a mistaken retry can never reshape the frozen
+    /// contribution set (stow#522).
+    #[tokio::test]
+    async fn demand_conflicting_same_id_payload_fails_before_writes() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("root", vec![dependency("mid")]),
+                request("mid", Vec::new()),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        apply(&db, "h0", vec![demand_entry("root", 5)])
+            .await
+            .expect("first delivery");
+
+        // Same id, changed delta — refused.
+        let error = apply(&db, "h0", vec![demand_entry("root", 7)])
+            .await
+            .expect_err("conflicting delta must fail");
+        assert!(
+            error.to_string().contains("different payload"),
+            "conflict error: {error}"
+        );
+        // Same id, different identity — refused.
+        apply(&db, "h0", vec![demand_entry("mid", 5)])
+            .await
+            .expect_err("conflicting identity must fail");
+
+        // Nothing moved: demands, contribution rows and the batch
+        // record are exactly what the first delivery established.
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
+        assert_eq!(demand_of(&db, &task_id_on("mid", TARGET)).await, 5);
+        assert_eq!(contribution_rows(&db, "h0").await, 2);
+        assert_eq!(batch_rows(&db, "h0").await, 1);
+    }
+
+    /// An exact replay folds the frozen set, not the live closure:
+    /// after the graph moves on — the root completes, a new task and
+    /// edge arrive that a fresh walk would reach — the replay applies
+    /// nothing the first delivery did not record (stow#522).
+    #[tokio::test]
+    async fn demand_replay_uses_the_frozen_set_not_the_live_closure() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[
+                request("leaf", Vec::new()),
+                request("root", vec![dependency("leaf")]),
+            ],
+        )
+        .await
+        .expect("enqueue");
+        let first = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("first delivery");
+        assert_eq!(first.touched_tasks, 2);
+
+        // The graph moves on: the root completes (a fresh walk would
+        // find no roots), and a new unbuilt task enters the closure —
+        // `extra` is now a live `dep_met = 0` dep of `leaf`.
+        mark_active(&db, "root", TARGET, "completed").await;
+        enqueue(&db, &[request("extra", Vec::new())])
+            .await
+            .expect("enqueue extra");
+        db.query(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_met) VALUES (?, ?, 0)",
+        )
+        .bind(task_id_on("leaf", TARGET))
+        .bind(task_id_on("extra", TARGET))
+        .execute()
+        .await
+        .expect("new edge");
+
+        let replay = apply(&db, "h0", vec![demand_entry("root", 4)])
+            .await
+            .expect("replay");
+        assert!(!replay.applied);
+        assert_eq!(replay.touched_tasks, 2);
+        assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 2);
+    }
+
+    /// An accepted batch that froze an empty contribution set keeps
+    /// its id claimed: replays still apply nothing, and a conflicting
+    /// payload on the same id is still a conflict — an unknown root at
+    /// first delivery does not make the id reusable (stow#522).
+    #[tokio::test]
+    async fn demand_empty_accepted_batch_stays_empty() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("other", Vec::new())])
+            .await
+            .expect("enqueue");
+
+        let first = apply(&db, "h0", vec![demand_entry("absent", 9)])
+            .await
+            .expect("first delivery");
+        assert!(!first.applied);
+        assert_eq!(first.touched_tasks, 0);
+        assert_eq!(batch_rows(&db, "h0").await, 1);
+
+        // The root becoming eligible later does not retro-apply: the
+        // frozen empty set is what replays.
+        enqueue(&db, &[request("absent", Vec::new())])
+            .await
+            .expect("enqueue late root");
+        let replay = apply(&db, "h0", vec![demand_entry("absent", 9)])
+            .await
+            .expect("replay");
+        assert!(!replay.applied);
+        assert_eq!(replay.touched_tasks, 0);
+        assert_eq!(demand_of(&db, &task_id_on("absent", TARGET)).await, 0);
+        assert_eq!(contribution_rows(&db, "h0").await, 0);
+
+        apply(&db, "h0", vec![demand_entry("absent", 8)])
+            .await
+            .expect_err("conflicting payload must fail");
+    }
+
+    /// The recorded-unapplied remainder resumes from the frozen set:
+    /// a batch record plus an `applied = 0` contribution whose mark
+    /// never ran folds on replay even when the live root is no longer
+    /// eligible — the stored set, not the current walk, decides
+    /// (stow#522).
+    #[tokio::test]
+    async fn demand_unapplied_remainder_folds_the_frozen_set() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(&db, &[request("root", Vec::new())])
+            .await
+            .expect("enqueue");
+        apply(&db, "h0", vec![demand_entry("root", 9)])
+            .await
+            .expect("first delivery");
+
+        // Simulate a delivery that crashed after recording: the batch
+        // record (same canonical input under a new id) and its
+        // contribution row exist, but the mark never flipped it. The
+        // frozen row is serialized through `ContributionRow` — the same
+        // type the writer freezes — so the planted state is exactly
+        // what a real crash leaves: canonical delta and stored row
+        // delta both 9.
+        let canonical: String = db
+            .query("SELECT input FROM demand_batches WHERE batch_id = ?")
+            .bind("h0".to_owned())
+            .fetch_scalar::<String>()
+            .await
+            .expect("stored input");
+        let frozen = serde_json::to_string(&[super::ContributionRow {
+            tid: task_id_on("root", TARGET),
+            delta: 9,
+        }])
+        .expect("serialize frozen set");
+        db_insert_batch_record(&db, "h0r", &canonical, &frozen).await;
+        db_insert_contribution(&db, &task_id_on("root", TARGET), "h0r", 9).await;
+
+        // The live root is no longer eligible — a fresh walk would
+        // touch nothing — but the frozen remainder still folds.
+        mark_active(&db, "root", TARGET, "completed").await;
+        let replay = apply(&db, "h0r", vec![demand_entry("root", 9)])
+            .await
+            .expect("replay");
+        assert!(replay.applied);
+        assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 18);
+        assert_eq!(contribution_rows(&db, "h0r").await, 1);
+    }
+
+    /// Persisted demand counts against the resubmit writer's band:
+    /// demand exactly at `PRIORITY_MAX` is legal while priority stays
+    /// 0, but a resubmit that would raise priority must be refused
+    /// before any write — queue, edges and demand untouched — while a
+    /// sibling below the bound still resubmits normally (stow#522).
+    #[tokio::test]
+    async fn demand_at_bound_then_rising_resubmit_is_refused() {
+        let db = memory_db().await.expect("memory db");
+        enqueue(
+            &db,
+            &[request("bound", Vec::new()), request("fine", Vec::new())],
+        )
+        .await
+        .expect("enqueue");
+        apply(
+            &db,
+            "h0",
+            vec![demand_entry("bound", super::PRIORITY_MAX as u64)],
+        )
+        .await
+        .expect("at-bound demand");
+
+        // downloads 1000 → new priority 1 > PRIORITY_MAX - demand = 0.
+        let mut resubmit = request("bound", Vec::new());
+        resubmit.downloads = 1000;
+        let error = enqueue(&db, &[resubmit])
+            .await
+            .expect_err("resubmit past the band must fail");
+        assert!(
+            error.to_string().contains("priority band"),
+            "band error: {error}"
+        );
+
+        // Nothing changed: demand, downloads and request count are the
+        // pre-resubmit values.
+        assert_eq!(
+            demand_of(&db, &task_id_on("bound", TARGET)).await,
+            super::PRIORITY_MAX
+        );
+        let downloads: i64 = db
+            .query("SELECT downloads FROM queue WHERE task_id = ?")
+            .bind(task_id_on("bound", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("downloads");
+        let request_count: i64 = db
+            .query("SELECT request_count FROM queue WHERE task_id = ?")
+            .bind(task_id_on("bound", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("request_count");
+        assert_eq!((downloads, request_count), (0, 1));
+
+        // Below the bound the same resubmit is ordinary: the sibling
+        // takes downloads 5000 → priority 5, demand still folded.
+        let mut ok = request("fine", Vec::new());
+        ok.downloads = 5000;
+        enqueue(&db, &[ok]).await.expect("below-bound resubmit");
+        let priority: i64 = db
+            .query("SELECT priority FROM queue WHERE task_id = ?")
+            .bind(task_id_on("fine", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("priority");
+        assert_eq!(priority, 5);
+    }
+
+    /// The same refusal precedes the human-lane budget charge: a human
+    /// resubmit that would overflow the band is rejected before any
+    /// mutation, so `human_daily_task_budget` stays byte-identical —
+    /// on both the untrusted and the trusted entry path (stow#522).
+    #[tokio::test]
+    async fn demand_at_bound_human_resubmit_spends_no_budget() {
+        async fn spent(db: &DurableDb) -> i64 {
+            db.query(
+                "SELECT task_count FROM human_daily_task_budget \
+                 WHERE day = date('now')",
+            )
+            .fetch_scalar::<i64>()
+            .await
+            .expect("budget spend")
+        }
+
+        let db = memory_db().await.expect("memory db");
+        let mut human = request("bound", Vec::new());
+        human.source = EnqueueSource::HumanRequest;
+        enqueue(&db, &[human.clone()]).await.expect("human enqueue");
+        assert_eq!(spent(&db).await, 1, "the first submit charged once");
+        apply(
+            &db,
+            "h0",
+            vec![demand_entry("bound", super::PRIORITY_MAX as u64)],
+        )
+        .await
+        .expect("at-bound demand");
+
+        // downloads 1000 → new priority 1 > PRIORITY_MAX - demand = 0:
+        // refused before the budget charge, through both entries.
+        let mut resubmit = human;
+        resubmit.downloads = 1000;
+        enqueue(&db, &[resubmit.clone()])
+            .await
+            .expect_err("untrusted resubmit past the band must fail");
+        assert_eq!(spent(&db).await, 1, "a refused resubmit spends nothing");
+        super::enqueue_trusted(&db, &[resubmit], &settings())
+            .await
+            .expect_err("trusted resubmit past the band must fail");
+        assert_eq!(spent(&db).await, 1, "trusted path spends nothing either");
+
+        // Queue state is the pre-resubmit truth.
+        assert_eq!(
+            demand_of(&db, &task_id_on("bound", TARGET)).await,
+            super::PRIORITY_MAX
+        );
+        let downloads: i64 = db
+            .query("SELECT downloads FROM queue WHERE task_id = ?")
+            .bind(task_id_on("bound", TARGET))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("downloads");
+        assert_eq!(downloads, 0);
+        let edges: i64 = db
+            .query("SELECT count(*) FROM queue_dependencies")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("edges");
+        assert_eq!(edges, 0);
     }
 
     /// Demand magnitudes above the JS safe-integer bound stay exact:
