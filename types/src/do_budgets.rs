@@ -239,8 +239,12 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // The route's full statement count is apply (8) + `next_alarm`
+        // (5): the batch probes, ledger write, settings reads and the
+        // plan's freeze/active-count/wake/lease reads — 13 measured at
+        // the 100k native gate (121 reads, 17 writes).
         name: "POST /demand",
-        statements: 10,
+        statements: 14,
         rows_read: 300,
         rows_written: 120,
         wall_ms: 500,

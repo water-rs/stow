@@ -5032,9 +5032,12 @@ pub async fn apply_mutation(
 /// the keyed cost join), the shared rank abstraction prices each under
 /// the human lane, and one keyed statement applies the lane move, the
 /// `not_before` wake (the human lane pays no age gate) and the fresh
-/// pair — the `pending`/`miss` guards on the write narrow its domain
-/// to exactly the rows the selector matched. `RETURNING` counts the
-/// rows actually moved, as every mutation does.
+/// pair. The match is the SELECT: its `pending`/`miss` predicates
+/// bound the write's domain to exactly the rows the selector matched,
+/// so the UPDATE's only term is the `task_id` key — the probe shape
+/// `apply_key_updates` already measures; any extra queue predicate
+/// invites a queue-driven plan that scans the table per batch.
+/// `RETURNING` counts the rows actually moved, as every mutation does.
 async fn promote_matched(
     db: &DurableDb,
     predicate: &str,
@@ -5096,7 +5099,6 @@ async fn promote_matched(
                      dispatch_eligible = 1 \
                  FROM (SELECT value AS e FROM json_each(?)) AS j \
                  WHERE queue.task_id = j.e ->> 'task_id' \
-                   AND queue.status = 'pending' AND queue.lane = 'miss' \
                  RETURNING task_id",
             )
             .bind(enqueue_json(chunk)?)
