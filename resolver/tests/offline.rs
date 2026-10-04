@@ -782,3 +782,243 @@ fn a_host_tasks_closure_pins_deduped_packages_at_target_sides() {
         "deep has no target-side unit — no normal pin to mirror cargo's dedup onto"
     );
 }
+
+/// `git` inside `dir`, asserting success.
+fn git_in(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {args:?} in {}", dir.display());
+}
+
+/// `stow-src-*` dirs currently under the process temp dir.
+fn stow_src_dirs() -> std::collections::BTreeSet<PathBuf> {
+    std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("stow-src-"))
+        })
+        .collect()
+}
+
+/// Run `body` so its `stow-src-*` count can only see its own case
+/// (stow#540): the parent spawns a copy of this test binary that runs
+/// just `case`, with `TMPDIR` aimed at a fresh parent-owned `TempDir` —
+/// every fixture, fetched tree, and scratch dir the case makes then
+/// lives under that root. `STOW_TEST_SCRATCH_ISOLATED` marks the child
+/// so it runs `body` directly. The child's exit status is the
+/// outcome; nothing reads its output.
+fn isolated_scratch(case: &str, body: impl FnOnce()) {
+    if std::env::var_os("STOW_TEST_SCRATCH_ISOLATED").is_some() {
+        body();
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", case])
+        .env("TMPDIR", root.path())
+        .env("STOW_TEST_SCRATCH_ISOLATED", "1")
+        .status()
+        .expect("the test binary spawns");
+    assert!(status.success(), "isolated case `{case}` failed");
+}
+
+/// The crate names a `SourceResolve` enqueues, deduped and sorted.
+fn requested_crates(source: &stow_resolver::SourceResolve) -> Vec<String> {
+    let mut names: Vec<String> = source
+        .targets
+        .iter()
+        .flat_map(|(_target, requests)| requests.iter())
+        .map(|request| request.crate_name.as_str().to_owned())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// A local git repo whose `main` and `side` refs carry manifests
+/// depending on `dep_a` and `dep_b` respectively; its `file://` URL.
+fn two_ref_project(repo: &Path) -> url::Url {
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    git_in(repo, &["init", "-b", "main"]);
+    git_in(repo, &["config", "user.email", "stow@test"]);
+    git_in(repo, &["config", "user.name", "stow"]);
+    let write_manifest = |dep: &str| {
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            toml_document(&json!({
+                "package": { "name": "gitproj", "version": "0.0.0", "edition": "2021" },
+                "dependencies": { dep: "1" },
+            })),
+        )
+        .unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "").unwrap();
+        git_in(repo, &["add", "-A"]);
+        git_in(repo, &["commit", "-qm", dep]);
+    };
+    write_manifest("dep_a");
+    git_in(repo, &["checkout", "-qb", "side"]);
+    write_manifest("dep_b");
+    url::Url::from_file_path(repo).unwrap()
+}
+
+/// `dep_a` and `dep_b` 1.0.0 in a fresh local registry under `work`.
+fn publish_deps(reg: &Path) {
+    std::fs::create_dir_all(reg).unwrap();
+    for name in ["dep_a", "dep_b"] {
+        publish(
+            reg,
+            &Fixture {
+                name,
+                version: "1.0.0",
+                deps: vec![],
+                features: &[],
+                yanked: false,
+                proc_macro: false,
+            },
+        );
+    }
+}
+
+/// stow#540: a fetched source tree lives only for its own resolve.
+/// Repeated and concurrent fetches of the same URL get independent
+/// checkouts — the old scheme put every fetch at one deterministic
+/// `git-<fnv>` dir under the session tempdir, where same-URL resolves
+/// collided — and every return releases the scratch it fetched into.
+#[test]
+fn repeated_and_concurrent_fetches_resolve_independent_trees() {
+    isolated_scratch(
+        "repeated_and_concurrent_fetches_resolve_independent_trees",
+        || {
+            let work = tempfile::tempdir().unwrap();
+            let reg = work.path().join("registry");
+            publish_deps(&reg);
+            let url = two_ref_project(&work.path().join("gitproj"));
+            let (_home, resolver) = resolver_at(&reg);
+            let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+            let rustc = pinned_rustc_version();
+            let baseline = stow_src_dirs();
+
+            // Repeated fetches at different refs resolve their own
+            // trees: each ref's dep set is what lands in the requests,
+            // the lib target is still reported — semantics intact.
+            let main = resolver
+                .resolve_git(url.as_str(), "main", &targets, rustc, 0)
+                .unwrap();
+            assert!(main.has_library);
+            assert!(!main.has_binary);
+            assert_eq!(requested_crates(&main), vec!["dep_a".to_owned()]);
+            let side = resolver
+                .resolve_git(url.as_str(), "side", &targets, rustc, 0)
+                .unwrap();
+            assert_eq!(requested_crates(&side), vec!["dep_b".to_owned()]);
+            assert_eq!(
+                stow_src_dirs(),
+                baseline,
+                "returned resolves release their scratch"
+            );
+
+            // The same URL fetched twice concurrently gets two
+            // independent checkouts — each ref's output reflects its
+            // own manifest.
+            std::thread::scope(|scope| {
+                let a =
+                    scope.spawn(|| resolver.resolve_git(url.as_str(), "main", &targets, rustc, 0));
+                let b =
+                    scope.spawn(|| resolver.resolve_git(url.as_str(), "side", &targets, rustc, 0));
+                let main = a.join().unwrap().unwrap();
+                let side = b.join().unwrap().unwrap();
+                assert_eq!(requested_crates(&main), vec!["dep_a".to_owned()]);
+                assert_eq!(requested_crates(&side), vec!["dep_b".to_owned()]);
+            });
+            assert_eq!(
+                stow_src_dirs(),
+                baseline,
+                "concurrent resolves release their scratch"
+            );
+        },
+    );
+}
+
+/// Failure paths release scratch too: an unfetchable remote and a
+/// fetched tree with no manifest both return the error — failures are
+/// not swallowed — and neither leaves its checkout behind (stow#540).
+#[test]
+fn failed_fetches_release_their_scratch() {
+    isolated_scratch("failed_fetches_release_their_scratch", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        std::fs::create_dir_all(&reg).unwrap();
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+        let baseline = stow_src_dirs();
+
+        assert!(
+            resolver
+                .resolve_git("file:///stow-540-no-such-repo", "main", &targets, rustc, 0)
+                .is_err(),
+            "an unfetchable remote still errors"
+        );
+        let empty = work.path().join("nopkg");
+        std::fs::create_dir_all(&empty).unwrap();
+        git_in(&empty, &["init", "-b", "main"]);
+        git_in(&empty, &["config", "user.email", "stow@test"]);
+        git_in(&empty, &["config", "user.name", "stow"]);
+        std::fs::write(empty.join("README"), "no manifest").unwrap();
+        git_in(&empty, &["add", "-A"]);
+        git_in(&empty, &["commit", "-qm", "readme"]);
+        let empty_url = url::Url::from_file_path(&empty).unwrap();
+        assert!(
+            resolver
+                .resolve_git(empty_url.as_str(), "main", &targets, rustc, 0)
+                .is_err(),
+            "a tree with no manifest errors at prepare"
+        );
+        assert_eq!(
+            stow_src_dirs(),
+            baseline,
+            "fetch and resolve failures release their scratch"
+        );
+    });
+}
+
+/// Caller-owned inputs stay caller-owned (stow#540):
+/// `resolve_package_dir` reads the package tree and drops only its
+/// bundled `Cargo.lock` — the lane's existing contract — while the
+/// manifest and sources the caller provided survive verbatim, and the
+/// semantic output is unchanged.
+#[test]
+fn resolve_package_dir_preserves_the_callers_tree() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    publish_deps(&reg);
+    let (_home, resolver) = resolver_at(&reg);
+    let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+
+    let package_dir = work.path().join("crate-src-0.0.0");
+    let manifest = project(&package_dir, &json!({ "dep_a": "1" }));
+    let manifest_before = std::fs::read_to_string(&manifest).unwrap();
+    let lib_before = std::fs::read_to_string(package_dir.join("src/lib.rs")).unwrap();
+    let out = resolver
+        .resolve_package_dir(&package_dir, &ResolveOptions::default(), &targets)
+        .unwrap();
+    assert_eq!(units_named(&out, "dep_a")[0].version, "1.0.0");
+    assert!(package_dir.is_dir(), "the caller's tree survives");
+    assert_eq!(
+        std::fs::read_to_string(&manifest).unwrap(),
+        manifest_before,
+        "the caller's manifest is untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(package_dir.join("src/lib.rs")).unwrap(),
+        lib_before,
+        "the caller's sources are untouched"
+    );
+}

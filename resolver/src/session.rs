@@ -461,6 +461,14 @@ impl Resolver {
     /// name the seed feature set; `members_are_crates_io` is forced on —
     /// a `.crate` member is the published package.
     ///
+    /// The unpacked tree lives in a scratch dir this invocation alone
+    /// owns (stow#540): it is released on every return — success or
+    /// failure — instead of accumulating under the session dir for the
+    /// session's life, and repeated or concurrent resolves of the same
+    /// package never share a path. The session dir keeps only what is
+    /// genuinely session-lived: shims, per-family probe caches, and the
+    /// `CARGO_HOME` whose index/src caches legitimately grow with input.
+    ///
     /// # Errors
     /// Fetch, manifest, resolve, or emission failures.
     pub async fn resolve_crate_units(
@@ -470,12 +478,11 @@ impl Resolver {
         opts: &ResolveOptions,
         targets: &[String],
     ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
-        let dir = self
-            .dir
-            .path()
-            .join(format!("crate-{crate_name}-{version}"));
-        std::fs::create_dir_all(&dir).context("crate dir")?;
-        let package_dir = crate::fetch::fetch_crate(crate_name, version, &dir).await?;
+        let scratch = tempfile::Builder::new()
+            .prefix("stow-src-crate-")
+            .tempdir()
+            .context("crate scratch dir")?;
+        let package_dir = crate::fetch::fetch_crate(crate_name, version, scratch.path()).await?;
         self.resolve_package_dir(&package_dir, opts, targets)
     }
 
@@ -507,6 +514,12 @@ impl Resolver {
     /// depth-1), drop its `Cargo.lock`, and resolve into per-target
     /// task batches.
     ///
+    /// The checkout lives in a scratch dir this invocation alone owns
+    /// (stow#540): released on every return like the crate lane's, so
+    /// a wave's source scratch is bounded by the resolves in flight —
+    /// and the same `url` fetched at two refs, or twice concurrently,
+    /// gets two independent trees rather than colliding on one dir.
+    ///
     /// # Errors
     /// Fetch, manifest, resolve, or emission failures.
     pub fn resolve_git(
@@ -517,12 +530,11 @@ impl Resolver {
         rustc_version: &WireRustcVersion,
         downloads: u64,
     ) -> CargoResult<SourceResolve> {
-        let dir = self
-            .dir
-            .path()
-            .join(format!("git-{:x}", fnv(url.as_bytes())));
-        std::fs::create_dir_all(&dir).context("git dir")?;
-        let root = crate::fetch::fetch_git(url, git_ref, &dir)?;
+        let scratch = tempfile::Builder::new()
+            .prefix("stow-src-git-")
+            .tempdir()
+            .context("git scratch dir")?;
+        let root = crate::fetch::fetch_git(url, git_ref, scratch.path())?;
         let tree = crate::fetch::prepare_project_tree(&root, true)?;
         let opts = ResolveOptions {
             members_are_crates_io: false,
@@ -589,17 +601,6 @@ impl Resolver {
             targets: batches,
         }
     }
-}
-
-/// A tiny deterministic hash for naming per-repo scratch dirs — not
-/// cryptographic, just collision-shy enough for a tempdir name.
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    hash
 }
 
 #[cfg(test)]
