@@ -51,7 +51,7 @@ pub async fn get_path_result<T: serde::de::DeserializeOwned>(
     path: &str,
 ) -> std::result::Result<T, zenwave::Error> {
     let url = format!("{API_BASE}{path}");
-    let response = send_get(token, &url, Some("application/vnd.github+json"), None).await?;
+    let response = send_get(Some(token), &url, Some("application/vnd.github+json"), None).await?;
     Ok(response.error_for_status().await?.into_json().await?)
 }
 
@@ -89,7 +89,7 @@ pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
     etag: Option<&str>,
 ) -> std::result::Result<Conditional<T>, zenwave::Error> {
     let url = format!("{API_BASE}/repos/{REPO}/{path}");
-    let response = send_get(token, &url, Some("application/vnd.github+json"), etag).await?;
+    let response = send_get(Some(token), &url, Some("application/vnd.github+json"), etag).await?;
     if response.status().as_u16() == 304 {
         drop(response);
         return Ok(Conditional::Unmodified);
@@ -104,12 +104,35 @@ pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
     Ok(Conditional::Modified { body, etag })
 }
 
-/// `GET` `url` under the operator token, retried on transport errors and
-/// transient statuses by the shared [`Backoff`] policy. Any other answer
-/// — success or a final status — returns for the caller to read; a
-/// transient failure that outlives the budget returns as its error.
+/// `GET` an absolute URL and decode the JSON body under the same
+/// bounded idempotent-read policy, attaching `Authorization` only when
+/// `token` is `Some`. The local CI server's reads are unauthenticated —
+/// they pass `None`, so no operator token can leave the machine.
+pub async fn get_url_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    token: Option<&str>,
+) -> stow_types::error::Result<T> {
+    let response = send_get(token, url, None, None)
+        .await
+        .map_err(|error| stow_error!("GET {url}: {error}"))?;
+    response
+        .error_for_status()
+        .await
+        .map_err(|error| stow_error!("GET {url}: {error}"))?
+        .into_json()
+        .await
+        .map_err(|error| stow_error!("read {url}: {error}"))
+}
+
+/// `GET` `url`, retried on transport errors and transient statuses by
+/// the shared [`Backoff`] policy; `Authorization` rides the request only
+/// when `token` is `Some`. zenwave delivers an error status as `Err`,
+/// the response inside it — a terminal status is its error without
+/// another attempt, a transient one carries its `Retry-After` hint into
+/// the wait, and a failure that outlives the budget returns as its
+/// final error.
 async fn send_get(
-    token: &str,
+    token: Option<&str>,
     url: &str,
     accept: Option<&str>,
     if_none_match: Option<&str>,
@@ -117,10 +140,10 @@ async fn send_get(
     let mut backoff = Backoff::new();
     loop {
         let mut client = zenwave::client();
-        let request = client
-            .get(url)?
-            .header("Authorization", format!("Bearer {token}"))
-            .and_then(|request| request.header("User-Agent", USER_AGENT))?;
+        let mut request = client.get(url)?.header("User-Agent", USER_AGENT)?;
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"))?;
+        }
         let request = match accept {
             Some(accept) => request.header("Accept", accept)?,
             None => request,
@@ -140,12 +163,24 @@ async fn send_get(
                     Err(error) => (error, retry_after),
                 }
             }
-            Err(error) => (error, None),
+            Err(error) => {
+                let http = error.response().map(|response| {
+                    (
+                        response.status().as_u16(),
+                        retry_after_hint(response.headers()),
+                    )
+                });
+                match http {
+                    Some((status, _)) if !is_transient_status(status) => return Err(error),
+                    Some((_, retry_after)) => (error, retry_after),
+                    None => (error, None),
+                }
+            }
         };
         let Some(wait) = backoff.next_wait(retry_after) else {
             return Err(error);
         };
-        tracing::warn!(url, %error, "GitHub request failed; retrying");
+        tracing::warn!(url, %error, "request failed; retrying");
         tokio::time::sleep(wait).await;
     }
 }
@@ -154,7 +189,7 @@ async fn send_get(
 /// signed blob host, where the `Authorization` header must not follow
 /// (zenwave strips it cross-origin).
 pub async fn get_text(token: &str, url: &str) -> stow_types::error::Result<String> {
-    let response = send_get(token, url, None, None)
+    let response = send_get(Some(token), url, None, None)
         .await
         .map_err(|error| stow_error!("GET {url}: {error}"))?;
     response
@@ -820,5 +855,118 @@ mod tests {
                 .iter()
                 .all(|q| q.contains("event=workflow_dispatch&branch=main"))
         );
+    }
+}
+
+#[cfg(test)]
+mod url_json_tests {
+    use super::get_url_json;
+    use crate::test_server;
+
+    /// A connection the server drops without answering is a transport
+    /// failure the shared policy retries — the same read succeeds on
+    /// the next connection.
+    #[tokio::test]
+    async fn get_url_json_recovers_a_dropped_connection() {
+        let server = test_server::Loopback::start(vec![
+            test_server::Step::Drop,
+            test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            },
+        ])
+        .await;
+        let body: serde_json::Value = get_url_json(&server.url, None)
+            .await
+            .expect("a dropped connection retries");
+        assert_eq!(body["ok"], true);
+        assert_eq!(server.requests(), 2);
+        server.join().await;
+    }
+
+    /// A transient status waits out its `Retry-After` hint and retries —
+    /// the bounded hint lengthens the wait, it is not ignored.
+    #[tokio::test]
+    async fn get_url_json_retries_a_transient_status_after_its_hint() {
+        let server = test_server::Loopback::start(vec![
+            test_server::Step::Respond {
+                status: 503,
+                retry_after: Some(1),
+                body: "{}",
+            },
+            test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            },
+        ])
+        .await;
+        let started = std::time::Instant::now();
+        let body: serde_json::Value = get_url_json(&server.url, None)
+            .await
+            .expect("a transient status retries");
+        assert_eq!(body["ok"], true);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1),
+            "the Retry-After hint must be honored, elapsed {elapsed:?}"
+        );
+        assert_eq!(server.requests(), 2);
+        assert_eq!(server.requests(), 2);
+        server.join().await;
+    }
+
+    /// A terminal status is the answer — fail fast, never retry.
+    #[tokio::test]
+    async fn get_url_json_does_not_retry_a_terminal_status() {
+        let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+            status: 404,
+            retry_after: None,
+            body: r#"{"message":"gone"}"#,
+        }])
+        .await;
+        let result: stow_types::error::Result<serde_json::Value> =
+            get_url_json(&server.url, None).await;
+        assert!(result.is_err());
+        assert_eq!(server.requests(), 1);
+        server.join().await;
+    }
+
+    /// A 2xx that does not decode is a failure, not a retry.
+    #[tokio::test]
+    async fn get_url_json_fails_a_malformed_body() {
+        let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: "not json",
+        }])
+        .await;
+        let result: stow_types::error::Result<serde_json::Value> =
+            get_url_json(&server.url, None).await;
+        assert!(result.is_err());
+        assert_eq!(server.requests(), 1);
+        server.join().await;
+    }
+
+    /// A transient failure that outlives the budget returns its final
+    /// error — after exactly four tries, the shared policy's bound.
+    #[tokio::test]
+    async fn get_url_json_returns_the_final_error_when_the_budget_runs_out() {
+        let server = test_server::Loopback::start(
+            (0..4)
+                .map(|_| test_server::Step::Respond {
+                    status: 503,
+                    retry_after: None,
+                    body: "{}",
+                })
+                .collect(),
+        )
+        .await;
+        let result: stow_types::error::Result<serde_json::Value> =
+            get_url_json(&server.url, None).await;
+        assert!(result.is_err());
+        assert_eq!(server.requests(), 4);
+        server.join().await;
     }
 }
