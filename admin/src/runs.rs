@@ -5,7 +5,6 @@
 use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
-use stow_types::stow_error;
 
 use crate::github::{self, BUILD_WORKFLOW};
 use crate::render::{self, Output, Table};
@@ -240,14 +239,15 @@ pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
 // ===== GitHub REST shapes =====
 
 #[derive(Debug, serde::Deserialize)]
-struct WorkflowRunsPage {
-    workflow_runs: Vec<WorkflowRun>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct WorkflowRun {
     id: u64,
     html_url: String,
+}
+
+impl github::RunRow for WorkflowRun {
+    fn run_id(&self) -> u64 {
+        self.id
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -296,34 +296,23 @@ pub async fn run(token: &str, args: RunsArgs, output: Output) -> stow_types::err
     }
 }
 
-/// Page through the workflow's failed runs since `since`.
+/// Every failed run of the workflow in the closed window `[now-since,
+/// now]` — range enumeration reads the whole window past GitHub's
+/// 1000-row listing cap, so a dense failure wave no longer drops its
+/// tail (stow#555).
 async fn fetch_failed_runs(
     token: &str,
     since: std::time::Duration,
 ) -> stow_types::error::Result<Vec<WorkflowRun>> {
-    // GitHub's `created` filter accepts `>=` an ISO timestamp.
-    let cutoff = time::OffsetDateTime::now_utc() - since;
-    let cutoff_text = cutoff
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|error| stow_error!("format --since cutoff: {error}"))?;
-    let mut runs = Vec::new();
-    let mut page = 1u32;
-    loop {
-        let page_runs: WorkflowRunsPage = github::get(
-            token,
-            &format!(
-                "actions/workflows/{BUILD_WORKFLOW}/runs?status=failure&created=%3E%3D{cutoff_text}&per_page=100&page={page}"
-            ),
-        )
-        .await?;
-        let count = page_runs.workflow_runs.len();
-        runs.extend(page_runs.workflow_runs);
-        if count < 100 {
-            break;
-        }
-        page += 1;
-    }
-    Ok(runs)
+    let until = time::OffsetDateTime::now_utc();
+    github::runs_in_range(
+        BUILD_WORKFLOW,
+        "status=failure",
+        until - since,
+        until,
+        |path| async move { github::get::<github::RunsPage<WorkflowRun>>(token, &path).await },
+    )
+    .await
 }
 
 /// Fetch each failed job's log and group the classified failures.
