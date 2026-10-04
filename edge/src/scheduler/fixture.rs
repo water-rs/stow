@@ -262,17 +262,29 @@ pub enum SeedPhase {
     Slices,
     /// The `deps_met` recompute — `n` runs `1..=pending_end`.
     DepsMet,
+    /// The feed bulk's retained delivered headers — `n` runs
+    /// `1..=feed_hist_hours` (stow#523).
+    FeedHeaders,
+    /// The feed bulk's retained delivered pages — `n` runs
+    /// `1..=feed_hist_pages`.
+    FeedPages,
+    /// The staging hour's current-generation bulk plus its 256-row
+    /// obsolete tail — `n` runs `1..=feed_staged_pages + 256`.
+    FeedStaged,
 }
 
 impl SeedPhase {
     /// The phase's `n` ceiling; `next` is where the cursor goes when `n`
     /// reaches it. `pub` for the budget route's position-derived
     /// counters (an ended phase reports its range end).
-    pub const fn range_end(self, shape: FixtureShape) -> u32 {
+    pub fn range_end(self, shape: FixtureShape) -> u32 {
         match self {
             Self::Queue => shape.queue_rows,
             Self::EdgesEvery | Self::EdgesThirds | Self::DepsMet => shape.pending_end(),
             Self::Slices => shape.completed_end(),
+            Self::FeedHeaders => feed_hist_hours(shape),
+            Self::FeedPages => feed_hist_pages(shape),
+            Self::FeedStaged => feed_staged_pages(shape) + FEED_OBSOLETE_TAIL,
         }
     }
 
@@ -292,7 +304,10 @@ impl SeedPhase {
             Self::EdgesEvery => Some(Self::EdgesThirds),
             Self::EdgesThirds => Some(Self::Slices),
             Self::Slices => Some(Self::DepsMet),
-            Self::DepsMet => None,
+            Self::DepsMet => Some(Self::FeedHeaders),
+            Self::FeedHeaders => Some(Self::FeedPages),
+            Self::FeedPages => Some(Self::FeedStaged),
+            Self::FeedStaged => None,
         }
     }
 }
@@ -958,10 +973,35 @@ pub async fn rearm(
     // in `settings` under [`PROBE_CLAIMED_KEY`] so the set survives
     // between `POST /budget` calls.
     let claimed_ns = restore_claimed_rows(db, shape, min_age_minutes).await?;
-    // The retained 2018 feed depth the probe's feed routes must
-    // measure against — `OR IGNORE` chunks make a repeat re-arm a
-    // bounded dedupe pass, not a rewrite.
-    seed_feed_bulk(db, shape).await?;
+    // Feed state the drives may have moved since seeding — the
+    // bounded live-window reset only: the growing 2018 history and
+    // the staging hour's current-generation bulk are fixture truth
+    // that must persist between probes; only the obsolete tail and
+    // the staged counters a cleanup drive could have disturbed are
+    // restored here (stow#523).
+    db.query(
+        "DELETE FROM demand_feed_pages \
+         WHERE hour = '2022-01-01T00' AND generation <> 9",
+    )
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("reset staging obsolete tail: {error}")))?;
+    db.query(include_str!("feed_obsolete_reseed.sql"))
+        .bind(i64::from(feed_staged_pages(shape)))
+        .bind(i64::from(feed_staged_pages(shape)))
+        .bind(i64::from(feed_staged_pages(shape)))
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("reseed staging obsolete tail: {error}")))?;
+    db.query(
+        "UPDATE demand_feed_hours SET staged_pages = ?, staged_entries = ? \
+         WHERE hour = '2022-01-01T00'",
+    )
+    .bind(i64::from(feed_staged_pages(shape)))
+    .bind(i64::from(feed_staged_pages(shape)) * 4)
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("reset staging feed counters: {error}")))?;
     // Row 101's seeded edge set: the resync's delta sync rewrote it.
     db.query("DELETE FROM queue_dependencies WHERE task_id = printf('%064x', ?)")
         .bind(101_i64)
@@ -1077,7 +1117,12 @@ pub const fn counted_table(phase: SeedPhase) -> Option<CountedTable> {
         SeedPhase::Queue => Some(CountedTable::Queue),
         SeedPhase::EdgesEvery | SeedPhase::EdgesThirds => Some(CountedTable::Dependencies),
         SeedPhase::Slices => Some(CountedTable::Slices),
-        SeedPhase::DepsMet => None,
+        // The feed phases write internal bulk the seed report does
+        // not count — the three-counter codec stays untouched.
+        SeedPhase::DepsMet
+        | SeedPhase::FeedHeaders
+        | SeedPhase::FeedPages
+        | SeedPhase::FeedStaged => None,
     }
 }
 
@@ -1132,6 +1177,19 @@ pub async fn seed_batch(
                 }
             }
             SeedPhase::DepsMet => seed_deps_met_chunk(db, n, hi).await?,
+            SeedPhase::FeedHeaders => seed_feed_headers_chunk(db, n, hi).await?,
+            SeedPhase::FeedPages => {
+                seed_feed_pages_chunk(db, feed_hist_hours(shape), n, hi).await?;
+            }
+            SeedPhase::FeedStaged => {
+                if n == 0 {
+                    seed_feed_staging_header(db, shape).await?;
+                }
+                seed_feed_staged_chunk(db, feed_staged_pages(shape), n, hi).await?;
+                if hi >= phase.range_end(shape) {
+                    fix_feed_staging_counters(db, shape).await?;
+                }
+            }
         }
     }
     let (next_phase, next_n, done) = if hi >= phase.range_end(shape) {
@@ -1150,82 +1208,127 @@ pub async fn seed_batch(
     })
 }
 
-/// Rows one feed-bulk chunk covers — the same bound the queue seed
-/// chunks at so a statement never outlives the runtime.
-const FEED_BULK_CHUNK: u32 = 4_000;
+/// The obsolete-generation tail the staging bulk hour always
+/// carries — the bounded retire target the begin/cleanup drives
+/// measure against.
+const FEED_OBSOLETE_TAIL: u32 = 256;
 
-/// The retained feed depth the #523 drives measure against —
-/// `queue_rows`-proportional delivered headers and retained pages,
-/// one staging hour with a current-generation bulk and an obsolete
-/// chunk, all under the 2018 window the re-arm's `hour >= '2019'`
-/// deletes never touch. Seeded with `OR IGNORE` so a repeat re-arm
-/// dedupes instead of rewriting; the ids are pure 2018 truth and
-/// never collide with the 2020+ window the drives stage in.
-///
-/// `queue_rows/512` delivered headers, `queue_rows/8` retained pages
-/// spread evenly over them, `queue_rows/16` current-generation pages
-/// on the staging hour plus a 256-row obsolete chunk — enough depth
-/// that a feed route going table-proportional instead of index-probe
-/// fails by orders of magnitude, not by slack.
-pub async fn seed_feed_bulk(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
-    let hist_hours = (shape.queue_rows / 512).clamp(8, 4_000);
-    let hist_pages = (shape.queue_rows / 8).clamp(64, 160_000);
-    let staged_pages = (shape.queue_rows / 16).clamp(32, 64_000);
-    // The staging bulk hour must sit ABOVE every hour a drive can
-    // deliver — an unfinished hour below the delivered one blocks the
-    // contiguous-watermark transition, so the current-generation bulk
-    // lives at 2022-01-01 while history stays in 2018.
-    for lo in (0..hist_hours).step_by(FEED_BULK_CHUNK as usize) {
-        let hi = (lo + FEED_BULK_CHUNK).min(hist_hours);
-        db.query(include_str!("feed_bulk_headers.sql"))
-            .bind(i64::from(lo) + 1)
-            .bind(i64::from(hi))
-            .execute()
-            .await
-            .map_err(|error| QueueError::Sql(format!("seed feed headers: {error}")))?;
+/// `queue_rows/512` delivered headers (clamped `8–4_000`) — the
+/// retained feed history the index probes must skip, not scan.
+pub fn feed_hist_hours(shape: FixtureShape) -> u32 {
+    (shape.queue_rows / 512).clamp(8, 4_000)
+}
+
+/// `queue_rows/8` retained delivered pages (clamped `64–160_000`).
+fn feed_hist_pages(shape: FixtureShape) -> u32 {
+    (shape.queue_rows / 8).clamp(64, 160_000)
+}
+
+/// `queue_rows/16` current-generation pages on the staging hour
+/// (clamped `32–64_000`) — the live bulk the none-obsolete cleanup
+/// drive's predicate must walk past without matching.
+pub fn feed_staged_pages(shape: FixtureShape) -> u32 {
+    (shape.queue_rows / 16).clamp(32, 64_000)
+}
+
+/// One bounded `FeedHeaders` chunk: historical delivered headers
+/// rolling from 2018-01-01, `INSERT OR IGNORE` so a replayed cursor
+/// dedupes instead of rewriting.
+async fn seed_feed_headers_chunk(db: &DurableDb, n: u32, hi: u32) -> Result<(), QueueError> {
+    if hi <= n {
+        return Ok(());
     }
-    for lo in (0..hist_pages).step_by(FEED_BULK_CHUNK as usize) {
-        let hi = (lo + FEED_BULK_CHUNK).min(hist_pages);
-        db.query(include_str!("feed_bulk_pages.sql"))
-            .bind(i64::from(lo) + 1)
-            .bind(i64::from(hi))
-            .bind(i64::from(hist_hours))
-            .bind(i64::from(hist_hours))
-            .bind(i64::from(hist_hours))
-            .execute()
-            .await
-            .map_err(|error| QueueError::Sql(format!("seed retained feed pages: {error}")))?;
+    db.query(include_str!("feed_bulk_headers.sql"))
+        .bind(i64::from(n) + 1)
+        .bind(i64::from(hi))
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("seed feed headers: {error}")))?;
+    Ok(())
+}
+
+/// One bounded `FeedPages` chunk: retained applied pages spread over
+/// `hist_hours` delivered headers.
+async fn seed_feed_pages_chunk(
+    db: &DurableDb,
+    hist_hours: u32,
+    n: u32,
+    hi: u32,
+) -> Result<(), QueueError> {
+    if hi <= n {
+        return Ok(());
     }
+    db.query(include_str!("feed_bulk_pages.sql"))
+        .bind(i64::from(n) + 1)
+        .bind(i64::from(hi))
+        .bind(i64::from(hist_hours))
+        .bind(i64::from(hist_hours))
+        .bind(i64::from(hist_hours))
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("seed retained feed pages: {error}")))?;
+    Ok(())
+}
+
+/// One bounded `FeedStaged` chunk: current-generation (9) rows up to
+/// `staged_pages`, then the 256-row obsolete (7) tail — the staging
+/// bulk hour '2022-01-01T00' sits above every hour a drive can
+/// deliver, since an unfinished hour below the delivered one blocks
+/// the contiguous-watermark transition.
+async fn seed_feed_staged_chunk(
+    db: &DurableDb,
+    staged_pages: u32,
+    n: u32,
+    hi: u32,
+) -> Result<(), QueueError> {
+    if hi <= n {
+        return Ok(());
+    }
+    db.query(include_str!("feed_bulk_staged.sql"))
+        .bind(i64::from(n) + 1)
+        .bind(i64::from(hi))
+        .bind(i64::from(staged_pages))
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("seed staging feed pages: {error}")))?;
+    Ok(())
+}
+
+/// The staging bulk header — written on the `FeedStaged` cursor's
+/// first chunk so the page rows' hour foreign key resolves.
+async fn seed_feed_staging_header(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    let staged = i64::from(feed_staged_pages(shape));
     db.query(
-        "INSERT OR IGNORE INTO demand_feed_hours              (hour, generation, state, staged_pages, staged_entries)          VALUES ('2022-01-01T00', 9, 'staging', 0, 0)",
+        "INSERT OR IGNORE INTO demand_feed_hours \
+         (hour, generation, state, staged_pages, staged_entries) \
+         VALUES ('2022-01-01T00', 9, 'staging', ?, ?)",
     )
+    .bind(staged)
+    .bind(staged * 4)
     .execute()
     .await
-    .map_err(|error| QueueError::Sql(format!("seed staging feed hour: {error}")))?;
-    for lo in (0..staged_pages + 256).step_by(FEED_BULK_CHUNK as usize) {
-        let hi = (lo + FEED_BULK_CHUNK).min(staged_pages + 256);
-        db.query(include_str!("feed_bulk_staged.sql"))
-            .bind(i64::from(lo) + 1)
-            .bind(i64::from(hi))
-            .bind(i64::from(staged_pages))
-            .execute()
-            .await
-            .map_err(|error| QueueError::Sql(format!("seed staging feed pages: {error}")))?;
-    }
-    // The insert trigger counted the obsolete rows too; the header's
-    // truth is the current generation's bulk alone.
+    .map_err(|error| QueueError::Sql(format!("seed staging feed header: {error}")))?;
+    Ok(())
+}
+
+/// The staging header's exact staged counters once the `FeedStaged`
+/// cursor finishes — the page-insert trigger counts the obsolete
+/// tail too; the header's truth is the current generation alone.
+async fn fix_feed_staging_counters(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    let staged = i64::from(feed_staged_pages(shape));
     db.query(
-        "UPDATE demand_feed_hours SET staged_pages = ?, staged_entries = ?          WHERE hour = '2022-01-01T00'",
+        "UPDATE demand_feed_hours SET staged_pages = ?, staged_entries = ? \
+         WHERE hour = '2022-01-01T00'",
     )
-    .bind(i64::from(staged_pages))
-    .bind(i64::from(staged_pages) * 4)
+    .bind(staged)
+    .bind(staged * 4)
     .execute()
     .await
     .map_err(|error| QueueError::Sql(format!("fix staging feed counters: {error}")))?;
     Ok(())
 }
 
-/// Seed the whole fixture on the host path — the same chunks the
+/// Seed the whole fixture on the host path — the same chunks the/// Seed the whole fixture on the host path — the same chunks the
 /// workerd probe writes, looped until the seed reports done.
 ///
 /// # Errors

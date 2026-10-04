@@ -113,16 +113,29 @@ async fn read_watermark(db: &DurableDb) -> Result<Option<String>, QueueError> {
         .map_err(|error| format!("read demand feed watermark: {error}").into())
 }
 
-/// Reject a write at or below the delivered watermark — an hour the
-/// durable cursor already passed must never re-materialize, and an
-/// out-of-order begin cannot create an inconsistency below it.
-async fn require_above_watermark(db: &DurableDb, hour: &DemandFeedHour) -> Result<(), QueueError> {
-    if let Some(watermark) = read_watermark(db).await? {
-        if hour.as_str() <= watermark.as_str() {
-            return Err(QueueError::Invariant(format!(
-                "demand feed hour {hour} is at or below delivered watermark {watermark}"
-            )));
-        }
+/// Reject a begin that is not the watermark's canonical successor.
+/// Once any hour has delivered, the only admissible new attempt —
+/// fresh insert or staging rotation alike — is the hour immediately
+/// after the cursor: an out-of-order begin would freeze demand the
+/// cursor can never pass, and wedging it below a gap blocks the
+/// genuine successor's recovery. One point read, no history scan.
+async fn require_canonical_successor(
+    db: &DurableDb,
+    hour: &DemandFeedHour,
+) -> Result<(), QueueError> {
+    let Some(watermark) = read_watermark(db).await? else {
+        return Ok(());
+    };
+    let watermark_hour = DemandFeedHour::parse(&watermark).map_err(|error| {
+        QueueError::Invariant(format!(
+            "demand feed watermark {watermark:?} is not a canonical hour: {error}"
+        ))
+    })?;
+    let successor = watermark_hour.next().map_err(QueueError::Invariant)?;
+    if hour != &successor {
+        return Err(QueueError::Invariant(format!(
+            "demand feed hour {hour} is not the watermark's canonical              successor {successor} — earlier hours must finish first"
+        )));
     }
     Ok(())
 }
@@ -200,7 +213,7 @@ pub async fn feed_begin(
 ) -> Result<DemandFeedBeginReport, QueueError> {
     hour.ensure_closed(now_unix_secs)
         .map_err(QueueError::Invariant)?;
-    require_above_watermark(db, hour).await?;
+    require_canonical_successor(db, hour).await?;
     if let Some(row) = read_hour(db, hour.as_str()).await? {
         if row.state != "staging" {
             return Err(QueueError::Invariant(format!(
@@ -524,6 +537,27 @@ pub async fn feed_deliver(
             "demand feed hour {hour} is still staging — only complete hours deliver"
         )));
     }
+    if row.state == "complete" {
+        // Before any demand or acknowledgment write: an unfinished
+        // hour below this one makes the delivery unordered — refuse
+        // here rather than let demand land and only then fail the
+        // terminal contiguity check. Bounded partial-index probe, one
+        // row maximum.
+        let older = db
+            .query(
+                "SELECT hour FROM demand_feed_hours \
+                 WHERE hour < ? AND state != 'delivered' LIMIT 1",
+            )
+            .bind(hour.as_str())
+            .fetch_scalar_optional::<String>()
+            .await
+            .map_err(|error| format!("probe unfinished predecessors of {hour}: {error}"))?;
+        if let Some(older) = older {
+            return Err(QueueError::Invariant(format!(
+                "demand feed hour {hour} cannot deliver while {older} is unfinished"
+            )));
+        }
+    }
     if row.state == "delivered" {
         let plan = queue::next_alarm(db, now_ms, settings).await?;
         return Ok((
@@ -728,7 +762,7 @@ async fn retire_chunk(
 
 #[cfg(test)]
 mod tests {
-    use super::{feed_begin, feed_cleanup, feed_complete, feed_deliver, feed_page};
+    use super::{feed_begin, feed_cleanup, feed_complete, feed_deliver, feed_page, read_hour};
     use crate::scheduler::queue::{Dispatch, SchedulerSettings};
     use crate::scheduler::test_db::{counting_memory_db, memory_db};
     use stow_types::api::{
@@ -1089,17 +1123,14 @@ mod tests {
         let h2 = hour(H2);
         let h4 = hour(H4);
         let page1 = vec![vec![entry("alpha", 1)]];
-        // h2 finishes while h1 is still staging: its terminal
-        // transition refuses — the cursor may not pass h1.
+        // h2 finishes while h1 is still staging: delivery refuses
+        // before a single page applies — the cursor may not pass h1,
+        // and no demand may land out of order.
         let g1 = feed_begin(&db, &h1, NOW_SECS)
             .await
             .expect("begin h1")
             .generation;
         stage_and_freeze(&db, &h2, &page1).await;
-        let (report, _) = feed_deliver(&db, &h2, NOW_MS, &settings())
-            .await
-            .expect("deliver h2 page");
-        assert_eq!(report.delivered_page, Some(0));
         feed_deliver(&db, &h2, NOW_MS, &settings())
             .await
             .expect_err("unfinished predecessor blocks delivery");
@@ -1111,14 +1142,47 @@ mod tests {
             .expect("complete empty h1");
         deliver_all(&db, &h1, 0).await;
         assert_eq!(watermark(&db).await.as_deref(), Some(H1));
+        let (report, _) = feed_deliver(&db, &h2, NOW_MS, &settings())
+            .await
+            .expect("deliver h2 page");
+        assert_eq!(report.delivered_page, Some(0));
         let (terminal, _) = feed_deliver(&db, &h2, NOW_MS, &settings())
             .await
             .expect("h2 terminal");
         assert_eq!(terminal.state, "delivered");
         assert_eq!(watermark(&db).await.as_deref(), Some(H2));
         // h4 completes with no unfinished headers below, but the
-        // watermark is at h2 — the leap over missing h3 refuses.
-        stage_and_freeze(&db, &h4, &page1).await;
+        // watermark is at h2 — its begin refuses as non-canonical,
+        // so seed the row directly to prove the terminal guard still
+        // cannot leap over missing h3 either.
+        feed_begin(&db, &h4, NOW_SECS)
+            .await
+            .expect_err("non-canonical begin refuses");
+        db.query(
+            "INSERT INTO demand_feed_hours (hour, generation, state) \
+             VALUES (?, 7, 'staging')",
+        )
+        .bind(h4.as_str())
+        .execute()
+        .await
+        .expect("insert h4");
+        for (index, entries) in page1.iter().enumerate() {
+            feed_page(
+                &db,
+                &page(
+                    &h4,
+                    7,
+                    u32::try_from(index).expect("page index"),
+                    entries.clone(),
+                ),
+                NOW_SECS,
+            )
+            .await
+            .expect("stage h4 page");
+        }
+        feed_complete(&db, &complete(&h4, 7, &page1), NOW_SECS)
+            .await
+            .expect("freeze h4");
         feed_deliver(&db, &h4, NOW_MS, &settings())
             .await
             .expect("deliver h4 page");
@@ -1133,6 +1197,110 @@ mod tests {
         feed_begin(&db, &h2, NOW_SECS)
             .await
             .expect_err("begin at the watermark refuses");
+    }
+
+    /// Two nonempty out-of-order hours: a begin that is not the
+    /// watermark's successor refuses before staging a single page —
+    /// no frozen wedge blocks the genuine successor, and a complete
+    /// hour refuses to deliver while any older hour is unfinished, so
+    /// no demand mutates the ledger out of order.
+    #[tokio::test]
+    async fn out_of_order_hours_never_mutate() {
+        let db = memory_db().await.expect("memory db");
+        let h1 = hour(H1);
+        let h2 = hour(H2);
+        let h3 = hour("2026-01-01T02");
+        let h4 = hour(H4);
+        let page = vec![vec![entry("alpha", 1)]];
+        stage_and_freeze(&db, &h1, &page).await;
+        deliver_all(&db, &h1, 1).await;
+        assert_eq!(watermark(&db).await.as_deref(), Some(H1));
+        // The leap: h3 is not the canonical successor — begin refuses
+        // before inserting a header or staging a page.
+        feed_begin(&db, &h3, NOW_SECS)
+            .await
+            .expect_err("begin past the canonical successor refuses");
+        assert!(
+            read_hour(&db, h3.as_str())
+                .await
+                .expect("read h3")
+                .is_none(),
+            "refused begin left a header row"
+        );
+        // A complete hour refuses to deliver while h2 is staging —
+        // before a single demand batch or acknowledgment lands.
+        let g2 = feed_begin(&db, &h2, NOW_SECS)
+            .await
+            .expect("begin canonical h2")
+            .generation;
+        feed_begin(&db, &h4, NOW_SECS)
+            .await
+            .expect_err("h4 is still not the successor");
+        // h4 cannot even begin: seed its row directly to exercise the
+        // deliver-side guard on pre-existing out-of-order data.
+        db.query(
+            "INSERT INTO demand_feed_hours (hour, generation, state) \
+             VALUES (?, 7, 'staging')",
+        )
+        .bind(h4.as_str())
+        .execute()
+        .await
+        .expect("insert h4");
+        for (i, entries) in page.iter().enumerate() {
+            feed_page(
+                &db,
+                &DemandFeedPageRequest {
+                    hour: h4.clone(),
+                    generation: 7,
+                    page_no: u32::try_from(i).expect("page index"),
+                    entries: entries.clone(),
+                },
+                NOW_SECS,
+            )
+            .await
+            .expect("stage h4 page");
+        }
+        feed_complete(&db, &complete(&h4, 7, &page), NOW_SECS)
+            .await
+            .expect("freeze h4");
+        feed_deliver(&db, &h4, NOW_MS, &settings())
+            .await
+            .expect_err("deliver refuses while h2 is unfinished");
+        let applied = db
+            .query(
+                "SELECT COUNT(*) FROM demand_feed_pages \
+                 WHERE hour = ? AND applied = 1",
+            )
+            .bind(h4.as_str())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count applied");
+        assert_eq!(applied, 0, "refused delivery applied a page");
+        let batches = db
+            .query(
+                "SELECT COUNT(*) FROM demand_batches \
+                 WHERE batch_id LIKE 'demand-feed/2026-01-01T04/%'",
+            )
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count batches");
+        assert_eq!(batches, 0, "refused delivery wrote a ledger batch");
+        // The genuine successor delivers, then h4 follows canonically
+        // once h3 materializes and finishes in between.
+        feed_complete(&db, &complete(&h2, g2, &[]), NOW_SECS)
+            .await
+            .expect("complete h2");
+        deliver_all(&db, &h2, 0).await;
+        assert_eq!(watermark(&db).await.as_deref(), Some(H2));
+        stage_and_freeze(&db, &h3, &[]).await;
+        deliver_all(&db, &h3, 0).await;
+        assert_eq!(watermark(&db).await.as_deref(), Some("2026-01-01T02"));
+        let h3b = hour("2026-01-01T03");
+        stage_and_freeze(&db, &h3b, &[]).await;
+        deliver_all(&db, &h3b, 0).await;
+        assert_eq!(watermark(&db).await.as_deref(), Some("2026-01-01T03"));
+        deliver_all(&db, &h4, 1).await;
+        assert_eq!(watermark(&db).await.as_deref(), Some(H4));
     }
 
     /// `cleanup` retires dead page rows in bounded chunks: obsolete

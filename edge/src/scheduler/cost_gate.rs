@@ -374,6 +374,12 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &["idx_queue_shape_requeue"],
         ddl_permitted: false,
     },
+    // Every demand-feed cap below is PROVISIONAL: host-measured on the
+    // 10k gate, pending actual workerd billed measurements — host
+    // result cardinality is not billed rows, so only these
+    // event-specific caps may move when the native pair reports, from
+    // measured costs plus stated headroom. The 31 existing budgets
+    // above stay unchanged (stow#523).
     RouteBudget {
         // The resume-cursor read (stow#523): one watermark probe
         // plus one unfinished-index probe — two point reads, flat in
@@ -447,20 +453,22 @@ const BUDGETS: &[RouteBudget] = &[
         ddl_permitted: false,
     },
     RouteBudget {
-        // One page-apply delivery: header read, bounded
-        // next-unapplied-page SELECT, the `demand_pass` closure for
-        // the page's four fixture identities, the acknowledged flip
-        // and the wake re-plan.
+        // One page-apply delivery at the protocol's maximum
+        // 256-entry page: header read, bounded next-unapplied-page
+        // SELECT, the `demand_pass` closure for 256 real fixture
+        // identities, the acknowledged flip and the wake re-plan —
+        // measured 273/640/310 on the 10k gate.
         name: "POST /scheduler/demand-feed/deliver (page apply)",
-        statements: 40,
-        rows_read: 60,
-        rows_written: 12,
+        statements: 550,
+        rows_read: 1300,
+        rows_written: 650,
         scan_allowlist: &[],
         ddl_permitted: false,
     },
     RouteBudget {
-        // The terminal call: last page-apply plus the
-        // contiguous-watermark guarded `delivered` transition.
+        // The terminal call — transition-only: every page already
+        // applied, so just the probes plus the contiguous-watermark
+        // guarded `delivered` transition.
         name: "POST /scheduler/demand-feed/deliver (terminal)",
         statements: 18,
         rows_read: 40,

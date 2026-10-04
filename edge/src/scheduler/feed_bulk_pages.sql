@@ -1,4 +1,4 @@
--- seed_feed_bulk's retained delivered pages: `?1`/`?2` bound the
+-- The FeedPages phase's retained delivered pages: `?1`/`?2` bound the
 -- chunk, the last three `?`s are hist_hours — the row count pages spread across so a
 -- 1M-scale seed still distributes over the header set. applied=1:
 -- history the delivery scan must skip, not apply.

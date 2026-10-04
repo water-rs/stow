@@ -1,4 +1,4 @@
--- seed_feed_bulk's staging-hour page bulk on '2022-01-01T00' (gen 9):
+-- The FeedStaged phase's staging-hour page bulk on '2022-01-01T00' (gen 9):
 -- `?1`/`?2` bound the chunk, the last `?` is staged_pages — rows at or below
 -- it stage current-generation depth, the 256-row tail above it is the
 -- obsolete generation 7 the retire index is measured against.

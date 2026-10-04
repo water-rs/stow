@@ -312,6 +312,11 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_written: 700,
         wall_ms: 3_000,
     },
+    // Every demand-feed cap below is PROVISIONAL: host-measured,
+    // pending actual workerd billed measurements — only these
+    // event-specific caps may be retuned from measured native costs
+    // plus stated headroom; the 31 existing budgets stay unchanged
+    // (stow#523).
     DriveBudget {
         // The resume-cursor read: one watermark probe plus one
         // unfinished-index probe — flat in retained depth.
@@ -375,17 +380,19 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 50,
     },
     DriveBudget {
-        // One page-apply delivery: the bounded next-page SELECT, the
-        // `demand_pass` closure for four fixture identities, the ack
-        // flip and the wake re-plan.
+        // One page-apply delivery at the protocol's maximum
+        // 256-entry page: the bounded next-page SELECT, the
+        // `demand_pass` closure for 256 real fixture identities, the
+        // ack flip and the wake re-plan.
         name: "POST /scheduler/demand-feed/deliver (page apply)",
-        statements: 40,
-        rows_read: 60,
-        rows_written: 12,
-        wall_ms: 300,
+        statements: 550,
+        rows_read: 1300,
+        rows_written: 650,
+        wall_ms: 600,
     },
     DriveBudget {
-        // The terminal call: last apply plus the contiguous-watermark
+        // The terminal call — transition-only after every page has
+        // applied: its probes plus the contiguous-watermark
         // `delivered` transition.
         name: "POST /scheduler/demand-feed/deliver (terminal)",
         statements: 18,

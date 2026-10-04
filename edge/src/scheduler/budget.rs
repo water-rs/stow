@@ -445,6 +445,9 @@ const fn seed_phase_tag(phase: fixture::SeedPhase) -> &'static str {
         fixture::SeedPhase::EdgesThirds => "edges_thirds",
         fixture::SeedPhase::Slices => "slices",
         fixture::SeedPhase::DepsMet => "deps",
+        fixture::SeedPhase::FeedHeaders => "feed_headers",
+        fixture::SeedPhase::FeedPages => "feed_pages",
+        fixture::SeedPhase::FeedStaged => "feed_staged",
     }
 }
 
@@ -456,6 +459,9 @@ fn parse_seed_phase(tag: &str) -> Option<fixture::SeedPhase> {
         "edges_thirds" => Some(fixture::SeedPhase::EdgesThirds),
         "slices" => Some(fixture::SeedPhase::Slices),
         "deps" => Some(fixture::SeedPhase::DepsMet),
+        "feed_headers" => Some(fixture::SeedPhase::FeedHeaders),
+        "feed_pages" => Some(fixture::SeedPhase::FeedPages),
+        "feed_staged" => Some(fixture::SeedPhase::FeedStaged),
         _ => None,
     }
 }

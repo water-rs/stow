@@ -1,4 +1,4 @@
--- seed_feed_bulk's historical delivered headers: the two `?`s bound the
+-- The FeedHeaders phase's historical delivered headers: the two `?`s bound the
 -- recursive row range this chunk writes — strftime rolls the hour
 -- from 2018-01-01 so the PK stays ordered and `INSERT OR IGNORE`
 -- makes a repeat re-arm a dedupe pass.

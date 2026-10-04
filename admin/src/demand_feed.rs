@@ -1015,13 +1015,23 @@ mod tests {
     /// panic-path backup; either way no accept or connection task
     /// outlives the test.
     impl MockServer {
-        async fn shutdown(mut self) {
+        /// Signal the graceful shutdown and await the accept task —
+        /// a wedged or panicked listener fails the test, it does not
+        /// pass silently: a `JoinError` surfaces the panic, and a
+        /// timeout aborts then awaits the owned task so the handle is
+        /// genuinely joined before the error reports.
+        async fn shutdown(mut self) -> Result<(), String> {
             if let Some(signal) = self.shutdown.take() {
                 let _ = signal.send(());
             }
             match tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.task).await {
-                Ok(_) => {}
-                Err(_) => self.task.abort(),
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(format!("mock server task failed: {error}")),
+                Err(_) => {
+                    self.task.abort();
+                    let _ = (&mut self.task).await;
+                    Err("mock server shutdown timed out; task aborted".to_owned())
+                }
             }
         }
     }
@@ -1227,7 +1237,7 @@ mod tests {
                 .count(),
             1
         );
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1257,7 +1267,7 @@ mod tests {
         assert_eq!(paths[0], "GET /api/v1/admin/scheduler/demand-feed/status");
         assert!(paths.iter().any(|p| p.contains("/deliver")));
         assert!(paths.iter().any(|p| p.contains("/cleanup")));
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1272,7 +1282,7 @@ mod tests {
         let paths = server.paths();
         assert!(paths.iter().all(|p| !p.contains("/complete")));
         assert!(paths.iter().all(|p| !p.contains("/deliver")));
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1288,7 +1298,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(server.paths().len(), 1, "status refusal stops the pass");
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1312,7 +1322,7 @@ mod tests {
                 .iter()
                 .all(|p| !p.contains("/complete") && !p.contains("/deliver"))
         );
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1338,7 +1348,7 @@ mod tests {
         );
         let paths = server.paths();
         assert!(paths.iter().all(|p| !p.contains("/complete")));
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1360,7 +1370,7 @@ mod tests {
         let calls = server.drain();
         assert_eq!(calls.iter().filter(|(p, _)| p.contains("/page")).count(), 5);
         assert!(calls.iter().all(|(p, _)| !p.contains("/deliver")));
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1386,7 +1396,7 @@ mod tests {
             "every launched deliver call was made before the error surfaced"
         );
         assert!(paths.iter().all(|p| !p.contains("/cleanup")));
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1418,7 +1428,7 @@ mod tests {
         assert!(format!("{error:#}").contains("leap"), "{error:#}");
         let paths = server.paths();
         assert_eq!(paths.len(), 1, "only the status read ran: {paths:?}");
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1449,7 +1459,7 @@ mod tests {
         let paths = server.paths();
         assert!(paths.iter().any(|p| p.contains("/deliver")));
         assert!(paths.iter().all(|p| !p.contains("/query")));
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1483,7 +1493,7 @@ mod tests {
             server.paths().is_empty(),
             "no side effect before validation"
         );
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1503,7 +1513,7 @@ mod tests {
             .is_err()
         );
         assert!(server.paths().is_empty());
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 
     #[tokio::test]
@@ -1526,6 +1536,6 @@ mod tests {
             .await
             .expect_err("unknown state refuses");
         assert!(format!("{error:#}").contains("unknown state"), "{error:#}");
-        server.shutdown().await;
+        server.shutdown().await.expect("mock server shutdown");
     }
 }
