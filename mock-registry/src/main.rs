@@ -15,7 +15,7 @@ use axum::{
     body::{Body, to_bytes},
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
@@ -420,7 +420,12 @@ async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
     let listener = TcpListener::bind(&request.listen).await.map_err(|error| {
         stow_types::stow_error!("bind mock registry {}: {error}", request.listen)
     })?;
-    let app = registry_app(&request.listen, request.registry_root.clone());
+    let app = registry_app_with_probe(
+        &request.listen,
+        request.registry_root.clone(),
+        None,
+        request.demand_fixtures.clone(),
+    );
     tracing::info!(
         listen = %request.listen,
         registry_root = %request.registry_root.display(),
@@ -436,14 +441,11 @@ async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
 /// `GET /token` mints the bearer the challenge points at, and only
 /// registry-issued unexpired tokens are served. `POST` takes the monolithic
 /// blob upload and `PUT` stores manifests — the same verbs GHCR answers.
-fn registry_app(listen: &str, registry_root: PathBuf) -> Router {
-    registry_app_with_probe(listen, registry_root, None)
-}
-
 fn registry_app_with_probe(
     listen: &str,
     registry_root: PathBuf,
     probe: Option<RegistryProbe>,
+    demand_fixtures: Option<PathBuf>,
 ) -> Router {
     Router::new()
         .route("/v2", get(v2_ping).head(v2_ping))
@@ -465,6 +467,7 @@ fn registry_app_with_probe(
             requests: probe.as_ref().map(|probe| Arc::clone(&probe.requests)),
             rate_limits: probe.as_ref().map(|probe| Arc::clone(&probe.rate_limits)),
             toggles: probe.as_ref().map(|probe| Arc::clone(&probe.toggles)),
+            demand_fixtures,
         })
 }
 
@@ -494,7 +497,7 @@ impl RegistryProbe {
         };
         let root = probe.registry_root.clone();
         (
-            registry_app_with_probe(listen, root, Some(probe.clone())),
+            registry_app_with_probe(listen, root, Some(probe.clone()), None),
             probe,
         )
     }
@@ -1406,6 +1409,14 @@ struct ServeArgs {
     registry_root: PathBuf,
     #[arg(long, default_value = "127.0.0.1:28123")]
     listen: String,
+    /// Optional directory of per-hour demand-feed provider documents
+    /// (`YYYY-MM-DDTHH.json`, served verbatim — a harness may write a
+    /// truncated or corrupt file). Absent keeps the built-in scripted
+    /// documents. Every served (or refused) demand query appends one
+    /// JSON line to `registry_root/demand-queries.log` so a harness
+    /// proves a query ran — or did not.
+    #[arg(long)]
+    demand_fixtures: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1422,6 +1433,9 @@ struct MockRegistryState {
     /// The probe's behavior toggles — `None` means the well-behaved
     /// registry: single `POST` uploads, digest headers, honest serving.
     toggles: Option<Arc<ProbeToggles>>,
+    /// The optional per-hour demand-feed fixture directory — `None`
+    /// keeps the built-in scripted `analytics_engine/sql` documents.
+    demand_fixtures: Option<PathBuf>,
 }
 
 /// Issued bearer tokens and their expirations; `Instant` is enough
@@ -1801,7 +1815,67 @@ async fn store_manifest(
 /// not name, so one row serves all six. The row keeps Analytics
 /// Engine's real `FORMAT JSON` shape (quoted `UInt64`s) so the public
 /// stats route exercises its genuine SQL-API path end to end.
-async fn analytics_engine_sql(body: String) -> Json<serde_json::Value> {
+async fn analytics_engine_sql(
+    State(state): State<MockRegistryState>,
+    body: String,
+) -> Response<Body> {
+    // Fixture mode (stow#523 harness): the optional `--demand-fixtures`
+    // directory carries one verbatim document per requested hour —
+    // `YYYY-MM-DDTHH.json` — so the harness edits a file between runs
+    // to change the provider's answer (including deliberately corrupt
+    // or truncated bytes). Every demand query appends one JSON line to
+    // `registry_root/demand-queries.log`: the hour it asked for and
+    // whether a fixture answered, which is how a lost-ACK resume
+    // proves NO new query ran. Without the flag the built-in scripted
+    // documents below answer exactly as before.
+    if let Some(fixtures) = &state.demand_fixtures
+        && body.contains("stow_cache_misses")
+    {
+        // The feed query interpolates its hour verbatim as
+        // `'YYYY-MM-DD HH'` — the only timestamp literal it carries.
+        let hour = body
+            .split('\'')
+            .nth(1)
+            .map(|raw| raw.replace(' ', "T"))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let file = fixtures.join(format!("{hour}.json"));
+        let bytes = tokio::fs::read(&file).await.ok();
+        let record = serde_json::json!({
+            "hour": hour,
+            "served": bytes.is_some(),
+        })
+        .to_string();
+        let log = state.registry_root.join("demand-queries.log");
+        use tokio::io::AsyncWriteExt as _;
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .await
+        {
+            Ok(mut file) => {
+                let _ = file.write_all(record.as_bytes()).await;
+                let _ = file.write_all(b"\n").await;
+            }
+            Err(error) => tracing::warn!(%error, "demand query log write failed"),
+        }
+        return match bytes {
+            Some(bytes) => (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response(),
+            // No fixture: a provider-side failure the materializer
+            // must surface, never a silent empty hour.
+            None => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "errors": [{"code": 1, "message": format!("no demand fixture for {hour}")}],
+                })),
+            )
+                .into_response(),
+        };
+    }
     // The demand feed's hourly leg (stow#523) posts the same endpoint:
     // its query is the only one carrying `LIMIT ALL … FORMAT JSON`
     // over `stow_cache_misses`. The document answers in Analytics
@@ -1836,7 +1910,8 @@ async fn analytics_engine_sql(body: String) -> Json<serde_json::Value> {
                 ],
                 "data": [],
                 "rows": 0
-            }));
+            }))
+            .into_response();
         }
         let data: Vec<serde_json::Value> = (0..rows)
             .map(|n| {
@@ -1861,7 +1936,8 @@ async fn analytics_engine_sql(body: String) -> Json<serde_json::Value> {
             ],
             "data": data,
             "rows": data.len()
-        }));
+        }))
+        .into_response();
     }
     Json(serde_json::json!({
         "success": true,
@@ -1876,6 +1952,7 @@ async fn analytics_engine_sql(body: String) -> Json<serde_json::Value> {
             "hits": 420.0
         }]
     }))
+    .into_response()
 }
 
 /// The edge byte path for hosts that run no worker (the bench lane):
@@ -2121,8 +2198,8 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::{
-        Body, RegistryProbe, SigningScheme, manifest_file_name, registry_app, split_reference,
-        write_blob, write_manifest, write_mock_signature, write_public_key,
+        Body, RegistryProbe, SigningScheme, manifest_file_name, registry_app_with_probe,
+        split_reference, write_blob, write_manifest, write_mock_signature, write_public_key,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
@@ -2146,7 +2223,7 @@ mod tests {
             b"{\"schemaVersion\":2}",
         )
         .expect("manifest file");
-        let app = registry_app("127.0.0.1:28123", root.path().to_path_buf());
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
 
         // 1. Unauthenticated asset request → 401 + Bearer challenge. The
         // version ping carries the same challenge — that is how the
@@ -2293,7 +2370,7 @@ mod tests {
         let root = tempfile::tempdir().expect("registry root");
         let bundle = b"not really a tar, but the bytes the index pins".to_vec();
         publish_slice(root.path(), &bundle).await;
-        let app = registry_app("127.0.0.1:28123", root.path().to_path_buf());
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
         let uri = format!("/api/v1/bundles/{}", sha256_digest(&bundle));
 
         let response = app

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 stow-types.workspace = true
+blake3.workspace = true
 stow-shim = { workspace = true, features = ["zstd"] }
 tracing.workspace = true
 serde.workspace = true
