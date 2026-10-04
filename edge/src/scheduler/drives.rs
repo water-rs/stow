@@ -2288,20 +2288,6 @@ fn feed_drive_entries(
         .collect()
 }
 
-/// The header generation a drive's hour is currently staging under —
-/// the begin report's own answer, so page calls land on the live
-/// generation whether the hour was opened or rotated.
-async fn feed_drive_generation(
-    db: &DurableDb,
-    hour: &stow_types::api::DemandFeedHour,
-) -> Result<i64, String> {
-    db.query("SELECT generation FROM demand_feed_hours WHERE hour = ?")
-        .bind(hour.as_str())
-        .fetch_scalar::<i64>()
-        .await
-        .map_err(|error| format!("read drive hour generation: {error}"))
-}
-
 /// The generation every feed drive pins its hour to — the begin
 /// report's wall-clock value varies run to run, so unmetered setup
 /// stamps one deterministic number and the measured run builds its

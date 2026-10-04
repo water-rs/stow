@@ -2538,7 +2538,10 @@ mod tests {
     fn sized_entry(crate_name: &str, target: usize) -> SchedulerDemandEntry {
         let bare = entry(crate_name, 0);
         let bare_len = serde_json::to_vec(&bare).expect("measure").len();
-        assert!(target > bare_len, "target {target} is below a one-name entry");
+        assert!(
+            target > bare_len,
+            "target {target} is below a one-name entry"
+        );
         // `need` is what the feature list must contribute over the
         // bare `"[]"`: Σ(len + 5) - 1 with the +3 list overhead.
         let need = target - bare_len + 1;

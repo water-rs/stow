@@ -135,61 +135,61 @@ pub async fn run(
         .transpose()?;
 
     let report = if let Some((hour, state)) = unfinished {
-            // The durable cursor owns the resume order: an explicit
-            // `--hour` naming a DIFFERENT hour while one is unfinished
-            // would cross or leap over it — refuse rather than ignore
-            // the override. The same hour resumes its canonical state.
-            if let Some(explicit) = &explicit
-                && *explicit != hour
-            {
-                return Err(Error::msg(format!(
-                    "--hour {explicit} but the durable cursor holds unfinished hour \
+        // The durable cursor owns the resume order: an explicit
+        // `--hour` naming a DIFFERENT hour while one is unfinished
+        // would cross or leap over it — refuse rather than ignore
+        // the override. The same hour resumes its canonical state.
+        if let Some(explicit) = &explicit
+            && *explicit != hour
+        {
+            return Err(Error::msg(format!(
+                "--hour {explicit} but the durable cursor holds unfinished hour \
                      {hour} ({state}) — refusing to leap over it"
+            )));
+        }
+        match state.as_str() {
+            // A frozen hour delivers its original staged pages —
+            // the input is immutable, so no new Analytics Engine
+            // query ever runs for it.
+            "complete" => {
+                let (delivered_pages, touched_tasks) = deliver_and_retire(edge, &hour).await?;
+                FeedRunReport {
+                    hour: hour.to_string(),
+                    state: "delivered".to_owned(),
+                    staged_pages: 0,
+                    staged_entries: 0,
+                    delivered_pages,
+                    touched_tasks,
+                }
+            }
+            // A `staging` hour materializes again from scratch —
+            // its pages were never frozen, so a fresh query under
+            // a fresh generation is the canonical restart.
+            "staging" => materialize(edge, hour).await?,
+            // An unknown state is an error — never a silent
+            // re-materialize.
+            other => {
+                return Err(Error::msg(format!(
+                    "demand feed hour {hour} reports unknown state {other:?}"
                 )));
             }
-            match state.as_str() {
-                // A frozen hour delivers its original staged pages —
-                // the input is immutable, so no new Analytics Engine
-                // query ever runs for it.
-                "complete" => {
-                    let (delivered_pages, touched_tasks) = deliver_and_retire(edge, &hour).await?;
-                    FeedRunReport {
-                        hour: hour.to_string(),
-                        state: "delivered".to_owned(),
-                        staged_pages: 0,
-                        staged_entries: 0,
-                        delivered_pages,
-                        touched_tasks,
-                    }
-                }
-                // A `staging` hour materializes again from scratch —
-                // its pages were never frozen, so a fresh query under
-                // a fresh generation is the canonical restart.
-                "staging" => materialize(edge, hour).await?,
-                // An unknown state is an error — never a silent
-                // re-materialize.
-                other => {
-                    return Err(Error::msg(format!(
-                        "demand feed hour {hour} reports unknown state {other:?}"
-                    )));
-                }
-            }
+        }
+    } else {
+        let hour = match (explicit, &status.watermark) {
+            (Some(hour), _) => hour,
+            (None, Some(watermark)) => DemandFeedHour::parse(watermark)
+                .and_then(|previous| previous.next())
+                .map_err(Error::msg)?,
+            (None, None) => DemandFeedHour::latest_closed(now_secs)
+                .ok_or_else(|| stow_error!("no closed hour is representable"))?,
+        };
+        if hour.ensure_closed(now_secs).is_err() {
+            // The cursor's successor has not closed yet — the feed
+            // is simply early, not failed.
+            FeedRunReport::skipped(hour.to_string())
         } else {
-            let hour = match (explicit, &status.watermark) {
-                (Some(hour), _) => hour,
-                (None, Some(watermark)) => DemandFeedHour::parse(watermark)
-                    .and_then(|previous| previous.next())
-                    .map_err(Error::msg)?,
-                (None, None) => DemandFeedHour::latest_closed(now_secs)
-                    .ok_or_else(|| stow_error!("no closed hour is representable"))?,
-            };
-            if hour.ensure_closed(now_secs).is_err() {
-                // The cursor's successor has not closed yet — the feed
-                // is simply early, not failed.
-                FeedRunReport::skipped(hour.to_string())
-            } else {
-                materialize(edge, hour).await?
-            }
+            materialize(edge, hour).await?
+        }
     };
     render::emit(output, &report, |report| {
         if report.state == "skipped" {
@@ -297,80 +297,80 @@ async fn stage_and_freeze(
     stream_query(edge, hour, staging_path).await?;
     let staged_hour = hour.clone();
     // The parser runs on the blocking pool with bounded in-flight
-        // pages; each page posts under the object-enforced sequential
-        // ordering, so a staging failure aborts the rest cleanly.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<DemandFeedPageRequest>(PAGE_CHANNEL_BOUND);
-        let parse_path = staging_path.to_owned();
-        let parse = tokio::task::spawn_blocking(move || {
-            parse_feed_document(&parse_path, &staged_hour, generation, tx)
-        });
+    // pages; each page posts under the object-enforced sequential
+    // ordering, so a staging failure aborts the rest cleanly.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DemandFeedPageRequest>(PAGE_CHANNEL_BOUND);
+    let parse_path = staging_path.to_owned();
+    let parse = tokio::task::spawn_blocking(move || {
+        parse_feed_document(&parse_path, &staged_hour, generation, tx)
+    });
 
-        let mut page_hashes = Vec::new();
-        let mut entry_count = 0_u64;
-        let mut staged_pages = 0_u32;
-        let staging: stow_types::error::Result<()> = async {
-            while let Some(request) = rx.recv().await {
-                // The shared builder already guarantees the exact
-                // whole-envelope bound; ordering is checked here.
-                if request.page_no != staged_pages {
-                    return Err(stow_error!(
-                        "demand feed parser emitted page {} after {}",
-                        request.page_no,
-                        staged_pages
-                    ));
-                }
-                page_hashes.push(demand_feed_page_hash(&request.entries).map_err(Error::msg)?);
-                entry_count = entry_count
-                    .checked_add(request.entries.len() as u64)
-                    .ok_or_else(|| stow_error!("demand feed entry count overflow"))?;
-                edge.post_unit(&format!("{FEED_ROUTE}/page"), &request)
-                    .await?;
-                staged_pages += 1;
+    let mut page_hashes = Vec::new();
+    let mut entry_count = 0_u64;
+    let mut staged_pages = 0_u32;
+    let staging: stow_types::error::Result<()> = async {
+        while let Some(request) = rx.recv().await {
+            // The shared builder already guarantees the exact
+            // whole-envelope bound; ordering is checked here.
+            if request.page_no != staged_pages {
+                return Err(stow_error!(
+                    "demand feed parser emitted page {} after {}",
+                    request.page_no,
+                    staged_pages
+                ));
             }
-            Ok(())
+            page_hashes.push(demand_feed_page_hash(&request.entries).map_err(Error::msg)?);
+            entry_count = entry_count
+                .checked_add(request.entries.len() as u64)
+                .ok_or_else(|| stow_error!("demand feed entry count overflow"))?;
+            edge.post_unit(&format!("{FEED_ROUTE}/page"), &request)
+                .await?;
+            staged_pages += 1;
         }
-        .await;
+        Ok(())
+    }
+    .await;
 
-        let summary = match staging {
-            Ok(()) => parse
-                .await
-                .map_err(|error| stow_error!("demand feed parser task: {error}"))
-                .and_then(|outcome| outcome.map_err(Error::msg))?,
-            Err(error) => {
-                // The page leg failed — close the receiver FIRST: a
-                // `blocking_send` against a live-but-undrained channel
-                // would park the parser thread forever on a full
-                // bounded queue. Dropping `rx` makes every pending
-                // send fail fast, then joining cannot hang. The
-                // original post error is what surfaces, not a
-                // secondary parse failure.
-                drop(rx);
-                let _ = parse.await;
-                return Err(error);
-            }
-        };
-
-        if summary.rows != entry_count {
-            return Err(stow_error!(
-                "demand feed staged {entry_count} entries but the document parsed {}",
-                summary.rows
-            ));
+    let summary = match staging {
+        Ok(()) => parse
+            .await
+            .map_err(|error| stow_error!("demand feed parser task: {error}"))
+            .and_then(|outcome| outcome.map_err(Error::msg))?,
+        Err(error) => {
+            // The page leg failed — close the receiver FIRST: a
+            // `blocking_send` against a live-but-undrained channel
+            // would park the parser thread forever on a full
+            // bounded queue. Dropping `rx` makes every pending
+            // send fail fast, then joining cannot hang. The
+            // original post error is what surfaces, not a
+            // secondary parse failure.
+            drop(rx);
+            let _ = parse.await;
+            return Err(error);
         }
-        let manifest_hash = demand_feed_manifest(&page_hashes)
-            .map(|hash| hash.to_hex().to_string())
-            .unwrap_or_default();
-        edge.post_unit(
-            &format!("{FEED_ROUTE}/complete"),
-            &DemandFeedCompleteRequest {
-                hour: hour.clone(),
-                generation,
-                page_count: staged_pages,
-                entry_count,
-                manifest_hash,
-            },
-        )
-        .await?;
-        Ok((entry_count, staged_pages))
+    };
+
+    if summary.rows != entry_count {
+        return Err(stow_error!(
+            "demand feed staged {entry_count} entries but the document parsed {}",
+            summary.rows
+        ));
+    }
+    let manifest_hash = demand_feed_manifest(&page_hashes)
+        .map(|hash| hash.to_hex().to_string())
+        .unwrap_or_default();
+    edge.post_unit(
+        &format!("{FEED_ROUTE}/complete"),
+        &DemandFeedCompleteRequest {
+            hour: hour.clone(),
+            generation,
+            page_count: staged_pages,
+            entry_count,
+            manifest_hash,
+        },
+    )
+    .await?;
+    Ok((entry_count, staged_pages))
 }
 
 /// `POST …/query` → owned temp file: the body streams through bounded
@@ -835,8 +835,8 @@ mod tests {
 
     #[test]
     fn truncation_and_trailing_bytes_fail() {
-        let body = serde_json::to_vec(&document(&[row("serde", &json!(1.0))]))
-            .expect("document encodes");
+        let body =
+            serde_json::to_vec(&document(&[row("serde", &json!(1.0))])).expect("document encodes");
         let truncated = &body[..body.len() - 20];
         assert!(parse_body(truncated).is_err(), "truncated body refuses");
         let mut appended = body.clone();

@@ -622,8 +622,8 @@ async fn finish_feed_deliver(
     settings: &SchedulerSettings,
 ) -> Result<(DemandFeedDeliverReport, AlarmPlan), QueueError> {
     let predecessor = hour.prev().map_err(QueueError::Invariant)?;
-        db.query(
-            "UPDATE demand_feed_hours SET state = 'delivered' \
+    db.query(
+        "UPDATE demand_feed_hours SET state = 'delivered' \
              WHERE hour = ? AND state = 'complete' \
                AND applied_pages = page_count \
                AND (NOT EXISTS (SELECT 1 FROM settings WHERE key = ?) OR \
@@ -632,33 +632,33 @@ async fn finish_feed_deliver(
                     SELECT 1 FROM demand_feed_hours older \
                     WHERE older.hour < demand_feed_hours.hour \
                       AND older.state IN ('staging', 'complete'))",
-        )
-        .bind(hour.as_str())
-        .bind(WATERMARK_KEY)
-        .bind(WATERMARK_KEY)
-        .bind(predecessor.as_str())
-        .execute()
-        .await
-        .map_err(|error| format!("mark demand feed hour {hour} delivered: {error}"))?;
-        if queue::changes(db).await? != 1 {
-            return Err(QueueError::Invariant(format!(
-                "demand feed hour {hour} cannot complete delivery: \
+    )
+    .bind(hour.as_str())
+    .bind(WATERMARK_KEY)
+    .bind(WATERMARK_KEY)
+    .bind(predecessor.as_str())
+    .execute()
+    .await
+    .map_err(|error| format!("mark demand feed hour {hour} delivered: {error}"))?;
+    if queue::changes(db).await? != 1 {
+        return Err(QueueError::Invariant(format!(
+            "demand feed hour {hour} cannot complete delivery: \
                  unacknowledged pages remain, the watermark is not at {predecessor}, \
                  or an unfinished hour sits below it"
-            )));
-        }
-        let plan = queue::next_alarm(db, now_ms, settings).await?;
-        Ok((
-            DemandFeedDeliverReport {
-                hour: hour.to_string(),
-                state: "delivered".to_owned(),
-                delivered_page: None,
-                applied: false,
-                touched_tasks: 0,
-                remaining_pages: 0,
-            },
-            plan,
-        ))
+        )));
+    }
+    let plan = queue::next_alarm(db, now_ms, settings).await?;
+    Ok((
+        DemandFeedDeliverReport {
+            hour: hour.to_string(),
+            state: "delivered".to_owned(),
+            delivered_page: None,
+            applied: false,
+            touched_tasks: 0,
+            remaining_pages: 0,
+        },
+        plan,
+    ))
 }
 
 /// Replay one frozen page verbatim into the demand ledger — never a
@@ -674,7 +674,6 @@ async fn apply_feed_page(
     now_ms: i64,
     settings: &SchedulerSettings,
 ) -> Result<(DemandFeedDeliverReport, AlarmPlan), QueueError> {
-    {
     let entries: Vec<SchedulerDemandEntry> =
         serde_json::from_str(&page.payload).map_err(|error| {
             QueueError::Invariant(format!(
@@ -708,15 +707,12 @@ async fn apply_feed_page(
         .fetch_scalar::<i64>()
         .await
         .map_err(|error| format!("read applied page count for {hour}: {error}"))?;
-    let remaining = row
-        .page_count
-        .checked_sub(applied_pages)
-        .ok_or_else(|| {
-            QueueError::Invariant(format!(
-                "demand feed hour {hour} applied_pages {applied_pages} exceeds page_count {}",
-                row.page_count
-            ))
-        })?;
+    let remaining = row.page_count.checked_sub(applied_pages).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "demand feed hour {hour} applied_pages {applied_pages} exceeds page_count {}",
+            row.page_count
+        ))
+    })?;
     Ok((
         DemandFeedDeliverReport {
             hour: hour.to_string(),
@@ -738,7 +734,6 @@ async fn apply_feed_page(
         },
         plan,
     ))
-    }
 }
 
 /// `POST /demand-feed/cleanup` — retire up to
@@ -809,8 +804,8 @@ mod tests {
     use crate::scheduler::queue::{Dispatch, SchedulerSettings};
     use crate::scheduler::test_db::{counting_memory_db, memory_db};
     use stow_types::api::{
-        DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageRequest, SchedulerDemandEntry,
-        EnqueueRequest, EnqueueSource, demand_feed_manifest, demand_feed_page_hash,
+        DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageRequest, EnqueueRequest,
+        EnqueueSource, SchedulerDemandEntry, demand_feed_manifest, demand_feed_page_hash,
     };
     use stow_types::identity::FeaturesJson;
 
@@ -1342,9 +1337,7 @@ mod tests {
             .await
             .expect_err("non-canonical delivery refuses before demand");
         let applied = db
-            .query(
-                "SELECT applied_pages FROM demand_feed_hours WHERE hour = ?",
-            )
+            .query("SELECT applied_pages FROM demand_feed_hours WHERE hour = ?")
             .bind(h4.as_str())
             .fetch_scalar::<i64>()
             .await
