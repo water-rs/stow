@@ -36,3 +36,6 @@ zstd = "0.14"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 stow-oci = { workspace = true, features = ["mock-verify"] }
+# The fixture example serializes QueueSelector task-id lists into the
+# same `task_ids=…&task_ids=…` wire encoding the admin queue route reads.
+serde_html_form = "0.4"

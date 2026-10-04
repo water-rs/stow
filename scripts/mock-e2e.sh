@@ -469,7 +469,7 @@ expect_unfinished() { # hour state staged_pages
     u_pages="$(feed_unfinished_field staged_pages)"
     [ "$u_hour" = "$1" ] && [ "$u_state" = "$2" ] \
         || die "unfinished is $u_hour/$u_state, expected $1/$2"
-    [ -z "$3" ] || [ "$u_pages" = "$3" ] \
+    [ -z "${3-}" ] || [ "$u_pages" = "$3" ] \
         || die "unfinished staged_pages is $u_pages, expected $3"
 }
 expect_query_delta() { # expected_new_queries hour
@@ -480,20 +480,42 @@ expect_query_delta() { # expected_new_queries hour
         || die "last provider query was not for $2"
 }
 
-# Every fixture queue row, paged through the typed task_ids selector
-# in bounded chunks (the admin list ceiling is 500; sixty ids per
-# call stays well under it and under URL length limits).
+# Every fixture queue row, paged through typed QueueSelector task-id
+# chunks the generator serialized with serde_html_form (the admin list
+# ceiling is 500; sixty ids per call stays well under it and under URL
+# length limits). Independent chunk fetches run under explicit bounded
+# concurrency — four in flight, never nine serialized round trips —
+# each to its own output file, then merged in input order with every
+# failure propagated.
+QUEUE_CONCURRENCY=4
 fixture_rows() { # out-file: one merged JSON array of QueueTask rows
-    local out="$1" chunk query
-    jq -r '.[].task_id' "$FIXTURES/expectations.json" >"$WORK_DIR/task-ids.txt"
-    rm -f "$WORK_DIR"/ids-chunk-*; : >"$out"
-    split -l 60 "$WORK_DIR/task-ids.txt" "$WORK_DIR/ids-chunk-"
-    for chunk in "$WORK_DIR"/ids-chunk-*; do
-        query="$(sed 's/^/task_ids=/' "$chunk" | paste -sd'&')"
-        curl -fsS -H "Authorization: Bearer $EDGE_BEARER" \
-            "$EDGE_URL/api/v1/admin/queue?$query" >"$WORK_DIR/queue-page.json" \
-            || die "queue readback failed"
-        jq -c '.[]' "$WORK_DIR/queue-page.json" >>"$out"
+    local out="$1" index=0 running=0 chunk query
+    : >"$out"
+    rm -f "$WORK_DIR"/queue-part-* "$WORK_DIR"/queue-err-*
+    jq -r '.[]' "$FIXTURES/queue-selector-queries.json" \
+        >"$WORK_DIR/queue-queries.txt"
+    while IFS= read -r query; do
+        ( curl -sS -o "$WORK_DIR/queue-part-$index.json" \
+              -w '%{http_code}' \
+              -H "Authorization: Bearer $EDGE_BEARER" \
+              "$EDGE_URL/api/v1/admin/queue?$query" \
+              >"$WORK_DIR/queue-code-$index" \
+              2>"$WORK_DIR/queue-err-$index" ) &
+        index=$((index + 1))
+        running=$((running + 1))
+        [ "$running" -lt "$QUEUE_CONCURRENCY" ] || { wait -n; running=$((running - 1)); }
+    done <"$WORK_DIR/queue-queries.txt"
+    wait
+    for chunk in "$WORK_DIR"/queue-code-*; do
+        local code
+        code="$(cat "$chunk")"
+        [[ "$code" =~ ^2 ]] \
+            || die "queue readback ${chunk##*-} failed ($code): $(cat "${chunk/code/err}" 2>/dev/null)"
+    done
+    for chunk in "$WORK_DIR"/queue-part-*; do
+        jq -e 'type == "array"' "$chunk" >/dev/null 2>&1 \
+            || die "queue chunk $chunk is not a JSON array"
+        jq -c '.[]' "$chunk" >>"$out"
     done
 }
 # task_id -> value map for the fixture set.
@@ -518,9 +540,10 @@ assert_fixture_rows() {
 # Exact per-task delta check against generated expectations:
 # jq exits 0 only when EVERY row's (final - initial) equals the
 # generated expected_delta — missing rows produce null and fail.
-assert_all_deltas() { # init-map final-map
+assert_all_deltas() { # init-map final-map [expectations-file]
+    local exp="${3:-$FIXTURES/expectations.json}"
     jq -n --slurpfile init "$1" --slurpfile final "$2" \
-        --slurpfile exp "$FIXTURES/expectations.json" '
+        --slurpfile exp "$exp" '
         ($exp[0]) as $e |
         all($e[];
             (($final[0][.task_id] // null) != null) and
@@ -529,9 +552,10 @@ assert_all_deltas() { # init-map final-map
         | grep -qx true \
         || die "fixture demand deltas mismatch — see $WORK_DIR/delta-diff.json"
 }
-delta_diff() { # init-map final-map -> writes mismatch report
+delta_diff() { # init-map final-map [expectations-file] -> writes mismatch report
+    local exp="${3:-$FIXTURES/expectations.json}"
     jq -n --slurpfile init "$1" --slurpfile final "$2" \
-        --slurpfile exp "$FIXTURES/expectations.json" '
+        --slurpfile exp "$exp" '
         ($exp[0]) | map(select(
             (($final[0][.task_id] // null) == null) or
             (($final[0][.task_id] - ($init[0][.task_id] // 0)) != .expected_delta)) |
@@ -705,11 +729,36 @@ expect_watermark 2020-01-01T05
 expect_unfinished 2020-01-01T06 staging 3
 assert_values_unchanged "$WORK_DIR/values-prev.json"
 
-# Stale payload retirement is real work, not a claim: the existing
-# cleanup report retires the staged pages before the retry rotates.
+# Stale payload retirement follows the real contract: `cleanup` on a
+# staging hour retires only pages whose generation is BELOW the
+# current attempt — every earlier failed generation was already
+# drained by the one bounded retire chunk each retry's `begin`
+# performs. So cleanup against the live generation must retire 0 and
+# report no remainder, while the 3 current-generation pages stay
+# staged under the current attempt.
 retired="$(feed_cleanup 2020-01-01T06)"
-[ "$retired" -ge 1 ] \
-    || die "cleanup must retire staged T06 pages after failures, retired=$retired"
+[ "$retired" = "0" ] \
+    || die "cleanup on the live generation must retire 0 pages, retired=$retired"
+expect_unfinished 2020-01-01T06 staging 3
+gen_before="$(feed_unfinished_field generation)"
+
+# An explicit begin rotates the generation: the new attempt's begin
+# retires the obsolete prefix in its one bounded chunk — for this
+# 3-page history the whole stale set fits inside it, so
+# stale_pages_pending reports no remainder, and the follow-up cleanup
+# finds nothing left to drain (begin-retire vs cleanup-drain are the
+# two halves of the same bounded contract).
+begin_reply="$(feed_post begin <(jq -nc '{hour:"2020-01-01T06"}'))" \
+    || die "explicit T06 begin failed"
+echo "$begin_reply" >"$LOG_DIR/feed-begin-06-rotate.json"
+gen_after="$(jq -r '.generation' <<<"$begin_reply")"
+[ "$gen_after" -gt "$gen_before" ] \
+    || die "begin must rotate the T06 generation ($gen_before -> $gen_after)"
+[ "$(jq -r '.stale_pages_pending' <<<"$begin_reply")" = "false" ] \
+    || die "one bounded retire chunk must drain the 3-page obsolete set"
+retired="$(feed_cleanup 2020-01-01T06)"
+[ "$retired" = "0" ] \
+    || die "cleanup after begin's drain must retire 0, retired=$retired"
 
 cp "$valid06" "$FIXTURES/hours/2020-01-01T06.json"
 feed_out="$LOG_DIR/demand-feed-06.json"
@@ -768,6 +817,7 @@ expect_unfinished null null
 # both the feed route and the #522 demand route.
 echo "[mock-e2e] demand feed: T10 freeze / lost-ACK resume"
 feed_freeze 2020-01-01T10
+fixture_values "$WORK_DIR/values-t10-before.json"
 reply="$(feed_post deliver <(jq -nc '{hour:"2020-01-01T10"}'))" \
     || die "T10 single-page deliver failed"
 echo "$reply" >"$LOG_DIR/feed-deliver-10-first.json"
@@ -776,16 +826,25 @@ echo "$reply" >"$LOG_DIR/feed-deliver-10-first.json"
     && [ "$(jq -r '.remaining_pages' <<<"$reply")" = "2" ] \
     && [ "$(jq -r '.touched_tasks' <<<"$reply")" -gt 0 ] \
     || die "T10 first deliver unexpected: $reply"
+# The first page's exact prefix effect: every task shows exactly the
+# generated page-0 delta — including the untouched ones (zero).
+fixture_values "$WORK_DIR/values-t10-page0.json"
+delta_diff "$WORK_DIR/values-t10-before.json" "$WORK_DIR/values-t10-page0.json" \
+    "$FIXTURES/t10-page0-expectations.json"
+assert_all_deltas "$WORK_DIR/values-t10-before.json" "$WORK_DIR/values-t10-page0.json" \
+    "$FIXTURES/t10-page0-expectations.json"
 q="$(query_count)"
 echo 'CORRUPTED upstream document' >"$FIXTURES/hours/2020-01-01T10.json"
 feed_out="$LOG_DIR/demand-feed-10.json"
 feed_cli "$feed_out" || die "demand-feed T10 resume failed -- see $feed_out"
 [ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
     && [ "$(jq -r '.staged_pages' "$feed_out")" = "0" ] \
-    || die "demand-feed T10: expected delivered/0 staged, got $(cat "$feed_out")"
+    && [ "$(jq -r '.delivered_pages' "$feed_out")" = "2" ] \
+    || die "demand-feed T10: expected delivered/0 staged/2 delivered, got $(cat "$feed_out")"
 expect_watermark 2020-01-01T10
 [ "$(query_count)" = "$q" ] \
     || die "frozen T10 resume must not query the (now corrupt) provider"
+values_checkpoint
 reply="$(feed_post deliver <(jq -nc '{hour:"2020-01-01T10"}'))" \
     || die "T10 delivered replay must be an accepted no-op"
 echo "$reply" >>"$LOG_DIR/feed-deliver-10-first.json"
@@ -802,6 +861,7 @@ demand_reply="$(demand_post "$FIXTURES/pages/2020-01-01T10-demand-replay.json")"
 echo "$demand_reply" >"$LOG_DIR/demand-replay-10.json"
 [ "$(jq -r '.applied' <<<"$demand_reply")" = "false" ] \
     || die "demand replay must report applied=false, got $demand_reply"
+assert_values_unchanged "$WORK_DIR/values-prev.json"
 
 # Exact whole-set demand deltas: every one of the 528 fixture tasks
 # (all 520 consumers AND every shared base closure) must show exactly

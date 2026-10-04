@@ -36,8 +36,9 @@ use std::path::PathBuf;
 
 use stow_types::api::{
     DEMAND_FEED_BATCH_PREFIX, DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageBuilder,
-    DemandFeedPageRequest, EnqueueDependency, EnqueueRequest, EnqueueSource, SchedulerDemandEntry,
-    SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash, task_id,
+    DemandFeedPageRequest, EnqueueDependency, EnqueueRequest, EnqueueSource, QueueSelector,
+    SchedulerDemandEntry, SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash,
+    task_id,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -118,6 +119,33 @@ fn anchor_name(combo_index: usize) -> String {
     format!("fixture-anchor-{combo_index:02}")
 }
 
+/// One consumer's queue task key, from its own identity — the single
+/// task_id computation every expectation/readback file shares.
+fn consumer_task_id(n: usize) -> String {
+    let (name, version, feats, triple, version_rustc, host_side) = identity(n);
+    task_id(
+        &name,
+        &version,
+        &FeaturesJson::canonicalize(feats).expect("features").raw(),
+        triple,
+        version_rustc,
+        host_side,
+    )
+}
+
+/// One base row's queue task key, from its combo position.
+fn base_task_id(combo_index: usize, combo: DepCombo) -> String {
+    let (triple, version_rustc, host_side) = combo;
+    task_id(
+        &base_name(combo_index),
+        "1.0.0",
+        "[]",
+        triple,
+        version_rustc,
+        host_side,
+    )
+}
+
 fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
     let (name, version, feats, triple, version_rustc, host_side) = identity(n);
     // Every consumer waits on the base row keyed by its own (target,
@@ -133,7 +161,7 @@ fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
         features_json: FeaturesJson::canonicalize(feats).expect("features"),
         target: target(triple),
         rustc_version: rustc(version_rustc),
-        downloads: 1_000_000 - u64::try_from(n).unwrap_or(0),
+        downloads: 1_000_000 - u64::try_from(n).expect("consumer index fits u64"),
         source: EnqueueSource::CacheMiss,
         depends_on: vec![EnqueueDependency {
             crate_name: crate_name(&base_name(dep_index)),
@@ -160,7 +188,7 @@ fn base_dep_request(combo_index: usize, combo: DepCombo) -> EnqueueRequest {
         features_json: FeaturesJson::default(),
         target: target(triple),
         rustc_version: rustc(version_rustc),
-        downloads: 2_000_000 - u64::try_from(combo_index).unwrap_or(0),
+        downloads: 2_000_000 - u64::try_from(combo_index).expect("combo index fits u64"),
         source: EnqueueSource::CacheMiss,
         depends_on: vec![EnqueueDependency {
             crate_name: crate_name(&anchor_name(combo_index)),
@@ -183,7 +211,7 @@ fn demand_entry(n: usize) -> SchedulerDemandEntry {
         features_json: FeaturesJson::canonicalize(feats).expect("features"),
         target: target(triple),
         rustc_version: rustc(version_rustc),
-        demand: u64::try_from(n % 7 + 1).unwrap_or(1),
+        demand: u64::try_from(n % 7 + 1).expect("demand fits u64"),
     }
 }
 
@@ -241,7 +269,7 @@ fn freeze_bodies(
         .collect();
     let entry_count: u64 = pages
         .iter()
-        .map(|page| u64::try_from(page.entries.len()).unwrap_or(0))
+        .map(|page| u64::try_from(page.entries.len()).expect("entry count fits u64"))
         .sum();
     let complete = DemandFeedCompleteRequest {
         hour,
@@ -286,7 +314,61 @@ fn write_json(path: &std::path::Path, value: &serde_json::Value) {
         .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
 }
 
+/// Per-entry demand deltas over one entry schedule: each entry adds
+/// its demand once to its own consumer row and once to the base row
+/// its dep combo keys — the shared-closure shape of the real walk.
+fn deltas_for(schedule: &[(usize, &SchedulerDemandEntry)]) -> (Vec<u64>, Vec<u64>) {
+    let combos = base_combos();
+    let mut consumer_delta = vec![0u64; CONSUMERS];
+    let mut base_delta = vec![0u64; combos.len()];
+    for (index, entry) in schedule {
+        consumer_delta[*index] += entry.demand;
+        let (_, _, _, triple, version_rustc, host_side) = identity(*index);
+        let dep_index = combos
+            .iter()
+            .position(|combo| *combo == (triple, version_rustc, host_side))
+            .expect("dep combo");
+        base_delta[dep_index] += entry.demand;
+    }
+    (consumer_delta, base_delta)
+}
+
+/// `{task_id, crate_name, expected_delta}` for EVERY submitted task
+/// (zero included), bases first then consumers — the same ordering
+/// and task_id helpers `queue-selector-queries.json` uses.
+fn expectations_json(
+    combos: &[DepCombo],
+    consumer_delta: &[u64],
+    base_delta: &[u64],
+) -> Vec<serde_json::Value> {
+    let mut expectations: Vec<serde_json::Value> = Vec::new();
+    for (index, combo) in combos.iter().enumerate() {
+        expectations.push(serde_json::json!({
+            "task_id": base_task_id(index, *combo),
+            "crate_name": base_name(index),
+            "expected_delta": base_delta[index],
+        }));
+    }
+    for (n, delta) in consumer_delta.iter().enumerate() {
+        let (name, ..) = identity(n);
+        expectations.push(serde_json::json!({
+            "task_id": consumer_task_id(n),
+            "crate_name": name,
+            "expected_delta": delta,
+        }));
+    }
+    expectations
+}
+
 fn main() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        // stderr, never stdout: keep diagnostics off the data stream.
+        .with_writer(std::io::stderr)
+        .init();
     let out = std::env::args()
         .nth(1)
         .map(PathBuf::from)
@@ -384,7 +466,7 @@ fn main() {
         let bytes = serde_json::to_vec(&body).expect("boundary body");
         std::fs::write(boundary.join(name), &bytes)
             .unwrap_or_else(|error| panic!("write {name}: {error}"));
-        eprintln!("{name}: {} bytes", bytes.len());
+        tracing::info!(%name, bytes = bytes.len(), "boundary page written");
     }
     let under_len = std::fs::metadata(boundary.join("under-page.json"))
         .expect("under page")
@@ -444,48 +526,53 @@ fn main() {
     add(&(0..20).collect::<Vec<_>>()); // T09 retry
     add(&(0..CONSUMERS).collect::<Vec<_>>()); // T10 page set
     add(&(0..10).collect::<Vec<_>>()); // T10 duplicated tail
-
-    let mut consumer_delta = vec![0u64; CONSUMERS];
-    let mut base_delta = vec![0u64; combos.len()];
-    for (index, entry) in &schedule {
-        consumer_delta[*index] += entry.demand;
-        let (_, _, _, triple, version_rustc, host_side) = identity(*index);
-        let dep_index = combos
-            .iter()
-            .position(|combo| *combo == (triple, version_rustc, host_side))
-            .expect("dep combo");
-        base_delta[dep_index] += entry.demand;
-    }
-    let mut expectations: Vec<serde_json::Value> = Vec::new();
-    for (index, combo) in combos.iter().enumerate() {
-        let (triple, version_rustc, host_side) = *combo;
-        expectations.push(serde_json::json!({
-            "task_id": task_id(&base_name(index), "1.0.0", "[]", triple, version_rustc, host_side),
-            "crate_name": base_name(index),
-            "expected_delta": base_delta[index],
-        }));
-    }
-    for (index, request) in enqueues.iter().enumerate().skip(combos.len()) {
-        let n = index - combos.len();
-        let (name, version, feats, triple, version_rustc, host_side) = identity(n);
-        expectations.push(serde_json::json!({
-            "task_id": task_id(
-                &name,
-                &version,
-                &FeaturesJson::canonicalize(feats).expect("features").raw(),
-                triple,
-                version_rustc,
-                host_side,
-            ),
-            "crate_name": name,
-            "expected_delta": consumer_delta[n],
-        }));
-        let _ = request;
-    }
+    let (consumer_delta, base_delta) = deltas_for(&schedule);
     write_json(
         &out.join("expectations.json"),
-        &serde_json::Value::Array(expectations),
+        &serde_json::Value::Array(expectations_json(&combos, &consumer_delta, &base_delta)),
     );
 
-    eprintln!("demand feed fixtures written under {}", out.display());
+    // t10-page0-expectations.json: the exact prefix effect the first
+    // delivered T10 page applies — its entries are three_page's
+    // leading slice, which the builder took from consumers[..256].
+    let page0_len = t10_pages[0].entries.len();
+    assert!(
+        page0_len <= CONSUMERS,
+        "T10 page 0 must slice the consumer prefix"
+    );
+    let page0_schedule: Vec<(usize, &SchedulerDemandEntry)> = (0..page0_len)
+        .map(|index| (index, &consumers[index]))
+        .collect();
+    let (page0_consumer, page0_base) = deltas_for(&page0_schedule);
+    write_json(
+        &out.join("t10-page0-expectations.json"),
+        &serde_json::Value::Array(expectations_json(&combos, &page0_consumer, &page0_base)),
+    );
+
+    // queue-selector-queries.json: typed QueueSelector task-id lists
+    // in bounded chunks, serialized by the same serde_html_form
+    // contract the real admin list reads — never hand-joined text.
+    const SELECTOR_CHUNK: usize = 60;
+    let task_ids: Vec<String> = combos
+        .iter()
+        .enumerate()
+        .map(|(index, combo)| base_task_id(index, *combo))
+        .chain((0..CONSUMERS).map(consumer_task_id))
+        .collect();
+    let queries: Vec<String> = task_ids
+        .chunks(SELECTOR_CHUNK)
+        .map(|chunk| {
+            serde_html_form::to_string(&QueueSelector {
+                task_ids: chunk.to_vec(),
+                ..QueueSelector::default()
+            })
+            .expect("selector encodes")
+        })
+        .collect();
+    write_json(
+        &out.join("queue-selector-queries.json"),
+        &serde_json::Value::Array(queries.into_iter().map(Into::into).collect()),
+    );
+
+    tracing::info!(dir = %out.display(), "demand feed fixtures written");
 }
