@@ -26,7 +26,7 @@ use sigstore::cosign::payload::SimpleSigning;
 use sigstore::crypto::signing_key::SigStoreKeyPair;
 use sigstore::crypto::{SigStoreSigner, SigningScheme};
 use stow_shim::schema as artifact_table_schema;
-use stow_types::api::ArtifactRecord;
+use stow_types::api::{ArtifactRecord, DemandFeedHour};
 use stow_types::bundle::{
     ArtifactBlobConfig, BundleArtifactConfig, BundleLayer, BundleParts, BundleSignatureMaterial,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
@@ -1815,6 +1815,74 @@ async fn store_manifest(
 /// not name, so one row serves all six. The row keeps Analytics
 /// Engine's real `FORMAT JSON` shape (quoted `UInt64`s) so the public
 /// stats route exercises its genuine SQL-API path end to end.
+/// The hour a feed demand query asks for: the `toDateTime('…')`
+/// argument the checked-in `edge/templates/demand_feed.sql` renders on
+/// both window bounds — `timestamp >= toDateTime('…')` and
+/// `timestamp < toDateTime('…') + INTERVAL '1' HOUR`. `Ok(None)` means
+/// the query isn't the demand query (e.g. the stats miss count, which
+/// shares `stow_cache_misses` but carries no bound); `Err` means a
+/// malformed or ambiguous bound the harness should hear about.
+fn demand_query_hour(body: &str) -> Result<Option<String>, String> {
+    const MARKER: &str = "toDateTime('";
+    let Some((start, _)) = body.match_indices(MARKER).next() else {
+        return Ok(None);
+    };
+    let arg = body[start + MARKER.len()..]
+        .split('\'')
+        .next()
+        .ok_or_else(|| "demand query's toDateTime bound is unterminated".to_owned())?;
+    let call = format!("{MARKER}{arg}'");
+    let occurrences = body.matches(&call).count();
+    if occurrences != 2 {
+        return Err(format!(
+            "demand query carries {occurrences} `toDateTime('{arg}')` bounds, expected the lower+upper pair"
+        ));
+    }
+    let literal = arg.strip_suffix(":00:00").ok_or_else(|| {
+        format!("demand hour bound {arg:?} is not the canonical `:00:00` timestamp")
+    })?;
+    let hour = literal.replace(' ', "T");
+    DemandFeedHour::parse(&hour)
+        .map_err(|error| format!("demand hour bound {arg:?} is not a valid hour: {error}"))?;
+    Ok(Some(hour))
+}
+
+/// One JSONL record in one append write —
+/// `registry_root/demand-queries.log` is the harness's proof of which
+/// hours the provider actually answered. A log failure is a provider
+/// failure, never a swallowed line.
+async fn log_demand_query(
+    registry_root: &std::path::Path,
+    hour: &str,
+    served: bool,
+) -> Result<(), Box<Response<Body>>> {
+    use tokio::io::AsyncWriteExt as _;
+    let record = format!("{}\n", serde_json::json!({"hour": hour, "served": served}));
+    let path = registry_root.join("demand-queries.log");
+    let outcome = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        file.write_all(record.as_bytes()).await?;
+        file.flush().await
+    }
+    .await;
+    outcome.map_err(|error| {
+        tracing::error!(%error, path = %path.display(), "demand query log write failed");
+        Box::new(
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "errors": [{"code": 1, "message": format!("demand query log: {error}")}],
+                })),
+            )
+                .into_response(),
+        )
+    })
+}
+
 async fn analytics_engine_sql(
     State(state): State<MockRegistryState>,
     body: String,
@@ -1831,50 +1899,47 @@ async fn analytics_engine_sql(
     if let Some(fixtures) = &state.demand_fixtures
         && body.contains("stow_cache_misses")
     {
-        // The feed query interpolates its hour verbatim as
-        // `'YYYY-MM-DD HH'` — the only timestamp literal it carries.
-        let hour = body
-            .split('\'')
-            .nth(1)
-            .map(|raw| raw.replace(' ', "T"))
-            .unwrap_or_else(|| "unknown".to_owned());
-        let file = fixtures.join(format!("{hour}.json"));
-        let bytes = tokio::fs::read(&file).await.ok();
-        let record = serde_json::json!({
-            "hour": hour,
-            "served": bytes.is_some(),
-        })
-        .to_string();
-        let log = state.registry_root.join("demand-queries.log");
-        use tokio::io::AsyncWriteExt as _;
-        match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-            .await
-        {
-            Ok(mut file) => {
-                let _ = file.write_all(record.as_bytes()).await;
-                let _ = file.write_all(b"\n").await;
+        match demand_query_hour(&body) {
+            // A demand query whose bound is malformed or ambiguous is a
+            // provider-side failure, never a guess.
+            Err(message) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({
+                        "errors": [{"code": 1, "message": message}],
+                    })),
+                )
+                    .into_response();
             }
-            Err(error) => tracing::warn!(%error, "demand query log write failed"),
+            // Not a demand query (e.g. the stats miss count): the
+            // scripted documents below keep their ordinary path.
+            Ok(None) => {}
+            Ok(Some(hour)) => {
+                let file = fixtures.join(format!("{hour}.json"));
+                let bytes = tokio::fs::read(&file).await.ok();
+                if let Err(response) =
+                    log_demand_query(&state.registry_root, &hour, bytes.is_some()).await
+                {
+                    return *response;
+                }
+                return match bytes {
+                    Some(bytes) => (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        bytes,
+                    )
+                        .into_response(),
+                    // No fixture: a provider-side failure the materializer
+                    // must surface, never a silent empty hour.
+                    None => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "errors": [{"code": 1, "message": format!("no demand fixture for {hour}")}],
+                        })),
+                    )
+                        .into_response(),
+                };
+            }
         }
-        return match bytes {
-            Some(bytes) => (
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                bytes,
-            )
-                .into_response(),
-            // No fixture: a provider-side failure the materializer
-            // must surface, never a silent empty hour.
-            None => (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({
-                    "errors": [{"code": 1, "message": format!("no demand fixture for {hour}")}],
-                })),
-            )
-                .into_response(),
-        };
     }
     // The demand feed's hourly leg (stow#523) posts the same endpoint:
     // its query is the only one carrying `LIMIT ALL … FORMAT JSON`
@@ -2198,8 +2263,10 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::{
-        Body, RegistryProbe, SigningScheme, manifest_file_name, registry_app_with_probe,
-        split_reference, write_blob, write_manifest, write_mock_signature, write_public_key,
+        Arc, Body, MockRegistryState, Mutex, RegistryProbe, SigningScheme, TokenState,
+        analytics_engine_sql, demand_query_hour, log_demand_query, manifest_file_name,
+        registry_app_with_probe, split_reference, write_blob, write_manifest, write_mock_signature,
+        write_public_key,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
@@ -2858,5 +2925,102 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{tag} must verify: {error}"));
         }
+    }
+
+    // ---- stow#523 demand-fixture provider tests ----
+
+    /// The checked-in `edge/templates/demand_feed.sql` rendered at a
+    /// known hour — `'miss'`/`'semantic'`/`'graph'` literals precede
+    /// the timestamp in the real WHERE clause, so the extraction must
+    /// key off `toDateTime('…')`, never off quote position.
+    fn rendered_feed_query(hour_sql_literal: &str) -> String {
+        let template = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../edge/templates/demand_feed.sql"
+        ))
+        .expect("checked-in demand feed template");
+        template.replace("{{ hour.sql_literal() }}", hour_sql_literal)
+    }
+
+    #[test]
+    fn demand_hour_from_the_real_rendered_template() {
+        let query = rendered_feed_query("2020-01-01 05");
+        assert!(
+            query.contains("'miss'") && query.contains("'semantic'"),
+            "identity literals precede the hour in the real query"
+        );
+        assert_eq!(
+            demand_query_hour(&query).expect("valid bound"),
+            Some("2020-01-01T05".to_owned())
+        );
+    }
+
+    #[test]
+    fn demand_hour_rejects_malformed_and_ambiguous_bounds() {
+        // One bound only — ambiguous.
+        let single =
+            "SELECT 1 FROM stow_cache_misses WHERE timestamp >= toDateTime('2020-01-01 05:00:00')";
+        assert!(demand_query_hour(single).is_err());
+        // Not the canonical hourly `:00:00` timestamp.
+        let off_hour = rendered_feed_query("2020-01-01 05").replace("05:00:00", "05:30:00");
+        assert!(demand_query_hour(&off_hour).is_err());
+        // Garbage argument.
+        let garbage = "toDateTime('not-a-date') + toDateTime('not-a-date')";
+        assert!(demand_query_hour(garbage).is_err());
+        // No toDateTime at all — not a demand query.
+        let stats = "SELECT count() FROM stow_cache_misses";
+        assert_eq!(demand_query_hour(stats), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn demand_query_log_writes_one_record_per_call() {
+        let root = std::env::temp_dir().join(format!("mock-reg-log-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        log_demand_query(&root, "2020-01-01T05", true)
+            .await
+            .expect("log write");
+        log_demand_query(&root, "2020-01-01T06", false)
+            .await
+            .expect("log write");
+        let log = std::fs::read_to_string(root.join("demand-queries.log")).expect("log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(lines[0]).expect("jsonl")["hour"],
+            "2020-01-01T05"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(lines[1]).expect("jsonl")["served"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn demand_fixture_hit_and_miss_through_the_handler() {
+        let root = std::env::temp_dir().join(format!("mock-reg-fix-{}", std::process::id()));
+        let fixtures = root.join("fixtures");
+        std::fs::create_dir_all(&fixtures).expect("fixtures dir");
+        std::fs::write(fixtures.join("2020-01-01T05.json"), b"{\"data\":[]}").expect("fixture");
+        let state = MockRegistryState {
+            registry_root: root.clone(),
+            token_realm: "http://127.0.0.1/token".to_owned(),
+            tokens: Arc::new(Mutex::new(TokenState::default())),
+            requests: None,
+            rate_limits: None,
+            toggles: None,
+            demand_fixtures: Some(fixtures),
+        };
+        let body = rendered_feed_query("2020-01-01 05");
+        // Hit: the verbatim fixture body answers.
+        let response =
+            analytics_engine_sql(axum::extract::State(state.clone()), body.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Miss: a provider 500, and the log still records the query.
+        let miss_body = rendered_feed_query("2020-01-01 07");
+        let response = analytics_engine_sql(axum::extract::State(state), miss_body).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let log = std::fs::read_to_string(root.join("demand-queries.log")).expect("log");
+        assert_eq!(log.lines().count(), 2);
+        assert!(log.contains("\"served\":false"));
     }
 }

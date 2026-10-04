@@ -2,12 +2,19 @@
 //!
 //! Writes, under the output directory given as the first argument:
 //!   enqueue.json
-//!       Vec<EnqueueRequest>: 5 unpublished base deps plus 520 consumers
-//!       that share them (round-robin DAG closures), with feature,
-//!       target, rustc and host-side variation — ordinary node
-//!       identities the authenticated `tasks/submit` route accepts.
-//!       Because the base deps are never published, every consumer's
-//!       `deps_met` stays 0 and nothing in the fixture can dispatch.
+//!       Vec<EnqueueRequest>: every distinct base dep the consumers
+//!       actually reference (one per realized (target, rustc,
+//!       host-side) combination) plus 520 consumers sharing them as a
+//!       real DAG. Every base itself waits on a `fixture-anchor-*`
+//!       identity that is never enqueued — a legitimate unresolved
+//!       dependency, so every base and consumer holds `deps_met`=0 and
+//!       nothing in the fixture can dispatch under the ordinary gate.
+//!   expectations.json
+//!       Per submitted task: `{task_id, crate_name, expected_delta}` —
+//!       the demand delta each queue row must show after every
+//!       delivered document and page, computed from the same entry
+//!       schedule the documents carry (each entry touches its named
+//!       node plus that node's unmet dependency chain).
 //!   hours/YYYY-MM-DDTHH.json
 //!       Analytics Engine `FORMAT JSON` provider documents, verbatim
 //!       file bodies the mock registry serves per queried hour.
@@ -28,9 +35,9 @@
 use std::path::PathBuf;
 
 use stow_types::api::{
-    DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageBuilder, DemandFeedPageRequest,
-    EnqueueDependency, EnqueueRequest, EnqueueSource, SchedulerDemandEntry, demand_feed_manifest,
-    demand_feed_page_hash,
+    DEMAND_FEED_BATCH_PREFIX, DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageBuilder,
+    DemandFeedPageRequest, EnqueueDependency, EnqueueRequest, EnqueueSource, SchedulerDemandEntry,
+    SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash, task_id,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -38,8 +45,11 @@ use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, 
 /// harness substitutes the real `begin` answer before POSTing.
 const GEN_PLACEHOLDER: i64 = 7;
 
-/// Five shared base dependencies + 520 consumer identities.
-const BASE_DEPS: usize = 5;
+/// The (target, rustc, host-side) tuple one base dep is keyed by —
+/// every distinct combination the consumers actually reference gets
+/// its own enqueued base row.
+type DepCombo = (&'static str, &'static str, bool);
+
 const CONSUMERS: usize = 520;
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -87,13 +97,36 @@ fn identity(
     )
 }
 
-fn enqueue_request(n: usize) -> EnqueueRequest {
+/// The dep combos consumers realize, in a deterministic order.
+fn base_combos() -> Vec<DepCombo> {
+    let mut combos: Vec<DepCombo> = (0..CONSUMERS)
+        .map(|n| {
+            let (_, _, _, triple, version_rustc, host_side) = identity(n);
+            (triple, version_rustc, host_side)
+        })
+        .collect();
+    combos.sort();
+    combos.dedup();
+    combos
+}
+
+fn base_name(combo_index: usize) -> String {
+    format!("fixture-dep-{combo_index:02}")
+}
+
+fn anchor_name(combo_index: usize) -> String {
+    format!("fixture-anchor-{combo_index:02}")
+}
+
+fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
     let (name, version, feats, triple, version_rustc, host_side) = identity(n);
-    // Every consumer waits on one shared unpublished base dep — the
-    // dependency row is the legitimate "never dispatch" configuration:
-    // `deps_met` stays 0 until that dep publishes, and it never does
-    // inside the harness.
-    let dep_index = n % BASE_DEPS;
+    // Every consumer waits on the base row keyed by its own (target,
+    // rustc, host-side) combination — a real shared DAG where many
+    // consumers collapse onto the same dep identity.
+    let dep_index = combos
+        .iter()
+        .position(|combo| *combo == (triple, version_rustc, host_side))
+        .expect("own combo is always in the base set");
     EnqueueRequest {
         crate_name: crate_name(&name),
         version: crate_version(&version),
@@ -103,7 +136,7 @@ fn enqueue_request(n: usize) -> EnqueueRequest {
         downloads: 1_000_000 - u64::try_from(n).unwrap_or(0),
         source: EnqueueSource::CacheMiss,
         depends_on: vec![EnqueueDependency {
-            crate_name: crate_name(&format!("fixture-dep-{dep_index:02}")),
+            crate_name: crate_name(&base_name(dep_index)),
             version: crate_version("1.0.0"),
             features_json: FeaturesJson::default(),
             target: target(triple),
@@ -115,17 +148,29 @@ fn enqueue_request(n: usize) -> EnqueueRequest {
     }
 }
 
-fn base_dep_request(dep: usize) -> EnqueueRequest {
+/// One base row: it waits on `fixture-anchor-*` — an identity that is
+/// never enqueued, so the base's `deps_met` stays 0 forever under the
+/// ordinary dependency gate and the whole fixture stays
+/// non-dispatchable without touching any dispatch setting.
+fn base_dep_request(combo_index: usize, combo: DepCombo) -> EnqueueRequest {
+    let (triple, version_rustc, host_side) = combo;
     EnqueueRequest {
-        crate_name: crate_name(&format!("fixture-dep-{dep:02}")),
+        crate_name: crate_name(&base_name(combo_index)),
         version: crate_version("1.0.0"),
         features_json: FeaturesJson::default(),
-        target: target(TARGET),
-        rustc_version: rustc(RUSTC),
-        downloads: 2_000_000 - u64::try_from(dep).unwrap_or(0),
+        target: target(triple),
+        rustc_version: rustc(version_rustc),
+        downloads: 2_000_000 - u64::try_from(combo_index).unwrap_or(0),
         source: EnqueueSource::CacheMiss,
-        depends_on: vec![],
-        host_side: false,
+        depends_on: vec![EnqueueDependency {
+            crate_name: crate_name(&anchor_name(combo_index)),
+            version: crate_version("1.0.0"),
+            features_json: FeaturesJson::default(),
+            target: target(triple),
+            rustc_version: rustc(version_rustc),
+            host_side,
+        }],
+        host_side,
         preserve_lockfile: false,
     }
 }
@@ -253,10 +298,16 @@ fn main() {
     std::fs::create_dir_all(&pages_dir).expect("pages dir");
     std::fs::create_dir_all(&boundary).expect("boundary dir");
 
-    // Ordinary node identities: the 5 never-published base deps plus
-    // 520 consumers waiting on them.
-    let mut enqueues: Vec<EnqueueRequest> = (0..BASE_DEPS).map(base_dep_request).collect();
-    enqueues.extend((0..CONSUMERS).map(enqueue_request));
+    // Ordinary node identities: every distinct base dep the consumers
+    // actually reference — each itself parked on an absent anchor —
+    // plus the 520 consumers waiting on them.
+    let combos = base_combos();
+    let mut enqueues: Vec<EnqueueRequest> = combos
+        .iter()
+        .enumerate()
+        .map(|(index, combo)| base_dep_request(index, *combo))
+        .collect();
+    enqueues.extend((0..CONSUMERS).map(|n| enqueue_request(n, &combos)));
     write_json(
         &out.join("enqueue.json"),
         &serde_json::to_value(&enqueues).expect("enqueue bodies"),
@@ -324,16 +375,117 @@ fn main() {
         );
     }
 
-    // Whole-envelope boundary: one request just under the 512KiB cap
-    // (must stage), one just over (must refuse before any write).
-    write_json(
-        &boundary.join("under-page.json"),
-        &boundary_page("2020-01-01T05", 4_200),
+    // Whole-envelope boundary: one 1-entry request just under the
+    // 512KiB cap (must stage) and one just over (must refuse), plus a
+    // 257-entry page the entry bound alone refuses. Compact serde
+    // bodies — the DO measures the posted envelope bytes.
+    for (name, features) in [("under-page.json", 4_200), ("over-page.json", 4_700)] {
+        let body = boundary_page("2020-01-01T05", features);
+        let bytes = serde_json::to_vec(&body).expect("boundary body");
+        std::fs::write(boundary.join(name), &bytes)
+            .unwrap_or_else(|error| panic!("write {name}: {error}"));
+        eprintln!("{name}: {} bytes", bytes.len());
+    }
+    let under_len = std::fs::metadata(boundary.join("under-page.json"))
+        .expect("under page")
+        .len();
+    let over_len = std::fs::metadata(boundary.join("over-page.json"))
+        .expect("over page")
+        .len();
+    assert!(
+        under_len < stow_types::api::DEMAND_FEED_PAGE_MAX_BYTES as u64
+            && over_len > stow_types::api::DEMAND_FEED_PAGE_MAX_BYTES as u64,
+        "boundary pages must straddle DEMAND_FEED_PAGE_MAX_BYTES: under={under_len} over={over_len}"
     );
+    // One entry past DEMAND_FEED_PAGE_MAX_ENTRIES: same hour as the
+    // byte pair so the harness can refuse it on the entry bound alone
+    // (the serialized body is far under the byte cap).
+    let over_entries = DemandFeedPageRequest {
+        hour: DemandFeedHour::parse("2020-01-01T05").expect("hour"),
+        generation: GEN_PLACEHOLDER,
+        page_no: 1,
+        entries: three_page[..257].to_vec(),
+    };
     write_json(
-        &boundary.join("over-page.json"),
-        &boundary_page("2020-01-01T05", 4_700),
+        &boundary.join("over-entries-page.json"),
+        &serde_json::to_value(&over_entries).expect("entries page"),
     );
 
-    println!("demand feed fixtures written under {}", out.display());
+    // The deterministic #522 replay: the same SchedulerDemandRequest
+    // the first delivered T10 page derived — `demand-feed/{hour}/{no}`
+    // — which the accepted batch must answer `applied=false`.
+    let (t10_pages, _) = freeze_bodies("2020-01-01T10", &three_page);
+    let replay = SchedulerDemandRequest {
+        batch_id: format!("{DEMAND_FEED_BATCH_PREFIX}2020-01-01T10/0"),
+        entries: t10_pages[0].entries.clone(),
+    };
+    write_json(
+        &pages_dir.join("2020-01-01T10-demand-replay.json"),
+        &serde_json::to_value(&replay).expect("replay body"),
+    );
+
+    // expectations.json: {task_id, crate_name, expected_delta} for
+    // every submitted task. One entry's closure touches its named node
+    // and that node's unmet deps — here {consumer_i, base_of_i} — so
+    // each entry adds its demand to both once, and a task reached by N
+    // entries (across any number of batches) sums N contributions.
+    // Every count below comes from the same Vecs the files carry.
+    let mut schedule: Vec<(usize, &SchedulerDemandEntry)> = Vec::new();
+    let mut add = |indices: &[usize]| {
+        schedule.extend(indices.iter().map(|index| (*index, &consumers[*index])));
+    };
+    add(&(0..5).collect::<Vec<_>>()); // T00 frozen page
+    add(&(0..CONSUMERS).collect::<Vec<_>>()); // T01
+    add(&(0..10).collect::<Vec<_>>()); // T02
+    add(&(0..CONSUMERS).collect::<Vec<_>>()); // T04 page set
+    add(&(0..10).collect::<Vec<_>>()); // T04 duplicated tail
+    add(&(100..200).collect::<Vec<_>>()); // T05
+    add(&(0..CONSUMERS).collect::<Vec<_>>()); // T06 retry
+    add(&(0..20).collect::<Vec<_>>()); // T09 retry
+    add(&(0..CONSUMERS).collect::<Vec<_>>()); // T10 page set
+    add(&(0..10).collect::<Vec<_>>()); // T10 duplicated tail
+
+    let mut consumer_delta = vec![0u64; CONSUMERS];
+    let mut base_delta = vec![0u64; combos.len()];
+    for (index, entry) in &schedule {
+        consumer_delta[*index] += entry.demand;
+        let (_, _, _, triple, version_rustc, host_side) = identity(*index);
+        let dep_index = combos
+            .iter()
+            .position(|combo| *combo == (triple, version_rustc, host_side))
+            .expect("dep combo");
+        base_delta[dep_index] += entry.demand;
+    }
+    let mut expectations: Vec<serde_json::Value> = Vec::new();
+    for (index, combo) in combos.iter().enumerate() {
+        let (triple, version_rustc, host_side) = *combo;
+        expectations.push(serde_json::json!({
+            "task_id": task_id(&base_name(index), "1.0.0", "[]", triple, version_rustc, host_side),
+            "crate_name": base_name(index),
+            "expected_delta": base_delta[index],
+        }));
+    }
+    for (index, request) in enqueues.iter().enumerate().skip(combos.len()) {
+        let n = index - combos.len();
+        let (name, version, feats, triple, version_rustc, host_side) = identity(n);
+        expectations.push(serde_json::json!({
+            "task_id": task_id(
+                &name,
+                &version,
+                &FeaturesJson::canonicalize(feats).expect("features").raw(),
+                triple,
+                version_rustc,
+                host_side,
+            ),
+            "crate_name": name,
+            "expected_delta": consumer_delta[n],
+        }));
+        let _ = request;
+    }
+    write_json(
+        &out.join("expectations.json"),
+        &serde_json::Value::Array(expectations),
+    );
+
+    eprintln!("demand feed fixtures written under {}", out.display());
 }
