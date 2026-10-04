@@ -489,33 +489,48 @@ expect_query_delta() { # expected_new_queries hour
 # failure propagated.
 QUEUE_CONCURRENCY=4
 fixture_rows() { # out-file: one merged JSON array of QueueTask rows
-    local out="$1" index=0 running=0 chunk query
+    # Only the readback children are waited on — an explicit
+    # PID:index list, never a bare `wait` (which would hang on the
+    # long-lived registry/edge/local-ci services) and never `wait -n`
+    # (absent on macOS Bash 3.2). At the bound the oldest child is
+    # reaped before the next spawn; each child's own exit status is
+    # the evidence — a nonzero curl propagates with its error log.
+    local out="$1" index=0 query chunk code pid oldest
+    local -a pids=()
     : >"$out"
-    rm -f "$WORK_DIR"/queue-part-* "$WORK_DIR"/queue-err-*
+    rm -f "$WORK_DIR"/queue-part-* "$WORK_DIR"/queue-code-* "$WORK_DIR"/queue-err-*
     jq -r '.[]' "$FIXTURES/queue-selector-queries.json" \
         >"$WORK_DIR/queue-queries.txt"
     while IFS= read -r query; do
-        ( curl -sS -o "$WORK_DIR/queue-part-$index.json" \
-              -w '%{http_code}' \
-              -H "Authorization: Bearer $EDGE_BEARER" \
-              "$EDGE_URL/api/v1/admin/queue?$query" \
-              >"$WORK_DIR/queue-code-$index" \
-              2>"$WORK_DIR/queue-err-$index" ) &
+        curl -sS -o "$WORK_DIR/queue-part-$index.json" \
+            -w '%{http_code}' \
+            -H "Authorization: Bearer $EDGE_BEARER" \
+            "$EDGE_URL/api/v1/admin/queue?$query" \
+            >"$WORK_DIR/queue-code-$index" \
+            2>"$WORK_DIR/queue-err-$index" &
+        pids+=("$!:$index")
         index=$((index + 1))
-        running=$((running + 1))
-        [ "$running" -lt "$QUEUE_CONCURRENCY" ] || { wait -n; running=$((running - 1)); }
+        if [ "${#pids[@]}" -ge "$QUEUE_CONCURRENCY" ]; then
+            oldest="${pids[0]}"
+            pids=("${pids[@]:1}")
+            if ! wait "${oldest%%:*}"; then
+                die "queue readback chunk ${oldest##*:} failed — see $WORK_DIR/queue-err-${oldest##*:}"
+            fi
+        fi
     done <"$WORK_DIR/queue-queries.txt"
-    wait
-    for chunk in "$WORK_DIR"/queue-code-*; do
-        local code
-        code="$(cat "$chunk")"
-        [[ "$code" =~ ^2 ]] \
-            || die "queue readback ${chunk##*-} failed ($code): $(cat "${chunk/code/err}" 2>/dev/null)"
+    for pid in "${pids[@]}"; do
+        if ! wait "${pid%%:*}"; then
+            die "queue readback chunk ${pid##*:} failed — see $WORK_DIR/queue-err-${pid##*:}"
+        fi
     done
-    for chunk in "$WORK_DIR"/queue-part-*; do
-        jq -e 'type == "array"' "$chunk" >/dev/null 2>&1 \
+    # Merge in numeric request order — never a lexicographic glob.
+    for ((chunk = 0; chunk < index; chunk++)); do
+        code="$(cat "$WORK_DIR/queue-code-$chunk" 2>/dev/null || echo FAIL)"
+        [[ "$code" =~ ^2 ]] \
+            || die "queue readback chunk $chunk failed ($code): $(cat "$WORK_DIR/queue-err-$chunk" 2>/dev/null)"
+        jq -e 'type == "array"' "$WORK_DIR/queue-part-$chunk.json" >/dev/null 2>&1 \
             || die "queue chunk $chunk is not a JSON array"
-        jq -c '.[]' "$chunk" >>"$out"
+        jq -c '.[]' "$WORK_DIR/queue-part-$chunk.json" >>"$out"
     done
 }
 # task_id -> value map for the fixture set.
