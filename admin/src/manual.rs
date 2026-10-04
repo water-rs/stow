@@ -2036,10 +2036,14 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].task_id, "taskabc");
         assert_eq!(runs[0].workflow_run_id, 7);
-        assert_eq!(server.requests(), 2);
-        for head in server.request_heads() {
-            assert!(!head.contains("Authorization"), "{head}");
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
+        for head in &heads {
+            assert!(
+                !head.headers.contains_key(http::header::AUTHORIZATION),
+                "the local read must not send an Authorization header: {:?}",
+                head.headers
+            );
         }
-        server.join().await;
     }
 }

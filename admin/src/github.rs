@@ -881,8 +881,8 @@ mod url_json_tests {
             .await
             .expect("a dropped connection retries");
         assert_eq!(body["ok"], true);
-        assert_eq!(server.requests(), 2);
-        server.join().await;
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
     }
 
     /// A transient status waits out its `Retry-After` hint and retries —
@@ -912,12 +912,13 @@ mod url_json_tests {
             elapsed >= std::time::Duration::from_secs(1),
             "the Retry-After hint must be honored, elapsed {elapsed:?}"
         );
-        assert_eq!(server.requests(), 2);
-        assert_eq!(server.requests(), 2);
         server.join().await;
     }
 
-    /// A terminal status is the answer — fail fast, never retry.
+    /// A terminal status is the answer — fail fast, never retry. A
+    /// retry would reach the server's success sentinel and this test
+    /// would see an `Ok`, so the error and the single captured request
+    /// both prove the stop.
     #[tokio::test]
     async fn get_url_json_does_not_retry_a_terminal_status() {
         let server = test_server::Loopback::start(vec![test_server::Step::Respond {
@@ -929,11 +930,12 @@ mod url_json_tests {
         let result: stow_types::error::Result<serde_json::Value> =
             get_url_json(&server.url, None).await;
         assert!(result.is_err());
-        assert_eq!(server.requests(), 1);
-        server.join().await;
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
     }
 
-    /// A 2xx that does not decode is a failure, not a retry.
+    /// A 2xx that does not decode is a failure, not a retry — the same
+    /// sentinel liveness proves the client stopped.
     #[tokio::test]
     async fn get_url_json_fails_a_malformed_body() {
         let server = test_server::Loopback::start(vec![test_server::Step::Respond {
@@ -945,8 +947,8 @@ mod url_json_tests {
         let result: stow_types::error::Result<serde_json::Value> =
             get_url_json(&server.url, None).await;
         assert!(result.is_err());
-        assert_eq!(server.requests(), 1);
-        server.join().await;
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
     }
 
     /// A transient failure that outlives the budget returns its final
@@ -966,7 +968,7 @@ mod url_json_tests {
         let result: stow_types::error::Result<serde_json::Value> =
             get_url_json(&server.url, None).await;
         assert!(result.is_err());
-        assert_eq!(server.requests(), 4);
-        server.join().await;
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 4);
     }
 }

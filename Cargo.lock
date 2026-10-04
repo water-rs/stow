@@ -7770,13 +7770,18 @@ name = "stow-admin"
 version = "0.6.0"
 dependencies = [
  "askama 0.14.0",
+ "bytes",
  "clap",
  "dirs 7.0.0",
  "flate2",
  "futures-util",
  "hex",
  "hmac 0.13.0",
+ "http",
+ "http-body-util",
  "humantime",
+ "hyper",
+ "hyper-util",
  "oci-client 0.16.1",
  "rustls",
  "semver",
