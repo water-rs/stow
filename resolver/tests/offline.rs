@@ -828,6 +828,17 @@ fn isolated_scratch(case: &str, body: impl FnOnce()) {
         .env("TMP", root.path())
         .env("TEMP", root.path())
         .env("STOW_TEST_SCRATCH_ISOLATED", "1")
+        // Test-only: file:// fixtures need file-protocol submodule
+        // clones; scoped to this child, never a global or production
+        // default (stow#543).
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        // `pinned_rustc_version` points `RUSTUP_HOME` at a harness
+        // home containing only `<release>-<host>` links; a child
+        // spawned after that inherits it and its fresh `rustup
+        // which` then can't find the real toolchain. Removing it
+        // gives the child the same view a fresh test process has —
+        // its own `OnceLock` then re-points at its own home.
+        .env_remove("RUSTUP_HOME")
         .status()
         .expect("the test binary spawns");
     assert!(status.success(), "isolated case `{case}` failed");
@@ -993,6 +1004,42 @@ fn failed_fetches_release_their_scratch() {
     });
 }
 
+/// A git dep whose lockfile pin survives a deleted branch
+/// (stow#543): `dropped_lockfile` semantics lock git deps to their
+/// recorded sha — `register_lock` alone could not, since it rewrites
+/// summaries only after the named ref already resolved.
+fn git_dep_with_lock(dep_repo: &Path, branch: &str) -> (String, String) {
+    std::fs::create_dir_all(dep_repo.join("src")).unwrap();
+    std::fs::write(
+        dep_repo.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "depgit", "version": "0.1.0", "edition": "2021" },
+            "dependencies": { "dep_a": "1" },
+        })),
+    )
+    .unwrap();
+    std::fs::write(dep_repo.join("src/lib.rs"), "").unwrap();
+    git_in(dep_repo, &["init", "-b", branch]);
+    git_in(dep_repo, &["config", "user.email", "stow@test"]);
+    git_in(dep_repo, &["config", "user.name", "stow"]);
+    git_in(
+        dep_repo,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    git_in(dep_repo, &["add", "-A"]);
+    git_in(dep_repo, &["commit", "-qm", "depgit"]);
+    let sha = {
+        let out = std::process::Command::new("git")
+            .current_dir(dep_repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let url = url::Url::from_file_path(dep_repo).unwrap();
+    (url.as_str().trim_end_matches('/').to_owned(), sha)
+}
+
 /// Caller-owned inputs stay caller-owned (stow#540):
 /// `resolve_package_dir` reads the package tree and drops only its
 /// bundled `Cargo.lock` — the lane's existing contract — while the
@@ -1025,4 +1072,200 @@ fn resolve_package_dir_preserves_the_callers_tree() {
         lib_before,
         "the caller's sources are untouched"
     );
+}
+
+/// stow#543: a fetched tree's gitlinks materialize — a workspace
+/// member living in a submodule resolves like a vendored dir.
+/// Commits a `sub` package manifest depending on `dep` into the
+/// fixture origin.
+fn commit_sub_manifest(repo: &Path, dep: &str) {
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "sub", "version": "0.1.0", "edition": "2021" },
+            "dependencies": { dep: "1" },
+        })),
+    )
+    .unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "").unwrap();
+    git_in(repo, &["add", "-A"]);
+    git_in(repo, &["commit", "-qm", dep]);
+}
+
+/// A parent workspace repo whose `libs/sub` member is a submodule
+/// pointing at a package origin under `work/sub` — the fixture for
+/// every stow#543 submodule case. The origin's path and the parent's
+/// `file://` URL.
+fn submodule_workspace(work: &Path, sub_dep: &str) -> (PathBuf, url::Url) {
+    let sub = work.join("sub");
+    std::fs::create_dir_all(sub.join("src")).unwrap();
+    git_in(&sub, &["init", "-b", "main"]);
+    git_in(&sub, &["config", "user.email", "stow@test"]);
+    git_in(&sub, &["config", "user.name", "stow"]);
+    // Depth-1 submodule fetches name the gitlink sha directly —
+    // allow it on this fixture origin only.
+    git_in(&sub, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    commit_sub_manifest(&sub, sub_dep);
+
+    let parent = work.join("parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    git_in(&parent, &["init", "-b", "main"]);
+    git_in(&parent, &["config", "user.email", "stow@test"]);
+    git_in(&parent, &["config", "user.name", "stow"]);
+    std::fs::write(
+        parent.join("Cargo.toml"),
+        toml_document(&json!({ "workspace": { "members": ["libs/sub"] } })),
+    )
+    .unwrap();
+    let sub_url = url::Url::from_file_path(&sub).unwrap();
+    git_in(
+        &parent,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_url.as_str(),
+            "libs/sub",
+        ],
+    );
+    git_in(&parent, &["add", "-A"]);
+    git_in(&parent, &["commit", "-qm", "parent"]);
+    (sub, url::Url::from_file_path(&parent).unwrap())
+}
+
+/// stow#543: a fetched tree's gitlinks materialize — a workspace
+/// member living in a submodule resolves like a vendored dir.
+#[test]
+fn submodule_workspace_members_resolve() {
+    isolated_scratch("submodule_workspace_members_resolve", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let (_sub, parent_url) = submodule_workspace(work.path(), "dep_a");
+        let out = resolver
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0)
+            .expect("the submodule member's manifest resolves");
+        assert_eq!(requested_crates(&out), vec!["dep_a".to_owned()]);
+    });
+}
+
+/// The gitlink, not the submodule's moving HEAD, is what a fetched
+/// tree resolves (stow#543): after the parent records `libs/sub` at
+/// the `dep_a` manifest, advancing the origin to `dep_b` changes
+/// nothing.
+#[test]
+fn submodules_resolve_the_pinned_gitlink_not_head() {
+    isolated_scratch("submodules_resolve_the_pinned_gitlink_not_head", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let (sub, parent_url) = submodule_workspace(work.path(), "dep_a");
+        // The origin moves on; the parent's gitlink stays behind.
+        commit_sub_manifest(&sub, "dep_b");
+
+        let out = resolver
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0)
+            .expect("the pinned gitlink resolves");
+        assert_eq!(
+            requested_crates(&out),
+            vec!["dep_a".to_owned()],
+            "the recorded submodule commit, not its moved HEAD"
+        );
+    });
+}
+
+/// A gitlink that cannot materialize fails the fetch instead of
+/// reading a half-tree (stow#543).
+#[test]
+fn submodule_materialization_failure_errors() {
+    isolated_scratch("submodule_materialization_failure_errors", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        std::fs::create_dir_all(&reg).unwrap();
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let (_sub, parent_url) = submodule_workspace(work.path(), "dep_a");
+        // Point the recorded URL at a repo that does not exist.
+        let parent = work.path().join("parent");
+        std::fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"libs/sub\"]\n\tpath = libs/sub\n\turl = file:///stow-543-no-such-repo\n",
+        )
+        .unwrap();
+        git_in(&parent, &["add", "-A"]);
+        git_in(&parent, &["commit", "-qm", "parent"]);
+
+        assert!(
+            resolver
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0)
+                .is_err(),
+            "an unmaterializable submodule fails the fetch"
+        );
+    });
+}
+
+/// stow#543: the dropped lockfile's git entries lock git deps to
+/// their sha — a dep whose `?branch=` is deleted upstream still
+/// resolves the pinned commit (fetch-by-sha), cargo's own
+/// `Cargo.lock` → `Revision::Locked` contract.
+#[test]
+fn deleted_branch_git_pins_resolve_by_sha() {
+    isolated_scratch("deleted_branch_git_pins_resolve_by_sha", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let (dep_url, sha) = git_dep_with_lock(&work.path().join("depgit"), "gone");
+        // The project locks the dep at its sha; its branch is then
+        // deleted upstream — `dep_a` proves the pinned manifest read.
+        let dir = work.path().join("proj");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            toml_document(&json!({
+                "package": { "name": "proj", "version": "0.0.0", "edition": "2021" },
+                "dependencies": { "depgit": { "git": dep_url, "branch": "gone" } },
+            })),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        std::fs::write(
+            dir.join("Cargo.lock"),
+            format!(
+                "version = 3\n\n[[package]]\nname = \"proj\"\nversion = \"0.0.0\"\n\
+                 dependencies = [\n    \"depgit\",\n]\n\n[[package]]\nname = \"depgit\"\n\
+                 version = \"0.1.0\"\nsource = \"git+{dep_url}?branch=gone#{sha}\"\n"
+            ),
+        )
+        .unwrap();
+        // `gone` is deleted but the commit stays advertised-reachable
+        // under another ref — tray-icon's exact upstream shape.
+        let depgit = work.path().join("depgit");
+        git_in(&depgit, &["branch", "survivor", &sha]);
+        git_in(&depgit, &["update-ref", "-d", "refs/heads/gone"]);
+
+        let out = resolver
+            .resolve_project_dir(&dir, &targets, rustc, 0)
+            .expect("the lockfile's sha pins the git dep");
+        assert_eq!(
+            requested_crates(&out),
+            vec!["dep_a".to_owned()],
+            "the pinned manifest's deps resolve — a live `gone` ref \
+             would have failed instead"
+        );
+    });
 }

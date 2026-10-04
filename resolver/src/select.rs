@@ -268,6 +268,23 @@ pub fn select_ws_with_opts<'gctx>(
             for (node, deps) in crate::lockfile::lockfile_git_pins(contents)? {
                 registry.register_lock(node, deps);
             }
+            // The lockfile's git entries lock git deps to their sha —
+            // `register_lock` alone can't do it: it only rewrites
+            // summaries *after* the source has loaded and resolved the
+            // manifest's named ref. Preloading each pinned source id
+            // (precise fragment included) makes the canonical
+            // `GitSource` start `Revision::Locked(sha)`, and the
+            // registry's source map — keyed ignoring `precise` — then
+            // serves the manifest's imprecise dep id from it: the
+            // pinned commit is fetched without consulting the ref
+            // (stow#543). Git-only: registry versions still resolve to
+            // the latest semver-compatible.
+            let git_sources = ids
+                .iter()
+                .map(|id| (*id).source_id())
+                .filter(|id| id.is_git())
+                .collect::<Vec<_>>();
+            registry.add_sources(git_sources)?;
             whitelist
         }
         None => HashSet::new(),
