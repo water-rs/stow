@@ -1648,6 +1648,9 @@ impl DemandFeedHour {
     /// non-canonical padding. Does not check whether the hour has
     /// closed; callers writing or querying use
     /// [`parse_closed`](Self::parse_closed).
+    ///
+    /// # Errors
+    /// The literal is not a canonical `YYYY-MM-DDTHH` calendar hour.
     pub fn parse(hour: &str) -> Result<Self, String> {
         if hour.len() != DEMAND_FEED_HOUR_LEN {
             return Err(format!("demand feed hour {hour:?} is not YYYY-MM-DDTHH"));
@@ -1668,6 +1671,10 @@ impl DemandFeedHour {
     /// [`parse`](Self::parse) plus require the hour fully closed at
     /// `now_unix_secs` — every feed write and Analytics Engine query
     /// goes through this.
+    ///
+    /// # Errors
+    /// The literal is not canonical, or the hour is not fully closed
+    /// at `now_unix_secs`.
     pub fn parse_closed(hour: &str, now_unix_secs: i64) -> Result<Self, String> {
         let this = Self::parse(hour)?;
         this.ensure_closed(now_unix_secs)?;
@@ -1678,6 +1685,10 @@ impl DemandFeedHour {
     /// feed writes and queries apply to an already-parsed hour. An
     /// hour whose end is outside the representable calendar range
     /// refuses rather than panicking on the arithmetic.
+    ///
+    /// # Errors
+    /// The hour is not fully closed at `now_unix_secs`, or its end is
+    /// outside the representable calendar range.
     pub fn ensure_closed(&self, now_unix_secs: i64) -> Result<(), String> {
         let Some(end) = self.end_unix_secs() else {
             return Err(format!("demand feed hour {} is not closed", self.0));
@@ -1689,12 +1700,14 @@ impl DemandFeedHour {
     }
 
     /// The canonical `YYYY-MM-DDTHH` literal.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// The `YYYY-MM-DD HH` form the `demand_feed.sql` askama
     /// template renders into the Analytics Engine query.
+    #[must_use]
     pub fn sql_literal(&self) -> String {
         self.0.replacen('T', " ", 1)
     }
@@ -1774,11 +1787,13 @@ impl std::fmt::Display for DemandFeedHour {
     }
 }
 
-/// One link of the demand-feed manifest chain:
+/// One link of the demand-feed manifest chain.
+///
 /// `blake3(chain(p-1) || page_hash(p))`. The Durable Object's staged
 /// `chain_hash`, the materializer's page builder, and the admin
 /// parser's manifest proof all go through this one function so the
 /// encoding can never drift between writer and verifier.
+#[must_use]
 pub fn demand_feed_chain(previous: &blake3::Hash, page_hash: &blake3::Hash) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(previous.as_bytes());
@@ -1786,10 +1801,12 @@ pub fn demand_feed_chain(previous: &blake3::Hash, page_hash: &blake3::Hash) -> b
     hasher.finalize()
 }
 
-/// The canonical page payload: the serde serialization of the entry
-/// list the Durable Object stores verbatim and hashes into the page
-/// manifest. The materializer and the verifier share this one
-/// function so the encoding can never drift between them.
+/// The canonical page payload — the entries' verbatim serialization.
+///
+/// The serde encoding of the entry list the Durable Object stores
+/// verbatim and hashes into the page manifest. The materializer and
+/// the verifier share this one function so the encoding can never
+/// drift between them.
 ///
 /// # Errors
 /// The serialization fails.
@@ -1804,6 +1821,7 @@ pub fn demand_feed_page_payload(
 ///
 /// # Errors
 /// The payload serialization fails.
+#[must_use = "the hash is the page's manifest link"]
 pub fn demand_feed_page_hash(entries: &[SchedulerDemandEntry]) -> Result<blake3::Hash, String> {
     let payload = demand_feed_page_payload(entries)
         .map_err(|error| format!("serialize demand feed page payload: {error}"))?;
@@ -1813,6 +1831,7 @@ pub fn demand_feed_page_hash(entries: &[SchedulerDemandEntry]) -> Result<blake3:
 /// The canonical demand-feed manifest: `chain(0) = page_hash(0)`, then
 /// `chain(p) = demand_feed_chain(chain(p-1), page_hash(p))` over the
 /// ordered page hashes — `None` for an empty attempt.
+#[must_use]
 pub fn demand_feed_manifest(page_hashes: &[blake3::Hash]) -> Option<blake3::Hash> {
     let mut chain = *page_hashes.first()?;
     for page_hash in &page_hashes[1..] {
@@ -1831,19 +1850,22 @@ impl<'de> Deserialize<'de> for DemandFeedHour {
     }
 }
 
-/// `POST /api/v1/admin/scheduler/demand-feed/query` request — run the
-/// closed-hour Analytics Engine miss query for `hour` and stream the
-/// `FORMAT JSON` document back unchanged.
+/// `POST /api/v1/admin/scheduler/demand-feed/query` request.
+///
+/// Runs the closed-hour Analytics Engine miss query for `hour` and
+/// streams the `FORMAT JSON` document back unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DemandFeedQueryRequest {
     /// UTC hour, already closed.
     pub hour: DemandFeedHour,
 }
 
-/// `POST /api/v1/admin/scheduler/demand-feed/begin` request — open
-/// (or resume) the staging attempt for `hour`. Once an hour froze
-/// (`complete`/`delivered`) a begin refuses: a complete hour never
-/// re-queries Analytics Engine.
+/// `POST /api/v1/admin/scheduler/demand-feed/begin` request.
+///
+/// Opens (or resumes) the staging attempt for `hour`. Once an hour
+/// froze (`complete`/`delivered`) a begin refuses: a complete hour
+/// never re-queries Analytics Engine.
+///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DemandFeedBeginRequest {
     /// UTC hour, already closed.
@@ -1867,11 +1889,13 @@ pub struct DemandFeedBeginReport {
     pub stale_pages_pending: bool,
 }
 
-/// `POST /api/v1/admin/scheduler/demand-feed/cleanup` request —
-/// retire up to a bounded chunk of page rows for `hour`: obsolete
+/// `POST /api/v1/admin/scheduler/demand-feed/cleanup` request.
+///
+/// Retires up to a bounded chunk of page rows for `hour`: obsolete
 /// generations (a rotated staging attempt's leftovers) or a
 /// `delivered` hour's acknowledged payloads. Explicit event work;
 /// nothing runs on a timer.
+///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DemandFeedCleanupRequest {
     /// UTC hour, already closed.
@@ -1890,10 +1914,12 @@ pub struct DemandFeedCleanupReport {
     pub remaining: bool,
 }
 
-/// `POST /api/v1/admin/scheduler/demand-feed/page` request — stage
-/// one bounded page of the hour's materialized entries. The payload
-/// serializes at most `DEMAND_FEED_PAGE_MAX_ENTRIES` entries below
-/// `DEMAND_FEED_PAGE_MAX_BYTES` on the wire.
+/// `POST /api/v1/admin/scheduler/demand-feed/page` request.
+///
+/// Stages one bounded page of the hour's materialized entries. The
+/// payload serializes at most `DEMAND_FEED_PAGE_MAX_ENTRIES` entries
+/// below `DEMAND_FEED_PAGE_MAX_BYTES` on the wire.
+///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DemandFeedPageRequest {
     /// UTC hour, already closed.
@@ -1907,9 +1933,10 @@ pub struct DemandFeedPageRequest {
     pub entries: Vec<SchedulerDemandEntry>,
 }
 
-/// Streams entries into [`DemandFeedPageRequest`]s that fit the wire
-/// bounds exactly — `DEMAND_FEED_PAGE_MAX_ENTRIES` entries *and* a
-/// whole-envelope `serde_json` encoding of at most
+/// Streams entries into wire-bounded [`DemandFeedPageRequest`]s.
+///
+/// The pages fit the bounds exactly — `DEMAND_FEED_PAGE_MAX_ENTRIES`
+/// entries *and* a whole-envelope `serde_json` encoding of at most
 /// [`DEMAND_FEED_PAGE_MAX_BYTES`], framing (`hour`, `generation`,
 /// `page_no`) included. The byte accounting is derived from the same
 /// serialization the Durable Object validates on receipt: the
@@ -1917,6 +1944,7 @@ pub struct DemandFeedPageRequest {
 /// serialized length once per push, so a page that fits the exact
 /// bound is never refused for slack and one that cannot fit is never
 /// sent.
+///
 #[derive(Debug)]
 pub struct DemandFeedPageBuilder {
     hour: DemandFeedHour,
@@ -2051,11 +2079,13 @@ impl DemandFeedPageBuilder {
     }
 }
 
-/// `POST /api/v1/admin/scheduler/demand-feed/complete` request —
-/// freeze the hour when every page of this generation is staged. The
+/// `POST /api/v1/admin/scheduler/demand-feed/complete` request.
+///
+/// Freezes the hour when every page of this generation is staged. The
 /// scheduler verifies the staged counters and the ordered page-hash
 /// manifest atomically in the same statement that freezes; after it
 /// succeeds the hour's payload is frozen and never re-materialized.
+///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DemandFeedCompleteRequest {
     /// UTC hour, already closed.
@@ -2075,11 +2105,13 @@ pub struct DemandFeedCompleteRequest {
     pub manifest_hash: String,
 }
 
-/// `POST /api/v1/admin/scheduler/demand-feed/deliver` request —
-/// deliver the next undelivered page of a `complete` hour as one
+/// `POST /api/v1/admin/scheduler/demand-feed/deliver` request.
+///
+/// Delivers the next undelivered page of a `complete` hour as one
 /// #522 demand batch (`demand-feed/{hour}/{page_no}`). A call is
 /// bounded work: one page at a time, the durable `applied` mark
 /// advancing only after the batch reports.
+///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DemandFeedDeliverRequest {
     /// UTC hour, already closed.
@@ -2505,11 +2537,11 @@ mod tests {
     /// measuring — the assertion is the test's own proof.
     fn sized_entry(crate_name: &str, target: usize) -> SchedulerDemandEntry {
         let bare = entry(crate_name, 0);
-        let base = serde_json::to_vec(&bare).expect("measure").len();
-        assert!(target > base, "target {target} is below a one-name entry");
+        let bare_len = serde_json::to_vec(&bare).expect("measure").len();
+        assert!(target > bare_len, "target {target} is below a one-name entry");
         // `need` is what the feature list must contribute over the
         // bare `"[]"`: Σ(len + 5) - 1 with the +3 list overhead.
-        let need = target - base + 1;
+        let need = target - bare_len + 1;
         assert!(need >= 6, "target {target} leaves no room for a name");
         let count = need / 133;
         let rest = need - count * 133; // the tuned name's len+5
@@ -2584,7 +2616,7 @@ mod tests {
     #[test]
     fn page_builder_refuses_a_singleton_overrun() {
         let hour = hour("2020-01-01T00");
-        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        let mut builder = DemandFeedPageBuilder::new(hour, 1).expect("builder");
         let fat = sized_entry("crate-b", DEMAND_FEED_PAGE_MAX_BYTES);
         let error = builder.push(fat).expect_err("oversized singleton");
         assert!(error.contains("over the"), "{error}");
@@ -2599,7 +2631,7 @@ mod tests {
     #[test]
     fn page_builder_splits_on_the_byte_boundary() {
         let hour = hour("2020-01-01T00");
-        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        let mut builder = DemandFeedPageBuilder::new(hour, 1).expect("builder");
         // ~400 KiB of real feature names — a page holds one, never two.
         let fat = || sized_entry("crate-a", 400_000);
         assert!(builder.push(fat()).expect("push").is_none());
@@ -2626,7 +2658,7 @@ mod tests {
     #[test]
     fn page_builder_refuses_an_oversized_entry_after_a_boundary() {
         let hour = hour("2020-01-01T00");
-        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        let mut builder = DemandFeedPageBuilder::new(hour, 1).expect("builder");
         assert!(builder.push(entry("crate-a", 0)).expect("push").is_none());
         let fat = sized_entry("crate-b", DEMAND_FEED_PAGE_MAX_BYTES);
         let error = builder.push(fat).expect_err("oversized after boundary");
@@ -2650,7 +2682,7 @@ mod tests {
             builder.push(fat()).expect("push");
         }
         let framing_9 = serde_json::to_vec(&crate::api::DemandFeedPageRequest {
-            hour: hour.clone(),
+            hour,
             generation: 1,
             page_no: 9,
             entries: Vec::new(),
@@ -2667,7 +2699,7 @@ mod tests {
     #[test]
     fn page_builder_keeps_the_entry_cap() {
         let hour = hour("2020-01-01T00");
-        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        let mut builder = DemandFeedPageBuilder::new(hour, 1).expect("builder");
         let small = entry("crate-a", 0);
         for _ in 0..DEMAND_FEED_PAGE_MAX_ENTRIES {
             assert!(builder.push(small.clone()).expect("push").is_none());

@@ -281,7 +281,7 @@ pub async fn feed_begin(
 /// frozen-in-progress manifest. Each insert carries `chain_hash`, the
 /// rolling blake3 over the ordered page hashes, and the same-statement
 /// trigger bumps `staged_pages`/`staged_entries` — counters and pages
-/// can never disagree. A replayed page (page_no < staged_pages) is a
+/// can never disagree. A replayed page (`page_no` < `staged_pages`) is a
 /// no-op only when its stored hash matches; changed bytes refuse.
 pub async fn feed_page(
     db: &DurableDb,
@@ -359,40 +359,61 @@ pub async fn feed_page(
     })?;
     let page_hash = blake3::hash(payload.as_bytes());
     if page_no < row.staged_pages {
-        // Idempotent replay: the same generation's page with the same
-        // bytes is already staged — a no-op, never a replace. Changed
-        // bytes on a staged page refuse.
-        let stored = db
-            .query(
-                "SELECT page_hash FROM demand_feed_pages \
-                 WHERE hour = ? AND generation = ? AND page_no = ?",
-            )
-            .bind(request.hour.as_str())
-            .bind(request.generation)
-            .bind(page_no)
-            .fetch_scalar_optional::<String>()
-            .await
-            .map_err(|error| format!("read staged page {}/{page_no}: {error}", request.hour))?;
-        return match stored.as_deref() {
-            Some(existing) if existing == page_hash.to_hex().as_str() => Ok(()),
-            Some(_) => Err(QueueError::Invariant(format!(
-                "demand feed page {}/{page_no} is immutable: \
-                 the staged payload differs",
-                request.hour
-            ))),
-            // The row is missing but the counter says it staged — the
-            // staging counters are trigger-maintained, so this is a
-            // storage inconsistency, not a retry.
-            None => Err(QueueError::Invariant(format!(
-                "demand feed page {}/{page_no} counted but absent",
-                request.hour
-            ))),
-        };
+        return feed_page_replay(db, request, page_no, page_hash).await;
     }
-    // Sequential extension: chain this page's hash onto the previous
-    // page's (page 0 seeds the chain with its own hash), so the last
-    // staged page proves the ordered set. The predecessor read is one
-    // PK lookup.
+    feed_page_extend(db, request, page_no, page_hash, payload).await
+}
+
+/// Idempotent replay of an already-staged page: the same generation's
+/// page with the same bytes is a no-op, never a replace — changed
+/// bytes on a staged page refuse.
+async fn feed_page_replay(
+    db: &DurableDb,
+    request: &DemandFeedPageRequest,
+    page_no: i64,
+    page_hash: blake3::Hash,
+) -> Result<(), QueueError> {
+    let stored = db
+        .query(
+            "SELECT page_hash FROM demand_feed_pages \
+             WHERE hour = ? AND generation = ? AND page_no = ?",
+        )
+        .bind(request.hour.as_str())
+        .bind(request.generation)
+        .bind(page_no)
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read staged page {}/{page_no}: {error}", request.hour))?;
+    match stored.as_deref() {
+        Some(existing) if existing == page_hash.to_hex().as_str() => Ok(()),
+        Some(_) => Err(QueueError::Invariant(format!(
+            "demand feed page {}/{page_no} is immutable: \
+             the staged payload differs",
+            request.hour
+        ))),
+        // The row is missing but the counter says it staged — the
+        // staging counters are trigger-maintained, so this is a
+        // storage inconsistency, not a retry.
+        None => Err(QueueError::Invariant(format!(
+            "demand feed page {}/{page_no} counted but absent",
+            request.hour
+        ))),
+    }
+}
+
+/// Sequential extension: chain this page's hash onto the previous
+/// page's (page 0 seeds the chain with its own hash), so the last
+/// staged page proves the ordered set. The predecessor read is one PK
+/// lookup, and the plain INSERT — never a replace — keeps same-page
+/// changed bytes from overwriting staged input while the trigger
+/// counts the stage in the same statement the row lands.
+async fn feed_page_extend(
+    db: &DurableDb,
+    request: &DemandFeedPageRequest,
+    page_no: i64,
+    page_hash: blake3::Hash,
+    payload: String,
+) -> Result<(), QueueError> {
     let chain_hash = if page_no == 0 {
         page_hash
     } else {
@@ -425,9 +446,6 @@ pub async fn feed_page(
         field: "demand feed page entry count",
         value: u64::try_from(request.entries.len()).unwrap_or(u64::MAX),
     })?;
-    // Plain INSERT — never a replace: same-page changed bytes cannot
-    // overwrite staged input, and the trigger counts the stage in the
-    // same statement the row lands.
     db.query(
         "INSERT INTO demand_feed_pages \
          (hour, generation, page_no, entry_count, page_hash, chain_hash, payload, applied) \
@@ -537,27 +555,6 @@ pub async fn feed_deliver(
             "demand feed hour {hour} is still staging — only complete hours deliver"
         )));
     }
-    if row.state == "complete" {
-        // Before any demand or acknowledgment write: an unfinished
-        // hour below this one makes the delivery unordered — refuse
-        // here rather than let demand land and only then fail the
-        // terminal contiguity check. Bounded partial-index probe, one
-        // row maximum.
-        let older = db
-            .query(
-                "SELECT hour FROM demand_feed_hours \
-                 WHERE hour < ? AND state != 'delivered' LIMIT 1",
-            )
-            .bind(hour.as_str())
-            .fetch_scalar_optional::<String>()
-            .await
-            .map_err(|error| format!("probe unfinished predecessors of {hour}: {error}"))?;
-        if let Some(older) = older {
-            return Err(QueueError::Invariant(format!(
-                "demand feed hour {hour} cannot deliver while {older} is unfinished"
-            )));
-        }
-    }
     if row.state == "delivered" {
         let plan = queue::next_alarm(db, now_ms, settings).await?;
         return Ok((
@@ -573,6 +570,28 @@ pub async fn feed_deliver(
         ));
     }
 
+    // Before any demand or acknowledgment write: this hour must be
+    // the watermark's canonical successor AND have no unfinished
+    // header below it — refuse here rather than let demand land and
+    // only then fail the terminal contiguity check. The canonical
+    // point read needs no scan; the older-unfinished probe is the
+    // existing bounded partial-index lookup, one row maximum.
+    require_canonical_successor(db, hour).await?;
+    let older = db
+        .query(
+            "SELECT hour FROM demand_feed_hours \
+             WHERE hour < ? AND state != 'delivered' LIMIT 1",
+        )
+        .bind(hour.as_str())
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("probe unfinished predecessors of {hour}: {error}"))?;
+    if let Some(older) = older {
+        return Err(QueueError::Invariant(format!(
+            "demand feed hour {hour} cannot deliver while {older} is unfinished"
+        )));
+    }
+
     let page = db
         .query(
             "SELECT page_no, payload FROM demand_feed_pages \
@@ -586,12 +605,23 @@ pub async fn feed_deliver(
         .map_err(|error| format!("read next undelivered page for {hour}: {error}"))?;
 
     let Some(page) = page else {
-        // Every original page is acknowledged: mark the hour terminal
-        // in one guarded statement — all acked (header counters) AND
-        // this hour is the watermark's canonical successor (or the
-        // first delivered hour), so the cursor can neither leap over
-        // missing hours nor move backwards.
-        let predecessor = hour.prev().map_err(QueueError::Invariant)?;
+        return finish_feed_deliver(db, hour, now_ms, settings).await;
+    };
+    apply_feed_page(db, hour, &row, &page, now_ms, settings).await
+}
+
+/// The terminal transition: every original page acknowledged, so the
+/// hour marks `delivered` in one guarded statement — all acked
+/// (header counters) AND this hour is the watermark's canonical
+/// successor (or the first delivered hour), so the cursor can neither
+/// leap over missing hours nor move backwards.
+async fn finish_feed_deliver(
+    db: &DurableDb,
+    hour: &DemandFeedHour,
+    now_ms: i64,
+    settings: &SchedulerSettings,
+) -> Result<(DemandFeedDeliverReport, AlarmPlan), QueueError> {
+    let predecessor = hour.prev().map_err(QueueError::Invariant)?;
         db.query(
             "UPDATE demand_feed_hours SET state = 'delivered' \
              WHERE hour = ? AND state = 'complete' \
@@ -618,7 +648,7 @@ pub async fn feed_deliver(
             )));
         }
         let plan = queue::next_alarm(db, now_ms, settings).await?;
-        return Ok((
+        Ok((
             DemandFeedDeliverReport {
                 hour: hour.to_string(),
                 state: "delivered".to_owned(),
@@ -628,13 +658,23 @@ pub async fn feed_deliver(
                 remaining_pages: 0,
             },
             plan,
-        ));
-    };
+        ))
+}
 
-    // Replay the frozen payload verbatim — never a fresh AE answer.
-    // The parse failure of a staged payload is an invariant: complete
-    // verified the manifest, and the bytes were serialized by serde at
-    // staging time.
+/// Replay one frozen page verbatim into the demand ledger — never a
+/// fresh Analytics Engine answer — and mark it applied. The parse
+/// failure of a staged payload is an invariant: `complete` verified
+/// the manifest, and the bytes were serialized by serde at staging
+/// time.
+async fn apply_feed_page(
+    db: &DurableDb,
+    hour: &DemandFeedHour,
+    row: &HourRow,
+    page: &PageRow,
+    now_ms: i64,
+    settings: &SchedulerSettings,
+) -> Result<(DemandFeedDeliverReport, AlarmPlan), QueueError> {
+    {
     let entries: Vec<SchedulerDemandEntry> =
         serde_json::from_str(&page.payload).map_err(|error| {
             QueueError::Invariant(format!(
@@ -671,10 +711,12 @@ pub async fn feed_deliver(
     let remaining = row
         .page_count
         .checked_sub(applied_pages)
-        .ok_or(QueueError::Invariant(format!(
-            "demand feed hour {hour} applied_pages {applied_pages} exceeds page_count {}",
-            row.page_count
-        )))?;
+        .ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "demand feed hour {hour} applied_pages {applied_pages} exceeds page_count {}",
+                row.page_count
+            ))
+        })?;
     Ok((
         DemandFeedDeliverReport {
             hour: hour.to_string(),
@@ -696,6 +738,7 @@ pub async fn feed_deliver(
         },
         plan,
     ))
+    }
 }
 
 /// `POST /demand-feed/cleanup` — retire up to
@@ -767,7 +810,7 @@ mod tests {
     use crate::scheduler::test_db::{counting_memory_db, memory_db};
     use stow_types::api::{
         DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageRequest, SchedulerDemandEntry,
-        demand_feed_manifest, demand_feed_page_hash,
+        EnqueueRequest, EnqueueSource, demand_feed_manifest, demand_feed_page_hash,
     };
     use stow_types::identity::FeaturesJson;
 
@@ -896,6 +939,140 @@ mod tests {
     }
 
     /// Deliver every page of a frozen hour plus the terminal call.
+    /// A real queued task whose demand the h4 page would fold into —
+    /// the refused apply must leave its demand/value/batch and every
+    /// acknowledgment untouched, not merely no-op on an absent
+    /// identity.
+    async fn enqueue_alpha(db: &skyzen_services::durable::DurableDb) {
+        super::queue::enqueue(
+            db,
+            &[EnqueueRequest {
+                crate_name: "alpha".parse().expect("alpha crate"),
+                version: "1.0.0".parse().expect("alpha version"),
+                features_json: FeaturesJson::default(),
+                target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                downloads: 0,
+                source: EnqueueSource::CacheMiss,
+                depends_on: Vec::new(),
+                preserve_lockfile: false,
+                host_side: false,
+            }],
+            &settings(),
+        )
+        .await
+        .expect("enqueue alpha");
+    }
+
+    /// Alpha's queued demand and value as text — a verbatim snapshot
+    /// the refusal must leave byte-identical and the canonical
+    /// delivery must fold exactly once.
+    async fn alpha_state(db: &skyzen_services::durable::DurableDb) -> serde_json::Value {
+        db.query(
+            "SELECT CAST(demand AS TEXT) AS demand, CAST(value AS TEXT) AS value \
+             FROM queue WHERE crate_name = 'alpha'",
+        )
+        .fetch_one::<serde_json::Value>()
+        .await
+        .expect("read alpha state")
+    }
+
+    /// No page of `hour` applied and no ledger batch of it exists.
+    async fn feed_writes_absent(
+        db: &skyzen_services::durable::DurableDb,
+        hour: &DemandFeedHour,
+    ) -> bool {
+        let applied = db
+            .query(
+                "SELECT COUNT(*) FROM demand_feed_pages \
+                 WHERE hour = ? AND applied = 1",
+            )
+            .bind(hour.as_str())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count applied");
+        let batches = db
+            .query(
+                "SELECT COUNT(*) FROM demand_batches \
+                 WHERE batch_id LIKE 'demand-feed/' || ? || '/%'",
+            )
+            .bind(hour.as_str())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count batches");
+        let contributions = db
+            .query(
+                "SELECT COUNT(*) FROM demand_contributions \
+                 WHERE batch_id LIKE 'demand-feed/' || ? || '/%'",
+            )
+            .bind(hour.as_str())
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count contributions");
+        applied == 0 && batches == 0 && contributions == 0
+    }
+
+    /// Complete and deliver the canonical chain h2 → h3 → h3b → h4 —
+    /// each stage advancing the watermark to the expected hour.
+    async fn finish_predecessors(
+        db: &skyzen_services::durable::DurableDb,
+        h2: &DemandFeedHour,
+        g2: i64,
+        h3: &DemandFeedHour,
+        h4: &DemandFeedHour,
+    ) {
+        feed_complete(db, &complete(h2, g2, &[]), NOW_SECS)
+            .await
+            .expect("complete h2");
+        deliver_all(db, h2, 0).await;
+        assert_eq!(watermark(db).await.as_deref(), Some(H2));
+        stage_and_freeze(db, h3, &[]).await;
+        deliver_all(db, h3, 0).await;
+        assert_eq!(watermark(db).await.as_deref(), Some("2026-01-01T02"));
+        let h3b = hour("2026-01-01T03");
+        stage_and_freeze(db, &h3b, &[]).await;
+        deliver_all(db, &h3b, 0).await;
+        assert_eq!(watermark(db).await.as_deref(), Some("2026-01-01T03"));
+        deliver_all(db, h4, 1).await;
+    }
+
+    /// Stage a complete hour under an inserted header — exercises the
+    /// deliver-side guards on pre-existing out-of-order data that a
+    /// refused begin cannot produce.
+    async fn seed_complete_hour(
+        db: &skyzen_services::durable::DurableDb,
+        hour: &DemandFeedHour,
+        generation: i64,
+        pages: &[Vec<SchedulerDemandEntry>],
+    ) {
+        db.query(
+            "INSERT INTO demand_feed_hours (hour, generation, state) \
+             VALUES (?, ?, 'staging')",
+        )
+        .bind(hour.as_str())
+        .bind(generation)
+        .execute()
+        .await
+        .expect("insert hour");
+        for (i, entries) in pages.iter().enumerate() {
+            feed_page(
+                db,
+                &DemandFeedPageRequest {
+                    hour: hour.clone(),
+                    generation,
+                    page_no: u32::try_from(i).expect("page index"),
+                    entries: entries.clone(),
+                },
+                NOW_SECS,
+            )
+            .await
+            .expect("stage page");
+        }
+        feed_complete(db, &complete(hour, generation, pages), NOW_SECS)
+            .await
+            .expect("freeze hour");
+    }
+
     async fn deliver_all(
         db: &skyzen_services::durable::DurableDb,
         hour: &DemandFeedHour,
@@ -1158,37 +1335,21 @@ mod tests {
         feed_begin(&db, &h4, NOW_SECS)
             .await
             .expect_err("non-canonical begin refuses");
-        db.query(
-            "INSERT INTO demand_feed_hours (hour, generation, state) \
-             VALUES (?, 7, 'staging')",
-        )
-        .bind(h4.as_str())
-        .execute()
-        .await
-        .expect("insert h4");
-        for (index, entries) in page1.iter().enumerate() {
-            feed_page(
-                &db,
-                &page(
-                    &h4,
-                    7,
-                    u32::try_from(index).expect("page index"),
-                    entries.clone(),
-                ),
-                NOW_SECS,
+        seed_complete_hour(&db, &h4, 7, &page1).await;
+        // The deliver-side canonical check refuses before the first
+        // page applies — no demand or acknowledgment may land.
+        feed_deliver(&db, &h4, NOW_MS, &settings())
+            .await
+            .expect_err("non-canonical delivery refuses before demand");
+        let applied = db
+            .query(
+                "SELECT applied_pages FROM demand_feed_hours WHERE hour = ?",
             )
+            .bind(h4.as_str())
+            .fetch_scalar::<i64>()
             .await
-            .expect("stage h4 page");
-        }
-        feed_complete(&db, &complete(&h4, 7, &page1), NOW_SECS)
-            .await
-            .expect("freeze h4");
-        feed_deliver(&db, &h4, NOW_MS, &settings())
-            .await
-            .expect("deliver h4 page");
-        feed_deliver(&db, &h4, NOW_MS, &settings())
-            .await
-            .expect_err("watermark cannot leap a missing hour");
+            .expect("h4 applied count");
+        assert_eq!(applied, 0, "non-canonical delivery applied a page");
         assert_eq!(watermark(&db).await.as_deref(), Some(H2));
         // An hour at or below the cursor can never re-materialize.
         feed_begin(&db, &h1, NOW_SECS)
@@ -1212,9 +1373,19 @@ mod tests {
         let h3 = hour("2026-01-01T02");
         let h4 = hour(H4);
         let page = vec![vec![entry("alpha", 1)]];
+        // A real queued task the h4 page's demand would fold into —
+        // the refused apply must leave its demand/value/batch and
+        // every acknowledgment untouched, not merely no-op on an
+        // absent identity.
+        enqueue_alpha(&db).await;
+        // The reachable pre-staged state — no synthetic header INSERT:
+        // h4 stages and freezes during bootstrap while NO watermark
+        // exists, alongside the genuinely earlier h1.
         stage_and_freeze(&db, &h1, &page).await;
+        stage_and_freeze(&db, &h4, &page).await;
         deliver_all(&db, &h1, 1).await;
         assert_eq!(watermark(&db).await.as_deref(), Some(H1));
+        let before = alpha_state(&db).await;
         // The leap: h3 is not the canonical successor — begin refuses
         // before inserting a header or staging a page.
         feed_begin(&db, &h3, NOW_SECS)
@@ -1227,80 +1398,64 @@ mod tests {
                 .is_none(),
             "refused begin left a header row"
         );
-        // A complete hour refuses to deliver while h2 is staging —
-        // before a single demand batch or acknowledgment lands.
+        // The missing-header case the indexed probe cannot see: h4
+        // is complete, yet h2/h3 have NO header rows — the
+        // unfinished-index probe finds nothing and alone would let
+        // demand land. The canonical-successor guard refuses before
+        // any page/demand/ack write.
+        feed_deliver(&db, &h4, NOW_MS, &settings())
+            .await
+            .expect_err("non-canonical delivery refuses before writes");
+        assert!(
+            feed_writes_absent(&db, &h4).await,
+            "refused delivery applied a page or wrote a ledger batch"
+        );
+        assert_eq!(
+            alpha_state(&db).await,
+            before,
+            "refused delivery moved real queued demand/value"
+        );
+        // The missing predecessors then materialize and deliver in
+        // order; the frozen original page succeeds exactly once.
         let g2 = feed_begin(&db, &h2, NOW_SECS)
             .await
             .expect("begin canonical h2")
             .generation;
-        feed_begin(&db, &h4, NOW_SECS)
-            .await
-            .expect_err("h4 is still not the successor");
-        // h4 cannot even begin: seed its row directly to exercise the
-        // deliver-side guard on pre-existing out-of-order data.
-        db.query(
-            "INSERT INTO demand_feed_hours (hour, generation, state) \
-             VALUES (?, 7, 'staging')",
-        )
-        .bind(h4.as_str())
-        .execute()
-        .await
-        .expect("insert h4");
-        for (i, entries) in page.iter().enumerate() {
-            feed_page(
-                &db,
-                &DemandFeedPageRequest {
-                    hour: h4.clone(),
-                    generation: 7,
-                    page_no: u32::try_from(i).expect("page index"),
-                    entries: entries.clone(),
-                },
-                NOW_SECS,
-            )
-            .await
-            .expect("stage h4 page");
-        }
-        feed_complete(&db, &complete(&h4, 7, &page), NOW_SECS)
-            .await
-            .expect("freeze h4");
-        feed_deliver(&db, &h4, NOW_MS, &settings())
-            .await
-            .expect_err("deliver refuses while h2 is unfinished");
-        let applied = db
-            .query(
-                "SELECT COUNT(*) FROM demand_feed_pages \
-                 WHERE hour = ? AND applied = 1",
-            )
-            .bind(h4.as_str())
-            .fetch_scalar::<i64>()
-            .await
-            .expect("count applied");
-        assert_eq!(applied, 0, "refused delivery applied a page");
-        let batches = db
+        finish_predecessors(&db, &h2, g2, &h3, &h4).await;
+        assert_eq!(watermark(&db).await.as_deref(), Some(H4));
+        // The frozen original page applied exactly once: alpha's
+        // demand gained the page's delta once — the staged
+        // contribution set retires at acceptance, so the batch
+        // header and the folded value are the record — and a
+        // delivered replay stays the early no-op.
+        let accepted = db
             .query(
                 "SELECT COUNT(*) FROM demand_batches \
-                 WHERE batch_id LIKE 'demand-feed/2026-01-01T04/%'",
+                 WHERE batch_id = 'demand-feed/2026-01-01T04/0' AND state = 'accepted'",
             )
             .fetch_scalar::<i64>()
             .await
-            .expect("count batches");
-        assert_eq!(batches, 0, "refused delivery wrote a ledger batch");
-        // The genuine successor delivers, then h4 follows canonically
-        // once h3 materializes and finishes in between.
-        feed_complete(&db, &complete(&h2, g2, &[]), NOW_SECS)
+            .expect("count h4 batch");
+        assert_eq!(accepted, 1, "h4 page did not accept exactly once");
+        let after = alpha_state(&db).await;
+        let folded: i64 = after["demand"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+            .expect("alpha demand parses");
+        let was: i64 = before["demand"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+            .expect("alpha demand parses");
+        assert_eq!(folded, was + 1, "h4 page's demand did not fold once");
+        let (replay, _) = feed_deliver(&db, &h4, NOW_MS, &settings())
             .await
-            .expect("complete h2");
-        deliver_all(&db, &h2, 0).await;
-        assert_eq!(watermark(&db).await.as_deref(), Some(H2));
-        stage_and_freeze(&db, &h3, &[]).await;
-        deliver_all(&db, &h3, 0).await;
-        assert_eq!(watermark(&db).await.as_deref(), Some("2026-01-01T02"));
-        let h3b = hour("2026-01-01T03");
-        stage_and_freeze(&db, &h3b, &[]).await;
-        deliver_all(&db, &h3b, 0).await;
-        assert_eq!(watermark(&db).await.as_deref(), Some("2026-01-01T03"));
-        deliver_all(&db, &h4, 1).await;
-        assert_eq!(watermark(&db).await.as_deref(), Some(H4));
+            .expect("delivered replay");
+        assert!(!replay.applied, "delivered replay reapplied");
+        assert_eq!(
+            alpha_state(&db).await,
+            after,
+            "delivered replay moved demand"
+        );
     }
 
     /// `cleanup` retires dead page rows in bounded chunks: obsolete

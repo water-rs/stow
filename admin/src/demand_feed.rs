@@ -134,8 +134,7 @@ pub async fn run(
         })
         .transpose()?;
 
-    let report = match unfinished {
-        Some((hour, state)) => {
+    let report = if let Some((hour, state)) = unfinished {
             // The durable cursor owns the resume order: an explicit
             // `--hour` naming a DIFFERENT hour while one is unfinished
             // would cross or leap over it — refuse rather than ignore
@@ -175,8 +174,7 @@ pub async fn run(
                     )));
                 }
             }
-        }
-        None => {
+        } else {
             let hour = match (explicit, &status.watermark) {
                 (Some(hour), _) => hour,
                 (None, Some(watermark)) => DemandFeedHour::parse(watermark)
@@ -192,7 +190,6 @@ pub async fn run(
             } else {
                 materialize(edge, hour).await?
             }
-        }
     };
     render::emit(output, &report, |report| {
         if report.state == "skipped" {
@@ -252,15 +249,58 @@ async fn materialize(
         .map_err(|error| stow_error!("demand feed tempfile task: {error}"))?
         .map_err(|error| stow_error!("create demand feed tempfile: {error}"))?;
     let staging_path = temp.path().to_owned();
-    let generation = begin.generation;
+    let outcome = stage_and_freeze(edge, &hour, &staging_path, begin.generation).await;
+
+    // The owned guard's close joins the blocking pool whichever way
+    // the operation resolved — a close failure only ever replaces a
+    // successful outcome; the operation's own error always wins, with
+    // the cleanup failure attached as diagnostics.
+    let closed = tokio::task::spawn_blocking(move || temp.close())
+        .await
+        .map_err(|error| stow_error!("demand feed tempfile close task: {error}"))
+        .and_then(|result| {
+            result.map_err(|error| stow_error!("close demand feed tempfile: {error}"))
+        });
+    let (entry_count, staged_pages) = match (outcome, closed) {
+        (Ok((entry_count, staged_pages)), Ok(())) => (entry_count, staged_pages),
+        (Ok(_), Err(close)) => return Err(close),
+        (Err(error), Ok(())) => return Err(error),
+        (Err(error), Err(close)) => {
+            return Err(Error::msg(format!(
+                "{error:#} — additionally failed to close the staging tempfile: {close:#}"
+            )));
+        }
+    };
+
+    let (delivered_pages, touched_tasks) = deliver_and_retire(edge, &hour).await?;
+    Ok(FeedRunReport {
+        hour: hour.to_string(),
+        state: "delivered".to_owned(),
+        staged_pages: u64::from(staged_pages),
+        staged_entries: entry_count,
+        delivered_pages,
+        touched_tasks,
+    })
+}
+
+/// The staging leg: stream the hour's document to disk, parse and
+/// post it page by page under the object-enforced ordering, then
+/// freeze on the manifest. The parser runs on the blocking pool with
+/// bounded in-flight pages, so a staging failure aborts the rest
+/// cleanly.
+async fn stage_and_freeze(
+    edge: &Edge,
+    hour: &DemandFeedHour,
+    staging_path: &std::path::Path,
+    generation: i64,
+) -> stow_types::error::Result<(u64, u32)> {
+    stream_query(edge, hour, staging_path).await?;
     let staged_hour = hour.clone();
-    let outcome: stow_types::error::Result<(u64, u32)> = async {
-        stream_query(edge, &hour, &staging_path).await?;
-        // The parser runs on the blocking pool with bounded in-flight
+    // The parser runs on the blocking pool with bounded in-flight
         // pages; each page posts under the object-enforced sequential
         // ordering, so a staging failure aborts the rest cleanly.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DemandFeedPageRequest>(PAGE_CHANNEL_BOUND);
-        let parse_path = staging_path.clone();
+        let parse_path = staging_path.to_owned();
         let parse = tokio::task::spawn_blocking(move || {
             parse_feed_document(&parse_path, &staged_hour, generation, tx)
         });
@@ -331,39 +371,6 @@ async fn materialize(
         )
         .await?;
         Ok((entry_count, staged_pages))
-    }
-    .await;
-
-    // The owned guard's close joins the blocking pool whichever way
-    // the operation resolved — a close failure only ever replaces a
-    // successful outcome; the operation's own error always wins, with
-    // the cleanup failure attached as diagnostics.
-    let closed = tokio::task::spawn_blocking(move || temp.close())
-        .await
-        .map_err(|error| stow_error!("demand feed tempfile close task: {error}"))
-        .and_then(|result| {
-            result.map_err(|error| stow_error!("close demand feed tempfile: {error}"))
-        });
-    let (entry_count, staged_pages) = match (outcome, closed) {
-        (Ok((entry_count, staged_pages)), Ok(())) => (entry_count, staged_pages),
-        (Ok(_), Err(close)) => return Err(close),
-        (Err(error), Ok(())) => return Err(error),
-        (Err(error), Err(close)) => {
-            return Err(Error::msg(format!(
-                "{error:#} — additionally failed to close the staging tempfile: {close:#}"
-            )));
-        }
-    };
-
-    let (delivered_pages, touched_tasks) = deliver_and_retire(edge, &hour).await?;
-    Ok(FeedRunReport {
-        hour: hour.to_string(),
-        state: "delivered".to_owned(),
-        staged_pages: u64::from(staged_pages),
-        staged_entries: entry_count,
-        delivered_pages,
-        touched_tasks,
-    })
 }
 
 /// `POST …/query` → owned temp file: the body streams through bounded
@@ -594,7 +601,7 @@ impl ParseState {
     /// Emit one completed page through the bounded channel — the send
     /// blocks while the async leg is `PAGE_CHANNEL_BOUND` pages
     /// behind, which is the feed's whole backpressure story.
-    fn send_page(&mut self, page: DemandFeedPageRequest) -> Result<(), String> {
+    fn send_page(&self, page: DemandFeedPageRequest) -> Result<(), String> {
         self.pages
             .blocking_send(page)
             .map_err(|_| "demand feed page channel closed".to_owned())
@@ -751,7 +758,7 @@ mod tests {
 
     /// One valid `data` row — built by the serializer, never hand-laid
     /// text.
-    pub(super) fn row(name: &str, demand: serde_json::Value) -> serde_json::Value {
+    pub(super) fn row(name: &str, demand: &serde_json::Value) -> serde_json::Value {
         json!({
             "crate_name": name,
             "version": "1.0.0",
@@ -786,16 +793,15 @@ mod tests {
         }
         let result = handle.join().expect("parser thread");
         drop(temp);
-        result.map(|doc| {
+        result.inspect(|doc| {
             assert!(
                 pages.iter().map(|p| p.entries.len() as u64).sum::<u64>() == doc.rows,
                 "every parsed row staged exactly once"
             );
-            doc
         })
     }
 
-    pub(super) fn document(rows: Vec<serde_json::Value>) -> serde_json::Value {
+    pub(super) fn document(rows: &[serde_json::Value]) -> serde_json::Value {
         json!({
             "meta": [
                 {"name": "crate_name", "type": "String"},
@@ -813,9 +819,9 @@ mod tests {
 
     #[test]
     fn valid_document_parses_to_end() {
-        let parsed = parse(&document(vec![
-            row("serde", json!(41.0)),
-            row("anyhow", json!("17.0")),
+        let parsed = parse(&document(&[
+            row("serde", &json!(41.0)),
+            row("anyhow", &json!("17.0")),
         ]))
         .expect("valid document parses");
         assert_eq!(parsed.rows, 2);
@@ -823,13 +829,13 @@ mod tests {
 
     #[test]
     fn empty_hour_is_a_valid_document() {
-        let parsed = parse(&document(vec![])).expect("empty document parses");
+        let parsed = parse(&document(&[])).expect("empty document parses");
         assert_eq!(parsed.rows, 0);
     }
 
     #[test]
     fn truncation_and_trailing_bytes_fail() {
-        let body = serde_json::to_vec(&document(vec![row("serde", json!(1.0))]))
+        let body = serde_json::to_vec(&document(&[row("serde", &json!(1.0))]))
             .expect("document encodes");
         let truncated = &body[..body.len() - 20];
         assert!(parse_body(truncated).is_err(), "truncated body refuses");
@@ -840,7 +846,7 @@ mod tests {
 
     #[test]
     fn declared_row_mismatch_fails() {
-        let mut doc = document(vec![row("serde", json!(1.0))]);
+        let mut doc = document(&[row("serde", &json!(1.0))]);
         doc["rows"] = json!(2);
         assert!(parse(&doc).is_err(), "declared != parsed fails");
     }
@@ -863,7 +869,7 @@ mod tests {
                 let _ = doc.as_object_mut().expect("object").remove("meta");
             },
         ] {
-            let mut doc = document(vec![row("serde", json!(1.0))]);
+            let mut doc = document(&[row("serde", &json!(1.0))]);
             mutate(&mut doc);
             assert!(parse(&doc).is_err(), "shape change must refuse");
         }
@@ -881,9 +887,9 @@ mod tests {
             json!({"demand": 1}),
         ] {
             assert!(
-                parse(&document(vec![
-                    row("serde", json!(1.0)),
-                    row("anyhow", demand)
+                parse(&document(&[
+                    row("serde", &json!(1.0)),
+                    row("anyhow", &demand)
                 ]))
                 .is_err(),
                 "a late invalid row still fails the whole document"
@@ -896,27 +902,27 @@ mod tests {
         // Boundaries land on entries: 256-entry pages, then a byte-bound
         // split — the parser measures serialized entry bytes.
         let mut rows: Vec<serde_json::Value> = (0..520)
-            .map(|n| row(&format!("crate-{n}"), json!(1.0)))
+            .map(|n| row(&format!("crate-{n}"), &json!(1.0)))
             .collect();
-        let parsed = parse(&document(rows.clone())).expect("large document parses");
+        let parsed = parse(&document(&rows)).expect("large document parses");
         assert_eq!(parsed.rows, 520);
         // An identity alone under the bound with a huge feature list.
         rows.clear();
-        rows.push(row("huge", json!(1.0)));
-        assert!(parse(&document(rows)).is_ok());
+        rows.push(row("huge", &json!(1.0)));
+        assert!(parse(&document(&rows)).is_ok());
     }
 
     #[test]
     fn missing_row_fields_fail() {
-        let mut broken = row("serde", json!(1.0));
+        let mut broken = row("serde", &json!(1.0));
         broken.as_object_mut().expect("row object").remove("target");
-        assert!(parse(&document(vec![broken])).is_err());
-        let mut extra = row("serde", json!(1.0));
+        assert!(parse(&document(&[broken])).is_err());
+        let mut extra = row("serde", &json!(1.0));
         extra
             .as_object_mut()
             .expect("row object")
             .insert("extra".to_owned(), json!(1));
-        assert!(parse(&document(vec![extra])).is_err());
+        assert!(parse(&document(&[extra])).is_err());
     }
 
     // ----- Mock edge: the real get/post/stream paths against the
@@ -952,7 +958,7 @@ mod tests {
     }
 
     impl MockEdge {
-        fn healthy(query_rows: Vec<serde_json::Value>) -> Self {
+        fn healthy(query_rows: &[serde_json::Value]) -> Self {
             Self {
                 status: json!({"watermark": "2020-01-01T05", "unfinished": null}),
                 query_body: serde_json::to_vec(&document(query_rows)).expect("body"),
@@ -1126,8 +1132,7 @@ mod tests {
                 stale_pages_pending: false,
             })
             .into_response(),
-            (axum::http::Method::POST, Some("/page"))
-            | (axum::http::Method::POST, Some("/complete")) => {
+            (axum::http::Method::POST, Some("/page" | "/complete")) => {
                 axum::Json(json!({})).into_response()
             }
             (axum::http::Method::POST, Some("/cleanup")) => axum::Json(DemandFeedCleanupReport {
@@ -1144,7 +1149,11 @@ mod tests {
                     .get(index)
                     .cloned()
                     .unwrap_or_else(|| "delivered".to_owned());
-                let delivered_page = (state != "delivered").then(|| index as u32);
+                let delivered_page = if state == "delivered" {
+                    None
+                } else {
+                    Some(u32::try_from(index).expect("deliver index fits u32"))
+                };
                 axum::Json(DemandFeedDeliverReport {
                     hour: request_json["hour"].as_str().unwrap_or_default().to_owned(),
                     state,
@@ -1170,9 +1179,9 @@ mod tests {
         // plays the real route set: status → begin → query → 3×page →
         // complete → deliver until delivered → cleanup.
         let rows: Vec<serde_json::Value> = (0..520)
-            .map(|n| row(&format!("crate-{n:04}"), json!((n % 7) as f64)))
+            .map(|n| row(&format!("crate-{n:04}"), &json!(f64::from(n % 7))))
             .collect();
-        let mut server = serve(MockEdge::healthy(rows).delivering(3)).await;
+        let mut server = serve(MockEdge::healthy(&rows).delivering(3)).await;
         run(&server.edge, DemandFeedArgs { hour: None }, Output::Json)
             .await
             .expect("full pass succeeds");
@@ -1196,7 +1205,7 @@ mod tests {
             .map(|(_, b)| b)
             .collect();
         for (index, body) in page_bodies.iter().enumerate() {
-            assert_eq!(body["page_no"], json!(index as u32));
+            assert_eq!(body["page_no"], json!(index));
             assert_eq!(body["generation"], json!(1));
             assert!(body["entries"].as_array().expect("entries").len() <= 256);
         }
@@ -1244,7 +1253,7 @@ mod tests {
     async fn frozen_hour_resumes_without_a_new_query() {
         // The durable cursor holds a complete hour: only deliver and
         // cleanup run — no begin, no query, no page staging.
-        let mut script = MockEdge::healthy(vec![]);
+        let mut script = MockEdge::healthy(&[]);
         script.status = json!({
             "watermark": null,
             "unfinished": {
@@ -1272,7 +1281,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_document_never_freezes() {
-        let mut script = MockEdge::healthy(vec![row("serde", json!(1.0))]);
+        let mut script = MockEdge::healthy(&[row("serde", &json!(1.0))]);
         script.query_body.truncate(script.query_body.len() - 20);
         let mut server = serve(script).await;
         let err = run(&server.edge, DemandFeedArgs { hour: None }, Output::Json)
@@ -1289,7 +1298,7 @@ mod tests {
     async fn unauthorized_fails_fast() {
         let script = MockEdge {
             unauthorized: true,
-            ..MockEdge::healthy(vec![])
+            ..MockEdge::healthy(&[])
         };
         let mut server = serve(script).await;
         assert!(
@@ -1306,9 +1315,9 @@ mod tests {
         // A declared-count mismatch: the parser may stage pages (they
         // are undeliverable in a staging attempt), but `complete` is
         // never called.
-        let mut doc = document(vec![row("serde", json!(1.0)), row("anyhow", json!(2.0))]);
+        let mut doc = document(&[row("serde", &json!(1.0)), row("anyhow", &json!(2.0))]);
         doc["rows"] = json!(99);
-        let mut script = MockEdge::healthy(vec![]);
+        let mut script = MockEdge::healthy(&[]);
         script.query_body = serde_json::to_vec(&doc).expect("body");
         let mut server = serve(script).await;
         assert!(
@@ -1332,9 +1341,9 @@ mod tests {
         // and the blocked parser unblocks — the run must return under
         // a bounded timeout instead of parking on a full channel.
         let rows: Vec<serde_json::Value> = (0..(4 * 256 + 10))
-            .map(|n| row(&format!("crate-{n:04}"), json!(1.0)))
+            .map(|n| row(&format!("crate-{n:04}"), &json!(1.0)))
             .collect();
-        let mut script = MockEdge::healthy(rows);
+        let mut script = MockEdge::healthy(&rows);
         script.hangup_on = vec!["/page".to_owned()];
         let mut server = serve(script).await;
         let outcome = tokio::time::timeout(
@@ -1357,9 +1366,9 @@ mod tests {
         // every earlier page is staged, the freeze is refused, nothing
         // delivers.
         let rows: Vec<serde_json::Value> = (0..(4 * 256 + 8))
-            .map(|n| row(&format!("crate-{n:04}"), json!(1.0)))
+            .map(|n| row(&format!("crate-{n:04}"), &json!(1.0)))
             .collect();
-        let mut script = MockEdge::healthy(rows);
+        let mut script = MockEdge::healthy(&rows);
         script.hangup_on = vec!["/complete".to_owned()];
         let mut server = serve(script).await;
         assert!(
@@ -1379,9 +1388,9 @@ mod tests {
         // settles before the error surfaces — no sibling call is left
         // cancelled, and retirement never runs on a failed leg.
         let rows: Vec<serde_json::Value> = (0..520)
-            .map(|n| row(&format!("crate-{n:04}"), json!(1.0)))
+            .map(|n| row(&format!("crate-{n:04}"), &json!(1.0)))
             .collect();
-        let mut script = MockEdge::healthy(rows).delivering(3);
+        let mut script = MockEdge::healthy(&rows).delivering(3);
         script.hangup_on = vec!["/deliver".to_owned()];
         let mut server = serve(script).await;
         assert!(
@@ -1404,7 +1413,7 @@ mod tests {
         // The cursor holds a complete hour; `--hour` naming a
         // different closed hour refuses — it would cross the cursor's
         // order — and nothing runs.
-        let mut script = MockEdge::healthy(vec![]);
+        let mut script = MockEdge::healthy(&[]);
         script.status = json!({
             "watermark": "2020-01-01T04",
             "unfinished": {
@@ -1435,7 +1444,7 @@ mod tests {
     async fn explicit_hour_resumes_the_same_unfinished_hour() {
         // `--hour` naming the cursor's unfinished hour resumes its
         // canonical state — a complete hour delivers, no new query.
-        let mut script = MockEdge::healthy(vec![]);
+        let mut script = MockEdge::healthy(&[]);
         script.status = json!({
             "watermark": null,
             "unfinished": {
@@ -1467,7 +1476,7 @@ mod tests {
         // Even with a frozen unfinished hour the cursor would resume,
         // a malformed `--hour` errors first — the explicit argument is
         // validated before any network side effect.
-        let mut script = MockEdge::healthy(vec![]);
+        let mut script = MockEdge::healthy(&[]);
         script.status = json!({
             "watermark": null,
             "unfinished": {
@@ -1500,7 +1509,7 @@ mod tests {
     async fn unfinished_explicit_hour_fails_before_any_side_effect() {
         // An explicit hour that has not closed refuses even though
         // the cursor could have served one.
-        let mut server = serve(MockEdge::healthy(vec![])).await;
+        let mut server = serve(MockEdge::healthy(&[])).await;
         assert!(
             run(
                 &server.edge,
@@ -1512,7 +1521,7 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(server.paths().is_empty());
+        assert_eq!(server.paths(), Vec::<String>::new());
         server.shutdown().await.expect("mock server shutdown");
     }
 
@@ -1520,7 +1529,7 @@ mod tests {
     async fn unknown_unfinished_state_is_an_error() {
         // An unfinished row in a state this build does not know is an
         // error — never a silent re-materialize.
-        let mut script = MockEdge::healthy(vec![]);
+        let mut script = MockEdge::healthy(&[]);
         script.status = json!({
             "watermark": null,
             "unfinished": {

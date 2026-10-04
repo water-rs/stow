@@ -854,6 +854,40 @@ async fn restore_claimed_rows(
     Ok(claimed_ns)
 }
 
+/// Feed state the drives may have moved since seeding — the bounded
+/// live-window reset only: the growing 2018 history and the staging
+/// hour's current-generation bulk are fixture truth that must persist
+/// between probes; only the obsolete tail (strict `generation < 9`,
+/// matching the seeded generations 7/9 — never an open `<> 9` walk
+/// over the live prefix) and the staged counters a cleanup drive
+/// could have disturbed are restored here (stow#523).
+async fn rearm_feed_window(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    db.query(
+        "DELETE FROM demand_feed_pages \
+         WHERE hour = '2022-01-01T00' AND generation < 9",
+    )
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("reset staging obsolete tail: {error}")))?;
+    db.query(include_str!("feed_obsolete_reseed.sql"))
+        .bind(i64::from(feed_staged_pages(shape)))
+        .bind(i64::from(feed_staged_pages(shape)))
+        .bind(i64::from(feed_staged_pages(shape)))
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("reseed staging obsolete tail: {error}")))?;
+    db.query(
+        "UPDATE demand_feed_hours SET staged_pages = ?, staged_entries = ? \
+         WHERE hour = '2022-01-01T00'",
+    )
+    .bind(i64::from(feed_staged_pages(shape)))
+    .bind(i64::from(feed_staged_pages(shape)) * 4)
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("reset staging feed counters: {error}")))?;
+    Ok(())
+}
+
 /// Restores the seeded queue the drives are calibrated on — outside
 /// the measured window, the same precedent as the installation-token
 /// seed. The contract is the seeded state, not just its shape: every
@@ -973,35 +1007,7 @@ pub async fn rearm(
     // in `settings` under [`PROBE_CLAIMED_KEY`] so the set survives
     // between `POST /budget` calls.
     let claimed_ns = restore_claimed_rows(db, shape, min_age_minutes).await?;
-    // Feed state the drives may have moved since seeding — the
-    // bounded live-window reset only: the growing 2018 history and
-    // the staging hour's current-generation bulk are fixture truth
-    // that must persist between probes; only the obsolete tail and
-    // the staged counters a cleanup drive could have disturbed are
-    // restored here (stow#523).
-    db.query(
-        "DELETE FROM demand_feed_pages \
-         WHERE hour = '2022-01-01T00' AND generation <> 9",
-    )
-    .execute()
-    .await
-    .map_err(|error| QueueError::Sql(format!("reset staging obsolete tail: {error}")))?;
-    db.query(include_str!("feed_obsolete_reseed.sql"))
-        .bind(i64::from(feed_staged_pages(shape)))
-        .bind(i64::from(feed_staged_pages(shape)))
-        .bind(i64::from(feed_staged_pages(shape)))
-        .execute()
-        .await
-        .map_err(|error| QueueError::Sql(format!("reseed staging obsolete tail: {error}")))?;
-    db.query(
-        "UPDATE demand_feed_hours SET staged_pages = ?, staged_entries = ? \
-         WHERE hour = '2022-01-01T00'",
-    )
-    .bind(i64::from(feed_staged_pages(shape)))
-    .bind(i64::from(feed_staged_pages(shape)) * 4)
-    .execute()
-    .await
-    .map_err(|error| QueueError::Sql(format!("reset staging feed counters: {error}")))?;
+    rearm_feed_window(db, shape).await?;
     // Row 101's seeded edge set: the resync's delta sync rewrote it.
     db.query("DELETE FROM queue_dependencies WHERE task_id = printf('%064x', ?)")
         .bind(101_i64)

@@ -154,8 +154,14 @@ fn usage_stats_from_rows(
     };
     let cpu_hours_saved_30d = events.hit_compile_millis_30d / 3_600_000.0;
     let daily_installs = installs.install_days_7d as f64 / INSTALL_WINDOW_DAYS;
-    let daily_active_installs_7d =
-        (daily_installs >= MIN_PUBLISHABLE_INSTALLS).then(|| daily_installs.round() as u64);
+    let daily_active_installs_7d = if daily_installs >= MIN_PUBLISHABLE_INSTALLS {
+        Some(analytics::f64_to_u64_exact(
+            daily_installs.round(),
+            "daily installs",
+        )?)
+    } else {
+        None
+    };
     let entries = |rows: Vec<LeaderboardRow>| {
         rows.into_iter()
             .map(|row| {

@@ -3,7 +3,7 @@
 -- the fixed generation 7 the bulk seed assigns. `OR IGNORE` +
 -- the delete that precedes make a repeat re-arm exact.
 WITH RECURSIVE seq(n) AS (
-    SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n <= 256
+    SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 256
 )
 INSERT OR IGNORE INTO demand_feed_pages
     (hour, generation, page_no, entry_count, page_hash, chain_hash,

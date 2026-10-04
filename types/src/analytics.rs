@@ -55,15 +55,24 @@ pub fn de_f64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, 
     }
 }
 
-/// Lossless `Float64 → u64` for callers that consume an estimate as a
-/// count: accepts only finite non-negative integral values in range —
-/// never clamps a negative or out-of-range aggregate, and reports a
+/// Lossless `Float64 → u64` for estimate-as-count callers.
+///
+/// Accepts only finite non-negative integral values in range — never
+/// clamps a negative or out-of-range aggregate, and reports a
 /// fractional estimate rather than silently rounding it.
 ///
 /// # Errors
 /// The value is non-finite, negative, fractional, or not below
 /// `2^64`. `u64::MAX as f64` rounds to exactly `2^64`, so the bound is
 /// exclusive — a `2^64` estimate must reject rather than saturate.
+// The bounds check above proves `value` finite, non-negative,
+// integral, and below `2^64`, so `as u64` is exact; `u64::MAX as f64`
+// is the deliberate exclusive bound the doc names.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub fn f64_to_u64_exact(value: f64, what: &str) -> Result<u64, String> {
     if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value < u64::MAX as f64 {
         Ok(value as u64)
