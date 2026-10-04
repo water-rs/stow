@@ -137,6 +137,19 @@ pub fn fetch_git(url: &str, git_ref: &str, dir: &Path) -> CargoResult<PathBuf> {
     debug!(%url, %fetch_ref, "resolve fetch");
     run(&["fetch", "--depth", "1", "origin", &fetch_ref])?;
     run(&["checkout", "--detach", "FETCH_HEAD"])?;
+    // A fetched tree's gitlinks are empty dirs until materialized —
+    // resolve the pinned tree's own `.gitmodules` at the recorded
+    // submodule commits (never `--remote`), depth-1 like the parent
+    // fetch. Without it a workspace member or `path` dep living in a
+    // submodule reads as a missing manifest (stow#543).
+    run(&[
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+        "--depth",
+        "1",
+    ])?;
     Ok(dir.to_path_buf())
 }
 
