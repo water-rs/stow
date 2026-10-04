@@ -53,7 +53,7 @@ use stow_types::api::{
     DEMAND_FEED_RETIRE_CHUNK, DemandFeedBeginReport, DemandFeedCleanupReport,
     DemandFeedCompleteRequest, DemandFeedDeliverReport, DemandFeedHour, DemandFeedPageRequest,
     DemandFeedStatus, DemandFeedUnfinished, SchedulerDemandEntry, SchedulerDemandRequest,
-    demand_feed_chain,
+    demand_feed_chain, demand_feed_page_payload,
 };
 
 use super::queue::{self, AlarmPlan, SchedulerSettings};
@@ -338,7 +338,7 @@ pub async fn feed_page(
             request.hour, row.staged_pages
         )));
     }
-    let payload = serde_json::to_string(&request.entries).map_err(|error| {
+    let payload = demand_feed_page_payload(&request.entries).map_err(|error| {
         QueueError::Invariant(format!(
             "serialize demand feed page {}/{}: {error}",
             request.hour, request.page_no
@@ -733,7 +733,7 @@ mod tests {
     use crate::scheduler::test_db::{counting_memory_db, memory_db};
     use stow_types::api::{
         DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageRequest, SchedulerDemandEntry,
-        demand_feed_manifest,
+        demand_feed_manifest, demand_feed_page_hash,
     };
     use stow_types::identity::FeaturesJson;
 
@@ -809,10 +809,7 @@ mod tests {
     fn manifest(pages: &[Vec<SchedulerDemandEntry>]) -> String {
         let page_hashes: Vec<blake3::Hash> = pages
             .iter()
-            .map(|entries| {
-                let payload = serde_json::to_string(entries).expect("entries serialize");
-                blake3::hash(payload.as_bytes())
-            })
+            .map(|entries| demand_feed_page_hash(entries).expect("entries serialize"))
             .collect();
         demand_feed_manifest(&page_hashes)
             .map(|hash| hash.to_hex().to_string())

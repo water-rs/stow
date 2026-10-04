@@ -896,6 +896,13 @@ pub async fn rearm(
     for statement in [
         "DELETE FROM demand_batches",
         "DELETE FROM demand_contributions",
+        // The hourly feed's staging/delivery state is fixture state
+        // too — hours, retained payloads and the watermark the
+        // delivery drive advanced; no feed residue may leak into the
+        // next measurement (stow#523).
+        "DELETE FROM demand_feed_pages",
+        "DELETE FROM demand_feed_hours",
+        "DELETE FROM settings WHERE key = 'demand_feed_watermark'",
         "DELETE FROM queue_dependencies WHERE task_id LIKE '%-%'",
         "DELETE FROM queue WHERE task_id LIKE '%-%'",
         "DELETE FROM requests WHERE request_id NOT IN \

@@ -374,6 +374,33 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &["idx_queue_shape_requeue"],
         ddl_permitted: false,
     },
+    RouteBudget {
+        // The frozen hour's delivery leg (stow#523): four
+        // `feed_deliver` calls — each the header read, one bounded
+        // next-unapplied-page SELECT, the `demand_pass` closure (~13)
+        // and the acknowledged flip — plus the terminal watermark
+        // transition (69 statements, 85 reads, 18 writes measured at
+        // the host fixture). Reads track the pages' own demand
+        // closures, not the staged bulk.
+        name: "POST /scheduler/demand-feed/deliver",
+        statements: 80,
+        rows_read: 400,
+        rows_written: 150,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // Retiring the delivered hour's payloads: one PK-prefix
+        // `DELETE … LIMIT 256` chunk plus the header read and the
+        // pending probe per call — the drain is flat in archive
+        // depth.
+        name: "POST /scheduler/demand-feed/cleanup",
+        statements: 8,
+        rows_read: 60,
+        rows_written: 260,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
 ];
 
 /// One measured route run.

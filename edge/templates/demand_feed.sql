@@ -10,9 +10,9 @@
 -- blob3 version, blob4 features_json, blob5 target, blob6 rustc_version.
 -- Only `semantic` and `graph` points carry a version (top_missed.sql's
 -- path filter); `exact` misses carry none and are excluded the same
--- way. The daily-salted privacy suppression keeps applying at write
--- time — points an opted-out caller never wrote cannot appear, and no
--- rescaling recovers them.
+-- way. Miss writes honor the `STOW_NO_ANALYTICS` consent at write
+-- time — points an opted-out caller never wrote cannot appear, and
+-- no rescaling recovers them.
 --
 -- `sum(_sample_interval * double1)` is the documented additive
 -- estimate: `_sample_interval` is the engine's per-row sampling

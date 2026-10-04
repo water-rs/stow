@@ -1749,6 +1749,22 @@ impl DemandFeedHour {
         time::PrimitiveDateTime::parse(&self.0, DEMAND_FEED_HOUR_FORMAT)
             .unwrap_or_else(|_| unreachable!("stored hour was validated"))
     }
+
+    /// The newest fully closed hour at `now_unix_secs` — the feed's
+    /// bootstrap choice when the watermark is empty. Floors `now` to
+    /// the hour boundary and steps back one hour, so the answer is
+    /// always closed by construction.
+    #[must_use]
+    pub fn latest_closed(now_unix_secs: i64) -> Option<Self> {
+        let floor = now_unix_secs - now_unix_secs.rem_euclid(3_600);
+        let start = time::OffsetDateTime::from_unix_timestamp(floor - 3_600).ok()?;
+        let canonical = start
+            .format(DEMAND_FEED_HOUR_FORMAT)
+            .map(|canonical| Self::parse(&canonical))
+            .ok()?
+            .ok()?;
+        Some(canonical)
+    }
 }
 
 impl std::fmt::Display for DemandFeedHour {
@@ -1767,6 +1783,30 @@ pub fn demand_feed_chain(previous: &blake3::Hash, page_hash: &blake3::Hash) -> b
     hasher.update(previous.as_bytes());
     hasher.update(page_hash.as_bytes());
     hasher.finalize()
+}
+
+/// The canonical page payload: the serde serialization of the entry
+/// list the Durable Object stores verbatim and hashes into the page
+/// manifest. The materializer and the verifier share this one
+/// function so the encoding can never drift between them.
+///
+/// # Errors
+/// The serialization fails.
+pub fn demand_feed_page_payload(
+    entries: &[SchedulerDemandEntry],
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(entries)
+}
+
+/// blake3 of [`demand_feed_page_payload`]: the `page_hash` a staged
+/// page stores and the materializer's manifest chains on.
+///
+/// # Errors
+/// The payload serialization fails.
+pub fn demand_feed_page_hash(entries: &[SchedulerDemandEntry]) -> Result<blake3::Hash, String> {
+    let payload = demand_feed_page_payload(entries)
+        .map_err(|error| format!("serialize demand feed page payload: {error}"))?;
+    Ok(blake3::hash(payload.as_bytes()))
 }
 
 /// The canonical demand-feed manifest: `chain(0) = page_hash(0)`, then

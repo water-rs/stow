@@ -431,10 +431,10 @@ mod tests {
         );
         // A fractional or negative wire count is a hard decode error,
         // never a silent clamp or round.
-        for bad in ["1234.5", "-1.0"] {
-            let events: Envelope<EventsRow> = serde_json::from_str(&format!(
-                r#"{{"data":[{{"hits_24h":{bad},"hit_compile_millis_30d":0.0}}]}}"#
-            ))
+        for bad in [serde_json::json!(1234.5), serde_json::json!(-1.0)] {
+            let events: Envelope<EventsRow> = serde_json::from_value(serde_json::json!({
+                "data": [{"hits_24h": bad, "hit_compile_millis_30d": 0.0}]
+            }))
             .expect("fractional events still decode as Float64");
             assert!(
                 usage_stats_from_rows(

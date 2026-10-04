@@ -13,6 +13,7 @@ mod cache;
 mod cloudflare;
 mod coverage;
 mod crates_io;
+mod demand_feed;
 mod deploy;
 mod github;
 mod index_cmd;
@@ -285,6 +286,17 @@ impl Edge {
                 .ok()
                 .filter(|value| !value.is_empty()),
         })
+    }
+
+    /// A connection pinned at a loopback base — the demand-feed tests
+    /// drive the real post/get paths against a scripted listener.
+    #[cfg(test)]
+    pub(crate) fn for_test(base: String) -> Self {
+        Self {
+            base,
+            token: Some("test-bearer".to_owned()),
+            version_override: None,
+        }
     }
 
     /// The trimmed base URL — `index export` builds paged URLs off it.

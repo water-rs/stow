@@ -312,4 +312,33 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_written: 700,
         wall_ms: 3_000,
     },
+    DriveBudget {
+        // The frozen hour's delivery leg (stow#523): each
+        // `feed_deliver` call is the header read, one bounded
+        // next-unapplied-page SELECT, the `demand_pass` closure
+        // (apply ≈ 8 + `next_alarm` ≈ 5), the acknowledged flip and
+        // the counter read-back — ~16 statements × 3 pages plus the
+        // terminal watermark transition's guarded UPDATE. The
+        // mechanics are the `POST /demand` pass repeated per page
+        // against retained payloads; reads track the touched-task
+        // probes of 12 fixture identities, not the staged bulk.
+        name: "POST /scheduler/demand-feed/deliver",
+        statements: 80,
+        rows_read: 400,
+        rows_written: 150,
+        wall_ms: 800,
+    },
+    DriveBudget {
+        // Retiring a delivered hour's payloads: one PK-prefix
+        // `DELETE … LIMIT 256` chunk plus the header read and the
+        // pending probe per call — three tiny statements per round,
+        // and the round count is `pages/256` so the drain is flat in
+        // archive depth. At the drive's three pages one chunk retires
+        // everything.
+        name: "POST /scheduler/demand-feed/cleanup",
+        statements: 8,
+        rows_read: 60,
+        rows_written: 260,
+        wall_ms: 300,
+    },
 ];

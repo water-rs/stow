@@ -23,6 +23,7 @@ use stow_types::api::{
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::{UnitInvocation, UnitShape};
 
+use super::feed;
 use super::fixture::FixtureShape;
 use super::queue::{self, QueueMutation, SchedulerSettings};
 #[cfg(not(target_arch = "wasm32"))]
@@ -1518,6 +1519,100 @@ pub const DRIVES: &[Drive] = &[
         },
         cleanup: None,
     },
+    Drive {
+        // The frozen hour's delivery leg (stow#523): `feed_deliver`
+        // until `delivered` — each call is one bounded next-page
+        // read, one `demand_pass` closure and one acknowledged flip,
+        // with the terminal watermark transition on the last. Reads
+        // scale with the retained pages; nothing scans the archive.
+        // Setup materializes the hour through the real stage calls
+        // (begin → page → complete) on fixture identities so the
+        // measured closures touch real tasks.
+        name: "POST /scheduler/demand-feed/deliver",
+        setup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                seed_feed_hour(
+                    db,
+                    "2020-01-01T00",
+                    FEED_DRIVE_PAGES,
+                    FEED_DRIVE_NOW_MS / 1_000,
+                )
+                .await
+            })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                loop {
+                    let (report, _plan) = feed::feed_deliver(
+                        db,
+                        &feed_drive_hour("2020-01-01T00"),
+                        FEED_DRIVE_NOW_MS,
+                        settings,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    if report.state == "delivered" {
+                        return Ok(());
+                    }
+                }
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // Retiring a delivered hour's payloads (stow#523): each
+        // `feed_cleanup` call deletes one bounded PK-prefix chunk —
+        // flat in archive depth, proportional only to the hour's own
+        // pages — and the drain is what the cron leg runs to
+        // terminal. Setup is the same materialized hour driven to
+        // `delivered`, so only retirement is measured.
+        name: "POST /scheduler/demand-feed/cleanup",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                // The watermark the delivery drive advanced blocks a
+                // re-begin of the same hour, so the cleanup drive
+                // stages the canonical successor — `prev(T01) = T00`
+                // keeps the cursor protocol satisfied.
+                seed_feed_hour(
+                    db,
+                    "2020-01-01T01",
+                    FEED_DRIVE_PAGES,
+                    FEED_DRIVE_NEXT_NOW_MS / 1_000,
+                )
+                .await?;
+                loop {
+                    let (report, _plan) = feed::feed_deliver(
+                        db,
+                        &feed_drive_hour("2020-01-01T01"),
+                        FEED_DRIVE_NEXT_NOW_MS,
+                        settings,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    if report.state == "delivered" {
+                        return Ok(());
+                    }
+                }
+            })
+        }),
+        run: |db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                loop {
+                    let report = feed::feed_cleanup(
+                        db,
+                        &feed_drive_hour("2020-01-01T01"),
+                        FEED_DRIVE_NEXT_NOW_MS / 1_000,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    if !report.remaining {
+                        return Ok(());
+                    }
+                }
+            })
+        },
+        cleanup: None,
+    },
 ];
 
 /// One dispatch pass exactly as `run_alarm` runs it, minus the metering
@@ -1855,6 +1950,110 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
 /// The fixture-row target the dep identities spread over.
 fn dep_target(n: u32) -> &'static str {
     stow_types::api::CI_TARGET_TRIPLES[usize::try_from(n).unwrap() % 9]
+}
+
+/// The deterministic closed hour the feed drives stage and drain —
+/// `2020-01-01T00` ends at unix `1577840400`, so a `now` one second
+/// past it passes `ensure_closed` on both targets without reading a
+/// wall clock.
+const FEED_DRIVE_NOW_MS: i64 = (1_577_840_400 + 1) * 1_000;
+
+/// The successor hour's equivalent — `2020-01-01T01` ends at
+/// `1577844000`.
+const FEED_DRIVE_NEXT_NOW_MS: i64 = (1_577_844_000 + 1) * 1_000;
+
+/// Pages the feed drives stage — three deliver calls of real closure
+/// work plus the terminal transition; each page's four entries touch
+/// fixture tasks.
+const FEED_DRIVE_PAGES: u32 = 3;
+
+fn feed_drive_hour(hour: &str) -> stow_types::api::DemandFeedHour {
+    stow_types::api::DemandFeedHour::parse(hour).expect("feed drive hour is canonical")
+}
+
+/// Materialize the drive hour through the feed's own calls —
+/// begin (fresh generation), `entries` real fixture-identity pages
+/// in order, then the manifest freeze — so the measured legs see a
+/// complete hour exactly as the cron path leaves it.
+async fn seed_feed_hour(
+    db: &DurableDb,
+    hour_str: &str,
+    pages: u32,
+    now_secs: i64,
+) -> Result<(), String> {
+    let hour = feed_drive_hour(hour_str);
+    // Repeat probes on a persisted fixture find the watermark already
+    // past this hour — the protocol's own "at or below" refusal would
+    // fire, so seeding is a no-op exactly when the cursor says the
+    // hour is terminal. An unfinished staging attempt proceeds: begin
+    // rotates it out under a fresh generation, as in production.
+    if let Some(watermark) = feed::feed_status(db)
+        .await
+        .map_err(|error| error.to_string())?
+        .watermark
+        && watermark.as_str() >= hour_str
+    {
+        return Ok(());
+    }
+    let begin = feed::feed_begin(db, &hour, now_secs)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut page_hashes = Vec::new();
+    let mut entry_count = 0_u64;
+    for page_no in 0..pages {
+        let entries: Vec<stow_types::api::SchedulerDemandEntry> = (0..4)
+            .map(
+                |k| -> Result<stow_types::api::SchedulerDemandEntry, String> {
+                    // Spread entries over the fixture task set — page n's
+                    // kth entry hits task n·4+k, the same identity formulas
+                    // the demand drive's batch uses.
+                    let n = 100 + page_no * 4 + k;
+                    let (crate_name, version) = crate_identity(n);
+                    Ok(stow_types::api::SchedulerDemandEntry {
+                        crate_name: CrateName::parse(&crate_name).map_err(|e| e.to_string())?,
+                        version: CrateVersion::new(
+                            semver::Version::parse(&version).map_err(|e| e.to_string())?,
+                        ),
+                        features_json: FeaturesJson::default(),
+                        target: TargetTriple::parse(dep_target(n)).map_err(|e| e.to_string())?,
+                        rustc_version: WireRustcVersion::parse("1.86.0")
+                            .map_err(|e| e.to_string())?,
+                        demand: 100,
+                    })
+                },
+            )
+            .collect::<Result<_, _>>()?;
+        page_hashes
+            .push(stow_types::api::demand_feed_page_hash(&entries).map_err(|e| e.to_string())?);
+        entry_count += entries.len() as u64;
+        feed::feed_page(
+            db,
+            &stow_types::api::DemandFeedPageRequest {
+                hour: hour.clone(),
+                generation: begin.generation,
+                page_no,
+                entries,
+            },
+            now_secs,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    let manifest =
+        stow_types::api::demand_feed_manifest(&page_hashes).map(|hash| hash.to_hex().to_string());
+    feed::feed_complete(
+        db,
+        &stow_types::api::DemandFeedCompleteRequest {
+            hour,
+            generation: begin.generation,
+            page_count: pages,
+            entry_count,
+            manifest_hash: manifest.unwrap_or_default(),
+        },
+        now_secs,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// One dependency edge on fixture row `n` — the same identity formulas

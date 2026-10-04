@@ -55,6 +55,18 @@ pub enum SchedulerCommand {
         #[arg(long)]
         dispatch_limit: Option<u32>,
     },
+    /// The hourly demand feed's native leg (stow#523): resume the
+    /// durable cursor's unfinished hour — frozen pages deliver without
+    /// a new Analytics Engine query — or materialize the next closed
+    /// hour, freeze it on the page manifest and deliver it to
+    /// `delivered`. The hourly GitHub job is the intended caller.
+    DemandFeed {
+        /// Materialize this specific closed hour (`YYYY-MM-DDTHH`, UTC)
+        /// instead of following the durable cursor — the operator's
+        /// recovery path.
+        #[arg(long)]
+        hour: Option<String>,
+    },
 }
 
 /// Dispatch one `scheduler` subcommand against the edge connection.
@@ -71,6 +83,9 @@ pub async fn run(
             no_seed,
             dispatch_limit,
         } => budget(edge, queue_rows, reset, no_seed, dispatch_limit, output).await,
+        SchedulerCommand::DemandFeed { hour } => {
+            crate::demand_feed::run(edge, crate::demand_feed::DemandFeedArgs { hour }, output).await
+        }
     }
 }
 
