@@ -2002,23 +2002,16 @@ impl DemandFeedPageBuilder {
         let entry_json_len = serde_json::to_vec(&entry)
             .map_err(|error| format!("encode demand feed entry: {error}"))?
             .len();
-        let completed = if !self.fits(entry_json_len) {
-            if self.entries.is_empty() {
-                return Err(format!(
-                    "demand feed identity for {} {} encodes to {entry_json_len} \
-                     bytes — over the {}-byte page bound",
-                    entry.crate_name, entry.version, DEMAND_FEED_PAGE_MAX_BYTES
-                ));
-            }
+        let completed = if !self.fits(entry_json_len) && !self.entries.is_empty() {
             self.finish_page()?
         } else {
             None
         };
-        // Re-check against the actual open page — either the page the
-        // entry stayed on or the fresh one `finish_page` reframed
-        // (its `page_no` digits may have grown). An entry that
-        // emptied a page but still overflows the new empty framing is
-        // the oversized singleton, refused on whatever page it lands.
+        // One check covers both landing spots: the entry stayed on the
+        // open page, or `finish_page` reframed a fresh one (its
+        // `page_no` digits may have grown). An entry that overflows an
+        // *empty* page is the oversized singleton, refused wherever it
+        // lands.
         if !self.fits(entry_json_len) {
             return Err(format!(
                 "demand feed identity for {} {} encodes to {entry_json_len} \

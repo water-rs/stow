@@ -91,6 +91,17 @@ const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, request_coun
      dispatch_eligible, \
      generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue";
 
+/// A wire request an unmetered feed setup built from the real staged
+/// state — the metered run hands it verbatim to the production
+/// handler, so request construction (generation reads, manifest
+/// recompute) never lands in the measured SQL window (stow#523).
+pub enum FeedDriveRequest {
+    /// `POST …/demand-feed/page` body.
+    Page(Box<stow_types::api::DemandFeedPageRequest>),
+    /// `POST …/demand-feed/complete` body.
+    Complete(Box<stow_types::api::DemandFeedCompleteRequest>),
+}
+
 /// What a drive may reach besides the metered queue `DurableDb`.
 ///
 /// The host gate's context is empty. The workerd probe's carries the
@@ -135,6 +146,9 @@ pub struct DriveContext {
     /// restores exactly the pre-drive state instead of leaving a
     /// probe arm behind.
     prior_alarm: std::sync::Arc<std::sync::Mutex<PriorAlarm>>,
+    /// The exact wire request a feed drive's setup staged for its
+    /// metered run — one slot; the run consumes it (stow#523).
+    pub feed_request: std::sync::Arc<std::sync::Mutex<Option<FeedDriveRequest>>>,
 }
 
 impl DriveContext {
@@ -153,6 +167,7 @@ impl DriveContext {
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
+            feed_request: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -171,6 +186,7 @@ impl DriveContext {
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
+            feed_request: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -1520,98 +1536,395 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
-        // The frozen hour's delivery leg (stow#523): `feed_deliver`
-        // until `delivered` — each call is one bounded next-page
-        // read, one `demand_pass` closure and one acknowledged flip,
-        // with the terminal watermark transition on the last. Reads
-        // scale with the retained pages; nothing scans the archive.
-        // Setup materializes the hour through the real stage calls
-        // (begin → page → complete) on fixture identities so the
-        // measured closures touch real tasks.
-        name: "POST /scheduler/demand-feed/deliver",
-        setup: Some(|db, _shape, _settings, _ctx| {
+        // The feed's resume-cursor read (stow#523): one watermark
+        // probe plus the bounded unfinished-index probe — two point
+        // reads, flat in retained depth.
+        name: "GET /scheduler/demand-feed/status",
+        setup: None,
+        run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
-                seed_feed_hour(
-                    db,
-                    "2020-01-01T00",
-                    FEED_DRIVE_PAGES,
-                    FEED_DRIVE_NOW_MS / 1_000,
-                )
-                .await
-            })
-        }),
-        run: |db, _shape, settings, _ctx| {
-            Box::pin(async move {
-                loop {
-                    let (report, _plan) = feed::feed_deliver(
-                        db,
-                        &feed_drive_hour("2020-01-01T00"),
-                        FEED_DRIVE_NOW_MS,
-                        settings,
-                    )
+                feed::feed_status(db)
                     .await
-                    .map_err(|error| error.to_string())?;
-                    if report.state == "delivered" {
-                        return Ok(());
-                    }
-                }
+                    .map(|_status| ())
+                    .map_err(|error| error.to_string())
             })
         },
         cleanup: None,
     },
     Drive {
-        // Retiring a delivered hour's payloads (stow#523): each
-        // `feed_cleanup` call deletes one bounded PK-prefix chunk —
-        // flat in archive depth, proportional only to the hour's own
-        // pages — and the drain is what the cron leg runs to
-        // terminal. Setup is the same materialized hour driven to
-        // `delivered`, so only retirement is measured.
-        name: "POST /scheduler/demand-feed/cleanup",
-        setup: Some(|db, _shape, settings, _ctx| {
+        // Opening a fresh hour (stow#523): closed-hour check,
+        // watermark guard, the header insert and generation
+        // read-back — four statements, no rotation work.
+        name: "POST /scheduler/demand-feed/begin (fresh)",
+        setup: None,
+        run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
-                // The watermark the delivery drive advanced blocks a
-                // re-begin of the same hour, so the cleanup drive
-                // stages the canonical successor — `prev(T01) = T00`
-                // keeps the cursor protocol satisfied.
-                seed_feed_hour(
-                    db,
-                    "2020-01-01T01",
-                    FEED_DRIVE_PAGES,
-                    FEED_DRIVE_NEXT_NOW_MS / 1_000,
-                )
-                .await?;
-                loop {
-                    let (report, _plan) = feed::feed_deliver(
-                        db,
-                        &feed_drive_hour("2020-01-01T01"),
-                        FEED_DRIVE_NEXT_NOW_MS,
-                        settings,
-                    )
+                feed::feed_begin(db, &feed_drive_hour(3), feed_drive_now_secs(3))
                     .await
-                    .map_err(|error| error.to_string())?;
-                    if report.state == "delivered" {
-                        return Ok(());
-                    }
-                }
+                    .map(|_report| ())
+                    .map_err(|error| error.to_string())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // Re-opening a staging hour with real debris (stow#523):
+        // setup opens the hour and bulk-seeds 512 pages under its
+        // live generation, so the measured rotate pays the full
+        // restart — counter reset, generation bump, one 256-row
+        // retire chunk, and a `stale_pages_pending` verdict that is
+        // true — never an empty degenerate rotate.
+        name: "POST /scheduler/demand-feed/begin (rotation)",
+        setup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                let hour = feed_drive_hour(4);
+                let generation = feed::feed_begin(db, &hour, feed_drive_now_secs(4))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .generation;
+                seed_stale_feed_pages(db, &hour, generation, 512).await
             })
         }),
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
-                loop {
-                    let report = feed::feed_cleanup(
-                        db,
-                        &feed_drive_hour("2020-01-01T01"),
-                        FEED_DRIVE_NEXT_NOW_MS / 1_000,
-                    )
+                let report = feed::feed_begin(db, &feed_drive_hour(4), feed_drive_now_secs(4))
                     .await
                     .map_err(|error| error.to_string())?;
-                    if !report.remaining {
-                        return Ok(());
-                    }
+                if !report.stale_pages_pending {
+                    return Err("rotation begin must report obsolete pages pending".to_owned());
                 }
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                // 512 seeded, the rotation retired one 256 chunk.
+                let left = db
+                    .query(
+                        "SELECT COUNT(*) FROM demand_feed_pages \
+                         WHERE hour = '2020-01-01T04' \
+                           AND generation < (SELECT generation \
+                                             FROM demand_feed_hours \
+                                             WHERE hour = '2020-01-01T04')",
+                    )
+                    .fetch_scalar::<i64>()
+                    .await
+                    .map_err(|error| format!("rotation leftover probe: {error}"))?;
+                if left != 256 {
+                    return Err(format!("rotation left {left} obsolete pages, expected 256"));
+                }
+                Ok(())
+            })
+        }),
+    },
+    Drive {
+        // Staging one bounded page (stow#523): setup opens the hour
+        // and stages page 0 through the real `feed_page`, then builds
+        // the exact wire request for page 1 from the live generation
+        // — so the metered run is only the handler: closed-hour
+        // check, header probe, in-order/matching-generation guards,
+        // the payload insert and its trigger.
+        name: "POST /scheduler/demand-feed/page (append)",
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let hour = feed_drive_hour(5);
+                feed::feed_begin(db, &hour, feed_drive_now_secs(5))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                feed_seed_page(db, &hour, 0).await?;
+                let request = feed_page_request(db, &hour, 1).await?;
+                *ctx.feed_request.lock().expect("feed request") =
+                    Some(FeedDriveRequest::Page(Box::new(request)));
+                Ok(())
+            })
+        }),
+        run: |db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let FeedDriveRequest::Page(request) = take_feed_request(ctx)? else {
+                    return Err("append drive expected a page request".to_owned());
+                };
+                feed::feed_page(db, &request, feed_drive_now_secs(5))
+                    .await
+                    .map_err(|error| error.to_string())
             })
         },
         cleanup: None,
+    },
+    Drive {
+        // A replayed page of the same bytes: the guards plus the
+        // stored-hash compare that answers the replay as a no-op —
+        // the bounded read a retried page call owes, with zero
+        // writes.
+        name: "POST /scheduler/demand-feed/page (replay)",
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let hour = feed_drive_hour(6);
+                feed::feed_begin(db, &hour, feed_drive_now_secs(6))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                feed_seed_page(db, &hour, 0).await?;
+                let request = feed_page_request(db, &hour, 0).await?;
+                *ctx.feed_request.lock().expect("feed request") =
+                    Some(FeedDriveRequest::Page(Box::new(request)));
+                Ok(())
+            })
+        }),
+        run: |db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let FeedDriveRequest::Page(request) = take_feed_request(ctx)? else {
+                    return Err("replay drive expected a page request".to_owned());
+                };
+                feed::feed_page(db, &request, feed_drive_now_secs(6))
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The completion barrier on a populated hour: the manifest
+        // verification read of the generation's page hashes plus the
+        // guarded freeze transition — the one event that binds the
+        // frozen set. The request's manifest comes from the real
+        /// staged rows, built unmetered.
+        name: "POST /scheduler/demand-feed/complete (nonempty)",
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let hour = feed_drive_hour(7);
+                feed::feed_begin(db, &hour, feed_drive_now_secs(7))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                for page_no in 0..FEED_DRIVE_PAGES {
+                    feed_seed_page(db, &hour, page_no).await?;
+                }
+                let request = feed_complete_request(db, &hour).await?;
+                *ctx.feed_request.lock().expect("feed request") =
+                    Some(FeedDriveRequest::Complete(Box::new(request)));
+                Ok(())
+            })
+        }),
+        run: |db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let FeedDriveRequest::Complete(request) = take_feed_request(ctx)? else {
+                    return Err("complete drive expected a complete request".to_owned());
+                };
+                feed::feed_complete(db, &request, feed_drive_now_secs(7))
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The same barrier on an hour with zero staged pages: the
+        // counter verification against an empty generation — the
+        // zero-page hour must still pay its guarded transition, and
+        // its reads must not scale with retained depth.
+        name: "POST /scheduler/demand-feed/complete (empty)",
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let hour = feed_drive_hour(8);
+                feed::feed_begin(db, &hour, feed_drive_now_secs(8))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let request = feed_complete_request(db, &hour).await?;
+                *ctx.feed_request.lock().expect("feed request") =
+                    Some(FeedDriveRequest::Complete(Box::new(request)));
+                Ok(())
+            })
+        }),
+        run: |db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let FeedDriveRequest::Complete(request) = take_feed_request(ctx)? else {
+                    return Err("complete-empty drive expected a complete request".to_owned());
+                };
+                feed::feed_complete(db, &request, feed_drive_now_secs(8))
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // One delivery call on an hour with pages still owed
+        // (stow#523): header read, the bounded next-unapplied-page
+        // SELECT, the `demand_pass` closure for four fixture
+        // identities, the acknowledged flip and counter read-back,
+        // plus the wake re-plan — the per-page marginal cost of the
+        // delivery loop, not the whole hour.
+        name: "POST /scheduler/demand-feed/deliver (page apply)",
+        setup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move { seed_feed_hour(db, 0, FEED_DRIVE_PAGES).await })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                feed::feed_deliver(db, &feed_drive_hour(0), feed_drive_now_ms(0), settings)
+                    .await
+                    .map(|(_report, _plan)| ())
+                    .map_err(|error| error.to_string())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The delivery call that lands the last owed page: the same
+        // page-apply work, then the contiguous-watermark guarded
+        // transition to `delivered` — the terminal event is priced
+        // separately from a mid-hour apply.
+        name: "POST /scheduler/demand-feed/deliver (terminal)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                // Contiguity: T01's transition needs the watermark at
+                // T00, so the predecessor delivers fully in unmetered
+                // setup — then T01 stages and every page applies,
+                // leaving the hour one call short of `delivered`.
+                deliver_feed_hour_fully(db, 0, settings).await?;
+                seed_feed_hour(db, 1, FEED_DRIVE_PAGES).await?;
+                for _ in 0..FEED_DRIVE_PAGES {
+                    feed::feed_deliver(db, &feed_drive_hour(1), feed_drive_now_ms(1), settings)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                feed::feed_deliver(db, &feed_drive_hour(1), feed_drive_now_ms(1), settings)
+                    .await
+                    .map(|(_report, _plan)| ())
+                    .map_err(|error| error.to_string())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // A delivery replay on an already-delivered hour: the header
+        // read that hits the `delivered` early-out plus the wake
+        // re-plan — the bounded cost a lost-ack re-fire owes, with
+        // zero ledger writes.
+        name: "POST /scheduler/demand-feed/deliver (replay)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                seed_feed_hour(db, 2, FEED_DRIVE_PAGES).await?;
+                deliver_feed_hour_fully(db, 2, settings).await
+            })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                feed::feed_deliver(db, &feed_drive_hour(2), feed_drive_now_ms(2), settings)
+                    .await
+                    .map(|(_report, _plan)| ())
+                    .map_err(|error| error.to_string())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // One bounded retire chunk with a full 256 obsolete pages
+        // owed (stow#523): setup stages the hour, bulk-seeds 512
+        // same-generation payloads, then rotates — the begin retire
+        // chunk clears 256, leaving exactly one full chunk for the
+        // measured `DELETE … LIMIT 256` plus its probes.
+        name: "POST /scheduler/demand-feed/cleanup (full chunk)",
+        setup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                let hour = feed_drive_hour(9);
+                let generation = feed::feed_begin(db, &hour, feed_drive_now_secs(9))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .generation;
+                seed_stale_feed_pages(db, &hour, generation, 512).await?;
+                feed::feed_begin(db, &hour, feed_drive_now_secs(9))
+                    .await
+                    .map(|_report| ())
+                    .map_err(|error| error.to_string())
+            })
+        }),
+        run: |db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                let report = feed::feed_cleanup(db, &feed_drive_hour(9), feed_drive_now_secs(9))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if report.retired != 256 {
+                    return Err(format!(
+                        "cleanup full chunk retired {}, expected 256",
+                        report.retired
+                    ));
+                }
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The retire probe on the bulk staging hour '2022-01-01T00'
+        // (stow#523): setup deletes that hour's obsolete-generation
+        // rows in one unmetered pass, so the measured cleanup scans
+        // its `generation < current` predicate over the growing
+        // current-generation bulk (queue_rows/16 pages, up to 64k at
+        // 1M) and must match zero — proof the retire index stays
+        // flat instead of walking live rows.
+        name: "POST /scheduler/demand-feed/cleanup (none obsolete)",
+        setup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move {
+                // Idempotent: `INSERT OR IGNORE` fills whatever the
+                // harness's re-arm did not seed (the host gate never
+                // re-arms), then one unmetered pass drains the
+                // obsolete-generation tail so the measured retire
+                // predicate must scan past the live bulk and match
+                // nothing.
+                super::fixture::seed_feed_bulk(db, shape)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                db.query(
+                    "DELETE FROM demand_feed_pages \
+                     WHERE hour = '2022-01-01T00' AND generation < \
+                           (SELECT generation FROM demand_feed_hours \
+                            WHERE hour = '2022-01-01T00')",
+                )
+                .execute()
+                .await
+                .map_err(|error| format!("drain obsolete bulk pages: {error}"))?;
+                Ok(())
+            })
+        }),
+        run: |db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                let report = feed::feed_cleanup(db, &feed_bulk_drive_hour(), FEED_BULK_NOW_SECS)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if report.retired != 0 || report.remaining {
+                    return Err(format!(
+                        "cleanup none-obsolete retired {}/remaining {}",
+                        report.retired, report.remaining
+                    ));
+                }
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move {
+                // The live bulk survived untouched: current-
+                // generation pages still number exactly the seeded
+                // staged_pages, growing 100k -> 1M with the shape.
+                let expected = (i64::from(shape.queue_rows) / 16).clamp(32, 64_000);
+                let live = db
+                    .query(
+                        "SELECT COUNT(*) FROM demand_feed_pages \
+                         WHERE hour = '2022-01-01T00' AND generation = 9",
+                    )
+                    .fetch_scalar::<i64>()
+                    .await
+                    .map_err(|error| format!("live bulk probe: {error}"))?;
+                if live != expected {
+                    return Err(format!(
+                        "cleanup disturbed live bulk: {live} pages, expected {expected}"
+                    ));
+                }
+                Ok(())
+            })
+        }),
     },
 ];
 
@@ -1952,77 +2265,228 @@ fn dep_target(n: u32) -> &'static str {
     stow_types::api::CI_TARGET_TRIPLES[usize::try_from(n).unwrap() % 9]
 }
 
-/// The deterministic closed hour the feed drives stage and drain —
-/// `2020-01-01T00` ends at unix `1577840400`, so a `now` one second
-/// past it passes `ensure_closed` on both targets without reading a
-/// wall clock.
-const FEED_DRIVE_NOW_MS: i64 = (1_577_840_400 + 1) * 1_000;
-
-/// The successor hour's equivalent — `2020-01-01T01` ends at
-/// `1577844000`.
-const FEED_DRIVE_NEXT_NOW_MS: i64 = (1_577_844_000 + 1) * 1_000;
-
-/// Pages the feed drives stage — three deliver calls of real closure
-/// work plus the terminal transition; each page's four entries touch
-/// fixture tasks.
-const FEED_DRIVE_PAGES: u32 = 3;
-
-fn feed_drive_hour(hour: &str) -> stow_types::api::DemandFeedHour {
-    stow_types::api::DemandFeedHour::parse(hour).expect("feed drive hour is canonical")
+/// Feed drives stage on deterministic closed hours `2020-01-01T00`
+/// through `T10` — each drive's own hour keeps protocol state
+/// isolated, and `now` one second past its end passes `ensure_closed`
+/// on both targets without a wall clock.
+fn feed_drive_hour(idx: u32) -> stow_types::api::DemandFeedHour {
+    stow_types::api::DemandFeedHour::parse(&format!("2020-01-01T{idx:02}"))
+        .expect("feed drive hour is canonical")
 }
 
-/// Materialize the drive hour through the feed's own calls —
-/// begin (fresh generation), `entries` real fixture-identity pages
-/// in order, then the manifest freeze — so the measured legs see a
-/// complete hour exactly as the cron path leaves it.
-async fn seed_feed_hour(
+/// Milliseconds one second past the end of drive hour `idx`.
+const fn feed_drive_now_ms(idx: u32) -> i64 {
+    (1_577_840_400 + idx as i64 * 3_600 + 1) * 1_000
+}
+
+/// The same instant in unix seconds for the staging routes.
+const fn feed_drive_now_secs(idx: u32) -> i64 {
+    feed_drive_now_ms(idx) / 1_000
+}
+
+/// Pages the feed drives stage — real fixture-identity pages whose
+/// four entries touch queue rows the demand closure resolves.
+const FEED_DRIVE_PAGES: u32 = 3;
+
+/// The bulk staging hour `seed_feed_bulk` plants current-generation
+/// depth under — the none-obsolete cleanup drive's target.
+fn feed_bulk_drive_hour() -> stow_types::api::DemandFeedHour {
+    stow_types::api::DemandFeedHour::parse("2022-01-01T00").expect("bulk feed hour is canonical")
+}
+
+/// One second past the bulk staging hour's close — its
+/// `ensure_closed` input (well below the wall clock, so the checked
+/// hour math stays exercised).
+const FEED_BULK_NOW_SECS: i64 = 1_672_531_201;
+
+/// Page `page_no`'s deterministic four entries — task `n = 100 +
+/// page_no·4 + k` uses the same identity formulas the demand drive's
+/// batch does, so a delivery closure touches real fixture rows.
+fn feed_drive_entries(page_no: u32) -> Result<Vec<stow_types::api::SchedulerDemandEntry>, String> {
+    (0..4)
+        .map(
+            |k| -> Result<stow_types::api::SchedulerDemandEntry, String> {
+                let n = 100 + page_no * 4 + k;
+                let (crate_name, version) = crate_identity(n);
+                Ok(stow_types::api::SchedulerDemandEntry {
+                    crate_name: CrateName::parse(&crate_name).map_err(|e| e.to_string())?,
+                    version: CrateVersion::new(
+                        semver::Version::parse(&version).map_err(|e| e.to_string())?,
+                    ),
+                    features_json: FeaturesJson::default(),
+                    target: TargetTriple::parse(dep_target(n)).map_err(|e| e.to_string())?,
+                    rustc_version: WireRustcVersion::parse("1.86.0").map_err(|e| e.to_string())?,
+                    demand: 100,
+                })
+            },
+        )
+        .collect()
+}
+
+/// The header generation a drive's hour is currently staging under —
+/// the begin report's own answer, so page calls land on the live
+/// generation whether the hour was opened or rotated.
+async fn feed_drive_generation(
     db: &DurableDb,
-    hour_str: &str,
-    pages: u32,
-    now_secs: i64,
+    hour: &stow_types::api::DemandFeedHour,
+) -> Result<i64, String> {
+    db.query("SELECT generation FROM demand_feed_hours WHERE hour = ?")
+        .bind(hour.as_str())
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("read drive hour generation: {error}"))
+}
+
+/// Build the exact page request `page_no`'s next `feed_page` call
+/// carries — the live generation read in unmetered setup, so the
+/// metered run only executes the handler.
+async fn feed_page_request(
+    db: &DurableDb,
+    hour: &stow_types::api::DemandFeedHour,
+    page_no: u32,
+) -> Result<stow_types::api::DemandFeedPageRequest, String> {
+    let generation = feed_drive_generation(db, hour).await?;
+    Ok(stow_types::api::DemandFeedPageRequest {
+        hour: hour.clone(),
+        generation,
+        page_no,
+        entries: feed_drive_entries(page_no)?,
+    })
+}
+
+/// Stage `page_no` under the hour's live generation through the real
+/// `feed_page` — no generation guessing when a setup rotated.
+async fn feed_seed_page(
+    db: &DurableDb,
+    hour: &stow_types::api::DemandFeedHour,
+    page_no: u32,
 ) -> Result<(), String> {
-    let hour = feed_drive_hour(hour_str);
-    // Repeat probes on a persisted fixture find the watermark already
-    // past this hour — the protocol's own "at or below" refusal would
-    // fire, so seeding is a no-op exactly when the cursor says the
-    // hour is terminal. An unfinished staging attempt proceeds: begin
-    // rotates it out under a fresh generation, as in production.
+    let request = feed_page_request(db, hour, page_no).await?;
+    feed::feed_page(db, &request, feed_drive_now_secs(hour_idx(hour)))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Recover the drive hour's index from its canonical string.
+fn hour_idx(hour: &stow_types::api::DemandFeedHour) -> u32 {
+    hour.as_str()[11..13].parse().expect("drive hour index")
+}
+
+/// Build the exact `feed_complete` request the staged hour answers —
+/// generation, counters, and the manifest recomputed from the same
+/// deterministic entries the page calls staged — all in unmetered
+/// setup so the metered run only executes the handler.
+async fn feed_complete_request(
+    db: &DurableDb,
+    hour: &stow_types::api::DemandFeedHour,
+) -> Result<stow_types::api::DemandFeedCompleteRequest, String> {
+    let generation = feed_drive_generation(db, hour).await?;
+    let counters = db
+        .query("SELECT staged_pages, staged_entries FROM demand_feed_hours WHERE hour = ?")
+        .bind(hour.as_str())
+        .fetch_one::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("read drive hour counters: {error}"))?;
+    let page_count = counters["staged_pages"]
+        .as_i64()
+        .ok_or_else(|| "drive hour staged_pages missing".to_owned())?;
+    let entry_count = counters["staged_entries"]
+        .as_i64()
+        .ok_or_else(|| "drive hour staged_entries missing".to_owned())?;
+    let mut page_hashes = Vec::new();
+    for page_no in 0..u32::try_from(page_count).map_err(|e| e.to_string())? {
+        page_hashes.push(
+            stow_types::api::demand_feed_page_hash(&feed_drive_entries(page_no)?)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    let manifest = stow_types::api::demand_feed_manifest(&page_hashes)
+        .map(|hash| hash.to_hex().to_string())
+        .unwrap_or_default();
+    Ok(stow_types::api::DemandFeedCompleteRequest {
+        hour: hour.clone(),
+        generation,
+        page_count: u32::try_from(page_count).map_err(|e| e.to_string())?,
+        entry_count: u64::try_from(entry_count).map_err(|e| e.to_string())?,
+        manifest_hash: manifest,
+    })
+}
+
+/// Freeze the drive hour through the real `feed_complete`.
+async fn seed_feed_complete(
+    db: &DurableDb,
+    hour: &stow_types::api::DemandFeedHour,
+) -> Result<(), String> {
+    let request = feed_complete_request(db, hour).await?;
+    feed::feed_complete(db, &request, feed_drive_now_secs(hour_idx(hour)))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Consume the wire request a drive's setup staged for its run.
+fn take_feed_request(ctx: &DriveContext) -> Result<FeedDriveRequest, String> {
+    ctx.feed_request
+        .lock()
+        .expect("feed request")
+        .take()
+        .ok_or_else(|| "feed drive setup left no staged request".to_owned())
+}
+
+/// Bulk-seed `count` obsolete-generation payloads for a staging hour —
+/// retirable debris for the cleanup drives. Direct unmetered INSERT:
+/// the rows' hashes/payloads are never applied or verified (stale
+/// generations retire unseen), and the rotation that follows resets
+/// the staged counters the insert trigger inflated.
+async fn seed_stale_feed_pages(
+    db: &DurableDb,
+    hour: &stow_types::api::DemandFeedHour,
+    generation: i64,
+    count: u32,
+) -> Result<(), String> {
+    db.query(include_str!("feed_stale_pages.sql"))
+        .bind(i64::from(count))
+        .bind(hour.as_str())
+        .bind(generation)
+        .execute()
+        .await
+        .map_err(|error| format!("seed stale feed pages: {error}"))
+        .map(|_| ())
+}
+
+/// Materialize drive hour `idx` through the feed's own calls —
+/// begin, `pages` real fixture-identity pages in order, then the
+/// manifest freeze — so delivery sees a complete hour exactly as the
+/// cron path leaves it. Idempotent on a persisted fixture: a
+/// watermark at or past the hour makes seeding a no-op.
+async fn seed_feed_hour(db: &DurableDb, idx: u32, pages: u32) -> Result<(), String> {
+    let hour = feed_drive_hour(idx);
     if let Some(watermark) = feed::feed_status(db)
         .await
         .map_err(|error| error.to_string())?
         .watermark
-        && watermark.as_str() >= hour_str
+        && watermark.as_str() >= hour.as_str()
     {
         return Ok(());
     }
-    let begin = feed::feed_begin(db, &hour, now_secs)
+    // A sibling drive may already have materialized the hour —
+    // `complete`/`delivered` headers need no seed, and re-beginning a
+    // frozen hour is the protocol's own refusal.
+    let existing = db
+        .query("SELECT state FROM demand_feed_hours WHERE hour = ?")
+        .bind(hour.as_str())
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read drive hour state: {error}"))?;
+    if existing.is_some_and(|state| state != "staging") {
+        return Ok(());
+    }
+    let begin = feed::feed_begin(db, &hour, feed_drive_now_secs(idx))
         .await
         .map_err(|error| error.to_string())?;
     let mut page_hashes = Vec::new();
     let mut entry_count = 0_u64;
     for page_no in 0..pages {
-        let entries: Vec<stow_types::api::SchedulerDemandEntry> = (0..4)
-            .map(
-                |k| -> Result<stow_types::api::SchedulerDemandEntry, String> {
-                    // Spread entries over the fixture task set — page n's
-                    // kth entry hits task n·4+k, the same identity formulas
-                    // the demand drive's batch uses.
-                    let n = 100 + page_no * 4 + k;
-                    let (crate_name, version) = crate_identity(n);
-                    Ok(stow_types::api::SchedulerDemandEntry {
-                        crate_name: CrateName::parse(&crate_name).map_err(|e| e.to_string())?,
-                        version: CrateVersion::new(
-                            semver::Version::parse(&version).map_err(|e| e.to_string())?,
-                        ),
-                        features_json: FeaturesJson::default(),
-                        target: TargetTriple::parse(dep_target(n)).map_err(|e| e.to_string())?,
-                        rustc_version: WireRustcVersion::parse("1.86.0")
-                            .map_err(|e| e.to_string())?,
-                        demand: 100,
-                    })
-                },
-            )
-            .collect::<Result<_, _>>()?;
+        let entries = feed_drive_entries(page_no)?;
         page_hashes
             .push(stow_types::api::demand_feed_page_hash(&entries).map_err(|e| e.to_string())?);
         entry_count += entries.len() as u64;
@@ -2034,7 +2498,7 @@ async fn seed_feed_hour(
                 page_no,
                 entries,
             },
-            now_secs,
+            feed_drive_now_secs(idx),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -2050,10 +2514,30 @@ async fn seed_feed_hour(
             entry_count,
             manifest_hash: manifest.unwrap_or_default(),
         },
-        now_secs,
+        feed_drive_now_secs(idx),
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+/// Drive a staged hour to `delivered` in unmetered setup — every
+/// unapplied page plus the terminal transition, looping on the
+/// report's own state so page-count changes never desync.
+async fn deliver_feed_hour_fully(
+    db: &DurableDb,
+    idx: u32,
+    settings: &SchedulerSettings,
+) -> Result<(), String> {
+    seed_feed_hour(db, idx, FEED_DRIVE_PAGES).await?;
+    loop {
+        let (report, _plan) =
+            feed::feed_deliver(db, &feed_drive_hour(idx), feed_drive_now_ms(idx), settings)
+                .await
+                .map_err(|error| error.to_string())?;
+        if report.state == "delivered" {
+            return Ok(());
+        }
+    }
 }
 
 /// One dependency edge on fixture row `n` — the same identity formulas

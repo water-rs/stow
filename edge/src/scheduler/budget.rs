@@ -813,7 +813,7 @@ fn d1_call_trace(ok: bool, started_ms: f64) {
 }
 
 /// Probe-only phase timing: emits one synchronous `tracing` line per
-/// `run_drive` boundary — drive name, phase (`setup`/`run`/`cleanup`)
+/// `run_drive` boundary — drive name, phase (`setup`/`pre_sync`/`run`/`post_sync`/`cleanup`)
 /// and the phase's `Date::now` elapsed — so the native wrangler
 /// persisted log locates fixture setup and cleanup separately from
 /// metered work. No I/O and no awaits: the line is pure synchronous

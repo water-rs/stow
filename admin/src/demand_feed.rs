@@ -926,17 +926,13 @@ mod tests {
     // flow through the two bounded channels — no global locks, no
     // statics. -----
 
-    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use tokio::sync::{Mutex, mpsc, oneshot};
+    use tokio::sync::{mpsc, oneshot};
 
     /// Calls the mock records — the bounded channel is the whole
     /// recording path; the test drains it once `run` has settled.
     const MOCK_CALL_BOUND: usize = 64;
-
-    /// Scripted `deliver` reply states the test stages.
-    const MOCK_DELIVER_BOUND: usize = 64;
 
     /// What the scripted edge answers, in call order.
     struct MockEdge {
@@ -944,9 +940,11 @@ mod tests {
         status: serde_json::Value,
         /// `POST …/query` body — verbatim bytes (may be truncated).
         query_body: Vec<u8>,
-        /// `deliver` reply states, consumed in order; an empty queue
-        /// answers `delivered`, matching the real terminal state.
-        deliver_plan: VecDeque<String>,
+        /// `deliver` reply states, indexed by the atomic sequence —
+        /// immutable once staged, so no lock mediates the read. An
+        /// index past the plan answers `delivered`, matching the real
+        /// terminal state.
+        deliver_plan: Vec<String>,
         /// Answer every route 401.
         unauthorized: bool,
         /// Abort the response body mid-stream instead of answering.
@@ -958,7 +956,7 @@ mod tests {
             Self {
                 status: json!({"watermark": "2020-01-01T05", "unfinished": null}),
                 query_body: serde_json::to_vec(&document(query_rows)).expect("body"),
-                deliver_plan: VecDeque::new(),
+                deliver_plan: Vec::new(),
                 unauthorized: false,
                 hangup_on: Vec::new(),
             }
@@ -968,28 +966,31 @@ mod tests {
         /// then `delivered` — the fan-out tail draws no-op terminals.
         fn delivering(mut self, pages: u32) -> Self {
             for _ in 0..pages {
-                self.deliver_plan.push_back("complete".to_owned());
+                self.deliver_plan.push("complete".to_owned());
             }
-            self.deliver_plan.push_back("delivered".to_owned());
+            self.deliver_plan.push("delivered".to_owned());
             self
         }
     }
 
     /// The owned state every handler shares — `State` carries one Arc;
-    /// all mutation flows through the bounded channels and the atomic
-    /// page counter.
+    /// the call log is the only mutation and it flows through a
+    /// bounded channel; the scripted replies are immutable and the
+    /// deliver sequence is one atomic index.
     struct MockShared {
         edge: MockEdge,
         calls: mpsc::Sender<(String, serde_json::Value)>,
-        deliver: Mutex<mpsc::Receiver<String>>,
-        deliver_page: AtomicU32,
+        deliver_seq: AtomicU32,
     }
 
     /// A running mock server the test drains and shuts down through
-    /// the same graceful mechanism the production listener uses.
+    /// the same graceful mechanism the production listener uses —
+    /// `shutdown` signals the accept loop and awaits it, and Drop's
+    /// abort is only the panic backup.
     struct MockServer {
         edge: Edge,
         calls: mpsc::Receiver<(String, serde_json::Value)>,
+        shutdown: Option<oneshot::Sender<()>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1008,8 +1009,25 @@ mod tests {
         }
     }
 
-    /// Dropping the server aborts its accept task — no listener
-    /// outlives its test.
+    /// Signal the graceful shutdown and await the accept task —
+    /// bounded so a wedged listener fails the test instead of
+    /// hanging the suite. Dropping without `shutdown` aborts as the
+    /// panic-path backup; either way no accept or connection task
+    /// outlives the test.
+    impl MockServer {
+        async fn shutdown(mut self) {
+            if let Some(signal) = self.shutdown.take() {
+                let _ = signal.send(());
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.task).await {
+                Ok(_) => {}
+                Err(_) => self.task.abort(),
+            }
+        }
+    }
+
+    /// Dropping an un-shutdown server aborts its accept task — the
+    /// panic-path backup; `shutdown` is the graceful path tests take.
     impl Drop for MockServer {
         fn drop(&mut self) {
             self.task.abort();
@@ -1018,15 +1036,10 @@ mod tests {
 
     async fn serve(mock: MockEdge) -> MockServer {
         let (calls_tx, calls_rx) = mpsc::channel(MOCK_CALL_BOUND);
-        let (deliver_tx, deliver_rx) = mpsc::channel(MOCK_DELIVER_BOUND);
-        for state in mock.deliver_plan.iter().cloned() {
-            deliver_tx.try_send(state).expect("scripted deliver bound");
-        }
         let shared = Arc::new(MockShared {
             edge: mock,
             calls: calls_tx,
-            deliver: Mutex::new(deliver_rx),
-            deliver_page: AtomicU32::new(0),
+            deliver_seq: AtomicU32::new(0),
         });
         let app = axum::Router::new()
             .fallback(axum::routing::any(mock_handler))
@@ -1035,12 +1048,19 @@ mod tests {
             .await
             .expect("bind mock edge");
         let addr = listener.local_addr().expect("local addr");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("mock edge server");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("mock edge server");
         });
         MockServer {
             edge: Edge::for_test(format!("http://{addr}")),
             calls: calls_rx,
+            shutdown: Some(shutdown_tx),
             task,
         }
     }
@@ -1107,14 +1127,14 @@ mod tests {
             })
             .into_response(),
             (axum::http::Method::POST, Some("/deliver")) => {
+                let index = shared.deliver_seq.fetch_add(1, Ordering::Relaxed) as usize;
                 let state = shared
-                    .deliver
-                    .lock()
-                    .await
-                    .try_recv()
-                    .unwrap_or_else(|_| "delivered".to_owned());
-                let delivered_page = (state != "delivered")
-                    .then(|| shared.deliver_page.fetch_add(1, Ordering::Relaxed));
+                    .edge
+                    .deliver_plan
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| "delivered".to_owned());
+                let delivered_page = (state != "delivered").then(|| index as u32);
                 axum::Json(DemandFeedDeliverReport {
                     hour: request_json["hour"].as_str().unwrap_or_default().to_owned(),
                     state,
@@ -1135,7 +1155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_to_end_stages_freezes_and_delivers() {
+    async fn scripted_transport_stages_freezes_and_delivers() {
         // 520 rows → 256+256+8 entries across three pages; the mock
         // plays the real route set: status → begin → query → 3×page →
         // complete → deliver until delivered → cleanup.
@@ -1207,6 +1227,7 @@ mod tests {
                 .count(),
             1
         );
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1236,6 +1257,7 @@ mod tests {
         assert_eq!(paths[0], "GET /api/v1/admin/scheduler/demand-feed/status");
         assert!(paths.iter().any(|p| p.contains("/deliver")));
         assert!(paths.iter().any(|p| p.contains("/cleanup")));
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1250,6 +1272,7 @@ mod tests {
         let paths = server.paths();
         assert!(paths.iter().all(|p| !p.contains("/complete")));
         assert!(paths.iter().all(|p| !p.contains("/deliver")));
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1265,6 +1288,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(server.paths().len(), 1, "status refusal stops the pass");
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1288,6 +1312,7 @@ mod tests {
                 .iter()
                 .all(|p| !p.contains("/complete") && !p.contains("/deliver"))
         );
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1313,6 +1338,7 @@ mod tests {
         );
         let paths = server.paths();
         assert!(paths.iter().all(|p| !p.contains("/complete")));
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1334,6 +1360,7 @@ mod tests {
         let calls = server.drain();
         assert_eq!(calls.iter().filter(|(p, _)| p.contains("/page")).count(), 5);
         assert!(calls.iter().all(|(p, _)| !p.contains("/deliver")));
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1359,6 +1386,7 @@ mod tests {
             "every launched deliver call was made before the error surfaced"
         );
         assert!(paths.iter().all(|p| !p.contains("/cleanup")));
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1390,6 +1418,7 @@ mod tests {
         assert!(format!("{error:#}").contains("leap"), "{error:#}");
         let paths = server.paths();
         assert_eq!(paths.len(), 1, "only the status read ran: {paths:?}");
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1420,6 +1449,7 @@ mod tests {
         let paths = server.paths();
         assert!(paths.iter().any(|p| p.contains("/deliver")));
         assert!(paths.iter().all(|p| !p.contains("/query")));
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1453,6 +1483,7 @@ mod tests {
             server.paths().is_empty(),
             "no side effect before validation"
         );
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1472,6 +1503,7 @@ mod tests {
             .is_err()
         );
         assert!(server.paths().is_empty());
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1494,5 +1526,6 @@ mod tests {
             .await
             .expect_err("unknown state refuses");
         assert!(format!("{error:#}").contains("unknown state"), "{error:#}");
+        server.shutdown().await;
     }
 }

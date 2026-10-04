@@ -897,11 +897,14 @@ pub async fn rearm(
         "DELETE FROM demand_batches",
         "DELETE FROM demand_contributions",
         // The hourly feed's staging/delivery state is fixture state
-        // too — hours, retained payloads and the watermark the
-        // delivery drive advanced; no feed residue may leak into the
-        // next measurement (stow#523).
-        "DELETE FROM demand_feed_pages",
-        "DELETE FROM demand_feed_hours",
+        // too — but only the live window: the 2018 bulk
+        // [`seed_feed_bulk`] plants is the retained depth the feed
+        // drives must measure against, while every probe-staged hour
+        // lands at 2020+. The re-arm clears the live window and the
+        // watermark the delivery drive advanced, then re-seeds the
+        // bulk below (stow#523).
+        "DELETE FROM demand_feed_pages WHERE hour >= '2019' AND hour < '2022'",
+        "DELETE FROM demand_feed_hours WHERE hour >= '2019' AND hour < '2022'",
         "DELETE FROM settings WHERE key = 'demand_feed_watermark'",
         "DELETE FROM queue_dependencies WHERE task_id LIKE '%-%'",
         "DELETE FROM queue WHERE task_id LIKE '%-%'",
@@ -955,6 +958,10 @@ pub async fn rearm(
     // in `settings` under [`PROBE_CLAIMED_KEY`] so the set survives
     // between `POST /budget` calls.
     let claimed_ns = restore_claimed_rows(db, shape, min_age_minutes).await?;
+    // The retained 2018 feed depth the probe's feed routes must
+    // measure against — `OR IGNORE` chunks make a repeat re-arm a
+    // bounded dedupe pass, not a rewrite.
+    seed_feed_bulk(db, shape).await?;
     // Row 101's seeded edge set: the resync's delta sync rewrote it.
     db.query("DELETE FROM queue_dependencies WHERE task_id = printf('%064x', ?)")
         .bind(101_i64)
@@ -1141,6 +1148,81 @@ pub async fn seed_batch(
         wrote,
         edges_written,
     })
+}
+
+/// Rows one feed-bulk chunk covers — the same bound the queue seed
+/// chunks at so a statement never outlives the runtime.
+const FEED_BULK_CHUNK: u32 = 4_000;
+
+/// The retained feed depth the #523 drives measure against —
+/// `queue_rows`-proportional delivered headers and retained pages,
+/// one staging hour with a current-generation bulk and an obsolete
+/// chunk, all under the 2018 window the re-arm's `hour >= '2019'`
+/// deletes never touch. Seeded with `OR IGNORE` so a repeat re-arm
+/// dedupes instead of rewriting; the ids are pure 2018 truth and
+/// never collide with the 2020+ window the drives stage in.
+///
+/// `queue_rows/512` delivered headers, `queue_rows/8` retained pages
+/// spread evenly over them, `queue_rows/16` current-generation pages
+/// on the staging hour plus a 256-row obsolete chunk — enough depth
+/// that a feed route going table-proportional instead of index-probe
+/// fails by orders of magnitude, not by slack.
+pub async fn seed_feed_bulk(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    let hist_hours = (shape.queue_rows / 512).clamp(8, 4_000);
+    let hist_pages = (shape.queue_rows / 8).clamp(64, 160_000);
+    let staged_pages = (shape.queue_rows / 16).clamp(32, 64_000);
+    // The staging bulk hour must sit ABOVE every hour a drive can
+    // deliver — an unfinished hour below the delivered one blocks the
+    // contiguous-watermark transition, so the current-generation bulk
+    // lives at 2022-01-01 while history stays in 2018.
+    for lo in (0..hist_hours).step_by(FEED_BULK_CHUNK as usize) {
+        let hi = (lo + FEED_BULK_CHUNK).min(hist_hours);
+        db.query(include_str!("feed_bulk_headers.sql"))
+            .bind(i64::from(lo) + 1)
+            .bind(i64::from(hi))
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("seed feed headers: {error}")))?;
+    }
+    for lo in (0..hist_pages).step_by(FEED_BULK_CHUNK as usize) {
+        let hi = (lo + FEED_BULK_CHUNK).min(hist_pages);
+        db.query(include_str!("feed_bulk_pages.sql"))
+            .bind(i64::from(lo) + 1)
+            .bind(i64::from(hi))
+            .bind(i64::from(hist_hours))
+            .bind(i64::from(hist_hours))
+            .bind(i64::from(hist_hours))
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("seed retained feed pages: {error}")))?;
+    }
+    db.query(
+        "INSERT OR IGNORE INTO demand_feed_hours              (hour, generation, state, staged_pages, staged_entries)          VALUES ('2022-01-01T00', 9, 'staging', 0, 0)",
+    )
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("seed staging feed hour: {error}")))?;
+    for lo in (0..staged_pages + 256).step_by(FEED_BULK_CHUNK as usize) {
+        let hi = (lo + FEED_BULK_CHUNK).min(staged_pages + 256);
+        db.query(include_str!("feed_bulk_staged.sql"))
+            .bind(i64::from(lo) + 1)
+            .bind(i64::from(hi))
+            .bind(i64::from(staged_pages))
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("seed staging feed pages: {error}")))?;
+    }
+    // The insert trigger counted the obsolete rows too; the header's
+    // truth is the current generation's bulk alone.
+    db.query(
+        "UPDATE demand_feed_hours SET staged_pages = ?, staged_entries = ?          WHERE hour = '2022-01-01T00'",
+    )
+    .bind(i64::from(staged_pages))
+    .bind(i64::from(staged_pages) * 4)
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("fix staging feed counters: {error}")))?;
+    Ok(())
 }
 
 /// Seed the whole fixture on the host path — the same chunks the

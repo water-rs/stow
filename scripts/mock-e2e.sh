@@ -358,6 +358,81 @@ current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 
+# --- stow#523: hourly demand feed ------------------------------------
+# The real admin -> authenticated workerd -> scheduler DO -> #522
+# storage path the hourly GitHub job runs — no scripted edge: the
+# worker's own `STOW_STATS_SQL_URL` loopback serves the
+# `analytics_engine/sql` document (mock-registry's demand fixture:
+# '2020-01-01 00' = 520 rows -> three 256-entry pages, '01' = empty
+# hour, '02' = small document, '09' = a schema-broken `meta` the
+# materializer must refuse without staging anything).
+feed_run() {
+    local hour="$1" out_file="$2"
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+        "$BIN/stow-admin" scheduler demand-feed --hour "$hour" --json \
+        >"$out_file" 2>&1
+    local status=$?
+    cat "$out_file"
+    return "$status"
+}
+
+echo "[mock-e2e] demand feed: 2020-01-01T00 (520 rows)"
+feed_out="$LOG_DIR/demand-feed-00.json"
+feed_run 2020-01-01T00 "$feed_out" \
+    || die "demand-feed 2020-01-01T00 failed — see $feed_out"
+feed_state="$(jq -r '.state' "$feed_out")"
+feed_pages="$(jq -r '.staged_pages' "$feed_out")"
+[ "$feed_state" = "delivered" ] && [ "$feed_pages" = "3" ] \
+    || die "demand-feed T00: expected delivered/3 staged pages, got state=$feed_state pages=$feed_pages"
+
+# The durable cursor: the same hour resumed must deliver idempotently —
+# no re-query, no new staged pages, the terminal no-op.
+echo "[mock-e2e] demand feed: 2020-01-01T00 resume (must not restage)"
+feed_out="$LOG_DIR/demand-feed-00-resume.json"
+feed_run 2020-01-01T00 "$feed_out" \
+    || die "demand-feed T00 resume failed — see $feed_out"
+[ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
+    && [ "$(jq -r '.staged_pages' "$feed_out")" = "0" ] \
+    || die "demand-feed T00 resume restaged: $(cat "$feed_out")"
+
+# The canonical next hour follows the watermark — an empty document
+# still walks begin -> complete -> delivered.
+echo "[mock-e2e] demand feed: 2020-01-01T01 (empty hour)"
+feed_out="$LOG_DIR/demand-feed-01.json"
+feed_run 2020-01-01T01 "$feed_out" \
+    || die "demand-feed 2020-01-01T01 failed — see $feed_out"
+[ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
+    || die "demand-feed T01: expected delivered, got $(cat "$feed_out")"
+
+# Leap refusal: T03 while T02 is still pending refuses before any
+# side effect; T02 then materializes under its own shape.
+echo "[mock-e2e] demand feed: 2020-01-01T03 leap refusal"
+feed_out="$LOG_DIR/demand-feed-03.json"
+if feed_run 2020-01-01T03 "$feed_out"; then
+    die "demand-feed 2020-01-01T03 should have refused (unfinished T02 below)"
+fi
+echo "[mock-e2e] demand feed: 2020-01-01T02 (10 rows)"
+feed_out="$LOG_DIR/demand-feed-02.json"
+feed_run 2020-01-01T02 "$feed_out" \
+    || die "demand-feed 2020-01-01T02 failed — see $feed_out"
+[ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
+    || die "demand-feed T02: expected delivered, got $(cat "$feed_out")"
+
+# Provider shape change: '2020-01-01 09' answers a schema-broken meta;
+# the materializer must fail the run and stage nothing — the durable
+# status readback proves no partial state was left for that hour.
+echo "[mock-e2e] demand feed: 2020-01-01T09 schema refusal"
+feed_out="$LOG_DIR/demand-feed-09.json"
+if feed_run 2020-01-01T09 "$feed_out"; then
+    die "demand-feed 2020-01-01T09 should have refused a schema-broken meta"
+fi
+feed_status="$(isolated_env GH_TOKEN="$EDGE_BEARER" \
+    curl -fsS -H "Authorization: Bearer $EDGE_BEARER" \
+    "$EDGE_URL/api/v1/admin/scheduler/demand-feed/status")"
+echo "$feed_status" | jq .
+[ "$(echo "$feed_status" | jq -r '.watermark')" = "2020-01-01T02" ] \
+    || die "feed watermark is not 2020-01-01T02: $feed_status"
+
 # stow#336: production links every Linux unit against the Debian buster
 # (glibc 2.28) sysroot build-crate.yml provisions — the dispatched builds
 # link the same way through the same scripts, into a cache dir keyed by

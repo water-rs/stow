@@ -1801,7 +1801,68 @@ async fn store_manifest(
 /// not name, so one row serves all six. The row keeps Analytics
 /// Engine's real `FORMAT JSON` shape (quoted `UInt64`s) so the public
 /// stats route exercises its genuine SQL-API path end to end.
-async fn analytics_engine_sql() -> Json<serde_json::Value> {
+async fn analytics_engine_sql(body: String) -> Json<serde_json::Value> {
+    // The demand feed's hourly leg (stow#523) posts the same endpoint:
+    // its query is the only one carrying `LIMIT ALL … FORMAT JSON`
+    // over `stow_cache_misses`. The document answers in Analytics
+    // Engine's legacy `FORMAT JSON` shape — `meta`/`data`/`rows` —
+    // with the six-column contract the materializer validates, so the
+    // mock-e2e pass exercises the real admin -> workerd -> storage
+    // path. Deterministic per-hour shapes make every leg assertable:
+    // '2020-01-01 00' carries the 520-row multi-page document, '01'
+    // an empty hour, '02' a small one-page document, and '09' a
+    // schema-broken `meta` the materializer must refuse — a provider
+    // shape change with no page applied.
+    if body.contains("stow_cache_misses") && body.contains("LIMIT ALL") {
+        let rows = if body.contains("'2020-01-01 00'") {
+            520
+        } else if body.contains("'2020-01-01 02'") {
+            10
+        } else {
+            0
+        };
+        if body.contains("'2020-01-01 09'") {
+            // A provider-side shape change: `demand` arrives as the
+            // dataset's raw integer, not Float64 — the strict meta
+            // contract refuses before any page stages.
+            return Json(serde_json::json!({
+                "meta": [
+                    {"name": "crate_name", "type": "String"},
+                    {"name": "version", "type": "String"},
+                    {"name": "features_json", "type": "String"},
+                    {"name": "target", "type": "String"},
+                    {"name": "rustc_version", "type": "String"},
+                    {"name": "demand", "type": "UInt64"}
+                ],
+                "data": [],
+                "rows": 0
+            }));
+        }
+        let data: Vec<serde_json::Value> = (0..rows)
+            .map(|n| {
+                serde_json::json!({
+                    "crate_name": format!("mock-demand-{n:04}"),
+                    "version": format!("1.{}.0", n % 5),
+                    "features_json": "[]",
+                    "target": "x86_64-unknown-linux-gnu",
+                    "rustc_version": "1.86.0",
+                    "demand": ((n % 7) + 1) as f64
+                })
+            })
+            .collect();
+        return Json(serde_json::json!({
+            "meta": [
+                {"name": "crate_name", "type": "String"},
+                {"name": "version", "type": "String"},
+                {"name": "features_json", "type": "String"},
+                {"name": "target", "type": "String"},
+                {"name": "rustc_version", "type": "String"},
+                {"name": "demand", "type": "Float64"}
+            ],
+            "data": data,
+            "rows": data.len()
+        }));
+    }
     Json(serde_json::json!({
         "success": true,
         "errors": [],

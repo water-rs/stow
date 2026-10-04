@@ -313,32 +313,110 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 3_000,
     },
     DriveBudget {
-        // The frozen hour's delivery leg (stow#523): each
-        // `feed_deliver` call is the header read, one bounded
-        // next-unapplied-page SELECT, the `demand_pass` closure
-        // (apply ≈ 8 + `next_alarm` ≈ 5), the acknowledged flip and
-        // the counter read-back — ~16 statements × 3 pages plus the
-        // terminal watermark transition's guarded UPDATE. The
-        // mechanics are the `POST /demand` pass repeated per page
-        // against retained payloads; reads track the touched-task
-        // probes of 12 fixture identities, not the staged bulk.
-        name: "POST /scheduler/demand-feed/deliver",
-        statements: 80,
-        rows_read: 400,
-        rows_written: 150,
-        wall_ms: 800,
+        // The resume-cursor read: one watermark probe plus one
+        // unfinished-index probe — flat in retained depth.
+        name: "GET /scheduler/demand-feed/status",
+        statements: 4,
+        rows_read: 8,
+        rows_written: 0,
+        wall_ms: 40,
     },
     DriveBudget {
-        // Retiring a delivered hour's payloads: one PK-prefix
-        // `DELETE … LIMIT 256` chunk plus the header read and the
-        // pending probe per call — three tiny statements per round,
-        // and the round count is `pages/256` so the drain is flat in
-        // archive depth. At the drive's three pages one chunk retires
-        // everything.
-        name: "POST /scheduler/demand-feed/cleanup",
+        // Fresh open: watermark guard, header insert, generation
+        // read-back.
+        name: "POST /scheduler/demand-feed/begin (fresh)",
         statements: 8,
+        rows_read: 8,
+        rows_written: 3,
+        wall_ms: 60,
+    },
+    DriveBudget {
+        // Restart with real debris: generation bump/counter reset
+        // plus one full 256-row obsolete retire chunk and the
+        // pending probe — measured 7/4/257 on the 10k gate.
+        name: "POST /scheduler/demand-feed/begin (rotation)",
+        statements: 14,
+        rows_read: 8,
+        rows_written: 520,
+        wall_ms: 120,
+    },
+    DriveBudget {
+        // One staged page: guards plus the payload insert whose
+        // trigger bumps counters.
+        name: "POST /scheduler/demand-feed/page (append)",
+        statements: 6,
+        rows_read: 8,
+        rows_written: 3,
+        wall_ms: 60,
+    },
+    DriveBudget {
+        // Same-bytes replay: bounded reads, zero writes.
+        name: "POST /scheduler/demand-feed/page (replay)",
+        statements: 6,
+        rows_read: 8,
+        rows_written: 0,
+        wall_ms: 50,
+    },
+    DriveBudget {
+        // Completion barrier, populated hour: manifest verification
+        // plus the guarded freeze.
+        name: "POST /scheduler/demand-feed/complete (nonempty)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 3,
+        wall_ms: 60,
+    },
+    DriveBudget {
+        // The same barrier with an empty generation.
+        name: "POST /scheduler/demand-feed/complete (empty)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 3,
+        wall_ms: 50,
+    },
+    DriveBudget {
+        // One page-apply delivery: the bounded next-page SELECT, the
+        // `demand_pass` closure for four fixture identities, the ack
+        // flip and the wake re-plan.
+        name: "POST /scheduler/demand-feed/deliver (page apply)",
+        statements: 40,
         rows_read: 60,
-        rows_written: 260,
+        rows_written: 12,
         wall_ms: 300,
+    },
+    DriveBudget {
+        // The terminal call: last apply plus the contiguous-watermark
+        // `delivered` transition.
+        name: "POST /scheduler/demand-feed/deliver (terminal)",
+        statements: 18,
+        rows_read: 40,
+        rows_written: 4,
+        wall_ms: 200,
+    },
+    DriveBudget {
+        // Delivered-hour replay: the `delivered` early-out plus the
+        // wake re-plan.
+        name: "POST /scheduler/demand-feed/deliver (replay)",
+        statements: 12,
+        rows_read: 30,
+        rows_written: 0,
+        wall_ms: 80,
+    },
+    DriveBudget {
+        // One full retirable chunk: `DELETE … LIMIT 256` plus its
+        // probes — flat in archive depth.
+        name: "POST /scheduler/demand-feed/cleanup (full chunk)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 260,
+        wall_ms: 200,
+    },
+    DriveBudget {
+        // The retire probe on an all-live generation.
+        name: "POST /scheduler/demand-feed/cleanup (none obsolete)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 2,
+        wall_ms: 60,
     },
 ];
