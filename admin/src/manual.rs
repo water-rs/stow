@@ -436,6 +436,65 @@ fn mark_blocked(
     blocked
 }
 
+/// One resolve wave's per-source progress: the `done`/`total` count
+/// and the wave's start, logged on each delivered result so a running
+/// input's log distinguishes completed, failed, and still-in-flight
+/// sources instead of going quiet for the whole fetch+resolve span
+/// (stow#540). The pool delivers results on the driving thread, so
+/// the counters need no sharing.
+struct SourceProgress {
+    done: usize,
+    total: usize,
+    started: std::time::Instant,
+}
+
+impl SourceProgress {
+    fn new(total: usize) -> Self {
+        Self {
+            done: 0,
+            total,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Record one delivered source: log its completion, then fold it
+    /// into the wave's accumulators — `Ok` tasks extend `requests`, an
+    /// `Err` appends `"{source}: {error}"` to `failures`.
+    fn collect(
+        &mut self,
+        source: impl std::fmt::Display,
+        result: Result<Vec<EnqueueRequest>, String>,
+        requests: &mut Vec<EnqueueRequest>,
+        failures: &mut Vec<String>,
+    ) {
+        self.done += 1;
+        match result {
+            Ok(tasks) => {
+                tracing::info!(
+                    %source,
+                    tasks = tasks.len(),
+                    done = self.done,
+                    total = self.total,
+                    elapsed_s = self.started.elapsed().as_secs_f64(),
+                    "resolved source"
+                );
+                requests.extend(tasks);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %source,
+                    %error,
+                    done = self.done,
+                    total = self.total,
+                    elapsed_s = self.started.elapsed().as_secs_f64(),
+                    "source resolve failed"
+                );
+                failures.push(format!("{source}: {error}"));
+            }
+        }
+    }
+}
+
 /// Read both inputs into one request list: a crates file resolves each
 /// line's newest non-yanked release (or the `@`-pinned one) with the
 /// crate lane; a projects file resolves each listed repository's git
@@ -465,6 +524,7 @@ async fn resolve_sources(
         let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
         let mut requests = Vec::new();
         if !jobs.is_empty() {
+            let mut progress = SourceProgress::new(jobs.len());
             pool.run(
                 &jobs,
                 |resolver, runtime, (name, version)| {
@@ -485,35 +545,39 @@ async fn resolve_sources(
                             .collect::<Vec<EnqueueRequest>>()
                     })
                 },
-                |_, (name, version), result| match result {
-                    Ok(tasks) => requests.extend(tasks),
-                    Err(error) => failures.push(format!("{name}@{version}: {error}")),
+                |_, (name, version), result| {
+                    progress.collect(
+                        format_args!("{name}@{version}"),
+                        result,
+                        &mut requests,
+                        &mut failures,
+                    );
                 },
             );
         }
         if let Some(path) = &projects {
             let repos = tokio::runtime::Handle::current()
                 .block_on(crate::projects::load_projects_file(path))?;
+            let mut progress = SourceProgress::new(repos.len());
             pool.run(
                 &repos,
                 |resolver, _runtime, repo| {
                     crate::projects::resolve_repository(resolver, repo, &targets, &rustc_version)
                 },
-                |_, repo, result| match result {
-                    Ok(tasks) => requests.extend(tasks),
-                    Err(error) => failures.push(format!("{repo}: {error}")),
+                |_, repo, result| {
+                    progress.collect(repo, result, &mut requests, &mut failures);
                 },
             );
         }
         if let Some(dirs) = &dirs {
+            let mut progress = SourceProgress::new(dirs.len());
             pool.run(
                 dirs,
                 |resolver, _runtime, dir| {
                     crate::projects::resolve_project_dir(resolver, dir, &targets, &rustc_version)
                 },
-                |_, dir, result| match result {
-                    Ok(tasks) => requests.extend(tasks),
-                    Err(error) => failures.push(format!("{}: {error}", dir.display())),
+                |_, dir, result| {
+                    progress.collect(dir.display(), result, &mut requests, &mut failures);
                 },
             );
         }
