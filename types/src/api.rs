@@ -1753,11 +1753,12 @@ impl DemandFeedHour {
     /// The newest fully closed hour at `now_unix_secs` — the feed's
     /// bootstrap choice when the watermark is empty. Floors `now` to
     /// the hour boundary and steps back one hour, so the answer is
-    /// always closed by construction.
+    /// always closed by construction. Checked arithmetic throughout:
+    /// an out-of-range `now` returns `None`, never panics.
     #[must_use]
     pub fn latest_closed(now_unix_secs: i64) -> Option<Self> {
-        let floor = now_unix_secs - now_unix_secs.rem_euclid(3_600);
-        let start = time::OffsetDateTime::from_unix_timestamp(floor - 3_600).ok()?;
+        let floor = now_unix_secs.checked_sub(now_unix_secs.rem_euclid(3_600))?;
+        let start = time::OffsetDateTime::from_unix_timestamp(floor.checked_sub(3_600)?).ok()?;
         let canonical = start
             .format(DEMAND_FEED_HOUR_FORMAT)
             .map(|canonical| Self::parse(&canonical))
@@ -1904,6 +1905,157 @@ pub struct DemandFeedPageRequest {
     pub page_no: u32,
     /// The page's entries — non-empty, bounded.
     pub entries: Vec<SchedulerDemandEntry>,
+}
+
+/// Streams entries into [`DemandFeedPageRequest`]s that fit the wire
+/// bounds exactly — `DEMAND_FEED_PAGE_MAX_ENTRIES` entries *and* a
+/// whole-envelope `serde_json` encoding of at most
+/// [`DEMAND_FEED_PAGE_MAX_BYTES`], framing (`hour`, `generation`,
+/// `page_no`) included. The byte accounting is derived from the same
+/// serialization the Durable Object validates on receipt: the
+/// empty-request envelope is measured once per page and each entry's
+/// serialized length once per push, so a page that fits the exact
+/// bound is never refused for slack and one that cannot fit is never
+/// sent.
+#[derive(Debug)]
+pub struct DemandFeedPageBuilder {
+    hour: DemandFeedHour,
+    generation: i64,
+    page_no: u32,
+    entries: Vec<SchedulerDemandEntry>,
+    /// Bytes the open page's entries occupy inside the framing's
+    /// `[]`: each entry's serialized length plus its separating
+    /// comma — the exact delta over the empty envelope.
+    entries_bytes: usize,
+    /// `serde_json::to_vec` length of the open page's request with
+    /// `entries` empty — the framing the entries land inside.
+    framing_bytes: usize,
+}
+
+impl DemandFeedPageBuilder {
+    /// A builder staging `generation` of `hour`, open at page 0.
+    ///
+    /// # Errors
+    /// The request framing fails to serialize.
+    pub fn new(hour: DemandFeedHour, generation: i64) -> Result<Self, String> {
+        let mut this = Self {
+            hour,
+            generation,
+            page_no: 0,
+            entries: Vec::new(),
+            entries_bytes: 0,
+            framing_bytes: 0,
+        };
+        this.reframe()?;
+        Ok(this)
+    }
+
+    /// Re-measure the empty envelope — `page_no` advances and its
+    /// digits change the framing's own length.
+    fn reframe(&mut self) -> Result<(), String> {
+        let framing = DemandFeedPageRequest {
+            hour: self.hour.clone(),
+            generation: self.generation,
+            page_no: self.page_no,
+            entries: Vec::new(),
+        };
+        self.framing_bytes = serde_json::to_vec(&framing)
+            .map_err(|error| format!("encode demand feed page framing: {error}"))?
+            .len();
+        Ok(())
+    }
+
+    /// Whole-envelope bytes the request would carry if an entry of
+    /// `entry_json_len` serialized bytes joined the open page — the
+    /// empty framing, the entries already inside, the separating
+    /// comma, and the entry itself.
+    fn envelope_with(&self, entry_json_len: usize) -> usize {
+        self.framing_bytes
+            + self.entries_bytes
+            + usize::from(!self.entries.is_empty())
+            + entry_json_len
+    }
+
+    /// `true` when an entry of `entry_json_len` serialized bytes fits
+    /// the open page under both bounds — the 256-entry cap and the
+    /// exact whole-envelope byte bound.
+    fn fits(&self, entry_json_len: usize) -> bool {
+        self.entries.len() < DEMAND_FEED_PAGE_MAX_ENTRIES
+            && self.envelope_with(entry_json_len) <= DEMAND_FEED_PAGE_MAX_BYTES
+    }
+
+    /// Append `entry` to the stream. When the open page cannot hold
+    /// it, the page closes first and the entry opens the next — the
+    /// completed page is returned for the caller's bounded handoff;
+    /// `None` means the open page grew and nothing completed. A page
+    /// boundary can only ever produce one finished page per push, so
+    /// the return value is the whole backlog.
+    ///
+    /// # Errors
+    /// The entry or framing fails to serialize, or the single entry
+    /// cannot fit an *empty* page — an oversized identity no page can
+    /// carry.
+    pub fn push(
+        &mut self,
+        entry: SchedulerDemandEntry,
+    ) -> Result<Option<DemandFeedPageRequest>, String> {
+        let entry_json_len = serde_json::to_vec(&entry)
+            .map_err(|error| format!("encode demand feed entry: {error}"))?
+            .len();
+        let completed = if !self.fits(entry_json_len) {
+            if self.entries.is_empty() {
+                return Err(format!(
+                    "demand feed identity for {} {} encodes to {entry_json_len} \
+                     bytes — over the {}-byte page bound",
+                    entry.crate_name, entry.version, DEMAND_FEED_PAGE_MAX_BYTES
+                ));
+            }
+            self.finish_page()?
+        } else {
+            None
+        };
+        // Re-check against the actual open page — either the page the
+        // entry stayed on or the fresh one `finish_page` reframed
+        // (its `page_no` digits may have grown). An entry that
+        // emptied a page but still overflows the new empty framing is
+        // the oversized singleton, refused on whatever page it lands.
+        if !self.fits(entry_json_len) {
+            return Err(format!(
+                "demand feed identity for {} {} encodes to {entry_json_len} \
+                 bytes — over the {}-byte page bound",
+                entry.crate_name, entry.version, DEMAND_FEED_PAGE_MAX_BYTES
+            ));
+        }
+        self.entries_bytes += usize::from(!self.entries.is_empty()) + entry_json_len;
+        self.entries.push(entry);
+        Ok(completed)
+    }
+
+    /// Close the open page into the exact request for the wire and
+    /// open the next page; `None` when nothing is staged. Called by
+    /// [`push`](Self::push) at a boundary and once by the caller for
+    /// the final remainder.
+    ///
+    /// # Errors
+    /// `page_no` overflows, or the framing fails to serialize.
+    pub fn finish_page(&mut self) -> Result<Option<DemandFeedPageRequest>, String> {
+        if self.entries.is_empty() {
+            return Ok(None);
+        }
+        let request = DemandFeedPageRequest {
+            hour: self.hour.clone(),
+            generation: self.generation,
+            page_no: self.page_no,
+            entries: std::mem::take(&mut self.entries),
+        };
+        self.entries_bytes = 0;
+        self.page_no = self
+            .page_no
+            .checked_add(1)
+            .ok_or_else(|| "demand feed page count overflow".to_owned())?;
+        self.reframe()?;
+        Ok(Some(request))
+    }
 }
 
 /// `POST /api/v1/admin/scheduler/demand-feed/complete` request —
@@ -2289,7 +2441,11 @@ pub struct ArtifactPruneResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{CI_TARGET_TRIPLES, RunnerFamily, runner_family};
+    use super::{
+        CI_TARGET_TRIPLES, DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES,
+        DemandFeedHour, DemandFeedPageBuilder, RunnerFamily, SchedulerDemandEntry, runner_family,
+    };
+    use crate::identity::FeaturesJson;
 
     /// Every CI target must land in exactly one family, and the families'
     /// `targets()` lists together must be exactly `CI_TARGET_TRIPLES` —
@@ -2313,6 +2469,237 @@ mod tests {
             );
         }
         assert_eq!(runner_family("aarch64-unknown-linux-musl"), None);
+    }
+
+    fn hour(raw: &str) -> DemandFeedHour {
+        DemandFeedHour::parse(raw).expect("test hour")
+    }
+
+    fn entry(crate_name: &str, features: usize) -> SchedulerDemandEntry {
+        SchedulerDemandEntry {
+            crate_name: crate_name.parse().expect("demand crate"),
+            version: "1.0.0".parse().expect("demand version"),
+            features_json: FeaturesJson::canonicalize(
+                (0..features)
+                    .map(|index| format!("feat{index:0124}"))
+                    .collect(),
+            )
+            .expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("demand target"),
+            rustc_version: "1.85.0".parse().expect("demand rustc"),
+            demand: 1,
+        }
+    }
+
+    /// An entry whose `serde_json` length is exactly `target` bytes —
+    /// real features carry the size (feature names cap at 128 chars,
+    /// so bulk comes from many max-length names and the trailing
+    /// "z"-name tunes the last byte). `features_json` serializes its
+    /// raw list as one JSON string, so the inner quotes escape: a name
+    /// of length L contributes `L + 5` bytes (`\"name\"` plus the
+    /// separating comma) and a non-empty list costs `Σ(L+5) + 3` over
+    /// the bare `"[]"`.
+    /// Build an entry whose serialized length is exactly `target`
+    /// bytes: a `crate_name`/`version`/… skeleton plus a feature list
+    /// sized through the serializer's own accounting. `FeaturesJson`
+    /// serializes as a JSON *string* holding the inner array, so each
+    /// name's quotes escape — a name of `len` chars contributes
+    /// `len + 5` bytes (`\"name\"` plus the separating comma), and a
+    /// non-empty list adds `3` over the bare `"[]"`. 128-char bulk
+    /// names contribute 133 apiece; a final tuned `"z"`-name closes
+    /// the remainder (and, when the remainder is under one name's
+    /// minimum, the last bulk name shrinks to make room). Verified by
+    /// measuring — the assertion is the test's own proof.
+    fn sized_entry(crate_name: &str, target: usize) -> SchedulerDemandEntry {
+        let bare = entry(crate_name, 0);
+        let base = serde_json::to_vec(&bare).expect("measure").len();
+        assert!(target > base, "target {target} is below a one-name entry");
+        // `need` is what the feature list must contribute over the
+        // bare `"[]"`: Σ(len + 5) - 1 with the +3 list overhead.
+        let need = target - base + 1;
+        assert!(need >= 6, "target {target} leaves no room for a name");
+        let count = need / 133;
+        let rest = need - count * 133; // the tuned name's len+5
+        let mut features: Vec<String> = (0..count).map(|index| format!("f{index:0127}")).collect();
+        match rest {
+            // Shrink the last bulk name by `6 - rest` chars and add a
+            // one-char "z" name: `-(6 - rest) + 1 + 5 = rest`.
+            1..=5 => {
+                let last = features.pop().expect("a bulk name");
+                features.push(last[..last.len() - (6 - rest)].to_owned());
+                features.push("z".to_owned());
+            }
+            // The tuned name alone covers `rest - 5` chars.
+            _ => features.push("z".repeat(rest - 5)),
+        }
+        let mut sized = bare;
+        sized.features_json = FeaturesJson::canonicalize(features).expect("features");
+        let measured = serde_json::to_vec(&sized).expect("measure").len();
+        assert_eq!(measured, target, "sized entry must land exactly");
+        sized
+    }
+
+    /// The bound is the *whole* serialized request envelope —
+    /// `hour`/`generation`/`page_no` framing plus the entries array —
+    /// and the builder's accounting must land exactly on it: an entry
+    /// that fills the envelope to the byte stays inside the page, and
+    /// the same entry one byte longer splits the page — no slack band,
+    /// no early rejection of what legitimately fits.
+    #[test]
+    fn page_builder_accounts_the_exact_envelope() {
+        let hour = hour("2020-01-01T00");
+        let plain = entry("crate-a", 0);
+        let plain_len = serde_json::to_vec(&plain).expect("measure").len();
+        for delta in [0_usize, 1] {
+            let mut builder = DemandFeedPageBuilder::new(hour.clone(), 7).expect("builder");
+            assert!(builder.push(plain.clone()).expect("push").is_none());
+            // The empty framing plus `plain` plus the separating
+            // comma is already committed; the second entry must fill
+            // the remaining room exactly (delta 0) or overflow by one
+            // byte (delta 1).
+            let framing = serde_json::to_vec(&super::DemandFeedPageRequest {
+                hour: hour.clone(),
+                generation: 7,
+                page_no: 0,
+                entries: Vec::new(),
+            })
+            .expect("framing")
+            .len();
+            let fat = sized_entry(
+                "crate-b",
+                DEMAND_FEED_PAGE_MAX_BYTES - framing - plain_len - 1 + delta,
+            );
+            let boundary = builder.push(fat).expect("push");
+            if delta == 0 {
+                assert!(boundary.is_none(), "exact-fit entry stays in the page");
+                let page = builder.finish_page().expect("page").expect("staged");
+                assert_eq!(page.entries.len(), 2);
+                let encoded = serde_json::to_vec(&page).expect("encode").len();
+                assert_eq!(encoded, DEMAND_FEED_PAGE_MAX_BYTES);
+            } else {
+                // One byte over: the push must close a page holding
+                // `plain` alone and open a fresh one for `fat`.
+                let completed = boundary.expect("boundary page");
+                assert_eq!(completed.page_no, 0);
+                assert_eq!(completed.entries, vec![plain.clone()]);
+            }
+        }
+    }
+
+    /// An entry whose own encoding cannot fit an empty envelope is a
+    /// hard failure — no page can carry it.
+    #[test]
+    fn page_builder_refuses_a_singleton_overrun() {
+        let hour = hour("2020-01-01T00");
+        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        let fat = sized_entry("crate-b", DEMAND_FEED_PAGE_MAX_BYTES);
+        let error = builder.push(fat).expect_err("oversized singleton");
+        assert!(error.contains("over the"), "{error}");
+        assert!(builder.finish_page().expect("page").is_none());
+    }
+
+    /// Pages split at the byte boundary with real feature payloads:
+    /// a large entry fills most of an envelope, the next large entry
+    /// cannot share it, and the boundary the push returns carries the
+    /// full first page while `page_no` advances — its own digits are
+    /// part of the measured framing.
+    #[test]
+    fn page_builder_splits_on_the_byte_boundary() {
+        let hour = hour("2020-01-01T00");
+        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        // ~400 KiB of real feature names — a page holds one, never two.
+        let fat = || sized_entry("crate-a", 400_000);
+        assert!(builder.push(fat()).expect("push").is_none());
+        let first = builder.push(fat()).expect("push").expect("boundary");
+        assert_eq!(first.page_no, 0);
+        assert_eq!(first.entries.len(), 1);
+        assert!(serde_json::to_vec(&first).expect("encode").len() <= DEMAND_FEED_PAGE_MAX_BYTES);
+        // A third entry splits again — the fresh page measures its own
+        // `page_no = 1` framing.
+        let second = builder.push(fat()).expect("push").expect("boundary");
+        assert_eq!(second.page_no, 1);
+        // A small entry shares the open page with the third fat one.
+        assert!(builder.push(entry("crate-b", 0)).expect("push").is_none());
+        let remainder = builder.finish_page().expect("page").expect("staged");
+        assert_eq!(remainder.page_no, 2);
+        assert_eq!(remainder.entries.len(), 2);
+        assert!(builder.finish_page().expect("page").is_none());
+    }
+
+    /// An oversized entry behind a small staged one is still refused:
+    /// the boundary completes the small page, then the post-reframe
+    /// check fails the entry on the fresh page — no append slips
+    /// through behind the completed page.
+    #[test]
+    fn page_builder_refuses_an_oversized_entry_after_a_boundary() {
+        let hour = hour("2020-01-01T00");
+        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        assert!(builder.push(entry("crate-a", 0)).expect("push").is_none());
+        let fat = sized_entry("crate-b", DEMAND_FEED_PAGE_MAX_BYTES);
+        let error = builder.push(fat).expect_err("oversized after boundary");
+        assert!(error.contains("over the"), "{error}");
+        assert!(builder.finish_page().expect("page").is_none());
+    }
+
+    /// `page_no` 9 → 10 grows the framing by a digit: an entry sized
+    /// to fill the old page's empty envelope exactly is one byte over
+    /// the new page's — the post-reframe check catches what the first
+    /// check could not have known.
+    #[test]
+    fn page_builder_rechecks_the_fresh_page_no_framing() {
+        let hour = hour("2020-01-01T00");
+        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        // Two large entries never share a page, so every push after
+        // the first completes a page — ten pushes leave one staged
+        // entry on `page_no` 9.
+        let fat = || sized_entry("crate-f", 300_000);
+        for _ in 0..10 {
+            builder.push(fat()).expect("push");
+        }
+        let framing_9 = serde_json::to_vec(&crate::api::DemandFeedPageRequest {
+            hour: hour.clone(),
+            generation: 1,
+            page_no: 9,
+            entries: Vec::new(),
+        })
+        .expect("frame")
+        .len();
+        let boundary = sized_entry("crate-x", DEMAND_FEED_PAGE_MAX_BYTES - framing_9);
+        let error = builder.push(boundary).expect_err("digit boundary refusal");
+        assert!(error.contains("over the"), "{error}");
+    }
+
+    /// The 256-entry cap is unchanged: entry 257 splits the page at
+    /// the count bound even with bytes to spare.
+    #[test]
+    fn page_builder_keeps_the_entry_cap() {
+        let hour = hour("2020-01-01T00");
+        let mut builder = DemandFeedPageBuilder::new(hour.clone(), 1).expect("builder");
+        let small = entry("crate-a", 0);
+        for _ in 0..DEMAND_FEED_PAGE_MAX_ENTRIES {
+            assert!(builder.push(small.clone()).expect("push").is_none());
+        }
+        let completed = builder.push(small).expect("push").expect("boundary");
+        assert_eq!(completed.entries.len(), DEMAND_FEED_PAGE_MAX_ENTRIES);
+    }
+
+    /// `latest_closed` must return `None` — never panic — at and below
+    /// the i64 floor, where the unchecked `floor - 3600` overflowed.
+    #[test]
+    fn latest_closed_is_checked_at_the_range_boundary() {
+        for now in [i64::MIN, i64::MIN + 1] {
+            assert_eq!(DemandFeedHour::latest_closed(now), None);
+        }
+        // The hour ending at the epoch boundary: closed at 3600s,
+        // still open at 3599 — the previous hour answers there.
+        assert_eq!(
+            DemandFeedHour::latest_closed(3_600).map(|h| h.as_str().to_owned()),
+            Some("1970-01-01T00".to_owned())
+        );
+        assert_eq!(
+            DemandFeedHour::latest_closed(3_599).map(|h| h.as_str().to_owned()),
+            Some("1969-12-31T23".to_owned())
+        );
     }
 }
 /// Public aggregate usage statistics served by `GET /api/v1/stats`.

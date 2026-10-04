@@ -7770,6 +7770,7 @@ name = "stow-admin"
 version = "0.6.0"
 dependencies = [
  "askama 0.14.0",
+ "axum",
  "blake3",
  "bytes",
  "clap",

@@ -50,6 +50,9 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
+# The demand-feed transport mock serves the same maintained axum the
+# mock-registry already pins (stow#523).
+axum = "0.8"
 
 [lints]
 workspace = true
