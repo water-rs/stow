@@ -580,7 +580,7 @@ pub async fn feed_deliver(
     let older = db
         .query(
             "SELECT hour FROM demand_feed_hours \
-             WHERE hour < ? AND state != 'delivered' LIMIT 1",
+             WHERE hour < ? AND state IN ('staging', 'complete') LIMIT 1",
         )
         .bind(hour.as_str())
         .fetch_scalar_optional::<String>()

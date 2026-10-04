@@ -99,6 +99,72 @@ struct FeedRunReport {
     touched_tasks: u64,
 }
 
+/// What one feed pass does with the durable cursor.
+enum Selected {
+    /// Resume the unfinished hour sitting at the cursor.
+    Resume(DemandFeedHour, String),
+    /// Materialize the chronological next hour.
+    Materialize(DemandFeedHour),
+}
+
+/// The chronological cursor: the watermark's successor decides one
+/// pass — resume the unfinished hour AT the successor, or materialize
+/// the successor itself. An unfinished hour past a gap keeps its
+/// frozen/staging bytes until the stream reaches it. Bootstrap (no
+/// watermark) resumes any unfinished hour, else the explicit/latest
+/// closed hour.
+fn select(
+    status: &DemandFeedStatus,
+    explicit: Option<&DemandFeedHour>,
+    now_secs: i64,
+) -> stow_types::error::Result<Selected> {
+    let canonical = status
+        .watermark
+        .as_deref()
+        .map(|raw| {
+            DemandFeedHour::parse(raw)
+                .and_then(|watermark| watermark.next())
+                .map_err(|error| Error::msg(format!("feed status watermark {raw:?}: {error}")))
+        })
+        .transpose()?;
+    let unfinished = status
+        .unfinished
+        .as_ref()
+        .map(|row| {
+            DemandFeedHour::parse(&row.hour)
+                .map_err(|error| Error::msg(format!("feed status unfinished hour: {error}")))
+                .map(|hour| (hour, row.state.clone()))
+        })
+        .transpose()?;
+    Ok(match (unfinished, canonical) {
+        (Some((hour, _)), Some(canonical)) if hour < canonical => {
+            // An unfinished row at or below the watermark means the
+            // durable cursor disagrees with itself — refuse rather
+            // than guess which side is real.
+            return Err(Error::msg(format!(
+                "feed cursor inconsistent: unfinished hour {hour} is not after \
+                 the watermark's successor {canonical}"
+            )));
+        }
+        (Some((hour, state)), Some(canonical)) if hour == canonical => {
+            Selected::Resume(hour, state)
+        }
+        (Some((hour, state)), None) => Selected::Resume(hour, state),
+        // Either no unfinished row, or the unfinished hour sits past a
+        // gap: keep its frozen/staging bytes untouched and materialize
+        // the canonical missing hour; later cron passes fill forward
+        // until the stored hour is reached and resumes.
+        (_, Some(canonical)) => Selected::Materialize(canonical),
+        (None, None) => match explicit {
+            Some(hour) => Selected::Materialize(hour.clone()),
+            None => Selected::Materialize(
+                DemandFeedHour::latest_closed(now_secs)
+                    .ok_or_else(|| stow_error!("no closed hour is representable"))?,
+            ),
+        },
+    })
+}
+
 /// Run the feed pass against the edge.
 pub async fn run(
     edge: &Edge,
@@ -124,30 +190,28 @@ pub async fn run(
         .transpose()?;
     let status: DemandFeedStatus = edge.get_json(&format!("{FEED_ROUTE}/status")).await?;
 
-    let unfinished = status
-        .unfinished
-        .as_ref()
-        .map(|row| {
-            DemandFeedHour::parse(&row.hour)
-                .map_err(Error::msg)
-                .map(|hour| (hour, row.state.clone()))
-        })
-        .transpose()?;
+    // The chronological cursor is the watermark's successor whenever a
+    // watermark exists — an unfinished hour later than it is a frozen
+    // future the stream will reach in order, not the next hour to run.
+    let selected = select(&status, explicit.as_ref(), now_secs)?;
+    let selected_hour = match &selected {
+        Selected::Resume(hour, _) | Selected::Materialize(hour) => hour,
+    };
+    // An explicit `--hour` must name the hour the cursor selects — a
+    // gap fill IS permitted to name the canonical missing hour, but
+    // anything past it (or a different resume) refuses before any
+    // begin/query/stage write.
+    if let Some(explicit) = &explicit
+        && explicit != selected_hour
+    {
+        return Err(Error::msg(format!(
+            "--hour {explicit} but the durable cursor selects {selected_hour} \
+                 — refusing to leap over it"
+        )));
+    }
 
-    let report = if let Some((hour, state)) = unfinished {
-        // The durable cursor owns the resume order: an explicit
-        // `--hour` naming a DIFFERENT hour while one is unfinished
-        // would cross or leap over it — refuse rather than ignore
-        // the override. The same hour resumes its canonical state.
-        if let Some(explicit) = &explicit
-            && *explicit != hour
-        {
-            return Err(Error::msg(format!(
-                "--hour {explicit} but the durable cursor holds unfinished hour \
-                     {hour} ({state}) — refusing to leap over it"
-            )));
-        }
-        match state.as_str() {
+    let report = match selected {
+        Selected::Resume(hour, state) => match state.as_str() {
             // A frozen hour delivers its original staged pages —
             // the input is immutable, so no new Analytics Engine
             // query ever runs for it.
@@ -173,22 +237,15 @@ pub async fn run(
                     "demand feed hour {hour} reports unknown state {other:?}"
                 )));
             }
-        }
-    } else {
-        let hour = match (explicit, &status.watermark) {
-            (Some(hour), _) => hour,
-            (None, Some(watermark)) => DemandFeedHour::parse(watermark)
-                .and_then(|previous| previous.next())
-                .map_err(Error::msg)?,
-            (None, None) => DemandFeedHour::latest_closed(now_secs)
-                .ok_or_else(|| stow_error!("no closed hour is representable"))?,
-        };
-        if hour.ensure_closed(now_secs).is_err() {
-            // The cursor's successor has not closed yet — the feed
-            // is simply early, not failed.
-            FeedRunReport::skipped(hour.to_string())
-        } else {
-            materialize(edge, hour).await?
+        },
+        Selected::Materialize(hour) => {
+            if hour.ensure_closed(now_secs).is_err() {
+                // The cursor's successor has not closed yet — the feed
+                // is simply early, not failed.
+                FeedRunReport::skipped(hour.to_string())
+            } else {
+                materialize(edge, hour).await?
+            }
         }
     };
     render::emit(output, &report, |report| {
@@ -1468,6 +1525,177 @@ mod tests {
         let paths = server.paths();
         assert!(paths.iter().any(|p| p.contains("/deliver")));
         assert!(paths.iter().all(|p| !p.contains("/query")));
+        server.shutdown().await.expect("mock server shutdown");
+    }
+
+    #[tokio::test]
+    async fn frozen_future_hour_keeps_its_pages_while_the_gap_fills() {
+        // The bootstrap-reachable gap: watermark T00 and a complete
+        // frozen T04. The cursor's next hour is T01 — the run
+        // materializes T01 and never touches T04's begin/query/deliver.
+        let mut script = MockEdge::healthy(&[row("crate-0000", &json!(1.0))]);
+        script.status = json!({
+            "watermark": "2020-01-01T00",
+            "unfinished": {
+                "hour": "2020-01-01T04",
+                "state": "complete",
+                "generation": 9,
+                "staged_pages": 2,
+                "staged_entries": 40,
+            },
+        });
+        let mut server = serve(script.delivering(1)).await;
+        run(&server.edge, DemandFeedArgs { hour: None }, Output::Json)
+            .await
+            .expect("the canonical missing hour materializes");
+        let calls = server.drain();
+        let begin = calls
+            .iter()
+            .find(|(p, _)| p == "POST /api/v1/admin/scheduler/demand-feed/begin")
+            .map(|(_, b)| b)
+            .expect("begin ran for the missing hour");
+        assert_eq!(begin["hour"], json!("2020-01-01T01"));
+        assert!(
+            calls.iter().any(|(p, _)| p.contains("/query")),
+            "the gap fill queries the demand document"
+        );
+        for (_, body) in &calls {
+            assert_ne!(
+                body["hour"],
+                json!("2020-01-01T04"),
+                "the frozen future hour is never written"
+            );
+        }
+        server.shutdown().await.expect("mock server shutdown");
+    }
+
+    #[tokio::test]
+    async fn explicit_gap_hour_materializes() {
+        // `--hour` naming the canonical missing hour is the permitted
+        // gap fill — same run as the default cursor, explicit.
+        let mut script = MockEdge::healthy(&[row("crate-0000", &json!(1.0))]);
+        script.status = json!({
+            "watermark": "2020-01-01T00",
+            "unfinished": {
+                "hour": "2020-01-01T04",
+                "state": "complete",
+                "generation": 9,
+                "staged_pages": 2,
+                "staged_entries": 40,
+            },
+        });
+        let mut server = serve(script.delivering(1)).await;
+        run(
+            &server.edge,
+            DemandFeedArgs {
+                hour: Some("2020-01-01T01".to_owned()),
+            },
+            Output::Json,
+        )
+        .await
+        .expect("explicit canonical gap hour materializes");
+        let calls = server.drain();
+        let begin = calls
+            .iter()
+            .find(|(p, _)| p == "POST /api/v1/admin/scheduler/demand-feed/begin")
+            .map(|(_, b)| b)
+            .expect("begin ran");
+        assert_eq!(begin["hour"], json!("2020-01-01T01"));
+        server.shutdown().await.expect("mock server shutdown");
+    }
+
+    #[tokio::test]
+    async fn frozen_hour_resumes_its_original_pages_after_the_gap_fills() {
+        // Once the watermark advances to T03, the still-frozen T04 IS
+        // the canonical successor: it delivers its original staged
+        // pages — no new query, no restage.
+        let mut script = MockEdge::healthy(&[]);
+        script.status = json!({
+            "watermark": "2020-01-01T03",
+            "unfinished": {
+                "hour": "2020-01-01T04",
+                "state": "complete",
+                "generation": 9,
+                "staged_pages": 2,
+                "staged_entries": 40,
+            },
+        });
+        let mut server = serve(script.delivering(1)).await;
+        run(&server.edge, DemandFeedArgs { hour: None }, Output::Json)
+            .await
+            .expect("the reached frozen hour resumes");
+        let calls = server.drain();
+        let deliver = calls
+            .iter()
+            .find(|(p, _)| p == "POST /api/v1/admin/scheduler/demand-feed/deliver")
+            .map(|(_, b)| b)
+            .expect("deliver ran");
+        assert_eq!(deliver["hour"], json!("2020-01-01T04"));
+        let paths: Vec<&String> = calls.iter().map(|(p, _)| p).collect();
+        assert!(
+            paths.iter().all(|p| !p.contains("/query")
+                && !p.contains("/page")
+                && !p.contains("/begin")
+                && !p.contains("/complete")),
+            "a frozen hour never re-queries or re-stages: {paths:?}"
+        );
+        server.shutdown().await.expect("mock server shutdown");
+    }
+
+    #[tokio::test]
+    async fn explicit_future_hour_past_the_gap_refuses() {
+        // `--hour T04` while the canonical hour is T01 refuses before
+        // any begin/query/stage write — the frozen T04's bytes stay
+        // exactly as staged.
+        let mut script = MockEdge::healthy(&[]);
+        script.status = json!({
+            "watermark": "2020-01-01T00",
+            "unfinished": {
+                "hour": "2020-01-01T04",
+                "state": "complete",
+                "generation": 9,
+                "staged_pages": 2,
+                "staged_entries": 40,
+            },
+        });
+        let mut server = serve(script).await;
+        let error = run(
+            &server.edge,
+            DemandFeedArgs {
+                hour: Some("2020-01-01T04".to_owned()),
+            },
+            Output::Json,
+        )
+        .await
+        .expect_err("explicit future past the gap refuses");
+        assert!(format!("{error:#}").contains("leap"), "{error:#}");
+        let paths = server.paths();
+        assert_eq!(paths.len(), 1, "only the status read ran: {paths:?}");
+        server.shutdown().await.expect("mock server shutdown");
+    }
+
+    #[tokio::test]
+    async fn unfinished_at_or_below_the_watermark_is_inconsistent() {
+        // A cursor reporting an unfinished hour the watermark already
+        // covers disagrees with itself — refuse rather than guess.
+        let mut script = MockEdge::healthy(&[]);
+        script.status = json!({
+            "watermark": "2020-01-01T04",
+            "unfinished": {
+                "hour": "2020-01-01T02",
+                "state": "complete",
+                "generation": 1,
+                "staged_pages": 1,
+                "staged_entries": 10,
+            },
+        });
+        let mut server = serve(script).await;
+        let error = run(&server.edge, DemandFeedArgs { hour: None }, Output::Json)
+            .await
+            .expect_err("stale unfinished refuses");
+        assert!(format!("{error:#}").contains("inconsistent"), "{error:#}");
+        let paths = server.paths();
+        assert_eq!(paths.len(), 1, "only the status read ran: {paths:?}");
         server.shutdown().await.expect("mock server shutdown");
     }
 
