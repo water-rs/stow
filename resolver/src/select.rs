@@ -255,17 +255,14 @@ pub fn select_ws_with_opts<'gctx>(
 
     let whitelist = match dropped_lockfile {
         Some(contents) => {
-            let ids = crate::lockfile::lockfile_package_ids(contents)?;
-            // Registry pins go to the yanked whitelist; git pins lock the
-            // git dep to its sha. Registering anything else would be
-            // wrong: `lock()` rewrites a registered node's deps to the
-            // lockfile's versions too.
-            let whitelist: HashSet<PackageId> = ids
-                .iter()
-                .copied()
-                .filter(|id| id.source_id().is_registry())
-                .collect();
-            for (node, deps) in crate::lockfile::lockfile_git_pins(contents)? {
+            // One parse: registry pins go to the yanked whitelist; used
+            // git pins lock the git dep to its sha — registering anything
+            // else would be wrong: `lock()` rewrites a registered node's
+            // deps to the lockfile's versions too. `patch.unused` rows
+            // are never registered or admitted: they are not in the
+            // keep graph.
+            let dropped = crate::lockfile::DroppedLockfile::parse(contents)?;
+            for (node, deps) in dropped.git_pins {
                 registry.register_lock(node, deps);
             }
             // The lockfile's git entries lock git deps to their sha —
@@ -277,15 +274,16 @@ pub fn select_ws_with_opts<'gctx>(
             // registry's source map — keyed ignoring `precise` — then
             // serves the manifest's imprecise dep id from it: the
             // pinned commit is fetched without consulting the ref
-            // (stow#543). Git-only: registry versions still resolve to
-            // the latest semver-compatible.
-            let git_sources = ids
-                .iter()
-                .map(|id| (*id).source_id())
-                .filter(|id| id.is_git())
-                .collect::<Vec<_>>();
-            registry.add_sources(git_sources)?;
-            whitelist
+            // (stow#543). `patch.unused` pins are preloaded the same
+            // way — an unused patch's source must still load to prove
+            // it is unused, and its deleted ref never has to resolve.
+            // Git-only: registry versions still resolve to the latest
+            // semver-compatible.
+            registry.add_sources(dropped.git_source_ids)?;
+            dropped
+                .registry_ids
+                .into_iter()
+                .collect::<HashSet<PackageId>>()
         }
         None => HashSet::new(),
     };
