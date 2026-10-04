@@ -809,11 +809,13 @@ fn stow_src_dirs() -> std::collections::BTreeSet<PathBuf> {
 
 /// Run `body` so its `stow-src-*` count can only see its own case
 /// (stow#540): the parent spawns a copy of this test binary that runs
-/// just `case`, with `TMPDIR` aimed at a fresh parent-owned `TempDir` —
-/// every fixture, fetched tree, and scratch dir the case makes then
-/// lives under that root. `STOW_TEST_SCRATCH_ISOLATED` marks the child
-/// so it runs `body` directly. The child's exit status is the
-/// outcome; nothing reads its output.
+/// just `case`, with `TMPDIR`, `TMP`, and `TEMP` all aimed at a fresh
+/// parent-owned `TempDir` — `std::env::temp_dir` reads `TMPDIR` on
+/// unix and `TMP`/`TEMP` on Windows, so every fixture, fetched tree,
+/// and scratch dir the case makes lives under that root on any host.
+/// `STOW_TEST_SCRATCH_ISOLATED` marks the child so it runs `body`
+/// directly. The child's exit status is the outcome; nothing reads
+/// its output.
 fn isolated_scratch(case: &str, body: impl FnOnce()) {
     if std::env::var_os("STOW_TEST_SCRATCH_ISOLATED").is_some() {
         body();
@@ -823,6 +825,8 @@ fn isolated_scratch(case: &str, body: impl FnOnce()) {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", case])
         .env("TMPDIR", root.path())
+        .env("TMP", root.path())
+        .env("TEMP", root.path())
         .env("STOW_TEST_SCRATCH_ISOLATED", "1")
         .status()
         .expect("the test binary spawns");
