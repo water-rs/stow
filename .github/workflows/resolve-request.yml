@@ -58,7 +58,7 @@ jobs:
       # toolchain is the request's rustc — and nothing more: no extra
       # components, no cross targets, the minimal profile those two
       # probes need.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ fromJSON(inputs.request).rustc_version }}
       # stow-admin comes from the signed toolchain artifact the merge
@@ -75,7 +75,7 @@ jobs:
       - name: Cache stamp
         id: cache-stamp
         run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.REQUEST_CARGO_HOME }}
           key: resolve-request-cargo-${{ runner.os }}-${{ fromJSON(inputs.request).rustc_version }}-${{ steps.cache-stamp.outputs.day }}
