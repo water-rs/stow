@@ -7957,6 +7957,7 @@ dependencies = [
  "async-fs",
  "axum",
  "base64 0.23.1",
+ "blake3",
  "clap",
  "hex",
  "rusqlite",
