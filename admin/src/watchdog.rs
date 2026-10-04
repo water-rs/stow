@@ -2658,18 +2658,18 @@ mod tests {
     }
 
     /// The Analytics Engine `FORMAT JSON` response quotes 64-bit
-    /// integers — `count()` arrives as `"0"`, not `0` (issue #485).
+    /// aggregates — `"0"` decodes just like `0` (issue #485).
     #[test]
     fn analytics_response_decodes_quoted_numbers() {
         let json =
             r#"{"meta":[{"name":"events","type":"UInt64"}],"data":[{"events":"0"}],"rows":1}"#;
         let envelope: Envelope<AnalyticsRow> = serde_json::from_str(json).unwrap();
-        assert_eq!(envelope.data[0].events, 0);
-        // An unquoted integer decodes too — a narrower-than-64-bit
-        // column stays a JSON number on the wire.
+        assert_eq!(envelope.data[0].events, 0.0);
+        // An unquoted number decodes too — a Float64 column stays a
+        // plain JSON number on the wire.
         let envelope: Envelope<AnalyticsRow> =
             serde_json::from_str(r#"{"data":[{"events":17}]}"#).unwrap();
-        assert_eq!(envelope.data[0].events, 17);
+        assert_eq!(envelope.data[0].events, 17.0);
     }
 
     /// A GraphQL `errors` array is a hard error — never a partial read.

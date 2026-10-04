@@ -341,18 +341,16 @@ impl Edge {
             .await
     }
 
-    /// [`post_json`](Self::post_json) at an explicit bound — for the
-    /// routes that legitimately outlive the default, like the scheduler
-    /// budget probe replaying every drive on a seeded fixture.
-    pub(crate) async fn post_json_with_timeout<
-        B: serde::Serialize + Sync,
-        T: serde::de::DeserializeOwned,
-    >(
+    /// `POST` a JSON body to an edge path — the one transport every
+    /// JSON/unit/stream caller shares: bearer + version header +
+    /// timeout + status guard. The caller owns the 2xx response's
+    /// decode, drain, or unbuffered stream.
+    async fn post_response<B: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &B,
         timeout: Duration,
-    ) -> stow_types::error::Result<T> {
+    ) -> stow_types::error::Result<zenwave::Response> {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
         let mut client = zenwave::client().timeout(timeout);
@@ -371,7 +369,24 @@ impl Edge {
         response
             .error_for_status()
             .await
-            .map_err(|error| stow_error!("POST {url}: {error}"))?
+            .map_err(|error| stow_error!("POST {url}: {error}"))
+    }
+
+    /// [`post_json`](Self::post_json) at an explicit bound — for the
+    /// routes that legitimately outlive the default, like the scheduler
+    /// budget probe replaying every drive on a seeded fixture.
+    pub(crate) async fn post_json_with_timeout<
+        B: serde::Serialize + Sync,
+        T: serde::de::DeserializeOwned,
+    >(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> stow_types::error::Result<T> {
+        let url = format!("{}{path}", self.base);
+        self.post_response(path, body, timeout)
+            .await?
             .into_json()
             .await
             .map_err(|error| stow_error!("decode {url}: {error}"))
@@ -386,24 +401,8 @@ impl Edge {
         body: &B,
     ) -> stow_types::error::Result<()> {
         let url = format!("{}{path}", self.base);
-        let bearer = self.bearer().await?;
-        let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
-        let request = client
-            .post(&url)
-            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
-            .and_then(|request| match &self.version_override {
-                Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
-                None => Ok(request),
-            })
-            .and_then(|request| request.json_body(body))
-            .map_err(|error| stow_error!("POST {url}: {error}"))?;
-        let response = request
-            .await
-            .map_err(|error| stow_error!("POST {url}: {error}"))?;
-        response
-            .error_for_status()
-            .await
-            .map_err(|error| stow_error!("POST {url}: {error}"))?
+        self.post_response(path, body, REQUEST_TIMEOUT)
+            .await?
             .into_bytes()
             .await
             .map(|_| ())
@@ -419,25 +418,7 @@ impl Edge {
         path: &str,
         body: &B,
     ) -> stow_types::error::Result<zenwave::Response> {
-        let url = format!("{}{path}", self.base);
-        let bearer = self.bearer().await?;
-        let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
-        let request = client
-            .post(&url)
-            .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
-            .and_then(|request| match &self.version_override {
-                Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
-                None => Ok(request),
-            })
-            .and_then(|request| request.json_body(body))
-            .map_err(|error| stow_error!("POST {url}: {error}"))?;
-        let response = request
-            .await
-            .map_err(|error| stow_error!("POST {url}: {error}"))?;
-        response
-            .error_for_status()
-            .await
-            .map_err(|error| stow_error!("POST {url}: {error}"))
+        self.post_response(path, body, REQUEST_TIMEOUT).await
     }
 }
 

@@ -1675,9 +1675,14 @@ impl DemandFeedHour {
     }
 
     /// Require this hour fully closed at `now_unix_secs` — the check
-    /// feed writes and queries apply to an already-parsed hour.
+    /// feed writes and queries apply to an already-parsed hour. An
+    /// hour whose end is outside the representable calendar range
+    /// refuses rather than panicking on the arithmetic.
     pub fn ensure_closed(&self, now_unix_secs: i64) -> Result<(), String> {
-        if self.end_unix_secs() > now_unix_secs {
+        let Some(end) = self.end_unix_secs() else {
+            return Err(format!("demand feed hour {} is not closed", self.0));
+        };
+        if end > now_unix_secs {
             return Err(format!("demand feed hour {} is not closed", self.0));
         }
         Ok(())
@@ -1688,38 +1693,56 @@ impl DemandFeedHour {
         &self.0
     }
 
-    /// The `YYYY-MM-DD HH` form `demand_feed.sql`'s `__HOUR__`
-    /// marker substitutes.
+    /// The `YYYY-MM-DD HH` form the `demand_feed.sql` askama
+    /// template renders into the Analytics Engine query.
     pub fn sql_literal(&self) -> String {
         self.0.replacen('T', " ", 1)
     }
 
     /// The hour after this one (calendar arithmetic — it may not be
     /// closed; that check happens at use).
-    pub fn next(&self) -> Self {
-        let next = self.parsed() + time::Duration::hours(1);
-        Self(
-            next.format(DEMAND_FEED_HOUR_FORMAT)
-                .unwrap_or_else(|_| unreachable!("calendar hour always formats")),
-        )
+    ///
+    /// # Errors
+    /// The result is outside `time`'s representable calendar range —
+    /// the final representable hour has no successor.
+    pub fn next(&self) -> Result<Self, String> {
+        self.shift(time::Duration::hours(1))
     }
 
     /// The hour before this one — the watermark contiguity check
     /// compares the stored cursor against `prev()` of the hour being
     /// marked delivered.
-    pub fn prev(&self) -> Self {
-        let prev = self.parsed() - time::Duration::hours(1);
-        Self(
-            prev.format(DEMAND_FEED_HOUR_FORMAT)
-                .unwrap_or_else(|_| unreachable!("calendar hour always formats")),
-        )
+    ///
+    /// # Errors
+    /// The result is outside `time`'s representable calendar range —
+    /// the first representable hour has no predecessor.
+    pub fn prev(&self) -> Result<Self, String> {
+        self.shift(-time::Duration::hours(1))
     }
 
-    /// The first second after this hour — the closure boundary.
-    fn end_unix_secs(&self) -> i64 {
-        (self.parsed() + time::Duration::hours(1))
-            .assume_utc()
-            .unix_timestamp()
+    /// Calendar shift that keeps the stored value inside the canonical
+    /// domain: checked arithmetic, canonical re-emit, and the full
+    /// [`parse`](Self::parse) validation round-trip.
+    fn shift(&self, duration: time::Duration) -> Result<Self, String> {
+        let moved = self
+            .parsed()
+            .checked_add(duration)
+            .ok_or_else(|| format!("demand feed hour {} has no representable neighbor", self.0))?;
+        let canonical = moved
+            .format(DEMAND_FEED_HOUR_FORMAT)
+            .map_err(|error| format!("format demand feed hour neighbor: {error}"))?;
+        Self::parse(&canonical)
+    }
+
+    /// The first second after this hour — the closure boundary, or
+    /// `None` when the end is outside the representable range.
+    fn end_unix_secs(&self) -> Option<i64> {
+        Some(
+            self.parsed()
+                .checked_add(time::Duration::hours(1))?
+                .assume_utc()
+                .unix_timestamp(),
+        )
     }
 
     fn parsed(&self) -> time::PrimitiveDateTime {
@@ -1732,6 +1755,29 @@ impl std::fmt::Display for DemandFeedHour {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// One link of the demand-feed manifest chain:
+/// `blake3(chain(p-1) || page_hash(p))`. The Durable Object's staged
+/// `chain_hash`, the materializer's page builder, and the admin
+/// parser's manifest proof all go through this one function so the
+/// encoding can never drift between writer and verifier.
+pub fn demand_feed_chain(previous: &blake3::Hash, page_hash: &blake3::Hash) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(previous.as_bytes());
+    hasher.update(page_hash.as_bytes());
+    hasher.finalize()
+}
+
+/// The canonical demand-feed manifest: `chain(0) = page_hash(0)`, then
+/// `chain(p) = demand_feed_chain(chain(p-1), page_hash(p))` over the
+/// ordered page hashes — `None` for an empty attempt.
+pub fn demand_feed_manifest(page_hashes: &[blake3::Hash]) -> Option<blake3::Hash> {
+    let mut chain = *page_hashes.first()?;
+    for page_hash in &page_hashes[1..] {
+        chain = demand_feed_chain(&chain, page_hash);
+    }
+    Some(chain)
 }
 
 impl<'de> Deserialize<'de> for DemandFeedHour {
@@ -1837,9 +1883,10 @@ pub struct DemandFeedCompleteRequest {
     /// Total entries across all pages.
     pub entry_count: u64,
     /// blake3 rolling hash of the ordered page hashes —
-    /// `chain(page) = blake3(chain(page-1) || page_hash)`, seeded by
-    /// `chain(0) = blake3(page0_hash)` — proving every staged page of
-    /// this attempt, in order. Ignored when `page_count` is `0`.
+    /// [`demand_feed_manifest`]: `chain(0) = page_hash(0)`, then
+    /// `chain(p) = blake3(chain(p-1) || page_hash(p))` — proving every
+    /// staged page of this attempt, in order. Ignored when
+    /// `page_count` is `0`.
     pub manifest_hash: String,
 }
 

@@ -1,9 +1,9 @@
 -- The hourly demand feed's closed-hour query (stow#523): the miss
 -- volume the scheduler's unbuilt closure ranks demand from. One
--- query per closed hour — the `__HOUR__` marker is the validated
--- `YYYY-MM-DD HH` UTC literal the edge substitutes (the SQL API takes
--- no bound parameters; the substitution is digits/dash/space only and
--- the range is checked before formatting). The window arithmetic
+-- query per closed hour — `hour` is the validated `DemandFeedHour`
+-- (YYYY-MM-DD HH UTC) the askama template substitutes (the SQL API
+-- takes no bound parameters; the literal is digits/dash/space only
+-- and the range is checked before formatting). The window arithmetic
 -- stays in the query so no caller-side date math exists.
 --
 -- Blob layout (edge/src/miss_logger.rs): blob1 event, blob2 crate_name,
@@ -37,8 +37,8 @@ WHERE blob1 = 'miss'
     AND blob8 IN ('semantic', 'graph')
     AND blob2 <> ''
     AND blob3 <> ''
-    AND timestamp >= toDateTime('__HOUR__:00:00')
-    AND timestamp < toDateTime('__HOUR__:00:00') + INTERVAL '1' HOUR
+    AND timestamp >= toDateTime('{{ hour.sql_literal() }}:00:00')
+    AND timestamp < toDateTime('{{ hour.sql_literal() }}:00:00') + INTERVAL '1' HOUR
 GROUP BY crate_name, version, features_json, target, rustc_version
 ORDER BY crate_name, version, features_json, target, rustc_version
 LIMIT ALL

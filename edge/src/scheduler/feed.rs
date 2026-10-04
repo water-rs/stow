@@ -53,6 +53,7 @@ use stow_types::api::{
     DEMAND_FEED_RETIRE_CHUNK, DemandFeedBeginReport, DemandFeedCleanupReport,
     DemandFeedCompleteRequest, DemandFeedDeliverReport, DemandFeedHour, DemandFeedPageRequest,
     DemandFeedStatus, DemandFeedUnfinished, SchedulerDemandEntry, SchedulerDemandRequest,
+    demand_feed_chain,
 };
 
 use super::queue::{self, AlarmPlan, SchedulerSettings};
@@ -398,20 +399,14 @@ pub async fn feed_page(
                     request.hour
                 )
             })?;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(
-            blake3::Hash::from_hex(previous.as_str())
-                .map_err(|error| {
-                    QueueError::Invariant(format!(
-                        "stored chain hash for {}/{} does not decode: {error}",
-                        request.hour,
-                        page_no - 1
-                    ))
-                })?
-                .as_bytes(),
-        );
-        hasher.update(page_hash.as_bytes());
-        hasher.finalize()
+        let previous_hash = blake3::Hash::from_hex(previous.as_str()).map_err(|error| {
+            QueueError::Invariant(format!(
+                "stored chain hash for {}/{} does not decode: {error}",
+                request.hour,
+                page_no - 1
+            ))
+        })?;
+        demand_feed_chain(&previous_hash, &page_hash)
     };
     let entry_count = i64::try_from(request.entries.len()).map_err(|_| QueueError::Overflow {
         field: "demand feed page entry count",
@@ -562,6 +557,7 @@ pub async fn feed_deliver(
         // this hour is the watermark's canonical successor (or the
         // first delivered hour), so the cursor can neither leap over
         // missing hours nor move backwards.
+        let predecessor = hour.prev().map_err(QueueError::Invariant)?;
         db.query(
             "UPDATE demand_feed_hours SET state = 'delivered' \
              WHERE hour = ? AND state = 'complete' \
@@ -576,16 +572,15 @@ pub async fn feed_deliver(
         .bind(hour.as_str())
         .bind(WATERMARK_KEY)
         .bind(WATERMARK_KEY)
-        .bind(hour.prev().as_str())
+        .bind(predecessor.as_str())
         .execute()
         .await
         .map_err(|error| format!("mark demand feed hour {hour} delivered: {error}"))?;
         if queue::changes(db).await? != 1 {
             return Err(QueueError::Invariant(format!(
                 "demand feed hour {hour} cannot complete delivery: \
-                 unacknowledged pages remain, the watermark is not at {}, \
-                 or an unfinished hour sits below it",
-                hour.prev()
+                 unacknowledged pages remain, the watermark is not at {predecessor}, \
+                 or an unfinished hour sits below it"
             )));
         }
         let plan = queue::next_alarm(db, now_ms, settings).await?;
@@ -738,6 +733,7 @@ mod tests {
     use crate::scheduler::test_db::{counting_memory_db, memory_db};
     use stow_types::api::{
         DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageRequest, SchedulerDemandEntry,
+        demand_feed_manifest,
     };
     use stow_types::identity::FeaturesJson;
 
@@ -808,25 +804,17 @@ mod tests {
     }
 
     /// The ordered page-hash manifest a materializer declares at
-    /// `complete`: `chain(p) = blake3(chain(p-1) || page_hash(p))`,
-    /// seeded by page 0 — over the same serialized page bytes the DO
-    /// stages.
+    /// `complete` — the canonical [`demand_feed_manifest`] over the
+    /// same serialized page bytes the DO stages.
     fn manifest(pages: &[Vec<SchedulerDemandEntry>]) -> String {
-        let mut chain: Option<blake3::Hash> = None;
-        for entries in pages {
-            let payload = serde_json::to_string(entries).expect("entries serialize");
-            let page_hash = blake3::hash(payload.as_bytes());
-            chain = Some(match chain {
-                None => page_hash,
-                Some(previous) => {
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(previous.as_bytes());
-                    hasher.update(page_hash.as_bytes());
-                    hasher.finalize()
-                }
-            });
-        }
-        chain
+        let page_hashes: Vec<blake3::Hash> = pages
+            .iter()
+            .map(|entries| {
+                let payload = serde_json::to_string(entries).expect("entries serialize");
+                blake3::hash(payload.as_bytes())
+            })
+            .collect();
+        demand_feed_manifest(&page_hashes)
             .map(|hash| hash.to_hex().to_string())
             .unwrap_or_default()
     }
@@ -1308,6 +1296,26 @@ mod tests {
         assert!(DemandFeedHour::parse("2026-1-1T00").is_err());
         assert!(DemandFeedHour::parse("2026-01-01T0030").is_err());
         assert!(DemandFeedHour::parse("2026-13-01T00").is_err());
+        // Calendar shifts stay inside the canonical domain: ordinary
+        // neighbors round-trip, and the representable edges refuse
+        // gracefully instead of panicking or storing a malformed key.
+        assert_eq!(
+            hour("2024-12-31T23").next().expect("next").as_str(),
+            "2025-01-01T00"
+        );
+        assert_eq!(
+            hour("2024-02-29T23").prev().expect("prev").as_str(),
+            "2024-02-29T22"
+        );
+        let first = DemandFeedHour::parse("0000-01-01T00").expect("first hour");
+        assert!(first.prev().is_err());
+        assert!(first.next().is_ok());
+        let last = DemandFeedHour::parse("9999-12-31T23").expect("last hour");
+        assert!(last.next().is_err());
+        // The last representable hour's end is unrepresentable, so
+        // closure is refused gracefully rather than panicking on the
+        // unchecked construction the type used to allow.
+        assert!(last.ensure_closed(i64::MAX).is_err());
         // The current open hour cannot be fed.
         assert!(DemandFeedHour::parse("2033-05-18T03").is_ok());
         let db = memory_db().await.expect("memory db");

@@ -513,7 +513,7 @@ pub async fn admin_scheduler_demand_feed_query(
         .hour
         .ensure_closed(now_secs)
         .map_err(GetArtifactError::BadRequestWithMessage)?;
-    stats::demand_feed_query(&stats_ctx, &request.hour.sql_literal()).await
+    stats::demand_feed_query(&stats_ctx, &request.hour).await
 }
 
 /// `POST /api/v1/admin/scheduler/demand-feed/begin`
