@@ -1425,6 +1425,101 @@ fn deleted_branch_git_patch_pins_resolve_by_sha() {
     });
 }
 
+/// stow#543: an *unused* `[patch.crates-io]` git patch — tray-icon's
+/// exact shape — still has to load its source when patches are
+/// registered, and its only surviving ref identity is the
+/// `[[patch.unused]]` row in the dropped lockfile. The registry copy
+/// wins the graph at its latest-compatible identity; the unused
+/// patch's own deps are never queued.
+#[test]
+fn unused_git_patch_pins_resolve_by_sha() {
+    isolated_scratch("unused_git_patch_pins_resolve_by_sha", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        // The patch repo IS package `dep_a`, but at `0.1.0` — short of
+        // the `dep_a = "1"` requirement — so the patch stays unused and
+        // `dep_b`, its marker dep, never enters the graph.
+        let depgit = work.path().join("depgit");
+        let (dep_url, sha) =
+            git_dep_with_lock(&depgit, "gone", "dep_a", "0.1.0", &json!({ "dep_b": "1" }));
+        let dir = work.path().join("proj");
+        locked_project(
+            &dir,
+            &json!({ "dep_a": "1" }),
+            &json!([
+                { "name": "proj", "version": "0.0.0", "dependencies": ["dep_a"] },
+                {
+                    "name": "dep_a",
+                    "version": "1.0.0",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                },
+            ]),
+        );
+        // The lockfile's only record of the patch is `[[patch.unused]]`
+        // — tray-icon's Cargo.lock row — serialized through
+        // `toml_document` like every fixture document; the manifest
+        // gains its `[patch.crates-io]` the same way.
+        std::fs::write(
+            dir.join("Cargo.lock"),
+            toml_document(&json!({
+                "version": 3,
+                "package": [
+                    { "name": "proj", "version": "0.0.0", "dependencies": ["dep_a"] },
+                    {
+                        "name": "dep_a",
+                        "version": "1.0.0",
+                        "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    },
+                ],
+                "patch": {
+                    "unused": [
+                        {
+                            "name": "dep_a",
+                            "version": "0.1.0",
+                            "source": locked_git_source(&dep_url, "gone", &sha),
+                        },
+                    ],
+                },
+            })),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            toml_document(&json!({
+                "package": { "name": "proj", "version": "0.0.0", "edition": "2021" },
+                "dependencies": { "dep_a": "1" },
+                "patch": { "crates-io": { "dep_a": { "git": dep_url, "branch": "gone" } } },
+            })),
+        )
+        .unwrap();
+        delete_branch_keep_sha(&depgit, "gone", &sha);
+
+        let out = resolver
+            .resolve_project_dir(&dir, &targets, rustc, 0)
+            .expect("the lockfile's unused-patch pin loads the patch source");
+        assert_eq!(
+            requested_crates(&out),
+            vec!["dep_a".to_owned()],
+            "the registry copy wins — the unused patch's deps are not queued"
+        );
+        let dep_a = out.targets[0]
+            .1
+            .iter()
+            .find(|request| request.crate_name.as_str() == "dep_a")
+            .expect("dep_a is queued");
+        assert_eq!(
+            dep_a.version.0.to_string(),
+            "1.0.0",
+            "resolved at the latest-compatible registry identity"
+        );
+    });
+}
+
 /// stow#543: a *transitive* git dep — one the root never names —
 /// honors its lockfile sha the same way: depgit's own manifest
 /// carries `depgit2` on `gone2`, deleted upstream, so only the
