@@ -1824,20 +1824,32 @@ async fn store_manifest(
 /// malformed or ambiguous bound the harness should hear about.
 fn demand_query_hour(body: &str) -> Result<Option<String>, String> {
     const MARKER: &str = "toDateTime('";
-    let Some((start, _)) = body.match_indices(MARKER).next() else {
+    if !body.contains(MARKER) {
         return Ok(None);
-    };
-    let arg = body[start + MARKER.len()..]
-        .split('\'')
-        .next()
-        .ok_or_else(|| "demand query's toDateTime bound is unterminated".to_owned())?;
-    let call = format!("{MARKER}{arg}'");
-    let occurrences = body.matches(&call).count();
-    if occurrences != 2 {
+    }
+    // The feed query's contract is exactly a lower+upper bound pair on
+    // ONE canonical hour: collect every `toDateTime('…')` argument
+    // (closed by `')`) and refuse any other shape — a single bound, a
+    // third bound, two different bounds, or an unterminated call are
+    // all provider malformations, never guesses.
+    let mut args: Vec<&str> = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find(MARKER) {
+        rest = &rest[open + MARKER.len()..];
+        let Some((arg, after)) = rest.split_once("')") else {
+            return Err("demand query's toDateTime bound is unterminated".to_owned());
+        };
+        args.push(arg);
+        rest = after;
+    }
+    if args.len() != 2 || args[0] != args[1] {
         return Err(format!(
-            "demand query carries {occurrences} `toDateTime('{arg}')` bounds, expected the lower+upper pair"
+            "demand query carries {} toDateTime bounds ({args:?}), \
+             expected the lower+upper pair on one canonical hour",
+            args.len(),
         ));
     }
+    let arg = args[0];
     let literal = arg.strip_suffix(":00:00").ok_or_else(|| {
         format!("demand hour bound {arg:?} is not the canonical `:00:00` timestamp")
     })?;
@@ -2934,12 +2946,10 @@ mod tests {
     /// the timestamp in the real WHERE clause, so the extraction must
     /// key off `toDateTime('…')`, never off quote position.
     fn rendered_feed_query(hour_sql_literal: &str) -> String {
-        let template = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../edge/templates/demand_feed.sql"
-        ))
-        .expect("checked-in demand feed template");
-        template.replace("{{ hour.sql_literal() }}", hour_sql_literal)
+        // Compile-time literal of the checked-in template — the test
+        // renders the exact query the edge posts, never a paraphrase.
+        const TEMPLATE: &str = include_str!("../../edge/templates/demand_feed.sql");
+        TEMPLATE.replace("{{ hour.sql_literal() }}", hour_sql_literal)
     }
 
     #[test]
@@ -2964,6 +2974,23 @@ mod tests {
         // Not the canonical hourly `:00:00` timestamp.
         let off_hour = rendered_feed_query("2020-01-01 05").replace("05:00:00", "05:30:00");
         assert!(demand_query_hour(&off_hour).is_err());
+        // Two DIFFERENT bounds — no canonical hour to serve.
+        let divergent = "timestamp >= toDateTime('2020-01-01 05:00:00') AND timestamp < toDateTime('2020-01-01 06:00:00')";
+        assert!(demand_query_hour(divergent).is_err());
+        // A third bound makes the pair ambiguous even when the first
+        // two agree.
+        let three = "toDateTime('2020-01-01 05:00:00') + toDateTime('2020-01-01 05:00:00') + toDateTime('2020-01-01 06:00:00')";
+        assert!(demand_query_hour(three).is_err());
+        // Unterminated call — no closing `')` at all.
+        let unterminated = "timestamp >= toDateTime('2020-01-01 05:00:00";
+        assert!(demand_query_hour(unterminated).is_err());
+        // Malformed closers: the quote closes but `')` never arrives;
+        // and an arg that runs to end-of-string with no close at all.
+        // (A call missing the OPENING quote has no `toDateTime('`
+        // marker at all — it takes the same `Ok(None)` no-marker path
+        // as the stats queries, covered below.)
+        assert!(demand_query_hour("toDateTime('2020-01-01 05:00:00' x)").is_err());
+        assert!(demand_query_hour("toDateTime('2020-01-01 05:00:00").is_err());
         // Garbage argument.
         let garbage = "toDateTime('not-a-date') + toDateTime('not-a-date')";
         assert!(demand_query_hour(garbage).is_err());
@@ -2972,37 +2999,52 @@ mod tests {
         assert_eq!(demand_query_hour(stats), Ok(None));
     }
 
-    #[tokio::test]
-    async fn demand_query_log_writes_one_record_per_call() {
-        let root = std::env::temp_dir().join(format!("mock-reg-log-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("temp dir");
-        log_demand_query(&root, "2020-01-01T05", true)
-            .await
-            .expect("log write");
-        log_demand_query(&root, "2020-01-01T06", false)
-            .await
-            .expect("log write");
-        let log = std::fs::read_to_string(root.join("demand-queries.log")).expect("log");
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(lines[0]).expect("jsonl")["hour"],
-            "2020-01-01T05"
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(lines[1]).expect("jsonl")["served"],
-            false
-        );
+    /// One shared current-thread runtime for the sync tests that
+    /// drive the production async handler/log helpers.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
     }
 
-    #[tokio::test]
-    async fn demand_fixture_hit_and_miss_through_the_handler() {
-        let root = std::env::temp_dir().join(format!("mock-reg-fix-{}", std::process::id()));
-        let fixtures = root.join("fixtures");
+    #[test]
+    fn demand_query_log_writes_one_record_per_call() {
+        // tempfile::TempDir owns a unique directory and drops it — no
+        // fixed temp_dir()+PID path, no stale records between runs.
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let log_path = root.path().join("demand-queries.log");
+        let root_path = root.path().to_path_buf();
+        block_on(async move {
+            log_demand_query(&root_path, "2020-01-01T05", true)
+                .await
+                .expect("log write");
+            log_demand_query(&root_path, "2020-01-01T06", false)
+                .await
+                .expect("log write");
+            let log = tokio::fs::read_to_string(&log_path).await.expect("log");
+            let lines: Vec<&str> = log.lines().collect();
+            assert_eq!(lines.len(), 2);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(lines[0]).expect("jsonl")["hour"],
+                "2020-01-01T05"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(lines[1]).expect("jsonl")["served"],
+                false
+            );
+        });
+    }
+
+    #[test]
+    fn demand_fixture_hit_and_miss_through_the_handler() {
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let fixtures = root.path().join("fixtures");
         std::fs::create_dir_all(&fixtures).expect("fixtures dir");
         std::fs::write(fixtures.join("2020-01-01T05.json"), b"{\"data\":[]}").expect("fixture");
         let state = MockRegistryState {
-            registry_root: root.clone(),
+            registry_root: root.path().to_path_buf(),
             token_realm: "http://127.0.0.1/token".to_owned(),
             tokens: Arc::new(Mutex::new(TokenState::default())),
             requests: None,
@@ -3011,16 +3053,18 @@ mod tests {
             demand_fixtures: Some(fixtures),
         };
         let body = rendered_feed_query("2020-01-01 05");
-        // Hit: the verbatim fixture body answers.
-        let response =
-            analytics_engine_sql(axum::extract::State(state.clone()), body.clone()).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        // Miss: a provider 500, and the log still records the query.
         let miss_body = rendered_feed_query("2020-01-01 07");
-        let response = analytics_engine_sql(axum::extract::State(state), miss_body).await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let log = std::fs::read_to_string(root.join("demand-queries.log")).expect("log");
-        assert_eq!(log.lines().count(), 2);
-        assert!(log.contains("\"served\":false"));
+        let log_path = root.path().join("demand-queries.log");
+        block_on(async move {
+            // Hit: the verbatim fixture body answers.
+            let response = analytics_engine_sql(axum::extract::State(state.clone()), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            // Miss: a provider 500, and the log still records the query.
+            let response = analytics_engine_sql(axum::extract::State(state), miss_body).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let log = tokio::fs::read_to_string(&log_path).await.expect("log");
+            assert_eq!(log.lines().count(), 2);
+            assert!(log.contains("\"served\":false"));
+        });
     }
 }
