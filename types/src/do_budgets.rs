@@ -312,11 +312,11 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_written: 700,
         wall_ms: 3_000,
     },
-    // Every demand-feed cap below is PROVISIONAL: host-measured,
-    // pending actual workerd billed measurements — only these
-    // event-specific caps may be retuned from measured native costs
-    // plus stated headroom; the 31 existing budgets stay unchanged
-    // (stow#523).
+    // The demand-feed caps below are native-calibrated (stow#523):
+    // measured workerd billed rows on the fixture's fixed 384-task
+    // delivery event, plus stated headroom where a shared planner
+    // cost scales with the dispatch cap rather than the event. The
+    // 31 existing budgets stay unchanged.
     DriveBudget {
         // The resume-cursor read: one watermark probe plus one
         // unfinished-index probe — flat in retained depth.
@@ -338,10 +338,12 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
     DriveBudget {
         // Restart with real debris: generation bump/counter reset
         // plus one full 256-row obsolete retire chunk and the
-        // pending probe — measured 7/4/257 on the 10k gate.
+        // pending probe. Native-billed 1028 reads (the indexed
+        // retire probe reads one archived page row per deleted key)
+        // and 257 writes — flat at both fixture shapes.
         name: "POST /scheduler/demand-feed/begin (rotation)",
         statements: 14,
-        rows_read: 8,
+        rows_read: 1_250,
         rows_written: 520,
         wall_ms: 120,
     },
@@ -351,7 +353,7 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         name: "POST /scheduler/demand-feed/page (append)",
         statements: 6,
         rows_read: 8,
-        rows_written: 3,
+        rows_written: 5,
         wall_ms: 60,
     },
     DriveBudget {
@@ -382,39 +384,52 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
     DriveBudget {
         // One page-apply delivery at the protocol's maximum
         // 256-entry page: the bounded next-page SELECT, the
-        // `demand_pass` closure for 256 real fixture identities, the
-        // ack flip and the wake re-plan.
+        // `demand_pass` closure over the entries' touched
+        // dependency graph — the drive's fixed event walks 384
+        // pending tasks on 512 edges, not merely the 256 roots —
+        // the ack flip and the wake re-plan, whose alarm probe cost
+        // is bounded by the dispatch cap. Native-billed
+        // 274/7188/3078 flat at both fixture shapes; the caps
+        // carry ~22% headroom over the measured event.
         name: "POST /scheduler/demand-feed/deliver (page apply)",
         statements: 550,
-        rows_read: 1300,
-        rows_written: 650,
+        rows_read: 8_750,
+        rows_written: 3_750,
         wall_ms: 600,
     },
     DriveBudget {
         // The terminal call — transition-only after every page has
         // applied: its probes plus the contiguous-watermark
-        // `delivered` transition.
+        // `delivered` transition. Native-billed 11/151/2 — of which
+        // ~141 reads are the shared wake planner's alarm probe over
+        // the fixture's 30 in-flight rows — so the cap reserves
+        // explicit headroom toward the production dispatch cap of
+        // 45 rather than a native-45 measurement.
         name: "POST /scheduler/demand-feed/deliver (terminal)",
         statements: 18,
-        rows_read: 40,
+        rows_read: 250,
         rows_written: 4,
         wall_ms: 200,
     },
     DriveBudget {
         // Delivered-hour replay: the `delivered` early-out plus the
-        // wake re-plan.
+        // wake re-plan. Native-billed 6/143/0 — the same shared
+        // wake-planner probe, so the cap carries the same
+        // dispatch-cap headroom as the terminal call.
         name: "POST /scheduler/demand-feed/deliver (replay)",
         statements: 12,
-        rows_read: 30,
+        rows_read: 250,
         rows_written: 0,
         wall_ms: 80,
     },
     DriveBudget {
         // One full retirable chunk: `DELETE … LIMIT 256` plus its
-        // probes — flat in archive depth.
+        // probes — flat in archive depth. Native-billed 1026 reads
+        // (the same indexed retire probe as rotation) and 256
+        // writes — flat at both fixture shapes.
         name: "POST /scheduler/demand-feed/cleanup (full chunk)",
         statements: 8,
-        rows_read: 8,
+        rows_read: 1_250,
         rows_written: 260,
         wall_ms: 200,
     },

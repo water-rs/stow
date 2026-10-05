@@ -1708,16 +1708,19 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // One delivery call that applies the protocol's maximum
         // 256-entry page (stow#523): header read, the bounded
-        // next-unapplied-page SELECT, the `demand_pass` closure for
-        // 256 real fixture identities, the acknowledged flip and
-        // counter read-back, plus the wake re-plan — the largest
-        // page-apply marginal cost the delivery loop can owe.
-        // The page's entries name the setup's own fixed event
+        // next-unapplied-page SELECT, the `demand_pass` closure over
+        // the entries' touched dependency graph, the acknowledged
+        // flip and counter read-back, plus the wake re-plan — whose
+        // alarm probe cost is bounded by the dispatch cap, not the
+        // page. The page's entries name the setup's own fixed event
         // subgraph (`seed_feed_event_subgraph`), so the measured
         // closure is exactly 256 roots + 128 shared deps = 384
         // touched tasks at every fixture shape — the scale check
-        // separates this event's work from stored bulk. The unmetered
-        // cleanup deletes exactly the subgraph's own primary keys.
+        // separates this event's work from stored bulk; a production
+        // 256-root page is bounded by whatever dependency closure
+        // its entries reach, which this fixture does not claim to
+        // bound. The unmetered cleanup deletes exactly the
+        // subgraph's own primary keys.
         name: "POST /scheduler/demand-feed/deliver (page apply)",
         setup: Some(|db, _shape, settings, _ctx| {
             Box::pin(async move {
