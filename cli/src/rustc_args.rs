@@ -13,7 +13,6 @@ pub const STOW_PUBLIC_CACHE_TARGET_ENV: &str = "STOW_PUBLIC_CACHE_TARGET";
 /// cargo ignore `.cargo/config.toml` `target.*.rustflags` — the usual way
 /// `-C link-arg=-fuse-ld=mold` is enabled — for the whole build.
 pub const STOW_RUSTC_EXTRA_ARGS_ENV: &str = "STOW_RUSTC_EXTRA_ARGS";
-
 #[tracing::instrument(name = "stow.rustc.probe.version", skip_all, fields(env_cache_hit))]
 pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, String> {
     if let Some(version) = configured_public_cache_rustc_version() {

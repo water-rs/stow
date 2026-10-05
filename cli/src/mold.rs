@@ -81,35 +81,18 @@ pub async fn provision(
     if !cfg!(target_os = "linux") || explicit_target.is_some_and(|target| !linux_target(target)) {
         return Ok(Vec::new());
     }
-    // The cfg probe and the availability probe are both process spawns,
-    // and they are independent unless a `cfg()` target table changes the
-    // probe's inputs: the conservative read — every cfg table a
-    // candidate, the same read `matching_target_tables` gives an
-    // unanswered cfg probe — launches the probe the config asks for while
-    // rustc is still answering. When the answered cfgs leave the probe
-    // inputs untouched the speculative answer stands; when they change
-    // it the probe reruns on the real inputs. The read is made before
-    // the target triple resolves, too: an explicit `--target` already
-    // names it, and without one the probe asks rustc for the host's own
-    // cfgs — the build's target is the host. A `target.<triple>` table
-    // cannot be matched either way until the triple arrives, so a
-    // resolution that turns out to need one reruns on the real inputs
-    // like a changed cfg answer does (stow#517).
-    let cfgs = tokio::spawn({
-        let target = explicit_target.map(str::to_owned);
-        async move {
-            rustc_target_cfgs(target.as_deref())
-                .instrument(tracing::debug_span!("stow.precargo.mold_cfg_probe"))
-                .await
-        }
-    });
-    let config = CargoConfig::load(cargo_dir, &process_env).await;
-    let candidate = resolve_link_from(
-        &config,
-        explicit_target.unwrap_or_default(),
-        None,
-        &process_env,
-    );
+    // The availability probe is a process spawn, and it is independent
+    // of the target triple unless a `cfg()` target table changes the
+    // probe's inputs: launch the probe the config asks for under a
+    // target-blind read while rustc's own host probe is still running.
+    // When the real target leaves the probe inputs untouched the
+    // speculative answer stands; when they change it the probe reruns
+    // on the real inputs. `cargo-config2` answers the cfg question
+    // lazily on first resolution, so this read costs a rustc probe
+    // only when a `cfg()` table exists (stow#517).
+    let config = cargo_config(cargo_dir, None)
+        .map_err(|error| stow_types::stow_error!("load cargo config: {error}"))?;
+    let candidate = resolve_link_from(&config, explicit_target.unwrap_or_default(), &process_env);
     let speculative = match (candidate.selects_mold, candidate.probe()) {
         (true, probe @ MoldProbe::Driver { .. }) => {
             let task = tokio::spawn({
@@ -128,16 +111,12 @@ pub async fn provision(
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     if !linux_target(&target) {
-        cfgs.abort();
         if let Some((_, task)) = speculative {
             task.abort();
         }
         return Ok(Vec::new());
     }
-    let cfgs = cfgs
-        .await
-        .map_err(|error| stow_types::stow_error!("join rustc cfg probe task: {error}"))?;
-    let link = resolve_link_from(&config, &target, cfgs.as_ref(), &process_env);
+    let link = resolve_link_from(&config, &target, &process_env);
     if link.selects_mold {
         let real = link.probe();
         let reason = match speculative {
@@ -234,12 +213,10 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
     let host = detect_rustc_host_target(OsStr::new("rustc"))
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
-    let (config, cfgs) = futures_util::future::join(
-        CargoConfig::load_global(&process_env),
-        rustc_target_cfgs(Some(&host)),
-    )
-    .await;
-    let link = resolve_link_from(&config, &host, cfgs.as_ref(), &process_env);
+    let cargo_home = crate::config::cargo_home();
+    let config = global_cargo_config(cargo_home.as_deref())
+        .map_err(|error| stow_types::stow_error!("load global cargo config: {error}"))?;
+    let link = resolve_link_from(&config, &host, &process_env);
     if link.selects_mold && link.unavailable_reason().await.is_none() {
         return Ok(None);
     }
@@ -365,10 +342,10 @@ struct LinkResolution {
 /// The environment a link resolution reads — `std::env::var_os` on a
 /// real build, a fixture's map in tests, so a test never mutates the
 /// process's shared environment.
-type EnvLookup<'a> = &'a (dyn Fn(&str) -> Option<OsString> + Sync);
+pub type EnvLookup<'a> = &'a (dyn Fn(&str) -> Option<OsString> + Sync);
 
 /// The process's environment — the [`EnvLookup`] real code reads.
-fn process_env(key: &str) -> Option<OsString> {
+pub fn process_env(key: &str) -> Option<OsString> {
     std::env::var_os(key)
 }
 
@@ -376,23 +353,41 @@ fn process_env(key: &str) -> Option<OsString> {
 /// chain: which `target.*` tables match (cfg tables only when `cfgs` was
 /// answered — `None` keeps them all candidates), the effective rustflags
 /// and linker they resolve to, and whether the selection picks mold.
+/// How the config's linker selection resolves for `target`, read
+/// through `cargo-config2`'s cargo-faithful resolution — env rustflags,
+/// `CARGO_TARGET_*` overrides, and `target.<triple>` plus every
+/// matching `target.<cfg>` table evaluated against `rustc --print
+/// cfg`. A failed read — the cfg probe could not run — selects mold:
+/// erring toward selection is the read whose worst case is an unused
+/// provisioned binary, never a build refused for a linker it could
+/// not check (stow#517).
 fn resolve_link_from(
-    config: &CargoConfig,
+    config: &cargo_config2::Config,
     target: &str,
-    cfgs: Option<&HashSet<String>>,
     env: EnvLookup<'_>,
 ) -> LinkResolution {
-    let tables = config.matching_target_tables(target, cfgs);
-    let rustflags = effective_rustflags(config, &tables, env);
-    let linker = rustflags_linker(&rustflags).or_else(|| effective_linker(target, &tables, env));
-    let selects_mold = linker
-        .as_deref()
-        .is_some_and(|linker| linker.contains("mold"))
-        || rustflags.iter().any(|flag| flag_mentions_mold(flag));
+    let rustflags = config.rustflags(target);
+    let linker = config.linker(target);
+    let probe_failed = rustflags.is_err() || linker.is_err();
+    let rustflags = rustflags
+        .ok()
+        .flatten()
+        .map(|flags| flags.flags)
+        .unwrap_or_default();
+    let linker = rustflags_linker(&rustflags).or_else(|| {
+        linker.ok().flatten().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+    });
     LinkResolution {
+        selects_mold: probe_failed
+            || linker
+                .as_deref()
+                .is_some_and(|linker| linker.contains("mold"))
+            || rustflags.iter().any(|flag| flag_mentions_mold(flag)),
         linker,
         rustflags,
-        selects_mold,
         compiler_path: effective_compiler_path(config, env),
     }
 }
@@ -400,12 +395,20 @@ fn resolve_link_from(
 /// The `COMPILER_PATH` a build at this config would run under, per
 /// cargo's `env` precedence: `force` entries beat the ambient variable,
 /// plain entries lose to it and apply only when it is unset.
-fn effective_compiler_path(config: &CargoConfig, env: EnvLookup<'_>) -> Option<OsString> {
+fn effective_compiler_path(config: &cargo_config2::Config, env: EnvLookup<'_>) -> Option<OsString> {
     let ambient = env("COMPILER_PATH");
-    match config.env_setting("COMPILER_PATH") {
-        Some((value, true)) => Some(value.into()),
-        Some((value, false)) => ambient.or_else(|| Some(value.into())),
-        None => ambient,
+    // `CARGO_ENV_<name>` overrides a `[env]` file entry the way cargo
+    // applies it — below `force` and the ambient variable, above the
+    // file's own entry; `cargo-config2` does not model the prefix.
+    let cargo_env = env("CARGO_ENV_COMPILER_PATH");
+    match config.env.get("COMPILER_PATH") {
+        Some(setting) if setting.force => Some(setting.value.clone()),
+        _ => ambient.or(cargo_env).or_else(|| {
+            config
+                .env
+                .get("COMPILER_PATH")
+                .map(|setting| setting.value.clone())
+        }),
     }
 }
 
@@ -516,20 +519,6 @@ fn path_contains(name: &str) -> bool {
     std::env::split_paths(&path).any(|dir| is_executable(&dir.join(name)))
 }
 
-/// Whether `target`'s effective linker configuration selects mold: the
-/// linker cargo selects for the triple, or any `-C` link option in the
-/// effective rustflags. The gate reads the fuller [`resolve_link_from`]
-/// answer itself; this stays the question the tests ask.
-#[cfg(test)]
-async fn uses_mold(target: &str, cargo_dir: &Path, env: EnvLookup<'_>) -> bool {
-    let (config, cfgs) = futures_util::future::join(
-        CargoConfig::load(cargo_dir, env),
-        rustc_target_cfgs(Some(target)),
-    )
-    .await;
-    resolve_link_from(&config, target, cfgs.as_ref(), env).selects_mold
-}
-
 /// A rustflag selects mold when a `-C` link option's value names it —
 /// `-C link-arg=-fuse-ld=mold`, `-C linker=mold`, a `-C link-args` bundle
 /// carrying `-fuse-ld=mold`, and so on.
@@ -605,55 +594,6 @@ fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
     dirs
 }
 
-/// The rustflags cargo resolves for `target`, honoring cargo's precedence:
-/// `CARGO_ENCODED_RUSTFLAGS`, then `RUSTFLAGS`, then — only when neither env
-/// source exists — the config tables via [`CargoConfig::rustflags`].
-fn effective_rustflags(
-    config: &CargoConfig,
-    tables: &[(String, &toml_edit::Table)],
-    env: EnvLookup<'_>,
-) -> Vec<String> {
-    if let Some(encoded) = env("CARGO_ENCODED_RUSTFLAGS") {
-        return encoded
-            .to_string_lossy()
-            .split('\x1f')
-            .filter(|flag| !flag.is_empty())
-            .map(str::to_owned)
-            .collect();
-    }
-    if let Some(flags) = env("RUSTFLAGS").and_then(|flags| flags.into_string().ok()) {
-        return shell_words::split(&flags).unwrap_or_default();
-    }
-    config.rustflags(tables)
-}
-
-/// The linker cargo selects for `target`: `CARGO_TARGET_<TRIPLE>_LINKER`,
-/// then `target.<triple>.linker`, then a matching `target.<cfg>.linker`.
-fn effective_linker(
-    target: &str,
-    tables: &[(String, &toml_edit::Table)],
-    env: EnvLookup<'_>,
-) -> Option<String> {
-    let env_key = format!(
-        "CARGO_TARGET_{}_LINKER",
-        target.to_uppercase().replace('-', "_")
-    );
-    if let Some(linker) = env(&env_key) {
-        return Some(linker.to_string_lossy().into_owned());
-    }
-    let mut cfg_linker = None;
-    for (key, table) in tables {
-        let Some(linker) = table.get("linker").and_then(toml_edit::Item::as_str) else {
-            continue;
-        };
-        if key == target {
-            return Some(linker.to_owned());
-        }
-        cfg_linker = Some(linker.to_owned());
-    }
-    cfg_linker
-}
-
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -668,192 +608,131 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// The cargo config files that apply to a cargo invocation at `cargo_dir`,
-/// ordered lowest → highest precedence: `$CARGO_HOME/config.toml` first,
-/// then every `.cargo/config` and `.cargo/config.toml` from the filesystem
-/// root down to `cargo_dir` (the same walk cargo performs).
-fn cargo_config_paths(cargo_dir: &Path, env: EnvLookup<'_>) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(cargo_home) = crate::config::cargo_home_with(env) {
-        paths.push(cargo_home.join("config.toml"));
+/// The cargo configuration `cargo-config2` resolves for an invocation
+/// at `cargo_dir` — the `$CARGO_HOME` + ancestor `.cargo/config*` chain
+/// merged and overridden the way cargo does, `target.<cfg>` tables
+/// evaluated against `rustc --print cfg`. `cargo_home` pins the global
+/// file's location; `None` lets the crate resolve `CARGO_HOME` itself.
+pub fn cargo_config(
+    cargo_dir: &Path,
+    cargo_home: Option<&Path>,
+) -> Result<cargo_config2::Config, cargo_config2::Error> {
+    let mut options = cargo_config2::ResolveOptions::default();
+    if let Some(home) = cargo_home {
+        options = options.cargo_home(Some(home.to_path_buf()));
     }
-    let ancestors: Vec<PathBuf> = cargo_dir.ancestors().map(Path::to_path_buf).collect();
-    for dir in ancestors.into_iter().rev() {
-        paths.push(dir.join(".cargo").join("config"));
-        paths.push(dir.join(".cargo").join("config.toml"));
-    }
-    paths
+    cargo_config2::Config::load_with_options(cargo_dir, options)
 }
 
-/// The parsed cargo config chain, kept per-file because cargo resolves each
-/// key from its highest-precedence definer rather than merging whole files.
-struct CargoConfig {
-    files: Vec<toml_edit::DocumentMut>,
-}
-
-impl CargoConfig {
-    /// Only the global `$CARGO_HOME/config.toml` — the read a global
-    /// `stow setup` makes, where project-level files must not answer.
-    async fn load_global(env: EnvLookup<'_>) -> Self {
-        let config = match crate::config::cargo_home_with(env) {
-            Some(cargo_home) => {
-                let path = cargo_home.join("config.toml");
-                async_fs::read_to_string(&path)
-                    .await
-                    .ok()
-                    .and_then(|contents| contents.parse::<toml_edit::DocumentMut>().ok())
-            }
-            None => None,
-        };
-        Self {
-            files: config.into_iter().collect(),
-        }
-    }
-
-    async fn load(cargo_dir: &Path, env: EnvLookup<'_>) -> Self {
-        let paths = cargo_config_paths(cargo_dir, env);
-        // Most of these paths do not exist, and none of the reads depends on
-        // another, so the whole chain is read in one round rather than one
-        // `await` per directory up the tree. `join_all` keeps the results in
-        // the order the paths were built, which is the precedence order.
-        let contents =
-            futures_util::future::join_all(paths.iter().map(async_fs::read_to_string)).await;
-        let files = paths
-            .iter()
-            .zip(contents)
-            .filter_map(|(path, contents)| {
-                let contents = contents.ok()?;
-                match contents.parse::<toml_edit::DocumentMut>() {
-                    Ok(document) => Some(document),
-                    Err(error) => {
-                        tracing::debug!(path = %path.display(), %error, "ignoring unparseable cargo config file");
-                        None
-                    }
-                }
-            })
-            .collect();
-        Self { files }
-    }
-
-    /// The rustflags cargo applies to a build whose target matches
-    /// `tables`: the `target.<triple>` and every matching `target.<cfg>`
-    /// table's `rustflags` joined together, with `build.rustflags` used
-    /// only when no matching target table carries flags — cargo's own
-    /// precedence (`get_target_cfgs` → `target_cfgs` in
-    /// cargo/src/cargo/util/context/target.rs, plus the documented
-    /// `build.rustflags` fallback in the cargo reference).
-    fn rustflags(&self, tables: &[(String, &toml_edit::Table)]) -> Vec<String> {
-        let target_flags = tables
-            .iter()
-            .flat_map(|(_, table)| table.get("rustflags").into_iter().flat_map(rustflags_value))
-            .collect::<Vec<_>>();
-        if !target_flags.is_empty() {
-            return target_flags;
-        }
-        self.lookup(&["build", "rustflags"])
-            .into_iter()
-            .flat_map(rustflags_value)
-            .collect()
-    }
-
-    /// The `env.<key>` entry the chain resolves to — `(value, force)` —
-    /// accepting both the `[env.KEY]` table shape and a bare
-    /// `env.KEY = "…"` string.
-    fn env_setting(&self, key: &str) -> Option<(String, bool)> {
-        let entry = self.lookup(&["env", key])?;
-        if let Some(value) = entry.as_str() {
-            return Some((value.to_owned(), false));
-        }
-        let table = entry.as_table_like()?;
-        let value = table.get("value")?.as_str()?.to_owned();
-        let force = table
-            .get("force")
-            .and_then(toml_edit::Item::as_bool)
-            .unwrap_or(false);
-        Some((value, force))
-    }
-
-    /// The last definition of `path` across the precedence-ordered files —
-    /// the one cargo would resolve.
-    fn lookup(&self, path: &[&str]) -> Option<&toml_edit::Item> {
-        self.files.iter().rev().find_map(|file| {
-            let mut value = file.as_item();
-            for key in path {
-                value = value.get(*key)?;
-            }
-            Some(value)
-        })
-    }
-
-    /// Every `target.*` table matching `target` across the chain —
-    /// `(table key, table)` pairs in precedence order, so later entries are
-    /// the higher-precedence definers.
-    fn matching_target_tables<'a>(
-        &'a self,
-        target: &str,
-        cfgs: Option<&HashSet<String>>,
-    ) -> Vec<(String, &'a toml_edit::Table)> {
-        // Keyed by table name so the nearest definer of each table wins;
-        // position records first appearance so entries stay in
-        // precedence order.
-        let mut order: Vec<String> = Vec::new();
-        let mut by_key: std::collections::HashMap<String, &toml_edit::Table> =
-            std::collections::HashMap::new();
-        for file in &self.files {
-            let Some(target_tables) = file.get("target").and_then(toml_edit::Item::as_table) else {
-                continue;
-            };
-            for (key, value) in target_tables {
-                let Some(table) = value.as_table() else {
-                    continue;
-                };
-                let matches = if key == target {
-                    true
-                } else if let Some(predicate) = key
-                    .strip_prefix("cfg(")
-                    .and_then(|key| key.strip_suffix(')'))
-                {
-                    cfg_matches(predicate, cfgs)
-                } else {
-                    false
-                };
-                if matches {
-                    if !by_key.contains_key(key) {
-                        order.push(key.to_owned());
-                    }
-                    by_key.insert(key.to_owned(), table);
-                }
-            }
-        }
-        order
-            .into_iter()
-            .filter_map(|key| by_key.get(&key).map(|table| (key, *table)))
-            .collect()
-    }
-}
-
-/// `rustc --print cfg --target <triple>` — the truth about which `cfg()`
-/// predicates match; a `None` triple asks rustc about the host, which a
-/// build without `--target` links for. `None` when rustc cannot answer,
-/// in which case every cfg table stays a candidate (favoring a read that
-/// errs toward mold being selected over one that refuses a working
-/// build).
-async fn rustc_target_cfgs(target: Option<&str>) -> Option<HashSet<String>> {
-    let mut command = async_process::Command::new("rustc");
-    command.args(["--print", "cfg"]);
-    if let Some(target) = target {
-        command.arg("--target").arg(target);
-    }
-    let output = command.output().await.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect(),
+/// Only the global end of the chain — the read `stow setup` makes,
+/// where project-level files must not answer: ancestors of
+/// `cargo_home`, which reach `$CARGO_HOME/config.toml` and any
+/// system-level `.cargo` configs above it but never a project's.
+fn global_cargo_config(
+    cargo_home: Option<&Path>,
+) -> Result<cargo_config2::Config, cargo_config2::Error> {
+    let cargo_home = cargo_home.map(Path::to_path_buf);
+    cargo_config2::Config::load_with_options(
+        cargo_home.clone().unwrap_or_default(),
+        cargo_config2::ResolveOptions::default().cargo_home(cargo_home),
     )
+}
+
+/// Every cargo config document cargo reads for an invocation at
+/// `cargo_dir` — `(source label, parsed document)` pairs in merge
+/// order: the files `cargo-config2` walks plus the `--config`
+/// arguments it does not model. Readers needing the documents
+/// themselves — the `[unstable]` scan (also unmodeled) and the cache
+/// key — share this; resolved values go through `cargo-config2`.
+pub fn cargo_config_documents(
+    cargo_dir: &Path,
+    cargo_args: &[std::ffi::OsString],
+) -> Vec<(String, toml_edit::DocumentMut)> {
+    let mut documents = Vec::new();
+    // The walk yields closest-first and only existing files — reverse
+    // to keep the documents in cargo's merge order.
+    for path in cargo_config2::Walk::new(cargo_dir)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match contents.parse::<toml_edit::DocumentMut>() {
+            Ok(document) => documents.push((path.display().to_string(), document)),
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "ignoring unparseable cargo config file");
+            }
+        }
+    }
+    documents.extend(config_arg_documents(cargo_dir, cargo_args));
+    documents
+}
+
+/// The documents `--config` arguments contribute — `(source label,
+/// parsed document)` pairs in spelled order, each a file path or an
+/// inline `key=value` — the one config input `cargo-config2` does not
+/// model.
+pub fn config_arg_documents(
+    cargo_dir: &Path,
+    cargo_args: &[std::ffi::OsString],
+) -> Vec<(String, toml_edit::DocumentMut)> {
+    let mut documents = Vec::new();
+    let mut iter = cargo_args.iter().filter_map(|arg| arg.to_str());
+    while let Some(arg) = iter.next() {
+        let value = arg
+            .strip_prefix("--config=")
+            .map(str::to_owned)
+            .or_else(|| {
+                (arg == "--config")
+                    .then(|| iter.next().map(str::to_owned))
+                    .flatten()
+            });
+        let Some(value) = value else {
+            continue;
+        };
+        let (label, contents) = if value.contains('=') {
+            (format!("--config {value}"), value)
+        } else {
+            let path = cargo_dir.join(&value);
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => (path.display().to_string(), contents),
+                Err(_) => continue,
+            }
+        };
+        match contents.parse::<toml_edit::DocumentMut>() {
+            Ok(document) => documents.push((label, document)),
+            Err(error) => {
+                tracing::debug!(source = %label, %error, "ignoring unparseable --config value");
+            }
+        }
+    }
+    documents
+}
+
+/// `build.target` spelled through `--config`, string or array —
+/// consulted between the spelled `--target` and the env/file chain
+/// (`--config` outranks both in cargo).
+pub fn config_arg_build_target(
+    cargo_dir: &Path,
+    cargo_args: &[std::ffi::OsString],
+) -> Option<Vec<String>> {
+    config_arg_documents(cargo_dir, cargo_args)
+        .iter()
+        .rev()
+        .find_map(|(_, document)| {
+            let value = document.get("build")?.get("target")?;
+            if let Some(target) = value.as_str() {
+                return Some(vec![target.to_owned()]);
+            }
+            value.as_array().map(|array| {
+                array
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+        })
 }
 
 /// A `rustflags` config value as individual flags: an array stays an array,
@@ -1119,63 +998,6 @@ fn unpack_mold(archive: &[u8], bin_dir: &Path) -> stow_types::error::Result<()> 
 }
 
 /// Evaluate a `cfg(...)` predicate body against rustc's printed cfg set.
-/// Unknown cfgs (`None`) keep the table a candidate.
-fn cfg_matches(predicate: &str, cfgs: Option<&HashSet<String>>) -> bool {
-    cfgs.is_none_or(|cfgs| eval_cfg(predicate, cfgs))
-}
-
-fn eval_cfg(text: &str, cfgs: &HashSet<String>) -> bool {
-    let text = text.trim();
-    if let Some(inner) = strip_cfg_fn(text, "all") {
-        return split_cfg_args(inner).all(|part| eval_cfg(part, cfgs));
-    }
-    if let Some(inner) = strip_cfg_fn(text, "any") {
-        return split_cfg_args(inner).any(|part| eval_cfg(part, cfgs));
-    }
-    if let Some(inner) = strip_cfg_fn(text, "not") {
-        return !eval_cfg(inner, cfgs);
-    }
-    match text.split_once('=') {
-        Some((key, value)) => {
-            let leaf = format!("{}={}", key.trim(), value.trim());
-            cfgs.contains(&leaf)
-        }
-        None => cfgs.contains(text),
-    }
-}
-
-/// The argument list of `name(...)` — `text` with the function stripped —
-/// only when `text` is exactly that call.
-fn strip_cfg_fn<'a>(text: &'a str, name: &str) -> Option<&'a str> {
-    text.strip_prefix(name)
-        .and_then(|rest| rest.trim_start().strip_prefix('('))
-        .and_then(|rest| rest.strip_suffix(')'))
-}
-
-/// Split `a, b, c` at top level — commas inside nested parentheses are not
-/// separators.
-fn split_cfg_args(inner: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0usize;
-    let mut parts = Vec::new();
-    let mut start = 0;
-    for (index, ch) in inner.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&inner[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&inner[start..]);
-    parts
-        .into_iter()
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,6 +1011,7 @@ mod tests {
     struct IsolatedProject {
         _tempdir: tempfile::TempDir,
         project: PathBuf,
+        cargo_home: PathBuf,
         env: std::collections::HashMap<String, OsString>,
     }
 
@@ -1196,6 +1019,19 @@ mod tests {
         /// The injected environment: `CARGO_HOME` alone.
         fn env(&self) -> impl Fn(&str) -> Option<OsString> + '_ {
             |key| self.env.get(key).cloned()
+        }
+
+        /// The resolved config for the fixture, with the injected
+        /// environment handed to `cargo-config2` — no test ever reads
+        /// the process environment its siblings share.
+        fn config(&self) -> cargo_config2::Config {
+            cargo_config2::Config::load_with_options(
+                &self.project,
+                cargo_config2::ResolveOptions::default()
+                    .cargo_home(Some(self.cargo_home.clone()))
+                    .env(self.env.clone()),
+            )
+            .expect("load config")
         }
     }
 
@@ -1208,11 +1044,12 @@ mod tests {
         std::fs::create_dir_all(&cargo_home).expect("cargo home");
         let env = std::collections::HashMap::from([(
             "CARGO_HOME".to_owned(),
-            cargo_home.into_os_string(),
+            cargo_home.clone().into_os_string(),
         )]);
         IsolatedProject {
             _tempdir: tempdir,
             project,
+            cargo_home,
             env,
         }
     }
@@ -1220,7 +1057,7 @@ mod tests {
     fn detects_mold(config: &str) -> bool {
         let fixture = isolated_project(config);
         let env = fixture.env();
-        smol::block_on(uses_mold(LINUX_TARGET, &fixture.project, &env))
+        resolve_link_from(&fixture.config(), LINUX_TARGET, &env).selects_mold
     }
 
     fn written_rustflags(config: &str, bin_dir: &str) -> Vec<String> {
@@ -1338,20 +1175,18 @@ mod tests {
         assert_eq!(flags, ["-C", "opt-level=2", "-C", "link-arg=-fuse-ld=mold"]);
     }
 
-    /// The rustflags a config produces for `target`, resolved the way the
-    /// model resolves them — the pieces under test are `CargoConfig::
-    /// matching_target_tables` and `CargoConfig::rustflags`, which answer
-    /// from the parsed documents alone and never consult an environment.
-    fn config_rustflags(config: &str, target: &str, cfgs: Option<&HashSet<String>>) -> Vec<String> {
-        let chain = CargoConfig {
-            files: vec![
-                config
-                    .parse::<toml_edit::DocumentMut>()
-                    .expect("parse config"),
-            ],
-        };
-        let tables = chain.matching_target_tables(target, cfgs);
-        chain.rustflags(&tables)
+    /// The rustflags a config produces for `target`, resolved through
+    /// `cargo-config2` the way cargo resolves them — env overrides,
+    /// matching `target.<triple>`/`target.<cfg>` tables joined, then
+    /// `build.rustflags` when no matching table carries flags.
+    fn config_rustflags(config: &str, target: &str) -> Vec<String> {
+        let fixture = isolated_project(config);
+        fixture
+            .config()
+            .rustflags(target)
+            .expect("resolve rustflags")
+            .map(|flags| flags.flags)
+            .unwrap_or_default()
     }
 
     /// Cargo joins a `target.<triple>` table's rustflags with every
@@ -1360,14 +1195,12 @@ mod tests {
     /// implements in `target_cfgs` (cargo/src/cargo/util/context/
     /// target.rs).
     #[test]
-    fn matching_target_tables_join_and_build_rustflags_drops_out() {
-        let cfgs: HashSet<String> = std::iter::once("target_os=\"linux\"".to_owned()).collect();
+    fn target_tables_join_and_build_rustflags_drops_out() {
         let flags = config_rustflags(
             "[build]\nrustflags = [\"-C\", \"debuginfo=0\"]\n\
              [target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"target-cpu=native\"]\n\
              [target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
             LINUX_TARGET,
-            Some(&cfgs),
         );
         assert_eq!(
             flags,
@@ -1380,12 +1213,10 @@ mod tests {
     /// flags, `build.rustflags` is the answer.
     #[test]
     fn build_rustflags_applies_when_no_target_table_matches() {
-        let cfgs: HashSet<String> = std::iter::once("target_os=\"macos\"".to_owned()).collect();
         let flags = config_rustflags(
             "[build]\nrustflags = [\"-C\", \"debuginfo=0\"]\n\
              [target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
             "aarch64-apple-darwin",
-            Some(&cfgs),
         );
         assert_eq!(flags, ["-C", "debuginfo=0"]);
     }
@@ -1425,17 +1256,12 @@ mod tests {
         let fixture = isolated_project(
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
         );
-        let env = fixture.env();
-        let global = smol::block_on(CargoConfig::load_global(&env));
-        let cfgs: HashSet<String> = std::iter::once("target_os=\"linux\"".to_owned()).collect();
+        let global = global_cargo_config(Some(&fixture.cargo_home)).expect("global config");
         assert!(
             global
-                .matching_target_tables(LINUX_TARGET, Some(&cfgs))
-                .is_empty(),
-            "the project config answered for a global setup"
-        );
-        assert!(
-            global.rustflags(&[]).is_empty(),
+                .rustflags(LINUX_TARGET)
+                .expect("resolve rustflags")
+                .is_none(),
             "project rustflags leaked into the global read"
         );
     }
@@ -1444,11 +1270,14 @@ mod tests {
     fn env_settings_resolve_both_shapes_and_force() {
         let fixture =
             isolated_project("[env.A]\nvalue = \"table\"\nforce = true\n\n[env]\nB = \"string\"\n");
-        let env = fixture.env();
-        let config = smol::block_on(CargoConfig::load(&fixture.project, &env));
-        assert_eq!(config.env_setting("A"), Some(("table".to_owned(), true)));
-        assert_eq!(config.env_setting("B"), Some(("string".to_owned(), false)));
-        assert_eq!(config.env_setting("MISSING"), None);
+        let config = fixture.config();
+        let a = config.env.get("A").expect("env.A");
+        assert_eq!(a.value, std::ffi::OsStr::new("table"));
+        assert!(a.force);
+        let b = config.env.get("B").expect("env.B");
+        assert_eq!(b.value, std::ffi::OsStr::new("string"));
+        assert!(!b.force);
+        assert!(!config.env.contains_key("MISSING"));
     }
 
     #[test]
@@ -1493,51 +1322,6 @@ mod tests {
             ])
             .as_deref(),
             Some("second")
-        );
-    }
-
-    #[test]
-    fn eval_cfg_handles_predicates() {
-        let cfgs: HashSet<String> = ["target_os=\"linux\"", "target_arch=\"x86_64\"", "unix"]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert!(eval_cfg("target_os=\"linux\"", &cfgs));
-        assert!(eval_cfg("unix", &cfgs));
-        assert!(!eval_cfg("target_os=\"macos\"", &cfgs));
-        assert!(eval_cfg("not(target_os=\"macos\")", &cfgs));
-        assert!(eval_cfg(
-            "all(target_os=\"linux\", target_arch=\"x86_64\")",
-            &cfgs
-        ));
-        assert!(!eval_cfg(
-            "all(target_os=\"linux\", target_arch=\"aarch64\")",
-            &cfgs
-        ));
-        assert!(eval_cfg(
-            "any(target_os=\"macos\", target_arch=\"x86_64\")",
-            &cfgs
-        ));
-        assert!(eval_cfg(
-            "all(unix, any(target_os=\"linux\", target_os=\"macos\"))",
-            &cfgs
-        ));
-    }
-
-    #[test]
-    fn cfg_matches_defaults_to_candidate_when_cfgs_unknown() {
-        assert!(cfg_matches("target_os=\"anything\"", None));
-        let cfgs: HashSet<String> = HashSet::new();
-        assert!(!cfg_matches("unix", Some(&cfgs)));
-    }
-
-    #[test]
-    fn split_cfg_args_splits_at_top_level_commas() {
-        let parts: Vec<&str> =
-            split_cfg_args("target_os=\"linux\", any(unix, target_family=\"gnu\")").collect();
-        assert_eq!(
-            parts,
-            vec!["target_os=\"linux\"", "any(unix, target_family=\"gnu\")"]
         );
     }
 

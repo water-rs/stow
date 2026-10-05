@@ -43,6 +43,8 @@ futures-util = "0.3"
 smol = "2"
 tempfile = "3"
 toml_edit = "0.25"
+cargo-config2 = "0.1"
+url = "2"
 find-msvc-tools = "0.1.13"
 zenwave.workspace = true
 toml = "1"
@@ -71,7 +73,6 @@ rustls.workspace = true
 olpc-cjson = "0.1.4"
 const-oid = { version = "0.10", features = ["db"] }
 cargo-lock = "11"
-cargo_metadata = "0.23"
 glob = "0.3"
 reflink = "0.1.3"
 walkdir = "2"

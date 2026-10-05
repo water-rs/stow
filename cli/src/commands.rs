@@ -847,9 +847,8 @@ pub fn configured_cxx_compiler(target: &str) -> Option<String> {
 /// walk). Returns every file holding a stow-owned value.
 fn stale_project_configs(dir: &Path, exclude: &Path) -> Vec<PathBuf> {
     let mut stale = Vec::new();
-    for ancestor in dir.ancestors() {
-        let path = ancestor.join(".cargo").join("config.toml");
-        if path == exclude || !path.is_file() {
+    for path in cargo_config2::Walk::new(dir) {
+        if path == exclude {
             continue;
         }
         let Ok(contents) = std::fs::read_to_string(&path) else {
