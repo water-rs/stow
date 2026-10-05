@@ -554,7 +554,10 @@ impl Watcher<'_> {
     /// writes the event at the point it catches a DO `overloaded` error
     /// (#438); until that writer lands the count is legitimately 0.
     async fn overloaded_reading(&self) -> Result<Vec<Reading>, String> {
-        let query = "SELECT count() AS events FROM stow_events \
+        // Additive estimate: `_sample_interval * double1` sums each
+        // point's engine-recorded interval times its stored weight —
+        // `count()` for today's unsampled writes, scaled if sampled.
+        let query = "SELECT sum(_sample_interval * double1) AS events FROM stow_events \
                      WHERE blob1 = 'overloaded' \
                      AND timestamp >= NOW() - INTERVAL '1' HOUR \
                      FORMAT JSON";
@@ -576,16 +579,12 @@ impl Watcher<'_> {
             .into_json()
             .await
             .map_err(|error| format!("decode {url}: {error}"))?;
-        let events = envelope.data.first().map_or(0, |row| row.events);
+        let events = envelope.data.first().map_or(0.0, |row| row.events);
         let signal = signal("edge.do.overloaded");
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "an hourly event count stays far below 2^52, where f64 is exact"
-        )]
         Ok(vec![Reading {
             signal,
             sample: 1,
-            value: events as f64,
+            value: events,
             evidence: vec![format!(
                 "stow_events blob1='overloaded' last hour: {events}"
             )],
@@ -1347,9 +1346,10 @@ impl CfSnapshot {
 
 #[derive(Debug, serde::Deserialize)]
 struct AnalyticsRow {
-    // `count()` is a UInt64 — `FORMAT JSON` emits it as a quoted string.
-    #[serde(default, deserialize_with = "analytics::de_u64")]
-    events: u64,
+    // `sum(_sample_interval * double1)` is a Float64 — a plain JSON
+    // number (the quoted form is accepted too).
+    #[serde(default, deserialize_with = "analytics::de_f64")]
+    events: f64,
 }
 
 // ----- GitHub wire types -----
@@ -2658,18 +2658,18 @@ mod tests {
     }
 
     /// The Analytics Engine `FORMAT JSON` response quotes 64-bit
-    /// integers — `count()` arrives as `"0"`, not `0` (issue #485).
+    /// aggregates — `"0"` decodes just like `0` (issue #485).
     #[test]
     fn analytics_response_decodes_quoted_numbers() {
         let json =
             r#"{"meta":[{"name":"events","type":"UInt64"}],"data":[{"events":"0"}],"rows":1}"#;
         let envelope: Envelope<AnalyticsRow> = serde_json::from_str(json).unwrap();
-        assert_eq!(envelope.data[0].events, 0);
-        // An unquoted integer decodes too — a narrower-than-64-bit
-        // column stays a JSON number on the wire.
+        assert_eq!(envelope.data[0].events, 0.0);
+        // An unquoted number decodes too — a Float64 column stays a
+        // plain JSON number on the wire.
         let envelope: Envelope<AnalyticsRow> =
             serde_json::from_str(r#"{"data":[{"events":17}]}"#).unwrap();
-        assert_eq!(envelope.data[0].events, 17);
+        assert_eq!(envelope.data[0].events, 17.0);
     }
 
     /// A GraphQL `errors` array is a hard error — never a partial read.

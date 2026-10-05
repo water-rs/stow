@@ -25,7 +25,7 @@ use crate::github_app;
 use crate::scheduler::budget;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
-use crate::scheduler::{dispatch, queue};
+use crate::scheduler::{dispatch, feed, queue};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 /// The catalog D1 binding — `pub(super)` so the budget probe's counted
@@ -191,6 +191,21 @@ impl DurableObject for Scheduler {
             // Trusted demand batches — #522's demand input; reached
             // from `POST /api/v1/admin/scheduler/demand`.
             "/demand".post(scheduler_demand),
+            // The hourly demand feed's durable staging/delivery
+            // surface (stow#523): `begin`/`page`/`complete` freeze one
+            // closed-hour Analytics Engine response into bounded
+            // immutable pages; `deliver` replays the next original
+            // page into the demand ledger and `status` is the resume
+            // cursor. All reached from
+            // `POST /api/v1/admin/scheduler/demand-feed/*`.
+            "/demand-feed".route((
+                "/begin".post(demand_feed_begin),
+                "/page".post(demand_feed_page),
+                "/complete".post(demand_feed_complete),
+                "/cleanup".post(demand_feed_cleanup),
+                "/deliver".post(demand_feed_deliver),
+                "/status".at(demand_feed_status),
+            )),
             // A nested Route under the root — the outer tuple caps at
             // 15 nodes.
             Route::new(("/dispatch-freeze"
@@ -300,6 +315,102 @@ async fn scheduler_demand(
         error
     })?;
     Ok(Json(report))
+}
+
+/// The feed's clock — `js_sys::Date::now()` seconds, same source as
+/// `alarm_inputs`.
+fn feed_now_secs() -> i64 {
+    #[allow(clippy::cast_possible_truncation)]
+    let now_ms = js_sys::Date::now() as i64;
+    now_ms / 1_000
+}
+
+/// `POST /demand-feed/begin` — open or rotate the hour's staging
+/// attempt (stow#523).
+async fn demand_feed_begin(
+    db: DurableDb,
+    Json(request): Json<stow_types::api::DemandFeedBeginRequest>,
+) -> Result<Json<stow_types::api::DemandFeedBeginReport>> {
+    feed::feed_begin(&db, &request.hour, feed_now_secs())
+        .await
+        .map(Json)
+        .map_err(demand_feed_error)
+}
+
+/// `POST /demand-feed/page` — stage one bounded immutable page.
+async fn demand_feed_page(
+    db: DurableDb,
+    Json(request): Json<stow_types::api::DemandFeedPageRequest>,
+) -> Result<Json<serde_json::Value>> {
+    feed::feed_page(&db, &request, feed_now_secs())
+        .await
+        .map(|()| Json(serde_json::json!({"staged": true})))
+        .map_err(demand_feed_error)
+}
+
+/// `POST /demand-feed/complete` — the completion barrier: freeze the
+/// hour once every page of its generation is staged and the manifest
+/// matches.
+async fn demand_feed_complete(
+    db: DurableDb,
+    Json(request): Json<stow_types::api::DemandFeedCompleteRequest>,
+) -> Result<Json<serde_json::Value>> {
+    feed::feed_complete(&db, &request, feed_now_secs())
+        .await
+        .map(|()| Json(serde_json::json!({"complete": true})))
+        .map_err(demand_feed_error)
+}
+
+/// `POST /demand-feed/cleanup` — retire one bounded chunk of the
+/// hour's dead page rows (obsolete generations or a delivered hour's
+/// acknowledged payloads). Explicit event work, never a timer.
+async fn demand_feed_cleanup(
+    db: DurableDb,
+    Json(request): Json<stow_types::api::DemandFeedCleanupRequest>,
+) -> Result<Json<stow_types::api::DemandFeedCleanupReport>> {
+    feed::feed_cleanup(&db, &request.hour, feed_now_secs())
+        .await
+        .map(Json)
+        .map_err(demand_feed_error)
+}
+
+/// `POST /demand-feed/deliver` — replay the next undelivered original
+/// page into the demand ledger, then arm the plan the shared pass
+/// decided — the same probe/rearm `/demand` performs.
+async fn demand_feed_deliver(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(request): Json<stow_types::api::DemandFeedDeliverRequest>,
+) -> Result<Json<stow_types::api::DemandFeedDeliverReport>> {
+    let (now_ms, settings) = alarm_inputs(&env)?;
+    let (report, plan) = feed::feed_deliver(&db, &request.hour, now_ms, &settings)
+        .await
+        .map_err(demand_feed_error)?;
+    queue::arm_alarm(&alarm, plan).await.map_err(|error| {
+        let error = to_error(error);
+        tracing::error!(%error, "demand feed deliver schedule_alarm failed");
+        error
+    })?;
+    Ok(Json(report))
+}
+
+/// `GET /demand-feed/status` — the durable resume cursor.
+async fn demand_feed_status(db: DurableDb) -> Result<Json<stow_types::api::DemandFeedStatus>> {
+    feed::feed_status(&db)
+        .await
+        .map(Json)
+        .map_err(demand_feed_error)
+}
+
+/// Map a feed [`QueueError`] — contract violations are 400s like
+/// `/demand`'s, storage failures 500s.
+fn demand_feed_error(error: QueueError) -> Error {
+    let status = match &error {
+        QueueError::Invariant(_) | QueueError::Overflow { .. } => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    to_error(error).set_status(status)
 }
 
 /// `POST /tasks/submit` — the anonymous-lane submit. The pending-depth

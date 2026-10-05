@@ -374,6 +374,138 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &["idx_queue_shape_requeue"],
         ddl_permitted: false,
     },
+    // Every demand-feed cap below is PROVISIONAL: host-measured on the
+    // 10k gate, pending actual workerd billed measurements — host
+    // result cardinality is not billed rows, so only these
+    // event-specific caps may move when the native pair reports, from
+    // measured costs plus stated headroom. The 31 existing budgets
+    // above stay unchanged (stow#523).
+    RouteBudget {
+        // The resume-cursor read (stow#523): one watermark probe
+        // plus one unfinished-index probe — two point reads, flat in
+        // retained depth.
+        name: "GET /scheduler/demand-feed/status",
+        statements: 4,
+        rows_read: 8,
+        rows_written: 0,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // Fresh open: closed-hour check, watermark guard, header
+        // insert, generation read-back.
+        name: "POST /scheduler/demand-feed/begin (fresh)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 3,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // Restart with real debris: the same guarded path plus the
+        // generation bump, one full 256-row obsolete retire chunk
+        // and the pending probe — measured 7/4/257 on the 10k gate.
+        name: "POST /scheduler/demand-feed/begin (rotation)",
+        statements: 14,
+        rows_read: 8,
+        rows_written: 520,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // One staged page: header probe, ordering/generation guard,
+        // payload insert whose trigger bumps counters.
+        name: "POST /scheduler/demand-feed/page (append)",
+        statements: 6,
+        rows_read: 8,
+        rows_written: 3,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // Same-bytes replay: the guards plus the stored-hash
+        // compare — bounded reads, zero writes.
+        name: "POST /scheduler/demand-feed/page (replay)",
+        statements: 6,
+        rows_read: 8,
+        rows_written: 0,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // Completion barrier, populated hour: manifest verification
+        // over the generation's staged hashes plus the guarded freeze.
+        name: "POST /scheduler/demand-feed/complete (nonempty)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 3,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // The same barrier with an empty generation — verification
+        // against zero pages, still a guarded transition.
+        name: "POST /scheduler/demand-feed/complete (empty)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 3,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // One page-apply delivery at the protocol's maximum
+        // 256-entry page: header read, bounded next-unapplied-page
+        // SELECT, the `demand_pass` closure for 256 real fixture
+        // identities, the acknowledged flip and the wake re-plan —
+        // measured 273/640/310 on the 10k gate.
+        name: "POST /scheduler/demand-feed/deliver (page apply)",
+        statements: 550,
+        rows_read: 1300,
+        rows_written: 650,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // The terminal call — transition-only: every page already
+        // applied, so just the probes plus the contiguous-watermark
+        // guarded `delivered` transition.
+        name: "POST /scheduler/demand-feed/deliver (terminal)",
+        statements: 18,
+        rows_read: 40,
+        rows_written: 4,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // Delivered-hour replay: the header `delivered` early-out
+        // plus the wake re-plan — two reads, no ledger writes.
+        name: "POST /scheduler/demand-feed/deliver (replay)",
+        statements: 12,
+        rows_read: 30,
+        rows_written: 0,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // One full retirable chunk: header read, `DELETE … LIMIT
+        // 256`, pending probe — flat in archive depth.
+        name: "POST /scheduler/demand-feed/cleanup (full chunk)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 260,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
+    RouteBudget {
+        // The retire probe on an all-live generation: header read,
+        // a zero-match DELETE, pending probe.
+        name: "POST /scheduler/demand-feed/cleanup (none obsolete)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 2,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
 ];
 
 /// One measured route run.
@@ -701,6 +833,20 @@ fn every_drive_has_exactly_one_row_in_each_budget_table() {
             names.len(),
             names.iter().copied().collect::<BTreeSet<_>>().len(),
             "{table} has a duplicate row",
+        );
+    }
+    // Route-level coverage, not just table parity: every demand-feed
+    // route the DO registers must have at least one priced drive — a
+    // set-parity check alone would let a whole request path go
+    // unmeasured (stow#523). Drive names carry ` (variant)` suffixes
+    // for the same route's distinct event shapes.
+    for route in ["begin", "page", "complete", "cleanup", "deliver", "status"] {
+        assert!(
+            drives.iter().any(|name| {
+                name.ends_with(&format!("/demand-feed/{route}"))
+                    || name.contains(&format!("/demand-feed/{route} ("))
+            }),
+            "no drive prices /demand-feed/{route}",
         );
     }
 }

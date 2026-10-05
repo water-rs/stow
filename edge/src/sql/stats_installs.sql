@@ -4,6 +4,12 @@
 -- by 7 for the daily average. `count(DISTINCT ...)` is the only distinct
 -- aggregate the Analytics Engine SQL API supports (no `uniq`/`uniqIf`),
 -- which is why the window is a WHERE clause rather than a condition.
+--
+-- This is a sample-observed figure, not an additive estimate: privacy
+-- suppression drops some installs entirely and their counter values
+-- never reach the dataset, so no `_sample_interval` rescaling recovers
+-- them. `count(DISTINCT index1)` reports exactly what was observed —
+-- we do not fabricate an unbiased estimate from the observed set.
 SELECT
     count(DISTINCT index1) AS install_days_7d
 FROM stow_events

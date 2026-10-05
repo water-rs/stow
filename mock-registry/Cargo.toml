@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 stow-types.workspace = true
+blake3.workspace = true
 stow-shim = { workspace = true, features = ["zstd"] }
 tracing.workspace = true
 serde.workspace = true
@@ -35,3 +36,6 @@ zstd = "0.14"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 stow-oci = { workspace = true, features = ["mock-verify"] }
+# The fixture example serializes QueueSelector task-id lists into the
+# same `task_ids=…&task_ids=…` wire encoding the admin queue route reads.
+serde_html_form = "0.4"

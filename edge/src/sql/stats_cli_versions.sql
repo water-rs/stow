@@ -1,10 +1,12 @@
 -- Hits per CLI version over the last 30 days. blob7 is the version
 -- parsed from the `stow-cli/<version> (<os>)` user agent; requests that
--- sent none carry the empty string and are excluded. double1 is the
--- sample weight.
+-- sent none carry the empty string and are excluded. The scaled
+-- estimate sums each point's sampling interval times its stored
+-- caller weight (`_sample_interval * double1`) — exact under today's
+-- unsampled writes.
 SELECT
     blob7 AS name,
-    sum(double1) AS hits
+    sum(_sample_interval * double1) AS hits
 FROM stow_events
 WHERE blob1 = 'hit' AND blob7 != '' AND timestamp >= NOW() - INTERVAL '30' DAY
 GROUP BY name

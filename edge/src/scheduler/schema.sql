@@ -221,7 +221,12 @@ CREATE TABLE IF NOT EXISTS demand_batches (
 -- PRECOMPUTED answers — derived in Rust through the shared rank
 -- abstraction at the post-fold demand before a single ledger write —
 -- so the trigger is a static prepared-field copy and no ranking
--- formula exists in SQL anywhere.
+-- formula exists in SQL anywhere. Acceptance consumes the staged set:
+-- `demand_fold` retires this batch's rows in the same statement after
+-- the fold verifies the count, because an accepted batch's replay
+-- reads only the header (stow#523 — the recurring feed would
+-- otherwise accumulate dead staging rows forever); a `prepared` draft
+-- keeps every staged row for accept-or-retry.
 CREATE TABLE IF NOT EXISTS demand_contributions (
     task_id TEXT NOT NULL,
     -- The batch's durable window identity (e.g. the feed hour).
@@ -245,6 +250,120 @@ CREATE TABLE IF NOT EXISTS demand_contributions (
 -- bound probe are driven by this index, never the stored ledger.
 CREATE INDEX IF NOT EXISTS idx_demand_contributions_batch
 ON demand_contributions (batch_id);
+
+-- One demand-feed hour's durable header (stow#523). `state` is the
+-- typed lifecycle: `staging` holds an incomplete materialization a
+-- same-generation resume continues, `complete` is a frozen hour — its
+-- staged page payloads are immutable input, delivery replays them
+-- verbatim and never re-queries Analytics Engine — and `delivered` is
+-- terminal, every original page acknowledged. `generation` identifies
+-- the staging attempt: pages and the complete barrier bind to it, so
+-- a restarted attempt cannot mix its bytes into a frozen hour, and a
+-- frozen hour's begin refuses. The header is compact forever — it is
+-- the replay proof an old-hour delivery dedupes against — and carries
+-- no retention clock.
+CREATE TABLE IF NOT EXISTS demand_feed_hours (
+    hour TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    state TEXT NOT NULL DEFAULT 'staging'
+        CHECK (state IN ('staging', 'complete', 'delivered')),
+    -- Live staging counters — maintained atomically by the page
+    -- insert/apply triggers, so a page call and a header counter can
+    -- never disagree, and the completion barrier reads the header
+    -- instead of rescanning the generation's pages.
+    staged_pages INTEGER NOT NULL DEFAULT 0 CHECK (staged_pages >= 0),
+    staged_entries INTEGER NOT NULL DEFAULT 0 CHECK (staged_entries >= 0),
+    applied_pages INTEGER NOT NULL DEFAULT 0 CHECK (applied_pages >= 0),
+    -- The frozen manifest the completion barrier verified: page count
+    -- and total entries across this generation's pages. Proving all
+    -- pages staged BEFORE the freeze is the barrier's job — this is
+    -- the recorded result, not a header stamp a later page write could
+    -- drift from.
+    page_count INTEGER NOT NULL DEFAULT 0 CHECK (page_count >= 0),
+    entry_count INTEGER NOT NULL DEFAULT 0 CHECK (entry_count >= 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One staged page of a demand-feed hour's frozen input (stow#523):
+-- the bounded immutable payload (≤256 entries, ≤512 KiB serialized —
+-- under the 100-bind / statement-size / row-size native limits) plus
+-- its `applied` mark. `page_hash` (blake3 of the payload) makes the
+-- page immutable: a same-page replay with identical bytes is a no-op
+-- and a changed payload refuses. `chain_hash` is the rolling blake3
+-- `chain(p) = blake3(chain(p-1) || page_hash(p))` seeded by page 0 —
+-- the completion barrier binds the frozen set to the one ordered
+-- manifest the materializer validated. Delivery replays the payload
+-- into the demand batch `demand-feed/{hour}/{page_no}` and flips
+-- `applied` only after the batch reports — a lost ack re-arms the
+-- same page, which the demand ledger answers as a zero-write
+-- accepted replay. Rows retire in bounded chunks after the hour
+-- delivers and the watermark makes every older replay a no-op:
+-- payloads live exactly as long as unacknowledged delivery needs them.
+CREATE TABLE IF NOT EXISTS demand_feed_pages (
+    hour TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    page_no INTEGER NOT NULL CHECK (page_no >= 0),
+    entry_count INTEGER NOT NULL CHECK (entry_count > 0),
+    page_hash TEXT NOT NULL,
+    chain_hash TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    applied INTEGER NOT NULL DEFAULT 0 CHECK (applied IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (hour, generation, page_no),
+    FOREIGN KEY (hour) REFERENCES demand_feed_hours(hour)
+);
+
+-- Page insert and header counters in the same statement: a staged
+-- page and the hour's `staged_pages`/`staged_entries` can never
+-- disagree. Fires only on INSERT — a begin-rotation's page delete or
+-- an `applied` flip never touches them.
+CREATE TRIGGER IF NOT EXISTS demand_feed_page_stage
+AFTER INSERT ON demand_feed_pages
+BEGIN
+    UPDATE demand_feed_hours
+    SET staged_pages = staged_pages + 1,
+        staged_entries = staged_entries + NEW.entry_count
+    WHERE hour = NEW.hour;
+END;
+
+-- The `applied` flip and the hour's `applied_pages` counter in the
+-- same statement — the deliver walk reads the header, never a COUNT
+-- over every remaining page.
+CREATE TRIGGER IF NOT EXISTS demand_feed_page_apply
+AFTER UPDATE OF applied ON demand_feed_pages
+WHEN NEW.applied = 1 AND OLD.applied = 0
+BEGIN
+    UPDATE demand_feed_hours
+    SET applied_pages = applied_pages + 1
+    WHERE hour = NEW.hour;
+END;
+
+-- The `delivered` transition stamps the durable watermark in the same
+-- statement — a restart can never observe a delivered hour without its
+-- cursor. The `excluded.value > settings.value` guard keeps the
+-- cursor monotonic: an out-of-order or replayed delivery can never
+-- move it backwards. Contiguity (only the canonical next hour may
+-- deliver) is enforced by the guarded transition statement itself.
+CREATE TRIGGER IF NOT EXISTS demand_feed_hour_delivered
+AFTER UPDATE OF state ON demand_feed_hours
+WHEN NEW.state = 'delivered'
+BEGIN
+    INSERT INTO settings (key, value) VALUES ('demand_feed_watermark', NEW.hour)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    WHERE excluded.value > settings.value;
+END;
+
+-- The durable resume cursor's unfinished half: at most one row per
+-- non-terminal hour (`staging` or `complete`), so the feed's status
+-- read is a bounded index probe — never a scan over delivered
+-- headers.
+CREATE INDEX IF NOT EXISTS idx_demand_feed_unfinished
+ON demand_feed_hours (hour)
+WHERE state IN ('staging', 'complete');
+
+-- The deliver walk's per-hour page scan.
+CREATE INDEX IF NOT EXISTS idx_demand_feed_pages_pending
+ON demand_feed_pages (hour, generation, applied, page_no);
 
 -- The claim walk: pending + deps-met rows in dispatch order. The alarm's
 -- dispatch pass reads the first page of this index, never the queue.

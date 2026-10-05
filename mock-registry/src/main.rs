@@ -15,7 +15,7 @@ use axum::{
     body::{Body, to_bytes},
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::Engine;
@@ -26,7 +26,7 @@ use sigstore::cosign::payload::SimpleSigning;
 use sigstore::crypto::signing_key::SigStoreKeyPair;
 use sigstore::crypto::{SigStoreSigner, SigningScheme};
 use stow_shim::schema as artifact_table_schema;
-use stow_types::api::ArtifactRecord;
+use stow_types::api::{ArtifactRecord, DemandFeedHour};
 use stow_types::bundle::{
     ArtifactBlobConfig, BundleArtifactConfig, BundleLayer, BundleParts, BundleSignatureMaterial,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
@@ -420,7 +420,12 @@ async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
     let listener = TcpListener::bind(&request.listen).await.map_err(|error| {
         stow_types::stow_error!("bind mock registry {}: {error}", request.listen)
     })?;
-    let app = registry_app(&request.listen, request.registry_root.clone());
+    let app = registry_app_with_probe(
+        &request.listen,
+        request.registry_root.clone(),
+        None,
+        request.demand_fixtures.clone(),
+    );
     tracing::info!(
         listen = %request.listen,
         registry_root = %request.registry_root.display(),
@@ -436,14 +441,11 @@ async fn serve_registry(request: ServeArgs) -> stow_types::error::Result<()> {
 /// `GET /token` mints the bearer the challenge points at, and only
 /// registry-issued unexpired tokens are served. `POST` takes the monolithic
 /// blob upload and `PUT` stores manifests — the same verbs GHCR answers.
-fn registry_app(listen: &str, registry_root: PathBuf) -> Router {
-    registry_app_with_probe(listen, registry_root, None)
-}
-
 fn registry_app_with_probe(
     listen: &str,
     registry_root: PathBuf,
     probe: Option<RegistryProbe>,
+    demand_fixtures: Option<PathBuf>,
 ) -> Router {
     Router::new()
         .route("/v2", get(v2_ping).head(v2_ping))
@@ -465,6 +467,7 @@ fn registry_app_with_probe(
             requests: probe.as_ref().map(|probe| Arc::clone(&probe.requests)),
             rate_limits: probe.as_ref().map(|probe| Arc::clone(&probe.rate_limits)),
             toggles: probe.as_ref().map(|probe| Arc::clone(&probe.toggles)),
+            demand_fixtures,
         })
 }
 
@@ -494,7 +497,7 @@ impl RegistryProbe {
         };
         let root = probe.registry_root.clone();
         (
-            registry_app_with_probe(listen, root, Some(probe.clone())),
+            registry_app_with_probe(listen, root, Some(probe.clone()), None),
             probe,
         )
     }
@@ -1406,6 +1409,14 @@ struct ServeArgs {
     registry_root: PathBuf,
     #[arg(long, default_value = "127.0.0.1:28123")]
     listen: String,
+    /// Optional directory of per-hour demand-feed provider documents
+    /// (`YYYY-MM-DDTHH.json`, served verbatim — a harness may write a
+    /// truncated or corrupt file). Absent keeps the built-in scripted
+    /// documents. Every served (or refused) demand query appends one
+    /// JSON line to `registry_root/demand-queries.log` so a harness
+    /// proves a query ran — or did not.
+    #[arg(long)]
+    demand_fixtures: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1422,6 +1433,9 @@ struct MockRegistryState {
     /// The probe's behavior toggles — `None` means the well-behaved
     /// registry: single `POST` uploads, digest headers, honest serving.
     toggles: Option<Arc<ProbeToggles>>,
+    /// The optional per-hour demand-feed fixture directory — `None`
+    /// keeps the built-in scripted `analytics_engine/sql` documents.
+    demand_fixtures: Option<PathBuf>,
 }
 
 /// Issued bearer tokens and their expirations; `Instant` is enough
@@ -1801,7 +1815,207 @@ async fn store_manifest(
 /// not name, so one row serves all six. The row keeps Analytics
 /// Engine's real `FORMAT JSON` shape (quoted `UInt64`s) so the public
 /// stats route exercises its genuine SQL-API path end to end.
-async fn analytics_engine_sql() -> Json<serde_json::Value> {
+/// The hour a feed demand query asks for: the `toDateTime('…')`
+/// argument the checked-in `edge/templates/demand_feed.sql` renders on
+/// both window bounds — `timestamp >= toDateTime('…')` and
+/// `timestamp < toDateTime('…') + INTERVAL '1' HOUR`. `Ok(None)` means
+/// the query isn't the demand query (e.g. the stats miss count, which
+/// shares `stow_cache_misses` but carries no bound); `Err` means a
+/// malformed or ambiguous bound the harness should hear about.
+fn demand_query_hour(body: &str) -> Result<Option<String>, String> {
+    const MARKER: &str = "toDateTime('";
+    if !body.contains(MARKER) {
+        return Ok(None);
+    }
+    // The feed query's contract is exactly a lower+upper bound pair on
+    // ONE canonical hour: collect every `toDateTime('…')` argument
+    // (closed by `')`) and refuse any other shape — a single bound, a
+    // third bound, two different bounds, or an unterminated call are
+    // all provider malformations, never guesses.
+    let mut args: Vec<&str> = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find(MARKER) {
+        rest = &rest[open + MARKER.len()..];
+        let Some((arg, after)) = rest.split_once("')") else {
+            return Err("demand query's toDateTime bound is unterminated".to_owned());
+        };
+        args.push(arg);
+        rest = after;
+    }
+    if args.len() != 2 || args[0] != args[1] {
+        return Err(format!(
+            "demand query carries {} toDateTime bounds ({args:?}), \
+             expected the lower+upper pair on one canonical hour",
+            args.len(),
+        ));
+    }
+    let arg = args[0];
+    let literal = arg.strip_suffix(":00:00").ok_or_else(|| {
+        format!("demand hour bound {arg:?} is not the canonical `:00:00` timestamp")
+    })?;
+    let hour = literal.replace(' ', "T");
+    DemandFeedHour::parse(&hour)
+        .map_err(|error| format!("demand hour bound {arg:?} is not a valid hour: {error}"))?;
+    Ok(Some(hour))
+}
+
+/// One JSONL record in one append write —
+/// `registry_root/demand-queries.log` is the harness's proof of which
+/// hours the provider actually answered. A log failure is a provider
+/// failure, never a swallowed line.
+async fn log_demand_query(
+    registry_root: &std::path::Path,
+    hour: &str,
+    served: bool,
+) -> Result<(), Box<Response<Body>>> {
+    use tokio::io::AsyncWriteExt as _;
+    let record = format!("{}\n", serde_json::json!({"hour": hour, "served": served}));
+    let path = registry_root.join("demand-queries.log");
+    let outcome = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        file.write_all(record.as_bytes()).await?;
+        file.flush().await
+    }
+    .await;
+    outcome.map_err(|error| {
+        tracing::error!(%error, path = %path.display(), "demand query log write failed");
+        Box::new(
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "errors": [{"code": 1, "message": format!("demand query log: {error}")}],
+                })),
+            )
+                .into_response(),
+        )
+    })
+}
+
+async fn analytics_engine_sql(
+    State(state): State<MockRegistryState>,
+    body: String,
+) -> Response<Body> {
+    // Fixture mode (stow#523 harness): the optional `--demand-fixtures`
+    // directory carries one verbatim document per requested hour —
+    // `YYYY-MM-DDTHH.json` — so the harness edits a file between runs
+    // to change the provider's answer (including deliberately corrupt
+    // or truncated bytes). Every demand query appends one JSON line to
+    // `registry_root/demand-queries.log`: the hour it asked for and
+    // whether a fixture answered, which is how a lost-ACK resume
+    // proves NO new query ran. Without the flag the built-in scripted
+    // documents below answer exactly as before.
+    if let Some(fixtures) = &state.demand_fixtures
+        && body.contains("stow_cache_misses")
+    {
+        match demand_query_hour(&body) {
+            // A demand query whose bound is malformed or ambiguous is a
+            // provider-side failure, never a guess.
+            Err(message) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({
+                        "errors": [{"code": 1, "message": message}],
+                    })),
+                )
+                    .into_response();
+            }
+            // Not a demand query (e.g. the stats miss count): the
+            // scripted documents below keep their ordinary path.
+            Ok(None) => {}
+            Ok(Some(hour)) => {
+                let file = fixtures.join(format!("{hour}.json"));
+                let bytes = tokio::fs::read(&file).await.ok();
+                if let Err(response) =
+                    log_demand_query(&state.registry_root, &hour, bytes.is_some()).await
+                {
+                    return *response;
+                }
+                return match bytes {
+                    Some(bytes) => (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        bytes,
+                    )
+                        .into_response(),
+                    // No fixture: a provider-side failure the materializer
+                    // must surface, never a silent empty hour.
+                    None => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "errors": [{"code": 1, "message": format!("no demand fixture for {hour}")}],
+                        })),
+                    )
+                        .into_response(),
+                };
+            }
+        }
+    }
+    // The demand feed's hourly leg (stow#523) posts the same endpoint:
+    // its query is the only one carrying `LIMIT ALL … FORMAT JSON`
+    // over `stow_cache_misses`. The document answers in Analytics
+    // Engine's legacy `FORMAT JSON` shape — `meta`/`data`/`rows` —
+    // with the six-column contract the materializer validates, so the
+    // mock-e2e pass exercises the real admin -> workerd -> storage
+    // path. Deterministic per-hour shapes make every leg assertable:
+    // '2020-01-01 00' carries the 520-row multi-page document, '01'
+    // an empty hour, '02' a small one-page document, and '09' a
+    // schema-broken `meta` the materializer must refuse — a provider
+    // shape change with no page applied.
+    if body.contains("stow_cache_misses") && body.contains("LIMIT ALL") {
+        let rows = if body.contains("'2020-01-01 00'") {
+            520
+        } else if body.contains("'2020-01-01 02'") {
+            10
+        } else {
+            0
+        };
+        if body.contains("'2020-01-01 09'") {
+            // A provider-side shape change: `demand` arrives as the
+            // dataset's raw integer, not Float64 — the strict meta
+            // contract refuses before any page stages.
+            return Json(serde_json::json!({
+                "meta": [
+                    {"name": "crate_name", "type": "String"},
+                    {"name": "version", "type": "String"},
+                    {"name": "features_json", "type": "String"},
+                    {"name": "target", "type": "String"},
+                    {"name": "rustc_version", "type": "String"},
+                    {"name": "demand", "type": "UInt64"}
+                ],
+                "data": [],
+                "rows": 0
+            }))
+            .into_response();
+        }
+        let data: Vec<serde_json::Value> = (0..rows)
+            .map(|n| {
+                serde_json::json!({
+                    "crate_name": format!("mock-demand-{n:04}"),
+                    "version": format!("1.{}.0", n % 5),
+                    "features_json": "[]",
+                    "target": "x86_64-unknown-linux-gnu",
+                    "rustc_version": "1.86.0",
+                    "demand": ((n % 7) + 1) as f64
+                })
+            })
+            .collect();
+        return Json(serde_json::json!({
+            "meta": [
+                {"name": "crate_name", "type": "String"},
+                {"name": "version", "type": "String"},
+                {"name": "features_json", "type": "String"},
+                {"name": "target", "type": "String"},
+                {"name": "rustc_version", "type": "String"},
+                {"name": "demand", "type": "Float64"}
+            ],
+            "data": data,
+            "rows": data.len()
+        }))
+        .into_response();
+    }
     Json(serde_json::json!({
         "success": true,
         "errors": [],
@@ -1815,6 +2029,7 @@ async fn analytics_engine_sql() -> Json<serde_json::Value> {
             "hits": 420.0
         }]
     }))
+    .into_response()
 }
 
 /// The edge byte path for hosts that run no worker (the bench lane):
@@ -2060,8 +2275,10 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::{
-        Body, RegistryProbe, SigningScheme, manifest_file_name, registry_app, split_reference,
-        write_blob, write_manifest, write_mock_signature, write_public_key,
+        Arc, Body, MockRegistryState, Mutex, RegistryProbe, SigningScheme, TokenState,
+        analytics_engine_sql, demand_query_hour, log_demand_query, manifest_file_name,
+        registry_app_with_probe, split_reference, write_blob, write_manifest, write_mock_signature,
+        write_public_key,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
@@ -2085,7 +2302,7 @@ mod tests {
             b"{\"schemaVersion\":2}",
         )
         .expect("manifest file");
-        let app = registry_app("127.0.0.1:28123", root.path().to_path_buf());
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
 
         // 1. Unauthenticated asset request → 401 + Bearer challenge. The
         // version ping carries the same challenge — that is how the
@@ -2232,7 +2449,7 @@ mod tests {
         let root = tempfile::tempdir().expect("registry root");
         let bundle = b"not really a tar, but the bytes the index pins".to_vec();
         publish_slice(root.path(), &bundle).await;
-        let app = registry_app("127.0.0.1:28123", root.path().to_path_buf());
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
         let uri = format!("/api/v1/bundles/{}", sha256_digest(&bundle));
 
         let response = app
@@ -2720,5 +2937,134 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{tag} must verify: {error}"));
         }
+    }
+
+    // ---- stow#523 demand-fixture provider tests ----
+
+    /// The checked-in `edge/templates/demand_feed.sql` rendered at a
+    /// known hour — `'miss'`/`'semantic'`/`'graph'` literals precede
+    /// the timestamp in the real WHERE clause, so the extraction must
+    /// key off `toDateTime('…')`, never off quote position.
+    fn rendered_feed_query(hour_sql_literal: &str) -> String {
+        // Compile-time literal of the checked-in template — the test
+        // renders the exact query the edge posts, never a paraphrase.
+        const TEMPLATE: &str = include_str!("../../edge/templates/demand_feed.sql");
+        TEMPLATE.replace("{{ hour.sql_literal() }}", hour_sql_literal)
+    }
+
+    #[test]
+    fn demand_hour_from_the_real_rendered_template() {
+        let query = rendered_feed_query("2020-01-01 05");
+        assert!(
+            query.contains("'miss'") && query.contains("'semantic'"),
+            "identity literals precede the hour in the real query"
+        );
+        assert_eq!(
+            demand_query_hour(&query).expect("valid bound"),
+            Some("2020-01-01T05".to_owned())
+        );
+    }
+
+    #[test]
+    fn demand_hour_rejects_malformed_and_ambiguous_bounds() {
+        // One bound only — ambiguous.
+        let single =
+            "SELECT 1 FROM stow_cache_misses WHERE timestamp >= toDateTime('2020-01-01 05:00:00')";
+        assert!(demand_query_hour(single).is_err());
+        // Not the canonical hourly `:00:00` timestamp.
+        let off_hour = rendered_feed_query("2020-01-01 05").replace("05:00:00", "05:30:00");
+        assert!(demand_query_hour(&off_hour).is_err());
+        // Two DIFFERENT bounds — no canonical hour to serve.
+        let divergent = "timestamp >= toDateTime('2020-01-01 05:00:00') AND timestamp < toDateTime('2020-01-01 06:00:00')";
+        assert!(demand_query_hour(divergent).is_err());
+        // A third bound makes the pair ambiguous even when the first
+        // two agree.
+        let three = "toDateTime('2020-01-01 05:00:00') + toDateTime('2020-01-01 05:00:00') + toDateTime('2020-01-01 06:00:00')";
+        assert!(demand_query_hour(three).is_err());
+        // Unterminated call — no closing `')` at all.
+        let unterminated = "timestamp >= toDateTime('2020-01-01 05:00:00";
+        assert!(demand_query_hour(unterminated).is_err());
+        // Malformed closers: the quote closes but `')` never arrives;
+        // and an arg that runs to end-of-string with no close at all.
+        // (A call missing the OPENING quote has no `toDateTime('`
+        // marker at all — it takes the same `Ok(None)` no-marker path
+        // as the stats queries, covered below.)
+        assert!(demand_query_hour("toDateTime('2020-01-01 05:00:00' x)").is_err());
+        assert!(demand_query_hour("toDateTime('2020-01-01 05:00:00").is_err());
+        // Garbage argument.
+        let garbage = "toDateTime('not-a-date') + toDateTime('not-a-date')";
+        assert!(demand_query_hour(garbage).is_err());
+        // No toDateTime at all — not a demand query.
+        let stats = "SELECT count() FROM stow_cache_misses";
+        assert_eq!(demand_query_hour(stats), Ok(None));
+    }
+
+    /// One shared current-thread runtime for the sync tests that
+    /// drive the production async handler/log helpers.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn demand_query_log_writes_one_record_per_call() {
+        // tempfile::TempDir owns a unique directory and drops it — no
+        // fixed temp_dir()+PID path, no stale records between runs.
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let log_path = root.path().join("demand-queries.log");
+        let root_path = root.path().to_path_buf();
+        block_on(async move {
+            log_demand_query(&root_path, "2020-01-01T05", true)
+                .await
+                .expect("log write");
+            log_demand_query(&root_path, "2020-01-01T06", false)
+                .await
+                .expect("log write");
+            let log = tokio::fs::read_to_string(&log_path).await.expect("log");
+            let lines: Vec<&str> = log.lines().collect();
+            assert_eq!(lines.len(), 2);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(lines[0]).expect("jsonl")["hour"],
+                "2020-01-01T05"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(lines[1]).expect("jsonl")["served"],
+                false
+            );
+        });
+    }
+
+    #[test]
+    fn demand_fixture_hit_and_miss_through_the_handler() {
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let fixtures = root.path().join("fixtures");
+        std::fs::create_dir_all(&fixtures).expect("fixtures dir");
+        std::fs::write(fixtures.join("2020-01-01T05.json"), b"{\"data\":[]}").expect("fixture");
+        let state = MockRegistryState {
+            registry_root: root.path().to_path_buf(),
+            token_realm: "http://127.0.0.1/token".to_owned(),
+            tokens: Arc::new(Mutex::new(TokenState::default())),
+            requests: None,
+            rate_limits: None,
+            toggles: None,
+            demand_fixtures: Some(fixtures),
+        };
+        let body = rendered_feed_query("2020-01-01 05");
+        let miss_body = rendered_feed_query("2020-01-01 07");
+        let log_path = root.path().join("demand-queries.log");
+        block_on(async move {
+            // Hit: the verbatim fixture body answers.
+            let response = analytics_engine_sql(axum::extract::State(state.clone()), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            // Miss: a provider 500, and the log still records the query.
+            let response = analytics_engine_sql(axum::extract::State(state), miss_body).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let log = tokio::fs::read_to_string(&log_path).await.expect("log");
+            assert_eq!(log.lines().count(), 2);
+            assert!(log.contains("\"served\":false"));
+        });
     }
 }

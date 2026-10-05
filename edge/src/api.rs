@@ -496,6 +496,105 @@ pub async fn admin_scheduler_demand(
     ))
 }
 
+/// `POST /api/v1/admin/scheduler/demand-feed/query`
+///
+/// Stream one closed hour's Analytics Engine `FORMAT JSON` document to
+/// the feed's materializer (stow#523): the edge authenticates, runs the
+/// checked-in query and hands the body through unbuffered — the hour
+/// can exceed anything the worker could hold.
+pub async fn admin_scheduler_demand_feed_query(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(stats_ctx): State<stats::StatsContext>,
+    Json(request): Json<stow_types::api::DemandFeedQueryRequest>,
+) -> Result<Response, GetArtifactError> {
+    #[allow(clippy::cast_possible_truncation)]
+    let now_secs = (js_sys::Date::now() / 1_000.0) as i64;
+    request
+        .hour
+        .ensure_closed(now_secs)
+        .map_err(GetArtifactError::BadRequestWithMessage)?;
+    stats::demand_feed_query(&stats_ctx, &request.hour).await
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/begin`
+///
+/// Open or resume the hour's staging attempt (stow#523). Operator-only.
+pub async fn admin_scheduler_demand_feed_begin(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::DemandFeedBeginRequest>,
+) -> Result<Json<stow_types::api::DemandFeedBeginReport>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::demand_feed_begin(&scheduler, &request).await?,
+    ))
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/page`
+///
+/// Stage one bounded immutable page under the attempt generation.
+pub async fn admin_scheduler_demand_feed_page(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::DemandFeedPageRequest>,
+) -> Result<StatusCode, GetArtifactError> {
+    scheduler_client::demand_feed_page(&scheduler, &request).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/complete`
+///
+/// The completion barrier — freeze the hour when its generation's
+/// manifest is fully staged.
+pub async fn admin_scheduler_demand_feed_complete(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::DemandFeedCompleteRequest>,
+) -> Result<StatusCode, GetArtifactError> {
+    scheduler_client::demand_feed_complete(&scheduler, &request).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/cleanup`
+///
+/// Retire one bounded chunk of the hour's dead page rows — explicit
+/// event work the feed's caller drains to completion (stow#523).
+pub async fn admin_scheduler_demand_feed_cleanup(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::DemandFeedCleanupRequest>,
+) -> Result<Json<stow_types::api::DemandFeedCleanupReport>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::demand_feed_cleanup(&scheduler, &request).await?,
+    ))
+}
+
+/// `POST /api/v1/admin/scheduler/demand-feed/deliver`
+///
+/// Deliver the next undelivered original page of a complete hour into
+/// the demand ledger, or retire a fully-acked hour (stow#523).
+pub async fn admin_scheduler_demand_feed_deliver(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::DemandFeedDeliverRequest>,
+) -> Result<Json<stow_types::api::DemandFeedDeliverReport>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::demand_feed_deliver(&scheduler, &request).await?,
+    ))
+}
+
+/// `GET /api/v1/admin/scheduler/demand-feed/status`
+///
+/// The durable resume cursor: oldest unfinished hour plus the
+/// delivered watermark (stow#523).
+pub async fn admin_scheduler_demand_feed_status(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DemandFeedStatus>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::demand_feed_status(&scheduler).await?,
+    ))
+}
+
 /// `GET /api/v1/admin/queue?task_ids=…&status=&target=&crate=&older_than=&limit=`
 ///
 /// Queue rows matching the selector, newest transition first — the
