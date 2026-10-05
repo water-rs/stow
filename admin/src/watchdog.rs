@@ -603,10 +603,7 @@ impl Watcher<'_> {
                 i64::try_from(HOUR).unwrap_or(i64::MAX),
             ))
             .ok_or("window underflow")?;
-        let since_text = since
-            .format(&Rfc3339)
-            .map_err(|error| format!("format window: {error}"))?;
-        let runs = fetch_completed_runs(self.gh_token, &since_text).await?;
+        let runs = fetch_completed_runs(self.gh_token, since).await?;
         let completed = u64::try_from(runs.len()).unwrap_or(u64::MAX);
         let failed: Vec<&GhRun> = runs
             .iter()
@@ -1358,12 +1355,6 @@ struct AnalyticsRow {
 // ----- GitHub wire types -----
 
 #[derive(Debug, serde::Deserialize)]
-struct GhRunsPage {
-    #[serde(default)]
-    workflow_runs: Vec<GhRun>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct GhRun {
     id: u64,
     html_url: String,
@@ -1371,6 +1362,12 @@ struct GhRun {
     conclusion: Option<String>,
     #[serde(default)]
     run_attempt: Option<u32>,
+}
+
+impl github::RunRow for GhRun {
+    fn run_id(&self) -> u64 {
+        self.id
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1405,29 +1402,20 @@ struct GhComment {
     body: Option<String>,
 }
 
-/// Page through build-crate's `completed` runs since `since_iso`
-/// (RFC3339) — both outcomes: the failure rate needs the denominator.
-async fn fetch_completed_runs(gh_token: &str, since_iso: &str) -> Result<Vec<GhRun>, String> {
-    let mut runs = Vec::new();
-    let mut page = 1u32;
-    loop {
-        let page_runs: GhRunsPage = github::get(
-            gh_token,
-            &format!(
-                "actions/workflows/{}/runs?status=completed&created=%3E%3D{since_iso}&per_page=100&page={page}",
-                github::BUILD_WORKFLOW
-            ),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let count = page_runs.workflow_runs.len();
-        runs.extend(page_runs.workflow_runs);
-        if count < 100 {
-            break;
-        }
-        page += 1;
-    }
-    Ok(runs)
+/// Every `completed` build-crate run in the closed window `[since, now]`
+/// — both outcomes, since the failure rate needs the denominator: range
+/// enumeration reads past GitHub's 1000-row listing cap so a dense wave
+/// cannot silently shrink the denominator (stow#555).
+async fn fetch_completed_runs(gh_token: &str, since: OffsetDateTime) -> Result<Vec<GhRun>, String> {
+    github::runs_in_range(
+        github::BUILD_WORKFLOW,
+        "status=completed",
+        since,
+        OffsetDateTime::now_utc(),
+        |path| async move { github::get::<github::RunsPage<GhRun>>(gh_token, &path).await },
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 // ===== Actuation =====

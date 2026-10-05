@@ -118,6 +118,12 @@ struct NodeRun {
     /// dispatch is still inside GitHub's registration grace.
     run_url: Option<String>,
     workflow_run_id: Option<u64>,
+    /// The validator for this node's bound `actions/runs/{id}` read —
+    /// a 304 keeps the cached row and costs nothing against the
+    /// primary rate budget. Both live and die with the node.
+    run_etag: Option<String>,
+    /// The last state the bound run reported — a 304's stand-in.
+    latest: Option<RunState>,
     dispatched: bool,
     /// This node's own dispatch time — `RUN_GRACE_MINUTES` applies per
     /// node, not per layer.
@@ -151,19 +157,18 @@ enum Dispatch {
 /// `MockTaskRun` list fold onto the same record. Both title shapes parse
 /// through `parse_run_title`: a run whose title is not `<rustc>-<task_id>`
 /// is not one this wave could have dispatched.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RunState {
     task_id: String,
     workflow_run_id: u64,
     status: String,
     conclusion: Option<String>,
     url: String,
-    /// The run's `created_at` — adoption pulls the `created>=` window
-    /// back to cover the oldest run the wave tracks.
-    created_at: Option<time::OffsetDateTime>,
-    /// Whether the run built the code `main` carries now. The local CI
-    /// server always runs the checkout it serves, so its runs are.
-    ran_current_code: bool,
+    /// The run's `head_sha` — staleness is judged at fold time against
+    /// this poll's `main` head, so a cached row reclassifies the moment
+    /// `main` moves. The local CI server always runs the checkout it
+    /// serves, so its rows carry an empty sha that is never stale.
+    head_sha: String,
 }
 
 impl RunState {
@@ -171,8 +176,9 @@ impl RunState {
     /// result, so the node is dispatched again rather than adopted as
     /// failed. A success or a run still in flight is adopted whatever it
     /// ran — the success published, and the in-flight run will.
-    fn stale_failure(&self) -> bool {
-        !self.ran_current_code
+    fn stale_failure(&self, main_head: &str) -> bool {
+        !self.head_sha.is_empty()
+            && self.head_sha != main_head
             && self.status == "completed"
             && self.conclusion.as_deref() != Some("success")
     }
@@ -339,6 +345,8 @@ fn build_graph(
             request,
             run_url: None,
             workflow_run_id: None,
+            run_etag: None,
+            latest: None,
             dispatched: false,
             dispatched_at: None,
             done: false,
@@ -854,10 +862,61 @@ async fn dispatch_node(
     Ok(())
 }
 
-/// Drive one layer to completion: adopt runs already on the tracker,
-/// dispatch the rest bounded by `in_flight`, and poll until every node
-/// resolves. Nodes whose runs never materialize inside the grace window
-/// surface as an error — GitHub accepted the dispatch and dropped it.
+/// Fold one observed run state into its node — shared by the one-time
+/// adoption fold and every bound-run poll. A stale failure drops the
+/// node's binding so it dispatches afresh; anything else binds the run
+/// (`dispatched`, `run_url`) and lands done/failed removals in `open`.
+fn fold_run(
+    state: RunState,
+    nodes: &mut BTreeMap<String, NodeRun>,
+    open: &mut BTreeSet<String>,
+    main_head: &str,
+) {
+    let Some(node) = nodes.get_mut(&state.task_id) else {
+        return;
+    };
+    if state.stale_failure(main_head) {
+        // The run this node was tracking ended as a failure of older
+        // code: drop its binding so the node dispatches afresh. The match
+        // is the bound run id — a fresh dispatch has no `run_url` yet and
+        // must still release — while a stale row for any other id never
+        // binds: an unbound node's adoption-time stale simply keeps it
+        // open for a new dispatch.
+        if node.workflow_run_id == Some(state.workflow_run_id) {
+            node.run_url = None;
+            node.workflow_run_id = None;
+            node.run_etag = None;
+            node.latest = None;
+            node.dispatched = false;
+            node.dispatched_at = None;
+        }
+        return;
+    }
+    node.run_url = Some(state.url.clone());
+    node.workflow_run_id = Some(state.workflow_run_id);
+    // An adopted run is a dispatch, whichever invocation sent it: it
+    // counts against `in_flight` and is never sent twice.
+    node.dispatched = true;
+    match (state.status.as_str(), state.conclusion.as_deref()) {
+        ("completed", Some("success")) => {
+            node.done = true;
+            open.remove(&state.task_id);
+        }
+        ("completed", _) => {
+            node.failed = true;
+            open.remove(&state.task_id);
+        }
+        _ => {}
+    }
+    node.latest = Some(state);
+}
+
+/// Drive one layer to completion: adopt once — every run in the closed
+/// `[adopt_since, now]` window whose title names an open node — dispatch
+/// the rest bounded by `in_flight`, then poll only the run ids the wave
+/// is bound to until every node resolves. Nodes whose runs never
+/// materialize inside the grace window surface as an error — GitHub
+/// accepted the dispatch and dropped it.
 async fn drive_layer(
     dispatch: &Dispatch,
     layer: &[String],
@@ -874,17 +933,23 @@ async fn drive_layer(
         })
         .cloned()
         .collect();
-    // The `created>=` window is the wave's adoption horizon: it floors
-    // at `--adopt-since` and can only move earlier, to the oldest run
-    // the wave actually tracks — an adopted run's `created_at`, or
-    // this invocation's first dispatch. A tracked run never falls out
-    // of the window, and runs older than the horizon were never
-    // adopted, so they cannot be mistaken for the wave's.
-    let mut created_since = adopt_since;
-    loop {
+    // Adoption happens exactly once per layer: the whole closed window
+    // `[adopt_since, now]` enumerates completely (past the runs-listing
+    // cap, subdividing as needed), so a run the wave tracks cannot drown
+    // under newer unrelated history. Runs dispatched from here on are
+    // bound by the id the dispatch response returns, and polls read only
+    // those ids — no listing ever runs again for this layer.
+    let mut head_cache: Option<HeadCache> = None;
+    let main_head = dispatch.refresh_head(&mut head_cache).await?;
+    {
         let mut latest = BTreeMap::<String, RunState>::new();
         for state in dispatch
-            .list_runs(&open, created_since, rustc_version)
+            .adopt_runs(
+                &open,
+                adopt_since,
+                time::OffsetDateTime::now_utc(),
+                rustc_version,
+            )
             .await?
         {
             let Some(node) = nodes.get(&state.task_id) else {
@@ -893,39 +958,34 @@ async fn drive_layer(
             retain_latest_run(&mut latest, state, node.workflow_run_id);
         }
         for state in latest.into_values() {
-            let Some(node) = nodes.get_mut(&state.task_id) else {
-                continue;
-            };
-            if state.stale_failure() {
-                // The run this node was tracking ended as a failure of
-                // older code: drop it, so the node dispatches afresh.
-                if node.run_url.as_deref() == Some(state.url.as_str()) {
-                    node.run_url = None;
-                    node.workflow_run_id = None;
-                    node.dispatched = false;
+            fold_run(state, nodes, &mut open, &main_head);
+        }
+    }
+    loop {
+        // `main`'s head is read once per poll — usually a free 304 —
+        // and every row's staleness is judged against it.
+        let main_head = dispatch.refresh_head(&mut head_cache).await?;
+        for outcome in dispatch.poll_bound(nodes, &open, rustc_version).await? {
+            match outcome {
+                BoundPoll::State {
+                    task_id,
+                    state,
+                    etag,
+                } => {
+                    if let Some(node) = nodes.get_mut(&task_id) {
+                        node.run_etag = etag;
+                    }
+                    fold_run(state, nodes, &mut open, &main_head);
                 }
-                continue;
-            }
-            if node.run_url.is_none()
-                && let Some(created) = state.created_at
-            {
-                created_since = created_since.min(created);
-            }
-            node.run_url = Some(state.url);
-            node.workflow_run_id = Some(state.workflow_run_id);
-            // An adopted run is a dispatch, whichever invocation sent it:
-            // it counts against `in_flight` and is never sent twice.
-            node.dispatched = true;
-            match (state.status.as_str(), state.conclusion.as_deref()) {
-                ("completed", Some("success")) => {
-                    node.done = true;
-                    open.remove(&state.task_id);
+                BoundPoll::Unmodified(task_id) => {
+                    // The cached row stands; refold it — a `main` head
+                    // that moved this poll can still stale it.
+                    let cached = nodes.get(&task_id).and_then(|node| node.latest.clone());
+                    if let Some(state) = cached {
+                        fold_run(state, nodes, &mut open, &main_head);
+                    }
                 }
-                ("completed", _) => {
-                    node.failed = true;
-                    open.remove(&state.task_id);
-                }
-                _ => {}
+                BoundPoll::Pending => {}
             }
         }
         let mut running = open
@@ -946,7 +1006,6 @@ async fn drive_layer(
                 continue;
             }
             dispatch_node(dispatch, id, node).await?;
-            created_since = created_since.min(time::OffsetDateTime::now_utc());
             running += 1;
         }
         if open.is_empty() {
@@ -1197,20 +1256,52 @@ impl Dispatch {
         }
     }
 
-    /// Every run the tracker answers for `open` — task-id keyed, so
-    /// GitHub's `workflow_runs` and the local server's task list
-    /// collapse onto the same record. A run's `display_title` is
-    /// `<rustc>-<task_id>`: a title that does not parse, or whose rustc
-    /// is not this wave's, is not one this wave could have dispatched.
-    /// `created_since` is the wave's adoption horizon: GitHub filters
-    /// `created=>={created_since}` and the pages are walked until
-    /// exhausted — a wave's runs can exceed one page of 100. Each run is
-    /// compared against `main`'s head read on the same poll, so a release
-    /// landing mid-wave marks the runs before it as older code.
-    async fn list_runs(
+    /// `main`'s head — GitHub reads it conditionally (a 304 keeps the
+    /// cached sha and its etag), the local server has no ref so staleness
+    /// never applies there.
+    async fn refresh_head(
+        &self,
+        cache: &mut Option<HeadCache>,
+    ) -> stow_types::error::Result<String> {
+        match self {
+            Self::GitHub { token } => {
+                let etag = cache.as_ref().and_then(|cache| cache.etag.as_deref());
+                match crate::github::get_conditional::<GitRef>(
+                    token,
+                    &format!("git/ref/heads/{BRANCH}"),
+                    etag,
+                )
+                .await?
+                {
+                    crate::github::Conditional::Modified { body, etag } => {
+                        let sha = body.object.sha;
+                        *cache = Some(HeadCache {
+                            sha: sha.clone(),
+                            etag,
+                        });
+                        Ok(sha)
+                    }
+                    crate::github::Conditional::Unmodified => Ok(cache
+                        .as_ref()
+                        .expect("a 304 follows a 200 whose validator we sent")
+                        .sha
+                        .clone()),
+                }
+            }
+            Self::Local { .. } => Ok(String::new()),
+        }
+    }
+
+    /// The layer's one-time adoption sweep: every run in the closed
+    /// `[since, until]` window whose `<rustc>-<task_id>` title names an
+    /// open node — GitHub range-enumerates `created` so the whole window
+    /// is read past the 1000-row cap, and the local server answers its
+    /// whole task list as before.
+    async fn adopt_runs(
         &self,
         open: &BTreeSet<String>,
-        created_since: time::OffsetDateTime,
+        since: time::OffsetDateTime,
+        until: time::OffsetDateTime,
         rustc_version: &WireRustcVersion,
     ) -> stow_types::error::Result<Vec<RunState>> {
         if open.is_empty() {
@@ -1218,28 +1309,17 @@ impl Dispatch {
         }
         match self {
             Self::GitHub { token } => {
-                let created = created_since
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .map_err(|error| stow_error!("format adoption horizon: {error}"))?;
-                let head: GitRef =
-                    crate::github::get(token, &format!("git/ref/heads/{BRANCH}")).await?;
-                let mut rows = Vec::new();
-                let mut page = 1u32;
-                loop {
-                    let runs: WorkflowRunsPage = crate::github::get(
-                        token,
-                        &format!(
-                            "actions/workflows/{WORKFLOW_FILE}/runs?event=workflow_dispatch&branch={BRANCH}&per_page=100&page={page}&created=%3E%3D{created}"
-                        ),
-                    )
-                    .await?;
-                    let last_page = runs.workflow_runs.len() < 100;
-                    rows.extend(runs.workflow_runs);
-                    if last_page {
-                        break;
-                    }
-                    page += 1;
-                }
+                let rows = crate::github::runs_in_range(
+                    WORKFLOW_FILE,
+                    &format!("event=workflow_dispatch&branch={BRANCH}"),
+                    since,
+                    until,
+                    |path| async move {
+                        crate::github::get::<crate::github::RunsPage<WorkflowRunRow>>(token, &path)
+                            .await
+                    },
+                )
+                .await?;
                 Ok(rows
                     .into_iter()
                     .filter_map(|run| {
@@ -1251,45 +1331,92 @@ impl Dispatch {
                                 status: run.status,
                                 conclusion: run.conclusion,
                                 url: run.html_url,
-                                ran_current_code: run.head_sha == head.object.sha,
-                                created_at: run.created_at.as_deref().and_then(|raw| {
-                                    time::OffsetDateTime::parse(
-                                        raw,
-                                        &time::format_description::well_known::Rfc3339,
-                                    )
-                                    .ok()
-                                }),
+                                head_sha: run.head_sha,
                             }
                         })
                     })
                     .collect())
             }
-            Self::Local { base } => {
-                let url = format!("{base}/tasks");
-                let mut client = zenwave::client();
-                let tasks: LocalTasksResponse = client
-                    .get(&url)?
-                    .await?
-                    .error_for_status()
-                    .await?
-                    .into_json()
-                    .await?;
-                Ok(tasks
-                    .tasks
-                    .into_iter()
-                    .filter_map(|run| {
-                        let (rustc, task_id) = parse_run_title(&run.display_title)?;
-                        (rustc == rustc_version.as_str() && open.contains(task_id)).then(|| {
-                            RunState {
-                                task_id: task_id.to_owned(),
-                                workflow_run_id: run.workflow_run_id,
-                                status: run.status,
-                                conclusion: run.conclusion,
-                                url: run.html_url,
-                                created_at: None,
-                                ran_current_code: true,
-                            }
+            Self::Local { base } => local_run_states(base, open, rustc_version).await,
+        }
+    }
+
+    /// Poll only the runs the wave is bound to: each open node's tracked
+    /// run id gets one conditional `actions/runs/{id}` read — a 304 keeps
+    /// the node's cached row — at the read bound of 8. A run id GitHub
+    /// has not materialized yet answers `Pending` and stays under the
+    /// node grace window. The local server keeps its `/tasks` contract:
+    /// it answers the open tasks' states from one list read.
+    async fn poll_bound(
+        &self,
+        nodes: &BTreeMap<String, NodeRun>,
+        open: &BTreeSet<String>,
+        rustc_version: &WireRustcVersion,
+    ) -> stow_types::error::Result<Vec<BoundPoll>> {
+        match self {
+            Self::GitHub { token } => futures_util::stream::iter(
+                open.iter()
+                    .filter_map(|id| {
+                        let node = nodes.get(id)?;
+                        node.workflow_run_id.map(|run_id| {
+                            (
+                                id.clone(),
+                                run_id,
+                                node.run_etag.clone(),
+                                node.run_url.is_some() || node.latest.is_some(),
+                            )
                         })
+                    })
+                    .map(|(task_id, run_id, etag, observed)| async move {
+                        let path = format!("actions/runs/{run_id}");
+                        match crate::github::get_conditional_result::<WorkflowRunRow>(
+                            token,
+                            &path,
+                            etag.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(crate::github::Conditional::Unmodified) => {
+                                Ok(BoundPoll::Unmodified(task_id))
+                            }
+                            Ok(crate::github::Conditional::Modified { body: row, etag }) => {
+                                let state = bound_run_state(row, run_id, &task_id, rustc_version)?;
+                                Ok(BoundPoll::State {
+                                    task_id,
+                                    state,
+                                    etag,
+                                })
+                            }
+                            Err(zenwave::Error::Http { status, .. }) if status.as_u16() == 404 => {
+                                run_404(run_id, observed)
+                            }
+                            Err(error) => Err(stow_error!("GET actions/runs/{run_id}: {error}")),
+                        }
+                    }),
+            )
+            .buffered(SLICE_PULL_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect(),
+            Self::Local { base } => {
+                // The same tracked-id binding GitHub gets: a local row
+                // that is not the node's bound run id is dropped before
+                // the fold, so an old same-task completion can never
+                // answer a newer bound retry.
+                let mut latest = BTreeMap::<String, RunState>::new();
+                for state in local_run_states(base, open, rustc_version).await? {
+                    let tracked = nodes
+                        .get(&state.task_id)
+                        .and_then(|node| node.workflow_run_id);
+                    retain_latest_run(&mut latest, state, tracked);
+                }
+                Ok(latest
+                    .into_values()
+                    .map(|state| BoundPoll::State {
+                        task_id: state.task_id.clone(),
+                        state,
+                        etag: None,
                     })
                     .collect())
             }
@@ -1297,12 +1424,109 @@ impl Dispatch {
     }
 }
 
-/// The GitHub runs API's page shape — the fields the driver needs.
-#[derive(serde::Deserialize)]
-struct WorkflowRunsPage {
-    workflow_runs: Vec<WorkflowRunRow>,
+/// One bound run's poll answer: a fresh row to fold, `Unmodified` when
+/// the node's cached row still stands (the fold re-judges it against the
+/// current `main` head), `Pending` when the run id has not materialized.
+enum BoundPoll {
+    State {
+        task_id: String,
+        state: RunState,
+        etag: Option<String>,
+    },
+    Unmodified(String),
+    Pending,
 }
 
+/// A bound run's 404: an id that already materialized — the node
+/// observed its row — is GitHub dropping a run, which is a clear error;
+/// only a fresh dispatch id that has never been seen waits out its
+/// grace window as `Pending`.
+fn run_404(run_id: u64, observed: bool) -> stow_types::error::Result<BoundPoll> {
+    if observed {
+        Err(stow_error!(
+            "workflow run {run_id} was observed and now answers 404 — GitHub dropped a materialized run"
+        ))
+    } else {
+        Ok(BoundPoll::Pending)
+    }
+}
+
+/// `main`'s cached head for one layer — the sha and the validator that
+/// turns the next read into a 304.
+struct HeadCache {
+    sha: String,
+    etag: Option<String>,
+}
+
+/// Fold a `GET actions/runs/{id}` row into a run state: the row's own id
+/// must be the bound one and its `display_title` the node's
+/// `<rustc>-<task_id>` — anything else means GitHub answered for a
+/// different run, which is never a state this node may take.
+fn bound_run_state(
+    row: WorkflowRunRow,
+    run_id: u64,
+    task_id: &str,
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<RunState> {
+    if row.id != run_id {
+        return Err(stow_error!(
+            "actions/runs/{run_id} answered with run {} — binding refused",
+            row.id
+        ));
+    }
+    let Some((rustc, title_task)) = parse_run_title(&row.display_title) else {
+        return Err(stow_error!(
+            "actions/runs/{run_id} title {:?} is not a task title",
+            row.display_title
+        ));
+    };
+    if rustc != rustc_version.as_str() || title_task != task_id {
+        return Err(stow_error!(
+            "actions/runs/{run_id} title {:?} does not match bound task {task_id}",
+            row.display_title
+        ));
+    }
+    Ok(RunState {
+        task_id: task_id.to_owned(),
+        workflow_run_id: row.id,
+        status: row.status,
+        conclusion: row.conclusion,
+        url: row.html_url,
+        head_sha: row.head_sha,
+    })
+}
+
+/// The local CI server's `/tasks` rows folded to run states — the same
+/// contract the mock always had: title-parsed, this wave's rustc, open
+/// tasks only.
+async fn local_run_states(
+    base: &str,
+    open: &BTreeSet<String>,
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<Vec<RunState>> {
+    let url = format!("{base}/tasks");
+    // The shared bounded idempotent read — the local server is
+    // unauthenticated, so no operator token rides it.
+    let tasks: LocalTasksResponse = crate::github::get_url_json(&url, None).await?;
+    Ok(tasks
+        .tasks
+        .into_iter()
+        .filter_map(|run| {
+            let (rustc, task_id) = parse_run_title(&run.display_title)?;
+            (rustc == rustc_version.as_str() && open.contains(task_id)).then(|| RunState {
+                task_id: task_id.to_owned(),
+                workflow_run_id: run.workflow_run_id,
+                status: run.status,
+                conclusion: run.conclusion,
+                url: run.html_url,
+                head_sha: String::new(),
+            })
+        })
+        .collect())
+}
+
+/// One run row as both `workflow_runs` listings and `actions/runs/{id}`
+/// serve it — the fields the driver needs.
 #[derive(serde::Deserialize)]
 struct WorkflowRunRow {
     id: u64,
@@ -1311,7 +1535,12 @@ struct WorkflowRunRow {
     status: String,
     conclusion: Option<String>,
     html_url: String,
-    created_at: Option<String>,
+}
+
+impl crate::github::RunRow for WorkflowRunRow {
+    fn run_id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// `GET /git/ref/heads/{branch}` — the fields the driver needs.
@@ -1349,6 +1578,9 @@ struct LocalTaskRun {
 mod tests {
     use super::*;
 
+    /// `main`'s sha in the test fixtures.
+    const MAIN_HEAD: &str = "1111111111111111111111111111111111111111";
+
     fn run_state(status: &str, conclusion: Option<&str>, ran_current_code: bool) -> RunState {
         run_state_with_id(1, status, conclusion, ran_current_code)
     }
@@ -1365,20 +1597,40 @@ mod tests {
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
             url: format!("https://github.com/water-rs/stow/actions/runs/{workflow_run_id}"),
-            created_at: None,
-            ran_current_code,
+            head_sha: if ran_current_code {
+                MAIN_HEAD.to_owned()
+            } else {
+                "2222222222222222222222222222222222222222".to_owned()
+            },
         }
     }
 
     /// Only a finished, unsuccessful run of older code is dispatched
-    /// again; everything else is adopted as the run says.
+    /// again; everything else is adopted as the run says. A cached row
+    /// re-judges staleness against the poll's own `main` head — a head
+    /// that moved stales a row that had read as current.
     #[test]
     fn only_a_failure_on_older_code_is_retried() {
-        assert!(run_state("completed", Some("failure"), false).stale_failure());
-        assert!(run_state("completed", Some("cancelled"), false).stale_failure());
-        assert!(!run_state("completed", Some("failure"), true).stale_failure());
-        assert!(!run_state("completed", Some("success"), false).stale_failure());
-        assert!(!run_state("in_progress", None, false).stale_failure());
+        assert!(run_state("completed", Some("failure"), false).stale_failure(MAIN_HEAD));
+        assert!(run_state("completed", Some("cancelled"), false).stale_failure(MAIN_HEAD));
+        assert!(!run_state("completed", Some("failure"), true).stale_failure(MAIN_HEAD));
+        assert!(!run_state("completed", Some("success"), false).stale_failure(MAIN_HEAD));
+        assert!(!run_state("in_progress", None, false).stale_failure(MAIN_HEAD));
+        // The local server's rows carry no sha and are never stale.
+        let local = RunState {
+            head_sha: String::new(),
+            ..run_state("completed", Some("failure"), false)
+        };
+        assert!(!local.stale_failure(""));
+    }
+
+    /// A run's staleness follows `main`'s head, not the row's arrival
+    /// poll: a 304-cached row folded under a moved head is stale.
+    #[test]
+    fn a_cached_row_stales_when_main_moves() {
+        let state = run_state("completed", Some("failure"), true);
+        assert!(!state.stale_failure(MAIN_HEAD));
+        assert!(state.stale_failure("9999999999999999999999999999999999999999"));
     }
 
     #[test]
@@ -1574,5 +1826,224 @@ mod tests {
             .find(|node| node.request.crate_name.as_str() == name)
             .map(|node| &node.request)
             .expect("node by name")
+    }
+
+    fn run_row(
+        workflow_run_id: u64,
+        title: &str,
+        status: &str,
+        conclusion: Option<&str>,
+    ) -> WorkflowRunRow {
+        WorkflowRunRow {
+            id: workflow_run_id,
+            display_title: title.to_owned(),
+            head_sha: MAIN_HEAD.to_owned(),
+            status: status.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+            html_url: format!("https://github.com/water-rs/stow/actions/runs/{workflow_run_id}"),
+        }
+    }
+
+    /// A bound-run GET must answer for the exact id the node tracks —
+    /// another run's row is never this node's state, so the binding is
+    /// refused rather than replaced.
+    #[test]
+    fn a_bound_poll_never_takes_another_run_id() {
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
+        let row = run_row(11, "1.99.0-task", "completed", Some("success"));
+        assert!(bound_run_state(row, 10, "task", &rustc).is_err());
+    }
+
+    /// The bound id's title must be the node's `<rustc>-<task_id>` — a
+    /// row for a different task, a different rustc, or no task title at
+    /// all is a hard error, not a fold.
+    #[test]
+    fn a_bound_poll_validates_the_run_title() {
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
+        assert!(
+            bound_run_state(
+                run_row(10, "1.99.0-task", "completed", Some("success")),
+                10,
+                "task",
+                &rustc
+            )
+            .is_ok()
+        );
+        assert!(
+            bound_run_state(
+                run_row(10, "1.99.0-other", "completed", Some("success")),
+                10,
+                "task",
+                &rustc
+            )
+            .is_err()
+        );
+        assert!(
+            bound_run_state(
+                run_row(10, "1.98.0-task", "completed", Some("success")),
+                10,
+                "task",
+                &rustc
+            )
+            .is_err()
+        );
+        assert!(
+            bound_run_state(
+                run_row(10, "no-task-title", "completed", Some("success")),
+                10,
+                "task",
+                &rustc
+            )
+            .is_err()
+        );
+    }
+
+    /// Mixed fold outcomes across one poll: a completed success marks
+    /// done, a completed failure on current code marks failed, an
+    /// in-flight run binds and stays open, and a failure on moved `main`
+    /// code unbinds for redispatch — a tracked old run id stays bound to
+    /// its node instead of being dispatched again.
+    #[test]
+    fn a_poll_folds_each_bound_run_by_its_outcome() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) = build_graph(vec![
+            request("won", T, false, &[]),
+            request("lost", T, false, &[]),
+            request("flying", T, false, &[]),
+            request("stale", T, false, &[]),
+        ]);
+        let ids: BTreeMap<&str, String> = ["won", "lost", "flying", "stale"]
+            .into_iter()
+            .map(|name| (name, node_task_id(request_by_name(name, &nodes))))
+            .collect();
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+
+        let mut states = BTreeMap::<String, RunState>::new();
+        for (name, run_id, status, conclusion) in [
+            ("won", 100, "completed", Some("success")),
+            ("lost", 101, "completed", Some("failure")),
+            ("flying", 102, "in_progress", None),
+        ] {
+            let task = ids[name].clone();
+            let mut state = run_state_with_id(run_id, status, conclusion, true);
+            state.task_id = task;
+            retain_latest_run(&mut states, state, None);
+        }
+        for state in states.into_values() {
+            fold_run(state, &mut nodes, &mut open, MAIN_HEAD);
+        }
+
+        let won = ids["won"].clone();
+        let lost = ids["lost"].clone();
+        let flying = ids["flying"].clone();
+        assert!(nodes[&won].done && !open.contains(&won));
+        assert!(nodes[&lost].failed && !open.contains(&lost));
+        assert!(!nodes[&flying].done && !nodes[&flying].failed && nodes[&flying].dispatched);
+        assert_eq!(nodes[&flying].workflow_run_id, Some(102));
+        // An adopted/dispatched run counts as bound — no re-dispatch.
+        assert!(nodes[&flying].dispatched);
+
+        // The stale node: its bound run failed on code `main` moved
+        // past — the binding drops and the node can dispatch again. The
+        // bound id is what releases, not a URL: a freshly dispatched
+        // node has no `run_url` yet and must still free.
+        let stale = ids["stale"].clone();
+        let mut old_run = run_state_with_id(50, "completed", Some("failure"), false);
+        old_run.task_id = stale.clone();
+        let node = nodes.get_mut(&stale).expect("stale node");
+        node.workflow_run_id = Some(50);
+        node.dispatched = true;
+        node.dispatched_at = Some(std::time::Instant::now());
+        fold_run(old_run, &mut nodes, &mut open, MAIN_HEAD);
+        let node = &nodes[&stale];
+        assert!(
+            node.workflow_run_id.is_none()
+                && node.run_url.is_none()
+                && !node.dispatched
+                && node.dispatched_at.is_none()
+                && node.run_etag.is_none()
+                && node.latest.is_none()
+        );
+        assert!(open.contains(&stale));
+    }
+
+    /// A stale row that is not the node's bound id never releases it —
+    /// and a node with no bound id ignores adoption-time stale rows
+    /// instead of binding them.
+    #[test]
+    fn only_the_bound_run_id_releases_on_stale() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) = build_graph(vec![request("bound", T, false, &[])]);
+        let task = node_task_id(request_by_name("bound", &nodes));
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        nodes.get_mut(&task).expect("node").workflow_run_id = Some(50);
+        nodes.get_mut(&task).expect("node").dispatched = true;
+
+        let mut other = run_state_with_id(99, "completed", Some("failure"), false);
+        other.task_id = task.clone();
+        fold_run(other, &mut nodes, &mut open, MAIN_HEAD);
+        assert_eq!(nodes[&task].workflow_run_id, Some(50));
+        assert!(nodes[&task].dispatched);
+    }
+
+    /// The tracked-id filter every poll and adoption applies through
+    /// `retain_latest_run`: an old same-task completion cannot answer a
+    /// newer bound retry — it drops before the fold, while the bound id
+    /// itself lands.
+    #[test]
+    fn an_old_same_task_completion_cannot_answer_a_bound_retry() {
+        let mut latest = BTreeMap::new();
+        let mut old = run_state_with_id(40, "completed", Some("success"), true);
+        old.task_id = "task".to_owned();
+        retain_latest_run(&mut latest, old, Some(50));
+        assert!(latest.is_empty(), "untracked id dropped before the fold");
+
+        let mut bound = run_state_with_id(50, "completed", Some("success"), true);
+        bound.task_id = "task".to_owned();
+        retain_latest_run(&mut latest, bound, Some(50));
+        assert_eq!(latest["task"].workflow_run_id, 50);
+    }
+
+    /// A 404 on an id whose row was already observed is GitHub dropping
+    /// a materialized run — an error. Only a fresh id that never
+    /// materialized waits its grace as `Pending`.
+    #[test]
+    fn a_404_on_an_observed_run_is_missing_not_pending() {
+        assert!(run_404(50, true).is_err());
+        assert!(matches!(run_404(50, false), Ok(BoundPoll::Pending)));
+    }
+
+    /// The local lane's `GET /tasks` poll rides the shared bounded
+    /// idempotent read: a server-side connection drop is retried rather
+    /// than ending the wave, and the unauthenticated request carries no
+    /// `Authorization` header — no credential leaves the machine.
+    #[tokio::test]
+    async fn local_list_runs_recovers_a_dropped_connection() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::Drop,
+            crate::test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7"}]}"#,
+            },
+        ])
+        .await;
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc version parses");
+        let open = BTreeSet::from(["taskabc".to_owned()]);
+        let runs = local_run_states(&server.url, &open, &rustc)
+            .await
+            .expect("a dropped connection retries");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].task_id, "taskabc");
+        assert_eq!(runs[0].workflow_run_id, 7);
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
+        for head in &heads {
+            assert!(
+                !head.headers.contains_key(http::header::AUTHORIZATION),
+                "the local read must not send an Authorization header: {:?}",
+                head.headers
+            );
+        }
     }
 }

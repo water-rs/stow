@@ -30,6 +30,8 @@ mod resolve;
 mod runs;
 mod rust_channel;
 mod scheduler;
+#[cfg(test)]
+mod test_server;
 mod watchdog;
 
 use std::fmt::Write as _;
