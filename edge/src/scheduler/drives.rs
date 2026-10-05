@@ -1612,14 +1612,14 @@ pub const DRIVES: &[Drive] = &[
         setup: Some(|db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 feed_drive_begin(db, 5).await?;
-                feed_seed_page(db, &feed_drive_hour(5), 0, 4).await
+                feed_seed_page(db, &feed_drive_hour(5), 0, 4, feed_drive_entries).await
             })
         }),
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 feed::feed_page(
                     db,
-                    &feed_drive_page_request(5, 1, 4)?,
+                    &feed_drive_page_request(5, 1, 4, feed_drive_entries)?,
                     feed_drive_now_secs(5),
                 )
                 .await
@@ -1637,14 +1637,14 @@ pub const DRIVES: &[Drive] = &[
         setup: Some(|db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 feed_drive_begin(db, 6).await?;
-                feed_seed_page(db, &feed_drive_hour(6), 0, 4).await
+                feed_seed_page(db, &feed_drive_hour(6), 0, 4, feed_drive_entries).await
             })
         }),
         run: |db, _shape, _settings, _ctx| {
             Box::pin(async move {
                 feed::feed_page(
                     db,
-                    &feed_drive_page_request(6, 0, 4)?,
+                    &feed_drive_page_request(6, 0, 4, feed_drive_entries)?,
                     feed_drive_now_secs(6),
                 )
                 .await
@@ -1665,7 +1665,7 @@ pub const DRIVES: &[Drive] = &[
                 feed_drive_begin(db, 7).await?;
                 let hour = feed_drive_hour(7);
                 for page_no in 0..FEED_DRIVE_PAGES {
-                    feed_seed_page(db, &hour, page_no, 4).await?;
+                    feed_seed_page(db, &hour, page_no, 4, feed_drive_entries).await?;
                 }
                 Ok(())
             })
@@ -1674,7 +1674,7 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(async move {
                 feed::feed_complete(
                     db,
-                    &feed_drive_complete_request(7, &[4; 3])?,
+                    &feed_drive_complete_request(7, &[4; 3], feed_drive_entries)?,
                     feed_drive_now_secs(7),
                 )
                 .await
@@ -1696,7 +1696,7 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(async move {
                 feed::feed_complete(
                     db,
-                    &feed_drive_complete_request(8, &[])?,
+                    &feed_drive_complete_request(8, &[], feed_drive_entries)?,
                     feed_drive_now_secs(8),
                 )
                 .await
@@ -1712,9 +1712,18 @@ pub const DRIVES: &[Drive] = &[
         // 256 real fixture identities, the acknowledged flip and
         // counter read-back, plus the wake re-plan — the largest
         // page-apply marginal cost the delivery loop can owe.
+        // The page's entries name the setup's own fixed event
+        // subgraph (`seed_feed_event_subgraph`), so the measured
+        // closure is exactly 256 roots + 128 shared deps = 384
+        // touched tasks at every fixture shape — the scale check
+        // separates this event's work from stored bulk. The unmetered
+        // cleanup deletes exactly the subgraph's own primary keys.
         name: "POST /scheduler/demand-feed/deliver (page apply)",
-        setup: Some(|db, _shape, _settings, _ctx| {
-            Box::pin(async move { seed_feed_hour_sized(db, 0, &[256, 4]).await })
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                seed_feed_event_subgraph(db, settings).await?;
+                seed_feed_hour_sized(db, 0, &[256, 4], feed_event_entries).await
+            })
         }),
         run: |db, _shape, settings, _ctx| {
             Box::pin(async move {
@@ -1724,7 +1733,9 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move { clear_feed_event_subgraph(db).await })
+        }),
     },
     Drive {
         // The delivery call on an hour whose pages all applied
@@ -2259,6 +2270,13 @@ fn feed_bulk_drive_hour() -> stow_types::api::DemandFeedHour {
 /// hour math stays exercised).
 const FEED_BULK_NOW_SECS: i64 = 1_672_531_201;
 
+/// How a drive's staging resolves one page's entries — a pure
+/// `(page_no, count) -> entries` map shared verbatim by the staged
+/// payload bytes, the wire page request and the manifest hash, so
+/// the run the measured `feed_deliver` decodes is exactly the
+/// bytes setup froze (stow#523).
+type FeedPageEntries = fn(u32, u32) -> Result<Vec<stow_types::api::SchedulerDemandEntry>, String>;
+
 /// Page `page_no`'s deterministic entries — `count` rows at
 /// `n = 100 + page_no·256 + k` use the same identity formulas the
 /// demand drive's batch does, so a delivery closure touches real
@@ -2311,17 +2329,19 @@ async fn feed_drive_begin(db: &DurableDb, idx: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// The pure typed page request — known generation, known entries.
+/// The pure typed page request — known generation, entries from
+/// the hour's own source.
 fn feed_drive_page_request(
     idx: u32,
     page_no: u32,
     count: u32,
+    entries: FeedPageEntries,
 ) -> Result<stow_types::api::DemandFeedPageRequest, String> {
     Ok(stow_types::api::DemandFeedPageRequest {
         hour: feed_drive_hour(idx),
         generation: FEED_DRIVE_GENERATION,
         page_no,
-        entries: feed_drive_entries(page_no, count)?,
+        entries: entries(page_no, count)?,
     })
 }
 
@@ -2331,11 +2351,12 @@ fn feed_drive_page_request(
 fn feed_drive_complete_request(
     idx: u32,
     counts: &[u32],
+    entries: FeedPageEntries,
 ) -> Result<stow_types::api::DemandFeedCompleteRequest, String> {
     let mut hashes = Vec::with_capacity(counts.len());
     let mut entry_count = 0_u64;
     for (page_no, count) in counts.iter().enumerate() {
-        let entries = feed_drive_entries(u32::try_from(page_no).expect("page index"), *count)?;
+        let entries = entries(u32::try_from(page_no).expect("page index"), *count)?;
         entry_count += u64::from(*count);
         hashes.push(stow_types::api::demand_feed_page_hash(&entries)?);
     }
@@ -2358,8 +2379,9 @@ async fn feed_seed_page(
     hour: &stow_types::api::DemandFeedHour,
     page_no: u32,
     count: u32,
+    entries: FeedPageEntries,
 ) -> Result<(), String> {
-    let request = feed_drive_page_request(hour_idx(hour), page_no, count)?;
+    let request = feed_drive_page_request(hour_idx(hour), page_no, count, entries)?;
     feed::feed_page(db, &request, feed_drive_now_secs(hour_idx(hour)))
         .await
         .map_err(|error| error.to_string())
@@ -2376,8 +2398,9 @@ async fn seed_feed_complete(
     db: &DurableDb,
     hour: &stow_types::api::DemandFeedHour,
     counts: &[u32],
+    entries: FeedPageEntries,
 ) -> Result<(), String> {
-    let request = feed_drive_complete_request(hour_idx(hour), counts)?;
+    let request = feed_drive_complete_request(hour_idx(hour), counts, entries)?;
     feed::feed_complete(db, &request, feed_drive_now_secs(hour_idx(hour)))
         .await
         .map_err(|error| error.to_string())
@@ -2411,7 +2434,12 @@ async fn seed_stale_feed_pages(
 /// `counts[k]` is page `k`'s entry count, letting a drive stage the
 /// protocol's maximum 256-entry page. Idempotent on a persisted
 /// fixture: a watermark at or past the hour makes seeding a no-op.
-async fn seed_feed_hour_sized(db: &DurableDb, idx: u32, counts: &[u32]) -> Result<(), String> {
+async fn seed_feed_hour_sized(
+    db: &DurableDb,
+    idx: u32,
+    counts: &[u32],
+    entries: FeedPageEntries,
+) -> Result<(), String> {
     let hour = feed_drive_hour(idx);
     if let Some(watermark) = feed::feed_status(db)
         .await
@@ -2440,15 +2468,22 @@ async fn seed_feed_hour_sized(db: &DurableDb, idx: u32, counts: &[u32]) -> Resul
             &hour,
             u32::try_from(page_no).expect("page index"),
             *count,
+            entries,
         )
         .await?;
     }
-    seed_feed_complete(db, &hour, counts).await
+    seed_feed_complete(db, &hour, counts, entries).await
 }
 
 /// The shared seed: `pages` uniform four-entry pages.
 async fn seed_feed_hour(db: &DurableDb, idx: u32, pages: u32) -> Result<(), String> {
-    seed_feed_hour_sized(db, idx, &vec![4; usize::try_from(pages).expect("pages")]).await
+    seed_feed_hour_sized(
+        db,
+        idx,
+        &vec![4; usize::try_from(pages).expect("pages")],
+        feed_drive_entries,
+    )
+    .await
 }
 
 /// Drive a staged hour to `delivered` in unmetered setup — every
@@ -2469,6 +2504,381 @@ async fn deliver_feed_hour_fully(
             return Ok(());
         }
     }
+}
+
+/// The page-apply drive's own event graph (stow#523): the stored
+/// bulk's identity formulas — `crate{n}` rows with `seed_edges`
+/// dependencies at `(n * k) % queue_rows` — name a *different*
+/// closure at every fixture size, so a scaled-bulk run measured a
+/// different event, not a bigger one. The measured 256-entry page
+/// therefore names this fixed subgraph instead: 256 distinct roots,
+/// each gating on two of 128 shared deps, every row born `pending`
+/// and unpublished. The closure it walks is exactly 256 + 128 = 384
+/// touched tasks at every bulk shape, which is what lets the scale
+/// check attribute growth to stored bulk rather than a changed
+/// event. The names are fixture-only (`stow-feed-*`), disjoint from
+/// every seeded `crate*`/`costgate-*`/`stow-gate-*` identity, and
+/// the cleanup deletes exactly these primary keys.
+const FEED_EVENT_ROOTS: u32 = 256;
+
+/// Shared deps the event subgraph's roots gate on.
+const FEED_EVENT_DEPS: u32 = 128;
+
+/// The subgraph's whole task set — roots plus shared deps — and the
+/// measured page's exact closure cardinality at every fixture shape.
+const FEED_EVENT_NODES: u32 = FEED_EVENT_ROOTS + FEED_EVENT_DEPS;
+
+/// Root `k`'s crate name — one per wire entry of the max page.
+fn feed_event_root_name(k: u32) -> String {
+    format!("stow-feed-root-{k:03}")
+}
+
+/// Shared dep `d`'s crate name.
+fn feed_event_dep_name(d: u32) -> String {
+    format!("stow-feed-dep-{d:03}")
+}
+
+/// The queued `task_id` an event node mints at — the content-derived
+/// key the enqueue path assigns: `1.0.0` on the node's spread triple
+/// and the drives' pinned rustc, target side. Fixture validation
+/// names rows through this, never through a stored-id lookup.
+fn feed_event_task_id(name: &str, spread: u32) -> String {
+    queue::task_id(name, "1.0.0", "[]", dep_target(spread), "1.86.0", false)
+}
+
+/// The whole subgraph's task ids — 256 roots then 128 shared deps —
+/// the exact primary-key set setup validates and cleanup deletes.
+fn feed_event_task_ids() -> Vec<String> {
+    (0..FEED_EVENT_ROOTS)
+        .map(|k| feed_event_task_id(&feed_event_root_name(k), k))
+        .chain((0..FEED_EVENT_DEPS).map(|d| feed_event_task_id(&feed_event_dep_name(d), d)))
+        .collect()
+}
+
+/// Root `k`'s two shared deps — `k/2` and `(k/2 + 1) % 128` — so each
+/// dep carries four owner edges (roots `2d`/`2d+1` on the first slot,
+/// `2d-2`/`2d-1` on the second): real shared/diamond reaches a UNION
+/// walk dedups, not a private tree.
+const fn feed_event_deps(k: u32) -> [u32; 2] {
+    [k / 2, (k / 2 + 1) % FEED_EVENT_DEPS]
+}
+
+/// The event subgraph's typed submit: 128 shared deps with no
+/// outgoing edges, then 256 roots each on `feed_event_deps` — landed
+/// through the real `enqueue_trusted`, so the rows and edge
+/// requirement columns come from the same production code a real
+/// submit runs (stow#523).
+fn feed_event_requests() -> Vec<EnqueueRequest> {
+    let dep_edge = |d: u32| EnqueueDependency {
+        crate_name: feed_event_dep_name(d).parse().expect("event dep crate"),
+        version: "1.0.0".parse().expect("event dep version"),
+        features_json: FeaturesJson::default(),
+        target: dep_target(d).parse().expect("event dep target"),
+        rustc_version: "1.86.0".parse().expect("event dep rustc"),
+        host_side: false,
+    };
+    (0..FEED_EVENT_DEPS)
+        .map(|d| EnqueueRequest {
+            crate_name: feed_event_dep_name(d).parse().expect("event dep crate"),
+            version: "1.0.0".parse().expect("event dep version"),
+            features_json: FeaturesJson::default(),
+            target: dep_target(d).parse().expect("event dep target"),
+            rustc_version: "1.86.0".parse().expect("event dep rustc"),
+            downloads: 1,
+            source: EnqueueSource::CacheMiss,
+            depends_on: Vec::new(),
+            preserve_lockfile: false,
+            host_side: false,
+        })
+        .chain((0..FEED_EVENT_ROOTS).map(|k| {
+            let [first, second] = feed_event_deps(k);
+            EnqueueRequest {
+                crate_name: feed_event_root_name(k).parse().expect("event root crate"),
+                version: "1.0.0".parse().expect("event root version"),
+                features_json: FeaturesJson::default(),
+                target: dep_target(k).parse().expect("event root target"),
+                rustc_version: "1.86.0".parse().expect("event root rustc"),
+                downloads: 1,
+                source: EnqueueSource::CacheMiss,
+                depends_on: vec![dep_edge(first), dep_edge(second)],
+                preserve_lockfile: false,
+                host_side: false,
+            }
+        }))
+        .collect()
+}
+
+/// The event hour's page-entry source (stow#523): page 0 is the
+/// measured max page — its `count` entries name the seeded subgraph's
+/// roots at their enqueued identities, so the delivered page's
+/// closure is the fixed 384-task set at every fixture shape. Trailing
+/// (and every other drive's) pages keep the fixture formula.
+fn feed_event_entries(
+    page_no: u32,
+    count: u32,
+) -> Result<Vec<stow_types::api::SchedulerDemandEntry>, String> {
+    if page_no != 0 {
+        return feed_drive_entries(page_no, count);
+    }
+    (0..count)
+        .map(
+            |k| -> Result<stow_types::api::SchedulerDemandEntry, String> {
+                Ok(stow_types::api::SchedulerDemandEntry {
+                    crate_name: CrateName::parse(feed_event_root_name(k))
+                        .map_err(|e| e.to_string())?,
+                    version: CrateVersion::new(
+                        semver::Version::parse("1.0.0").map_err(|e| e.to_string())?,
+                    ),
+                    features_json: FeaturesJson::default(),
+                    target: TargetTriple::parse(dep_target(k)).map_err(|e| e.to_string())?,
+                    rustc_version: WireRustcVersion::parse("1.86.0").map_err(|e| e.to_string())?,
+                    demand: 100,
+                })
+            },
+        )
+        .collect()
+}
+
+/// Seed and prove the page-apply event graph in unmetered setup,
+/// BEFORE the measured run bills a statement: the typed batch lands
+/// 384 rows through the real `enqueue_trusted`; then the exact
+/// contract the walk and the fold rely on is verified — 384 unique
+/// task ids, all `pending` (unbuilt), each root owning exactly its
+/// two `dep_met = 0` edges into the shared-dep set, the deps owning
+/// none (no out-edges), the max page's wire carrying 256 distinct
+/// identities, and every entry's live closure through production's
+/// own `demand_closure_tasks` equal to its expected three-task set —
+/// the set, not just the cardinality. Any drift fails the drive
+/// rather than measuring a different event.
+async fn seed_feed_event_subgraph(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+) -> Result<(), String> {
+    // A previous pass's accepted fold moved these rows' demand/value —
+    // a resubmit would leave them — so the event restarts from its
+    // exact primary-key deletes, identical every run.
+    clear_feed_event_subgraph(db).await?;
+    let inserted = queue::enqueue_trusted(db, &feed_event_requests(), settings)
+        .await
+        .map_err(|error| error.to_string())?;
+    if inserted != FEED_EVENT_NODES {
+        return Err(format!(
+            "event subgraph inserted {inserted} rows, expected {FEED_EVENT_NODES}"
+        ));
+    }
+    validate_feed_event_subgraph(db).await
+}
+
+/// Prove the seeded subgraph is exactly the contract the measured
+/// walk relies on — every check keyed by the explicit typed id list.
+async fn validate_feed_event_subgraph(db: &DurableDb) -> Result<(), String> {
+    let ids = feed_event_task_ids();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != usize::try_from(FEED_EVENT_NODES).expect("count") {
+        return Err(format!(
+            "event subgraph has {} unique task ids, expected {FEED_EVENT_NODES}",
+            unique.len(),
+        ));
+    }
+    let ids_json =
+        serde_json::to_string(&ids).map_err(|error| format!("encode event task ids: {error}"))?;
+    let roots_json =
+        serde_json::to_string(&ids[..usize::try_from(FEED_EVENT_ROOTS).expect("count")])
+            .map_err(|error| format!("encode event root ids: {error}"))?;
+    let deps_json =
+        serde_json::to_string(&ids[usize::try_from(FEED_EVENT_ROOTS).expect("count")..])
+            .map_err(|error| format!("encode event dep ids: {error}"))?;
+    let present: i64 = db
+        .query("SELECT count(*) FROM queue WHERE task_id IN (SELECT value FROM json_each(?))")
+        .bind(ids_json.clone())
+        .fetch_scalar()
+        .await
+        .map_err(|error| format!("probe event rows: {error}"))?;
+    let built: i64 = db
+        .query(
+            "SELECT count(*) FROM queue \
+             WHERE task_id IN (SELECT value FROM json_each(?)) \
+               AND status != 'pending'",
+        )
+        .bind(ids_json)
+        .fetch_scalar()
+        .await
+        .map_err(|error| format!("probe event row status: {error}"))?;
+    if i64::from(FEED_EVENT_NODES) != present || built != 0 {
+        return Err(format!(
+            "event subgraph has {present} rows ({built} built), expected {FEED_EVENT_NODES} pending"
+        ));
+    }
+    validate_feed_event_edges(db, roots_json, deps_json).await?;
+    validate_feed_event_closures(db, &ids).await
+}
+
+/// The edge contract each root's seeded rows must hold: exactly two
+/// unmet edges (`dep_met = 0` — the deps publish nothing), every edge
+/// pointing into the shared-dep set, the deps owning no outgoing
+/// edges — the diamond shape whose UNION walk returns exactly the
+/// 384-task set.
+async fn validate_feed_event_edges(
+    db: &DurableDb,
+    roots_json: String,
+    deps_json: String,
+) -> Result<(), String> {
+    let edges: i64 = db
+        .query(
+            "SELECT count(*) FROM queue_dependencies \
+             WHERE task_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(roots_json.clone())
+        .fetch_scalar()
+        .await
+        .map_err(|error| format!("probe event edges: {error}"))?;
+    let unmet: i64 = db
+        .query(
+            "SELECT count(*) FROM queue_dependencies \
+             WHERE task_id IN (SELECT value FROM json_each(?)) \
+               AND dep_met = 0",
+        )
+        .bind(roots_json.clone())
+        .fetch_scalar()
+        .await
+        .map_err(|error| format!("probe event edge flags: {error}"))?;
+    let foreign: i64 = db
+        .query(
+            "SELECT count(*) FROM queue_dependencies \
+             WHERE task_id IN (SELECT value FROM json_each(?)) \
+               AND depends_on_task_id NOT IN (SELECT value FROM json_each(?))",
+        )
+        .bind(roots_json)
+        .bind(deps_json.clone())
+        .fetch_scalar()
+        .await
+        .map_err(|error| format!("probe event edge targets: {error}"))?;
+    let dep_owned: i64 = db
+        .query(
+            "SELECT count(*) FROM queue_dependencies \
+             WHERE task_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(deps_json)
+        .fetch_scalar()
+        .await
+        .map_err(|error| format!("probe dep out-edges: {error}"))?;
+    if edges != 2 * i64::from(FEED_EVENT_ROOTS) || unmet != edges || foreign != 0 || dep_owned != 0
+    {
+        return Err(format!(
+            "event edges: {edges} owned ({unmet} unmet, {foreign} foreign), {dep_owned} dep-owned; \
+             expected {} unmet root edges into the dep set and none dep-owned",
+            2 * FEED_EVENT_ROOTS
+        ));
+    }
+    Ok(())
+}
+
+/// The wire and walk contracts: the max page carries 256 distinct
+/// identities — the entries the staged payload bytes and the manifest
+/// hash must agree on — and every entry's live closure through the
+/// production walk is the exact three-task set its root covers, so
+/// the measured page's union is the seeded 384 by construction, not
+/// by count.
+async fn validate_feed_event_closures(db: &DurableDb, ids: &[String]) -> Result<(), String> {
+    let page = feed_event_entries(0, FEED_EVENT_ROOTS)?;
+    let mut identities: Vec<String> = page
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}|{}|{}|{}|{}",
+                entry.crate_name,
+                entry.version,
+                entry.features_json.raw(),
+                entry.target,
+                entry.rustc_version
+            )
+        })
+        .collect();
+    identities.sort();
+    identities.dedup();
+    if page.len() != usize::try_from(FEED_EVENT_ROOTS).expect("count")
+        || identities.len() != page.len()
+    {
+        return Err(format!(
+            "event page carries {} entries ({} distinct), expected {FEED_EVENT_ROOTS}",
+            page.len(),
+            identities.len()
+        ));
+    }
+    for (k, root_id) in ids[..usize::try_from(FEED_EVENT_ROOTS).expect("count")]
+        .iter()
+        .enumerate()
+    {
+        let k = u32::try_from(k).expect("root index");
+        let mut expected: Vec<String> = feed_event_deps(k)
+            .iter()
+            .map(|&d| feed_event_task_id(&feed_event_dep_name(d), d))
+            .collect();
+        expected.push(root_id.clone());
+        expected.sort();
+        let mut touched = queue::demand_closure_tasks(
+            db,
+            &[
+                feed_event_root_name(k),
+                "1.0.0".to_owned(),
+                "[]".to_owned(),
+                dep_target(k).to_owned(),
+                "1.86.0".to_owned(),
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        touched.sort();
+        if touched != expected {
+            return Err(format!(
+                "event root {k} closure is {touched:?}, expected {expected:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Delete only the event subgraph's own records — the roots' 512
+/// edges, then the 384 queue rows — every probe keyed by the explicit
+/// typed id list (`json_each` feeds the `task_id` primary keys; no
+/// prefix match or table walk). The queue's status counters live on
+/// triggers over these deletes, so they stay consistent; nothing
+/// else in the fixture moves. A first setup finds nothing; the
+/// drive's post-apply cleanup must land the whole owned set — a
+/// partial remnant would shrink the next run's event, so it errors
+/// instead of drifting.
+async fn clear_feed_event_subgraph(db: &DurableDb) -> Result<(), String> {
+    let ids_json = serde_json::to_string(&feed_event_task_ids())
+        .map_err(|error| format!("encode event task ids: {error}"))?;
+    db.query(
+        "DELETE FROM queue_dependencies \
+         WHERE task_id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(ids_json.clone())
+    .execute()
+    .await
+    .map_err(|error| format!("clear event edges: {error}"))?;
+    let edges = queue::changes(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    db.query("DELETE FROM queue WHERE task_id IN (SELECT value FROM json_each(?))")
+        .bind(ids_json)
+        .execute()
+        .await
+        .map_err(|error| format!("clear event rows: {error}"))?;
+    let rows = queue::changes(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (want_edges, want_rows) = (2 * u64::from(FEED_EVENT_ROOTS), u64::from(FEED_EVENT_NODES));
+    if rows != 0 && (edges != want_edges || rows != want_rows) {
+        return Err(format!(
+            "event subgraph cleanup removed {edges} edges / {rows} rows, \
+             expected {want_edges} / {want_rows}"
+        ));
+    }
+    Ok(())
 }
 
 /// One dependency edge on fixture row `n` — the same identity formulas
@@ -2823,6 +3233,197 @@ mod lifecycle_tests {
             ],
             rig.events().as_slice(),
             "setup writes, fixture barrier, run write, in-window barrier, cleanup",
+        );
+    }
+}
+
+/// The page-apply drive's fixed event graph (stow#523): the measured
+/// max page must walk the same seeded 384-task set — 256 roots plus
+/// 128 shared deps — at every stored-bulk size, on rows and edges the
+/// real enqueue path wrote, and its cleanup must leave nothing
+/// behind for the next pass.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod feed_event_tests {
+    use super::{
+        FEED_EVENT_NODES, FEED_EVENT_ROOTS, clear_feed_event_subgraph, feed_drive_hour,
+        feed_drive_now_ms, feed_event_dep_name, feed_event_entries, feed_event_root_name,
+        feed_event_task_id, feed_event_task_ids, seed_feed_event_subgraph, seed_feed_hour_sized,
+    };
+    use crate::scheduler::feed;
+    use crate::scheduler::fixture::{self, FixtureShape};
+    use crate::scheduler::queue::SchedulerSettings;
+    use crate::scheduler::test_db::memory_db;
+    use skyzen_services::durable::DurableDb;
+
+    /// The persisted demand one event row carries.
+    async fn demand_of(db: &DurableDb, task_id: &str) -> i64 {
+        db.query("SELECT demand FROM queue WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_scalar()
+            .await
+            .expect("demand")
+    }
+
+    /// The staged page 0 the event hour froze — the payload bytes the
+    /// measured `feed_deliver` decodes — must name the subgraph's
+    /// roots verbatim: the wire, the manifest input and the stored
+    /// set are the same list.
+    async fn assert_event_page_bytes(db: &DurableDb) {
+        let payload: String = db
+            .query(
+                "SELECT payload FROM demand_feed_pages \
+                 WHERE hour = '2020-01-01T00' AND generation = ? AND page_no = 0",
+            )
+            .bind(super::FEED_DRIVE_GENERATION)
+            .fetch_scalar()
+            .await
+            .expect("staged page 0");
+        let entries: Vec<stow_types::api::SchedulerDemandEntry> =
+            serde_json::from_str(&payload).expect("page payload decodes");
+        assert_eq!(
+            entries.len(),
+            usize::try_from(FEED_EVENT_ROOTS).expect("count"),
+            "page 0 stages the full max page"
+        );
+        for (k, entry) in entries.iter().enumerate() {
+            let k = u32::try_from(k).expect("entry index");
+            assert_eq!(entry.crate_name.as_str(), feed_event_root_name(k));
+            assert_eq!(entry.target.as_str(), super::dep_target(k));
+        }
+    }
+
+    /// One full drive pass at `queue_rows`: seed the subgraph and the
+    /// hour through the drive's own setup path, then measure the
+    /// `feed_deliver` apply — the assertions a shape change must not
+    /// move.
+    async fn run_event_drive(db: &DurableDb, settings: &SchedulerSettings) {
+        seed_feed_event_subgraph(db, settings)
+            .await
+            .expect("event subgraph");
+        seed_feed_hour_sized(db, 0, &[256, 4], feed_event_entries)
+            .await
+            .expect("hour materialization");
+        assert_event_page_bytes(db).await;
+        let (report, _plan) =
+            feed::feed_deliver(db, &feed_drive_hour(0), feed_drive_now_ms(0), settings)
+                .await
+                .expect("page apply");
+        assert!(report.applied, "page 0 applies");
+        assert_eq!(
+            report.touched_tasks,
+            u64::from(FEED_EVENT_NODES),
+            "the measured event is the fixed subgraph's closure"
+        );
+        // The shared fold: each root takes its own entry's +100 once;
+        // each dep sits in four roots' closures, so it folds +400 —
+        // real diamond contributions, not a per-tree count.
+        for k in [0_u32, 127, 255] {
+            assert_eq!(
+                demand_of(db, &feed_event_task_id(&feed_event_root_name(k), k)).await,
+                100,
+                "root {k} folds its own delta"
+            );
+        }
+        for d in [0_u32, 64, 127] {
+            assert_eq!(
+                demand_of(db, &feed_event_task_id(&feed_event_dep_name(d), d)).await,
+                400,
+                "dep {d} folds its four owners' deltas"
+            );
+        }
+    }
+
+    /// The event's reachable set is bulk-invariant: seed the subgraph
+    /// over two different stored-bulk sizes and the measured page
+    /// touches exactly the same 384 tasks with the same fold deltas —
+    /// the gate's scale check can then attribute any growth to the
+    /// stored bulk, never to a changed event.
+    #[tokio::test]
+    async fn fixed_event_set_is_bulk_invariant() {
+        let settings = SchedulerSettings::default();
+        for queue_rows in [4_000_u32, 20_000] {
+            let db = memory_db().await.expect("memory db");
+            let shape = FixtureShape { queue_rows };
+            fixture::seed_production_shape(&db, &shape, 0)
+                .await
+                .expect("fixture");
+            run_event_drive(&db, &settings).await;
+        }
+    }
+
+    /// Cleanup deletes exactly the subgraph's own primary keys — a
+    /// typed-id probe proves nothing owned survives and nothing
+    /// foreign moved — and restaging lands the identical validated
+    /// event, the repeated-run contract the persisted fixture needs.
+    #[tokio::test]
+    async fn event_cleanup_restages_identically() {
+        let db = memory_db().await.expect("memory db");
+        let shape = FixtureShape { queue_rows: 4_000 };
+        fixture::seed_production_shape(&db, &shape, 0)
+            .await
+            .expect("fixture");
+        let settings = SchedulerSettings::default();
+        seed_feed_event_subgraph(&db, &settings)
+            .await
+            .expect("first seed");
+        clear_feed_event_subgraph(&db).await.expect("cleanup");
+        let ids_json = serde_json::to_string(&feed_event_task_ids()).expect("ids");
+        let rows: i64 = db
+            .query("SELECT count(*) FROM queue WHERE task_id IN (SELECT value FROM json_each(?))")
+            .bind(ids_json.clone())
+            .fetch_scalar()
+            .await
+            .expect("rows");
+        let edges: i64 = db
+            .query(
+                "SELECT count(*) FROM queue_dependencies \
+                 WHERE task_id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(ids_json)
+            .fetch_scalar()
+            .await
+            .expect("edges");
+        assert_eq!(
+            (rows, edges),
+            (0, 0),
+            "cleanup leaves no event rows or edges"
+        );
+        // The bulk is untouched: seeded rows and the fixture's own
+        // (formula-keyed) edges are all still in place.
+        let seeded: i64 = db
+            .query("SELECT count(*) FROM queue WHERE task_id NOT LIKE '%-%'")
+            .fetch_scalar()
+            .await
+            .expect("seeded rows");
+        assert_eq!(
+            i64::from(shape.queue_rows),
+            seeded,
+            "cleanup never touches the stored bulk"
+        );
+        // Restaging sees the identical event — every setup validation
+        // (ids, edges, statuses, per-root closure sets) runs again.
+        seed_feed_event_subgraph(&db, &settings)
+            .await
+            .expect("restage");
+        // And a fresh run of the measured call reads the same event:
+        // re-materialize the hour through the rearm's live-window
+        // contract, then deliver page 0 to the same 384 tasks.
+        fixture::rearm(&db, shape, 0).await.expect("rearm");
+        clear_feed_event_subgraph(&db).await.expect("post-rearm");
+        seed_feed_event_subgraph(&db, &settings)
+            .await
+            .expect("reseed after rearm");
+        seed_feed_hour_sized(&db, 0, &[256, 4], feed_event_entries)
+            .await
+            .expect("hour re-materialization");
+        let (report, _plan) =
+            feed::feed_deliver(&db, &feed_drive_hour(0), feed_drive_now_ms(0), &settings)
+                .await
+                .expect("second apply");
+        assert_eq!(
+            report.touched_tasks,
+            u64::from(FEED_EVENT_NODES),
+            "the restaged event measures identically"
         );
     }
 }
