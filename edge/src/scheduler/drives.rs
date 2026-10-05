@@ -2872,7 +2872,7 @@ async fn clear_feed_event_subgraph(db: &DurableDb) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     let (want_edges, want_rows) = (2 * u64::from(FEED_EVENT_ROOTS), u64::from(FEED_EVENT_NODES));
-    if rows != 0 && (edges != want_edges || rows != want_rows) {
+    if (edges != 0 || rows != 0) && (edges != want_edges || rows != want_rows) {
         return Err(format!(
             "event subgraph cleanup removed {edges} edges / {rows} rows, \
              expected {want_edges} / {want_rows}"
@@ -3425,5 +3425,51 @@ mod feed_event_tests {
             u64::from(FEED_EVENT_NODES),
             "the restaged event measures identically"
         );
+    }
+
+    /// A half-cleared subgraph — owned edges surviving without their
+    /// rows — is the partial remnant the cleanup must refuse, not
+    /// absorb: the schema holds no foreign key tying
+    /// `queue_dependencies` to `queue`, so deleting only the rows
+    /// leaves a real edge-only state the exact-id accounting has to
+    /// catch.
+    #[tokio::test]
+    async fn edge_only_remnant_fails_cleanup() {
+        let db = memory_db().await.expect("memory db");
+        let shape = FixtureShape { queue_rows: 4_000 };
+        fixture::seed_production_shape(&db, &shape, 0)
+            .await
+            .expect("fixture");
+        let settings = SchedulerSettings::default();
+        seed_feed_event_subgraph(&db, &settings)
+            .await
+            .expect("seed");
+        // Delete only the rows through the schema's own keys — no FK
+        // cascades the 512 owned edges, so they survive alone.
+        let ids_json = serde_json::to_string(&feed_event_task_ids()).expect("ids");
+        db.query("DELETE FROM queue WHERE task_id IN (SELECT value FROM json_each(?))")
+            .bind(ids_json.clone())
+            .execute()
+            .await
+            .expect("row-only delete");
+        let error = clear_feed_event_subgraph(&db)
+            .await
+            .expect_err("an edge-only remnant must fail the cleanup accounting");
+        assert!(
+            error.contains("cleanup removed"),
+            "the remnant is reported, not absorbed: {error}"
+        );
+        // The delete still ran — the remnant is cleared and the error
+        // is the accounting verdict, not a preserved state.
+        let remaining: i64 = db
+            .query(
+                "SELECT count(*) FROM queue_dependencies \
+                 WHERE task_id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(ids_json)
+            .fetch_scalar()
+            .await
+            .expect("remnant edges");
+        assert_eq!(0, remaining, "the edge-only remnant was deleted");
     }
 }

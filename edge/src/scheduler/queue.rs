@@ -3767,7 +3767,7 @@ fn contribution_chunks(rows: &[ContributionRow]) -> Result<Vec<String>, QueueErr
 /// through two roots or two diamond paths appears once and cycles
 /// cannot recur. Task ids are TEXT, so this set crosses the workerd
 /// cursor losslessly.
-pub async fn demand_closure_tasks(
+pub(super) async fn demand_closure_tasks(
     db: &DurableDb,
     identity: &[String; 5],
 ) -> Result<Vec<String>, QueueError> {
