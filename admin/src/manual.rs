@@ -1505,14 +1505,9 @@ async fn local_run_states(
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<Vec<RunState>> {
     let url = format!("{base}/tasks");
-    let mut client = zenwave::client();
-    let tasks: LocalTasksResponse = client
-        .get(&url)?
-        .await?
-        .error_for_status()
-        .await?
-        .into_json()
-        .await?;
+    // The shared bounded idempotent read — the local server is
+    // unauthenticated, so no operator token rides it.
+    let tasks: LocalTasksResponse = crate::github::get_url_json(&url, None).await?;
     Ok(tasks
         .tasks
         .into_iter()
@@ -2016,5 +2011,39 @@ mod tests {
     fn a_404_on_an_observed_run_is_missing_not_pending() {
         assert!(run_404(50, true).is_err());
         assert!(matches!(run_404(50, false), Ok(BoundPoll::Pending)));
+    }
+
+    /// The local lane's `GET /tasks` poll rides the shared bounded
+    /// idempotent read: a server-side connection drop is retried rather
+    /// than ending the wave, and the unauthenticated request carries no
+    /// `Authorization` header — no credential leaves the machine.
+    #[tokio::test]
+    async fn local_list_runs_recovers_a_dropped_connection() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::Drop,
+            crate::test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7"}]}"#,
+            },
+        ])
+        .await;
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc version parses");
+        let open = BTreeSet::from(["taskabc".to_owned()]);
+        let runs = local_run_states(&server.url, &open, &rustc)
+            .await
+            .expect("a dropped connection retries");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].task_id, "taskabc");
+        assert_eq!(runs[0].workflow_run_id, 7);
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
+        for head in &heads {
+            assert!(
+                !head.headers.contains_key(http::header::AUTHORIZATION),
+                "the local read must not send an Authorization header: {:?}",
+                head.headers
+            );
+        }
     }
 }

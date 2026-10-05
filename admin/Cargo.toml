@@ -41,6 +41,13 @@ hex.workspace = true
 [dev-dependencies]
 # `#[tokio::test]` + `start_paused` for the pacing loop's boundary tests.
 tokio = { version = "1", features = ["macros", "test-util"] }
+# The loopback test server speaks real h1 on maintained crates already
+# in the lockfile — no hand-rolled protocol bytes.
+hyper = { version = "1.11", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
 
 [lints]
 workspace = true
