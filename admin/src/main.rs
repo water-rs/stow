@@ -30,6 +30,7 @@ mod resolve;
 mod runs;
 mod rust_channel;
 mod scheduler;
+mod source_trees;
 #[cfg(test)]
 mod test_server;
 mod watchdog;

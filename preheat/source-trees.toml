@@ -1,0 +1,41 @@
+# Pinned source trees (stow#558) — extra repositories a ranked
+# project's own git checkout does not carry, declared by the operator
+# and passed explicitly:
+#
+#   stow-admin preheat projects submit --source-trees preheat/source-trees.toml …
+#   stow-admin preheat manual --projects <list> --source-trees <file> …
+#
+# `[[project]]` names a repository the input list contains and the
+# exact commit its checkout must sit at — a project that moved since
+# its declaration fails before anything else is fetched rather than
+# silently resolving a different tree. Each `[[project.source]]`
+# fetches one extra repository at an exact commit into a
+# project-relative destination that must be missing or empty.
+#
+# There is no default: the file applies only when the operator passes
+# it, and a declaration for a repository the input does not list is
+# rejected.
+
+# oven-sh/bun — its root Cargo.toml path-depends on `vendor/lolhtml`
+# and `vendor/rust-argon2`, which the repository does not ship:
+# `scripts/build/deps/lolhtml.ts` and `scripts/build/deps/rust-argon2.ts`
+# (at the pinned commit) clone oven-sh/lol-html@725ce499… and
+# sru-systems/rust-argon2@ed81866f… there before cargo runs. The
+# resolver lane never executes upstream build scripts, so the inputs
+# are pinned here instead. The upstream rust-argon2 recipe applies a
+# `legacy-low-memory.patch` touching only src/common.rs/src/context.rs
+# — no manifest, dependency, or feature content — so the pinned
+# unmodified source is the exact resolver input.
+[[project]]
+repo = "https://github.com/oven-sh/bun"
+commit = "d4928764f23213ecf3cd61fa0b5b4a44369a5096"
+
+[[project.source]]
+destination = "vendor/lolhtml"
+repo = "https://github.com/oven-sh/lol-html"
+commit = "725ce499aa9b71e38b7a2d0a9fbb6d7294a4079e"
+
+[[project.source]]
+destination = "vendor/rust-argon2"
+repo = "https://github.com/sru-systems/rust-argon2"
+commit = "ed81866f163f0c7026aa6fd8388adf37242eb32a"

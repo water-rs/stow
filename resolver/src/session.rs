@@ -520,8 +520,17 @@ impl Resolver {
     /// and the same `url` fetched at two refs, or twice concurrently,
     /// gets two independent trees rather than colliding on one dir.
     ///
+    /// `preparation` pins operator-declared source trees (stow#558):
+    /// the checkout must already sit at the declared commit — verified
+    /// before any extra acquisition — and each declared source is
+    /// fetched at its own pinned commit into its declared
+    /// missing-or-empty destination, all before
+    /// [`crate::fetch::prepare_project_tree`] runs.
+    ///
     /// # Errors
-    /// Fetch, manifest, resolve, or emission failures.
+    /// Fetch, manifest, resolve, or emission failures — plus a project
+    /// HEAD, source commit, or destination that does not match its
+    /// declaration.
     pub fn resolve_git(
         &self,
         url: &str,
@@ -529,13 +538,22 @@ impl Resolver {
         targets: &[String],
         rustc_version: &WireRustcVersion,
         downloads: u64,
+        preparation: Option<&crate::prepare::SourcePreparation>,
     ) -> CargoResult<SourceResolve> {
         let scratch = tempfile::Builder::new()
             .prefix("stow-src-git-")
             .tempdir()
             .context("git scratch dir")?;
         let root = crate::fetch::fetch_git(url, git_ref, scratch.path())?;
-        let tree = crate::fetch::prepare_project_tree(&root, true)?;
+        // Selection runs on the project's own checkout, before any
+        // declared source lands: an imported tree's manifest+lockfile
+        // pair can never displace the manifest the project selects.
+        let manifest_path = crate::fetch::select_manifest(&root)?;
+        if let Some(preparation) = preparation {
+            crate::prepare::verify_project_commit(&root, preparation)?;
+            crate::prepare::prepare_source_trees(&root, preparation)?;
+        }
+        let tree = crate::fetch::prepare_selected_manifest(&manifest_path, true)?;
         let opts = ResolveOptions {
             members_are_crates_io: false,
             dropped_lockfile: tree.dropped_lockfile,

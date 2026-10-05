@@ -331,9 +331,10 @@ acting unless `--yes` is given.
 - `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
   — promote the top-K most-missed `(crate, version, features)` identities
   from the `stow_cache_misses` Analytics Engine dataset.
-- `stow-admin preheat projects submit [--file preheat/projects.toml] --rustc-version ... [--targets a,b] --yes`
+- `stow-admin preheat projects submit [--file preheat/projects.toml] --rustc-version ... [--targets a,b] [--source-trees preheat/source-trees.toml] --yes`
   — resolve every repository the reviewed `preheat/projects.toml` lists:
-  stow-admin fetches its codeload tarball, drops the committed
+  stow-admin does a depth-1 git fetch of the repository and materializes
+  its pinned submodules recursively, drops the committed
   `Cargo.lock` so cargo re-resolves the latest semver-compatible
   versions, and runs the resolve once per CI target — in-process, four
   projects at a time (`resolve::RESOLVE_CONCURRENCY`; cargo's
@@ -344,7 +345,9 @@ acting unless `--yes` is given.
   dependencies as `depends_on` edges at the same `(target,
   rustc_version)`. A repository that fails to resolve is reported and
   skipped; a project contributes names and feature sets, never version
-  pins.
+  pins. `--source-trees` declares pinned extra source trees for
+  projects whose checkout names inputs git does not carry — schema
+  and semantics in [source-trees.md](source-trees.md).
 - `stow-admin preheat projects generate [--limit 200] [--min-stars 250] [--output preheat/projects.toml]`
   — refresh the reviewed list: every entry already in the file is
   re-evaluated under the same admission rule — a git tree carrying a
@@ -360,7 +363,8 @@ acting unless `--yes` is given.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
 - `stow-admin preheat manual --crates <file>|--projects <file>
-  --rustc-version <v> [--targets a,b] [--in-flight 45]` — the
+  --rustc-version <v> [--targets a,b] [--in-flight 45]
+  [--source-trees <file>]` — the
   edge-free wave: resolve the input in-process, layer it against the
   published index, dispatch `build-crate.yml` straight through GitHub's
   `workflow_dispatch`, and publish each index slice as its layer lands.
@@ -369,7 +373,8 @@ acting unless `--yes` is given.
   local CI server instead; `--adopt-since <RFC 3339>` (default 24 h ago)
   bounds how far back a resumed wave adopts already-dispatched runs;
   `--edge-url` (or `STOW_EDGE_URL`) is forwarded to the index-publish
-  workflow so it can sync the D1 catalog.
+  workflow so it can sync the D1 catalog. `--source-trees` is only
+  valid with `--projects` — see [source-trees.md](source-trees.md).
 - `stow-admin index export --out-dir <dir>` /
   `index publish --file <index> --folded <folded>` /
   `index sync --file <new-records.json>` / `index targets` — export
