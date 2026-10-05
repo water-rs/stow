@@ -75,10 +75,20 @@ set.
 
 `predict` runs the same local index analysis as `stow check`. A prediction
 that cannot be computed — stow not configured, the registry unreachable,
-`cargo metadata --offline` unable to resolve the lockfile because the
-crates.io index or a git dependency is not in the local cargo cache yet —
-exits non-zero with the reason. Passing `--target <triple>` analyzes a
-target the host cannot compile for.
+the lockfile unwalkable because the crates.io index or a git dependency
+is not in the local cargo cache yet — exits non-zero with the reason.
+Passing `--target <triple>` analyzes a target the host cannot compile
+for.
+
+The graph the analysis reads is cargo's own: stow re-runs the wrapped
+subcommand with `--unit-graph -Z unstable-options` and projects the
+units it reports. `-Z` is unlocked on that one child process with
+cargo's channel override (`__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly`),
+which cargo honors but rustc never reads — cfg evaluation stays exactly
+what the user's stable toolchain sees. A user-set `RUSTC_BOOTSTRAP`
+passes through untouched; an `[unstable]` table or `CARGO_UNSTABLE_*`
+variable in the user's config is an error on a stable toolchain, since
+the query would honor it while the real build ignores it.
 
 ## `stow setup`
 

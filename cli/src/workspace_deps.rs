@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
 use cargo_lock::{Lockfile, package::SourceId};
-use cargo_metadata::{Dependency, DependencyKind, FeatureName, Metadata, Package, PackageId};
 use glob::glob;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -21,12 +21,19 @@ pub struct DirectDependency {
     pub(crate) features: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct SelectedRegistryDependency {
-    pub(crate) extern_name: String,
-    pub(crate) crate_name: String,
-    pub(crate) version: Version,
-    pub(crate) features: Vec<String>,
+    /// Every extern name this node is a direct dependency under —
+    /// renamed deps across roots spell their own (`once_cell` beside
+    /// `oc = { package = "once_cell" }`), and rustc needs each.
+    pub extern_names: BTreeSet<String>,
+    pub crate_name: String,
+    pub version: Version,
+    /// Cargo's recorded features for this side — never unioned across
+    /// sides; a crate that is direct on both lands as two entries.
+    pub features: Vec<String>,
+    /// Which half of the unit graph the dependency edge lands on.
+    pub host_side: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -39,21 +46,41 @@ pub struct PackageKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockfileGraph {
     pub(crate) direct_dependencies: Vec<DirectDependency>,
-    pub(crate) workspace_packages: BTreeSet<PackageKey>,
-    pub(crate) parents_by_package: BTreeMap<PackageKey, Vec<PackageKey>>,
 }
 
-/// The transitive resolve plus each visited package's feature surface —
-/// the two facts the local index resolver derives from `cargo metadata`.
+/// The units cargo compiles for the wrapped command — one
+/// `cargo <subcommand> --unit-graph` run — projected onto the facts
+/// the local index resolver needs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExpandedDependencyGraph {
     /// The normalized expanded graph the resolver and the admissions
     /// request both consume.
     pub entries: Vec<ResolvedDependencyGraphEntry>,
-    /// Per-package `[features]` table plus optional-dependency names,
-    /// keyed the way [`crate::resolve::analyze_dependency_graph`] looks
-    /// them up.
-    pub feature_graphs: BTreeMap<crate::resolve::PackageKey, crate::resolve::PackageFeatureGraph>,
+    /// The roots' direct registry externs — the top-crate path's
+    /// dependency set, from the same unit graph.
+    pub direct_dependencies: Vec<SelectedRegistryDependency>,
+    /// Every local (path-source) package manifest cargo read for this
+    /// answer, with its content hash — path deps outside the workspace
+    /// root are inputs too, so the persisted copy verifies these on
+    /// load instead of trying to name them in the cache key.
+    pub local_manifests: Vec<LocalManifestHash>,
+}
+
+/// A manifest cargo read, recorded with its blake3 so a later cache
+/// load can check it has not changed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalManifestHash {
+    pub path: PathBuf,
+    pub blake3: String,
+}
+
+impl LocalManifestHash {
+    /// Whether the file still hashes to the recorded value — a missing
+    /// or unreadable manifest is a mismatch, not an error.
+    pub fn verify(&self) -> bool {
+        std::fs::read(&self.path)
+            .is_ok_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == self.blake3)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +129,7 @@ pub fn resolve_lockfile_graph(
     let selected_manifest_path = canonicalize_or_original(manifest_path);
     let workspace_manifest_path = canonicalize_or_original(&workspace_manifest_path);
     let selected_members = if selected_manifest_path == workspace_manifest_path {
-        workspace_members.clone()
+        workspace_members
     } else {
         BTreeSet::from([selected_manifest_path])
     };
@@ -125,36 +152,6 @@ pub fn resolve_lockfile_graph(
             )
         })
         .collect::<BTreeMap<_, _>>();
-
-    let mut workspace_packages = BTreeSet::<PackageKey>::new();
-    for member_path in &workspace_members {
-        let member_manifest = load_manifest(member_path)?;
-        let package = member_manifest.package.as_ref().ok_or_else(|| {
-            stow_types::stow_error!(
-                "workspace member {} is missing [package]",
-                member_path.display()
-            )
-        })?;
-        let version = member_manifest
-            .package_version(&workspace_manifest)
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "workspace member {} package {} is missing version",
-                    member_path.display(),
-                    package.name
-                )
-            })?;
-        workspace_packages.insert(PackageKey {
-            crate_name: package.name.clone(),
-            version: Version::parse(version).wrap_err_with(|| {
-                format!(
-                    "parse version `{version}` for workspace member {}",
-                    member_path.display()
-                )
-            })?,
-            source: None,
-        });
-    }
 
     let workspace_deps = workspace_manifest
         .workspace
@@ -213,166 +210,626 @@ pub fn resolve_lockfile_graph(
 
     Ok(LockfileGraph {
         direct_dependencies,
-        workspace_packages: workspace_packages.clone(),
-        parents_by_package: build_parents_by_package(&lockfile, &workspace_packages),
     })
 }
 
-#[tracing::instrument(
-    name = "stow.workspace.resolve_exact_dependency_graph",
-    skip_all,
-    fields(target = target)
-)]
+/// Re-run the wrapped cargo subcommand as `cargo <subcommand>
+/// --unit-graph` with the user's own arguments (stow#551).
+///
+/// `target` is the triple cargo was given — by `--target`, by
+/// `CARGO_BUILD_TARGET`, or by `build.target` — and `None` when the
+/// build is native. Several given targets resolve side-by-side in
+/// cargo's graph; units for a target other than `target` are never
+/// nodes (stow serves one target's units), so they are filtered by
+/// `platform` rather than merged.
+#[tracing::instrument(name = "stow.workspace_deps.unit_graph", skip_all)]
 pub async fn resolve_exact_dependency_graph(
-    workspace_root: &Path,
     manifest_path: &Path,
-    args: &MetadataArgs,
-    target: &str,
+    action: &str,
+    cargo_args: &[OsString],
+    target: Option<&str>,
+    current_dir: &Path,
+    toolchain: &str,
 ) -> stow_types::error::Result<ExpandedDependencyGraph> {
-    let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
-    let resolve = metadata.resolve.as_ref().ok_or_else(|| {
-        stow_types::stow_error!("cargo metadata response is missing resolve graph")
-    })?;
-    let package_by_id = metadata
-        .packages
-        .iter()
-        .map(|package| (package.id.clone(), package))
-        .collect::<BTreeMap<_, _>>();
-    let selected_package_ids = selected_package_ids(&metadata, manifest_path)?;
-
-    // The walk keys every package on the side it compiles for: a
-    // workspace's own units are target-side, except a proc-macro
-    // member, which cargo always compiles for the host — the same rule
-    // `dependency_sides` applies to each edge's target. A package
-    // reachable on both sides is visited twice and posts two entries.
-    let mut visited = BTreeSet::<(PackageId, bool)>::new();
-    let mut queue: VecDeque<(PackageId, bool)> = selected_package_ids
-        .iter()
-        .map(|id| {
-            (
-                id.clone(),
-                package_by_id.get(id).is_some_and(|package| {
-                    package
-                        .targets
-                        .iter()
-                        .any(cargo_metadata::Target::is_proc_macro)
-                }),
-            )
-        })
-        .collect();
-    let mut entries = BTreeMap::<(String, Version, bool), ResolvedDependencyGraphEntry>::new();
-    let mut feature_graphs =
-        BTreeMap::<crate::resolve::PackageKey, crate::resolve::PackageFeatureGraph>::new();
-
-    while let Some((package_id, host_side)) = queue.pop_front() {
-        if !visited.insert((package_id.clone(), host_side)) {
-            continue;
+    let subcommand = unit_graph_subcommand(action)?;
+    let mut unit_graph = Command::new("cargo");
+    unit_graph
+        .arg(subcommand)
+        // Before the user's args: never lands behind a `--` terminator.
+        .arg("--unit-graph")
+        .arg("-Z")
+        .arg("unstable-options")
+        .current_dir(current_dir);
+    // `-Z` needs nightly cargo or RUSTC_BOOTSTRAP. On a stable channel
+    // with no user-set value, the child gets cargo's own channel
+    // override instead: cargo treats itself as nightly and accepts
+    // `-Z unstable-options`, while rustc — which never reads the
+    // variable — keeps answering `--print cfg` as stable, so
+    // `cfg(target_thread_local)`-class cfgs stay absent exactly as the
+    // user's build sees them (stow#551). RUSTC_BOOTSTRAP would change
+    // rustc's answer, so it is never injected; a user-set value passes
+    // through untouched because the user's build sees the same cfgs.
+    // If a future cargo drops the override, cargo rejects `-Z` and the
+    // query fails loudly below — no fallback.
+    if std::env::var_os("RUSTC_BOOTSTRAP").is_none() && cargo_channel_is_stable(current_dir).await?
+    {
+        unstable_feature_gate(current_dir, cargo_args)?;
+        for (key, value) in unit_graph_channel_env() {
+            unit_graph.env(key, value);
         }
-        let package = package_by_id.get(&package_id).ok_or_else(|| {
-            stow_types::stow_error!(
-                "cargo metadata package index is missing package {}",
-                package_id
-            )
-        })?;
-        let node = resolve
-            .nodes
-            .iter()
-            .find(|node| node.id == package_id)
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "cargo metadata resolve graph is missing node {}",
-                    package_id
-                )
-            })?;
+    }
+    // `--offline` is non-negotiable: dropping it makes cargo refresh the
+    // crates.io index on each invocation — a multi-second blocking call
+    // that turns small projects (clap ~1s vanilla) into 20-second stow
+    // runs and explodes the no-slowdown budget.
+    if !arg_spelled(cargo_args, "--offline") {
+        unit_graph.arg("--offline");
+    }
+    if !arg_spelled(cargo_args, "--manifest-path") {
+        unit_graph.arg("--manifest-path").arg(manifest_path);
+    }
+    unit_graph.args(cargo_args);
 
-        for dependency in &node.deps {
-            for side in dependency_sides(dependency, host_side, &package_by_id) {
-                queue.push_back((dependency.pkg.clone(), side));
+    let unit_graph = unit_graph
+        .output()
+        .await
+        .wrap_err("spawn cargo --unit-graph")?;
+    if !unit_graph.status.success() {
+        return Err(stow_types::stow_error!(
+            "cargo {subcommand} --unit-graph failed on toolchain {toolchain}: {}",
+            String::from_utf8_lossy(&unit_graph.stderr).trim()
+        ));
+    }
+    let graph: UnitGraph<'_> =
+        serde_json::from_slice(&unit_graph.stdout).wrap_err("parse cargo --unit-graph JSON")?;
+    if graph.version != 1 {
+        return Err(stow_types::stow_error!(
+            "cargo --unit-graph reported version {} (toolchain {toolchain}); only version 1 is understood",
+            graph.version
+        ));
+    }
+    let (entries, direct_dependencies, local_manifests) = emit_expanded_graph(&graph, target)?;
+    Ok(ExpandedDependencyGraph {
+        entries,
+        direct_dependencies,
+        local_manifests,
+    })
+}
+
+/// The cargo subcommand whose unit graph each wrapped action compiles;
+/// `predict` answers what `check` compiles. Only the actions stow
+/// wraps (`check`, `build`, `test`, `predict`) reach this mapping.
+fn unit_graph_subcommand(action: &str) -> stow_types::error::Result<&str> {
+    Ok(match action {
+        "check" | "predict" => "check",
+        "build" | "test" => action,
+        other => {
+            return Err(stow_types::stow_error!(
+                "stow action `{other}` has no cargo unit-graph subcommand"
+            ));
+        }
+    })
+}
+
+/// `cargo -V`'s channel: `cargo X.Y.Z` is stable; `-nightly`/`-dev`
+/// suffixes take `-Z` flags without `RUSTC_BOOTSTRAP`, so the query needs
+/// no injection there (beta counts as stable-channel, the same answer
+/// cargo's own feature gate gives for `RUSTC_BOOTSTRAP`).
+async fn cargo_channel_is_stable(current_dir: &Path) -> stow_types::error::Result<bool> {
+    let output = Command::new("cargo")
+        .arg("-V")
+        .current_dir(current_dir)
+        .output()
+        .await
+        .wrap_err("spawn cargo -V")?;
+    let version = String::from_utf8_lossy(&output.stdout);
+    Ok(!(version.contains("nightly") || version.contains("-dev")))
+}
+
+/// cargo's own channel override variable: `nightly` makes cargo accept
+/// `-Z` without `RUSTC_BOOTSTRAP`, and rustc never reads it — the
+/// probe keeps answering stable cfgs (stow#551).
+const CARGO_CHANNEL_OVERRIDE: &str = "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS";
+
+/// The extra environment the unit-graph child needs beyond the user's,
+/// reached only when stable cargo must accept `-Z` and the user's own
+/// environment does not already unlock it. `RUSTC_BOOTSTRAP` is never
+/// set here — it changes rustc's `--print cfg` answer.
+fn unit_graph_channel_env() -> Vec<(&'static str, &'static str)> {
+    vec![(CARGO_CHANNEL_OVERRIDE, "nightly")]
+}
+
+/// Fail when cargo config enables unstable features: under the nightly
+/// channel override cargo honors `[unstable]`/`CARGO_UNSTABLE_*`, while
+/// the user's stable build ignores them — the query cannot represent
+/// that build, so it must not answer.
+fn unstable_feature_gate(
+    current_dir: &Path,
+    cargo_args: &[OsString],
+) -> stow_types::error::Result<()> {
+    let mut enabled = Vec::<String>::new();
+    for (key, _value) in std::env::vars() {
+        if let Some(name) = key.strip_prefix("CARGO_UNSTABLE_") {
+            enabled.push(format!("CARGO_UNSTABLE_{name}"));
+        }
+    }
+    for (source, document) in crate::mold::cargo_config_documents(current_dir, cargo_args) {
+        let Some(item) = document.get("unstable") else {
+            continue;
+        };
+        match item.as_table_like() {
+            Some(table) => enabled.extend(
+                table
+                    .iter()
+                    .map(|(key, _)| format!("{source}: unstable.{key}")),
+            ),
+            None => enabled.push(format!("{source}: unstable")),
+        }
+    }
+    if enabled.is_empty() {
+        return Ok(());
+    }
+    enabled.sort();
+    Err(stow_types::stow_error!(
+        "cargo unstable feature{} enabled, but stable cargo would ignore it outside the unit-graph query: {}",
+        if enabled.len() == 1 { " is" } else { "s are" },
+        enabled.join(", ")
+    ))
+}
+
+/// `--unit-graph` kinds that are library compilations.
+const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "proc-macro", "staticlib", "cdylib"];
+
+/// Real-compilation modes — `cargo check` names its lib units `check`.
+const COMPILE_MODES: &[&str] = &["build", "check"];
+
+/// The `pkg_id` prefix every crates.io unit carries — alternative-registry
+/// packages must not become nodes.
+const CRATES_IO_PREFIX: &str = "registry+https://github.com/rust-lang/crates.io-index#";
+
+const HOST: u8 = 1;
+const TARGET: u8 = 2;
+
+/// `cargo <subcommand> --unit-graph` stdout, format version 1 (borrowed).
+#[derive(Deserialize)]
+struct UnitGraph<'a> {
+    version: u32,
+    #[serde(borrow)]
+    units: Vec<Unit<'a>>,
+    roots: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct Unit<'a> {
+    #[serde(borrow)]
+    pkg_id: &'a str,
+    target: UnitTarget<'a>,
+    /// `null` marks the host half when cargo was given a target; the
+    /// triple otherwise. Several targets resolve side-by-side and each
+    /// unit records the one it compiles for.
+    platform: Option<&'a str>,
+    #[serde(borrow)]
+    mode: &'a str,
+    #[serde(borrow, default)]
+    features: Vec<&'a str>,
+    #[serde(borrow, default)]
+    dependencies: Vec<UnitDependency<'a>>,
+}
+
+#[derive(Deserialize)]
+struct UnitTarget<'a> {
+    #[serde(borrow)]
+    kind: Vec<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct UnitDependency<'a> {
+    index: u32,
+    #[serde(borrow)]
+    extern_crate_name: &'a str,
+}
+
+/// `flag` or `flag=…` appears in `args`.
+fn arg_spelled(args: &[OsString], flag: &str) -> bool {
+    args.iter().any(|arg| {
+        arg.as_os_str() == flag
+            || arg
+                .to_str()
+                .is_some_and(|a| a.starts_with(&format!("{flag}=")))
+    })
+}
+
+/// The source `Cargo.lock` records for crates.io packages — the
+/// `CRATES_IO_PREFIX` without the `#` pkg-id separator.
+pub const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
+/// `registry+…#name@version` → (name, version, is-crates-io).
+fn parse_pkg_id(pkg_id: &str) -> (&str, &str, bool) {
+    match pkg_id
+        .rsplit('#')
+        .next()
+        .and_then(|frag| frag.split_once('@'))
+    {
+        Some((name, version)) => (name, version, pkg_id.starts_with(CRATES_IO_PREFIX)),
+        None => (pkg_id, "", false),
+    }
+}
+
+/// Per-unit facts the projection consults: `parsed` is `Some` exactly
+/// when the unit is a node — non-registry pkg ids (`path+`, `git+`)
+/// are not `name@version` and cannot be parsed.
+struct UnitInfo<'a> {
+    name: &'a str,
+    version_str: &'a str,
+    /// `Some` exactly when the unit is a node — a crates.io lib in a
+    /// real-compilation mode (`unit_infos` computes the flag once).
+    parsed: Option<(stow_types::identity::CrateName, Version)>,
+}
+
+impl UnitInfo<'_> {
+    /// `(CrateName, Version)` of a node unit — the `unit_infos` gate.
+    const fn parsed(&self) -> &(stow_types::identity::CrateName, Version) {
+        self.parsed.as_ref().expect("node units are parsed")
+    }
+}
+
+fn unit_infos<'a>(graph: &UnitGraph<'a>) -> stow_types::error::Result<Vec<UnitInfo<'a>>> {
+    graph
+        .units
+        .iter()
+        .map(|unit| {
+            let (name, version, crates_io) = parse_pkg_id(unit.pkg_id);
+            let node = crates_io
+                && unit.target.kind.iter().any(|kind| LIB_KINDS.contains(kind))
+                && COMPILE_MODES.contains(&unit.mode);
+            let parsed = node
+                .then(|| {
+                    let bad = |error: &dyn std::fmt::Display| {
+                        stow_types::stow_error!(
+                            "cargo --unit-graph pkg_id `{}`: {error}",
+                            unit.pkg_id
+                        )
+                    };
+                    Ok::<_, stow_types::error::Error>((
+                        stow_types::identity::CrateName::parse(name)
+                            .map_err(|error| bad(&error))?,
+                        Version::parse(version).map_err(|error| bad(&error))?,
+                    ))
+                })
+                .transpose()?;
+            Ok(UnitInfo {
+                name,
+                version_str: version,
+                parsed,
+            })
+        })
+        .collect()
+}
+
+fn info_at<'a>(
+    infos: &'a [UnitInfo<'a>],
+    index: u32,
+) -> stow_types::error::Result<&'a UnitInfo<'a>> {
+    infos.get(index as usize).ok_or_else(|| {
+        stow_types::stow_error!("cargo --unit-graph dependency index {index} is out of bounds")
+    })
+}
+
+/// A proc-macro or build-script unit — cargo's `CompileKind::Host`.
+fn host_kinded(unit: &Unit<'_>) -> bool {
+    unit.target.kind == ["custom-build"] || unit.target.kind.contains(&"proc-macro")
+}
+
+/// Side per unit. When cargo was given a target, host units are
+/// `platform: null` and target units carry their triple — a unit for a
+/// different target than the one served gets side 0 (never a node).
+/// Without a given target the side is cargo's `CompileKind` rule —
+/// roots and normal deps target, anything under a
+/// proc-macro/build-script/host unit host. Both sides reachable carries
+/// both bits.
+fn unit_sides(graph: &UnitGraph<'_>, target: Option<&str>) -> stow_types::error::Result<Vec<u8>> {
+    if let Some(target) = target {
+        return Ok(graph
+            .units
+            .iter()
+            .map(|unit| match unit.platform {
+                None => HOST,
+                Some(platform) if platform == target => TARGET,
+                // cargo compiles the other targets it was given too;
+                // their units are never nodes for the served target.
+                Some(_) => 0,
+            })
+            .collect());
+    }
+    let mut sides = vec![0u8; graph.units.len()];
+    let mut queue = VecDeque::<(usize, u8)>::new();
+    for &root in &graph.roots {
+        let root = info_at_index(graph, root)?;
+        let side = if host_kinded(&graph.units[root]) {
+            HOST
+        } else {
+            TARGET
+        };
+        if sides[root] & side == 0 {
+            sides[root] |= side;
+            queue.push_back((root, side));
+        }
+    }
+    while let Some((index, side)) = queue.pop_front() {
+        for dependency in &graph.units[index].dependencies {
+            let dep = info_at_index(graph, dependency.index)?;
+            let dep_side = if host_kinded(&graph.units[dep]) || side == HOST {
+                HOST
+            } else {
+                TARGET
+            };
+            if sides[dep] & dep_side == 0 {
+                sides[dep] |= dep_side;
+                queue.push_back((dep, dep_side));
             }
         }
+    }
+    Ok(sides)
+}
 
-        // Every visited package — registry or workspace/path — contributes
-        // its real `[features]` table: the resolver canonicalizes manifest
-        // seed features through it.
-        if let Some((key, graph)) = package_feature_graph(package) {
-            feature_graphs.insert(key, graph);
+/// Bounds-checked unit index — an out-of-range `roots`/`dependencies`
+/// index is cargo reporting a graph we do not understand, not a unit
+/// to skip.
+fn info_at_index(graph: &UnitGraph<'_>, index: u32) -> stow_types::error::Result<usize> {
+    let index = index as usize;
+    if index >= graph.units.len() {
+        return Err(stow_types::stow_error!(
+            "cargo --unit-graph index {index} is out of bounds"
+        ));
+    }
+    Ok(index)
+}
+
+/// Each unit's registry lib-dep edges per consumer side — slot 0 host,
+/// slot 1 target. A dep lands `HOST` when it is host-kinded or the
+/// consumer is host-side, else `TARGET` — under spelled `--target` the
+/// dep's own `platform` flag, under native the consumer's side (one
+/// shared unit serves both).
+fn unit_dep_edges(
+    graph: &UnitGraph<'_>,
+    infos: &[UnitInfo],
+    sides: &[u8],
+) -> stow_types::error::Result<Vec<[BTreeSet<ResolvedDependencyGraphDependency>; 2]>> {
+    let mut edges = Vec::with_capacity(graph.units.len());
+    for (index, unit) in graph.units.iter().enumerate() {
+        let mut by_side: [BTreeSet<ResolvedDependencyGraphDependency>; 2] =
+            [BTreeSet::new(), BTreeSet::new()];
+        for dependency in &unit.dependencies {
+            let dep_index = dependency.index as usize;
+            let dep = info_at(infos, dependency.index)?;
+            if dep.parsed.is_none() {
+                continue;
+            }
+            for consumer_side in [HOST, TARGET] {
+                if sides[index] & consumer_side == 0 {
+                    continue;
+                }
+                let dep_side = if host_kinded(&graph.units[dep_index]) || consumer_side == HOST {
+                    HOST
+                } else {
+                    TARGET
+                };
+                if sides[dep_index] & dep_side == 0 {
+                    continue;
+                }
+                let (crate_name, version) = dep.parsed();
+                by_side[usize::from(consumer_side == TARGET)].insert(
+                    ResolvedDependencyGraphDependency {
+                        crate_name: crate_name.clone(),
+                        version: version.clone(),
+                        host_side: dep_side == HOST,
+                    },
+                );
+            }
         }
+        edges.push(by_side);
+    }
+    Ok(edges)
+}
 
-        if !is_registry_package(package) {
+/// Direct registry externs — the roots' lib deps in the same graph,
+/// keyed by node identity `(crate, version, side)`. Two extern names
+/// for one crate (a rename in one member's manifest) union into the
+/// same node's `extern_names` instead of colliding; a crate that is a
+/// direct dependency on both sides lands as two entries with each
+/// side's own recorded features — features are never unioned across
+/// sides.
+fn direct_dependencies(
+    graph: &UnitGraph<'_>,
+    infos: &[UnitInfo],
+    sides: &[u8],
+) -> stow_types::error::Result<Vec<SelectedRegistryDependency>> {
+    let mut direct =
+        BTreeMap::<(String, Version, bool), (BTreeSet<String>, BTreeSet<String>)>::new();
+    for &root in &graph.roots {
+        let root_index = info_at_index(graph, root)?;
+        for dependency in &graph.units[root_index].dependencies {
+            let dep_index = info_at_index(graph, dependency.index)?;
+            let dep = info_at(infos, dependency.index)?;
+            if dep.parsed.is_none() || sides[dep_index] == 0 {
+                continue;
+            }
+            for consumer_side in [HOST, TARGET] {
+                if sides[root_index] & consumer_side == 0 {
+                    continue;
+                }
+                let dep_side = if host_kinded(&graph.units[dep_index]) || consumer_side == HOST {
+                    HOST
+                } else {
+                    TARGET
+                };
+                if sides[dep_index] & dep_side == 0 {
+                    continue;
+                }
+                let entry = direct
+                    .entry((
+                        dep.name.to_owned(),
+                        dep.parsed().1.clone(),
+                        dep_side == HOST,
+                    ))
+                    .or_default();
+                entry.0.insert(dependency.extern_crate_name.to_owned());
+                entry.1.extend(
+                    graph.units[dep_index]
+                        .features
+                        .iter()
+                        .map(|feature| (*feature).to_owned()),
+                );
+            }
+        }
+    }
+    Ok(direct
+        .into_iter()
+        .map(
+            |((crate_name, version, host_side), (extern_names, features))| {
+                SelectedRegistryDependency {
+                    extern_names,
+                    crate_name,
+                    version,
+                    features: features.into_iter().collect(),
+                    host_side,
+                }
+            },
+        )
+        .collect())
+}
+
+/// The unit graph as `ResolvedDependencyGraphEntry` rows + root direct
+/// deps + the local manifests cargo read. `target` is cargo's given
+/// target triple; `None` is a native build.
+fn emit_expanded_graph(
+    graph: &UnitGraph<'_>,
+    target: Option<&str>,
+) -> stow_types::error::Result<(
+    Vec<ResolvedDependencyGraphEntry>,
+    Vec<SelectedRegistryDependency>,
+    Vec<LocalManifestHash>,
+)> {
+    let infos = unit_infos(graph)?;
+    let sides = unit_sides(graph, target)?;
+    let unit_edges = unit_dep_edges(graph, &infos, &sides)?;
+
+    // A package's build-dependencies hang under its build-script
+    // compile unit (a host-side unit); merge its edges onto the
+    // package's lib node(s).
+    let mut extra_edges = BTreeMap::<usize, &BTreeSet<ResolvedDependencyGraphDependency>>::new();
+    for (index, unit) in graph.units.iter().enumerate() {
+        // A build-script *compile* unit's deps are the package's
+        // `[build-dependencies]` lib units.
+        if !(unit.target.kind == ["custom-build"] && unit.mode == "build") {
             continue;
         }
-
-        let mut features = node.features.clone();
-        features.sort();
-        features.dedup();
-        let features = features
-            .into_iter()
-            .map(FeatureName::into_inner)
-            .collect::<Vec<_>>();
-
-        let dependencies = resolved_dependencies(node, host_side, &package_by_id);
-
-        let entry_crate_name = stow_types::identity::CrateName::parse(package.name.as_str())
-            .map_err(|error| {
-                stow_types::stow_error!("workspace package name `{}`: {error}", package.name)
-            })?;
-        entries.insert(
-            (
-                package.name.clone().into_inner(),
-                package.version.clone(),
-                host_side,
-            ),
-            ResolvedDependencyGraphEntry {
-                crate_name: entry_crate_name,
-                version: package.version.clone(),
-                features,
-                host_side,
-                dependencies,
-            },
-        );
+        for (lib_index, lib) in infos.iter().enumerate() {
+            if lib.parsed.is_some()
+                && lib.name == infos[index].name
+                && lib.version_str == infos[index].version_str
+            {
+                extra_edges.insert(lib_index, &unit_edges[index][0]);
+            }
+        }
     }
 
-    Ok(ExpandedDependencyGraph {
-        entries: entries.into_values().collect(),
-        feature_graphs,
-    })
+    let mut entries = BTreeMap::<(String, Version, bool), ResolvedDependencyGraphEntry>::new();
+    for (index, (unit, info)) in graph.units.iter().zip(infos.iter()).enumerate() {
+        if info.parsed.is_none() {
+            continue;
+        }
+        // A node unit for a different given target never compiles for
+        // the served one — skip it; an eligible unit unreachable from
+        // the roots has no side to compile on — surface it.
+        if sides[index] == 0 {
+            if target.is_none_or(|t| unit.platform == Some(t) || unit.platform.is_none()) {
+                return Err(stow_types::stow_error!(
+                    "cargo --unit-graph unit {} is unreachable from the roots",
+                    unit.pkg_id
+                ));
+            }
+            continue;
+        }
+        for side in [HOST, TARGET] {
+            if sides[index] & side == 0 {
+                continue;
+            }
+            let (crate_name, version) = info.parsed();
+            let entry = entries
+                .entry((info.name.to_owned(), version.clone(), side == HOST))
+                .or_insert_with(|| ResolvedDependencyGraphEntry {
+                    crate_name: crate_name.clone(),
+                    version: version.clone(),
+                    features: Vec::new(),
+                    host_side: side == HOST,
+                    dependencies: Vec::new(),
+                });
+            entry
+                .features
+                .extend(unit.features.iter().map(|feature| (*feature).to_owned()));
+            entry.dependencies.extend(
+                unit_edges[index][usize::from(side == TARGET)]
+                    .iter()
+                    .cloned(),
+            );
+            entry.dependencies.extend(
+                extra_edges
+                    .get(&index)
+                    .into_iter()
+                    .flat_map(|set| set.iter().cloned()),
+            );
+        }
+    }
+    for entry in entries.values_mut() {
+        entry.features.sort();
+        entry.features.dedup();
+        entry.dependencies.sort();
+        entry.dependencies.dedup();
+    }
+    Ok((
+        entries.into_values().collect(),
+        direct_dependencies(graph, &infos, &sides)?,
+        local_manifest_hashes(graph)?,
+    ))
 }
 
-/// The registry-dep edges one visited package emits on one side, keyed
-/// the way [`dependency_sides`] classifies each `NodeDep`.
-fn resolved_dependencies(
-    node: &cargo_metadata::Node,
-    host_side: bool,
-    package_by_id: &BTreeMap<PackageId, &Package>,
-) -> Vec<ResolvedDependencyGraphDependency> {
-    let mut dependencies = node
-        .deps
-        .iter()
-        .flat_map(|dependency| {
-            let Some(dependency_package) = package_by_id.get(&dependency.pkg) else {
-                return Vec::new();
-            };
-            if !is_registry_package(dependency_package) {
-                return Vec::new();
-            }
-            let Ok(crate_name) =
-                stow_types::identity::CrateName::parse(dependency_package.name.as_str())
-            else {
-                return Vec::new();
-            };
-            dependency_sides(dependency, host_side, package_by_id)
-                .into_iter()
-                .map(|dep_host_side| ResolvedDependencyGraphDependency {
-                    crate_name: crate_name.clone(),
-                    version: dependency_package.version.clone(),
-                    host_side: dep_host_side,
-                })
-                .collect()
+/// Every local package manifest cargo read for this answer —
+/// `path+file://` pkg ids (path deps anywhere on disk, not only
+/// workspace members), hashed at resolve time for the persisted
+/// graph's load-side verification.
+fn local_manifest_hashes(
+    graph: &UnitGraph<'_>,
+) -> stow_types::error::Result<Vec<LocalManifestHash>> {
+    let mut paths = BTreeSet::<PathBuf>::new();
+    for unit in &graph.units {
+        let Some(rest) = unit.pkg_id.strip_prefix("path+") else {
+            continue;
+        };
+        let Some(root) = rest
+            .split('#')
+            .next()
+            .and_then(|url| url.strip_prefix("file://"))
+        else {
+            return Err(stow_types::stow_error!(
+                "cargo --unit-graph pkg_id `{}` is not a path+file url",
+                unit.pkg_id
+            ));
+        };
+        paths.insert(PathBuf::from(root).join("Cargo.toml"));
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).wrap_err_with(|| {
+                format!("read local manifest {} from unit graph", path.display())
+            })?;
+            Ok(LocalManifestHash {
+                path,
+                blake3: blake3::hash(&bytes).to_hex().to_string(),
+            })
         })
-        .collect::<Vec<_>>();
-    dependencies.sort();
-    dependencies.dedup();
-    dependencies
+        .collect()
 }
 
 /// The graph one build's compile observations mint misses from
@@ -558,244 +1015,6 @@ fn observed_dep_edges(
     Some((dependencies, dep_nodes))
 }
 
-/// The sides a resolve edge's target compiles for, matching cargo's
-/// `HostDep` classification: everything a host-side package reaches is
-/// host-side too; from the target side a dependency lands on the host
-/// when it is a proc-macro (proc-macros always compile for the host) or
-/// when an edge kind is `build`, and on the target for `normal` and
-/// `dev` edges — dev-deps compile for the target, they are linked into
-/// target test binaries. A dependency carrying both kinds — a
-/// `build-dependencies` line that is also an ordinary dependency —
-/// yields both nodes.
-fn dependency_sides(
-    dependency: &cargo_metadata::NodeDep,
-    parent_host_side: bool,
-    package_by_id: &BTreeMap<PackageId, &Package>,
-) -> BTreeSet<bool> {
-    if parent_host_side {
-        return BTreeSet::from([true]);
-    }
-    if package_by_id.get(&dependency.pkg).is_some_and(|package| {
-        package
-            .targets
-            .iter()
-            .any(cargo_metadata::Target::is_proc_macro)
-    }) {
-        return BTreeSet::from([true]);
-    }
-    let mut sides = BTreeSet::new();
-    for dep_kind in &dependency.dep_kinds {
-        sides.insert(matches!(dep_kind.kind, DependencyKind::Build));
-    }
-    if sides.is_empty() {
-        sides.insert(false);
-    }
-    sides
-}
-
-/// A package's feature surface keyed for the resolver: its `[features]`
-/// table verbatim plus the manifest-spelled names of optional deps (each
-/// grants an implicit selectable feature). `None` when the package name
-/// cannot parse as a crates.io name — such a package can never be a
-/// requested entry either, keeping the two key spaces identical.
-fn package_feature_graph(
-    package: &Package,
-) -> Option<(
-    crate::resolve::PackageKey,
-    crate::resolve::PackageFeatureGraph,
-)> {
-    let crate_name = stow_types::identity::CrateName::parse(package.name.as_str()).ok()?;
-    Some((
-        crate::resolve::PackageKey {
-            crate_name,
-            version: package.version.clone(),
-        },
-        crate::resolve::PackageFeatureGraph {
-            features: package
-                .features
-                .iter()
-                .map(|(name, entries)| (name.clone(), entries.clone()))
-                .collect(),
-            optional_dependencies: package
-                .dependencies
-                .iter()
-                .filter(|dependency| dependency.optional)
-                .map(|dependency| dependency.name.clone())
-                .collect(),
-        },
-    ))
-}
-
-pub async fn resolve_selected_registry_dependencies(
-    workspace_root: &Path,
-    manifest_path: &Path,
-    args: &MetadataArgs,
-    target: &str,
-    include_dev_dependencies: bool,
-) -> stow_types::error::Result<Vec<SelectedRegistryDependency>> {
-    let metadata = cargo_metadata(workspace_root, manifest_path, args, target).await?;
-    let resolve = metadata.resolve.as_ref().ok_or_else(|| {
-        stow_types::stow_error!("cargo metadata response is missing resolve graph")
-    })?;
-    let package_by_id = metadata
-        .packages
-        .iter()
-        .map(|package| (package.id.clone(), package))
-        .collect::<BTreeMap<_, _>>();
-    let selected_package_ids = selected_package_ids(&metadata, manifest_path)?;
-    let mut dependencies = BTreeSet::<SelectedRegistryDependency>::new();
-
-    for package_id in selected_package_ids {
-        let package = package_by_id.get(&package_id).ok_or_else(|| {
-            stow_types::stow_error!(
-                "cargo metadata package index is missing selected package {}",
-                package_id
-            )
-        })?;
-        let node = resolve
-            .nodes
-            .iter()
-            .find(|node| node.id == package_id)
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "cargo metadata resolve graph is missing node {}",
-                    package_id
-                )
-            })?;
-        for dependency in &node.deps {
-            if !dependency.dep_kinds.iter().any(|kind| {
-                dependency_kind_is_top_crate_extern(kind.kind, include_dev_dependencies)
-            }) {
-                continue;
-            }
-            let manifest_dependency = find_manifest_dependency(package, dependency)?;
-            if manifest_dependency.optional
-                && !optional_dependency_is_enabled(
-                    package,
-                    &node.features,
-                    dependency.name.as_str(),
-                )
-            {
-                continue;
-            }
-            let dependency_package = package_by_id.get(&dependency.pkg).ok_or_else(|| {
-                stow_types::stow_error!(
-                    "cargo metadata package index is missing package {}",
-                    dependency.pkg
-                )
-            })?;
-            if !is_registry_package(dependency_package) {
-                continue;
-            }
-            let dependency_node = resolve
-                .nodes
-                .iter()
-                .find(|node| node.id == dependency.pkg)
-                .ok_or_else(|| {
-                    stow_types::stow_error!(
-                        "cargo metadata resolve graph is missing node {}",
-                        dependency.pkg
-                    )
-                })?;
-            let mut features = dependency_node.features.clone();
-            features.sort();
-            features.dedup();
-            let features = features.into_iter().map(FeatureName::into_inner).collect();
-            dependencies.insert(SelectedRegistryDependency {
-                extern_name: dependency.name.replace('-', "_"),
-                crate_name: dependency_package.name.clone().into_inner(),
-                version: dependency_package.version.clone(),
-                features,
-            });
-        }
-    }
-
-    Ok(dependencies.into_iter().collect())
-}
-
-fn find_manifest_dependency<'a>(
-    package: &'a Package,
-    dependency: &cargo_metadata::NodeDep,
-) -> stow_types::error::Result<&'a Dependency> {
-    package
-        .dependencies
-        .iter()
-        .find(|candidate| dependency_extern_name(candidate) == dependency.name)
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "cargo metadata node dependency {} is missing from package {} manifest dependencies",
-                dependency.name,
-                package.name
-            )
-        })
-}
-
-fn dependency_extern_name(dependency: &Dependency) -> String {
-    dependency
-        .rename
-        .as_deref()
-        .unwrap_or(dependency.name.as_str())
-        .replace('-', "_")
-}
-
-fn optional_dependency_is_enabled(
-    package: &Package,
-    enabled_features: &[FeatureName],
-    dependency_name: &str,
-) -> bool {
-    let enabled_features = enabled_features
-        .iter()
-        .map(|feature| feature.as_ref().to_owned())
-        .collect::<Vec<String>>();
-    if enabled_features
-        .iter()
-        .any(|feature| feature == dependency_name)
-    {
-        return true;
-    }
-
-    let mut pending = enabled_features;
-    let mut seen = BTreeSet::new();
-    while let Some(feature) = pending.pop() {
-        if !seen.insert(feature.clone()) {
-            continue;
-        }
-        let Some(entries) = package.features.get(&feature) else {
-            continue;
-        };
-        for entry in entries {
-            if feature_entry_enables_dependency(entry, dependency_name) {
-                return true;
-            }
-            if package.features.contains_key(entry) {
-                pending.push(entry.clone());
-            }
-        }
-    }
-    false
-}
-
-fn feature_entry_enables_dependency(entry: &str, dependency_name: &str) -> bool {
-    if let Some(dependency) = entry.strip_prefix("dep:") {
-        return dependency == dependency_name;
-    }
-    if let Some((dependency, _)) = entry.split_once('/') {
-        return !dependency.ends_with('?') && dependency == dependency_name;
-    }
-    entry == dependency_name
-}
-
-const fn dependency_kind_is_top_crate_extern(
-    kind: DependencyKind,
-    include_dev_dependencies: bool,
-) -> bool {
-    match kind {
-        DependencyKind::Normal => true,
-        DependencyKind::Development => include_dev_dependencies,
-        DependencyKind::Build | DependencyKind::Unknown => false,
-    }
-}
-
 fn find_nearest_manifest(current_dir: &Path) -> stow_types::error::Result<PathBuf> {
     for ancestor in current_dir.ancestors() {
         let manifest_path = ancestor.join("Cargo.toml");
@@ -845,39 +1064,35 @@ fn manifest_in_workspace(
     Ok(expand_workspace_members(workspace_root, workspace_manifest)?.contains(selected_manifest))
 }
 
-fn build_parents_by_package(
-    lockfile: &Lockfile,
-    workspace_packages: &BTreeSet<PackageKey>,
+/// Reverse the expanded graph's dependency edges: for every entry,
+/// the registry packages that depend on it. This is the unit-graph
+/// substitute for the lockfile's `parents_by_package` — ranking reads
+/// whether a dep still has parents among the compiled set (stow#551).
+pub fn parents_by_package(
+    entries: &[ResolvedDependencyGraphEntry],
 ) -> BTreeMap<PackageKey, Vec<PackageKey>> {
-    let mut parents_by_package = BTreeMap::<PackageKey, Vec<PackageKey>>::new();
-    for package in &lockfile.packages {
-        let parent_key = PackageKey {
-            crate_name: package.name.to_string(),
-            version: package.version.clone(),
-            source: package.source.as_ref().map(ToString::to_string),
-        };
-        for dependency in &package.dependencies {
-            let dependency_key = PackageKey {
-                crate_name: dependency.name.to_string(),
-                version: dependency.version.clone(),
-                source: dependency.source.as_ref().map(ToString::to_string),
-            };
-            parents_by_package
-                .entry(dependency_key)
+    let mut parents: BTreeMap<PackageKey, Vec<PackageKey>> = BTreeMap::new();
+    for entry in entries {
+        for dependency in &entry.dependencies {
+            parents
+                .entry(PackageKey {
+                    crate_name: dependency.crate_name.to_string(),
+                    version: dependency.version.clone(),
+                    source: Some(CRATES_IO_SOURCE.to_owned()),
+                })
                 .or_default()
-                .push(parent_key.clone());
+                .push(PackageKey {
+                    crate_name: entry.crate_name.to_string(),
+                    version: entry.version.clone(),
+                    source: Some(CRATES_IO_SOURCE.to_owned()),
+                });
         }
     }
-    for parents in parents_by_package.values_mut() {
+    for parents in parents.values_mut() {
         parents.sort();
         parents.dedup();
     }
-    for workspace_package in workspace_packages {
-        parents_by_package
-            .entry(workspace_package.clone())
-            .or_default();
-    }
-    parents_by_package
+    parents
 }
 
 fn collect_dependency_section(
@@ -1089,7 +1304,7 @@ fn package_is_crates_io(package: &cargo_lock::Package) -> bool {
 /// glob match, and every path dependency of a member that lives under the
 /// workspace root — minus `[workspace].exclude`. A `[workspace]` table with
 /// no `members` key is a single-package workspace, not an error.
-fn expand_workspace_members(
+pub fn expand_workspace_members(
     workspace_root: &Path,
     workspace_manifest: &Manifest,
 ) -> stow_types::error::Result<BTreeSet<PathBuf>> {
@@ -1189,7 +1404,7 @@ pub fn enabled_optional_dependency_names(
     Ok(feature_config.enabled_optional_deps)
 }
 
-fn load_manifest(path: &Path) -> stow_types::error::Result<Manifest> {
+pub fn load_manifest(path: &Path) -> stow_types::error::Result<Manifest> {
     let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("read Cargo.toml {}", path.display()))?;
     toml::from_str::<Manifest>(&contents)
@@ -1198,91 +1413,6 @@ fn load_manifest(path: &Path) -> stow_types::error::Result<Manifest> {
 
 fn canonicalize_or_original(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-async fn cargo_metadata(
-    workspace_root: &Path,
-    manifest_path: &Path,
-    args: &MetadataArgs,
-    target: &str,
-) -> stow_types::error::Result<Metadata> {
-    let mut command = Command::new("cargo");
-    command
-        .arg("metadata")
-        .arg("--format-version")
-        .arg("1")
-        // No `--locked`: a stow-mirror lockfile is the resolver's runtime
-        // closure (no dev/build/optional pins), so `--locked` would error
-        // on every absent entry. Without it, cargo augments from the
-        // local index for whatever the resolver couldn't cover.
-        //
-        // `--offline` is non-negotiable: dropping it causes `cargo
-        // metadata` to refresh the crates.io index on each invocation —
-        // a multi-second blocking call that turns small projects (clap
-        // ~1s vanilla) into 20-second stow runs and explodes the
-        // no-slowdown budget. The local registry cache populated by any
-        // prior `cargo` run is enough to resolve absent pins; if it's
-        // missing entries entirely, this returns an error and the outer
-        // pipeline falls back to vanilla cargo passthrough.
-        .arg("--offline")
-        .arg("--filter-platform")
-        .arg(target)
-        .arg("--manifest-path")
-        .arg(manifest_path)
-        .current_dir(workspace_root);
-    if args.all_features {
-        command.arg("--all-features");
-    } else {
-        if args.no_default_features {
-            command.arg("--no-default-features");
-        }
-        if !args.features.is_empty() {
-            command.arg("--features").arg(args.features.join(","));
-        }
-    }
-
-    let output = command.output().await?;
-    if !output.status.success() {
-        return Err(stow_types::stow_error!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    serde_json::from_slice::<Metadata>(&output.stdout).wrap_err("parse cargo metadata JSON")
-}
-
-fn selected_package_ids(
-    metadata: &Metadata,
-    manifest_path: &Path,
-) -> stow_types::error::Result<BTreeSet<PackageId>> {
-    let selected_manifest = canonicalize_or_original(manifest_path);
-    let workspace_root_manifest =
-        canonicalize_or_original(&metadata.workspace_root.as_std_path().join("Cargo.toml"));
-    if selected_manifest == workspace_root_manifest {
-        return Ok(metadata.workspace_members.iter().cloned().collect());
-    }
-
-    let selected = metadata
-        .packages
-        .iter()
-        .find(|package| {
-            canonicalize_or_original(package.manifest_path.as_std_path()) == selected_manifest
-        })
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "cargo metadata does not include selected manifest {}",
-                selected_manifest.display()
-            )
-        })?;
-    Ok(BTreeSet::from([selected.id.clone()]))
-}
-
-fn is_registry_package(package: &cargo_metadata::Package) -> bool {
-    package
-        .source
-        .as_ref()
-        .is_some_and(|source| source.to_string().starts_with("registry+"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1421,7 +1551,7 @@ struct ResolvedDependencySpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct Manifest {
+pub struct Manifest {
     package: Option<PackageSection>,
     workspace: Option<WorkspaceSection>,
     features: Option<BTreeMap<String, Vec<String>>>,
@@ -1435,24 +1565,6 @@ struct Manifest {
 #[derive(Debug, Clone, Deserialize)]
 struct PackageSection {
     name: String,
-    version: Option<InheritableString>,
-}
-
-/// A `[package]` field that may either carry a literal value or be inherited
-/// from the workspace root with `version.workspace = true` — workspace
-/// inheritance, stable since Rust 1.64 and used by most modern workspaces.
-/// Declaring the field as a plain `String` made every such manifest fail to
-/// parse, which aborted the whole command.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum InheritableString {
-    Value(String),
-    Inherited(WorkspaceInherited),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct WorkspaceInherited {
-    workspace: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1460,12 +1572,6 @@ struct WorkspaceSection {
     members: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
     dependencies: Option<BTreeMap<String, DependencySpec>>,
-    package: Option<WorkspacePackageSection>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct WorkspacePackageSection {
-    version: Option<String>,
 }
 
 impl Manifest {
@@ -1481,26 +1587,6 @@ impl Manifest {
         .flatten()
         .flat_map(BTreeMap::values)
         .filter_map(DependencySpec::path)
-    }
-
-    /// This manifest's package version, resolving `version.workspace = true`
-    /// against the workspace root's `[workspace.package]`.
-    fn package_version<'a>(&'a self, workspace_manifest: &'a Self) -> Option<&'a str> {
-        match self.package.as_ref()?.version.as_ref()? {
-            InheritableString::Value(version) => Some(version.as_str()),
-            InheritableString::Inherited(inherited) => {
-                if !inherited.workspace {
-                    return None;
-                }
-                workspace_manifest
-                    .workspace
-                    .as_ref()?
-                    .package
-                    .as_ref()?
-                    .version
-                    .as_deref()
-            }
-        }
     }
 }
 
@@ -1599,70 +1685,6 @@ struct DetailedDependencySpec {
     registry: Option<String>,
     #[serde(rename = "registry-index")]
     registry_index: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::feature_entry_enables_dependency;
-
-    #[test]
-    fn weak_dependency_feature_does_not_enable_optional_dependency() {
-        assert!(!feature_entry_enables_dependency(
-            "quinn?/rustls-aws-lc-rs",
-            "quinn"
-        ));
-    }
-
-    #[test]
-    fn dependency_feature_and_dep_entry_enable_optional_dependency() {
-        assert!(feature_entry_enables_dependency("dep:quinn", "quinn"));
-        assert!(feature_entry_enables_dependency(
-            "quinn/runtime-tokio",
-            "quinn"
-        ));
-    }
-}
-
-#[cfg(test)]
-mod workspace_inheritance_tests {
-    use super::Manifest;
-
-    fn parse(contents: &str) -> Manifest {
-        toml::from_str::<Manifest>(contents).expect("parse manifest")
-    }
-
-    #[test]
-    fn package_version_reads_a_literal_value() {
-        let manifest = parse("[package]\nname = \"demo\"\nversion = \"1.2.3\"\n");
-        assert_eq!(manifest.package_version(&manifest), Some("1.2.3"));
-    }
-
-    #[test]
-    fn package_version_is_inherited_from_the_workspace_root() {
-        // `version.workspace = true` is a table, not a string. Declaring the
-        // field as `Option<String>` made this manifest fail to parse outright.
-        let member = parse("[package]\nname = \"demo\"\nversion.workspace = true\n");
-        let root = parse(
-            "[workspace]\nmembers = [\"demo\"]\n\n[workspace.package]\nversion = \"4.5.6\"\n",
-        );
-        assert_eq!(member.package_version(&root), Some("4.5.6"));
-    }
-
-    #[test]
-    fn a_root_package_can_inherit_from_its_own_workspace_table() {
-        let manifest = parse(
-            "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nversion = \"0.9.0\"\n\n\
-             [package]\nname = \"demo\"\nversion.workspace = true\n",
-        );
-        assert_eq!(manifest.package_version(&manifest), Some("0.9.0"));
-    }
-
-    #[test]
-    fn inheritance_without_a_workspace_package_version_is_absent_not_an_error() {
-        let member = parse("[package]\nname = \"demo\"\nversion.workspace = true\n");
-        let root = parse("[workspace]\nmembers = [\"demo\"]\n");
-        assert_eq!(member.package_version(&root), None);
-    }
 }
 
 #[cfg(test)]
@@ -2150,5 +2172,575 @@ mod observed_miss_tests {
         let serde = node(&graph, "serde", false);
         assert!(serde.dependencies[0].host_side);
         node(&graph, "serde_derive", true);
+    }
+}
+
+#[cfg(test)]
+mod unit_graph_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
+    use super::{
+        CARGO_CHANNEL_OVERRIDE, SelectedRegistryDependency, UnitGraph, emit_expanded_graph,
+        parse_pkg_id, resolve_exact_dependency_graph, unit_graph_channel_env,
+        unit_graph_subcommand, unstable_feature_gate,
+    };
+    use stow_types::api::ResolvedDependencyGraphEntry;
+
+    const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent dir")).expect("create dir");
+        std::fs::write(path, contents).expect("write file");
+    }
+
+    fn vendored(root: &Path, name: &str, manifest: &str) {
+        let base = format!("vendor/{name}");
+        write(root, &format!("{base}/Cargo.toml"), manifest);
+        write(
+            root,
+            &format!("{base}/src/lib.rs"),
+            "pub fn vendored() {}\n",
+        );
+        write(
+            root,
+            &format!("{base}/.cargo-checksum.json"),
+            "{\"files\":{}}",
+        );
+    }
+
+    /// A one-member root-package workspace whose dependencies exercise
+    /// every defect cargo's unit graph now answers for us: `feat-a`
+    /// reaches both sides at different feature sets, `opt-dep` is pulled
+    /// only through a weak feature edge (never compiled), `unix-host-dep`
+    /// and `win-host-dep` gate on cfg either side of a cross build, and
+    /// `dev-dep` exists only for dev-including subcommands.
+    fn fixture() -> TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        write(
+            &root,
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n\
+             [source.vendored-sources]\ndirectory = \"vendor\"\n",
+        );
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [workspace]\nresolver = \"2\"\n\n\
+             [features]\nmember-feat = [\"opt-dep?/f1\"]\n\n\
+             [dependencies]\nfeat-a = { version = \"1\", default-features = false }\n\
+             opt-dep = { version = \"1\", optional = true }\n\n\
+             [build-dependencies]\nhost-side = \"1\"\n\n\
+             [target.'cfg(unix)'.build-dependencies]\nunix-host-dep = \"1\"\n\n\
+             [target.'cfg(windows)'.build-dependencies]\nwin-host-dep = \"1\"\n\n\
+             [dev-dependencies]\ndev-dep = \"1\"\n",
+        );
+        write(&root, "src/lib.rs", "pub fn member() {}\n");
+        write(&root, "build.rs", "fn main() {}\n");
+
+        vendored(
+            &root,
+            "feat-a",
+            "[package]\nname = \"feat-a\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n\
+             [features]\ndefault = [\"f1\"]\nf1 = []\nf2 = []\n\n\
+             [dependencies]\nleaf = \"1\"\n\
+             renamed = { version = \"1\", optional = true, package = \"opt-dep\" }\n",
+        );
+        vendored(
+            &root,
+            "leaf",
+            "[package]\nname = \"leaf\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+        vendored(
+            &root,
+            "host-side",
+            "[package]\nname = \"host-side\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nfeat-a = \"1\"\n",
+        );
+        vendored(
+            &root,
+            "opt-dep",
+            "[package]\nname = \"opt-dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n\
+             [features]\ndefault = [\"f1\"]\nf1 = []\n",
+        );
+        vendored(
+            &root,
+            "unix-host-dep",
+            "[package]\nname = \"unix-host-dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+        vendored(
+            &root,
+            "win-host-dep",
+            "[package]\nname = \"win-host-dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+        vendored(
+            &root,
+            "dev-dep",
+            "[package]\nname = \"dev-dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+
+        dir
+    }
+
+    fn resolve(root: &Path, action: &str, cargo_args: &[&str]) -> super::ExpandedDependencyGraph {
+        let cargo_args = cargo_args.iter().map(OsString::from).collect::<Vec<_>>();
+        let spelled_target = cargo_args
+            .iter()
+            .skip_while(|arg| arg.as_os_str() != "--target")
+            .nth(1)
+            .map(|arg| arg.to_string_lossy().into_owned());
+        let spelled_target = cargo_args
+            .iter()
+            .find_map(|arg| {
+                arg.to_str()
+                    .and_then(|arg| arg.strip_prefix("--target="))
+                    .map(str::to_owned)
+            })
+            .or(spelled_target);
+        smol::block_on(resolve_exact_dependency_graph(
+            &root.join("Cargo.toml"),
+            action,
+            &cargo_args,
+            spelled_target.as_deref(),
+            root,
+            "rustc",
+        ))
+        .expect("resolve exact dependency graph")
+    }
+
+    fn index(
+        entries: &[ResolvedDependencyGraphEntry],
+    ) -> BTreeMap<(&str, bool), &ResolvedDependencyGraphEntry> {
+        entries
+            .iter()
+            .map(|entry| ((entry.crate_name.as_str(), entry.host_side), entry))
+            .collect()
+    }
+
+    fn dependencies(entry: &ResolvedDependencyGraphEntry) -> BTreeSet<(String, bool)> {
+        entry
+            .dependencies
+            .iter()
+            .map(|dep| (dep.crate_name.as_str().to_owned(), dep.host_side))
+            .collect()
+    }
+
+    /// Defect 1: `node.features` was one set unified across both sides.
+    /// `feat-a` is a target dependency with no features and a build-dep
+    /// chain dependency with its defaults — cargo compiles the two sides
+    /// separately, so the graph must carry both sets.
+    #[test]
+    fn each_side_carries_its_own_feature_set() {
+        let root = fixture();
+        let graph = resolve(root.path(), "build", &[]);
+        let entries = index(&graph.entries);
+
+        let target_side = entries[&("feat-a", false)];
+        let host_side = entries[&("feat-a", true)];
+        assert_eq!(target_side.features, [] as [String; 0]);
+        assert_eq!(host_side.features, vec!["default", "f1"]);
+    }
+
+    /// Defect 2: an optional dependency reachable only through a weak
+    /// (`dep?/feat`) feature edge stayed in the hand-walked resolve even
+    /// though cargo never compiles it.
+    #[test]
+    fn weak_only_optional_dependency_is_not_built() {
+        let root = fixture();
+        let graph = resolve(root.path(), "build", &["--features", "member-feat"]);
+        assert!(
+            !graph
+                .entries
+                .iter()
+                .any(|entry| entry.crate_name.as_str() == "opt-dep")
+        );
+    }
+
+    /// Defect 3: `--filter-platform <target>` evaluated build-dep edges
+    /// with the target's cfg. On a unix host cross-compiling for
+    /// windows, cargo still builds the unix-gated build dependency — and
+    /// never builds the windows-gated one, since build deps compile for
+    /// host.
+    #[cfg(unix)]
+    #[test]
+    fn host_side_edges_use_the_host_cfg_when_cross_compiling() {
+        let root = fixture();
+        let graph = resolve(root.path(), "build", &["--target", WINDOWS_TARGET]);
+        let entries = index(&graph.entries);
+
+        assert!(entries.contains_key(&("unix-host-dep", true)));
+        assert!(!entries.contains_key(&("win-host-dep", true)));
+        assert!(!entries.contains_key(&("win-host-dep", false)));
+    }
+
+    /// Defect 4: dev edges were always followed. `dev-dep` is present
+    /// only when the wrapped subcommand compiles dev-dependencies.
+    #[test]
+    fn dev_edges_follow_the_wrapped_subcommand() {
+        let root = fixture();
+        let build_graph = resolve(root.path(), "build", &[]);
+        let test_graph = resolve(root.path(), "test", &[]);
+
+        assert!(
+            !build_graph
+                .entries
+                .iter()
+                .any(|entry| entry.crate_name.as_str() == "dev-dep")
+        );
+        let test = index(&test_graph.entries);
+        assert!(test.contains_key(&("dev-dep", false)));
+    }
+
+    /// The edges are the unit graph's own: a dep edge lands on the side
+    /// the consumer needs it for. Cargo emits ONE `leaf` unit in dev
+    /// (both `feat-a` units dep on it) and one per side in release —
+    /// either way the target `feat-a` lists only the target `leaf` and
+    /// the host `feat-a` only the host `leaf`.
+    #[test]
+    fn edges_are_the_unit_graphs_own() {
+        let root = fixture();
+        // Dev shares one `leaf` unit between feat-a's host and target
+        // consumers; each consumer's edge lands on its own side — cargo
+        // splits the unit per side under `--target`, and a target entry
+        // never carries host-side dep edges.
+        let dev = resolve(root.path(), "build", &[]);
+        let dev_entries = index(&dev.entries);
+        assert_eq!(
+            dependencies(dev_entries[&("feat-a", false)]),
+            BTreeSet::from([("leaf".to_owned(), false)])
+        );
+        assert_eq!(
+            dependencies(dev_entries[&("feat-a", true)]),
+            BTreeSet::from([("leaf".to_owned(), true)])
+        );
+        // Build-dependencies hang under the build-script compile unit;
+        // they merge onto the package's host node.
+        assert_eq!(
+            dependencies(dev_entries[&("host-side", true)]),
+            BTreeSet::from([("feat-a".to_owned(), true)])
+        );
+
+        let release = resolve(root.path(), "build", &["--release"]);
+        let release_entries = index(&release.entries);
+        assert_eq!(
+            dependencies(release_entries[&("feat-a", false)]),
+            BTreeSet::from([("leaf".to_owned(), false)])
+        );
+        assert_eq!(
+            dependencies(release_entries[&("feat-a", true)]),
+            BTreeSet::from([("leaf".to_owned(), true)])
+        );
+    }
+
+    /// The native (unspelled `--target`) invocation's projection must
+    /// equal the explicit `--target <host>` projection — the host-side
+    /// derivation (`platform` is null for every native unit) must land
+    /// the same units on each side.
+    #[test]
+    fn native_side_derivation_matches_spelled_target() {
+        let root = fixture();
+        let native = resolve(root.path(), "build", &[]);
+        let host = rustc_host_triple();
+        let spelled = resolve(root.path(), "build", &["--target", &host]);
+
+        let shape = |graph: &super::ExpandedDependencyGraph| {
+            graph
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.crate_name.as_str().to_owned(),
+                        entry.version.to_string(),
+                        entry.host_side,
+                        entry.features.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(shape(&native), shape(&spelled));
+    }
+
+    /// The user's own args forward verbatim: `--release` resolves the
+    /// same node set (cargo may emit a different unit layout — shared
+    /// dep units split per side — but the packages and feature sets are
+    /// the graph's).
+    #[test]
+    fn release_flag_resolves_the_same_nodes() {
+        let root = fixture();
+        let dev = resolve(root.path(), "build", &[]);
+        let release = resolve(root.path(), "build", &["--release"]);
+        let nodes = |graph: &super::ExpandedDependencyGraph| {
+            graph
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.crate_name.as_str().to_owned(),
+                        entry.version.to_string(),
+                        entry.host_side,
+                        entry.features.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(nodes(&dev), nodes(&release));
+    }
+
+    /// The wrapped action picks the cargo subcommand whose unit graph it
+    /// compiles — clippy resolves the graph `check` compiles, predict
+    /// answers against the same shape.
+    #[test]
+    fn action_maps_to_subcommand() {
+        assert_eq!(unit_graph_subcommand("check").unwrap(), "check");
+        assert_eq!(unit_graph_subcommand("build").unwrap(), "build");
+        assert_eq!(unit_graph_subcommand("test").unwrap(), "test");
+        assert_eq!(unit_graph_subcommand("predict").unwrap(), "check");
+        // Only check/build/test/predict reach the query — every other
+        // action names itself rather than guessing a graph cargo would
+        // not build (stow#551).
+        for action in ["clippy", "run", "bench", "doc", "rustc", "publish"] {
+            assert!(unit_graph_subcommand(action).is_err(), "{action}");
+        }
+    }
+
+    /// Direct registry dependencies are the roots' lib deps in the same
+    /// unit graph, keyed by their extern name — here `feat-a` and
+    /// nothing transitive.
+    #[test]
+    fn direct_dependencies_are_the_roots_lib_deps() {
+        let root = fixture();
+        let graph = resolve(root.path(), "build", &[]);
+        assert_eq!(
+            graph.direct_dependencies,
+            vec![SelectedRegistryDependency {
+                extern_names: std::iter::once("feat_a".to_owned()).collect(),
+                crate_name: "feat-a".to_owned(),
+                version: semver::Version::parse("1.0.0").unwrap(),
+                features: vec![],
+                host_side: false,
+            }]
+        );
+    }
+
+    fn rustc_host_triple() -> String {
+        let output = std::process::Command::new("rustc")
+            .args(["--print", "host-tuple"])
+            .output()
+            .expect("rustc host tuple");
+        String::from_utf8(output.stdout)
+            .expect("utf8 host tuple")
+            .trim()
+            .to_owned()
+    }
+
+    /// The projection answers only `pkg_id`s whose source is the
+    /// crates.io index.
+    #[test]
+    fn parse_pkg_id_extracts_crates_io_packages() {
+        let (name, version, crates_io) =
+            parse_pkg_id("registry+https://github.com/rust-lang/crates.io-index#feat-a@1.0.0");
+        assert_eq!((name, version, crates_io), ("feat-a", "1.0.0", true));
+
+        let (_, _, crates_io) = parse_pkg_id("path+file:///tmp/member#0.1.0");
+        assert!(!crates_io);
+        let (_, _, crates_io) = parse_pkg_id("registry+https://other.registry/index#feat-a@1.0.0");
+        assert!(!crates_io);
+        let (_, _, crates_io) = parse_pkg_id("sparse+https://index.crates.io/#feat-a@1.0.0");
+        assert!(!crates_io, "only the registry+ crates.io form qualifies");
+    }
+
+    /// A `version` other than 1 fails fast — the projection can only be
+    /// read while its wire shape is the one cargo documents. The emit
+    /// side fails fast too: a dependency index outside `units` is an
+    /// error, never a dropped edge.
+    #[test]
+    fn malformed_unit_graph_is_an_error() {
+        let out_of_bounds = r#"{
+            "version": 1,
+            "roots": [0],
+            "units": [{
+                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#a@1.0.0",
+                "target": {"kind": ["lib"]},
+                "platform": null,
+                "mode": "build",
+                "features": [],
+                "dependencies": [{"index": 9, "extern_crate_name": "b"}]
+            }]
+        }"#;
+        let graph: UnitGraph<'_> = serde_json::from_str(out_of_bounds).expect("parse");
+        assert!(emit_expanded_graph(&graph, None).is_err());
+    }
+
+    /// Members `a` and `b` depending on one crate under two extern
+    /// names — `oc = { package = "shared" }` — record one dependency
+    /// entry carrying both names, not a duplicate the analysis index
+    /// would reject (stow#551).
+    #[test]
+    fn renamed_extern_names_for_one_crate_fold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(
+            root,
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n",
+        );
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"b\"]\n",
+        );
+        write(
+            root,
+            "a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nshared = \"1\"\n",
+        );
+        write(root, "a/src/lib.rs", "pub fn a() {}\n");
+        write(
+            root,
+            "b/Cargo.toml",
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\noc = { package = \"shared\", version = \"1\" }\n",
+        );
+        write(root, "b/src/lib.rs", "pub fn b() {}\n");
+        vendored(
+            root,
+            "shared",
+            "[package]\nname = \"shared\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+        std::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .output()
+            .expect("generate lockfile");
+
+        let graph = resolve(root, "build", &[]);
+        let mut shared = graph
+            .direct_dependencies
+            .iter()
+            .filter(|dependency| dependency.crate_name == "shared");
+        let entry = shared.next().expect("shared is a direct dependency");
+        assert!(
+            shared.next().is_none(),
+            "one crate version must not emit two analysis requests"
+        );
+        assert_eq!(
+            entry.extern_names.iter().collect::<Vec<_>>(),
+            vec!["oc", "shared"],
+            "both extern names ride the one entry"
+        );
+    }
+
+    /// A dep behind `cfg(target_thread_local)` must not appear: the
+    /// query unlocks `-Z` through cargo's channel override, which rustc
+    /// never reads — cargo evaluates the cfg exactly as the user's
+    /// stable build does, where bootstrap would report the cfg and a
+    /// phantom node would land (stow#551).
+    #[test]
+    fn channel_override_hides_bootstrap_cfgs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(
+            root,
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"vendor\"\n",
+        );
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nresolver = \"2\"\n\n[target.'cfg(target_thread_local)'.dependencies]\nanyhow = \"1\"\n",
+        );
+        write(root, "src/lib.rs", "pub fn member() {}\n");
+        vendored(
+            root,
+            "anyhow",
+            "[package]\nname = \"anyhow\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+        std::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .output()
+            .expect("generate lockfile");
+
+        let graph = resolve(root, "build", &[]);
+        assert!(
+            graph
+                .entries
+                .iter()
+                .all(|entry| entry.crate_name.as_str() != "anyhow"),
+            "cfg(target_thread_local) is a bootstrap cfg the stable build cannot satisfy"
+        );
+    }
+
+    /// The query's extra environment is exactly the channel override:
+    /// `RUSTC_BOOTSTRAP` must never appear in it — bootstrap changes
+    /// rustc's `--print cfg` answer, so a user who did not set it must
+    /// not have it injected (stow#551).
+    #[test]
+    fn query_env_never_injects_bootstrap() {
+        let env = unit_graph_channel_env();
+        assert_eq!(env, vec![(CARGO_CHANNEL_OVERRIDE, "nightly")]);
+        assert!(
+            env.iter().all(|(key, _)| *key != "RUSTC_BOOTSTRAP"),
+            "RUSTC_BOOTSTRAP changes rustc's probe answer; only a user-set value may reach the query"
+        );
+    }
+
+    /// An `[unstable]` config table is honored under the query's
+    /// channel override while the user's stable cargo would ignore it —
+    /// the query cannot represent their build, so the setting must
+    /// name itself in the error (stow#551).
+    #[test]
+    fn unstable_config_is_an_error_on_stable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write(
+            root,
+            ".cargo/config.toml",
+            "[unstable]\nunit-graph = true\n",
+        );
+        let error = unstable_feature_gate(root, &[]).expect_err("unstable gate errors");
+        assert!(
+            error.to_string().contains("unstable.unit-graph"),
+            "the setting names itself: {error}"
+        );
+    }
+
+    /// Several spelled `--target`s: only the units for the resolved
+    /// target plus the host units survive — no merging, no other
+    /// platform's packages (stow#551).
+    #[test]
+    fn multiple_spelled_targets_keep_only_the_resolved_one() {
+        let json = r#"{
+            "version": 1,
+            "roots": [0, 1],
+            "units": [
+                {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#a@1.0.0",
+                 "target": {"kind": ["lib"]}, "platform": "x86_64-pc-windows-msvc",
+                 "mode": "build", "features": [], "dependencies": []},
+                {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#a@1.0.0",
+                 "target": {"kind": ["lib"]}, "platform": "x86_64-unknown-linux-gnu",
+                 "mode": "build", "features": [], "dependencies": []},
+                {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#h@1.0.0",
+                 "target": {"kind": ["lib"]}, "platform": null,
+                 "mode": "build", "features": [], "dependencies": []}
+            ]
+        }"#;
+        let graph: UnitGraph<'_> = serde_json::from_str(json).expect("parse");
+        let (entries, _, _) = emit_expanded_graph(&graph, Some("x86_64-unknown-linux-gnu"))
+            .expect("resolved target is present");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.crate_name.as_str(), entry.host_side))
+                .collect::<Vec<_>>(),
+            vec![("a", false), ("h", true)],
+            "the unselected platform's units are excluded, host units kept"
+        );
     }
 }

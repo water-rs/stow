@@ -497,9 +497,10 @@ pub struct ResolvedDependencyGraphEntry {
     /// Package crate version.
     #[schema(value_type = String)]
     pub version: semver::Version,
-    /// Sorted, deduplicated features (raw list — wire form is JSON array).
-    /// `cargo metadata` reports one unified set per package, so a package
-    /// present on both sides carries the union on each.
+    /// Sorted, deduplicated features for this side (raw list — wire form
+    /// is JSON array). Cargo compiles each side with its own feature set
+    /// (resolver version 2+ semantics), so a package present on both
+    /// sides may carry different features on each.
     pub features: Vec<String>,
     /// Whether this node compiles for the build host — proc-macros and
     /// build dependencies, and everything only they reach. A package

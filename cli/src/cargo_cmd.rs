@@ -63,7 +63,10 @@ fn spawn_mold_provision(
     pending: &PendingProjectContext,
 ) -> tokio::task::JoinHandle<stow_types::error::Result<Vec<String>>> {
     let target = pending.target.clone();
-    let explicit_target = pending.metadata_args.target.clone();
+    // The target cargo was given — `--target` or `CARGO_BUILD_TARGET`
+    // or `build.target` — decides whether this build links for the
+    // host at all (stow#551).
+    let explicit_target = pending.resolved_target.clone();
     let dir = pending.current_dir.clone();
     tokio::spawn(async move {
         crate::mold::provision(target, explicit_target.as_deref(), &dir)
@@ -99,7 +102,7 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     let invocation = CargoInvocation::new(command, args);
     let config = tracing::debug_span!("stow.precargo.config_load").in_scope(load_stow_config);
     let project_span = tracing::debug_span!("stow.precargo.project_context");
-    let pending = project_span.in_scope(|| ProjectContext::begin(&invocation.cargo_args))?;
+    let pending = project_span.in_scope(|| ProjectContext::begin(&invocation))?;
     let mold = spawn_mold_provision(&pending);
     let mut project = pending.finish().instrument(project_span).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
@@ -382,7 +385,7 @@ async fn run_original_workspace_build(
     let expanded_entries = expanded_graph.as_deref();
     let prefetch_artifacts = prefetch_artifacts.as_deref();
     let covered_units = prefetch_artifacts.map_or(0, <[PrefetchArtifact]>::len);
-    // The top-crate fast path pays its own `cargo metadata` plus a
+    // The top-crate fast path pays its own graph resolve plus a
     // prefetch warm, so it only exists when the filesystem pass already
     // proved the graph servable — on an all-miss build it can only burn
     // seconds to reach the same "nothing to serve" the serve map already
@@ -556,13 +559,22 @@ fn build_mirror_project_context(
     let manifest_path = mirror_manifest_path(project, mirror)?;
     let current_dir_relative =
         pathdiff::diff_paths(&current_dir, &workspace_root).unwrap_or_default();
+    // The mirror queries the mirror's own manifest: spelled
+    // `--manifest-path` (either form) rewrites to the mirror path —
+    // forwarding the user's absolute path would resolve the user's
+    // lockfile graph under the mirror's key (stow#551).
+    let mut metadata_args = project.metadata_args.clone();
+    metadata_args.manifest_path = Some(manifest_path.clone());
     Ok(ProjectContext {
+        action: project.action.clone(),
+        cargo_args: rewrite_args_for_mirror(&project.cargo_args, project, mirror)?,
         workspace_root,
         current_dir,
         current_dir_relative,
         manifest_path,
-        metadata_args: project.metadata_args.clone(),
+        metadata_args,
         target: project.target.clone(),
+        target_given: project.target_given,
         rustc_version: project.rustc_version.clone(),
         mold_config_args: project.mold_config_args.clone(),
     })
@@ -587,7 +599,7 @@ async fn analyze_for_prediction(
     args: CargoCommandArgs,
 ) -> stow_types::error::Result<Option<WorkspacePrediction>> {
     let invocation = CargoInvocation::new("predict", args);
-    let project = ProjectContext::load(&invocation.cargo_args).await?;
+    let project = ProjectContext::load(&invocation).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -639,14 +651,24 @@ impl CargoInvocation {
 }
 
 #[derive(Debug, Clone)]
-struct ProjectContext {
-    workspace_root: PathBuf,
-    current_dir: PathBuf,
-    current_dir_relative: PathBuf,
-    manifest_path: PathBuf,
-    metadata_args: MetadataArgs,
-    target: String,
-    rustc_version: String,
+pub struct ProjectContext {
+    /// The wrapped action (`check`, `build`, `test`, `predict`, …) —
+    /// picks the cargo subcommand the unit-graph query re-runs.
+    pub action: String,
+    /// The user's own cargo arguments, forwarded verbatim to the
+    /// `--unit-graph` re-run so cargo computes selection, features and
+    /// platform cfg exactly as it does for the real build.
+    pub cargo_args: Vec<OsString>,
+    pub workspace_root: PathBuf,
+    pub current_dir: PathBuf,
+    pub(crate) current_dir_relative: PathBuf,
+    pub manifest_path: PathBuf,
+    pub(crate) metadata_args: MetadataArgs,
+    pub target: String,
+    /// Cargo was given a target — `--target`, `CARGO_BUILD_TARGET`, or
+    /// `build.target` — so its unit graph splits host and target units.
+    pub target_given: bool,
+    pub rustc_version: String,
     /// The cargo `--config` values this build needs so its Linux units
     /// link with mold — empty on non-Linux, and empty when the cargo
     /// configuration already selects a reachable mold (the setup path).
@@ -654,7 +676,7 @@ struct ProjectContext {
     /// cargo invocation as command-line overrides, so the effective
     /// selection — and therefore the compile keys — is identical
     /// whether it came from `--config` or from a written config file.
-    mold_config_args: Vec<String>,
+    pub(crate) mold_config_args: Vec<String>,
 }
 
 /// The build's target triple while rustc is still answering: `Shared` so
@@ -669,22 +691,47 @@ type SharedTargetProbe = Shared<BoxFuture<'static, Result<String, String>>>;
 /// than after them, then `finish` joins what the probes answered
 /// (stow#517).
 struct PendingProjectContext {
+    action: String,
+    cargo_args: Vec<OsString>,
     workspace_root: PathBuf,
     current_dir: PathBuf,
     current_dir_relative: PathBuf,
     manifest_path: PathBuf,
     metadata_args: MetadataArgs,
     target: SharedTargetProbe,
+    /// The first of the targets cargo was given, whatever the source —
+    /// `None` for a native (host-triple) build.
+    resolved_target: Option<String>,
     rustc_version: tokio::task::JoinHandle<Result<String, String>>,
 }
 
 impl ProjectContext {
     /// Everything `load` resolves without waiting on rustc: the workspace
     /// layout, and both probes already running beside it.
-    fn begin(cargo_args: &[OsString]) -> stow_types::error::Result<PendingProjectContext> {
+    fn begin(invocation: &CargoInvocation) -> stow_types::error::Result<PendingProjectContext> {
         let invocation_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-        let metadata_args = MetadataArgs::parse(&invocation_dir, cargo_args)?;
-        let target: SharedTargetProbe = metadata_args.target.clone().map_or_else(
+        let metadata_args = MetadataArgs::parse(&invocation_dir, &invocation.cargo_args)?;
+        // Cargo's target chain: spelled `--target`(s), then
+        // `--config build.target` — the one config input
+        // `cargo-config2` does not model, which cargo gives precedence
+        // over environment variables and files — then
+        // `CARGO_BUILD_TARGET` and `build.target` in the config chain,
+        // both resolved by `build_target_for_cli`, then the host
+        // triple (stow#551). stow serves the first resolved target;
+        // `given` records that cargo was told one at all — the
+        // difference between split and shared units.
+        let resolved_targets = crate::mold::cargo_config(&invocation_dir, None)
+            .map_err(|error| stow_types::stow_error!("load cargo config: {error}"))?
+            .build_target_for_cli(
+                metadata_args.targets.iter().chain(
+                    crate::mold::config_arg_build_target(&invocation_dir, &invocation.cargo_args)
+                        .iter()
+                        .flatten(),
+                ),
+            )
+            .map_err(|error| stow_types::stow_error!("resolve cargo build target: {error}"))?;
+        let resolved_target = resolved_targets.first().cloned();
+        let target: SharedTargetProbe = resolved_targets.into_iter().next().map_or_else(
             || {
                 let probe = tokio::spawn(
                     detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
@@ -721,19 +768,22 @@ impl ProjectContext {
         let current_dir_relative =
             pathdiff::diff_paths(&current_dir, &workspace_root).unwrap_or_else(PathBuf::new);
         Ok(PendingProjectContext {
+            action: invocation.action.clone(),
+            cargo_args: invocation.cargo_args.clone(),
             workspace_root,
             current_dir,
             current_dir_relative,
             manifest_path,
             metadata_args,
             target,
+            resolved_target,
             rustc_version,
         })
     }
 
     #[tracing::instrument(name = "stow.project.context", skip_all)]
-    async fn load(cargo_args: &[OsString]) -> stow_types::error::Result<Self> {
-        Self::begin(cargo_args)?.finish().await
+    async fn load(invocation: &CargoInvocation) -> stow_types::error::Result<Self> {
+        Self::begin(invocation)?.finish().await
     }
 
     fn current_dir(&self) -> &Path {
@@ -754,12 +804,15 @@ impl PendingProjectContext {
             .map_err(|error| stow_types::stow_error!("join rustc version probe task: {error}"))?
             .map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
         Ok(ProjectContext {
+            action: self.action,
+            cargo_args: self.cargo_args,
             workspace_root: self.workspace_root,
             current_dir: self.current_dir,
             current_dir_relative: self.current_dir_relative,
             manifest_path: self.manifest_path,
             metadata_args: self.metadata_args,
             target,
+            target_given: self.resolved_target.is_some(),
             rustc_version,
             mold_config_args: Vec::new(),
         })
@@ -769,7 +822,8 @@ impl PendingProjectContext {
 #[derive(Debug, Clone, Default)]
 pub struct MetadataArgs {
     pub(crate) manifest_path: Option<PathBuf>,
-    pub(crate) target: Option<String>,
+    /// Every spelled `--target` in order — cargo compiles all of them.
+    pub(crate) targets: Vec<String>,
     pub(crate) features: Vec<String>,
     pub(crate) all_features: bool,
     pub(crate) no_default_features: bool,
@@ -790,7 +844,7 @@ impl MetadataArgs {
                 continue;
             }
             if let Some(value) = arg.strip_prefix("--target=") {
-                parsed.target = Some(value.to_owned());
+                parsed.targets.push(value.to_owned());
                 continue;
             }
             if let Some(value) = arg.strip_prefix("--features=") {
@@ -819,7 +873,7 @@ impl MetadataArgs {
                         .next()
                         .and_then(|value| value.to_str())
                         .ok_or_else(|| stow_types::stow_error!("missing value after --target"))?;
-                    parsed.target = Some(value.to_owned());
+                    parsed.targets.push(value.to_owned());
                 }
                 "--features" | "-F" => {
                     let value = iter
@@ -833,7 +887,6 @@ impl MetadataArgs {
                 _ => {}
             }
         }
-
         Ok(parsed)
     }
 }
@@ -912,13 +965,6 @@ async fn analyze_workspace_prediction(
     manifest_path: &Path,
     config: &StowConfig,
 ) -> stow_types::error::Result<WorkspacePrediction> {
-    let lockfile_graph = tracing::debug_span!("stow.precargo.lockfile_graph").in_scope(|| {
-        workspace_deps::resolve_lockfile_graph(
-            &project.workspace_root,
-            manifest_path,
-            &project.metadata_args,
-        )
-    })?;
     let expanded = expanded_graph(config, project, manifest_path).await?;
     // Resolution never leaves the machine: the verified index slice is the
     // only catalog consulted, and the graph walk runs in-process.
@@ -932,7 +978,6 @@ async fn analyze_workspace_prediction(
             host_slice,
             expanded: Some(expanded),
             slice_pending: false,
-            lockfile_graph,
         },
     )
     .await
@@ -951,31 +996,14 @@ async fn analyze_workspace_prediction_lite(
     manifest_path: &Path,
     config: &StowConfig,
 ) -> stow_types::error::Result<WorkspacePrediction> {
-    // The lockfile graph is pure filesystem work on inputs the rustc
-    // probes never touch; it parses beside the expanded-graph and slice
-    // reads rather than behind them (stow#517).
-    let lockfile = {
-        let workspace_root = project.workspace_root.clone();
-        let manifest_path = manifest_path.to_path_buf();
-        let metadata_args = project.metadata_args.clone();
-        tokio::task::spawn_blocking(move || {
-            workspace_deps::resolve_lockfile_graph(&workspace_root, &manifest_path, &metadata_args)
-        })
-    };
-    let (expanded, slices, lockfile_graph) = tokio::join!(
-        expanded_graph_cached(config, project, manifest_path)
+    let (expanded, slices) = tokio::join!(
+        expanded_graph_cached(config, project)
             .instrument(tracing::debug_span!("stow.precargo.expanded_graph_load")),
         cached_consumer_slices(config, project)
             .instrument(tracing::debug_span!("stow.precargo.cached_slices")),
-        async move {
-            lockfile
-                .await
-                .map_err(|error| stow_types::stow_error!("join lockfile graph task: {error}"))?
-        },
     );
     let expanded = expanded?;
     let (slice, host_slice, slice_pending) = slices?;
-    let lockfile_graph = lockfile_graph?;
     analyze_workspace_prediction_from(
         project,
         manifest_path,
@@ -985,7 +1013,6 @@ async fn analyze_workspace_prediction_lite(
             host_slice,
             expanded,
             slice_pending,
-            lockfile_graph,
         },
     )
     .await
@@ -1024,12 +1051,11 @@ struct AnalysisInputs {
     host_slice: Option<index::IndexSlice>,
     expanded: Option<ExpandedDependencyGraph>,
     slice_pending: bool,
-    lockfile_graph: workspace_deps::LockfileGraph,
 }
 
 async fn analyze_workspace_prediction_from(
     project: &ProjectContext,
-    _manifest_path: &Path,
+    manifest_path: &Path,
     config: &StowConfig,
     inputs: AnalysisInputs,
 ) -> stow_types::error::Result<WorkspacePrediction> {
@@ -1038,21 +1064,11 @@ async fn analyze_workspace_prediction_from(
         host_slice,
         expanded,
         slice_pending,
-        lockfile_graph,
     } = inputs;
-    let dependencies = direct_resolved_dependencies(&lockfile_graph);
-    let entries = dependencies
-        .iter()
-        .cloned()
-        .map(into_api_dependency)
-        .collect::<stow_types::error::Result<Vec<_>>>()?;
     let local_units = locally_covered_units_or_warn(config, &project.rustc_version).await;
     let expanded_in = expanded
         .as_ref()
         .map_or_else(Vec::new, |expanded| expanded.entries.clone());
-    let feature_graphs = expanded
-        .map(|expanded| expanded.feature_graphs)
-        .unwrap_or_default();
     let rows = slice.map(|slice| slice.index.rows).unwrap_or_default();
     let mut map = tracing::debug_span!("stow.precargo.serve_map_build").in_scope(|| {
         build_serve_map(
@@ -1070,9 +1086,21 @@ async fn analyze_workspace_prediction_from(
         // the lite pass cannot rank semantic upgrades; it answers with
         // the serve map alone, which needs no expanded entries, and the
         // in-build enrichment resolves the full analysis (stow#347).
+        // The lockfile walk only exists for this branch: with no
+        // expanded graph the unit graph's parents map is empty anyway,
+        // and its manifest-view direct deps are the lite answer.
+        let lockfile_graph =
+            tracing::debug_span!("stow.precargo.lockfile_graph").in_scope(|| {
+                workspace_deps::resolve_lockfile_graph(
+                    &project.workspace_root,
+                    manifest_path,
+                    &project.metadata_args,
+                )
+            })?;
+        let dependencies = direct_resolved_dependencies(&lockfile_graph);
         return Ok(WorkspacePrediction {
             current_cached: 0,
-            current_total: entries.len(),
+            current_total: dependencies.len(),
             expanded_cached: 0,
             expanded_total: 0,
             expanded_entries: Vec::new(),
@@ -1083,17 +1111,25 @@ async fn analyze_workspace_prediction_from(
             servable_units,
         });
     }
+    // With an expanded graph the requested entries are the unit graph's
+    // direct registry dependencies: cargo's own recorded feature sets,
+    // and only the deps this target actually compiles (stow#551).
+    let dependencies = direct_unit_dependencies(
+        &expanded
+            .as_ref()
+            .expect("expanded_in non-empty means expanded present")
+            .direct_dependencies,
+    );
+    let entries = dependencies
+        .iter()
+        .cloned()
+        .map(into_api_dependency)
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
     let analysis = {
         let entries = entries.clone();
         let expanded_in = expanded_in.clone();
         tokio::task::spawn_blocking(move || {
-            resolve::analyze_dependency_graph(
-                &rows,
-                &entries,
-                &expanded_in,
-                &feature_graphs,
-                resolve::host_glibc(),
-            )
+            resolve::analyze_dependency_graph(&rows, &entries, &expanded_in, resolve::host_glibc())
         })
         .await
         .wrap_err("join dependency-graph resolver")??
@@ -1103,7 +1139,13 @@ async fn analyze_workspace_prediction_from(
     let mut analysis_by_key = index_analysis_entries(analysis.entries)?;
     let (current_cached, missing_current, mut candidates) =
         apply_dependency_analyses(dependencies, &mut analysis_by_key)?;
-    rank_upgrade_candidates(&mut candidates, &lockfile_graph.parents_by_package);
+    // Ranking walks the unit graph's own reverse edges — the
+    // lockfile resolve that used to build this map is gone from the
+    // analysis path (stow#551).
+    let parents_by_package = expanded.as_ref().map_or_else(BTreeMap::new, |expanded| {
+        workspace_deps::parents_by_package(&expanded.entries)
+    });
+    rank_upgrade_candidates(&mut candidates, &parents_by_package);
     let (prefetch_artifacts, cache_policy_entries) = prediction_fetch_lists(
         &project.target,
         &project.rustc_version,
@@ -1175,7 +1217,7 @@ fn build_serve_map(
     // sides; on a native build every unit arrives unspelled, so the whole
     // servable graph sits on the host side — the consumer slice and the
     // host slice are the same rows there.
-    let consumer_spelled = project.metadata_args.target.is_some();
+    let consumer_spelled = project.target_given;
     // Unspelled units look up the slice for the build's own host triple:
     // the consumer slice on a native build, the fetched host slice on a
     // `--target` build — and none when no host slice was fetched.
@@ -1544,20 +1586,15 @@ async fn query_admissions(
         .map_err(|error| stow_types::stow_error!("parse admissions {url} response: {error}"))
 }
 
-/// The expanded (transitive) dependency graph for this lockfile: the
-/// on-disk cache entry when present, a live `cargo metadata` resolve on
+/// The expanded (transitive) dependency graph for this invocation: the
+/// on-disk cache entry when present, a live `cargo --unit-graph` query on
 /// miss or load error (with the result written back best-effort).
 async fn expanded_graph(
     config: &StowConfig,
     project: &ProjectContext,
     manifest_path: &Path,
 ) -> stow_types::error::Result<ExpandedDependencyGraph> {
-    let expanded_cache_key = crate::lockfile_graph_cache::cache_key(
-        &project.workspace_root,
-        manifest_path,
-        &project.target,
-        &project.rustc_version,
-    )?;
+    let expanded_cache_key = crate::lockfile_graph_cache::cache_key(project)?;
     match crate::lockfile_graph_cache::load(config, &expanded_cache_key).await {
         Ok(Some(graph)) => {
             tracing::debug!(
@@ -1565,51 +1602,40 @@ async fn expanded_graph(
                 entries = graph.entries.len(),
                 "lockfile_graph_cache hit"
             );
-            Ok(graph)
+            return Ok(graph);
         }
-        Ok(None) => {
-            let graph = workspace_deps::resolve_exact_dependency_graph(
-                &project.workspace_root,
-                manifest_path,
-                &project.metadata_args,
-                &project.target,
-            )
-            .await?;
-            if let Err(error) =
-                crate::lockfile_graph_cache::store(config, &expanded_cache_key, &graph).await
-            {
-                tracing::warn!(%error, "lockfile_graph_cache store failed; continuing");
-            }
-            Ok(graph)
-        }
+        Ok(None) => {}
         Err(error) => {
             tracing::warn!(%error, "lockfile_graph_cache load failed; falling back to live resolve");
-            workspace_deps::resolve_exact_dependency_graph(
-                &project.workspace_root,
-                manifest_path,
-                &project.metadata_args,
-                &project.target,
-            )
-            .await
         }
     }
+    let graph = workspace_deps::resolve_exact_dependency_graph(
+        manifest_path,
+        &project.action,
+        &project.cargo_args,
+        project.target_given.then_some(project.target.as_str()),
+        &project.current_dir,
+        &project.rustc_version,
+    )
+    .await?;
+    if let Err(error) =
+        crate::lockfile_graph_cache::store(config, &expanded_cache_key, &graph).await
+    {
+        tracing::warn!(%error, "lockfile_graph_cache store failed; continuing");
+    }
+    Ok(graph)
 }
 
 /// The filesystem half of [`expanded_graph`]: the persisted graph cache
 /// only. `Ok(None)` means no usable snapshot is on disk — a path that
-/// must not block cargo's start does not pay `cargo metadata` to refill
-/// it; the in-build enrichment resolves it live instead (stow#347).
+/// must not block cargo's start does not pay the `--unit-graph` re-run
+/// to refill it; the in-build enrichment resolves it live instead
+/// (stow#347).
 async fn expanded_graph_cached(
     config: &StowConfig,
     project: &ProjectContext,
-    manifest_path: &Path,
 ) -> stow_types::error::Result<Option<ExpandedDependencyGraph>> {
-    let expanded_cache_key = crate::lockfile_graph_cache::cache_key(
-        &project.workspace_root,
-        manifest_path,
-        &project.target,
-        &project.rustc_version,
-    )?;
+    let expanded_cache_key = crate::lockfile_graph_cache::cache_key(project)?;
     match crate::lockfile_graph_cache::load(config, &expanded_cache_key).await {
         Ok(graph) => Ok(graph),
         Err(error) => {
@@ -1637,6 +1663,39 @@ fn direct_resolved_dependencies(
             crate_name: dependency.crate_name,
             version: dependency.version,
             features: dependency.features,
+            depth: 1,
+        })
+        .collect()
+}
+
+/// The unit graph's direct registry dependencies as depth-1
+/// `ResolvedDependency` rows — cargo's own recorded feature sets and
+/// only the deps the wrapped target compiles (stow#551).
+fn direct_unit_dependencies(
+    direct: &[workspace_deps::SelectedRegistryDependency],
+) -> Vec<ResolvedDependency> {
+    // The unit graph records the edge per member per side; identical
+    // (crate, version, features) rows are one compiled unit — fold
+    // them or the analysis index would reject the duplicate (stow#551).
+    let mut seen = BTreeSet::new();
+    direct
+        .iter()
+        .filter(|dependency| {
+            seen.insert((
+                dependency.crate_name.clone(),
+                dependency.version.clone(),
+                dependency.features.clone(),
+            ))
+        })
+        .map(|dependency| ResolvedDependency {
+            package_key: PackageKey {
+                crate_name: dependency.crate_name.clone(),
+                version: dependency.version.clone(),
+                source: Some(workspace_deps::CRATES_IO_SOURCE.to_owned()),
+            },
+            crate_name: dependency.crate_name.clone(),
+            version: dependency.version.clone(),
+            features: dependency.features.clone(),
             depth: 1,
         })
         .collect()
@@ -1947,7 +2006,7 @@ async fn prepare_pinned_mirror(
 
 /// Analyze the pinned mirror's graph. Returns `None` on failure: the
 /// mirror lockfile is the runtime closure only — dev/build dep pins are
-/// intentionally absent, cargo metadata in mirror mode hydrates ALL dep
+/// intentionally absent, the lockfile walk in mirror mode hydrates ALL dep
 /// kinds and fails when those pins are missing, and continuing would feed
 /// that broken lockfile to a real build invocation downstream.
 async fn analyze_pinned_mirror(
@@ -2392,14 +2451,12 @@ async fn try_run_top_crate_with_cached_dependencies(
         tracing::warn!(%error, "prefetch for the prebuilt-deps path failed");
         return Ok(false);
     }
-    let direct_dependencies = workspace_deps::resolve_selected_registry_dependencies(
-        &project.workspace_root,
-        &project.manifest_path,
-        &project.metadata_args,
-        &project.target,
-        cargo_args_include_dev_dependencies(cargo_args),
-    )
-    .await?;
+    // The selected packages' direct registry externs ride the same
+    // `--unit-graph` resolve as the expanded graph (and its cache), so
+    // the top-crate path pays no second resolution.
+    let direct_dependencies = expanded_graph(config, project, &project.manifest_path)
+        .await?
+        .direct_dependencies;
     if direct_dependencies.is_empty() {
         return Ok(false);
     }
@@ -2496,37 +2553,6 @@ fn cached_dependency_shape(action: &str) -> Option<CachedDependencyShape> {
     }
 }
 
-fn cargo_args_include_dev_dependencies(cargo_args: &[OsString]) -> bool {
-    let mut iter = cargo_args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        let Some(value) = arg.to_str() else {
-            continue;
-        };
-        if matches!(
-            value,
-            "--all-targets"
-                | "--tests"
-                | "--benches"
-                | "--examples"
-                | "--test"
-                | "--bench"
-                | "--example"
-        ) {
-            return true;
-        }
-        if value.starts_with("--test=")
-            || value.starts_with("--bench=")
-            || value.starts_with("--example=")
-        {
-            return true;
-        }
-        if matches!(value, "--test" | "--bench" | "--example") && iter.peek().is_some() {
-            return true;
-        }
-    }
-    false
-}
-
 fn rlib_dependency_shape(emit: Vec<&str>) -> CachedDependencyArtifactShape {
     CachedDependencyArtifactShape {
         emit: emit.into_iter().map(str::to_owned).collect(),
@@ -2551,7 +2577,19 @@ async fn resolve_cached_dependency_plan(
 ) -> stow_types::error::Result<CachedDependencyPlan> {
     let mut bundles = BTreeMap::<String, crate::artifact_cache::CachedArtifactBundle>::new();
     let mut direct_externs = Vec::with_capacity(direct_dependencies.len());
+    // One unit may carry several extern names — a renamed dependency
+    // beside the plain one, or a dep used on both sides — so rows fold
+    // on the compile identity and emit every name the members recorded
+    // (stow#551).
+    let mut seen = BTreeSet::new();
     for dependency in direct_dependencies {
+        if !seen.insert((
+            dependency.crate_name.clone(),
+            dependency.version.clone(),
+            dependency.features.clone(),
+        )) {
+            continue;
+        }
         let candidates =
             load_cached_dependency_bundle_candidates(config, project, dependency, shape).await?;
         let mut candidate_errors = Vec::new();
@@ -2581,10 +2619,12 @@ async fn resolve_cached_dependency_plan(
                 reason
             )
         })?;
-        direct_externs.push(CachedDirectExtern {
-            extern_name: dependency.extern_name.clone(),
-            c_metadata,
-        });
+        direct_externs.extend(dependency.extern_names.iter().map(|extern_name| {
+            CachedDirectExtern {
+                extern_name: extern_name.clone(),
+                c_metadata: c_metadata.clone(),
+            }
+        }));
     }
 
     Ok(CachedDependencyPlan {
@@ -3835,7 +3875,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         .await;
 
     // The full graph analysis — the verified index fetch and the live
-    // `cargo metadata` resolve — runs while cargo builds rather than in
+    // `--unit-graph` resolve — runs while cargo builds rather than in
     // front of it: its answers land in the serve map file the facades
     // read and the cell the supervisor's plan path reads, mid-build
     // (stow#347).
@@ -4127,7 +4167,7 @@ fn journal_and_drain_misses(
         &project.rustc_version,
         observations,
         &target_dir,
-        project.metadata_args.target.is_some(),
+        project.target_given,
     );
     crate::miss_journal::spawn_drain(&target_dir);
 }
@@ -4543,9 +4583,9 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedDependencyPlan, MetadataArgs, ProjectContext, cached_dependency_profile,
-        feature_references_dependency, native_requires_link_replay, rewrite_args_for_root,
-        validate_top_crate_cached_native_support,
+        CachedDependencyPlan, MetadataArgs, ProjectContext, WorkspaceMirror,
+        cached_dependency_profile, feature_references_dependency, native_requires_link_replay,
+        rewrite_args_for_mirror, rewrite_args_for_root, validate_top_crate_cached_native_support,
     };
     #[cfg(unix)]
     use super::{create_workspace_mirror, strip_selected_manifest_dependencies};
@@ -4557,12 +4597,15 @@ mod tests {
 
     fn project_context() -> ProjectContext {
         ProjectContext {
+            action: "check".to_owned(),
+            cargo_args: Vec::new(),
             workspace_root: PathBuf::from("/workspace"),
             current_dir: PathBuf::from("/workspace"),
             current_dir_relative: PathBuf::new(),
             manifest_path: PathBuf::from("/workspace/Cargo.toml"),
             metadata_args: MetadataArgs::default(),
             target: "aarch64-apple-darwin".to_owned(),
+            target_given: false,
             rustc_version: "1.91.1".to_owned(),
             mold_config_args: Vec::new(),
         }
@@ -4597,6 +4640,58 @@ mod tests {
                     .to_string_lossy()
                     .into_owned(),
             ]
+        );
+    }
+
+    /// A spelled absolute `--manifest-path` is the user's own
+    /// manifest: forwarding it would make the mirror query the user's
+    /// workspace and store that graph under the mirror's key — it must
+    /// be replaced with the mirror's copy (stow#551).
+    #[test]
+    fn rewrite_args_for_mirror_replaces_an_absolute_manifest_path() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mirror_dir = tempfile::tempdir().expect("mirror tempdir");
+        let project = ProjectContext {
+            workspace_root: workspace.path().to_path_buf(),
+            manifest_path: workspace.path().join("Cargo.toml"),
+            ..project_context()
+        };
+        let mirror = WorkspaceMirror {
+            tempdir: mirror_dir,
+            current_dir_relative: PathBuf::new(),
+        };
+        let mirror_manifest = mirror.root().join("Cargo.toml");
+        let rewritten = rewrite_args_for_mirror(
+            &[
+                OsString::from("--manifest-path"),
+                project.manifest_path.clone().into_os_string(),
+            ],
+            &project,
+            &mirror,
+        )
+        .expect("rewrite args");
+        assert_eq!(
+            as_strings(&rewritten),
+            vec![
+                "--manifest-path".to_owned(),
+                mirror_manifest.to_string_lossy().into_owned(),
+            ]
+        );
+        let rewritten = rewrite_args_for_mirror(
+            &[OsString::from(format!(
+                "--manifest-path={}",
+                workspace.path().join("sub/Cargo.toml").display()
+            ))],
+            &project,
+            &mirror,
+        )
+        .expect("rewrite args");
+        assert_eq!(
+            as_strings(&rewritten),
+            vec![format!(
+                "--manifest-path={}",
+                mirror.root().join("sub/Cargo.toml").display()
+            )],
         );
     }
 
@@ -4699,12 +4794,15 @@ mod tests {
         std::fs::write(member.join("Cargo.toml"), manifest_source).expect("write member manifest");
 
         let project = ProjectContext {
+            action: "check".to_owned(),
+            cargo_args: Vec::new(),
             workspace_root: workspace.to_path_buf(),
             current_dir: member.clone(),
             current_dir_relative: PathBuf::from("member"),
             manifest_path: member.join("Cargo.toml"),
             metadata_args: MetadataArgs::default(),
             target: "aarch64-apple-darwin".to_owned(),
+            target_given: false,
             rustc_version: "1.91.1".to_owned(),
             mold_config_args: Vec::new(),
         };
