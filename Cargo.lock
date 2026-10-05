@@ -7802,6 +7802,7 @@ dependencies = [
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zenwave",
 ]
 
@@ -8020,6 +8021,7 @@ dependencies = [
  "cargo-util-schemas",
  "cargo-util-terminal",
  "flate2",
+ "gix-hash",
  "http",
  "semver",
  "serde",

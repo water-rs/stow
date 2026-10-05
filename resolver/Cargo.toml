@@ -28,6 +28,9 @@ stow-types = { workspace = true }
 zenwave = { workspace = true }
 toml = { workspace = true }
 url = "2"
+# Commit ids parse through gix-hash's own ObjectId (already locked at
+# 0.25.1 via cargo) — no hand-rolled hex handling.
+gix-hash = "0.25.1"
 tempfile = { workspace = true }
 
 [dev-dependencies]

@@ -18,6 +18,7 @@ mod emit;
 pub mod enqueue;
 pub mod fetch;
 mod lockfile;
+pub mod prepare;
 mod select;
 mod session;
 pub mod shim;
@@ -27,6 +28,7 @@ pub use enqueue::{
     RequestPlanParts, TaskGraph, TaskNode, enqueue_requests_from_output, enqueue_requests_inner,
     request_plan_parts,
 };
+pub use prepare::{GitCommit, PreparedSourceTree, RelativeSourcePath, SourcePreparation};
 pub use session::{ResolveOptions, Resolver, SourceResolve};
 pub use units::{
     SpecsAndResolvedFeatures, StowDep, StowResolveOutput, StowSide, StowUnit, StowUnitKey,

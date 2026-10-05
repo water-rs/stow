@@ -31,6 +31,7 @@ blake3.workspace = true
 askama = "0.14"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1"
+url = "2"
 dirs = "7"
 oci-client = { version = "0.16.1", default-features = false }
 futures-util = "0.3"
