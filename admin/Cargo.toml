@@ -33,7 +33,7 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1"
 url = "2"
 dirs = "7"
-oci-client = { version = "0.16.1", default-features = false }
+oci-client = { version = "0.17.0", default-features = false }
 futures-util = "0.3"
 tempfile.workspace = true
 tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
