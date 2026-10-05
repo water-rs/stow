@@ -4692,7 +4692,7 @@ mod tests {
             as_strings(&rewritten),
             vec![format!(
                 "--manifest-path={}",
-                mirror.root().join("sub/Cargo.toml").display()
+                mirror.root().join("sub").join("Cargo.toml").display()
             )],
         );
     }
