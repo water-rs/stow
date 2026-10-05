@@ -90,16 +90,22 @@ impl Loopback {
 
     /// Shut the listener down and reap the task, returning every
     /// request head the server accepted, in order. A server panic or a
-    /// shutdown that misses `JOIN_BOUND` propagates as a panic.
+    /// shutdown that misses `JOIN_BOUND` propagates as a panic. The
+    /// handle stays owned through the timeout: a join that gives up
+    /// still leaves `Drop` an abort-able task, and only a completed
+    /// task is taken.
     pub async fn join(mut self) -> Vec<RequestHead> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let task = self.task.take().expect("server task");
-        tokio::time::timeout(JOIN_BOUND, task).await.map_or_else(
-            |_| panic!("loopback server did not stop inside {JOIN_BOUND:?}"),
-            |joined| joined.expect("loopback task panicked"),
-        )
+        let heads = tokio::time::timeout(JOIN_BOUND, self.task.as_mut().expect("server task"))
+            .await
+            .map_or_else(
+                |_| panic!("loopback server did not stop inside {JOIN_BOUND:?}"),
+                |joined| joined.expect("loopback task panicked"),
+            );
+        self.task.take();
+        heads
     }
 }
 
@@ -122,22 +128,25 @@ async fn run(
     mut steps: VecDeque<Step>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Vec<RequestHead> {
-    let (head_tx, mut head_rx) = mpsc::channel::<RequestHead>(64);
+    // One request per connection and the receiver drains after each —
+    // a single slot is the whole bound; a full channel is a bug.
+    let (head_tx, mut head_rx) = mpsc::channel::<RequestHead>(1);
     let mut heads = Vec::new();
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { break };
+                let (stream, _) = accepted.expect("the loopback listener accepts");
                 let step = steps.pop_front().unwrap_or(SENTINEL);
+                let service_step = step.clone();
                 let tx = head_tx.clone();
                 let service = service_fn(move |request: Request<Incoming>| {
                     let tx = tx.clone();
-                    let step = step.clone();
+                    let step = service_step.clone();
                     async move {
                         let (head, _body) = request.into_parts();
-                        let _ = tx.try_send(head);
+                        tx.try_send(head).expect("the head slot drains each connection");
                         match step {
                             Step::Drop => Err(io::Error::new(
                                 io::ErrorKind::ConnectionAborted,
@@ -155,13 +164,24 @@ async fn run(
                 // keep-alive off: one request per connection, so the
                 // script advances per request and the loop keeps
                 // accepting instead of holding an idle conn.
-                let _ = tokio::time::timeout(
+                let served = tokio::time::timeout(
                     CONNECTION_BOUND,
                     http1::Builder::new()
                         .keep_alive(false)
                         .serve_connection(io, service),
                 )
-                .await;
+                .await
+                .expect("each connection serves inside the bound");
+                match step {
+                    // The scripted drop is the only connection error a
+                    // step may produce — raised after request capture.
+                    Step::Drop => {
+                        served.expect_err("the drop step must fail the connection");
+                    }
+                    // Every response step must serve cleanly; anything
+                    // else is a server bug, not a scripted outcome.
+                    Step::Respond { .. } => served.expect("a respond step serves the request"),
+                }
                 while let Ok(head) = head_rx.try_recv() {
                     heads.push(head);
                 }
