@@ -28,7 +28,7 @@
 # unmodified source is the exact resolver input.
 [[project]]
 repo = "https://github.com/oven-sh/bun"
-commit = "d4928764f23213ecf3cd61fa0b5b4a44369a5096"
+commit = "9bd19c98eacc01530a4e7609bc427abffa87d77e"
 
 [[project.source]]
 destination = "vendor/lolhtml"

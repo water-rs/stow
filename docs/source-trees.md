@@ -23,7 +23,7 @@ The reviewed declaration ships the real Bun mapping:
 ```toml
 [[project]]
 repo = "https://github.com/oven-sh/bun"      # normalized like projects.toml
-commit = "d4928764f23213ecf3cd61fa0b5b4a44369a5096"  # the checkout must sit here
+commit = "9bd19c98eacc01530a4e7609bc427abffa87d77e"  # the checkout must sit here
 
 [[project.source]]
 destination = "vendor/lolhtml"               # project-relative
