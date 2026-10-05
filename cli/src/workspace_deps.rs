@@ -803,20 +803,10 @@ fn local_manifest_hashes(
 ) -> stow_types::error::Result<Vec<LocalManifestHash>> {
     let mut paths = BTreeSet::<PathBuf>::new();
     for unit in &graph.units {
-        let Some(rest) = unit.pkg_id.strip_prefix("path+") else {
+        if !unit.pkg_id.starts_with("path+") {
             continue;
-        };
-        let Some(root) = rest
-            .split('#')
-            .next()
-            .and_then(|url| url.strip_prefix("file://"))
-        else {
-            return Err(stow_types::stow_error!(
-                "cargo --unit-graph pkg_id `{}` is not a path+file url",
-                unit.pkg_id
-            ));
-        };
-        paths.insert(PathBuf::from(root).join("Cargo.toml"));
+        }
+        paths.insert(path_pkg_root(unit.pkg_id)?.join("Cargo.toml"));
     }
     paths
         .into_iter()
@@ -830,6 +820,22 @@ fn local_manifest_hashes(
             })
         })
         .collect()
+}
+
+/// The local root a `path+file://` pkg id points at: the pkgid is a
+/// URL, so `Url::to_file_path` converts it the way the host OS reads
+/// it — Windows drive letters and percent escapes. String surgery on
+/// the URL leaves a leading `/` (an unreadable path on Windows) and
+/// keeps the escapes.
+fn path_pkg_root(pkg_id: &str) -> stow_types::error::Result<PathBuf> {
+    let not_file =
+        || stow_types::stow_error!("cargo --unit-graph pkg_id `{pkg_id}` is not a path+file url");
+    let url = url::Url::parse(pkg_id.strip_prefix("path+").ok_or_else(not_file)?)
+        .map_err(|e| stow_types::stow_error!("cargo --unit-graph pkg_id `{pkg_id}`: {e}"))?;
+    if url.scheme() != "file" {
+        return Err(not_file());
+    }
+    url.to_file_path().map_err(|()| not_file())
 }
 
 /// The graph one build's compile observations mint misses from
@@ -1411,8 +1417,24 @@ pub fn load_manifest(path: &Path) -> stow_types::error::Result<Manifest> {
         .wrap_err_with(|| format!("parse Cargo.toml {}", path.display()))
 }
 
-fn canonicalize_or_original(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// Canonical form for path comparisons: the deepest existing ancestor
+/// resolves symlinks (macOS `/var -> /private/var`, Windows short
+/// names) and any components below it rejoin verbatim, so a path that
+/// does not exist yet still lands in the same canonical form as the
+/// root it sits under. Every side of a `strip_prefix`/`starts_with`
+/// must go through the same conversion — resolving one side but not
+/// the other leaves a symlinked spelling that never matches.
+pub fn canonicalize_or_original(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(mut resolved) = std::fs::canonicalize(ancestor) {
+            resolved.extend(
+                path.strip_prefix(ancestor)
+                    .expect("Path::ancestors yields only prefixes"),
+            );
+            return resolved;
+        }
+    }
+    path.to_path_buf()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2185,7 +2207,7 @@ mod unit_graph_tests {
 
     use super::{
         CARGO_CHANNEL_OVERRIDE, SelectedRegistryDependency, UnitGraph, emit_expanded_graph,
-        parse_pkg_id, resolve_exact_dependency_graph, unit_graph_channel_env,
+        parse_pkg_id, path_pkg_root, resolve_exact_dependency_graph, unit_graph_channel_env,
         unit_graph_subcommand, unstable_feature_gate,
     };
     use stow_types::api::ResolvedDependencyGraphEntry;
@@ -2554,6 +2576,62 @@ mod unit_graph_tests {
         assert!(!crates_io);
         let (_, _, crates_io) = parse_pkg_id("sparse+https://index.crates.io/#feat-a@1.0.0");
         assert!(!crates_io, "only the registry+ crates.io form qualifies");
+    }
+
+    /// A `path+file` pkg id is a URL, converted by `Url::to_file_path`
+    /// the way the host OS reads it — Windows drive letters get no
+    /// leading `/` and percent escapes decode. String surgery produced
+    /// `/C:/...`, an unreadable path (os error 123) on Windows.
+    #[test]
+    fn path_pkg_root_converts_pkgid_urls() {
+        #[cfg(windows)]
+        let cases = [
+            (
+                "path+file:///C:/Users/runner/proj#0.1.0",
+                r"C:\Users\runner\proj",
+            ),
+            (
+                "path+file:///C:/tmp/spaced%20dir#0.1.0",
+                r"C:\tmp\spaced dir",
+            ),
+        ];
+        #[cfg(not(windows))]
+        let cases = [
+            (
+                "path+file:///C:/Users/runner/proj#0.1.0",
+                "/C:/Users/runner/proj",
+            ),
+            ("path+file:///tmp/spaced%20dir#0.1.0", "/tmp/spaced dir"),
+        ];
+        for (pkg_id, expected) in cases {
+            assert_eq!(
+                path_pkg_root(pkg_id).expect("pkgid path"),
+                Path::new(expected),
+                "{pkg_id}"
+            );
+        }
+        assert!(path_pkg_root("path+https://host/x#0.1.0").is_err());
+    }
+
+    /// The hash path a `path+file` unit lands on really is the manifest
+    /// — a percent-escaped directory must resolve to the real file.
+    #[test]
+    fn local_manifests_read_the_decoded_pkgid_path() {
+        let root = TempDir::new().expect("tempdir");
+        let project = root.path().join("spaced dir");
+        write(
+            &project,
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        );
+        let url = url::Url::from_directory_path(&project).expect("dir url");
+        let json = format!(
+            r#"{{"version":1,"roots":[0],"units":[{{"pkg_id":"path+{url}#0.1.0","target":{{"kind":["lib"],"name":"x","crate_types":["lib"]}},"platform":null,"mode":"build","features":[],"dependencies":[]}}]}}"#
+        );
+        let graph: UnitGraph<'_> = serde_json::from_str(&json).expect("parse");
+        let hashes = super::local_manifest_hashes(&graph).expect("hashes");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].path, project.join("Cargo.toml"));
     }
 
     /// A `version` other than 1 fails fast — the projection can only be

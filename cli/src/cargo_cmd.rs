@@ -3713,13 +3713,14 @@ fn rewrite_path_for_root(
 }
 
 fn relative_path(root: &Path, path: &Path) -> stow_types::error::Result<PathBuf> {
-    // Canonicalize both sides so paths that traverse macOS's `/tmp -> /private/tmp`
-    // (or any other resolvable symlink) compare structurally instead of failing
-    // strip_prefix on the symlink boundary.
-    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    canonical_path
-        .strip_prefix(&canonical_root)
+    // Both sides through the same lossy canonicalization: the spelled
+    // manifest often does not exist yet, while the root always does, so
+    // a plain `canonicalize` + fallback resolves one side through a
+    // symlink (macOS `/var -> /private/var`, Windows short-name temp
+    // dirs) and leaves the other spelled — the prefix check then fails
+    // on a path that is inside the root.
+    crate::workspace_deps::canonicalize_or_original(path)
+        .strip_prefix(crate::workspace_deps::canonicalize_or_original(root))
         .map(Path::to_path_buf)
         .map_err(|_| {
             stow_types::stow_error!(
@@ -4585,7 +4586,8 @@ mod tests {
     use super::{
         CachedDependencyPlan, MetadataArgs, ProjectContext, WorkspaceMirror,
         cached_dependency_profile, feature_references_dependency, native_requires_link_replay,
-        rewrite_args_for_mirror, rewrite_args_for_root, validate_top_crate_cached_native_support,
+        relative_path, rewrite_args_for_mirror, rewrite_args_for_root,
+        validate_top_crate_cached_native_support,
     };
     #[cfg(unix)]
     use super::{create_workspace_mirror, strip_selected_manifest_dependencies};
@@ -4692,6 +4694,78 @@ mod tests {
                 "--manifest-path={}",
                 mirror.root().join("sub/Cargo.toml").display()
             )],
+        );
+    }
+
+    /// Both sides of `relative_path`'s prefix check go through the same
+    /// lossy canonicalization — resolving only the root through a
+    /// symlink leaves the spelled path on the link's spelling and the
+    /// check fails on a path that is inside the root (the macOS
+    /// `/var -> /private/var` merge-queue failure).
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_matches_spelled_and_canonical_sides() {
+        let base = tempfile::tempdir().expect("base");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let canonical_root = std::fs::canonicalize(&link).expect("canonical root");
+        // A manifest that does not exist yet, spelled through the link.
+        let spelled = link.join("member").join("Cargo.toml");
+        let relative = relative_path(&canonical_root, &spelled).expect("inside root");
+        assert_eq!(relative, Path::new("member").join("Cargo.toml"));
+    }
+
+    /// A manifest spelled before it exists still compares under the
+    /// root — the missing tail must not break the prefix check.
+    #[test]
+    fn relative_path_keeps_missing_tail_components() {
+        let root = tempfile::tempdir().expect("root");
+        let spelled = root.path().join("sub").join("member").join("Cargo.toml");
+        let relative = relative_path(root.path(), &spelled).expect("inside root");
+        assert_eq!(relative, Path::new("sub").join("member").join("Cargo.toml"));
+    }
+
+    /// The mirror rewrite resolves the same way: a workspace under a
+    /// symlink must accept an absolute `--manifest-path` spelled
+    /// through the link (the reported failure shape).
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_args_for_mirror_resolves_through_symlinked_root() {
+        let base = tempfile::tempdir().expect("base");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let project = ProjectContext {
+            workspace_root: std::fs::canonicalize(&link).expect("canonical root"),
+            manifest_path: link.join("Cargo.toml"),
+            ..project_context()
+        };
+        let mirror = WorkspaceMirror {
+            tempdir: tempfile::tempdir().expect("mirror"),
+            current_dir_relative: PathBuf::new(),
+        };
+        let rewritten = rewrite_args_for_mirror(
+            &[
+                OsString::from("--manifest-path"),
+                link.join("Cargo.toml").into_os_string(),
+            ],
+            &project,
+            &mirror,
+        )
+        .expect("rewrite args");
+        assert_eq!(
+            as_strings(&rewritten),
+            vec![
+                "--manifest-path".to_owned(),
+                mirror
+                    .root()
+                    .join("Cargo.toml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
         );
     }
 

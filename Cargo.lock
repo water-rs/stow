@@ -7908,6 +7908,7 @@ dependencies = [
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
+ "url",
  "walkdir",
  "windows-sys 0.60.2",
  "x509-cert",

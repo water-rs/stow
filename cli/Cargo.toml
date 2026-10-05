@@ -44,6 +44,7 @@ smol = "2"
 tempfile = "3"
 toml_edit = "0.25"
 cargo-config2 = "0.1"
+url = "2"
 find-msvc-tools = "0.1.13"
 zenwave.workspace = true
 toml = "1"
