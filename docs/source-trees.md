@@ -23,12 +23,17 @@ The reviewed declaration ships the real Bun mapping:
 ```toml
 [[project]]
 repo = "https://github.com/oven-sh/bun"      # normalized like projects.toml
-commit = "c7b06d94bac19817ba34b6677bb1099fb4f6d2be"  # the checkout must sit here
+commit = "d4928764f23213ecf3cd61fa0b5b4a44369a5096"  # the checkout must sit here
 
 [[project.source]]
 destination = "vendor/lolhtml"               # project-relative
 repo = "https://github.com/oven-sh/lol-html" # any git-compatible absolute URL
 commit = "725ce499aa9b71e38b7a2d0a9fbb6d7294a4079e"  # fetched by exact commit
+
+[[project.source]]
+destination = "vendor/rust-argon2"
+repo = "https://github.com/sru-systems/rust-argon2"
+commit = "ed81866f163f0c7026aa6fd8388adf37242eb32a"
 ```
 
 Validation happens once per command, before the resolve pool starts:
