@@ -2110,7 +2110,9 @@ async fn try_serve_local_prefetched_graph_bundle(
     rustc_version: &str,
     ctx: &BuildContext,
 ) -> bool {
-    let Some((crate_name, version)) = detect_registry_crate_version(parsed).ok().flatten() else {
+    // `Ok(None)` is the non-registry case, which can match no published
+    // bundle.
+    let Some((crate_name, version)) = registry_unit_identity(parsed) else {
         return false;
     };
     let expected_features_json =
@@ -2144,11 +2146,13 @@ async fn try_serve_local_prefetched_graph_bundle(
                 return false;
             }
         };
-    // The driver indexed its prefetch payload by canonical crate name
+    // The driver indexed its prefetch payload by canonical PACKAGE name
     // before cargo started; a crate name's candidates are one map lookup.
+    // The registry path's name, never `parsed.crate_name` — `[lib] name`
+    // lets the two differ (stow#578).
     let Some(candidate_c_metadatas) = ctx
         .prefetch_candidates()
-        .and_then(|candidates| candidates.get(&canonical_crate_name(&parsed.crate_name)))
+        .and_then(|candidates| candidates.get(&canonical_crate_name(&crate_name)))
     else {
         return false;
     };
@@ -2175,7 +2179,7 @@ async fn try_serve_local_prefetched_graph_bundle(
             }
         };
         if let Err(error) = validate_prefetched_graph_bundle(
-            parsed,
+            &crate_name,
             &version,
             &expected_features_json,
             &expected_dependency_c_metadata_json,
@@ -2573,14 +2577,48 @@ fn collect_dependency_closure_file_names(
     Ok(())
 }
 
+/// The name a downloaded bundle's `crate_name` must match: the package
+/// name the invocation's registry source path carries. A bundle's
+/// `crate_name` is the package, while `parsed.crate_name` is the lib
+/// target `[lib] name` may rename (stow#578) — `None` for an invocation
+/// with no registry identity, which has nothing a published bundle can
+/// legitimately serve.
+fn expected_bundle_crate_name(parsed: &rustc_args::ParsedRustcArgs) -> Option<String> {
+    registry_unit_identity(parsed).map(|(name, _version)| name)
+}
+
+/// The `(package name, version)` an invocation's registry source path
+/// carries — the package identity, where `parsed.crate_name` is the lib
+/// target `[lib] name` may rename (stow#578). `None` for an invocation
+/// with no registry identity, which no published artifact can serve.
+///
+/// The serve paths calling this return `bool` — no error channel — so a
+/// probe error is logged and lands on the same miss as a mismatch.
+fn registry_unit_identity(parsed: &rustc_args::ParsedRustcArgs) -> Option<(String, String)> {
+    match detect_registry_crate_version(parsed) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                "registry identity probe failed; the invocation cannot match a published artifact"
+            );
+            None
+        }
+    }
+}
+
 fn validate_prefetched_graph_bundle(
-    parsed: &rustc_args::ParsedRustcArgs,
+    crate_name: &str,
     expected_version: &str,
     expected_features_json: &str,
     expected_dependency_c_metadata_json: &str,
     cached_bundle: &artifact_cache::CachedArtifactBundle,
 ) -> stow_types::error::Result<()> {
-    if canonical_crate_name(&cached_bundle.crate_name) != canonical_crate_name(&parsed.crate_name) {
+    // `crate_name` is the package name the invocation's registry path
+    // carries — what a bundle's `crate_name` records — never the lib
+    // target's name `[lib] name` may have changed (stow#578).
+    if canonical_crate_name(&cached_bundle.crate_name) != canonical_crate_name(crate_name) {
         return Err(stow_types::stow_error!(
             "prefetched graph bundle crate name mismatch"
         ));
@@ -2610,9 +2648,15 @@ async fn try_serve_downloaded_bundle(
     bundle: &fetch::ArtifactBundle,
 ) -> bool {
     let config = &env.env_base.config;
+    // The bundle's `crate_name` is the package name — compare against the
+    // registry path's name, not `parsed.crate_name`, which `[lib] name`
+    // may have renamed (stow#578).
+    let Some(package_name) = expected_bundle_crate_name(parsed) else {
+        return false;
+    };
     if let Err(error) = fetch::validate_bundle_identity(
         bundle,
-        &parsed.crate_name,
+        &package_name,
         request.c_metadata,
         request.target,
         request.rustc_version,
@@ -3966,5 +4010,40 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// stow#578: the name a bundle's `crate_name` is checked against is
+    /// the package name the registry source path carries — the lib
+    /// target's name a `[lib] name` rename changes is never it.
+    #[test]
+    fn the_expected_bundle_name_is_the_registry_package_name() {
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "debug_unreachable",
+            "--crate-type",
+            "lib",
+            "/root/.cargo/registry/src/index.crates.io-0123abcd/new_debug_unreachable-1.0.6/src/lib.rs",
+        ]))
+        .expect("parse rustc args");
+        assert_eq!(parsed.crate_name, "debug_unreachable");
+        assert_eq!(
+            super::expected_bundle_crate_name(&parsed).as_deref(),
+            Some("new_debug_unreachable")
+        );
+    }
+
+    /// An invocation with no registry source path is the non-registry
+    /// case: `Ok(None)`, no bundle name to match — the miss path.
+    #[test]
+    fn the_expected_bundle_name_is_none_for_a_non_registry_unit() {
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "mycrate",
+            "--crate-type",
+            "lib",
+            "src/lib.rs",
+        ]))
+        .expect("parse rustc args");
+        assert_eq!(super::expected_bundle_crate_name(&parsed), None);
     }
 }

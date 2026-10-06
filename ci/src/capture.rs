@@ -352,13 +352,17 @@ async fn serve_consumed_artifact(
             bundle.compile_key
         ));
     }
+    // The bundle's `crate_name` is the package name — compare against the
+    // stable identity's, which was derived from the registry source path.
+    // `original_parsed.crate_name` is the lib name `[lib] name` may have
+    // renamed (stow#578).
     if stow_types::public_cache::canonical_crate_name(&bundle.crate_name)
-        != stow_types::public_cache::canonical_crate_name(&original_parsed.crate_name)
+        != stow_types::public_cache::canonical_crate_name(&stable_identity.crate_name)
     {
         return Err(stow_types::stow_error!(
             "consume-store entry carries crate `{}` but the invocation is compiling `{}` — a staged bundle must match the unit it is served for",
             bundle.crate_name,
-            original_parsed.crate_name
+            stable_identity.crate_name
         ));
     }
 
@@ -789,7 +793,7 @@ async fn materialize_original_output_aliases(
         capture_dir,
     )
     .await?;
-    touch_invoked_timestamp_alias(original_parsed).await?;
+    touch_invoked_timestamp_alias(original_parsed, &identity.crate_name).await?;
     Ok(())
 }
 
@@ -873,18 +877,24 @@ pub async fn detect_rustc_toolchain(
     })
 }
 
-async fn touch_invoked_timestamp_alias(parsed: &ParsedRustcArgs) -> stow_types::error::Result<()> {
+/// Touch cargo's `invoked.timestamp` for a served unit. `package_name` is
+/// the stable identity's crate name — the PACKAGE name the registry
+/// source path carried — because cargo names the fingerprint dir
+/// `<pkg>-<meta>` and a `[lib] name` rename means `parsed.crate_name`
+/// (the lib target name) is not it (stow#578).
+async fn touch_invoked_timestamp_alias(
+    parsed: &ParsedRustcArgs,
+    package_name: &str,
+) -> stow_types::error::Result<()> {
     let Some(out_dir) = parsed.out_dir.as_ref() else {
         return Ok(());
     };
     let Some(profile_dir) = out_dir.parent() else {
         return Ok(());
     };
-    let fingerprint_dir = profile_dir.join(".fingerprint").join(format!(
-        "{}{}",
-        parsed.crate_name.replace('_', "-"),
-        parsed.extra_filename
-    ));
+    let fingerprint_dir = profile_dir
+        .join(".fingerprint")
+        .join(format!("{package_name}{}", parsed.extra_filename));
     let timestamp_path = fingerprint_dir.join("invoked.timestamp");
     smol::unblock(move || {
         std::fs::create_dir_all(&fingerprint_dir).wrap_err_with(|| {
@@ -2337,5 +2347,28 @@ mod tests {
             std::env::remove_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV);
             std::env::remove_var("CARGO_TARGET_DIR");
         }
+    }
+
+    /// stow#578: cargo names the fingerprint dir after the package
+    /// (`<pkg>-<meta>`), so a `[lib] name` rename must not send the
+    /// timestamp under the lib name the invocation spells.
+    #[test]
+    fn the_timestamp_alias_uses_the_package_fingerprint_name() {
+        smol::block_on(async {
+            let tempdir = tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("debug/deps");
+            let parsed = parsed_lib("debug_unreachable", out_dir, "-0123456789abcdef");
+
+            super::touch_invoked_timestamp_alias(&parsed, "new_debug_unreachable")
+                .await
+                .expect("touch timestamp");
+
+            assert!(
+                tempdir
+                    .path()
+                    .join("debug/.fingerprint/new_debug_unreachable-0123456789abcdef/invoked.timestamp")
+                    .exists()
+            );
+        });
     }
 }

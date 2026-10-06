@@ -479,11 +479,21 @@ async fn touch_invoked_timestamp(
     let profile_dir = out_dir.parent().ok_or_else(|| {
         stow_types::stow_error!("rustc out dir {} has no profile parent", out_dir.display())
     })?;
-    let fingerprint_dir = profile_dir.join(".fingerprint").join(format!(
-        "{}{}",
-        parsed.crate_name.replace('_', "-"),
-        parsed.extra_filename
-    ));
+    // Cargo names the fingerprint dir after the PACKAGE (`<pkg>-<meta>`),
+    // not the lib target `parsed.crate_name` records — a `[lib] name`
+    // rename puts the timestamp where cargo never looks (stow#578). The
+    // registry source path carries the package name verbatim. A unit
+    // with none is a locally-built (non-registry) entry — the local cache
+    // restores those too — whose package name is the rustc spelling with
+    // cargo's `-` fold.
+    let fingerprint_name = stow_types::public_cache::detect_registry_crate_version(parsed)?
+        .map_or_else(
+            || parsed.crate_name.replace('_', "-"),
+            |(name, _version)| name,
+        );
+    let fingerprint_dir = profile_dir
+        .join(".fingerprint")
+        .join(format!("{fingerprint_name}{}", parsed.extra_filename));
     let timestamp_path = fingerprint_dir.join("invoked.timestamp");
     smol::unblock(move || {
         std::fs::create_dir_all(&fingerprint_dir).wrap_err_with(|| {
@@ -804,6 +814,62 @@ mod tests {
     use crate::artifact_cache::CachedArtifactBundle;
     use crate::rustc_args::ParsedRustcArgs;
 
+    /// stow#578: cargo names the fingerprint dir after the package
+    /// (`<pkg>-<meta>`), so a `[lib] name` rename must not send the
+    /// timestamp under the lib name.
+    #[test]
+    fn invoked_timestamp_uses_the_package_fingerprint_name() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("target/debug/deps");
+            std::fs::create_dir_all(&out_dir).expect("out dir");
+
+            let mut parsed = semantic_test_parsed_args(&out_dir);
+            parsed.crate_name = "debug_unreachable".to_owned();
+            parsed.input_path = Some(PathBuf::from(
+                "/root/.cargo/registry/src/index.crates.io-0123abcd/new_debug_unreachable-1.0.6/src/lib.rs",
+            ));
+            parsed.extra_filename = "-0123456789abcdef".to_owned();
+
+            super::touch_invoked_timestamp(&parsed, &out_dir)
+                .await
+                .expect("touch timestamp");
+
+            assert!(
+                tempdir
+                    .path()
+                    .join("target/debug/.fingerprint/new_debug_unreachable-0123456789abcdef/invoked.timestamp")
+                    .exists()
+            );
+        });
+    }
+
+    /// A locally-built (non-registry) entry restores through the same path:
+    /// its fingerprint dir takes the rustc spelling's `-` fold — the local
+    /// package's name.
+    #[test]
+    fn invoked_timestamp_uses_the_rustc_spelling_for_a_non_registry_unit() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("target/debug/deps");
+            std::fs::create_dir_all(&out_dir).expect("out dir");
+            let mut parsed = semantic_test_parsed_args(&out_dir);
+            parsed.crate_name = "my_crate".to_owned();
+            parsed.input_path = Some(PathBuf::from("src/lib.rs"));
+
+            super::touch_invoked_timestamp(&parsed, &out_dir)
+                .await
+                .expect("touch timestamp");
+
+            assert!(
+                tempdir
+                    .path()
+                    .join("target/debug/.fingerprint/my-crate-expected/invoked.timestamp")
+                    .exists()
+            );
+        });
+    }
+
     /// `ParsedRustcArgs` fixture for the semantic-bundle test: an `itoa` lib
     /// unit whose `-C metadata` (`expected`) deliberately differs from the
     /// bundle's `c_metadata` (`0123abcd`) — the mismatch under test.
@@ -815,7 +881,9 @@ mod tests {
             cfgs: BTreeSet::default(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
-            input_path: None,
+            input_path: Some(PathBuf::from(
+                "/root/.cargo/registry/src/index.crates.io-0123abcd/itoa-1.0.18/src/lib.rs",
+            )),
             target: Some("aarch64-apple-darwin".to_owned()),
             c_metadata: Some("expected".to_owned()),
             out_dir: Some(out_dir.to_path_buf()),
