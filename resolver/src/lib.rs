@@ -28,7 +28,9 @@ pub use enqueue::{
     RequestPlanParts, TaskGraph, TaskNode, enqueue_requests_from_output, enqueue_requests_inner,
     request_plan_parts,
 };
-pub use prepare::{GitCommit, PreparedSourceTree, RelativeSourcePath, SourcePreparation};
+pub use prepare::{
+    GitCommit, PreparedSourceTree, RelativeSourcePath, SourcePreparation, project_fetch_ref,
+};
 pub use session::{ResolveOptions, Resolver, SourceResolve};
 pub use units::{
     SpecsAndResolvedFeatures, StowDep, StowResolveOutput, StowSide, StowUnit, StowUnitKey,

@@ -861,11 +861,12 @@ pub fn normalize_repo_url(raw: &str) -> stow_types::error::Result<String> {
 }
 
 /// Resolve one listed repository into its enqueue batch — the pool
-/// worker fetches the tree (depth-1, `HEAD`) and runs cargo's own
-/// resolver on it, once per CI target: the committed lockfile's pins
-/// are dropped so the resolve lands on the latest semver-compatible
-/// version — a project contributes crate names and feature sets, never
-/// version pins.
+/// worker fetches the tree (depth-1, the declared commit when the
+/// project has a source-trees declaration, else `HEAD`) and runs
+/// cargo's own resolver on it, once per CI target: the committed
+/// lockfile's pins are dropped so the resolve lands on the latest
+/// semver-compatible version — a project contributes crate names and
+/// feature sets, never version pins.
 pub fn resolve_repository(
     resolver: &stow_resolver::Resolver,
     repo: &str,
@@ -873,10 +874,11 @@ pub fn resolve_repository(
     rustc_version: &WireRustcVersion,
     preparation: Option<&stow_resolver::SourcePreparation>,
 ) -> Result<Vec<EnqueueRequest>, String> {
+    let git_ref = stow_resolver::project_fetch_ref(preparation);
     let source = resolver
         .resolve_git(
             repo,
-            "HEAD",
+            &git_ref,
             &crate::resolve::target_strings(targets),
             rustc_version,
             0,

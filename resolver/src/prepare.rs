@@ -10,10 +10,10 @@
 //! commit of each extra repository and the destination it lands at.
 //!
 //! Nothing here guesses: a preparation applies only to the project it
-//! declares, the project checkout must already sit at the declared
-//! commit, and every destination must be missing or empty inside the
-//! fetched tree — a declared path that already holds content fails the
-//! resolve rather than silently shadowing what the repository ships.
+//! declares, the lane fetches the project at its declared commit, and
+//! every destination must be missing or empty inside the fetched tree
+//! — a declared path that already holds content fails the resolve
+//! rather than silently shadowing what the repository ships.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -218,6 +218,16 @@ impl SourcePreparation {
     }
 }
 
+/// The git ref a project lane fetches for a repository.
+///
+/// The declared commit when the project has a preparation — the
+/// repository's HEAD may have moved past the declaration (stow#573) —
+/// else `HEAD`, the remote's default branch.
+#[must_use]
+pub fn project_fetch_ref(preparation: Option<&SourcePreparation>) -> String {
+    preparation.map_or_else(|| "HEAD".to_owned(), |p| p.commit().to_hex())
+}
+
 /// `git -C <dir> rev-parse HEAD`, trimmed.
 fn rev_parse_head(dir: &Path) -> CargoResult<String> {
     let output = std::process::Command::new("git")
@@ -237,9 +247,9 @@ fn rev_parse_head(dir: &Path) -> CargoResult<String> {
 /// Verify the project checkout sits at the declared commit.
 ///
 /// Runs after [`crate::fetch::fetch_git`], before any source
-/// acquisition or cargo work — a project that moved since its
-/// declaration fails here instead of silently resolving a different
-/// tree.
+/// acquisition or cargo work — the lane fetches the declared commit
+/// itself ([`project_fetch_ref`]), and this proves the checkout
+/// landed there rather than on a different tree.
 ///
 /// # Errors
 /// The checkout's `HEAD` is not the declared commit.
