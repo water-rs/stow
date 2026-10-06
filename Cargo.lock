@@ -9781,7 +9781,7 @@ dependencies = [
 [[package]]
 name = "zenwave"
 version = "0.7.1"
-source = "git+https://github.com/zen-rs/zenwave?rev=f2bb056f8a52b746082400a7c4a60ba79c11b38f#f2bb056f8a52b746082400a7c4a60ba79c11b38f"
+source = "git+https://github.com/zen-rs/zenwave?rev=776f9fd7d7626406b6300961e3a856e8f5297c69#776f9fd7d7626406b6300961e3a856e8f5297c69"
 dependencies = [
  "anyhow",
  "async-fs",
