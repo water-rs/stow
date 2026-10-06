@@ -26,7 +26,6 @@ use stow_types::public_cache::canonical_crate_name;
 
 use crate::capture;
 use crate::dep_scan;
-use crate::task::BuildWorkspace;
 
 /// What [`prefetch`] staged for the capture wrapper to serve: the read-only
 /// store the sandbox grant covers and how many verified bundles it holds.
@@ -61,9 +60,9 @@ pub async fn slices_for_task(
 }
 
 /// Fetch and stage the published artifacts this task's dependencies can be
-/// served from: every signed-index row naming a registry library package
-/// of the resolved closure at the same version and feature set — never the
-/// task crate itself, which the task exists to compile.
+/// served from: every signed-index row naming a dep pin at the same
+/// version and feature set — never the task crate itself, which the task
+/// exists to compile.
 ///
 /// Rows whose dep-identity does not match this build's resolution are not
 /// excluded here — the wrapper's compile-key lookup is what decides a hit;
@@ -71,23 +70,20 @@ pub async fn slices_for_task(
 ///
 /// # Errors
 ///
-/// Returns an error when the config, the index slices, or `cargo metadata`
-/// cannot be obtained — the caller treats that as "consumption disabled"
+/// Returns an error when the config or the index slices cannot be
+/// obtained — the caller treats that as "consumption disabled"
 /// and builds exactly as before. A bundle that could not be *fetched* is
 /// logged and skipped the same way: it removes one candidate, never the
 /// task. A bundle that arrived and failed verification is neither, and
 /// propagates — see [`build_consume::StageFailure`].
 pub async fn prefetch(
     task: &BuildTaskPayload,
-    workspace: &BuildWorkspace,
     store_dir: &Path,
 ) -> Result<Consumption, build_consume::StageFailure> {
     let unavailable = build_consume::StageFailure::Unavailable;
-    // The closure comes from `cargo metadata`, which this stage already
-    // runs on its own executor.
-    let packages = dep_scan::consumable_packages(workspace, task)
-        .await
-        .map_err(unavailable)?;
+    // The consumable set is the task's dep pins — the published identities
+    // the pins were resolved at — so it needs no resolution of its own.
+    let packages = dep_scan::consumable_packages(task);
 
     // Everything past here is the CLI's verified-download chain, and that
     // chain's HTTP client resolves DNS through a Tokio reactor. The build
@@ -300,6 +296,15 @@ async fn fetch_and_stage(
 
 #[cfg(test)]
 mod tests {
+    use stow_types::api::{BuildDepPin, BuildTaskPayload};
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::identity::{
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
+        WireRustcVersion,
+    };
+    use stow_types::index::{ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow};
+    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
+
     /// The chain this module reuses resolves DNS through a Tokio reactor
     /// and panics — "there is no reactor running" — without one, while the
     /// build stage runs on smol. Whatever else changes, the network phase
@@ -316,5 +321,83 @@ mod tests {
                 .expect("runtime")
         });
         assert!(has_reactor, "the network phase ran without a Tokio reactor");
+    }
+
+    /// stow#579: a row is consumable by the dep pin's feature set — the
+    /// identity the dep's own task published it at — so the row the
+    /// invocation's `--cfg feature=` set labels hits, while a row still
+    /// carrying cargo metadata's platform-agnostic resolve features (an
+    /// implicit feature of a dep this target never compiles) does not.
+    #[test]
+    fn candidates_match_the_dep_pins_feature_set() {
+        let pin_features = ["fs".to_owned(), "net".to_owned()];
+        let task = BuildTaskPayload {
+            task_id: "consumer-1.0.0".to_owned(),
+            attempt: 1,
+            crate_name: CrateName::parse("consumer").unwrap(),
+            version: CrateVersion::new(semver::Version::new(1, 0, 0)),
+            features_json: FeaturesJson::default(),
+            target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
+            rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
+            preserve_lockfile: false,
+            host_side: false,
+            dep_pins: vec![BuildDepPin {
+                crate_name: CrateName::parse("tokio").unwrap(),
+                version: CrateVersion::new(semver::Version::new(1, 53, 2)),
+                features_json: FeaturesJson::canonicalize(pin_features.to_vec()).unwrap(),
+                host_side: false,
+            }],
+        };
+        let packages = crate::dep_scan::consumable_packages(&task);
+        assert_eq!(packages.len(), 1);
+
+        let row = |features: &[&str], c_metadata: &str| ArtifactIndexRow {
+            crate_name: CrateName::parse("tokio").unwrap(),
+            version: CrateVersion::new(semver::Version::new(1, 53, 2)),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .unwrap(),
+            dependency_c_metadata_json: DependencyCMetadataJson::default(),
+            c_metadata: CMetadata::parse(c_metadata).unwrap(),
+            compile_key: String::new(),
+            bundle_digest: "sha256:".to_owned() + &"ab".repeat(32),
+            bundle_size: 1,
+            artifact_kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Lib],
+            profile: Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 1,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+                strip: StripLevel::None,
+            },
+            emit: vec![],
+            unit_shape: None,
+            min_glibc: None,
+        };
+        let slice = stow_cli::build_consume::IndexSlice {
+            manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
+            index: ArtifactIndex {
+                header: ArtifactIndexHeader {
+                    format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
+                    target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
+                    rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
+                    generated_at: String::new(),
+                    generation: 1,
+                    row_count: 2,
+                },
+                rows: vec![
+                    row(&["fs", "net", "windows-sys"], "0123456789abcdef"),
+                    row(&["fs", "net"], "123456789abcdef0"),
+                ],
+            },
+        };
+
+        let slices = [slice];
+        let hits = super::candidates(&slices, &packages, &task);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.c_metadata.as_str(), "123456789abcdef0");
     }
 }
