@@ -883,6 +883,7 @@ mod tests {
                         write_budget: budget.rows_written,
                         wall_budget: budget.wall_ms,
                         over_budget: factor > 1.0,
+                        over_wall: factor > 1.0,
                         log: Vec::new(),
                     }
                 })

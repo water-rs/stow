@@ -630,8 +630,10 @@ pub async fn run(
 /// at the run's starting mark — the fixture barrier has already
 /// resolved, so every earlier write was confirmed durable — and
 /// closes at the in-window barrier's finished mark, so the drive's
-/// own write confirmation is priced as its work. Statement and D1
-/// deltas bracket the same window.
+/// own write confirmation lands in the reported number. Statement and
+/// D1 deltas bracket the same window. The wall is a reported
+/// measurement, never a gate (stow#567): in this lane it is mostly the
+/// runner's own storage latency, not the code's cost.
 struct WindowMeasure<'a> {
     drive: &'a str,
     ctx: &'a drives::DriveContext,
@@ -729,10 +731,11 @@ fn budget_row(drive: &str, measure: WindowMeasure) -> Result<SchedulerBudgetRow,
             d1_rows_read: measure.d1_after.0.saturating_sub(measure.d1_before.0),
             d1_rows_written: measure.d1_after.1.saturating_sub(measure.d1_before.1),
             d1_elapsed_ms: measure.d1_after.2.saturating_sub(measure.d1_before.2),
-            over_budget: totals.0 > budget.statements
-                || totals.1 > budget.rows_read
-                || totals.2 > budget.rows_written
-                || measure.wall_ms > budget.wall_ms,
+            over_budget: budget.over_budget(totals.0, totals.1, totals.2),
+            // Reported, never gated (stow#567): the local lane's wall
+            // is mostly the in-window `db.sync()` durability barrier —
+            // runner storage latency, not the code's cost.
+            over_wall: budget.over_wall(measure.wall_ms),
             log: measure
                 .statements
                 .into_iter()

@@ -851,6 +851,28 @@ fn every_drive_has_exactly_one_row_in_each_budget_table() {
     }
 }
 
+/// stow#567: a wall breach is reported, never gated — the local
+/// workerd lane's `wall_ms` is mostly the in-window `db.sync()`
+/// durability barrier on the runner's SQLite, so the report row's
+/// `over_wall` marks it while `over_budget` stays clear. A
+/// statements/rows breach still gates. (`budget_row` is wasm-only;
+/// these are the predicates it delegates to.)
+#[test]
+fn a_wall_breach_is_reported_not_gated() {
+    let budget = crate::scheduler::do_budgets::DO_BUDGETS
+        .first()
+        .expect("a drive budget");
+    // Wall over, counts at budget: reported, not gated.
+    assert!(budget.over_wall(budget.wall_ms + 1));
+    assert!(
+        !budget.over_budget(budget.statements, budget.rows_read, budget.rows_written),
+        "the wall is reported, not gated"
+    );
+    // A rows_read breach still gates even with the wall inside budget.
+    assert!(budget.over_budget(budget.statements, budget.rows_read + 1, budget.rows_written));
+    assert!(!budget.over_wall(budget.wall_ms));
+}
+
 /// Every drive once under the gate, logging per-statement counters —
 /// the loop `per_request_cost_gate` and the persisted-fixture repeat
 /// share.
