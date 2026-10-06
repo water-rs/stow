@@ -910,9 +910,10 @@ async fn download(url: &str) -> stow_types::error::Result<Vec<u8>> {
 /// read with no side effects, so replaying it is safe.
 async fn download_once(url: &str) -> DownloadOutcome {
     use zenwave::Client as _;
-    let mut client = zenwave::client()
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
-        .follow_redirect();
+    // The default client already follows redirects; the request bound is
+    // a tokio timeout so the awaited error stays `zenwave::Error` — the
+    // middleware stack's error type is opaque.
+    let mut client = zenwave::client();
     let request = match client.get(url) {
         Ok(request) => request,
         Err(error) => {
@@ -921,31 +922,54 @@ async fn download_once(url: &str) -> DownloadOutcome {
             ));
         }
     };
-    let response = match request.await {
-        Ok(response) => response,
-        Err(error) => {
+    // zenwave lifts 4xx/5xx into `Err` before any status branch — whichever
+    // arm carries the response, one `(status, hint)` extraction feeds the
+    // single classification below; transport/timeout failures retry the
+    // whole GET with no hint.
+    let (status, retry_after, error) = match tokio::time::timeout(
+        std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
+        async move { request.await },
+    )
+    .await
+    {
+        Ok(Err(error)) => {
+            let Some(response) = error.response() else {
+                return DownloadOutcome::Retryable {
+                    error: stow_types::stow_error!("download {url}: {error}"),
+                    retry_after: None,
+                };
+            };
+            (
+                response.status().as_u16(),
+                stow_types::transient::retry_after_hint(response.headers()),
+                stow_types::stow_error!("download {url}: HTTP {}", response.status().as_u16()),
+            )
+        }
+        Ok(Ok(response)) if response.status().is_success() => {
+            return match response.into_body().into_bytes().await {
+                Ok(bytes) => DownloadOutcome::Bytes(bytes.to_vec()),
+                Err(error) => DownloadOutcome::Retryable {
+                    error: stow_types::stow_error!("read {url} body: {error}"),
+                    retry_after: None,
+                },
+            };
+        }
+        Ok(Ok(response)) => (
+            response.status().as_u16(),
+            stow_types::transient::retry_after_hint(response.headers()),
+            stow_types::stow_error!("download {url}: HTTP {}", response.status()),
+        ),
+        Err(_) => {
             return DownloadOutcome::Retryable {
-                error: stow_types::stow_error!("download {url}: {error}"),
+                error: stow_types::stow_error!("download {url}: timed out"),
                 retry_after: None,
             };
         }
     };
-    let status = response.status();
-    if !status.is_success() {
-        let retry_after = stow_types::transient::retry_after_hint(response.headers());
-        let error = stow_types::stow_error!("download {url}: HTTP {status}");
-        return if stow_types::transient::is_transient_status(status.as_u16()) {
-            DownloadOutcome::Retryable { error, retry_after }
-        } else {
-            DownloadOutcome::Fatal(error)
-        };
-    }
-    match response.into_body().into_bytes().await {
-        Ok(bytes) => DownloadOutcome::Bytes(bytes.to_vec()),
-        Err(error) => DownloadOutcome::Retryable {
-            error: stow_types::stow_error!("read {url} body: {error}"),
-            retry_after: None,
-        },
+    if stow_types::transient::is_transient_status(status) {
+        DownloadOutcome::Retryable { error, retry_after }
+    } else {
+        DownloadOutcome::Fatal(error)
     }
 }
 
@@ -1410,6 +1434,196 @@ mod tests {
             let bytes = download(&url).await.expect("the retried download succeeds");
             assert_eq!(bytes, body);
             assert_eq!(*requests.lock().expect("request count"), 2);
+        });
+    }
+
+    /// An owned, bounded one-answer HTTP stub on a real loopback socket:
+    /// at most `LIMIT` connections, each stream bounded by read/write
+    /// timeouts, accepting until the deadline, the limit, or `stop`.
+    /// `join` ends it deterministically after the test's assertions;
+    /// `Drop` stops it even when a test panics first.
+    struct StubServer {
+        /// Base URL — `http://127.0.0.1:<port>`.
+        url: String,
+        requests: std::sync::Arc<std::sync::Mutex<usize>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// Accept at most this many connections — far more than the one
+    /// request each test expects, so a wrongly-retrying client is
+    /// still served and counted.
+    const LIMIT: usize = 8;
+    /// Overall accept deadline — the thread never outlives it.
+    const ACCEPT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+    /// Per-stream socket bound — no accepted connection stalls the
+    /// thread on a slow peer.
+    const STREAM_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    impl StubServer {
+        /// How many connections the stub has accepted so far — one per
+        /// HTTP request this test makes.
+        fn request_count(&self) -> usize {
+            *self.requests.lock().expect("request count")
+        }
+
+        /// Stop accepting and reap the thread — the deterministic end
+        /// when the test's assertions are done.
+        fn join(mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("stub server thread");
+            }
+        }
+    }
+
+    impl Drop for StubServer {
+        /// A test that panics before `join` still stops the thread —
+        /// the accept loop polls `stop` between would-block slices.
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Serve `status_line` (with `extra_headers` ahead of
+    /// `content-length: 0`) on every accepted connection, counting each
+    /// one — a classification that wrongly retries shows up in the
+    /// count.
+    fn serve_once(status_line: &'static str, extra_headers: &'static str) -> StubServer {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answer = format!(
+            "HTTP/1.1 {status_line}\r\n{extra_headers}content-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        let thread = {
+            let seen = std::sync::Arc::clone(&requests);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + ACCEPT_BOUND;
+                let mut served = 0usize;
+                while served < LIMIT
+                    && std::time::Instant::now() < deadline
+                    && !stop.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            served += 1;
+                            *seen.lock().expect("request count") = served;
+                            stream
+                                .set_read_timeout(Some(STREAM_BOUND))
+                                .expect("read timeout");
+                            stream
+                                .set_write_timeout(Some(STREAM_BOUND))
+                                .expect("write timeout");
+                            let mut reader =
+                                BufReader::new(stream.try_clone().expect("clone stream"));
+                            loop {
+                                let mut line = String::new();
+                                match reader.read_line(&mut line) {
+                                    // End of stream or a timed-out,
+                                    // refused, or reset read ends the
+                                    // header scan — the per-stream
+                                    // bound keeps it from hanging.
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) if line == "\r\n" => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                            stream.write_all(answer.as_bytes()).expect("write answer");
+                            stream.flush().expect("flush");
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        StubServer {
+            url,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// zenwave delivers a terminal status on the `Err` arm — the carried
+    /// response still classifies: 404 is `Fatal`, so `download` stops
+    /// after exactly one request instead of burning the retry budget.
+    #[test]
+    fn a_terminal_status_is_fatal_after_one_request() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let server = serve_once("404 Not Found", "");
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), download(&server.url))
+                    .await
+                    .expect("the download completes within the deadline");
+            assert!(result.is_err(), "a terminal status must fail");
+            assert_eq!(server.request_count(), 1);
+            server.join();
+        });
+    }
+
+    /// A transient status inside the `Err` keeps its `Retry-After`
+    /// hint — the carried response's headers drive the wait.
+    #[test]
+    fn a_transient_status_error_keeps_the_retry_after_hint() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let server = serve_once("429 Too Many Requests", "retry-after: 7\r\n");
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                download_once(&server.url),
+            )
+            .await
+            .expect("the download completes within the deadline");
+            let DownloadOutcome::Retryable { retry_after, .. } = outcome else {
+                panic!("429 must be Retryable");
+            };
+            assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
+            assert_eq!(server.request_count(), 1);
+            server.join();
+        });
+    }
+
+    /// A server failure inside the `Err` retries — with no hint when
+    /// the response carries none.
+    #[test]
+    fn a_server_failure_error_is_retryable() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async {
+            let server = serve_once("500 Internal Server Error", "");
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                download_once(&server.url),
+            )
+            .await
+            .expect("the download completes within the deadline");
+            assert!(
+                matches!(outcome, DownloadOutcome::Retryable { .. }),
+                "500 must be Retryable"
+            );
+            assert_eq!(server.request_count(), 1);
+            server.join();
         });
     }
 }

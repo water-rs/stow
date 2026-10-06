@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use stow_types::stow_error;
-use zenwave::{Client, ResponseExt};
+use zenwave::{Client, HttpError, ResponseExt};
 
 use stow_types::transient::{Backoff, is_transient_status, retry_after_hint};
 
@@ -144,7 +144,10 @@ enum FetchOutcome {
 
 /// One paced GET of a `crates.io` URL.
 async fn fetch_once(url: &str, timeout: Duration) -> FetchOutcome {
-    let mut client = zenwave::client().timeout(timeout).follow_redirect();
+    // The default client already follows redirects; the request bound is
+    // a tokio timeout so the awaited error stays `zenwave::Error` — the
+    // middleware stack's error type is opaque.
+    let mut client = zenwave::client();
     let request = match client
         .get(url)
         .and_then(|request| request.header("User-Agent", USER_AGENT))
@@ -157,22 +160,41 @@ async fn fetch_once(url: &str, timeout: Duration) -> FetchOutcome {
             };
         }
     };
-    let response = match request.await {
-        Ok(response) => response,
-        Err(error) => {
-            return FetchOutcome::Retryable {
-                error: stow_error!("fetch crates.io {url}: {error}"),
-                retry_after: None,
-            };
-        }
-    };
-    let status = response.status();
-    if status.is_success() {
-        return FetchOutcome::Body(response);
-    }
-    let retry_after = retry_after_hint(response.headers());
-    let error = stow_error!("crates.io {url} returned HTTP {status}");
-    if is_transient_status(status.as_u16()) {
+    // zenwave lifts 4xx/5xx into `Err` before any status branch — whichever
+    // arm carries the response, one `(status, hint)` extraction feeds the
+    // single classification below; transport/timeout failures retry with
+    // no hint.
+    let (status, retry_after, error) =
+        match tokio::time::timeout(timeout, async move { request.await }).await {
+            Ok(Err(error)) => {
+                let Some(response) = error.response() else {
+                    return FetchOutcome::Retryable {
+                        error: stow_error!("fetch crates.io {url}: {error}"),
+                        retry_after: None,
+                    };
+                };
+                (
+                    response.status().as_u16(),
+                    retry_after_hint(response.headers()),
+                    stow_error!("fetch crates.io {url}: {error}"),
+                )
+            }
+            Ok(Ok(response)) if response.status().is_success() => {
+                return FetchOutcome::Body(response);
+            }
+            Ok(Ok(response)) => (
+                response.status().as_u16(),
+                retry_after_hint(response.headers()),
+                stow_error!("crates.io {url} returned HTTP {}", response.status()),
+            ),
+            Err(_) => {
+                return FetchOutcome::Retryable {
+                    error: stow_error!("fetch crates.io {url}: timed out"),
+                    retry_after: None,
+                };
+            }
+        };
+    if is_transient_status(status) {
         FetchOutcome::Retryable { error, retry_after }
     } else {
         FetchOutcome::Fatal(error)
@@ -390,7 +412,7 @@ pub struct IndexRelease {
 /// The crate's index file URL — the same sharding cargo applies: `1/`
 /// and `2/` for the short names, `3/<first>` for three letters,
 /// `<first-two>/<chars3-4>` beyond.
-fn index_url(crate_name: &str) -> String {
+fn index_url_at(index_base: &str, crate_name: &str) -> String {
     let name = crate_name.to_ascii_lowercase();
     let path = match name.len() {
         1 => format!("1/{name}"),
@@ -398,7 +420,15 @@ fn index_url(crate_name: &str) -> String {
         3 => format!("3/{}/{name}", &name[0..1]),
         _ => format!("{}/{}/{name}", &name[0..2], &name[2..4]),
     };
-    format!("{INDEX_BASE}/{path}")
+    format!("{index_base}/{path}")
+}
+
+/// The crate's index URL at the production root — the shape tests pin
+/// against cargo's sharding (`index_releases` reaches the same path
+/// through [`index_url_at`]).
+#[cfg(test)]
+fn index_url(crate_name: &str) -> String {
+    index_url_at(INDEX_BASE, crate_name)
 }
 
 /// Fetch a crate's whole version listing from the sparse index — one
@@ -409,24 +439,46 @@ fn index_url(crate_name: &str) -> String {
 /// index, or a line does not decode — a truncated file is an error, not
 /// a partial answer.
 pub async fn index_releases(crate_name: &str) -> stow_types::error::Result<Vec<IndexRelease>> {
-    let url = index_url(crate_name);
+    index_releases_at(INDEX_BASE, crate_name).await
+}
+
+/// `index_releases` at an explicit index root — production passes
+/// [`INDEX_BASE`], tests an owned loopback URL.
+async fn index_releases_at(
+    index_base: &str,
+    crate_name: &str,
+) -> stow_types::error::Result<Vec<IndexRelease>> {
+    let url = index_url_at(index_base, crate_name);
     let mut client = zenwave::client().timeout(INDEX_TIMEOUT).follow_redirect();
-    let response = client
+    let request = client
         .get(&url)
         .and_then(|request| request.header("User-Agent", USER_AGENT))
-        .map_err(|error| stow_error!("fetch crates.io index {url}: {error}"))?
-        .await
         .map_err(|error| stow_error!("fetch crates.io index {url}: {error}"))?;
-    if response.status() == zenwave::StatusCode::NOT_FOUND {
+    // `error_for_status` lifts an Ok-carried 4xx/5xx into the error
+    // path — one status read names the unknown-crate 404 either way.
+    let (status, detail) = match request.await {
+        Ok(response) => match response.error_for_status().await {
+            Ok(response) => {
+                let body = response
+                    .into_string()
+                    .await
+                    .map_err(|error| stow_error!("read crates.io index {url}: {error}"))?;
+                return index_lines(crate_name, &body);
+            }
+            Err(error) => (error.status(), error.to_string()),
+        },
+        Err(error) => (error.status(), error.to_string()),
+    };
+    if status == zenwave::StatusCode::NOT_FOUND {
         return Err(stow_error!("{crate_name} is unknown to index.crates.io"));
     }
-    let body = response
-        .error_for_status()
-        .await
-        .map_err(|error| stow_error!("fetch crates.io index {url}: {error}"))?
-        .into_string()
-        .await
-        .map_err(|error| stow_error!("read crates.io index {url}: {error}"))?;
+    Err(stow_error!("fetch crates.io index {url}: {detail}"))
+}
+
+/// Decode one sparse-index body into releases — each line one
+/// `IndexLine`; an unparseable version is skipped while a malformed
+/// line is a hard error.
+fn index_lines(crate_name: &str, body: &str) -> stow_types::error::Result<Vec<IndexRelease>> {
     let mut releases = Vec::new();
     for line in body.lines().filter(|line| !line.trim().is_empty()) {
         let line: IndexLine = serde_json::from_slice(line.as_bytes()).map_err(|error| {
@@ -464,7 +516,9 @@ pub fn latest_version(releases: &[IndexRelease]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexRelease, index_url, latest_version};
+    use super::{
+        FetchOutcome, IndexRelease, fetch_once, index_releases_at, index_url, latest_version,
+    };
 
     /// The sharding rule is cargo's own — pin it so a regression names
     /// itself rather than surfacing as wrong releases.
@@ -513,5 +567,150 @@ mod tests {
             Some("1.1.0-alpha".to_owned())
         );
         assert_eq!(latest_version(&releases(&[])), None);
+    }
+
+    /// The sparse-index 404 is the unknown-crate answer — zenwave
+    /// delivers it on the `Err` arm, and one status read names it.
+    #[tokio::test]
+    async fn absent_index_entry_is_the_unknown_answer() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 404,
+            retry_after: None,
+            body: "",
+        }])
+        .await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            index_releases_at(&server.url, "no_such_crate_xyz"),
+        )
+        .await
+        .expect("index fetch completes within the deadline")
+        .expect_err("404 is the unknown-crate answer")
+        .to_string();
+        assert!(
+            error.contains("unknown to index.crates.io"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(server.join().await.len(), 1);
+    }
+
+    /// A 500 is a fetch error — the unknown-crate reading belongs to
+    /// 404 alone.
+    #[tokio::test]
+    async fn index_server_failure_stays_a_fetch_error() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 500,
+            retry_after: None,
+            body: "",
+        }])
+        .await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            index_releases_at(&server.url, "serde"),
+        )
+        .await
+        .expect("index fetch completes within the deadline")
+        .expect_err("500 is a fetch failure")
+        .to_string();
+        assert!(
+            error.contains("fetch crates.io index"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(server.join().await.len(), 1);
+    }
+
+    /// Two well-formed index lines decode to two releases — versions
+    /// and yanked flags carried through.
+    #[tokio::test]
+    async fn index_body_decodes_releases() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: "{\"vers\":\"1.0.0\",\"yanked\":false}\n{\"vers\":\"2.1.0\",\"yanked\":true}\n",
+        }])
+        .await;
+        let releases = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            index_releases_at(&server.url, "serde"),
+        )
+        .await
+        .expect("index fetch completes within the deadline")
+        .expect("two index lines decode");
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].version, semver::Version::new(1, 0, 0));
+        assert_eq!(releases[1].version, semver::Version::new(2, 1, 0));
+        assert!(!releases[0].yanked);
+        assert!(releases[1].yanked);
+        assert_eq!(server.join().await.len(), 1);
+    }
+
+    /// `fetch_once` classifies the status zenwave carries inside the
+    /// `Err`, the same read the `Ok` arm applies: a terminal 404 is
+    /// `Fatal` after exactly one request — never a budget burned.
+    #[tokio::test]
+    async fn fetch_once_terminal_status_is_fatal_after_one_request() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 404,
+            retry_after: None,
+            body: r#"{"errors":[{"detail":"Not Found"}]}"#,
+        }])
+        .await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_once(&server.url, std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("the fetch completes within the deadline");
+        assert!(
+            matches!(outcome, FetchOutcome::Fatal(_)),
+            "404 must be Fatal"
+        );
+        assert_eq!(server.join().await.len(), 1);
+    }
+
+    /// A transient status inside the `Err` keeps its `Retry-After`
+    /// hint — the carried response's headers drive the wait.
+    #[tokio::test]
+    async fn fetch_once_transient_status_keeps_the_retry_after_hint() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 429,
+            retry_after: Some(7),
+            body: r#"{"errors":[{"detail":"rate limited"}]}"#,
+        }])
+        .await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_once(&server.url, std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("the fetch completes within the deadline");
+        let FetchOutcome::Retryable { retry_after, .. } = outcome else {
+            panic!("429 must be Retryable");
+        };
+        assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
+        assert_eq!(server.join().await.len(), 1);
+    }
+
+    /// A server failure inside the `Err` retries — with no hint to
+    /// ride when the response carries none.
+    #[tokio::test]
+    async fn fetch_once_server_failure_is_retryable() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 500,
+            retry_after: None,
+            body: "{}",
+        }])
+        .await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_once(&server.url, std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("the fetch completes within the deadline");
+        assert!(
+            matches!(outcome, FetchOutcome::Retryable { .. }),
+            "500 must be Retryable"
+        );
+        assert_eq!(server.join().await.len(), 1);
     }
 }

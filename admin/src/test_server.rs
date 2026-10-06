@@ -29,6 +29,11 @@ use tokio::task::JoinHandle;
 const CONNECTION_BOUND: Duration = Duration::from_secs(15);
 const JOIN_BOUND: Duration = Duration::from_secs(10);
 
+/// How long a [`Step::Stall`] holds its incomplete body open — long
+/// enough for the client's own deadline to fire first, short enough
+/// that `join` still finishes inside [`JOIN_BOUND`].
+const HOLD_BOUND: Duration = Duration::from_secs(2);
+
 /// The answer every request past the scripted steps gets: a success
 /// the test did not ask for, so an out-of-contract retry succeeds
 /// where the assertion expected failure.
@@ -55,6 +60,21 @@ pub enum Step {
         retry_after: Option<u64>,
         /// The response body.
         body: &'static str,
+    },
+    /// Answer `status` headers declaring `content_length`, send `body`
+    /// once, then hold the connection open — the rest of the declared
+    /// body never arrives, so a read that trusted the headers stalls
+    /// until the client's own deadline ends it. `content_length` must
+    /// exceed `body`'s length. The hold ends at [`HOLD_BOUND`] so the
+    /// serial accept loop still reaches the next scripted step.
+    Stall {
+        /// The status code.
+        status: u16,
+        /// The body bytes actually sent — strictly less than
+        /// `content_length`.
+        body: &'static str,
+        /// The declared `Content-Length`.
+        content_length: u64,
     },
 }
 
@@ -157,30 +177,52 @@ async fn run(
                                 retry_after,
                                 body,
                             } => respond(status, retry_after, body),
+                            Step::Stall {
+                                status,
+                                body,
+                                content_length,
+                            } => stall(status, body, content_length),
                         }
                     }
                 });
                 let io = TokioIo::new(stream);
                 // keep-alive off: one request per connection, so the
                 // script advances per request and the loop keeps
-                // accepting instead of holding an idle conn.
+                // accepting instead of holding an idle conn. A stall
+                // holds under its own short bound so the loop reaches
+                // the next step (and `join`'s shutdown) on time.
+                let serve_bound = match step {
+                    Step::Stall { .. } => HOLD_BOUND,
+                    _ => CONNECTION_BOUND,
+                };
                 let served = tokio::time::timeout(
-                    CONNECTION_BOUND,
+                    serve_bound,
                     http1::Builder::new()
                         .keep_alive(false)
                         .serve_connection(io, service),
                 )
-                .await
-                .expect("each connection serves inside the bound");
+                .await;
                 match step {
                     // The scripted drop is the only connection error a
                     // step may produce — raised after request capture.
                     Step::Drop => {
-                        served.expect_err("the drop step must fail the connection");
+                        served
+                            .expect("each connection serves inside the bound")
+                            .expect_err("the drop step must fail the connection");
+                    }
+                    // The stall's body never completes: the hold bound
+                    // ends the serve or the walking-away client does —
+                    // either way the step played out as scripted.
+                    Step::Stall { .. } => {
+                        let _ = served;
                     }
                     // Every response step must serve cleanly; anything
                     // else is a server bug, not a scripted outcome.
-                    Step::Respond { .. } => served.expect("a respond step serves the request"),
+                    Step::Respond { .. } => {
+                        served
+                            .expect("each connection serves inside the bound")
+                            .expect("a respond step serves the request");
+                    }
                 }
                 while let Ok(head) = head_rx.try_recv() {
                     heads.push(head);
@@ -194,17 +236,22 @@ async fn run(
     heads
 }
 
+/// The body every served response shares — boxed so `respond` and
+/// `stall` agree on one response type.
+type ServedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+
 /// A typed h1 response for the scripted status, with `Retry-After`
 /// when the step carries a hint.
 fn respond(
     status: u16,
     retry_after: Option<u64>,
     body: &'static str,
-) -> io::Result<Response<Full<Bytes>>> {
+) -> io::Result<Response<ServedBody>> {
+    use http_body_util::BodyExt as _;
     let mut response = Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from_static(body.as_bytes())))
+        .body(Full::new(Bytes::from_static(body.as_bytes())).boxed())
         .map_err(io::Error::other)?;
     if let Some(hint) = retry_after {
         response
@@ -212,4 +259,46 @@ fn respond(
             .insert(http::header::RETRY_AFTER, HeaderValue::from(hint));
     }
     Ok(response)
+}
+
+/// A body that emits its bytes once, then pends forever — the
+/// response's declared `content-length` stays unmet and the client's
+/// body read is what stalls, not the header read.
+struct StallBody(Option<Bytes>);
+
+impl hyper::body::Body for StallBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        // Never `Ready(None)` — that would end the body cleanly;
+        // pending is what makes the client's body read stall.
+        self.get_mut().0.take().map_or_else(
+            || std::task::Poll::Pending,
+            |bytes| std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes)))),
+        )
+    }
+}
+
+/// A typed h1 response whose headers promise a `content_length` the
+/// body never delivers: `body` goes out once, then the stream holds
+/// open with the rest undeclared — [`HOLD_BOUND`] ends the hold.
+fn stall(status: u16, body: &'static str, content_length: u64) -> io::Result<Response<ServedBody>> {
+    use http_body_util::BodyExt as _;
+    assert!(
+        (body.len() as u64) < content_length,
+        "a stall must declare more than it sends"
+    );
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from(content_length),
+        )
+        .body(StallBody(Some(Bytes::from_static(body.as_bytes()))).boxed())
+        .map_err(io::Error::other)
 }
