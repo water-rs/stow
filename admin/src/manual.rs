@@ -233,12 +233,19 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
         },
     };
 
-    let requests = resolve_sources(&args, &targets, &rustc_version).await?;
-    if requests.is_empty() {
+    let resolved = resolve_sources(&args, &targets, &rustc_version).await?;
+    if resolved.requests.is_empty() {
+        if !resolved.unresolved_projects.is_empty() {
+            return Err(stow_error!(
+                "no tasks resolved: {} project(s) failed to resolve:\n{}",
+                resolved.unresolved_projects.len(),
+                resolved.unresolved_projects.join("\n")
+            ));
+        }
         render::emit_line("no tasks resolved");
         return Ok(());
     }
-    let (mut nodes, edges) = build_graph(requests);
+    let (mut nodes, edges) = build_graph(resolved.requests);
 
     let base = crate::index_cmd::registry_base()?;
     let session = base.session();
@@ -290,16 +297,24 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
         publish_and_wait(&dispatch, &args, &nodes, layer, &catalog, &rustc_version).await?;
     }
 
-    finish_report(&nodes, &failures, &blocked_report)
+    finish_report(
+        &nodes,
+        &failures,
+        &blocked_report,
+        &resolved.unresolved_projects,
+    )
 }
 
 /// The wave's outcome line plus its failure list — a node still undone
-/// failed, or was skipped behind a failed ancestor, and the report
-/// names both. The run exits non-zero unless every node is done.
+/// failed, or was skipped behind a failed ancestor, a `--projects`
+/// repository that never resolved is named too, and the report names
+/// all three. The run exits non-zero unless every node is done and
+/// every project resolved.
 fn finish_report(
     nodes: &BTreeMap<String, NodeRun>,
     failures: &[(String, String)],
     blocked_report: &[(String, String)],
+    unresolved_projects: &[String],
 ) -> stow_types::error::Result<()> {
     let total = nodes.len();
     let done = nodes.values().filter(|node| node.done).count();
@@ -314,16 +329,23 @@ fn finish_report(
     for (id, ancestor) in blocked_report {
         let _ = writeln!(report, "  SKIPPED {id} blocked by {ancestor}");
     }
+    for project in unresolved_projects {
+        let _ = writeln!(report, "  UNRESOLVED {project}");
+    }
     let _ = writeln!(
         report,
-        "manual preheat: {done}/{total} built, {} failed, {skipped} skipped",
-        failures.len()
+        "manual preheat: {done}/{total} built, {} failed, {skipped} skipped, {} unresolved",
+        failures.len(),
+        unresolved_projects.len()
     );
     render::emit_line(&report);
-    if failures.is_empty() && done == total {
+    if failures.is_empty() && done == total && unresolved_projects.is_empty() {
         Ok(())
     } else {
-        Err(stow_error!("manual preheat incomplete"))
+        Err(stow_error!(
+            "manual preheat incomplete:\n{}",
+            report.trim_end()
+        ))
     }
 }
 
@@ -508,6 +530,18 @@ impl SourceProgress {
     }
 }
 
+/// What the source lanes produced: the resolved task requests, and the
+/// `--projects` repositories that failed to resolve. A projects
+/// failure is reported and counted rather than aborting the wave — it
+/// is named at the finish report and fails the run; a `--crates` or
+/// `--dirs` failure still aborts before dispatch.
+struct ResolvedSources {
+    requests: Vec<EnqueueRequest>,
+    /// `"<repo>: <reason>"`, the string `SourceProgress::collect`
+    /// builds — only the `--projects` lane feeds this.
+    unresolved_projects: Vec<String>,
+}
+
 /// Read both inputs into one request list: a crates file resolves each
 /// line's newest non-yanked release (or the `@`-pinned one) with the
 /// crate lane; a projects file resolves each listed repository's git
@@ -516,7 +550,7 @@ async fn resolve_sources(
     args: &ManualArgs,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<Vec<EnqueueRequest>> {
+) -> stow_types::error::Result<ResolvedSources> {
     // Version lookup runs sequentially (crates.io's pace gate); the
     // resolves then fan out on the pool.
     let mut jobs: Vec<(String, semver::Version)> = Vec::new();
@@ -534,9 +568,10 @@ async fn resolve_sources(
     let projects = args.projects.clone();
     let source_trees = args.source_trees.clone();
     let dirs = args.dirs.clone();
-    let (requests, failures) = tokio::task::spawn_blocking(move || {
+    let (requests, failures, unresolved_projects) = tokio::task::spawn_blocking(move || {
         let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
         let mut requests = Vec::new();
+        let mut unresolved_projects = Vec::new();
         if !jobs.is_empty() {
             let mut progress = SourceProgress::new(jobs.len());
             pool.run(
@@ -570,26 +605,15 @@ async fn resolve_sources(
             );
         }
         if let Some(path) = &projects {
-            let repos = tokio::runtime::Handle::current()
-                .block_on(crate::projects::load_projects_file(path))?;
-            let trees =
-                crate::source_trees::load_optional_source_trees(source_trees.as_ref(), &repos)?;
-            let mut progress = SourceProgress::new(repos.len());
-            pool.run(
-                &repos,
-                |resolver, _runtime, repo| {
-                    crate::projects::resolve_repository(
-                        resolver,
-                        repo,
-                        &targets,
-                        &rustc_version,
-                        trees.as_ref().and_then(|trees| trees.get(repo)),
-                    )
-                },
-                |_, repo, result| {
-                    progress.collect(repo, result, &mut requests, &mut failures);
-                },
-            );
+            resolve_projects_lane(
+                &pool,
+                path,
+                source_trees.as_ref(),
+                &targets,
+                &rustc_version,
+                &mut requests,
+                &mut unresolved_projects,
+            )?;
         }
         if let Some(dirs) = &dirs {
             let mut progress = SourceProgress::new(dirs.len());
@@ -603,7 +627,7 @@ async fn resolve_sources(
                 },
             );
         }
-        Ok::<_, stow_types::error::Error>((requests, failures))
+        Ok::<_, stow_types::error::Error>((requests, failures, unresolved_projects))
     })
     .await
     .expect("resolve pool panicked")?;
@@ -614,7 +638,46 @@ async fn resolve_sources(
             failures.join("\n")
         ));
     }
-    Ok(requests)
+    Ok(ResolvedSources {
+        requests,
+        unresolved_projects,
+    })
+}
+
+/// The `--projects` lane inside `resolve_sources`: load the file and
+/// the declared source trees, then fan the repositories over the pool.
+/// A repository that fails to resolve lands in `unresolved_projects`
+/// — reported and counted at the finish report (stow#572) — rather
+/// than aborting the wave like a `--crates` or `--dirs` failure.
+fn resolve_projects_lane(
+    pool: &crate::resolve::ResolvePool,
+    projects: &Path,
+    source_trees: Option<&PathBuf>,
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+    requests: &mut Vec<EnqueueRequest>,
+    unresolved_projects: &mut Vec<String>,
+) -> stow_types::error::Result<()> {
+    let repos = tokio::runtime::Handle::current()
+        .block_on(crate::projects::load_projects_file(projects))?;
+    let trees = crate::source_trees::load_optional_source_trees(source_trees, &repos)?;
+    let mut progress = SourceProgress::new(repos.len());
+    pool.run(
+        &repos,
+        |resolver, _runtime, repo| {
+            crate::projects::resolve_repository(
+                resolver,
+                repo,
+                targets,
+                rustc_version,
+                trees.as_ref().and_then(|trees| trees.get(repo)),
+            )
+        },
+        |_, repo, result| {
+            progress.collect(repo, result, requests, unresolved_projects);
+        },
+    );
+    Ok(())
 }
 
 /// The crate list's version semantics — `name@version` names that
@@ -2131,5 +2194,68 @@ mod tests {
                 head.headers
             );
         }
+    }
+
+    fn all_done(crates: &[&str]) -> BTreeMap<String, NodeRun> {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) = build_graph(
+            crates
+                .iter()
+                .map(|name| request(name, T, false, &[]))
+                .collect(),
+        );
+        for node in nodes.values_mut() {
+            node.done = true;
+        }
+        nodes
+    }
+
+    /// stow#572: a `--projects` repository that failed to resolve does
+    /// not stop the wave, but the report names every one with its
+    /// reason and the run exits non-zero — even when every dispatched
+    /// node built.
+    #[test]
+    fn finish_report_fails_on_unresolved_projects() {
+        let nodes = all_done(&["built"]);
+        let unresolved = vec![
+            "https://github.com/a/one: fetch failed".to_owned(),
+            "https://github.com/b/two: no rust manifest".to_owned(),
+        ];
+        let message = finish_report(&nodes, &[], &[], &unresolved)
+            .expect_err("unresolved projects fail the wave")
+            .to_string();
+        for entry in &unresolved {
+            assert!(message.contains(entry), "{message}");
+        }
+    }
+
+    /// Every node done and every project resolved is the only Ok.
+    #[test]
+    fn finish_report_ok_when_all_done_and_resolved() {
+        let nodes = all_done(&["built"]);
+        finish_report(&nodes, &[], &[], &[]).expect("a clean wave");
+    }
+
+    /// An undone node and an unresolved project both land in the error.
+    #[test]
+    fn finish_report_names_undone_and_unresolved() {
+        let (nodes, _) = build_graph(vec![request(
+            "undone",
+            "x86_64-unknown-linux-gnu",
+            false,
+            &[],
+        )]);
+        let id = node_task_id(request_by_name("undone", &nodes));
+        let unresolved = vec!["https://github.com/a/one: fetch failed".to_owned()];
+        let message = finish_report(
+            &nodes,
+            &[(id.clone(), "http://localhost/run/1".to_owned())],
+            &[],
+            &unresolved,
+        )
+        .expect_err("an undone node plus an unresolved project fails")
+        .to_string();
+        assert!(message.contains(&id), "{message}");
+        assert!(message.contains(&unresolved[0]), "{message}");
     }
 }

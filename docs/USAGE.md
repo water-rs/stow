@@ -379,7 +379,10 @@ acting unless `--yes` is given.
   published index, dispatch `build-crate.yml` straight through GitHub's
   `workflow_dispatch`, and publish each index slice as its layer lands.
   Works while Cloudflare is down. Resumable by index, exits non-zero
-  with the failed runs' URLs. `--dispatch-url` aims it at the mock's
+  with the failed runs' URLs. A `--projects` repository that fails to
+  resolve is reported and the wave dispatches the rest, exiting
+  non-zero naming it; a `--crates` or `--dirs` failure still aborts
+  before dispatch. `--dispatch-url` aims it at the mock's
   local CI server instead; `--adopt-since <RFC 3339>` (default 24 h ago)
   bounds how far back a resumed wave adopts already-dispatched runs;
   `--edge-url` (or `STOW_EDGE_URL`) is forwarded to the index-publish
