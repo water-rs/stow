@@ -521,15 +521,16 @@ impl Resolver {
     /// gets two independent trees rather than colliding on one dir.
     ///
     /// `preparation` pins operator-declared source trees (stow#558):
-    /// the checkout must already sit at the declared commit — verified
-    /// before any extra acquisition — and each declared source is
-    /// fetched at its own pinned commit into its declared
+    /// the caller fetches the declared commit —
+    /// [`crate::prepare::project_fetch_ref`] — and the checkout is
+    /// verified against it before any extra acquisition; each declared
+    /// source is fetched at its own pinned commit into its declared
     /// missing-or-empty destination, all before
     /// [`crate::fetch::prepare_project_tree`] runs.
     ///
     /// # Errors
     /// Fetch, manifest, resolve, or emission failures — plus a project
-    /// HEAD, source commit, or destination that does not match its
+    /// commit, source commit, or destination that does not match its
     /// declaration.
     pub fn resolve_git(
         &self,

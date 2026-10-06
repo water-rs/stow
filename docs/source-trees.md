@@ -13,8 +13,8 @@ error with `--crates` or `--dirs` and without `--projects`). The
 reviewed declaration for the current projects list lives in
 [`preheat/source-trees.toml`](../preheat/source-trees.toml); it is a
 file an operator passes explicitly — nothing applies it to a project
-silently, and a project without a declaration resolves its ordinary
-git tree.
+silently, and a project without a declaration resolves its
+default-branch HEAD.
 
 ## Schema
 
@@ -23,7 +23,7 @@ The reviewed declaration ships the real Bun mapping:
 ```toml
 [[project]]
 repo = "https://github.com/oven-sh/bun"      # normalized like projects.toml
-commit = "9bd19c98eacc01530a4e7609bc427abffa87d77e"  # the checkout must sit here
+commit = "9bd19c98eacc01530a4e7609bc427abffa87d77e"  # the lane resolves at this commit
 
 [[project.source]]
 destination = "vendor/lolhtml"               # project-relative
@@ -51,12 +51,12 @@ Validation happens once per command, before the resolve pool starts:
 
 ## Semantics
 
-- **Pin enforcement.** The project's fetched checkout must sit at the
-  declared `[[project]]` commit before anything else happens — a
-  declaration written for an older HEAD fails rather than dragging the
-  project back. Each source is fetched by its exact commit the same
-  way projects are (shallow fetch plus recursive submodules), and the
-  checkout's `HEAD` must equal the declared commit.
+- **Pin enforcement.** A declared project is fetched at its declared
+  `[[project]]` commit — the pin is the resolved tree even after the
+  repository moved — and the checkout's `HEAD` must equal it before
+  anything else happens; an undeclared project resolves its
+  default-branch HEAD. Each source is fetched by its exact commit the
+  same way projects are (shallow fetch plus recursive submodules).
 - **Acquisition-only.** Source fetches run during the project's own
   resolve, inside its scratch checkout, before the workspace resolve
   reads the tree — the source's `Cargo.lock` files are dropped under

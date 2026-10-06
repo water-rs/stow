@@ -1749,6 +1749,70 @@ fn a_prepared_project_must_sit_at_its_declared_commit() {
     });
 }
 
+/// stow#573: a declared project resolves at its declared commit, not
+/// the repository's moved HEAD — the lane fetches the pin the
+/// declaration carries (`project_fetch_ref`, the ref
+/// `resolve_repository` computes). Commit 1's manifest names `dep_a`
+/// and the `vendor/sub` path dep the declaration materializes;
+/// commit 2 — the new HEAD — names `dep_b` instead. The resolve lands
+/// on commit 1: `dep_a` is requested, `dep_b` never appears, and the
+/// declared-commit verification passes.
+#[test]
+fn a_declared_project_resolves_its_declared_commit() {
+    isolated_scratch("a_declared_project_resolves_its_declared_commit", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let sub = work.path().join("sub");
+        git_origin(&sub);
+        commit_pkg_manifest(&sub, "sub", &json!({}));
+        let sub_sha = git_head(&sub);
+        let sub_url = repo_url(&sub);
+
+        let parent = work.path().join("parent");
+        git_origin(&parent);
+        std::fs::create_dir_all(parent.join("src")).unwrap();
+        std::fs::write(parent.join("src/lib.rs"), "").unwrap();
+        let manifest = |dep: &str| {
+            toml_document(&json!({
+                "package": { "name": "proj", "version": "0.1.0", "edition": "2021" },
+                "dependencies": { dep: "1", "sub": { "path": "vendor/sub" } },
+            }))
+        };
+        std::fs::write(parent.join("Cargo.toml"), manifest("dep_a")).unwrap();
+        git_in(&parent, &["add", "-A"]);
+        git_in(&parent, &["commit", "-qm", "declared"]);
+        let declared_sha = git_head(&parent);
+        // The repository moves on; the declaration stays at commit 1.
+        std::fs::write(parent.join("Cargo.toml"), manifest("dep_b")).unwrap();
+        git_in(&parent, &["add", "-A"]);
+        git_in(&parent, &["commit", "-qm", "moved"]);
+        let parent_url = repo_url(&parent);
+
+        let prep = source_preparation(&declared_sha, "vendor/sub", &sub_url, &sub_sha);
+        let git_ref = stow_resolver::project_fetch_ref(Some(&prep));
+        let out = resolver
+            .resolve_git(
+                parent_url.as_str(),
+                &git_ref,
+                &targets,
+                rustc,
+                0,
+                Some(&prep),
+            )
+            .expect("the declared commit resolves");
+        assert_eq!(
+            requested_crates(&out),
+            vec!["dep_a".to_owned()],
+            "the declared commit's manifest, not the moved HEAD's"
+        );
+    });
+}
+
 /// stow#558: a source commit the source repository does not hold fails
 /// the fetch — the declared commit is fetched by sha, never a branch
 /// snapshot.

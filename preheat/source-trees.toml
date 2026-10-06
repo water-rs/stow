@@ -6,11 +6,11 @@
 #   stow-admin preheat manual --projects <list> --source-trees <file> …
 #
 # `[[project]]` names a repository the input list contains and the
-# exact commit its checkout must sit at — a project that moved since
-# its declaration fails before anything else is fetched rather than
-# silently resolving a different tree. Each `[[project.source]]`
-# fetches one extra repository at an exact commit into a
-# project-relative destination that must be missing or empty.
+# exact commit the lane resolves it at — a declared project's checkout
+# is fetched at that commit even after the repository moved, while an
+# undeclared project resolves its default-branch HEAD. Each
+# `[[project.source]]` fetches one extra repository at an exact commit
+# into a project-relative destination that must be missing or empty.
 #
 # There is no default: the file applies only when the operator passes
 # it, and a declaration for a repository the input does not list is
