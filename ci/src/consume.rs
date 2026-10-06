@@ -244,6 +244,50 @@ fn candidates<'a>(
             selected.push((slice, row));
         }
     }
+
+    // A pin names only the task's direct dep edges — they double as the
+    // scheduler's dependency DAG — so a dep the build reaches
+    // transitively (an unconditional `[dependencies]` entry under a
+    // pinned crate, like windows-sys pulling windows-link) carries no
+    // pin (stow#581). The row it was published under is still the exact
+    // identity this build compiles: each selected row's
+    // `dependency_c_metadata_json` records the `--extern` identities its
+    // own build consumed, keyed by the dep artifact's `c_metadata`.
+    // Follow those edges until no new row appears. The recorded name is
+    // the extern alias, which `[lib] name` can rename away from the
+    // package name — `c_metadata` alone identifies the dep's row.
+    let mut visited: BTreeSet<String> = selected
+        .iter()
+        .map(|(_, row)| row.compile_key.clone())
+        .collect();
+    let mut cursor = 0;
+    while cursor < selected.len() {
+        let dependencies = selected[cursor]
+            .1
+            .dependency_c_metadata_json
+            .entries()
+            .iter()
+            .map(|identity| identity.c_metadata.as_str().to_owned())
+            .collect::<Vec<_>>();
+        cursor += 1;
+        for dep_c_metadata in dependencies {
+            for slice in slices {
+                for row in &slice.index.rows {
+                    if row.c_metadata.as_str() != dep_c_metadata
+                        || !visited.insert(row.compile_key.clone())
+                    {
+                        continue;
+                    }
+                    let is_task_crate = canonical_crate_name(row.crate_name.as_str())
+                        == canonical_crate_name(task.crate_name.as_str())
+                        && row.version == task.version;
+                    if !is_task_crate {
+                        selected.push((slice, row));
+                    }
+                }
+            }
+        }
+    }
     selected
 }
 
@@ -351,31 +395,8 @@ mod tests {
         let packages = crate::dep_scan::consumable_packages(&task);
         assert_eq!(packages.len(), 1);
 
-        let row = |features: &[&str], c_metadata: &str| ArtifactIndexRow {
-            crate_name: CrateName::parse("tokio").unwrap(),
-            version: CrateVersion::new(semver::Version::new(1, 53, 2)),
-            features_json: FeaturesJson::canonicalize(
-                features.iter().map(|f| (*f).to_owned()).collect(),
-            )
-            .unwrap(),
-            dependency_c_metadata_json: DependencyCMetadataJson::default(),
-            c_metadata: CMetadata::parse(c_metadata).unwrap(),
-            compile_key: String::new(),
-            bundle_digest: "sha256:".to_owned() + &"ab".repeat(32),
-            bundle_size: 1,
-            artifact_kind: ArtifactKind::Rlib,
-            crate_types: vec![RustCrateType::Lib],
-            profile: Profile {
-                opt_level: "0".to_owned(),
-                debuginfo: 1,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: PanicStrategy::Unwind,
-                strip: StripLevel::None,
-            },
-            emit: vec![],
-            unit_shape: None,
-            min_glibc: None,
+        let row = |features: &[&str], c_metadata: &str| {
+            index_row("tokio", "1.53.2", c_metadata, features, &[])
         };
         let slice = stow_cli::build_consume::IndexSlice {
             manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
@@ -399,5 +420,137 @@ mod tests {
         let hits = super::candidates(&slices, &packages, &task);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].1.c_metadata.as_str(), "123456789abcdef0");
+    }
+
+    /// An index row fixture: `compile_key` hashes to `c_metadata`'s prefix
+    /// (canonical rows are keyed so), and `deps` carry the
+    /// `(extern-name, c_metadata)` identities a published row records.
+    fn index_row(
+        name: &str,
+        version: &str,
+        c_metadata: &str,
+        features: &[&str],
+        deps: &[(&str, &str)],
+    ) -> ArtifactIndexRow {
+        ArtifactIndexRow {
+            crate_name: CrateName::parse(name).unwrap(),
+            version: CrateVersion::new(semver::Version::parse(version).unwrap()),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .unwrap(),
+            dependency_c_metadata_json: DependencyCMetadataJson::canonicalize(
+                deps.iter()
+                    .map(
+                        |(name, meta)| stow_types::identity::DependencyCMetadataIdentity {
+                            crate_name: CrateName::parse(*name).unwrap(),
+                            c_metadata: CMetadata::parse(*meta).unwrap(),
+                        },
+                    )
+                    .collect(),
+            )
+            .unwrap(),
+            c_metadata: CMetadata::parse(c_metadata).unwrap(),
+            compile_key: format!("{c_metadata}{c_metadata}{c_metadata}"),
+            bundle_digest: "sha256:".to_owned() + &"ab".repeat(32),
+            bundle_size: 1,
+            artifact_kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Lib],
+            profile: Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 1,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+                strip: StripLevel::None,
+            },
+            emit: vec![],
+            unit_shape: None,
+            min_glibc: None,
+        }
+    }
+
+    /// stow#581: pins cover only the task's direct dep edges — a dep the
+    /// build reaches transitively through a pinned crate (winapi-util's
+    /// `cfg(windows)` windows-sys pin pulling windows-sys's unconditional
+    /// windows-link) carries no pin of its own. The published row's
+    /// recorded `--extern` identities still name it by `c_metadata`, and
+    /// candidates must follow those edges or the unit compiles and fails
+    /// the foreign-unit scan.
+    #[test]
+    fn candidates_cover_deps_reached_transitively() {
+        let task = BuildTaskPayload {
+            task_id: "winapi-util-0.1.11".to_owned(),
+            attempt: 1,
+            crate_name: CrateName::parse("winapi-util").unwrap(),
+            version: CrateVersion::new(semver::Version::new(0, 1, 11)),
+            features_json: FeaturesJson::default(),
+            target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
+            rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
+            preserve_lockfile: false,
+            host_side: true,
+            dep_pins: vec![BuildDepPin {
+                crate_name: CrateName::parse("windows-sys").unwrap(),
+                version: CrateVersion::new(semver::Version::new(0, 61, 2)),
+                features_json: FeaturesJson::canonicalize(vec![
+                    "Win32_Foundation".to_owned(),
+                    "Win32_Storage_FileSystem".to_owned(),
+                    "Win32_System_Console".to_owned(),
+                    "Win32_System_SystemInformation".to_owned(),
+                ])
+                .unwrap(),
+                host_side: true,
+            }],
+        };
+        let packages = crate::dep_scan::consumable_packages(&task);
+        assert_eq!(packages.len(), 1);
+
+        let slice = stow_cli::build_consume::IndexSlice {
+            manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
+            index: ArtifactIndex {
+                header: ArtifactIndexHeader {
+                    format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
+                    target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
+                    rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
+                    generated_at: String::new(),
+                    generation: 1,
+                    row_count: 3,
+                },
+                rows: vec![
+                    // windows-sys's published row records the dep edge as
+                    // the extern alias (`windows_link`), not the package
+                    // name — the c_metadata alone carries the edge.
+                    index_row(
+                        "windows-sys",
+                        "0.61.2",
+                        "aaaaaaaaaaaaaaaa",
+                        &[
+                            "Win32_Foundation",
+                            "Win32_Storage_FileSystem",
+                            "Win32_System_Console",
+                            "Win32_System_SystemInformation",
+                        ],
+                        &[("windows_link", "bbbbbbbbbbbbbbbb")],
+                    ),
+                    index_row("windows-link", "0.2.1", "bbbbbbbbbbbbbbbb", &[], &[]),
+                    index_row("unrelated", "1.0.0", "cccccccccccccccc", &[], &[]),
+                ],
+            },
+        };
+
+        let slices = [slice];
+        let hits = super::candidates(&slices, &packages, &task);
+        let staged = hits
+            .iter()
+            .map(|(_, row)| (row.crate_name.as_str(), row.c_metadata.as_str()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            staged,
+            std::collections::BTreeSet::from([
+                ("windows-sys", "aaaaaaaaaaaaaaaa"),
+                ("windows-link", "bbbbbbbbbbbbbbbb"),
+            ]),
+            "the transitive dep the pin never names rides along on the pinned row's dep edge"
+        );
     }
 }
