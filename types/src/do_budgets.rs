@@ -27,6 +27,28 @@ pub struct DriveBudget {
     pub wall_ms: u64,
 }
 
+impl DriveBudget {
+    /// `true` when the measured counts exceed a gated dimension —
+    /// statements, `rowsRead`, or `rowsWritten`. Wall time is not in
+    /// this set; see [`Self::over_wall`].
+    #[must_use]
+    pub const fn over_budget(&self, statements: u64, rows_read: u64, rows_written: u64) -> bool {
+        statements > self.statements
+            || rows_read > self.rows_read
+            || rows_written > self.rows_written
+    }
+
+    /// `true` when the measured wall exceeded this budget — reported
+    /// but never gated: the local workerd lane's `wall_ms` is mostly
+    /// the in-window `db.sync()` durability barrier on the runner's
+    /// own SQLite, storage latency rather than the code's cost
+    /// (stow#567).
+    #[must_use]
+    pub const fn over_wall(&self, wall_ms: u64) -> bool {
+        wall_ms > self.wall_ms
+    }
+}
+
 /// The workerd budget table the host gate carries.
 ///
 /// Measured in the units Cloudflare bills, filled from the harness's

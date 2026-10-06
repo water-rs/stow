@@ -178,14 +178,20 @@ async fn budget(
 }
 
 /// The budget table as a terminal row set — one line per drive with its
-/// four measurements against budget, and the over-budget marker.
+/// four measurements against budget, the `OVER` marker on a gated
+/// breach, and `SLOW` on a wall-budget breach — reported, never gated
+/// (stow#567).
 fn render_budget_table(report: &SchedulerBudgetReport) -> String {
     let mut out = format!(
         "scheduler budget (queue rows {}, schema v{}):\n",
         report.queue_rows, report.schema_version
     );
     for row in &report.rows {
-        let marker = if row.over_budget { " OVER" } else { "" };
+        let marker = format!(
+            "{}{}",
+            if row.over_budget { " OVER" } else { "" },
+            if row.over_wall { " SLOW" } else { "" },
+        );
         let _ = std::fmt::Write::write_fmt(
             &mut out,
             format_args!(
