@@ -13,8 +13,8 @@ use zenwave::{Client, ResponseExt};
 /// and the Actions cache live here.
 pub const REPO: &str = "water-rs/stow";
 
-const API_BASE: &str = "https://api.github.com";
-const USER_AGENT: &str = "stow-admin";
+pub const API_BASE: &str = "https://api.github.com";
+pub const USER_AGENT: &str = "stow-admin";
 /// Workflow file whose runs `runs failures` inspects.
 pub const BUILD_WORKFLOW: &str = "build-crate.yml";
 
@@ -311,22 +311,37 @@ async fn send_empty(
 /// `DELETE` one API path under `/repos/{REPO}/`; 2xx/404 both count —
 /// deleting an entry that is already gone achieves the same end state.
 pub async fn delete(token: &str, path: &str) -> stow_types::error::Result<()> {
-    let url = format!("{API_BASE}/repos/{REPO}/{path}");
+    delete_at(API_BASE, token, path).await
+}
+
+/// `delete` at an explicit API root — production passes [`API_BASE`],
+/// tests an owned loopback URL.
+async fn delete_at(api_base: &str, token: &str, path: &str) -> stow_types::error::Result<()> {
+    let url = format!("{api_base}/repos/{REPO}/{path}");
     let mut client = zenwave::client();
-    let response = client
+    let result = client
         .delete(&url)
         .map_err(|error| stow_error!("build DELETE {url}: {error}"))?
         .header("Authorization", format!("Bearer {token}"))
         .and_then(|request| request.header("User-Agent", USER_AGENT))
         .and_then(|request| request.header("Accept", "application/vnd.github+json"))
         .map_err(|error| stow_error!("build DELETE {url}: {error}"))?
-        .await
-        .map_err(|error| stow_error!("DELETE {url}: {error}"))?;
-    response
-        .error_for_status()
-        .await
-        .map_err(|error| stow_error!("DELETE {url}: {error}"))?;
-    Ok(())
+        .await;
+    // zenwave lifts 4xx/5xx into `Err(Error::Http)` at `.await` — the
+    // 404 the doc promises lands there, not in a response branch.
+    let error = match result {
+        Ok(response) => match response.error_for_status().await {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    if matches!(error, zenwave::Error::Http { status, .. } if status == zenwave::StatusCode::NOT_FOUND)
+    {
+        Ok(())
+    } else {
+        Err(stow_error!("DELETE {url}: {error}"))
+    }
 }
 
 /// `POST` one API path under `/repos/{REPO}/` with a JSON body whose
@@ -856,6 +871,54 @@ mod tests {
                 .all(|q| q.contains("event=workflow_dispatch&branch=main"))
         );
     }
+
+    /// 204 and 404 both close the delete — the contract is the end
+    /// state, one request either way.
+    #[tokio::test]
+    async fn delete_accepts_removed_and_already_gone() {
+        for status in [204u16, 404] {
+            let server =
+                crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+                    status,
+                    retry_after: None,
+                    body: "{}",
+                }])
+                .await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                delete_at(&server.url, "test-token", "actions/caches/42"),
+            )
+            .await
+            .expect("delete completes within the deadline")
+            .unwrap_or_else(|error| panic!("delete status {status}: {error}"));
+            let heads = server.join().await;
+            assert_eq!(heads.len(), 1, "delete status {status}");
+        }
+    }
+
+    /// Authorization and server failures stay errors — the 204/404
+    /// contract admits nothing else.
+    #[tokio::test]
+    async fn delete_propagates_other_failures() {
+        for status in [403u16, 500] {
+            let server =
+                crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+                    status,
+                    retry_after: None,
+                    body: "{}",
+                }])
+                .await;
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                delete_at(&server.url, "test-token", "actions/caches/42"),
+            )
+            .await
+            .expect("delete completes within the deadline");
+            assert!(outcome.is_err(), "delete status {status}");
+            let heads = server.join().await;
+            assert_eq!(heads.len(), 1, "delete status {status}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -970,5 +1033,43 @@ mod url_json_tests {
         assert!(result.is_err());
         let heads = server.join().await;
         assert_eq!(heads.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod send_get_tests {
+    use super::send_get;
+    use crate::test_server;
+
+    /// A conditional GET's 304 answer carries no `Location` — it is a
+    /// cache verdict, not a redirect. The client must deliver it so the
+    /// caller can read the status itself; treating it as a redirect
+    /// failure (or retrying past it) is the bug under test.
+    #[tokio::test]
+    async fn send_get_delivers_a_conditional_304_without_location() {
+        let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+            status: 304,
+            retry_after: None,
+            body: "",
+        }])
+        .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_get(None, &server.url, None, Some("\"v1\"")),
+        )
+        .await
+        .expect("the conditional read answers inside the bound");
+        let heads = server.join().await;
+        let response = result.expect("a 304 without Location is a response, not a redirect error");
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].method, http::Method::GET);
+        assert_eq!(
+            heads[0]
+                .headers
+                .get(http::header::IF_NONE_MATCH)
+                .expect("the validator rides the request"),
+            "\"v1\""
+        );
+        assert_eq!(response.status().as_u16(), 304);
     }
 }

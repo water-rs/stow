@@ -925,13 +925,13 @@ fn repeated_and_concurrent_fetches_resolve_independent_trees() {
             // trees: each ref's dep set is what lands in the requests,
             // the lib target is still reported — semantics intact.
             let main = resolver
-                .resolve_git(url.as_str(), "main", &targets, rustc, 0)
+                .resolve_git(url.as_str(), "main", &targets, rustc, 0, None)
                 .unwrap();
             assert!(main.has_library);
             assert!(!main.has_binary);
             assert_eq!(requested_crates(&main), vec!["dep_a".to_owned()]);
             let side = resolver
-                .resolve_git(url.as_str(), "side", &targets, rustc, 0)
+                .resolve_git(url.as_str(), "side", &targets, rustc, 0, None)
                 .unwrap();
             assert_eq!(requested_crates(&side), vec!["dep_b".to_owned()]);
             assert_eq!(
@@ -944,10 +944,10 @@ fn repeated_and_concurrent_fetches_resolve_independent_trees() {
             // independent checkouts — each ref's output reflects its
             // own manifest.
             std::thread::scope(|scope| {
-                let a =
-                    scope.spawn(|| resolver.resolve_git(url.as_str(), "main", &targets, rustc, 0));
-                let b =
-                    scope.spawn(|| resolver.resolve_git(url.as_str(), "side", &targets, rustc, 0));
+                let a = scope
+                    .spawn(|| resolver.resolve_git(url.as_str(), "main", &targets, rustc, 0, None));
+                let b = scope
+                    .spawn(|| resolver.resolve_git(url.as_str(), "side", &targets, rustc, 0, None));
                 let main = a.join().unwrap().unwrap();
                 let side = b.join().unwrap().unwrap();
                 assert_eq!(requested_crates(&main), vec!["dep_a".to_owned()]);
@@ -978,7 +978,14 @@ fn failed_fetches_release_their_scratch() {
 
         assert!(
             resolver
-                .resolve_git("file:///stow-540-no-such-repo", "main", &targets, rustc, 0)
+                .resolve_git(
+                    "file:///stow-540-no-such-repo",
+                    "main",
+                    &targets,
+                    rustc,
+                    0,
+                    None
+                )
                 .is_err(),
             "an unfetchable remote still errors"
         );
@@ -993,7 +1000,7 @@ fn failed_fetches_release_their_scratch() {
         let empty_url = url::Url::from_file_path(&empty).unwrap();
         assert!(
             resolver
-                .resolve_git(empty_url.as_str(), "main", &targets, rustc, 0)
+                .resolve_git(empty_url.as_str(), "main", &targets, rustc, 0, None)
                 .is_err(),
             "a tree with no manifest errors at prepare"
         );
@@ -1152,6 +1159,92 @@ fn submodule_workspace(work: &Path, sub_dep: &str) -> (PathBuf, PathBuf, url::Ur
     (sub, parent, parent_url)
 }
 
+/// `git -C <repo> rev-parse HEAD` — the commit a fixture origin's
+/// `main` currently names.
+fn git_head(repo: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git rev-parse in {}",
+        repo.display()
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// One [`stow_resolver::SourcePreparation`]: the project at
+/// `project_sha` needs `source_repo`'s `source_sha` at `destination`.
+fn source_preparation(
+    project_sha: &str,
+    destination: &str,
+    source_repo: &url::Url,
+    source_sha: &str,
+) -> stow_resolver::SourcePreparation {
+    stow_resolver::SourcePreparation::new(
+        stow_resolver::GitCommit::parse(project_sha).unwrap(),
+        vec![
+            stow_resolver::PreparedSourceTree::new(
+                stow_resolver::RelativeSourcePath::parse(destination).unwrap(),
+                source_repo.clone(),
+                stow_resolver::GitCommit::parse(source_sha).unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
+/// A project origin whose manifest path-depends on `vendor/sub` —
+/// a tree the repository itself never carries (stow#558). The
+/// parent's dir, its `file://` URL, and its `HEAD` commit.
+fn parent_with_missing_path_dep(work: &Path) -> (PathBuf, url::Url, String) {
+    let parent = work.join("parent");
+    git_origin(&parent);
+    std::fs::create_dir_all(parent.join("src")).unwrap();
+    std::fs::write(
+        parent.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "proj", "version": "0.1.0", "edition": "2021" },
+            "dependencies": { "sub": { "path": "vendor/sub" } },
+        })),
+    )
+    .unwrap();
+    std::fs::write(parent.join("src/lib.rs"), "").unwrap();
+    git_in(&parent, &["add", "-A"]);
+    git_in(&parent, &["commit", "-qm", "parent"]);
+    let sha = git_head(&parent);
+    let url = repo_url(&parent);
+    (parent, url, sha)
+}
+
+/// Same shape with two missing path deps — `vendor/sub` and
+/// `vendor/other` — so the declaration has to fan the fetches out.
+fn parent_with_two_missing_path_deps(work: &Path) -> (PathBuf, url::Url, String) {
+    let parent = work.join("parent");
+    git_origin(&parent);
+    std::fs::create_dir_all(parent.join("src")).unwrap();
+    std::fs::write(
+        parent.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "proj", "version": "0.1.0", "edition": "2021" },
+            "dependencies": {
+                "sub": { "path": "vendor/sub" },
+                "other": { "path": "vendor/other" },
+            },
+        })),
+    )
+    .unwrap();
+    std::fs::write(parent.join("src/lib.rs"), "").unwrap();
+    git_in(&parent, &["add", "-A"]);
+    git_in(&parent, &["commit", "-qm", "parent"]);
+    let sha = git_head(&parent);
+    let url = repo_url(&parent);
+    (parent, url, sha)
+}
+
 /// A caller-owned project dir: `proj` manifest depending on `deps`,
 /// a lockfile whose `packages` are serialized through the same
 /// `toml_document` path as every other fixture document.
@@ -1201,7 +1294,7 @@ fn submodule_workspace_members_resolve() {
 
         let (_sub, _parent, parent_url) = submodule_workspace(work.path(), "dep_a");
         let out = resolver
-            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0)
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, None)
             .expect("the submodule member's manifest resolves");
         assert_eq!(requested_crates(&out), vec!["dep_a".to_owned()]);
     });
@@ -1226,7 +1319,7 @@ fn submodules_resolve_the_pinned_gitlink_not_head() {
         commit_pkg_manifest(&sub, "sub", &json!({ "dep_b": "1" }));
 
         let out = resolver
-            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0)
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, None)
             .expect("the pinned gitlink resolves");
         assert_eq!(
             requested_crates(&out),
@@ -1266,7 +1359,7 @@ fn submodule_materialization_failure_errors() {
 
         assert!(
             resolver
-                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0)
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, None)
                 .is_err(),
             "an unmaterializable submodule fails the fetch"
         );
@@ -1312,7 +1405,7 @@ fn nested_submodules_resolve_via_relative_urls() {
         git_in(&parent, &["commit", "-qm", "parent"]);
 
         let out = resolver
-            .resolve_git(repo_url(&parent).as_str(), "main", &targets, rustc, 0)
+            .resolve_git(repo_url(&parent).as_str(), "main", &targets, rustc, 0, None)
             .expect("the nested relative-url gitlink resolves");
         assert_eq!(requested_crates(&out), vec!["dep_a".to_owned()]);
     });
@@ -1583,4 +1676,681 @@ fn deleted_branch_transitive_git_pins_resolve_by_sha() {
              ref would have failed instead"
         );
     });
+}
+
+/// stow#558: a `path` dep on a tree the repository does not ship fails
+/// the resolve on its own — and succeeds once the declaration fetches
+/// the pinned source into the missing destination.
+#[test]
+fn declared_source_trees_materialize_missing_inputs() {
+    isolated_scratch("declared_source_trees_materialize_missing_inputs", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let sub = work.path().join("sub");
+        git_origin(&sub);
+        commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+        let sub_sha = git_head(&sub);
+        let sub_url = repo_url(&sub);
+
+        let (_parent, parent_url, parent_sha) = parent_with_missing_path_dep(work.path());
+        assert!(
+            resolver
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, None)
+                .is_err(),
+            "without a declaration the missing path dep fails the resolve"
+        );
+
+        let prep = source_preparation(&parent_sha, "vendor/sub", &sub_url, &sub_sha);
+        let out = resolver
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+            .expect("the declared source resolves the path dep");
+        assert_eq!(
+            requested_crates(&out),
+            vec!["dep_a".to_owned()],
+            "the materialized tree's registry dep is what the project names"
+        );
+    });
+}
+
+/// stow#558: a declaration for a commit the project's checkout is not
+/// at fails before any source is acquired — the declaration never
+/// drags the project back to an older HEAD.
+#[test]
+fn a_prepared_project_must_sit_at_its_declared_commit() {
+    isolated_scratch("a_prepared_project_must_sit_at_its_declared_commit", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let sub = work.path().join("sub");
+        git_origin(&sub);
+        commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+        let sub_sha = git_head(&sub);
+
+        let (_parent, parent_url, _parent_sha) = parent_with_missing_path_dep(work.path());
+        // The declaration pins the *source's* commit as the project's —
+        // a real object id that is simply not this checkout's HEAD.
+        let prep = source_preparation(&sub_sha, "vendor/sub", &repo_url(&sub), &sub_sha);
+        let error = resolver
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+            .expect_err("a stale declaration cannot resolve a moved project");
+        assert!(
+            format!("{error:#}").contains("source-trees declaration pins"),
+            "the error names the pinned commit, got {error:#}"
+        );
+    });
+}
+
+/// stow#558: a source commit the source repository does not hold fails
+/// the fetch — the declared commit is fetched by sha, never a branch
+/// snapshot.
+#[test]
+fn a_source_fetch_of_a_missing_commit_fails() {
+    isolated_scratch("a_source_fetch_of_a_missing_commit_fails", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let sub = work.path().join("sub");
+        git_origin(&sub);
+        commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+
+        let other = work.path().join("other");
+        git_origin(&other);
+        commit_pkg_manifest(&other, "other", &json!({ "dep_a": "1" }));
+        // A real commit id, but one the source repo does not contain.
+        let foreign_sha = git_head(&other);
+
+        let (_parent, parent_url, parent_sha) = parent_with_missing_path_dep(work.path());
+        let prep = source_preparation(&parent_sha, "vendor/sub", &repo_url(&sub), &foreign_sha);
+        assert!(
+            resolver
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep),)
+                .is_err(),
+            "a source commit the repo does not hold fails the fetch"
+        );
+    });
+}
+
+/// stow#558: destinations are portable project-relative paths only —
+/// traversal, absolute, drive-qualified, backslash, and `.git`
+/// components all fail before any fetch runs.
+#[test]
+fn source_destinations_reject_non_normal_components() {
+    for bad in [
+        "",
+        "../escape",
+        "a/../b",
+        "a/./b",
+        "/abs",
+        "C:\\win",
+        "a\\b",
+        ".git",
+        ".git/hooks",
+        "x/.git",
+        ".GIT",
+        "vendor/.Git/tree",
+        "git~1",
+        "GIT~2/tree",
+        ".git ",
+        ".git./tree",
+        "vendor//sub",
+    ] {
+        assert!(
+            stow_resolver::RelativeSourcePath::parse(bad).is_err(),
+            "`{bad}` is not a legal destination"
+        );
+    }
+    assert!(
+        stow_resolver::RelativeSourcePath::parse("vendor/sub").is_ok(),
+        "an ordinary nested path parses"
+    );
+}
+
+/// stow#558: a destination the repository already fills — a real file
+/// or a materialized gitlink — is never overwritten.
+#[test]
+fn an_occupied_source_destination_fails() {
+    isolated_scratch("an_occupied_source_destination_fails", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let sub = work.path().join("sub");
+        git_origin(&sub);
+        commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+        let sub_sha = git_head(&sub);
+
+        let (parent, parent_url, _unused) = parent_with_missing_path_dep(work.path());
+        // The project actually ships `vendor/sub` itself.
+        std::fs::create_dir_all(parent.join("vendor/sub")).unwrap();
+        std::fs::write(parent.join("vendor/sub/README"), "real content").unwrap();
+        git_in(&parent, &["add", "-A"]);
+        git_in(&parent, &["commit", "-qm", "vendor"]);
+        let parent_sha = git_head(&parent);
+
+        let prep = source_preparation(&parent_sha, "vendor/sub", &repo_url(&sub), &sub_sha);
+        let error = resolver
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+            .expect_err("an occupied destination is never overwritten");
+        assert!(
+            format!("{error:#}").contains("already holds"),
+            "the error names the occupied destination, got {error:#}"
+        );
+    });
+}
+
+/// stow#558: an existing ancestor symlink cannot carry a destination
+/// outside the project scratch.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_parent_cannot_escape_the_project() {
+    isolated_scratch("a_symlinked_parent_cannot_escape_the_project", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let sub = work.path().join("sub");
+        git_origin(&sub);
+        commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+        let sub_sha = git_head(&sub);
+
+        let outside = work.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let (parent, parent_url, _unused) = parent_with_missing_path_dep(work.path());
+        std::os::unix::fs::symlink(&outside, parent.join("vendor")).unwrap();
+        git_in(&parent, &["add", "-A"]);
+        git_in(&parent, &["commit", "-qm", "symlink"]);
+        let parent_sha = git_head(&parent);
+
+        let prep = source_preparation(&parent_sha, "vendor/sub", &repo_url(&sub), &sub_sha);
+        let error = resolver
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+            .expect_err("a symlinked ancestor cannot escape the scratch");
+        assert!(
+            format!("{error:#}").contains("crosses a symlink"),
+            "the error names the escaping parent, got {error:#}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing was written outside the project scratch"
+        );
+    });
+}
+
+/// stow#558: an empty declaration and nested destinations both fail at
+/// construction — the fetch path never sees them.
+#[test]
+fn malformed_declarations_fail_at_construction() {
+    let sub_sha = "0123456789012345678901234567890123456789";
+    let url = url::Url::parse("https://github.com/owner/sub").unwrap();
+    let commit = stow_resolver::GitCommit::parse(sub_sha).unwrap();
+    assert!(
+        stow_resolver::SourcePreparation::new(commit.clone(), Vec::new()).is_err(),
+        "a declared project needs at least one source"
+    );
+    let tree = |destination: &str, commit: &stow_resolver::GitCommit| {
+        stow_resolver::PreparedSourceTree::new(
+            stow_resolver::RelativeSourcePath::parse(destination).unwrap(),
+            url.clone(),
+            commit.clone(),
+        )
+        .unwrap()
+    };
+    assert!(
+        stow_resolver::SourcePreparation::new(
+            commit.clone(),
+            vec![tree("a", &commit), tree("a", &commit)],
+        )
+        .is_err(),
+        "a destination declared twice fails"
+    );
+    assert!(
+        stow_resolver::SourcePreparation::new(
+            commit.clone(),
+            vec![tree("a", &commit), tree("a/b", &commit)],
+        )
+        .is_err(),
+        "a nested destination fails"
+    );
+}
+
+/// stow#558: the scratch dir covers failure too — a resolve that fails
+/// mid-preparation leaves no `stow-src-*` tree behind.
+#[test]
+fn a_failed_preparation_leaves_no_scratch() {
+    isolated_scratch("a_failed_preparation_leaves_no_scratch", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+        let baseline = stow_src_dirs();
+
+        let sub = work.path().join("sub");
+        git_origin(&sub);
+        commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+
+        let other = work.path().join("other");
+        git_origin(&other);
+        commit_pkg_manifest(&other, "other", &json!({ "dep_a": "1" }));
+        let foreign_sha = git_head(&other);
+
+        let (_parent, parent_url, parent_sha) = parent_with_missing_path_dep(work.path());
+        let prep = source_preparation(&parent_sha, "vendor/sub", &repo_url(&sub), &foreign_sha);
+        assert!(
+            resolver
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep),)
+                .is_err()
+        );
+        assert_eq!(
+            stow_src_dirs(),
+            baseline,
+            "the scratch dir is released on a failed preparation"
+        );
+    });
+}
+
+/// stow#558: selection runs on the project's own checkout, so an
+/// imported child's `Cargo.toml`+`Cargo.lock` pair can never displace
+/// a lockless parent's root manifest — the parent's own registry
+/// names still reach the graph.
+#[test]
+fn a_lockless_parent_keeps_its_manifest_over_a_locked_child() {
+    isolated_scratch(
+        "a_lockless_parent_keeps_its_manifest_over_a_locked_child",
+        || {
+            let work = tempfile::tempdir().unwrap();
+            let reg = work.path().join("registry");
+            publish_deps(&reg);
+            let (_home, resolver) = resolver_at(&reg);
+            let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+            let rustc = pinned_rustc_version();
+
+            // The child source carries both files of a lock+manifest pair.
+            let sub = work.path().join("sub");
+            git_origin(&sub);
+            commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+            std::fs::write(
+                sub.join("Cargo.lock"),
+                toml_document(&json!({
+                    "version": 3,
+                    "package": [{ "name": "sub", "version": "0.1.0" }],
+                })),
+            )
+            .unwrap();
+            git_in(&sub, &["add", "-A"]);
+            git_in(&sub, &["commit", "-qm", "lock"]);
+            let sub_sha = git_head(&sub);
+            let sub_url = repo_url(&sub);
+
+            // A parent-only registry dep carrying a feature only the
+            // parent's own manifest can request.
+            publish(
+                &reg,
+                &Fixture {
+                    name: "dep_feat",
+                    version: "1.0.0",
+                    deps: vec![],
+                    features: &[("parent-only", &[])],
+                    yanked: false,
+                    proc_macro: false,
+                },
+            );
+
+            // The parent root carries a manifest and *no* lock; it names
+            // `dep_feat` at `parent-only`, a feature identity the
+            // child's graph alone never yields.
+            let parent = work.path().join("parent");
+            git_origin(&parent);
+            std::fs::create_dir_all(parent.join("src")).unwrap();
+            std::fs::write(
+                parent.join("Cargo.toml"),
+                toml_document(&json!({
+                    "package": { "name": "proj", "version": "0.1.0", "edition": "2021" },
+                    "dependencies": {
+                        "sub": { "path": "vendor/sub" },
+                        "dep_feat": { "version": "1", "features": ["parent-only"] },
+                    },
+                })),
+            )
+            .unwrap();
+            std::fs::write(parent.join("src/lib.rs"), "").unwrap();
+            git_in(&parent, &["add", "-A"]);
+            git_in(&parent, &["commit", "-qm", "parent"]);
+            let parent_sha = git_head(&parent);
+            let parent_url = repo_url(&parent);
+
+            let prep = source_preparation(&parent_sha, "vendor/sub", &sub_url, &sub_sha);
+            let out = resolver
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+                .expect("the parent's own manifest still roots the resolve");
+            let mut requested = requested_crates(&out);
+            requested.sort();
+            assert_eq!(
+                requested,
+                vec!["dep_a".to_owned(), "dep_feat".to_owned()],
+                "the parent's dependency graph — not the imported child's — was selected"
+            );
+            let (target, requests) = &out.targets[0];
+            assert_eq!(target, "x86_64-unknown-linux-gnu");
+            let dep_feat = requests
+                .iter()
+                .find(|request| request.crate_name.as_str() == "dep_feat")
+                .expect("the parent-only dep is enqueued");
+            assert_eq!(
+                dep_feat.features_json.features(),
+                &["parent-only".to_owned()],
+                "the parent's own feature identity reached the unit"
+            );
+            let dep_a = requests
+                .iter()
+                .find(|request| request.crate_name.as_str() == "dep_a")
+                .expect("the child's registry dep is enqueued");
+            assert!(
+                !dep_a
+                    .features_json
+                    .features()
+                    .iter()
+                    .any(|feature| feature == "parent-only"),
+                "the child's unit never picks up the parent's feature"
+            );
+        },
+    );
+}
+
+/// stow#558: a symlink inside the project is still a symlink — a
+/// destination routed through one is rejected even though it happens
+/// to land back inside the root.
+#[cfg(unix)]
+#[test]
+fn an_inside_root_symlinked_parent_is_rejected() {
+    isolated_scratch("an_inside_root_symlinked_parent_is_rejected", || {
+        let work = tempfile::tempdir().unwrap();
+        let reg = work.path().join("registry");
+        publish_deps(&reg);
+        let (_home, resolver) = resolver_at(&reg);
+        let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+        let rustc = pinned_rustc_version();
+
+        let sub = work.path().join("sub");
+        git_origin(&sub);
+        commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+        let sub_sha = git_head(&sub);
+
+        let (parent, parent_url, _unused) = parent_with_missing_path_dep(work.path());
+        // `vendor` is a link into a directory the project itself owns.
+        std::fs::create_dir_all(parent.join("real")).unwrap();
+        std::fs::write(parent.join("real/README"), "real").unwrap();
+        std::os::unix::fs::symlink("real", parent.join("vendor")).unwrap();
+        git_in(&parent, &["add", "-A"]);
+        git_in(&parent, &["commit", "-qm", "symlink"]);
+        let parent_sha = git_head(&parent);
+
+        let prep = source_preparation(&parent_sha, "vendor/sub", &repo_url(&sub), &sub_sha);
+        let error = resolver
+            .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+            .expect_err("an inside-root symlinked parent is rejected");
+        assert!(
+            format!("{error:#}").contains("crosses a symlink"),
+            "the error names the symlinked component, got {error:#}"
+        );
+    });
+}
+
+/// stow#558: on a case-insensitive volume `vendor/A` and `vendor/a`
+/// are the same directory — canonicalized destination identities must
+/// collide before either fetch runs. On a case-sensitive host the two
+/// names are legitimately distinct and only the lexical check applies.
+#[test]
+fn case_aliased_destinations_are_rejected_before_any_fetch() {
+    isolated_scratch(
+        "case_aliased_destinations_are_rejected_before_any_fetch",
+        || {
+            let work = tempfile::tempdir().unwrap();
+            let reg = work.path().join("registry");
+            publish_deps(&reg);
+            let (_home, resolver) = resolver_at(&reg);
+            let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+            let rustc = pinned_rustc_version();
+
+            // Probe the fixture volume itself rather than assuming.
+            let probe_dir = work.path().join("probe");
+            std::fs::create_dir_all(probe_dir.join("aliasProbe")).unwrap();
+            let case_insensitive = probe_dir
+                .join("ALIASPROBE")
+                .canonicalize()
+                .is_ok_and(|p| p == probe_dir.join("aliasProbe").canonicalize().unwrap());
+
+            // Both aliases name a repository that does not exist — had a
+            // fetch actually run, the error would be git's, not the
+            // destination-overlap rejection.
+            let dead = url::Url::parse("file:///nonexistent-stow-fixture").unwrap();
+            let sha = stow_resolver::GitCommit::parse("0123456789012345678901234567890123456789")
+                .unwrap();
+            let tree = |destination: &str| {
+                stow_resolver::PreparedSourceTree::new(
+                    stow_resolver::RelativeSourcePath::parse(destination).unwrap(),
+                    dead.clone(),
+                    sha.clone(),
+                )
+                .unwrap()
+            };
+            let (parent_url, parent_sha) = {
+                let (_parent, url, sha) = parent_with_missing_path_dep(work.path());
+                (url, sha)
+            };
+            let prep = stow_resolver::SourcePreparation::new(
+                stow_resolver::GitCommit::parse(&parent_sha).unwrap(),
+                vec![tree("vendor/A"), tree("vendor/a")],
+            )
+            .unwrap();
+
+            let error = resolver
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+                .expect_err("aliased destinations never reach the fetch");
+            if case_insensitive {
+                assert!(
+                    format!("{error:#}").contains("overlapping directories"),
+                    "canonical identities collided before any fetch, got {error:#}"
+                );
+            } else {
+                assert!(
+                    !format!("{error:#}").contains("overlapping directories"),
+                    "case-distinct names are legitimate on this volume, got {error:#}"
+                );
+            }
+        },
+    );
+}
+
+/// stow#558: two disjoint declared trees materialize through the
+/// bounded worker fan-out — the root names both path deps and the
+/// resolved units keep each fetched tree's own registry dep and
+/// feature identity.
+#[test]
+fn two_disjoint_source_trees_materialize_through_the_fanout() {
+    isolated_scratch(
+        "two_disjoint_source_trees_materialize_through_the_fanout",
+        || {
+            let work = tempfile::tempdir().unwrap();
+            let reg = work.path().join("registry");
+            publish_deps(&reg);
+            publish(
+                &reg,
+                &Fixture {
+                    name: "dep_feat",
+                    version: "1.0.0",
+                    deps: vec![],
+                    features: &[("side-only", &[])],
+                    yanked: false,
+                    proc_macro: false,
+                },
+            );
+            let (_home, resolver) = resolver_at(&reg);
+            let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+            let rustc = pinned_rustc_version();
+
+            let sub = work.path().join("sub");
+            git_origin(&sub);
+            commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+            let sub_sha = git_head(&sub);
+            let sub_url = repo_url(&sub);
+
+            let other = work.path().join("other");
+            git_origin(&other);
+            commit_pkg_manifest(
+                &other,
+                "other",
+                &json!({ "dep_feat": { "version": "1", "features": ["side-only"] } }),
+            );
+            let other_sha = git_head(&other);
+            let other_url = repo_url(&other);
+
+            let (_parent, parent_url, parent_sha) = parent_with_two_missing_path_deps(work.path());
+            let prep = stow_resolver::SourcePreparation::new(
+                stow_resolver::GitCommit::parse(&parent_sha).unwrap(),
+                vec![
+                    stow_resolver::PreparedSourceTree::new(
+                        stow_resolver::RelativeSourcePath::parse("vendor/sub").unwrap(),
+                        sub_url,
+                        stow_resolver::GitCommit::parse(&sub_sha).unwrap(),
+                    )
+                    .unwrap(),
+                    stow_resolver::PreparedSourceTree::new(
+                        stow_resolver::RelativeSourcePath::parse("vendor/other").unwrap(),
+                        other_url,
+                        stow_resolver::GitCommit::parse(&other_sha).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let out = resolver
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+                .expect("both declared trees resolve the path deps");
+            let mut requested = requested_crates(&out);
+            requested.sort();
+            assert_eq!(
+                requested,
+                vec!["dep_a".to_owned(), "dep_feat".to_owned()],
+                "each fanned-out tree contributed its own registry dep"
+            );
+            let (_target, requests) = &out.targets[0];
+            let dep_feat = requests
+                .iter()
+                .find(|request| request.crate_name.as_str() == "dep_feat")
+                .expect("the second tree's dep is enqueued");
+            assert_eq!(
+                dep_feat.features_json.features(),
+                &["side-only".to_owned()],
+                "the fetched tree's feature identity reached the unit"
+            );
+            let dep_a = requests
+                .iter()
+                .find(|request| request.crate_name.as_str() == "dep_a")
+                .expect("the first tree's dep is enqueued");
+            assert!(
+                !dep_a
+                    .features_json
+                    .features()
+                    .iter()
+                    .any(|feature| feature == "side-only"),
+                "the sibling tree's feature never leaks across destinations"
+            );
+        },
+    );
+}
+
+/// stow#558: one source failing mid-fan-out still joins every spawned
+/// worker before the error surfaces — the scratch tree releases whole
+/// and no caller-owned path is touched.
+#[test]
+fn a_failed_source_fetch_joins_workers_and_releases_the_scratch() {
+    isolated_scratch(
+        "a_failed_source_fetch_joins_workers_and_releases_the_scratch",
+        || {
+            let work = tempfile::tempdir().unwrap();
+            let reg = work.path().join("registry");
+            publish_deps(&reg);
+            let (_home, resolver) = resolver_at(&reg);
+            let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+            let rustc = pinned_rustc_version();
+            let baseline = stow_src_dirs();
+
+            let sub = work.path().join("sub");
+            git_origin(&sub);
+            commit_pkg_manifest(&sub, "sub", &json!({ "dep_a": "1" }));
+            let sub_sha = git_head(&sub);
+            let sub_url = repo_url(&sub);
+
+            // A repository that does not exist: its fetch can only
+            // fail, while the sibling fetch genuinely runs.
+            let dead = url::Url::parse("file:///nonexistent-stow-fixture").unwrap();
+            let dead_sha =
+                stow_resolver::GitCommit::parse("0123456789012345678901234567890123456789")
+                    .unwrap();
+
+            let (parent, parent_url, parent_sha) = parent_with_two_missing_path_deps(work.path());
+            let prep = stow_resolver::SourcePreparation::new(
+                stow_resolver::GitCommit::parse(&parent_sha).unwrap(),
+                vec![
+                    stow_resolver::PreparedSourceTree::new(
+                        stow_resolver::RelativeSourcePath::parse("vendor/sub").unwrap(),
+                        sub_url,
+                        stow_resolver::GitCommit::parse(&sub_sha).unwrap(),
+                    )
+                    .unwrap(),
+                    stow_resolver::PreparedSourceTree::new(
+                        stow_resolver::RelativeSourcePath::parse("vendor/other").unwrap(),
+                        dead,
+                        dead_sha,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+            let error = resolver
+                .resolve_git(parent_url.as_str(), "main", &targets, rustc, 0, Some(&prep))
+                .expect_err("the dead source fails the resolve");
+            assert!(
+                format!("{error:#}").contains("git fetch failed"),
+                "the failure is the source fetch, got {error:#}"
+            );
+            assert_eq!(
+                stow_src_dirs(),
+                baseline,
+                "every worker joined and the scratch tree released"
+            );
+            assert!(
+                !parent.join("vendor").exists(),
+                "nothing landed in the caller-owned project dir"
+            );
+            assert_eq!(
+                git_head(&sub),
+                sub_sha,
+                "the fetched-from fixture repo is untouched"
+            );
+        },
+    );
 }

@@ -66,6 +66,11 @@ pub struct ManualArgs {
     /// `[[project]] repo = "https://github.com/<owner>/<name>"`.
     #[arg(long)]
     projects: Option<PathBuf>,
+    /// Pinned source trees (stow#558) for `--projects` entries whose
+    /// git checkout does not carry every Rust input — see
+    /// `preheat/source-trees.toml`. Only meaningful with `--projects`.
+    #[arg(long, requires = "projects", conflicts_with_all = ["crates", "dirs"])]
+    source_trees: Option<PathBuf>,
     /// Comma-separated local project directories — resolved like a
     /// `--projects` entry (cargo's own resolver, the tree's `Cargo.lock`
     /// dropped). Each directory is mutated: pass a disposable copy.
@@ -527,6 +532,7 @@ async fn resolve_sources(
     let targets = targets.to_vec();
     let rustc_version = rustc_version.clone();
     let projects = args.projects.clone();
+    let source_trees = args.source_trees.clone();
     let dirs = args.dirs.clone();
     let (requests, failures) = tokio::task::spawn_blocking(move || {
         let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
@@ -566,11 +572,19 @@ async fn resolve_sources(
         if let Some(path) = &projects {
             let repos = tokio::runtime::Handle::current()
                 .block_on(crate::projects::load_projects_file(path))?;
+            let trees =
+                crate::source_trees::load_optional_source_trees(source_trees.as_ref(), &repos)?;
             let mut progress = SourceProgress::new(repos.len());
             pool.run(
                 &repos,
                 |resolver, _runtime, repo| {
-                    crate::projects::resolve_repository(resolver, repo, &targets, &rustc_version)
+                    crate::projects::resolve_repository(
+                        resolver,
+                        repo,
+                        &targets,
+                        &rustc_version,
+                        trees.as_ref().and_then(|trees| trees.get(repo)),
+                    )
                 },
                 |_, repo, result| {
                     progress.collect(repo, result, &mut requests, &mut failures);
@@ -1577,9 +1591,81 @@ struct LocalTaskRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     /// `main`'s sha in the test fixtures.
     const MAIN_HEAD: &str = "1111111111111111111111111111111111111111";
+
+    /// stow#558: `preheat manual --projects` accepts `--source-trees`;
+    /// without `--projects` it is a clap error before any file is read.
+    #[test]
+    fn the_source_trees_flag_requires_projects() {
+        let cli = crate::Cli::try_parse_from([
+            "stow-admin",
+            "preheat",
+            "manual",
+            "--projects",
+            "list.toml",
+            "--rustc-version",
+            "1.99.0",
+            "--source-trees",
+            "trees.toml",
+        ])
+        .expect("manual --projects accepts --source-trees");
+        let crate::Command::Preheat(preheat) = &cli.command else {
+            panic!("expected preheat");
+        };
+        let crate::preheat::PreheatCommand::Manual(manual) = &preheat.command else {
+            panic!("expected manual");
+        };
+        assert_eq!(
+            manual.source_trees.as_deref(),
+            Some(std::path::Path::new("trees.toml")),
+            "the flag lands on the manual args"
+        );
+
+        for argv in [
+            [
+                "stow-admin",
+                "preheat",
+                "manual",
+                "--rustc-version",
+                "1.99.0",
+                "--source-trees",
+                "trees.toml",
+            ]
+            .as_slice(),
+            [
+                "stow-admin",
+                "preheat",
+                "manual",
+                "--crates",
+                "c.txt",
+                "--rustc-version",
+                "1.99.0",
+                "--source-trees",
+                "trees.toml",
+            ]
+            .as_slice(),
+            [
+                "stow-admin",
+                "preheat",
+                "manual",
+                "--dirs",
+                "a,b",
+                "--rustc-version",
+                "1.99.0",
+                "--source-trees",
+                "trees.toml",
+            ]
+            .as_slice(),
+        ] {
+            assert!(
+                crate::Cli::try_parse_from(argv).is_err(),
+                "{argv:?} cannot take --source-trees"
+            );
+        }
+    }
 
     fn run_state(status: &str, conclusion: Option<&str>, ran_current_code: bool) -> RunState {
         run_state_with_id(1, status, conclusion, ran_current_code)

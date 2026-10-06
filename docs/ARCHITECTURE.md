@@ -638,6 +638,29 @@ Four workflows keep it warm:
   scheduler in one batch through the same authenticated endpoint the
   other admin lanes use, with the miss count as the task's `downloads`
   priority signal.
+- `demand-feed.yml` (hourly, five past the hour, plus manual) is the
+  demand ledger's input lane (stow#523): one job pulls the signed
+  `stow-admin` toolchain of `main`'s merge-queue head — the command
+  ships with this change, so ticks fail visibly until a toolchain
+  carrying it exists — and runs `stow-admin scheduler demand-feed`
+  under the job's OIDC identity inside a 25-minute deadline. The pass
+  resumes the Durable Object's durable cursor before choosing work: an
+  unfinished staging attempt re-materializes from scratch under a fresh
+  generation, a frozen `complete` hour delivers its original staged
+  pages without a new query, and only then is the watermark's
+  successor — or `--hour YYYY-MM-DDTHH`, the operator's recovery path —
+  materialized: one `analytics_engine/sql` `FORMAT JSON` query over the
+  closed hour's `semantic`/`graph` misses weighted
+  `sum(_sample_interval * double1)`, response streamed to disk, parsed
+  on the blocking pool with whole-document validation (meta shape,
+  declared `rows`, terminal EOF), staged as sequential
+  manifest-chained pages of at most 256 entries / 512 KiB per
+  serialized request, frozen, then delivered — `feed_deliver` calls
+  under a bound of four, each of which applies the object's next
+  unapplied page through the #522 atomic-acceptance path — until the
+  watermark-guarded `delivered` transition, after which bounded
+  `feed_cleanup` chunks retire the payloads. A failed job leaves the
+  durable cursor for the next tick; nothing idles in the object.
 - `preheat-projects.yml` (weekly, Mondays 05:30 UTC, plus manual) keeps
   the projects lane's source list honest: `stow-admin preheat projects
   generate` refreshes `preheat/projects.toml` — every listed entry is

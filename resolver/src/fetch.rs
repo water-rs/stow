@@ -153,22 +153,20 @@ pub fn fetch_git(url: &str, git_ref: &str, dir: &Path) -> CargoResult<PathBuf> {
     Ok(dir.to_path_buf())
 }
 
-/// Pick the root manifest of a materialized tree.
+/// Pick the root manifest of a materialized tree — selection only.
+///
+/// A caller runs it on the project's own checkout *before* any
+/// supplemental source lands (stow#558): an imported tree carrying a
+/// `Cargo.toml`+`Cargo.lock` pair can never outrank the manifest the
+/// project itself selects.
 ///
 /// `select_manifest` parity: the shallowest `Cargo.lock` whose
 /// directory also carries a `Cargo.toml` roots the workspace it pins;
 /// absent any lockfile the tree's own shallowest `Cargo.toml` does.
-/// When `drop_lockfile`, every `Cargo.lock` under the workspace root is
-/// deleted and the root one's contents returned for the resolve's
-/// whitelist/git-pin handling.
 ///
 /// # Errors
 /// No manifest found, or filesystem failures.
-///
-/// # Panics
-/// A manifest path's parent always exists — the walk only yields
-/// children of `root`.
-pub fn prepare_project_tree(root: &Path, drop_lockfile: bool) -> CargoResult<Materialized> {
+pub fn select_manifest(root: &Path) -> CargoResult<PathBuf> {
     // `select_manifest` parity: the shallowest `Cargo.lock` whose
     // directory also carries `Cargo.toml` roots the workspace it pins —
     // else the shallowest `Cargo.toml` at all. Lock dirs sort
@@ -196,19 +194,35 @@ pub fn prepare_project_tree(root: &Path, drop_lockfile: bool) -> CargoResult<Mat
             .cmp(&b.components().count())
             .then_with(|| a.cmp(b))
     });
-    let mut manifest_path = None;
     for dir in &lock_dirs {
         if let Some((_, manifest)) = manifest_dirs.iter().find(|(dir2, _)| dir2 == dir) {
-            manifest_path = Some(manifest.clone());
-            break;
+            return Ok(manifest.clone());
         }
     }
-    if manifest_path.is_none() {
-        manifest_path = manifest_dirs.first().map(|(_, manifest)| manifest.clone());
-    }
-    let manifest_path =
-        manifest_path.with_context(|| format!("no Cargo.toml under {}", root.display()))?;
+    manifest_dirs
+        .first()
+        .map(|(_, manifest)| manifest.clone())
+        .with_context(|| format!("no Cargo.toml under {}", root.display()))
+}
 
+/// The post-selection half of tree preparation.
+///
+/// The lockfile semantics of the selected manifest's workspace root:
+/// when `drop_lockfile`, every `Cargo.lock` under the workspace root —
+/// including any a prepared source just brought in — is deleted and
+/// the root one's contents returned for the resolve's
+/// whitelist/git-pin handling.
+///
+/// # Errors
+/// Filesystem failures.
+///
+/// # Panics
+/// A manifest path's parent always exists — selection only yields
+/// children of the walked root.
+pub fn prepare_selected_manifest(
+    manifest_path: &Path,
+    drop_lockfile: bool,
+) -> CargoResult<Materialized> {
     let ws_root = manifest_path
         .parent()
         .expect("manifest path has a parent")
@@ -235,9 +249,21 @@ pub fn prepare_project_tree(root: &Path, drop_lockfile: bool) -> CargoResult<Mat
     }
 
     Ok(Materialized {
-        manifest_path,
+        manifest_path: manifest_path.to_path_buf(),
         dropped_lockfile,
     })
+}
+
+/// Pick the root manifest of a materialized tree and apply its
+/// workspace's lockfile handling — [`select_manifest`] then
+/// [`prepare_selected_manifest`], for callers whose tree needs no
+/// supplemental sources.
+///
+/// # Errors
+/// No manifest found, or filesystem failures.
+pub fn prepare_project_tree(root: &Path, drop_lockfile: bool) -> CargoResult<Materialized> {
+    let manifest_path = select_manifest(root)?;
+    prepare_selected_manifest(&manifest_path, drop_lockfile)
 }
 
 /// Files (not directories) under `root`, shallowest first. The `.git`

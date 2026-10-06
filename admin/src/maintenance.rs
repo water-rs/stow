@@ -256,20 +256,43 @@ async fn cf_request(
             None => Ok(request),
         })
         .map_err(|error| format!("build {url}: {error}"))?;
-    let response = builder.await.map_err(|error| format!("{url}: {error}"))?;
-    let status = response.status().as_u16();
-    let text = zenwave::ResponseExt::into_string(response)
-        .await
-        .map_err(|error| format!("read {url} body: {error}"))?;
+    // zenwave lifts 4xx/5xx into `Err(Error::Http)` at `.await` — the
+    // caller-facing `(status, envelope)` contract still applies, so an
+    // `Error::Http`'s status and body rejoin the same decode path while
+    // transport failures stay errors.
+    let (status, text) = match builder.await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let text = zenwave::ResponseExt::into_string(response)
+                .await
+                .map_err(|error| format!("read {url} body: {error}"))?;
+            (status, text)
+        }
+        Err(zenwave::Error::Http {
+            status, response, ..
+        }) => (
+            status.as_u16(),
+            response.body_text.unwrap_or_default().into(),
+        ),
+        Err(error) => return Err(format!("{url}: {error}")),
+    };
     let envelope: CfResponse = serde_json::from_str(text.as_ref())
         .map_err(|error| format!("decode {url} ({status}): {error} — {text}"))?;
+    // Absence is exact: HTTP 404 carrying a nonempty `errors` whose
+    // rows are all code 10003 ("could not find entrypoint ruleset for
+    // phase"). A mixed list, an empty list, or a 404 without that
+    // signature is a hard failure like every other envelope error.
+    let absent = status == 404
+        && !envelope.errors.is_empty()
+        && envelope.errors.iter().all(|error| error.code == 10003);
     if let Some(error) = envelope.errors.first() {
-        // 10003 is "could not find entrypoint ruleset for phase" — the
-        // one error a reader legitimately meets; everything else is a
-        // hard failure.
-        if !(status == 404 && error.code == 10003) {
+        if !absent {
             return Err(format!("{url}: API error {} {}", error.code, error.message));
         }
+    } else if status == 404 {
+        return Err(format!(
+            "{url}: HTTP 404 without the absent-entrypoint errors"
+        ));
     }
     Ok((status, envelope))
 }
@@ -279,7 +302,17 @@ async fn cf_request(
 /// creates it; a missing entrypoint here means `deploy-edge.yml` has
 /// not run its WAF step yet.
 async fn entrypoint(token: &str, zone_id: &str) -> Result<Option<Ruleset>, String> {
-    let url = format!("{API_BASE}/zones/{zone_id}/rulesets/phases/{WAF_PHASE}/entrypoint");
+    entrypoint_at(API_BASE, token, zone_id).await
+}
+
+/// `entrypoint` at an explicit API root — production passes
+/// [`cloudflare::API_BASE`], tests an owned loopback URL.
+async fn entrypoint_at(
+    api_base: &str,
+    token: &str,
+    zone_id: &str,
+) -> Result<Option<Ruleset>, String> {
+    let url = format!("{api_base}/zones/{zone_id}/rulesets/phases/{WAF_PHASE}/entrypoint");
     let (status, envelope) = cf_request(token, zenwave::Method::GET, &url, None::<&u8>).await?;
     if status == 404 {
         return Ok(None);
@@ -780,5 +813,92 @@ mod tests {
             assert!(expression.contains("edge.example.com"));
             assert_ne!(scope.description(), "");
         }
+    }
+
+    /// A 404 entrypoint envelope carrying code 10003 is the designed
+    /// "never provisioned" answer — `entrypoint` reads it as absent.
+    #[tokio::test]
+    async fn absent_entrypoint_answers_none() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 404,
+            retry_after: None,
+            body: ENTRYPOINT_ABSENT,
+        }])
+        .await;
+        let entry = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            entrypoint_at(&server.url, "test-token", "zone-1"),
+        )
+        .await
+        .expect("entrypoint read completes within the deadline")
+        .expect("the absent entrypoint decodes");
+        assert!(entry.is_none());
+        assert_eq!(server.join().await.len(), 1);
+    }
+
+    /// A 4xx whose envelope carries any other error code is a real
+    /// failure — only code 10003 means absent.
+    #[tokio::test]
+    async fn other_entrypoint_error_stays_an_error() {
+        let server =
+            crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+                status: 400,
+                retry_after: None,
+                body: r#"{"success":false,"errors":[{"code":10000,"message":"zone invalid"}],"messages":[],"result":null}"#,
+            }])
+            .await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            entrypoint_at(&server.url, "test-token", "zone-1"),
+        )
+        .await
+        .expect("entrypoint read completes within the deadline")
+        .expect_err("a non-10003 envelope error is not absence");
+        assert!(error.contains("10000"), "unexpected error: {error}");
+        assert_eq!(server.join().await.len(), 1);
+    }
+
+    /// Absence needs the whole signature — a 404 with an `errors` list
+    /// that is empty, missing, or carries another code alongside 10003
+    /// is a hard failure, never `Ok(None)`.
+    #[tokio::test]
+    async fn only_an_exact_10003_list_means_absent() {
+        for body in [
+            r#"{"success":false,"errors":[],"messages":[],"result":null}"#,
+            r#"{"success":false,"messages":[],"result":null}"#,
+            r#"{"success":false,"errors":[{"code":10003,"message":"absent"},{"code":10000,"message":"mixed"}],"messages":[],"result":null}"#,
+        ] {
+            let server =
+                crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+                    status: 404,
+                    retry_after: None,
+                    body,
+                }])
+                .await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                entrypoint_at(&server.url, "test-token", "zone-1"),
+            )
+            .await
+            .expect("entrypoint read completes within the deadline")
+            .expect_err("only an all-10003 errors list means absent");
+            assert_eq!(server.join().await.len(), 1);
+        }
+    }
+
+    /// A dropped connection is a transport failure, not an absent
+    /// entrypoint.
+    #[tokio::test]
+    async fn dropped_entrypoint_read_stays_an_error() {
+        let server =
+            crate::test_server::Loopback::start(vec![crate::test_server::Step::Drop]).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            entrypoint_at(&server.url, "test-token", "zone-1"),
+        )
+        .await
+        .expect("entrypoint read completes within the deadline")
+        .expect_err("a dropped connection is not absence");
+        server.join().await;
     }
 }

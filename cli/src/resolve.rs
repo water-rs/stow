@@ -4,8 +4,8 @@
 //! Ported from the edge's `db::analyze_dependency_graph` +
 //! `dependency_resolver::expand_scheduler_requests`: where the edge read
 //! candidate rows out of D1 and feature graphs out of crates.io, the CLI
-//! walks the decoded [`ArtifactIndexRow`] slice and the feature tables
-//! `cargo metadata` already reports — the dependency graph never leaves
+//! walks the decoded [`ArtifactIndexRow`] slice and cargo's own
+//! recorded feature sets — the dependency graph never leaves
 //! the machine.
 //!
 //! The semantic split the edge ran stays: *candidates* are canonical rows
@@ -14,7 +14,7 @@
 //! may reference, and a node is covered only when its candidate's whole
 //! dependency chain resolves inside the slice.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry};
@@ -63,22 +63,6 @@ impl<'de> serde::Deserialize<'de> for PackageKey {
             version: version.parse().map_err(serde::de::Error::custom)?,
         })
     }
-}
-
-/// A package's feature surface as `cargo metadata` reports it — the
-/// local stand-in for the crates.io `VersionGraph` the edge fetched.
-///
-/// Used to canonicalize a manifest's seed features the way the edge did:
-/// seeds the package's real feature table does not declare are dropped,
-/// and surviving seeds expand through the table's plain-name items.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct PackageFeatureGraph {
-    /// The package's declared `[features]` table.
-    pub features: BTreeMap<String, Vec<String>>,
-    /// Manifest-spelled names of optional dependencies — each grants an
-    /// implicit selectable feature unless a declared feature references
-    /// it through `dep:<name>`.
-    pub optional_dependencies: BTreeSet<String>,
 }
 
 /// A semver-compatible version with strictly more cached artifacts than
@@ -177,26 +161,24 @@ pub const fn host_glibc() -> Option<GlibcVersion> {
 /// exact-artifact prefetch set, and the enqueue requests covering the
 /// misses.
 ///
-/// `feature_graphs` carries each requested entry's `[features]` table plus
-/// optional-dependency names as `cargo metadata` reports them — the local
-/// replacement for the crates.io version graphs the edge consulted to
-/// canonicalize seed features. `host_glibc` is the caller's read of the
-/// host libc ([`host_glibc`]): a covered row whose floor exceeds it still
-/// counts as covered — no rebuild can lower the floor — but leaves the
-/// prefetch set, because downloading a bundle rustc cannot `dlopen` is a
-/// wasted round trip.
+/// `entries` are the unit graph's direct registry dependencies —
+/// cargo's own recorded identities and feature sets — so the analysis
+/// semantic key is the recorded set serialized, the same identity the
+/// expanded entries carry. `host_glibc` is the caller's read of the
+/// host libc ([`host_glibc`]): a covered row whose floor exceeds it
+/// still counts as covered — no rebuild can lower the floor — but
+/// leaves the prefetch set, because downloading a bundle rustc cannot
+/// `dlopen` is a wasted round trip.
 ///
 /// # Errors
 ///
 /// Returns an error when `expanded_entries` is missing or malformed
-/// (duplicate node, dangling edge, missing root), when a root's feature
-/// graph is absent from `feature_graphs`, or when an index row carries
-/// a `compile_key` the canonical-metadata check cannot read.
+/// (duplicate node, dangling edge, missing root), or when an index row
+/// carries a `compile_key` the canonical-metadata check cannot read.
 pub fn analyze_dependency_graph(
     rows: &[ArtifactIndexRow],
     entries: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
-    feature_graphs: &BTreeMap<PackageKey, PackageFeatureGraph>,
     host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<GraphAnalysis> {
     if entries.is_empty() {
@@ -211,25 +193,13 @@ pub fn analyze_dependency_graph(
 
     let exact_graph = exact_graph_from_request(entries, expanded_entries)?;
 
-    // The analysis entries' feature key is the *requested* feature set
-    // canonicalized through the crate's own feature table — the same
-    // semantics the edge applied to manifest seeds — while coverage and
-    // enqueue identity come from the expanded graph's resolved features.
+    // The analysis entries' feature key is cargo's recorded feature
+    // set — the same identity the expanded entries carry — while
+    // coverage and enqueue identity come from the expanded graph.
     let mut crate_names = BTreeSet::<String>::new();
     let mut exact_entries = Vec::<ExactDependencyEntry>::with_capacity(entries.len());
     for entry in entries {
-        let key = PackageKey {
-            crate_name: entry.crate_name.clone(),
-            version: entry.version.clone(),
-        };
-        let graph = feature_graphs.get(&key).ok_or_else(|| {
-            stow_types::stow_error!(
-                "feature graph missing for {} {}",
-                key.crate_name,
-                key.version
-            )
-        })?;
-        let resolved = resolve_local_features(graph, &entry.features.iter().cloned().collect());
+        let resolved = normalize_feature_set(entry.features.clone())?;
         crate_names.insert(entry.crate_name.as_str().to_owned());
         exact_entries.push(ExactDependencyEntry {
             dependency: entry.clone(),
@@ -855,63 +825,6 @@ fn canonical_crate_name(crate_name: impl AsRef<str>) -> String {
     crate_name.as_ref().replace('-', "_")
 }
 
-/// The per-version feature surface for seed canonicalization: every
-/// declared `[features]` key plus the implicit feature cargo grants each
-/// optional dependency — unless a declared feature references that
-/// dependency through `dep:<name>`, which hides the implicit feature.
-fn selectable_features(graph: &PackageFeatureGraph) -> BTreeSet<String> {
-    let dep_referenced = graph
-        .features
-        .values()
-        .flat_map(|items| items.iter())
-        .filter_map(|item| item.strip_prefix("dep:"))
-        .collect::<BTreeSet<_>>();
-    graph
-        .features
-        .keys()
-        .cloned()
-        .chain(
-            graph
-                .optional_dependencies
-                .iter()
-                .filter(|name| !dep_referenced.contains(name.as_str()))
-                .cloned(),
-        )
-        .collect()
-}
-
-/// Canonicalize a manifest's seed features against the package's real
-/// feature surface: seeds the table does not declare are dropped before
-/// any task identity is minted, and surviving seeds expand through the
-/// table's plain-name items (`dep:` and `name/feature` edges never name a
-/// feature on this package).
-fn resolve_local_features(
-    graph: &PackageFeatureGraph,
-    seed_features: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let selectable = selectable_features(graph);
-    let mut features = seed_features
-        .iter()
-        .filter(|feature| selectable.contains(feature.as_str()))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut queue = features.iter().cloned().collect::<VecDeque<String>>();
-    while let Some(feature) = queue.pop_front() {
-        let Some(items) = graph.features.get(&feature) else {
-            continue;
-        };
-        for item in items {
-            if item.starts_with("dep:") || item.contains('/') {
-                continue;
-            }
-            if features.insert(item.clone()) {
-                queue.push_back(item.clone());
-            }
-        }
-    }
-    features
-}
-
 /// Validate and deduplicate a requested feature list.
 fn normalize_feature_set(features: Vec<String>) -> stow_types::error::Result<BTreeSet<String>> {
     let mut set = BTreeSet::<String>::new();
@@ -1225,7 +1138,7 @@ fn emit_covers_request(candidate_emit: &[String], requested_emit: &[String]) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use semver::Version;
     use stow_types::api::{
@@ -1241,10 +1154,9 @@ mod tests {
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        PackageFeatureGraph, PackageKey, analyze_dependency_graph, build_exact_artifact_catalog,
-        build_semantic_catalog, exact_graph_from_request, find_exact_artifact,
-        find_semantic_artifact, resolve_local_features, resolve_reachable_cached_rows,
-        row_servable_on_host, semantic_identity_match,
+        PackageKey, analyze_dependency_graph, build_exact_artifact_catalog, build_semantic_catalog,
+        exact_graph_from_request, find_exact_artifact, find_semantic_artifact,
+        resolve_reachable_cached_rows, row_servable_on_host, semantic_identity_match,
     };
     use crate::fetch::SemanticFetchRequest;
 
@@ -1504,70 +1416,6 @@ mod tests {
     }
 
     #[test]
-    fn local_features_drop_seeds_the_crate_does_not_declare() {
-        let graph = PackageFeatureGraph {
-            features: BTreeMap::from([
-                ("default".to_owned(), Vec::new()),
-                ("derive".to_owned(), vec!["dep:serde_derive".to_owned()]),
-                ("full".to_owned(), vec!["derive".to_owned()]),
-            ]),
-            optional_dependencies: BTreeSet::new(),
-        };
-        // "bogus" is dropped before any task id exists; "full" survives and
-        // drags its declared "derive" expansion in.
-        let resolved = resolve_local_features(
-            &graph,
-            &BTreeSet::from(["bogus".to_owned(), "full".to_owned()]),
-        );
-        assert_eq!(
-            resolved,
-            BTreeSet::from(["full".to_owned(), "derive".to_owned()])
-        );
-    }
-
-    #[test]
-    fn local_features_all_bogus_collapses_to_the_empty_set() {
-        let graph = PackageFeatureGraph {
-            features: BTreeMap::from([("std".to_owned(), Vec::new())]),
-            optional_dependencies: BTreeSet::new(),
-        };
-        // Every bogus-feature variant of a crate collapses onto the one
-        // canonical empty-feature task identity.
-        assert!(resolve_local_features(&graph, &BTreeSet::from(["bogus".to_owned()])).is_empty());
-    }
-
-    #[test]
-    fn local_features_keep_implicit_optional_dependency_features() {
-        // slab's real shape: `serde` is an optional dependency no declared
-        // feature references through `dep:`, so cargo grants an implicit
-        // `serde` feature that must survive validation.
-        let graph = PackageFeatureGraph {
-            features: BTreeMap::from([
-                ("default".to_owned(), vec!["std".to_owned()]),
-                ("std".to_owned(), Vec::new()),
-            ]),
-            optional_dependencies: BTreeSet::from(["serde".to_owned()]),
-        };
-        let resolved = resolve_local_features(
-            &graph,
-            &BTreeSet::from(["serde".to_owned(), "bogus".to_owned()]),
-        );
-        assert_eq!(resolved, BTreeSet::from(["serde".to_owned()]));
-    }
-
-    #[test]
-    fn local_features_drop_dep_referenced_optional_dependencies() {
-        // When a declared feature references `dep:foo`, cargo hides the
-        // implicit `foo` feature — `foo` as a seed is bogus like any other
-        // undeclared name.
-        let graph = PackageFeatureGraph {
-            features: BTreeMap::from([("full".to_owned(), vec!["dep:foo".to_owned()])]),
-            optional_dependencies: BTreeSet::from(["foo".to_owned()]),
-        };
-        assert!(resolve_local_features(&graph, &BTreeSet::from(["foo".to_owned()])).is_empty());
-    }
-
-    #[test]
     fn dependency_graph_catalogs_ignore_noncanonical_duplicate_rows() {
         let rows = [
             row_with_compile_key(
@@ -1639,7 +1487,7 @@ mod tests {
         let expanded_entries = vec![
             ResolvedDependencyGraphEntry {
                 crate_name: dep_a.crate_name.clone(),
-                version: dep_a.version.clone(),
+                version: dep_a.version,
                 features: Vec::new(),
                 host_side: false,
                 dependencies: vec![ResolvedDependencyGraphDependency {
@@ -1657,20 +1505,14 @@ mod tests {
             },
             ResolvedDependencyGraphEntry {
                 crate_name: missing.crate_name.clone(),
-                version: missing.version.clone(),
+                version: missing.version,
                 features: Vec::new(),
                 host_side: false,
                 dependencies: Vec::new(),
             },
         ];
-        let feature_graphs = BTreeMap::from([
-            (dep_a, PackageFeatureGraph::default()),
-            (missing, PackageFeatureGraph::default()),
-        ]);
-
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs, None)
-                .expect("analyze");
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, None).expect("analyze");
 
         assert_eq!(analysis.expanded_total, 3);
         assert_eq!(analysis.expanded_cached, 2);
@@ -1832,7 +1674,7 @@ mod tests {
         let expanded_entries = vec![
             ResolvedDependencyGraphEntry {
                 crate_name: dep_a.crate_name.clone(),
-                version: dep_a.version.clone(),
+                version: dep_a.version,
                 features: Vec::new(),
                 host_side: false,
                 dependencies: vec![ResolvedDependencyGraphDependency {
@@ -1849,7 +1691,6 @@ mod tests {
                 dependencies: Vec::new(),
             },
         ];
-        let feature_graphs = BTreeMap::from([(dep_a, PackageFeatureGraph::default())]);
         let host = Some(GlibcVersion {
             major: 2,
             minor: 35,
@@ -1857,8 +1698,7 @@ mod tests {
         });
 
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, &feature_graphs, host)
-                .expect("analyze");
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, host).expect("analyze");
 
         // Both nodes stay covered — dep-b's row exists, it simply cannot
         // be served here — so nothing turns into an enqueue miss.

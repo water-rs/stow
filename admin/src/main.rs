@@ -13,6 +13,7 @@ mod cache;
 mod cloudflare;
 mod coverage;
 mod crates_io;
+mod demand_feed;
 mod deploy;
 mod github;
 mod index_cmd;
@@ -30,6 +31,7 @@ mod resolve;
 mod runs;
 mod rust_channel;
 mod scheduler;
+mod source_trees;
 #[cfg(test)]
 mod test_server;
 mod watchdog;
@@ -287,6 +289,17 @@ impl Edge {
         })
     }
 
+    /// A connection pinned at a loopback base — the demand-feed tests
+    /// drive the real post/get paths against a scripted listener.
+    #[cfg(test)]
+    pub(crate) fn for_test(base: String) -> Self {
+        Self {
+            base,
+            token: Some("test-bearer".to_owned()),
+            version_override: None,
+        }
+    }
+
     /// The trimmed base URL — `index export` builds paged URLs off it.
     pub(crate) fn base(&self) -> &str {
         &self.base
@@ -341,18 +354,16 @@ impl Edge {
             .await
     }
 
-    /// [`post_json`](Self::post_json) at an explicit bound — for the
-    /// routes that legitimately outlive the default, like the scheduler
-    /// budget probe replaying every drive on a seeded fixture.
-    pub(crate) async fn post_json_with_timeout<
-        B: serde::Serialize + Sync,
-        T: serde::de::DeserializeOwned,
-    >(
+    /// `POST` a JSON body to an edge path — the one transport every
+    /// JSON/unit/stream caller shares: bearer + version header +
+    /// timeout + status guard. The caller owns the 2xx response's
+    /// decode, drain, or unbuffered stream.
+    async fn post_response<B: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &B,
         timeout: Duration,
-    ) -> stow_types::error::Result<T> {
+    ) -> stow_types::error::Result<zenwave::Response> {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
         let mut client = zenwave::client().timeout(timeout);
@@ -371,10 +382,56 @@ impl Edge {
         response
             .error_for_status()
             .await
-            .map_err(|error| stow_error!("POST {url}: {error}"))?
+            .map_err(|error| stow_error!("POST {url}: {error}"))
+    }
+
+    /// [`post_json`](Self::post_json) at an explicit bound — for the
+    /// routes that legitimately outlive the default, like the scheduler
+    /// budget probe replaying every drive on a seeded fixture.
+    pub(crate) async fn post_json_with_timeout<
+        B: serde::Serialize + Sync,
+        T: serde::de::DeserializeOwned,
+    >(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> stow_types::error::Result<T> {
+        let url = format!("{}{path}", self.base);
+        self.post_response(path, body, timeout)
+            .await?
             .into_json()
             .await
             .map_err(|error| stow_error!("decode {url}: {error}"))
+    }
+
+    /// `POST` a JSON body whose answer carries nothing the caller
+    /// reads — the response body is still drained so the connection
+    /// returns to the pool rather than stalling in it.
+    pub(crate) async fn post_unit<B: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> stow_types::error::Result<()> {
+        let url = format!("{}{path}", self.base);
+        self.post_response(path, body, REQUEST_TIMEOUT)
+            .await?
+            .into_bytes()
+            .await
+            .map(|_| ())
+            .map_err(|error| stow_error!("drain {url}: {error}"))
+    }
+
+    /// `POST` a JSON body and hand the 2xx response back with its body
+    /// unbuffered — the demand feed's hour document is larger than
+    /// anything this process should hold (stow#523), so the caller
+    /// streams it to disk itself.
+    pub(crate) async fn post_stream<B: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> stow_types::error::Result<zenwave::Response> {
+        self.post_response(path, body, REQUEST_TIMEOUT).await
     }
 }
 

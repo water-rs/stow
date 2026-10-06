@@ -214,6 +214,65 @@ pub async fn scheduler_demand(
     post_json(namespace, SCHEDULER_DEMAND_URL, request).await
 }
 
+const SCHEDULER_DEMAND_FEED_BEGIN_URL: &str = "https://scheduler.internal/demand-feed/begin";
+const SCHEDULER_DEMAND_FEED_PAGE_URL: &str = "https://scheduler.internal/demand-feed/page";
+const SCHEDULER_DEMAND_FEED_COMPLETE_URL: &str = "https://scheduler.internal/demand-feed/complete";
+const SCHEDULER_DEMAND_FEED_CLEANUP_URL: &str = "https://scheduler.internal/demand-feed/cleanup";
+const SCHEDULER_DEMAND_FEED_DELIVER_URL: &str = "https://scheduler.internal/demand-feed/deliver";
+const SCHEDULER_DEMAND_FEED_STATUS_URL: &str = "https://scheduler.internal/demand-feed/status";
+
+/// `POST /demand-feed/begin` — open or rotate the hour's staging
+/// attempt (stow#523); a resume answers a fresh generation.
+pub async fn demand_feed_begin(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::DemandFeedBeginRequest,
+) -> Result<stow_types::api::DemandFeedBeginReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_DEMAND_FEED_BEGIN_URL, request).await
+}
+
+/// `POST /demand-feed/page` — stage one bounded immutable page under
+/// the attempt generation.
+pub async fn demand_feed_page(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::DemandFeedPageRequest,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_DEMAND_FEED_PAGE_URL, request).await
+}
+
+/// `POST /demand-feed/complete` — the completion barrier freezing the
+/// hour once every page of its generation is staged.
+pub async fn demand_feed_complete(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::DemandFeedCompleteRequest,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_DEMAND_FEED_COMPLETE_URL, request).await
+}
+
+/// `POST /demand-feed/cleanup` — retire one bounded chunk of the
+/// hour's dead page rows (obsolete generations, delivered payloads).
+pub async fn demand_feed_cleanup(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::DemandFeedCleanupRequest,
+) -> Result<stow_types::api::DemandFeedCleanupReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_DEMAND_FEED_CLEANUP_URL, request).await
+}
+
+/// `POST /demand-feed/deliver` — replay the next undelivered original
+/// page into the demand ledger, or mark a fully-acked hour delivered.
+pub async fn demand_feed_deliver(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::DemandFeedDeliverRequest,
+) -> Result<stow_types::api::DemandFeedDeliverReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_DEMAND_FEED_DELIVER_URL, request).await
+}
+
+/// `GET /demand-feed/status` — the durable resume cursor.
+pub async fn demand_feed_status(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::DemandFeedStatus, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_DEMAND_FEED_STATUS_URL).await
+}
+
 /// Admin queue listing behind `stow-admin queue list` and the mutation
 /// previews; the selector rides the query string flattened
 /// (`?task_ids=…&status=&target=&crate=&older_than=&limit=`).

@@ -30,6 +30,7 @@ default, and the purpose.
 | `STOW_ENABLE_SEMANTIC_FALLBACK` | wired by parent `stow check` | When `1`, the per-rustc wrapper falls back to a semver-relaxed lookup in the cached index slice after an exact-key miss. |
 | `STOW_ENABLE_PREBUILT_DEPS` | unset (off) | When set to anything but `0`, enables the experimental top-crate fast path: `stow check` materializes a workspace whose every direct dependency is already cached, so the run compiles only the top crate. Off by default; the regular per-unit inject path is unaffected either way. |
 | `STOW_EXPANDED_GRAPH_JSON` | wired by parent | JSON-encoded transitive `Vec<DependencyGraphEntry>` so the wrapper can validate a semantic candidate against the user's lockfile. |
+| `__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS` | `nightly`, set on the `--unit-graph` query child only | Cargo's own channel override: makes the wrapped cargo accept `-Z unstable-options` on a stable toolchain while rustc — which never reads it — keeps answering probes as stable. Set only when the channel is stable and the user has no `RUSTC_BOOTSTRAP` of their own. |
 | `STOW_PREFETCH_ARTIFACTS_JSON` | wired by parent | JSON-encoded `Vec<PrefetchArtifactRow>` — (crate, c_metadata, bundle_digest) triples to stream through the edge byte path — each checked against its `bundle_digest` — before any rustc invocation. |
 | `STOW_CACHE_POLICY_PATH` | wired by parent | Directory of `allow/<target>/<c_metadata>` marker files. The wrapper only consults the public cache for invocations with a marker; the parent `stow check` writes the markers from the local index analysis. |
 | `STOW_SUPERVISOR_ENDPOINT` / `STOW_SUPERVISOR_TOKEN` | wired by parent `stow check`/`build`/`test` | Endpoint (`unix:<path>` or `tcp:<port>`) and bearer token of the supervising run the wrapper delegates each invocation to. An endpoint that is set but unusable fails the build; unset means standalone mode, where the wrapper decides in-process. |
@@ -53,7 +54,7 @@ JSON) and sends nothing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path), `index sync` and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `preheat manual` and `index export`/`publish` never read it — they run against GitHub and GHCR only. |
+| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path), `index sync` and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `preheat manual` and `index export`/`publish` never read it — they run against GitHub and GHCR only. |
 | `STOW_EDGE_VERSION_OVERRIDE` | _optional_ | Verbatim `Cloudflare-Workers-Version-Overrides` header value (e.g. `stow-edge="<version-id>"`) pinned onto every edge call — `deploy-edge.yml` sets it so `scheduler migrate` runs on the uploaded candidate before traffic shifts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints and the GitHub REST calls (`runs`, `cache`, `preheat projects generate`); the owner must have push access to `water-rs/stow`. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed` and `watchdog`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
@@ -143,7 +144,7 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |
 | `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `workflow_dispatch`. Used by mock fixtures. |
 | `STOW_SCHEDULER_BUDGET` | unset | **Mock-only.** When `"1"`, the Durable Object answers the `/budget` and `/budget/seed` probe routes the workerd cost gate (`scripts/scheduler-budget.sh`) drives. Set only by `edge/Skyzen.mock.toml`; a test asserts it never appears in `edge/Skyzen.toml`, so the probe cannot reach production. |
-| `STOW_STATS_SQL_URL` | unset | **Mock-only.** Overrides the Analytics Engine SQL API base URL the public stats routes post to (`/stats` and friends). Loopback-pinned — the account's analytics token rides in the `Authorization` header, so a non-loopback URL would exfiltrate it; set only by `edge/Skyzen.mock.toml` (to `stow-mock-registry serve`'s stub) and pinned out of `edge/Skyzen.toml` by the same manifest test as `STOW_LOCAL_CI_URL`. |
+| `STOW_STATS_SQL_URL` | unset | **Mock-only.** Overrides the Analytics Engine SQL API base URL the public stats routes post to (`/stats` and friends) — and the edge-side override the demand feed's `analytics_engine/sql` query posts through in the mock deploy. Loopback-pinned — the account's analytics token rides in the `Authorization` header, so a non-loopback URL would exfiltrate it; set only by `edge/Skyzen.mock.toml` (to `stow-mock-registry serve`'s stub) and pinned out of `edge/Skyzen.toml` by the same manifest test as `STOW_LOCAL_CI_URL`. |
 | `STOW_DISPATCH_MIN_AGE_MINUTES` | `5` | Minimum age (minutes) a task must wait in `pending` before being dispatched, so misses can coalesce. Mock fixtures set `0`. |
 | `STOW_MAX_CONCURRENT_JOBS` | `45` | Maximum concurrently dispatched CI builds across all runner families. Sized against the org's 60-runner pool, leaving 15 runners for the repo's own CI. Mock fixtures set `3` because miniflare OOMs under parallel complete bursts. `"0"` pauses dispatch: submits keep queueing, nothing is claimed, and the alarm wakes only for stale recovery on builds already in flight — see `DEPLOYMENT.md`'s pause procedure. |
 | `STOW_MAX_CONCURRENT_MACOS_JOBS` | `16` | Maximum concurrently dispatched CI builds on macOS targets (`aarch64-apple-*`). The org has 20 macOS runners; the cap leaves 4 for the repo's own CI, and macOS rows past the cap stay pending until a slot frees. |
@@ -166,3 +167,39 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `TURNSTILE_SECRET_KEY` | _required_ (secret) | Turnstile secret key the worker posts to siteverify for `POST /api/v1/requests` token checks. Never logged or returned in a response. Mock fixtures use the always-pass test secret `1x0000000000000000000000000000000AA`; production deploys source it from the `STOW_TURNSTILE_SECRET_KEY` repository secret. |
 | `GITHUB_APP_ID` / `GITHUB_APP_INSTALLATION_ID` | `4985635` / `162649982` | The `stow-ci` GitHub App's ID and its installation ID on `water-rs`. Required when `STOW_LOCAL_CI_URL` is unset. |
 | `GITHUB_APP_PRIVATE_KEY` | _required when STOW_LOCAL_CI_URL is unset_ (secret) | The App's private-key PEM. The scheduler signs an RS256 JWT with it (WebCrypto) and exchanges it for an installation token that authorizes `workflow_dispatch` — the App needs **Actions: Read and write** on `GITHUB_REPO` (deliberately no `issues`: the edge is untrusted serving infrastructure; the `incident` issue record is the watchdog's job). The token is cached in the Durable Object's SQL storage while more than 5 minutes of validity remain. Deploy jobs source it from the `STOW_APP_PRIVATE_KEY` repository secret — the same one release-plz uses. |
+
+### Demand feed (stow#523)
+
+`stow-admin scheduler demand-feed` is the hourly lane between the
+`stow_cache_misses` Analytics Engine dataset and the #522 demand
+ledger. Semantics the operator knobs expose:
+
+- `--hour YYYY-MM-DDTHH` (UTC, required to be a *closed* hour): the
+  explicit recovery path. It is validated before any side effect —
+  malformed input and an open hour error out immediately. When the
+  durable cursor holds an unfinished hour, `--hour` must name it
+  (resume its frozen state); naming any other hour refuses rather than
+  silently leap past unfinished work. The default (no flag) resumes
+  the cursor first — an unfinished staging attempt re-materializes
+  under a fresh generation, a `complete` hour delivers its already
+  staged pages without a new query — and only then materializes the
+  watermark's canonical successor, which a no-op tick skips.
+- The Analytics Engine leg is one `FORMAT JSON` `analytics_engine/sql`
+  query per closed hour — `semantic`/`graph` misses weighted
+  `sum(_sample_interval * double1)` — honoring the `STOW_NO_ANALYTICS`
+  consent at write time: opted-out callers' points are never written,
+  never rescaled back. The weight sum is the documented additive
+  estimate; today's unsampled `double1 = 1.0` writes keep it exact.
+  The response streams to a temp file and validates the whole
+  document (meta contract, declared `rows`, terminal EOF) before a
+  single page freezes — a late-invalid or truncated body abandons the
+  attempt under a fresh generation on the next tick.
+- Concurrency: the GitHub hourly job plus a possible manual rerun are
+  the only callers; overlapping invocations contend only on the
+  DO's serialized storage — the durable cursor is the arbiter, and a
+  second job finding the hour frozen delivers rather than
+  re-materializing.
+- Ordering: the workflow pulls the signed `stow-admin` binary of the
+  merge-queue head of `main`; the command ships with this change so
+  ticks fail visibly until a released toolchain carries it — no
+  per-hour toolchain build, no new alert cron.

@@ -25,6 +25,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use askama::Template as _;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use stow_types::launch_model::{LaunchModel, LaunchRates, LaunchRatios, LaunchScale, LaunchWindow};
@@ -40,37 +41,65 @@ const DEFAULT_OUT: &str = "launch-model.toml";
 /// `CF_ACCOUNT_ID` — the account the AE SQL and zone analytics read.
 const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 
+/// `YYYY-MM-DD` calendar bounds every launch-model Analytics Engine
+/// query shares — the one typed value the three askama templates
+/// render into `toDateTime` literals; no marker replace, no
+/// hand-built SQL text.
+#[derive(Debug)]
+struct QueryWindow {
+    /// Inclusive first day of the window.
+    since: String,
+    /// Exclusive day after the window's end.
+    until: String,
+}
+
 /// The Analytics Engine SQL API posts one query and answers
 /// `{"data": [...]}` — the same `FORMAT JSON` envelope the edge's stats
 /// surface decodes.
-const ANALYTICS_SQL: &[&str] = &[
-    // Distinct installs over the window: `stow_events.index1` is the
-    // daily-salted install hash, so distinct values over the window
-    // count install-days.
-    "SELECT count(DISTINCT index1) AS value FROM stow_events \
-     WHERE blob1 = 'hit' AND timestamp >= toDateTime('$since 00:00:00') \
-     AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
-    // Byte-path fetches: hit points are 1/10-sampled, `double1` carries
-    // the weight — `sum` restores the true count.
-    "SELECT sum(double1) AS value FROM stow_events \
-     WHERE blob1 = 'hit' AND timestamp >= toDateTime('$since 00:00:00') \
-     AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
-    // Miss nodes: `stow_cache_misses` points are unsampled — one per
-    // uncovered node the admissions lane minted a ticket for.
-    "SELECT count() AS value FROM stow_cache_misses \
-     WHERE blob1 = 'miss' AND timestamp >= toDateTime('$since 00:00:00') \
-     AND timestamp < toDateTime('$until 00:00:00') FORMAT JSON",
-];
+/// `launch_model/install_days.sql` — distinct install-days over the
+/// window.
+#[derive(Debug, askama::Template)]
+#[template(path = "launch_model/install_days.sql", escape = "txt")]
+struct InstallDaysQuery<'a> {
+    /// The shared window bounds.
+    window: &'a QueryWindow,
+}
 
-/// One `count()`/`sum()` row an [`ANALYTICS_SQL`] query returns —
-/// `FORMAT JSON` quotes 64-bit integers, so the shared Analytics
-/// Engine deserializer decodes it.
+/// `launch_model/cli_fetches.sql` — sampled fetch weight over the
+/// window (the `Float64` estimate).
+#[derive(Debug, askama::Template)]
+#[template(path = "launch_model/cli_fetches.sql", escape = "txt")]
+struct CliFetchesQuery<'a> {
+    /// The shared window bounds.
+    window: &'a QueryWindow,
+}
+
+/// `launch_model/miss_nodes.sql` — miss points over the window (the
+/// `Float64` estimate).
+#[derive(Debug, askama::Template)]
+#[template(path = "launch_model/miss_nodes.sql", escape = "txt")]
+struct MissNodesQuery<'a> {
+    /// The shared window bounds.
+    window: &'a QueryWindow,
+}
+
+/// One `count(DISTINCT)` row [`InstallDaysQuery`] returns — `FORMAT
+/// JSON` quotes `UInt64`, so `de_u64` decodes it.
 #[derive(Debug, Deserialize)]
 struct AeCountRow {
-    /// The queried aggregate — each `ANALYTICS_SQL` selects it as
-    /// `value`.
+    /// The queried aggregate — the query selects it as `value`.
     #[serde(deserialize_with = "stow_types::analytics::de_u64")]
     value: u64,
+}
+
+/// One `sum(_sample_interval * double1)` row — the additive estimate
+/// is `Float64`, decoded with `de_f64` and validated losslessly
+/// before its u64 use rather than clamped.
+#[derive(Debug, Deserialize)]
+struct AeSumRow {
+    /// The queried aggregate — the query selects it as `value`.
+    #[serde(deserialize_with = "stow_types::analytics::de_f64")]
+    value: f64,
 }
 
 /// `launch-model.graphql` — the zone's HTTP request counts by method
@@ -276,30 +305,32 @@ async fn gather_snapshot(
     let window_end = end.map_or_else(default_window_end, str::to_owned);
     let since = shift_day(&window_end, -i64::from(window_days))?;
 
-    let mut ae_rows = Vec::new();
-    for template in ANALYTICS_SQL {
-        let sql = template
-            .replace("$since", &since)
-            .replace("$until", &window_end);
-        ae_rows.push(
-            cloudflare::analytics_engine_sql::<AeCountRow>(&token, &account, &sql)
+    let window = QueryWindow {
+        since,
+        until: window_end.clone(),
+    };
+    let install_days_sql = InstallDaysQuery { window: &window }
+        .render()
+        .map_err(|error| stow_error!("render launch-model query: {error}"))?;
+    let cli_fetches_sql = CliFetchesQuery { window: &window }
+        .render()
+        .map_err(|error| stow_error!("render launch-model query: {error}"))?;
+    let miss_nodes_sql = MissNodesQuery { window: &window }
+        .render()
+        .map_err(|error| stow_error!("render launch-model query: {error}"))?;
+    let (install_days, cli_fetches, miss_nodes, requests) = futures_util::try_join!(
+        async {
+            cloudflare::analytics_engine_sql::<AeCountRow>(&token, &account, &install_days_sql)
                 .await
-                .map_err(|error| stow_error!("analytics engine: {error}"))?,
-        );
-    }
-    let install_days = ae_rows[0]
-        .first()
-        .map(|row| row.value)
-        .ok_or_else(|| stow_error!("install-days query returned no row"))?;
-    let cli_fetches = ae_rows[1]
-        .first()
-        .map(|row| row.value)
-        .ok_or_else(|| stow_error!("fetch query returned no row"))?;
-    let miss_nodes = ae_rows[2]
-        .first()
-        .map(|row| row.value)
-        .ok_or_else(|| stow_error!("miss query returned no row"))?;
-    let requests = zone_path_counts(&token, &zone, &since, &window_end).await?;
+                .map_err(|error| stow_error!("analytics engine: {error}"))?
+                .first()
+                .map(|row| row.value)
+                .ok_or_else(|| stow_error!("install-days query returned no row"))
+        },
+        analytic_sum(&token, &account, &cli_fetches_sql, "fetch"),
+        analytic_sum(&token, &account, &miss_nodes_sql, "miss"),
+        zone_path_counts(&token, &zone, &window.since, &window.until),
+    )?;
     Ok(WindowSnapshot {
         window_days,
         window_end,
@@ -308,6 +339,27 @@ async fn gather_snapshot(
         miss_nodes,
         requests,
     })
+}
+
+/// One `Float64` aggregate row — the additive sampled-weight
+/// estimate — decoded at the actual column type and validated
+/// losslessly before its u64 use rather than clamped.
+async fn analytic_sum(
+    token: &str,
+    account: &str,
+    sql: &str,
+    what: &'static str,
+) -> stow_types::error::Result<u64> {
+    cloudflare::analytics_engine_sql::<AeSumRow>(token, account, sql)
+        .await
+        .map_err(|error| stow_error!("analytics engine: {error}"))?
+        .first()
+        .map(|row| row.value)
+        .ok_or_else(|| stow_error!("{what} query returned no row"))
+        .and_then(|value| {
+            stow_types::analytics::f64_to_u64_exact(value, what)
+                .map_err(stow_types::error::Error::msg)
+        })
 }
 
 /// The freeze day's recorded end — the window the checked-in model was
@@ -540,6 +592,33 @@ mod tests {
         let document = render_toml(&model).expect("model serializes");
         let reparsed = LaunchModel::from_toml(&document).expect("rendered document reparses");
         assert_eq!(model, reparsed);
+    }
+
+    /// The three Analytics templates substitute only the typed
+    /// [`QueryWindow`] bounds — no marker strings survive a render and
+    /// each query keeps its own dataset.
+    #[test]
+    fn analytics_templates_render_the_typed_window() {
+        let window = QueryWindow {
+            since: "2026-09-20".to_owned(),
+            until: "2026-09-27".to_owned(),
+        };
+        let queries = [
+            (InstallDaysQuery { window: &window }.render(), "stow_events"),
+            (CliFetchesQuery { window: &window }.render(), "stow_events"),
+            (
+                MissNodesQuery { window: &window }.render(),
+                "stow_cache_misses",
+            ),
+        ];
+        for (query, dataset) in queries {
+            let sql = query.expect("template renders");
+            assert!(sql.contains("toDateTime('2026-09-20 00:00:00')"), "{sql}");
+            assert!(sql.contains("toDateTime('2026-09-27 00:00:00')"), "{sql}");
+            assert!(sql.contains(dataset), "{sql}");
+            assert!(!sql.contains("{{"), "{sql}");
+            assert!(!sql.contains('$'), "{sql}");
+        }
     }
 
     #[test]

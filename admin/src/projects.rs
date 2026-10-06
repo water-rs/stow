@@ -90,6 +90,14 @@ pub struct SubmitArgs {
     /// 0 without enqueuing.
     #[arg(long)]
     pub yes: bool,
+    /// Pinned source trees (stow#558): `[[project]]` names the exact
+    /// commit a listed repository resolves at and `[[project.source]]`
+    /// the repository/commit/destination of each extra tree the
+    /// project's own checkout does not carry. Every declaration must
+    /// name a listed repository; projects without a declaration resolve
+    /// their ordinary git tree.
+    #[arg(long)]
+    pub source_trees: Option<PathBuf>,
 }
 
 /// The schema of `preheat/projects.toml`: a reviewed list of
@@ -389,6 +397,10 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
         })
         .collect::<stow_types::error::Result<_>>()?;
     let repos = tokio::runtime::Handle::current().block_on(load_projects_file(&args.file))?;
+    // Declared source trees load once, before the pool: every row must
+    // name a repository this input actually lists.
+    let trees =
+        crate::source_trees::load_optional_source_trees(args.source_trees.as_ref(), &repos)?;
     let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let mut plan = ProjectsPlan {
         file: args.file.display().to_string(),
@@ -408,7 +420,15 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
     // property the sequential loop had.
     pool.run(
         &repos,
-        |resolver, _runtime, repo| resolve_repository(resolver, repo, &targets, &rustc_version),
+        |resolver, _runtime, repo| {
+            resolve_repository(
+                resolver,
+                repo,
+                &targets,
+                &rustc_version,
+                trees.as_ref().and_then(|trees| trees.get(repo)),
+            )
+        },
         |_index, repo, result| match result {
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
@@ -824,7 +844,7 @@ pub async fn load_projects_file(path: &Path) -> stow_types::error::Result<Vec<St
 /// Normalize a listed repository to `https://github.com/<owner>/<name>`:
 /// strip a trailing `.git` or `/`, then demand exactly the two path
 /// segments GitHub carries.
-fn normalize_repo_url(raw: &str) -> stow_types::error::Result<String> {
+pub fn normalize_repo_url(raw: &str) -> stow_types::error::Result<String> {
     let trimmed = raw.trim().trim_end_matches('/').trim_end_matches(".git");
     let Some(tail) = trimmed.strip_prefix("https://github.com/") else {
         return Err(stow_error!(
@@ -851,6 +871,7 @@ pub fn resolve_repository(
     repo: &str,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
+    preparation: Option<&stow_resolver::SourcePreparation>,
 ) -> Result<Vec<EnqueueRequest>, String> {
     let source = resolver
         .resolve_git(
@@ -859,6 +880,7 @@ pub fn resolve_repository(
             &crate::resolve::target_strings(targets),
             rustc_version,
             0,
+            preparation,
         )
         .map_err(|error| format!("resolve {repo}: {error:#}"))?;
     Ok(source

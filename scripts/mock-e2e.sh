@@ -280,7 +280,20 @@ echo "[mock-e2e] building stow-cli, stow-build, stow-mock-registry, stow-admin"
 cargo build -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin \
     >"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build failed — see $LOG_DIR/cargo-build.log"
+cargo build -p stow-mock-registry --example demand_feed_fixture \
+    >>"$LOG_DIR/cargo-build.log" 2>&1 \
+    || die "cargo build (demand_feed_fixture example) failed — see $LOG_DIR/cargo-build.log"
 BIN="$REPO_ROOT/target/debug"
+
+# stow#523: typed demand-feed fixtures — the example writes the
+# enqueue/queue document, per-hour provider documents, typed
+# freeze bodies and the 512 KiB boundary pages the feed harness
+# serves and posts below. `T05` starts hidden: the missing-fixture
+# leg serves it back later.
+"$BIN/examples/demand_feed_fixture" "$WORK_DIR/demand-fixtures" \
+    || die "demand-feed fixture generation failed"
+mv "$WORK_DIR/demand-fixtures/hours/2020-01-01T05.json" \
+    "$WORK_DIR/demand-fixtures/2020-01-01T05.json"
 
 # P-256 PKCS#8 key pair — the format sigstore accepts (docs/MOCK.md).
 mkdir -p "$WORK_DIR/keys"
@@ -301,7 +314,8 @@ for port in "$EDGE_PORT" "${REGISTRY_ADDR##*:}" "${LOCAL_CI_ADDR##*:}"; do
 done
 
 start_service mock-registry "$LOG_DIR/mock-registry.log" \
-    "$BIN/stow-mock-registry" serve --registry-root "$WORK_DIR/mock-registry" --listen "$REGISTRY_ADDR"
+    "$BIN/stow-mock-registry" serve --registry-root "$WORK_DIR/mock-registry" --listen "$REGISTRY_ADDR" \
+    --demand-fixtures "$WORK_DIR/demand-fixtures/hours"
 # The version ping answers 401 + Bearer challenge, mirroring GHCR — that
 # response is the readiness signal AND the auth handshake entry point.
 mock_registry_ready() {
@@ -357,6 +371,547 @@ current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
     || die "scheduler migrate reported '$migrate_out', expected schema $current_schema"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
+
+# --- stow#523: hourly demand feed ------------------------------------
+# The real admin -> authenticated workerd -> scheduler DO -> #522
+# demand backend the hourly GitHub cron runs. The mock registry's
+# --demand-fixtures dir answers every `analytics_engine/sql` demand
+# query with the verbatim fixture file for the requested hour and
+# appends one {"hour","served"} JSONL record to
+# demand-queries.log, so the harness proves which hours were queried
+# and that frozen hours are never re-queried. Corrupt/truncated byte
+# streams live only in the mock provider files — the real edge
+# endpoint is never faked. All expected identities and demand deltas
+# come from the generator's expectations.json, never retyped here.
+FEED_ROUTE="$EDGE_URL/api/v1/admin/scheduler/demand-feed"
+DEMAND_ROUTE="$EDGE_URL/api/v1/admin/scheduler/demand"
+FIXTURES="$WORK_DIR/demand-fixtures"
+QUERY_LOG="$WORK_DIR/mock-registry/demand-queries.log"
+EXPECT_TASKS="$(jq 'length' "$FIXTURES/expectations.json")"
+
+feed_post() { # sub-route, body-file -> response body (fails on non-2xx)
+    curl -fsS -H "Authorization: Bearer $EDGE_BEARER" \
+        -H "Content-Type: application/json" \
+        -X POST --data-binary "@$2" "$FEED_ROUTE/$1"
+}
+feed_post_code() { # sub-route, body-file -> HTTP status only
+    curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $EDGE_BEARER" \
+        -H "Content-Type: application/json" \
+        -X POST --data-binary "@$2" "$FEED_ROUTE/$1"
+}
+demand_post() { # body-file -> demand report body
+    curl -fsS -H "Authorization: Bearer $EDGE_BEARER" \
+        -H "Content-Type: application/json" \
+        -X POST --data-binary "@$1" "$DEMAND_ROUTE"
+}
+feed_freeze() { # hour: real begin -> patched-generation pages -> complete
+    local hour="$1" gen page
+    gen="$(feed_post begin <(jq -nc --arg h "$hour" '{hour:$h}') \
+        | tee -a "$LOG_DIR/feed-begin-$hour.json" | jq -r '.generation')"
+    [ -n "$gen" ] && [ "$gen" != "null" ] || die "feed begin $hour returned no generation"
+    for page in "$FIXTURES/pages/$hour"-page-*.json; do
+        jq --argjson g "$gen" '.generation = $g' "$page" >"$WORK_DIR/feed-page.json"
+        feed_post page "$WORK_DIR/feed-page.json" >/dev/null \
+            || die "feed freeze $hour: page $(basename "$page") rejected"
+    done
+    jq --argjson g "$gen" '.generation = $g' \
+        "$FIXTURES/pages/$hour-complete.json" >"$WORK_DIR/feed-page.json"
+    feed_post complete "$WORK_DIR/feed-page.json" >/dev/null \
+        || die "feed freeze $hour: complete rejected"
+    rm -f "$WORK_DIR/feed-page.json"
+}
+feed_deliver_until() { # hour: native deliver POSTs until delivered
+    local hour="$1" reply
+    for _ in 1 2 3 4 5 6 7 8; do
+        reply="$(feed_post deliver <(jq -nc --arg h "$hour" '{hour:$h}'))" \
+            || die "feed deliver $hour rejected"
+        echo "$reply" >>"$LOG_DIR/feed-deliver-$hour.jsonl"
+        [ "$(jq -rn --arg r "$reply" '$r|fromjson|.state' 2>/dev/null \
+            || echo fail)" = "delivered" ] && return 0
+    done
+    die "feed deliver $hour never reached delivered"
+}
+feed_cleanup() { # hour: existing cleanup op drains staged payload pages
+    local hour="$1" reply retired=0
+    for _ in 1 2 3 4 5 6 7 8; do
+        reply="$(feed_post cleanup <(jq -nc --arg h "$hour" '{hour:$h}'))" \
+            || die "feed cleanup $hour rejected"
+        echo "$reply" >>"$LOG_DIR/feed-cleanup-$hour.jsonl"
+        retired=$((retired + $(jq -r '.retired' <<<"$reply")))
+        [ "$(jq -r '.remaining' <<<"$reply")" = "false" ] && { echo "$retired"; return 0; }
+    done
+    die "feed cleanup $hour never reported remaining=false"
+}
+feed_cli() { # out_file [cli args...] -> prints captured output, CLI exit preserved
+    local out_file="$1"; shift
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+        "$BIN/stow-admin" scheduler demand-feed --json "$@" \
+        >"$out_file" 2>&1
+    local status=$?
+    cat "$out_file"
+    return "$status"
+}
+feed_status() {
+    curl -fsS -H "Authorization: Bearer $EDGE_BEARER" "$FEED_ROUTE/status"
+}
+feed_watermark() { feed_status | jq -r '.watermark // "null"'; }
+feed_unfinished() { feed_status | jq -r '.unfinished.hour // "null"'; }
+feed_unfinished_field() { feed_status | jq -r ".unfinished.$1 // \"null\""; }
+query_count() { [ -f "$QUERY_LOG" ] && wc -l <"$QUERY_LOG" || echo 0; }
+expect_watermark() {
+    [ "$(feed_watermark)" = "$1" ] \
+        || die "feed watermark is $(feed_watermark), expected $1"
+}
+expect_unfinished() { # hour state staged_pages
+    local u_hour u_state u_pages
+    u_hour="$(feed_unfinished)"; u_state="$(feed_unfinished_field state)"
+    u_pages="$(feed_unfinished_field staged_pages)"
+    [ "$u_hour" = "$1" ] && [ "$u_state" = "$2" ] \
+        || die "unfinished is $u_hour/$u_state, expected $1/$2"
+    [ -z "${3-}" ] || [ "$u_pages" = "$3" ] \
+        || die "unfinished staged_pages is $u_pages, expected $3"
+}
+expect_query_delta() { # expected_new_queries hour
+    local count
+    count="$(query_count)"
+    [ "$count" = "$1" ] || die "provider query count is $count, expected $1"
+    [ "$(jq -r '.hour' "$QUERY_LOG" | tail -1)" = "$2" ] \
+        || die "last provider query was not for $2"
+}
+
+# Every fixture queue row, paged through typed QueueSelector task-id
+# chunks the generator serialized with serde_html_form (the admin list
+# ceiling is 500; sixty ids per call stays well under it and under URL
+# length limits). Independent chunk fetches run under explicit bounded
+# concurrency — four in flight, never nine serialized round trips —
+# each to its own output file, then merged in input order with every
+# failure propagated.
+QUEUE_CONCURRENCY=4
+fixture_rows() { # out-file: one merged JSON array of QueueTask rows
+    # Only the readback children are waited on — an explicit
+    # PID:index list, never a bare `wait` (which would hang on the
+    # long-lived registry/edge/local-ci services) and never `wait -n`
+    # (absent on macOS Bash 3.2). At the bound the oldest child is
+    # reaped before the next spawn; each child's own exit status is
+    # the evidence — a nonzero curl propagates with its error log.
+    local out="$1" index=0 query chunk code pid oldest
+    local -a pids=()
+    : >"$out"
+    rm -f "$WORK_DIR"/queue-part-* "$WORK_DIR"/queue-code-* "$WORK_DIR"/queue-err-*
+    jq -r '.[]' "$FIXTURES/queue-selector-queries.json" \
+        >"$WORK_DIR/queue-queries.txt"
+    while IFS= read -r query; do
+        curl -sS -o "$WORK_DIR/queue-part-$index.json" \
+            -w '%{http_code}' \
+            -H "Authorization: Bearer $EDGE_BEARER" \
+            "$EDGE_URL/api/v1/admin/queue?$query" \
+            >"$WORK_DIR/queue-code-$index" \
+            2>"$WORK_DIR/queue-err-$index" &
+        pids+=("$!:$index")
+        index=$((index + 1))
+        if [ "${#pids[@]}" -ge "$QUEUE_CONCURRENCY" ]; then
+            oldest="${pids[0]}"
+            pids=("${pids[@]:1}")
+            if ! wait "${oldest%%:*}"; then
+                die "queue readback chunk ${oldest##*:} failed — see $WORK_DIR/queue-err-${oldest##*:}"
+            fi
+        fi
+    done <"$WORK_DIR/queue-queries.txt"
+    for pid in "${pids[@]}"; do
+        if ! wait "${pid%%:*}"; then
+            die "queue readback chunk ${pid##*:} failed — see $WORK_DIR/queue-err-${pid##*:}"
+        fi
+    done
+    # Merge in numeric request order — never a lexicographic glob.
+    for ((chunk = 0; chunk < index; chunk++)); do
+        code="$(cat "$WORK_DIR/queue-code-$chunk" 2>/dev/null || echo FAIL)"
+        [[ "$code" =~ ^2 ]] \
+            || die "queue readback chunk $chunk failed ($code): $(cat "$WORK_DIR/queue-err-$chunk" 2>/dev/null)"
+        jq -e 'type == "array"' "$WORK_DIR/queue-part-$chunk.json" >/dev/null 2>&1 \
+            || die "queue chunk $chunk is not a JSON array"
+        jq -c '.[]' "$WORK_DIR/queue-part-$chunk.json" >>"$out"
+    done
+}
+# task_id -> value map for the fixture set.
+fixture_values() { # out-file: {task_id: number}
+    fixture_rows "$WORK_DIR/fixture-rows.jsonl"
+    jq -s 'map({key: .task_id, value: (.value | tonumber)}) | from_entries' \
+        "$WORK_DIR/fixture-rows.jsonl" >"$1"
+}
+# Assert the whole fixture set: every expected task present exactly
+# once, every row non-dispatched.
+assert_fixture_rows() {
+    local rows uniq bad_status
+    rows="$(jq -s 'length' "$WORK_DIR/fixture-rows.jsonl")"
+    uniq="$(jq -s '[.[].task_id] | unique | length' "$WORK_DIR/fixture-rows.jsonl")"
+    [ "$rows" = "$EXPECT_TASKS" ] && [ "$uniq" = "$EXPECT_TASKS" ] \
+        || die "fixture queue rows: $rows rows / $uniq unique, expected $EXPECT_TASKS"
+    bad_status="$(jq -s '[.[] | select(.status != "pending" and .status != "blocked")] | length' \
+        "$WORK_DIR/fixture-rows.jsonl")"
+    [ "$bad_status" = "0" ] \
+        || die "fixture tasks must stay non-dispatched, got $bad_status rows outside pending/blocked"
+}
+# Exact per-task delta check against generated expectations:
+# jq exits 0 only when EVERY row's (final - initial) equals the
+# generated expected_delta — missing rows produce null and fail.
+assert_all_deltas() { # init-map final-map [expectations-file]
+    local exp="${3:-$FIXTURES/expectations.json}"
+    jq -n --slurpfile init "$1" --slurpfile final "$2" \
+        --slurpfile exp "$exp" '
+        ($exp[0]) as $e |
+        all($e[];
+            (($final[0][.task_id] // null) != null) and
+            (($init[0][.task_id] // null) != null) and
+            (($final[0][.task_id] - $init[0][.task_id]) == .expected_delta))' \
+        | grep -qx true \
+        || die "fixture demand deltas mismatch — see $WORK_DIR/delta-diff.json"
+}
+delta_diff() { # init-map final-map [expectations-file] -> writes mismatch report
+    local exp="${3:-$FIXTURES/expectations.json}"
+    jq -n --slurpfile init "$1" --slurpfile final "$2" \
+        --slurpfile exp "$exp" '
+        ($exp[0]) | map(select(
+            (($final[0][.task_id] // null) == null) or
+            (($final[0][.task_id] - ($init[0][.task_id] // 0)) != .expected_delta)) |
+            {task_id, crate_name, expected_delta,
+             initial: $init[0][.task_id], final: $final[0][.task_id]})' \
+        >"$WORK_DIR/delta-diff.json"
+}
+# Checkpoint the whole set right before a no-effect group.
+values_checkpoint() { fixture_values "$WORK_DIR/values-prev.json"; }
+# Whole-map equality for the "no demand effect" legs.
+assert_values_unchanged() { # before-map
+    fixture_values "$WORK_DIR/values-now.json"
+    jq -n --slurpfile a "$1" --slurpfile b "$WORK_DIR/values-now.json" '$a[0] == $b[0]' \
+        | grep -qx true || die "queue values changed across a no-effect leg"
+}
+
+# 1) Real queue tasks through the authenticated submit route: every
+# distinct base dep the consumers reference — each parked on an
+# absent `fixture-anchor-*` dep so deps_met stays 0 forever — plus
+# 520 consumers sharing them as a real DAG. Nothing fixture-side can
+# dispatch under the ordinary gate; no dispatch setting changes.
+echo "[mock-e2e] demand feed: submitting fixture queue tasks"
+submit_code="$(curl -s -o "$LOG_DIR/submit-fixture.json" -w '%{http_code}' \
+    -H "Authorization: Bearer $EDGE_BEARER" -H "Content-Type: application/json" \
+    -X POST --data-binary @"$FIXTURES/enqueue.json" \
+    "$EDGE_URL/api/v1/scheduler/tasks/submit")"
+[ "$submit_code" -ge 200 ] && [ "$submit_code" -lt 300 ] \
+    || die "fixture submit failed ($submit_code): $(cat "$LOG_DIR/submit-fixture.json")"
+fixture_rows "$WORK_DIR/fixture-rows.jsonl"
+assert_fixture_rows
+jq -s 'map({key: .task_id, value: (.value | tonumber)}) | from_entries' \
+    "$WORK_DIR/fixture-rows.jsonl" >"$WORK_DIR/values-init.json"
+
+# 5) Bootstrap gap scenario: freeze future T04 (3 pages) AND T00 with
+# no watermark, deliver T00, then default CLI runs fill T01..T03 from
+# the provider while T04's frozen bytes stay untouched; once T04 is
+# canonical its original pages resume with no query.
+echo "[mock-e2e] demand feed: freeze T00 + T04 (bootstrap, no watermark)"
+feed_freeze 2020-01-01T00
+feed_freeze 2020-01-01T04
+feed_deliver_until 2020-01-01T00
+expect_watermark 2020-01-01T00
+expect_unfinished 2020-01-01T04 complete 3
+
+echo "[mock-e2e] demand feed: canonical T01/T02/T03 fill under frozen T04"
+q="$(query_count)"
+feed_out="$LOG_DIR/demand-feed-01.json"
+feed_cli "$feed_out" || die "demand-feed T01 failed -- see $feed_out"
+[ "$(jq -r '.hour' "$feed_out")" = "2020-01-01T01" ] \
+    && [ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
+    || die "demand-feed T01 unexpected report: $(cat "$feed_out")"
+expect_watermark 2020-01-01T01
+expect_unfinished 2020-01-01T04 complete 3
+expect_query_delta $((q + 1)) 2020-01-01T01
+feed_out="$LOG_DIR/demand-feed-02.json"
+feed_cli "$feed_out" || die "demand-feed T02 failed -- see $feed_out"
+expect_watermark 2020-01-01T02
+expect_unfinished 2020-01-01T04 complete 3
+expect_query_delta $((q + 2)) 2020-01-01T02
+
+# Explicit leap past the canonical gap refuses before any query/write.
+values_checkpoint
+feed_out="$LOG_DIR/demand-feed-04-leap.json"
+if feed_cli "$feed_out" --hour 2020-01-01T04; then
+    die "demand-feed T04 should refuse while T03 is the canonical cursor"
+fi
+expect_query_delta $((q + 2)) 2020-01-01T02
+expect_watermark 2020-01-01T02
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+
+feed_out="$LOG_DIR/demand-feed-03.json"
+feed_cli "$feed_out" || die "demand-feed T03 failed -- see $feed_out"
+expect_watermark 2020-01-01T03
+expect_query_delta $((q + 3)) 2020-01-01T03
+
+q="$(query_count)"
+feed_out="$LOG_DIR/demand-feed-04.json"
+feed_cli "$feed_out" || die "demand-feed T04 resume failed -- see $feed_out"
+[ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
+    || die "demand-feed T04: expected delivered, got $(cat "$feed_out")"
+expect_watermark 2020-01-01T04
+[ "$(query_count)" = "$q" ] \
+    || die "frozen T04 resume must not re-query the provider"
+expect_unfinished null null
+
+# 2) Envelope bounds on the real DO stage route: a 1-entry page just
+# under the 512KiB framing accepts; the same page just over refuses;
+# a 257-entry page refuses on the entry bound alone. Rejections
+# stage nothing — the durable status keeps only the accepted page.
+echo "[mock-e2e] demand feed: T05 envelope + entry-count bounds"
+values_checkpoint
+gen="$(feed_post begin <(jq -nc '{hour:"2020-01-01T05"}') | jq -r '.generation')"
+[ -n "$gen" ] && [ "$gen" != "null" ] || die "T05 begin returned no generation"
+jq --argjson g "$gen" '.generation = $g' "$FIXTURES/boundary/under-page.json" \
+    >"$WORK_DIR/feed-page.json"
+under_code="$(feed_post_code page "$WORK_DIR/feed-page.json")"
+[ "$under_code" -ge 200 ] && [ "$under_code" -lt 300 ] \
+    || die "under-boundary page rejected ($under_code)"
+jq --argjson g "$gen" '.generation = $g' "$FIXTURES/boundary/over-page.json" \
+    >"$WORK_DIR/feed-page.json"
+over_code="$(feed_post_code page "$WORK_DIR/feed-page.json")"
+[ "$over_code" -ge 400 ] && [ "$over_code" -lt 500 ] \
+    || die "oversize page must be refused 4xx, got $over_code"
+jq --argjson g "$gen" '.generation = $g' "$FIXTURES/boundary/over-entries-page.json" \
+    >"$WORK_DIR/feed-page.json"
+entries_code="$(feed_post_code page "$WORK_DIR/feed-page.json")"
+[ "$entries_code" -ge 400 ] && [ "$entries_code" -lt 500 ] \
+    || die "257-entry page must be refused 4xx, got $entries_code"
+expect_unfinished 2020-01-01T05 staging 1
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+
+# 3) Provider HTTP error on the canonical hour: T05's fixture was
+# hidden, so the resumed materialization rotates the staged boundary
+# page, queries, and fails — demand values stay put.
+q="$(query_count)"
+feed_out="$LOG_DIR/demand-feed-05-missing.json"
+if feed_cli "$feed_out"; then
+    die "demand-feed T05 should fail while its fixture file is absent"
+fi
+expect_query_delta $((q + 1)) 2020-01-01T05
+expect_watermark 2020-01-01T04
+expect_unfinished 2020-01-01T05 staging
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+mv "$FIXTURES/2020-01-01T05.json" "$FIXTURES/hours/2020-01-01T05.json"
+feed_out="$LOG_DIR/demand-feed-05.json"
+feed_cli "$feed_out" || die "demand-feed T05 retry failed -- see $feed_out"
+expect_watermark 2020-01-01T05
+expect_query_delta $((q + 2)) 2020-01-01T05
+
+# Truncated stream, a late-invalid row (index 300, past the first
+# page bound), then a declared-rows mismatch — the parser stages
+# completed pages as it streams, so each failure leaves the hour
+# staging with pages staged, the watermark unmoved, and zero demand
+# effect. The cleanup report then drains the staged payload.
+echo "[mock-e2e] demand feed: T06 failure classes"
+valid06="$FIXTURES/hours/2020-01-01T06-valid.json"
+values_checkpoint
+size="$(wc -c <"$valid06")"
+q="$(query_count)"
+head -c $((size / 2)) "$valid06" >"$FIXTURES/hours/2020-01-01T06.json"
+feed_out="$LOG_DIR/demand-feed-06-truncated.json"
+if feed_cli "$feed_out"; then
+    die "demand-feed T06 should fail on a truncated document"
+fi
+expect_query_delta $((q + 1)) 2020-01-01T06
+expect_watermark 2020-01-01T05
+expect_unfinished 2020-01-01T06 staging
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+
+# 300 > 255, so page 0 already streamed to the DO: the failure leaves
+# a genuine partial stage (exactly one page), never a freeze.
+jq '.data[300].demand = "not-a-number"' "$valid06" >"$FIXTURES/hours/2020-01-01T06.json"
+feed_out="$LOG_DIR/demand-feed-06-badrow.json"
+if feed_cli "$feed_out"; then
+    die "demand-feed T06 should fail on a late-invalid row"
+fi
+expect_query_delta $((q + 2)) 2020-01-01T06
+expect_watermark 2020-01-01T05
+expect_unfinished 2020-01-01T06 staging 1
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+
+# `.rows` is checked at stream end, so all three pages of the 520-row
+# document are already staged when the mismatch fails the run.
+jq '.rows = 9999' "$valid06" >"$FIXTURES/hours/2020-01-01T06.json"
+feed_out="$LOG_DIR/demand-feed-06-rowcount.json"
+if feed_cli "$feed_out"; then
+    die "demand-feed T06 should fail on a declared-rows mismatch"
+fi
+expect_query_delta $((q + 3)) 2020-01-01T06
+expect_watermark 2020-01-01T05
+expect_unfinished 2020-01-01T06 staging 3
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+
+# Stale payload retirement follows the real contract: `cleanup` on a
+# staging hour retires only pages whose generation is BELOW the
+# current attempt — every earlier failed generation was already
+# drained by the one bounded retire chunk each retry's `begin`
+# performs. So cleanup against the live generation must retire 0 and
+# report no remainder, while the 3 current-generation pages stay
+# staged under the current attempt.
+retired="$(feed_cleanup 2020-01-01T06)"
+[ "$retired" = "0" ] \
+    || die "cleanup on the live generation must retire 0 pages, retired=$retired"
+expect_unfinished 2020-01-01T06 staging 3
+gen_before="$(feed_unfinished_field generation)"
+
+# An explicit begin rotates the generation: the new attempt's begin
+# retires the obsolete prefix in its one bounded chunk — for this
+# 3-page history the whole stale set fits inside it, so
+# stale_pages_pending reports no remainder, and the follow-up cleanup
+# finds nothing left to drain (begin-retire vs cleanup-drain are the
+# two halves of the same bounded contract).
+begin_reply="$(feed_post begin <(jq -nc '{hour:"2020-01-01T06"}'))" \
+    || die "explicit T06 begin failed"
+echo "$begin_reply" >"$LOG_DIR/feed-begin-06-rotate.json"
+gen_after="$(jq -r '.generation' <<<"$begin_reply")"
+[ "$gen_after" -gt "$gen_before" ] \
+    || die "begin must rotate the T06 generation ($gen_before -> $gen_after)"
+[ "$(jq -r '.stale_pages_pending' <<<"$begin_reply")" = "false" ] \
+    || die "one bounded retire chunk must drain the 3-page obsolete set"
+retired="$(feed_cleanup 2020-01-01T06)"
+[ "$retired" = "0" ] \
+    || die "cleanup after begin's drain must retire 0, retired=$retired"
+
+cp "$valid06" "$FIXTURES/hours/2020-01-01T06.json"
+feed_out="$LOG_DIR/demand-feed-06.json"
+feed_cli "$feed_out" || die "demand-feed T06 retry failed -- see $feed_out"
+expect_watermark 2020-01-01T06
+expect_query_delta $((q + 4)) 2020-01-01T06
+expect_unfinished null null
+
+# Empty canonical hours walk begin -> complete -> delivered and move
+# the watermark without touching the queue.
+echo "[mock-e2e] demand feed: T07 + T08 empty hours"
+values_checkpoint
+q="$(query_count)"
+feed_out="$LOG_DIR/demand-feed-07.json"
+feed_cli "$feed_out" || die "demand-feed T07 failed -- see $feed_out"
+expect_watermark 2020-01-01T07
+expect_query_delta $((q + 1)) 2020-01-01T07
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+
+# Leap refusal before any query, then the canonical fill.
+feed_out="$LOG_DIR/demand-feed-09-leap.json"
+if feed_cli "$feed_out" --hour 2020-01-01T09; then
+    die "demand-feed T09 should refuse while T08 is canonical"
+fi
+expect_query_delta $((q + 1)) 2020-01-01T07
+feed_out="$LOG_DIR/demand-feed-08.json"
+feed_cli "$feed_out" || die "demand-feed T08 failed -- see $feed_out"
+expect_watermark 2020-01-01T08
+expect_query_delta $((q + 2)) 2020-01-01T08
+
+# Schema-broken meta on the canonical hour, then the valid document.
+values_checkpoint
+cp "$FIXTURES/hours/2020-01-01T09.json" "$WORK_DIR/t09-valid.json"
+jq '.meta = [{"bogus": true}]' "$WORK_DIR/t09-valid.json" \
+    >"$FIXTURES/hours/2020-01-01T09.json"
+feed_out="$LOG_DIR/demand-feed-09-broken.json"
+if feed_cli "$feed_out"; then
+    die "demand-feed T09 should refuse a schema-broken meta"
+fi
+expect_query_delta $((q + 3)) 2020-01-01T09
+expect_watermark 2020-01-01T08
+expect_unfinished 2020-01-01T09 staging
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+mv "$WORK_DIR/t09-valid.json" "$FIXTURES/hours/2020-01-01T09.json"
+feed_out="$LOG_DIR/demand-feed-09.json"
+feed_cli "$feed_out" || die "demand-feed T09 retry failed -- see $feed_out"
+expect_watermark 2020-01-01T09
+expect_query_delta $((q + 4)) 2020-01-01T09
+expect_unfinished null null
+
+# 4) Lost-ACK resume: freeze T10's three pages via the typed routes,
+# deliver exactly one page natively and keep the reply — the client
+# died before seeing it. The provider file then turns corrupt; the
+# real CLI resumes and delivers the two remaining frozen pages with
+# zero new queries. Delivered-hour replays are terminal no-ops on
+# both the feed route and the #522 demand route.
+echo "[mock-e2e] demand feed: T10 freeze / lost-ACK resume"
+feed_freeze 2020-01-01T10
+fixture_values "$WORK_DIR/values-t10-before.json"
+reply="$(feed_post deliver <(jq -nc '{hour:"2020-01-01T10"}'))" \
+    || die "T10 single-page deliver failed"
+echo "$reply" >"$LOG_DIR/feed-deliver-10-first.json"
+[ "$(jq -r '.delivered_page' <<<"$reply")" = "0" ] \
+    && [ "$(jq -r '.applied' <<<"$reply")" = "true" ] \
+    && [ "$(jq -r '.remaining_pages' <<<"$reply")" = "2" ] \
+    && [ "$(jq -r '.touched_tasks' <<<"$reply")" -gt 0 ] \
+    || die "T10 first deliver unexpected: $reply"
+# The first page's exact prefix effect: every task shows exactly the
+# generated page-0 delta — including the untouched ones (zero).
+fixture_values "$WORK_DIR/values-t10-page0.json"
+delta_diff "$WORK_DIR/values-t10-before.json" "$WORK_DIR/values-t10-page0.json" \
+    "$FIXTURES/t10-page0-expectations.json"
+assert_all_deltas "$WORK_DIR/values-t10-before.json" "$WORK_DIR/values-t10-page0.json" \
+    "$FIXTURES/t10-page0-expectations.json"
+q="$(query_count)"
+echo 'CORRUPTED upstream document' >"$FIXTURES/hours/2020-01-01T10.json"
+feed_out="$LOG_DIR/demand-feed-10.json"
+feed_cli "$feed_out" || die "demand-feed T10 resume failed -- see $feed_out"
+[ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
+    && [ "$(jq -r '.staged_pages' "$feed_out")" = "0" ] \
+    && [ "$(jq -r '.delivered_pages' "$feed_out")" = "2" ] \
+    || die "demand-feed T10: expected delivered/0 staged/2 delivered, got $(cat "$feed_out")"
+expect_watermark 2020-01-01T10
+[ "$(query_count)" = "$q" ] \
+    || die "frozen T10 resume must not query the (now corrupt) provider"
+values_checkpoint
+reply="$(feed_post deliver <(jq -nc '{hour:"2020-01-01T10"}'))" \
+    || die "T10 delivered replay must be an accepted no-op"
+echo "$reply" >>"$LOG_DIR/feed-deliver-10-first.json"
+[ "$(jq -r '.state' <<<"$reply")" = "delivered" ] \
+    && [ "$(jq -r '.delivered_page' <<<"$reply")" = "null" ] \
+    && [ "$(jq -r '.applied' <<<"$reply")" = "false" ] \
+    && [ "$(jq -r '.touched_tasks' <<<"$reply")" = "0" ] \
+    && [ "$(jq -r '.remaining_pages' <<<"$reply")" = "0" ] \
+    || die "T10 replay must be a delivered no-op, got $reply"
+# The deterministic #522 batch id the first page already accepted:
+# replaying it through the demand route writes nothing.
+demand_reply="$(demand_post "$FIXTURES/pages/2020-01-01T10-demand-replay.json")" \
+    || die "demand replay must be accepted"
+echo "$demand_reply" >"$LOG_DIR/demand-replay-10.json"
+[ "$(jq -r '.applied' <<<"$demand_reply")" = "false" ] \
+    || die "demand replay must report applied=false, got $demand_reply"
+assert_values_unchanged "$WORK_DIR/values-prev.json"
+
+# Exact whole-set demand deltas: every one of the 528 fixture tasks
+# (all 520 consumers AND every shared base closure) must show exactly
+# its generated expected_delta — no spot checks.
+echo "[mock-e2e] demand feed: exact whole-set demand deltas"
+fixture_values "$WORK_DIR/values-final.json"
+delta_diff "$WORK_DIR/values-init.json" "$WORK_DIR/values-final.json"
+assert_all_deltas "$WORK_DIR/values-init.json" "$WORK_DIR/values-final.json"
+fixture_rows "$WORK_DIR/fixture-rows.jsonl"
+assert_fixture_rows
+
+# The provider log: exact per-hour query counts — T00/T04/T10 never
+# appear (frozen bytes), T05 twice (missing then valid), T06 four
+# times (three failures + retry), T09 twice (broken meta + valid).
+echo "[mock-e2e] demand feed: provider query log"
+feed_hours="$(jq -r '.hour' "$QUERY_LOG" | sort | uniq -c | tr -s ' ' | tr '\n' ';')"
+expected_hours=" 1 2020-01-01T01; 1 2020-01-01T02; 1 2020-01-01T03; 2 2020-01-01T05; 4 2020-01-01T06; 1 2020-01-01T07; 1 2020-01-01T08; 2 2020-01-01T09;"
+[ "$feed_hours" = "$expected_hours" ] \
+    || die "unexpected provider-query timeline: $feed_hours"
+
+# Consent + sampling stay pinned to the checked-in SQL: weighted
+# `sum(_sample_interval * double1)` under deterministic full ordering
+# with LIMIT ALL (no engine-side truncation), and consent enforced at
+# write time (STOW_NO_ANALYTICS) — the query can only ever see
+# identities from consenting rows.
+grep -q '_sample_interval \* double1' "$REPO_ROOT/edge/templates/demand_feed.sql" \
+    || die "demand feed query lost the weighted sampling estimate"
+grep -q 'LIMIT ALL' "$REPO_ROOT/edge/templates/demand_feed.sql" \
+    || die "demand feed query lost LIMIT ALL truncation guard"
+grep -q 'STOW_NO_ANALYTICS' "$REPO_ROOT/edge/templates/demand_feed.sql" \
+    || die "demand feed query lost the consent contract"
+# Observability limit, stated honestly: public surfaces expose queue
+# values only — aborted/prepared input is proven here as zero value
+# effect, and accepted-vs-consumed under real dispatch remains
+# measured only by the existing stow#522 native budget drives.
 
 # stow#336: production links every Linux unit against the Debian buster
 # (glibc 2.28) sysroot build-crate.yml provisions — the dispatched builds

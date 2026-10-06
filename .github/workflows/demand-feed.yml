@@ -1,0 +1,79 @@
+name: Demand feed
+
+# The hourly demand feed (stow#523): once an hour one job runs
+# `stow-admin scheduler demand-feed`, which resumes the durable feed
+# cursor first — an unfinished staging attempt restarts from scratch,
+# a frozen `complete` hour delivers its original immutable pages with
+# no new Analytics Engine query — and only then materializes the next
+# closed hour: one `analytics_engine/sql` FORMAT JSON query streamed to
+# disk, staged to the Durable Object as bounded manifest-chained pages,
+# frozen, then delivered to `delivered` and retired through the bounded
+# cleanup drain. State lives in the object, so a failed job is visible
+# here and the next tick resumes the cursor exactly — no runner-side
+# state, no background timers in the object.
+#
+# Ordering note: the feed command lands on `main` with this change, so
+# the toolchain this job pulls must come from a merge-queue commit that
+# carries it. Until then the job fails visibly at the `stow-toolchain`
+# pull or at clap — there is no per-hour toolchain build and no
+# silent legacy fallback, by design.
+
+on:
+  schedule:
+    # Five past the hour: Analytics Engine closes a hour's writes at the
+    # boundary, and the small skew absorbs the delay Cloudflare reports
+    # on sampled rows.
+    - cron: "5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+# One invocation at a time, and a pending tick is never cancelled: the
+# next cron resumes the durable cursor, so queueing stale ticks only
+# repeats the same hour's drain.
+concurrency:
+  group: demand-feed
+  cancel-in-progress: false
+
+jobs:
+  feed:
+    runs-on: ubuntu-latest
+    # The explicit deadline bounds one invocation's resume, query,
+    # staging, delivery and retirement work — a huge hour posts more
+    # bounded calls, and a run that cannot finish inside the window
+    # leaves the durable cursor for the next tick to resume.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: read # pull the pinned stow toolchain from GHCR
+      # Mints the run's OIDC token — the edge accepts any workflow OIDC
+      # minted inside water-rs/stow for the scheduler endpoints, and
+      # stow-admin refreshes it per request.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Scheduled runs execute on the default branch, but the signed
+      # toolchain artifact exists only for merge-queue commits on
+      # `main` — resolve `main`'s head and pull that commit's verified
+      # toolchain, never a per-job source build.
+      - name: Resolve the signed toolchain commit
+        id: toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ steps.toolchain.outputs.sha }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run the hourly demand feed
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+        run: |
+          set -euo pipefail
+          stow-admin scheduler demand-feed

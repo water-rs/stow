@@ -554,7 +554,10 @@ impl Watcher<'_> {
     /// writes the event at the point it catches a DO `overloaded` error
     /// (#438); until that writer lands the count is legitimately 0.
     async fn overloaded_reading(&self) -> Result<Vec<Reading>, String> {
-        let query = "SELECT count() AS events FROM stow_events \
+        // Additive estimate: `_sample_interval * double1` sums each
+        // point's engine-recorded interval times its stored weight —
+        // `count()` for today's unsampled writes, scaled if sampled.
+        let query = "SELECT sum(_sample_interval * double1) AS events FROM stow_events \
                      WHERE blob1 = 'overloaded' \
                      AND timestamp >= NOW() - INTERVAL '1' HOUR \
                      FORMAT JSON";
@@ -576,16 +579,12 @@ impl Watcher<'_> {
             .into_json()
             .await
             .map_err(|error| format!("decode {url}: {error}"))?;
-        let events = envelope.data.first().map_or(0, |row| row.events);
+        let events = envelope.data.first().map_or(0.0, |row| row.events);
         let signal = signal("edge.do.overloaded");
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "an hourly event count stays far below 2^52, where f64 is exact"
-        )]
         Ok(vec![Reading {
             signal,
             sample: 1,
-            value: events as f64,
+            value: events,
             evidence: vec![format!(
                 "stow_events blob1='overloaded' last hour: {events}"
             )],
@@ -1347,9 +1346,10 @@ impl CfSnapshot {
 
 #[derive(Debug, serde::Deserialize)]
 struct AnalyticsRow {
-    // `count()` is a UInt64 — `FORMAT JSON` emits it as a quoted string.
-    #[serde(default, deserialize_with = "analytics::de_u64")]
-    events: u64,
+    // `sum(_sample_interval * double1)` is a Float64 — a plain JSON
+    // number (the quoted form is accepted too).
+    #[serde(default, deserialize_with = "analytics::de_f64")]
+    events: f64,
 }
 
 // ----- GitHub wire types -----
@@ -1529,9 +1529,65 @@ async fn find_incident(gh_token: &str) -> Result<Option<GhIssue>, String> {
     }))
 }
 
-/// Create the `incident` label when the repo lacks it — a 422 "already
-/// exists" is success.
-async fn ensure_label(gh_token: &str) -> Result<(), String> {
+/// Is `error` the typed `zenwave::Error::Http` carrying `code`? Other
+/// kinds — transport, URI, decode — carry no status.
+const fn is_http_status(error: &zenwave::Error, code: u16) -> bool {
+    matches!(error, zenwave::Error::Http { status, .. } if status.as_u16() == code)
+}
+
+/// The named label's GET body — `name` is the only field read.
+#[derive(Debug, serde::Deserialize)]
+struct NamedLabel {
+    name: String,
+}
+
+/// GitHub's structured 422 body — each row names the resource, field
+/// and rule it rejected.
+#[derive(Debug, serde::Deserialize)]
+struct LabelValidationError {
+    errors: Vec<LabelValidationRow>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LabelValidationRow {
+    resource: String,
+    field: String,
+    code: String,
+}
+
+/// The concurrent-create win — a 422 whose validation body names only
+/// `Label`/`name`/`already_exists` rows. A malformed body, other codes
+/// or mixed rows are not a race: they stay failures.
+fn is_duplicate_label_conflict(error: &zenwave::Error) -> bool {
+    if !is_http_status(error, 422) {
+        return false;
+    }
+    let Some(validation) = error.deserialize_http_error::<LabelValidationError>() else {
+        return false;
+    };
+    !validation.errors.is_empty()
+        && validation.errors.iter().all(|row| {
+            row.resource == "Label" && row.field == "name" && row.code == "already_exists"
+        })
+}
+
+/// Ensure the `incident` label exists without mutating it when present.
+/// `GET /labels/{name}` answers first — a 200 costs one named lookup
+/// and no POST; the typed `Error::Http` 404 is the only normal missing
+/// case and falls through to one bounded `POST /labels`. zenwave lifts
+/// 4xx/5xx into `Err(Error::Http)` at `.await`, so every status read
+/// happens on the error, never on a response branch that cannot run.
+/// A 200 names a different entity → hard failure. The POST accepts 201;
+/// a racing create answers 422, success only via
+/// [`is_duplicate_label_conflict`]. Everything else — auth, transport,
+/// server and validation failures — propagates. `request_timeout`
+/// bounds each whole read — send, status, and body decode — so a
+/// stalled body cannot outlive it.
+async fn ensure_label(
+    api_base: &str,
+    gh_token: &str,
+    request_timeout: std::time::Duration,
+) -> Result<(), String> {
     #[derive(serde::Serialize)]
     struct NewLabel {
         name: &'static str,
@@ -1543,27 +1599,92 @@ async fn ensure_label(gh_token: &str) -> Result<(), String> {
         color: "B60205",
         description: "stow watchdog incident — one open issue per incident",
     };
-    let path = "labels";
-    let url = format!("https://api.github.com/repos/{}/{path}", github::REPO);
+    // The default client yields `zenwave::Error` — the 30 s request bound
+    // the watchdog's other calls use goes on the await through tokio so the
+    // carried response stays reachable (`Error::response()`); a middleware
+    // timeout would make the error type opaque.
     let mut client = zenwave::client();
-    let response = client
-        .post(&url)
+
+    let get_url = format!("{api_base}/repos/{}/labels/{INCIDENT_LABEL}", github::REPO);
+    let request = client
+        .get(&get_url)
         .and_then(|request| request.header("Authorization", format!("Bearer {gh_token}")))
-        .and_then(|request| request.header("User-Agent", "stow-admin"))
+        .and_then(|request| request.header("User-Agent", github::USER_AGENT))
+        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
+        .map_err(|error| format!("GET {get_url}: {error}"))?;
+    // The deadline covers the whole named-label read — the send, the
+    // status, and the body decode — so a response that stalls mid-body
+    // expires here instead of hanging the mail that follows.
+    let found = tokio::time::timeout(request_timeout, {
+        let url = get_url.clone();
+        async move {
+            let response = match request.await {
+                // A backend that delivers 4xx/5xx as `Ok` meets the same
+                // gate: `error_for_status` lifts it into the `Err` arm.
+                Ok(response) => response.error_for_status().await,
+                Err(error) => Err(error),
+            };
+            match response {
+                Ok(response) => response
+                    .into_json::<NamedLabel>()
+                    .await
+                    .map(Some)
+                    .map_err(|error| format!("GET {url}: {error}")),
+                Err(error) if is_http_status(&error, 404) => Ok(None),
+                Err(error) => Err(format!("GET {url}: {error}")),
+            }
+        }
+    })
+    .await
+    .map_err(|_| format!("GET {get_url}: timed out"))??;
+    if let Some(found) = found {
+        return if found.name == INCIDENT_LABEL {
+            Ok(())
+        } else {
+            Err(format!(
+                "GET {get_url}: label `{}` is not `{INCIDENT_LABEL}`",
+                found.name
+            ))
+        };
+    }
+
+    let post_url = format!("{api_base}/repos/{}/labels", github::REPO);
+    let request = client
+        .post(&post_url)
+        .and_then(|request| request.header("Authorization", format!("Bearer {gh_token}")))
+        .and_then(|request| request.header("User-Agent", github::USER_AGENT))
         .and_then(|request| request.header("Accept", "application/vnd.github+json"))
         .and_then(|request| request.json_body(&label))
-        .map_err(|error| format!("POST {url}: {error}"))?
-        .await
-        .map_err(|error| format!("POST {url}: {error}"))?;
-    let status = response.status().as_u16();
-    if status == 422 || (200..300).contains(&status) {
+        .map_err(|error| format!("POST {post_url}: {error}"))?;
+    // Same whole-read bound: `error_for_status` reads the error body
+    // where a backend delivers non-2xx on `Ok`, so it lives inside the
+    // deadline too; the 422 check's `body_text` arrives inside
+    // `Error::Http` and needs no further read.
+    let post_result = tokio::time::timeout(request_timeout, async move {
+        match request.await {
+            Ok(response) => response.error_for_status().await,
+            Err(error) => Err(error),
+        }
+    })
+    .await
+    .map_err(|_| format!("POST {post_url}: timed out"))?;
+    let error = match post_result {
+        Ok(created) => {
+            return if created.status() == zenwave::StatusCode::CREATED {
+                Ok(())
+            } else {
+                Err(format!(
+                    "POST {post_url}: unexpected status {}",
+                    created.status()
+                ))
+            };
+        }
+        Err(error) => error,
+    };
+    if is_duplicate_label_conflict(&error) {
         return Ok(());
     }
-    response
-        .error_for_status()
-        .await
-        .map_err(|error| format!("POST {url}: {error}"))?;
-    Ok(())
+    Err(format!("POST {post_url}: {error}"))
 }
 
 /// `digest_due` — is it an hour or more since the last watchdog comment?
@@ -1989,7 +2110,10 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
                 .push("would open/update the incident issue".to_owned());
         } else {
             let issue = update_incident(
-                &gh_token,
+                GhChannel {
+                    api_base: github::API_BASE,
+                    token: &gh_token,
+                },
                 watcher.now,
                 &now_text,
                 &title,
@@ -2398,12 +2522,23 @@ struct IssueOutcome {
     failure: Option<String>,
 }
 
+/// The GitHub API the issue channel writes to — production passes
+/// `github::API_BASE`; tests hand an owned loopback URL, so the
+/// endpoint is explicit state rather than a global.
+#[derive(Clone, Copy)]
+struct GhChannel<'a> {
+    /// API root — `https://api.github.com` or a test loopback.
+    api_base: &'a str,
+    /// The operator's GitHub token.
+    token: &'a str,
+}
+
 /// Open-or-update the incident issue and hold its comment cadence — the
 /// durable record channel. Called only on a real (non-dry-run) run with
 /// an incident; any step that fails lands in `failure` rather than
 /// aborting the mail that follows.
 async fn update_incident(
-    gh_token: &str,
+    gh: GhChannel<'_>,
     now: OffsetDateTime,
     now_text: &str,
     title: &str,
@@ -2412,7 +2547,9 @@ async fn update_incident(
     outcome: &mut ApplyOutcome,
 ) -> stow_types::error::Result<IssueOutcome> {
     let mut issue_outcome = IssueOutcome::default();
-    if let Err(error) = ensure_label(gh_token).await {
+    if let Err(error) =
+        ensure_label(gh.api_base, gh.token, std::time::Duration::from_secs(30)).await
+    {
         issue_outcome.failure = Some(format!("label: {error}"));
     } else {
         let body = IncidentTemplate {
@@ -2424,7 +2561,7 @@ async fn update_incident(
         }
         .render()
         .map_err(|error| stow_error!("render incident body: {error}"))?;
-        match upsert_incident(gh_token, title, &body).await {
+        match upsert_incident(gh.token, title, &body).await {
             Err(error) => issue_outcome.failure = Some(error),
             Ok((issue, opened)) => {
                 issue_outcome.opened = opened;
@@ -2438,7 +2575,7 @@ async fn update_incident(
                 if !opened {
                     // Digest cadence: at most one comment an hour; a
                     // freshly opened issue needs none.
-                    match last_digest_at(gh_token, issue.number).await {
+                    match last_digest_at(gh.token, issue.number).await {
                         Ok(last) => {
                             if digest_due(last, now) {
                                 let comment = DigestTemplate {
@@ -2449,7 +2586,7 @@ async fn update_incident(
                                 }
                                 .render()
                                 .map_err(|error| stow_error!("render digest: {error}"))?;
-                                match post_comment(gh_token, issue.number, &comment).await {
+                                match post_comment(gh.token, issue.number, &comment).await {
                                     Ok(()) => {
                                         issue_outcome.digest_posted = true;
                                         outcome.actions.push("digest comment posted".to_owned());
@@ -2658,18 +2795,18 @@ mod tests {
     }
 
     /// The Analytics Engine `FORMAT JSON` response quotes 64-bit
-    /// integers — `count()` arrives as `"0"`, not `0` (issue #485).
+    /// aggregates — `"0"` decodes just like `0` (issue #485).
     #[test]
     fn analytics_response_decodes_quoted_numbers() {
         let json =
             r#"{"meta":[{"name":"events","type":"UInt64"}],"data":[{"events":"0"}],"rows":1}"#;
         let envelope: Envelope<AnalyticsRow> = serde_json::from_str(json).unwrap();
-        assert_eq!(envelope.data[0].events, 0);
-        // An unquoted integer decodes too — a narrower-than-64-bit
-        // column stays a JSON number on the wire.
+        assert_eq!(envelope.data[0].events, 0.0);
+        // An unquoted number decodes too — a Float64 column stays a
+        // plain JSON number on the wire.
         let envelope: Envelope<AnalyticsRow> =
             serde_json::from_str(r#"{"data":[{"events":17}]}"#).unwrap();
-        assert_eq!(envelope.data[0].events, 17);
+        assert_eq!(envelope.data[0].events, 17.0);
     }
 
     /// A GraphQL `errors` array is a hard error — never a partial read.
@@ -2764,5 +2901,315 @@ mod tests {
             .next()
             .and_then(|tail| tail.strip_suffix(')'));
         assert_eq!(target, Some("aarch64-apple-darwin"));
+    }
+
+    // ===== `ensure_label` against a real client on a loopback =====
+    //
+    // The #565 regression suite: zenwave lifts 4xx/5xx into
+    // `Err(Error::Http)` at `.await`, so the scripted steps below feed
+    // the real default client through the pinned Hyper error path — no
+    // mock, no other backend. Each server is owned by its test, joined
+    // for the captured request heads, and bounded by `test_server`'s
+    // own connection/join timeouts.
+
+    /// The captured request at `index` — method and path, in order.
+    fn request_at(heads: &[http::request::Parts], index: usize) -> (&http::Method, &str) {
+        let head = &heads[index];
+        (&head.method, head.uri.path())
+    }
+
+    /// `GET /labels/incident` 200 → no mutation at all.
+    #[tokio::test]
+    async fn present_incident_label_costs_one_get() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"id":123,"name":"incident","color":"B60205","default":false}"#,
+        }])
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ensure_label(
+                &server.url,
+                "test-token",
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("ensure_label completes within the deadline")
+        .expect("a present label is success");
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
+        assert_eq!(
+            request_at(&heads, 0),
+            (&http::Method::GET, "/repos/water-rs/stow/labels/incident")
+        );
+    }
+
+    /// A 200 naming a different entity is not the label's presence —
+    /// fail rather than silently accept it.
+    #[tokio::test]
+    async fn mismatched_label_name_fails() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"id":124,"name":"incidents","color":"B60205","default":false}"#,
+        }])
+        .await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ensure_label(
+                &server.url,
+                "test-token",
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("ensure_label completes within the deadline")
+        .expect_err("a different entity is not `incident`");
+        assert!(error.contains("is not"), "unexpected error: {error}");
+        server.join().await;
+    }
+
+    /// 404 → exactly one bounded `POST /labels` accepted at 201.
+    #[tokio::test]
+    async fn missing_incident_label_posts_once() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::Respond {
+                status: 404,
+                retry_after: None,
+                body: r#"{"message":"Not Found","documentation_url":"https://docs.github.com"}"#,
+            },
+            crate::test_server::Step::Respond {
+                status: 201,
+                retry_after: None,
+                body: r#"{"id":123,"name":"incident","color":"B60205","default":false}"#,
+            },
+        ])
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ensure_label(
+                &server.url,
+                "test-token",
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("ensure_label completes within the deadline")
+        .expect("a missing label is created");
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
+        assert_eq!(
+            request_at(&heads, 0),
+            (&http::Method::GET, "/repos/water-rs/stow/labels/incident")
+        );
+        assert_eq!(
+            request_at(&heads, 1),
+            (&http::Method::POST, "/repos/water-rs/stow/labels")
+        );
+    }
+
+    /// The racing create: 422 whose every validation row is
+    /// `Label`/`name`/`already_exists` — GitHub's own duplicate body.
+    #[tokio::test]
+    async fn concurrent_label_create_is_success() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::Respond {
+                status: 404,
+                retry_after: None,
+                body: r#"{"message":"Not Found"}"#,
+            },
+            crate::test_server::Step::Respond {
+                status: 422,
+                retry_after: None,
+                body: r#"{"message":"Validation Failed","errors":[{"resource":"Label","code":"already_exists","field":"name","message":"name already exists"}],"documentation_url":"https://docs.github.com/rest/issues/labels"}"#,
+            },
+        ])
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ensure_label(
+                &server.url,
+                "test-token",
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("ensure_label completes within the deadline")
+        .expect("a concurrent duplicate is the race win");
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
+    }
+
+    /// Every other 422 stays a failure: another rule, a mixed body,
+    /// an empty `errors`, a missing `errors` — none is the race.
+    #[tokio::test]
+    async fn other_422_validation_failures_propagate() {
+        let bodies = [
+            // another rule rejected the name
+            r#"{"message":"Validation Failed","errors":[{"resource":"Label","code":"custom","field":"name","message":"name is disallowed"}]}"#,
+            // already_exists alongside an unrelated row
+            r#"{"message":"Validation Failed","errors":[{"resource":"Label","code":"already_exists","field":"name"},{"resource":"Label","code":"custom","field":"color","message":"color is invalid"}]}"#,
+            // an empty errors array names nothing
+            r#"{"message":"Validation Failed","errors":[]}"#,
+            // no errors array at all — malformed for the gate
+            r#"{"message":"Validation Failed"}"#,
+        ];
+        for body in bodies {
+            let server = crate::test_server::Loopback::start(vec![
+                crate::test_server::Step::Respond {
+                    status: 404,
+                    retry_after: None,
+                    body: r#"{"message":"Not Found"}"#,
+                },
+                crate::test_server::Step::Respond {
+                    status: 422,
+                    retry_after: None,
+                    body,
+                },
+            ])
+            .await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                ensure_label(
+                    &server.url,
+                    "test-token",
+                    std::time::Duration::from_secs(30),
+                ),
+            )
+            .await
+            .expect("ensure_label completes within the deadline")
+            .expect_err("non-duplicate 422s stay failures");
+            let heads = server.join().await;
+            assert_eq!(heads.len(), 2);
+        }
+    }
+
+    /// A non-2xx on the POST that is not the duplicate race — 403 on
+    /// create — propagates rather than being read as success.
+    #[tokio::test]
+    async fn forbidden_label_create_fails() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::Respond {
+                status: 404,
+                retry_after: None,
+                body: r#"{"message":"Not Found"}"#,
+            },
+            crate::test_server::Step::Respond {
+                status: 403,
+                retry_after: None,
+                body: r#"{"message":"Forbidden"}"#,
+            },
+        ])
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ensure_label(
+                &server.url,
+                "test-token",
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("ensure_label completes within the deadline")
+        .expect_err("a forbidden create is a failure");
+        server.join().await;
+    }
+
+    /// Authorization and server failures on the named GET propagate —
+    /// neither is the missing case.
+    #[tokio::test]
+    async fn label_get_failures_propagate() {
+        for status in [403u16, 500u16] {
+            let server =
+                crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+                    status,
+                    retry_after: None,
+                    body: r#"{"message":"broken"}"#,
+                }])
+                .await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                ensure_label(
+                    &server.url,
+                    "test-token",
+                    std::time::Duration::from_secs(30),
+                ),
+            )
+            .await
+            .expect("ensure_label completes within the deadline")
+            .expect_err("a non-404 GET failure propagates");
+            let heads = server.join().await;
+            assert_eq!(heads.len(), 1);
+        }
+    }
+
+    /// A 200 whose headers land but whose body never completes must die
+    /// on the request deadline — the named-label read is bounded end to
+    /// end, not just to the headers.
+    #[tokio::test]
+    async fn a_stalled_label_body_fails_inside_the_deadline() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Stall {
+            status: 200,
+            body: r#"{"id":123,"name":"inci"#,
+            content_length: 256,
+        }])
+        .await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ensure_label(
+                &server.url,
+                "test-token",
+                std::time::Duration::from_millis(400),
+            ),
+        )
+        .await
+        .expect("ensure_label completes within the deadline")
+        .expect_err("a stalled body is a failure, not a hang");
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+        server.join().await;
+    }
+
+    /// The issue channel's failure folds into `IssueOutcome` instead of
+    /// aborting `update_incident` — the mail path afterwards never sees
+    /// the error, and the channel stops before touching anything else.
+    #[tokio::test]
+    async fn issue_channel_error_stays_off_the_mail_path() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 403,
+            retry_after: None,
+            body: r#"{"message":"Forbidden"}"#,
+        }])
+        .await;
+        let mut outcome = ApplyOutcome::default();
+        let issue = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            update_incident(
+                GhChannel {
+                    api_base: &server.url,
+                    token: "test-token",
+                },
+                OffsetDateTime::now_utc(),
+                "now",
+                "stow incident: cf.d1.rows_written",
+                &[],
+                &[],
+                &mut outcome,
+            ),
+        )
+        .await
+        .expect("update_incident completes within the deadline")
+        .expect("the issue channel's failure is not fatal");
+        assert!(
+            issue
+                .failure
+                .as_deref()
+                .is_some_and(|f| f.contains("label:")),
+            "expected the label failure in the outcome, got {:?}",
+            issue.failure
+        );
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
     }
 }

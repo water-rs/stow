@@ -176,6 +176,15 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
                 "/scheduler/budget".post(api::admin_scheduler_budget),
                 "/scheduler/budget/seed".post(api::admin_scheduler_budget_seed),
                 "/scheduler/demand".post(api::admin_scheduler_demand),
+                "/scheduler/demand-feed".route((
+                    "/query".post(api::admin_scheduler_demand_feed_query),
+                    "/begin".post(api::admin_scheduler_demand_feed_begin),
+                    "/page".post(api::admin_scheduler_demand_feed_page),
+                    "/complete".post(api::admin_scheduler_demand_feed_complete),
+                    "/cleanup".post(api::admin_scheduler_demand_feed_cleanup),
+                    "/deliver".post(api::admin_scheduler_demand_feed_deliver),
+                    "/status".at(api::admin_scheduler_demand_feed_status),
+                )),
                 "/status".at(api::admin_status),
             ))
             .with(gate.clone()),
