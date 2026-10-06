@@ -98,10 +98,14 @@ lto = "thin"
 # which is how stow-admin's long resolve and submit calls failed. Its h2 pool
 # fix (zen-rs/zenwave#96): a pooled HTTP/2 connection the server sent GOAWAY
 # on was handed out again, so the first GitHub API call after an idle gap
-# failed with `GoAway(NO_ERROR, Remote)`. Neither is in a release yet; the pin
-# is the exact commit on zenwave's dev and moves to a crates.io version once
-# one carries them.
-zenwave = { git = "https://github.com/zen-rs/zenwave", rev = "f2bb056f8a52b746082400a7c4a60ba79c11b38f" }
+# failed with `GoAway(NO_ERROR, Remote)`.
+# The conditional-request fix (zen-rs/zenwave#97): FollowRedirect now follows
+# only 301/302/303/307/308, so GitHub's 304 answer to an If-None-Match read
+# reaches stow-admin's conditional handler instead of failing as a redirect
+# without Location, which is what aborted `preheat manual`. None of these is
+# in a release yet; the pin is the exact commit on zenwave's dev and moves to
+# a crates.io version once one carries them.
+zenwave = { git = "https://github.com/zen-rs/zenwave", rev = "776f9fd7d7626406b6300961e3a856e8f5297c69" }
 heel = { git = "https://github.com/lexoliu/heel", rev = "da72ac1abd8a7de66b7a4540fae9e2979e9b7616" }
 # cargo 0.99 (stow-resolver) pins rusqlite 0.40 → libsqlite3-sys ^0.38;
 # sqlx-sqlite releases cap below it, so two `links = "sqlite3"` crates

@@ -972,3 +972,41 @@ mod url_json_tests {
         assert_eq!(heads.len(), 4);
     }
 }
+
+#[cfg(test)]
+mod send_get_tests {
+    use super::send_get;
+    use crate::test_server;
+
+    /// A conditional GET's 304 answer carries no `Location` — it is a
+    /// cache verdict, not a redirect. The client must deliver it so the
+    /// caller can read the status itself; treating it as a redirect
+    /// failure (or retrying past it) is the bug under test.
+    #[tokio::test]
+    async fn send_get_delivers_a_conditional_304_without_location() {
+        let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+            status: 304,
+            retry_after: None,
+            body: "",
+        }])
+        .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_get(None, &server.url, None, Some("\"v1\"")),
+        )
+        .await
+        .expect("the conditional read answers inside the bound");
+        let heads = server.join().await;
+        let response = result.expect("a 304 without Location is a response, not a redirect error");
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].method, http::Method::GET);
+        assert_eq!(
+            heads[0]
+                .headers
+                .get(http::header::IF_NONE_MATCH)
+                .expect("the validator rides the request"),
+            "\"v1\""
+        );
+        assert_eq!(response.status().as_u16(), 304);
+    }
+}
