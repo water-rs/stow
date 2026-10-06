@@ -89,7 +89,10 @@ in-process for every CI target, layers it so each layer's deps sit in
 the published index, dispatches `build-crate.yml` through GitHub's
 `workflow_dispatch` API under the operator token, dispatches
 `index-publish.yml` between layers, and resumes by re-reading the
-published index — no edge, no local state. `--dispatch-url` points the
+published index — no edge, no local state. A `--projects` repository
+that fails to resolve is reported while the wave dispatches the rest,
+and the run exits non-zero naming it; a `--crates` or `--dirs` failure
+still aborts before dispatch. `--dispatch-url` points the
 wave at the mock's local CI server (`GET /tasks` polling, in-process
 index publish) for `scripts/mock-e2e.sh`.
 
