@@ -590,10 +590,9 @@ fn lockfile_packages(
 /// build.
 async fn stage_consumption_store(
     task: &BuildTaskPayload,
-    workspace: &BuildWorkspace,
 ) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
     let store_dir = TempDir::new()?;
-    let staged = match consume::prefetch(task, workspace, store_dir.path()).await {
+    let staged = match consume::prefetch(task, store_dir.path()).await {
         Ok(consumption) if consumption.artifacts > 0 => Some(consumption.store_dir),
         Ok(_) => None,
         Err(stow_cli::build_consume::StageFailure::Unavailable(error)) => {
@@ -622,7 +621,7 @@ pub async fn build(
 
     fetch_workspace_dependencies(task, &workspace).await?;
 
-    let (_consume_store_dir, consume_store) = stage_consumption_store(task, &workspace).await?;
+    let (_consume_store_dir, consume_store) = stage_consumption_store(task).await?;
 
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
         .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;

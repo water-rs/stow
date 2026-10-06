@@ -89,7 +89,26 @@ pub fn public_cache_allowed(
         .or_else(|| fallback_target.map(str::to_owned))
         .filter(|target| !target.trim().is_empty())?;
 
-    let marker = allow_marker_path(dir, target.as_str(), &parsed.crate_name);
+    // The driver's entries name packages; `parsed.crate_name` is the lib
+    // name `[lib] name` may have renamed (stow#578), so the package name
+    // comes from the registry source path. An invocation without one is
+    // a non-registry unit, which can hold no marker: the same answer a
+    // missing marker file gives. This signature has no error channel —
+    // its caller's decision type has none — so a probe error is logged
+    // and treated as deny, not silently allowed.
+    let crate_name = match stow_types::public_cache::detect_registry_crate_version(parsed) {
+        Ok(Some((name, _version))) => name,
+        Ok(None) => return Some(false),
+        Err(error) => {
+            tracing::warn!(
+                crate_name = %parsed.crate_name,
+                %error,
+                "registry identity probe failed; treating invocation as not allowed"
+            );
+            return Some(false);
+        }
+    };
+    let marker = allow_marker_path(dir, target.as_str(), &crate_name);
     Some(marker.exists())
 }
 
@@ -111,4 +130,68 @@ fn allow_marker_path(policy_dir: &Path, target: &str, crate_name: &str) -> PathB
         .join("allow")
         .join(target)
         .join(crate_name.replace('-', "_"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    /// stow#578: the driver writes allow markers by package name, but the
+    /// invocation spells the lib target name — a `[lib] name` rename must
+    /// still find its marker through the registry source path.
+    #[test]
+    fn a_renamed_lib_matches_its_package_allow_marker() {
+        let dir = tempfile::tempdir().expect("policy dir");
+        let parsed = stow_types::rustc::ParsedRustcArgs::parse(&[
+            OsString::from("--crate-name"),
+            OsString::from("debug_unreachable"),
+            OsString::from("--crate-type"),
+            OsString::from("lib"),
+            OsString::from("--target"),
+            OsString::from("x86_64-unknown-linux-gnu"),
+            OsString::from(
+                "/root/.cargo/registry/src/index.crates.io-0123abcd/new_debug_unreachable-1.0.6/src/lib.rs",
+            ),
+        ])
+        .expect("parse");
+        assert_eq!(parsed.crate_name, "debug_unreachable");
+
+        let marker = super::allow_marker_path(
+            dir.path(),
+            "x86_64-unknown-linux-gnu",
+            "new_debug_unreachable",
+        );
+        std::fs::create_dir_all(marker.parent().unwrap()).expect("marker dir");
+        std::fs::write(&marker, []).expect("write marker");
+
+        assert_eq!(
+            super::public_cache_allowed(Some(dir.path()), &parsed, None),
+            Some(true),
+            "the marker named for the package must cover the renamed lib unit"
+        );
+    }
+
+    /// A unit with no registry source path is a non-registry invocation:
+    /// it can hold no allow marker, so the answer is deny — the same as
+    /// a missing marker file.
+    #[test]
+    fn a_non_registry_unit_is_denied() {
+        let dir = tempfile::tempdir().expect("policy dir");
+        let parsed = stow_types::rustc::ParsedRustcArgs::parse(&[
+            OsString::from("--crate-name"),
+            OsString::from("mycrate"),
+            OsString::from("--crate-type"),
+            OsString::from("lib"),
+            OsString::from("--target"),
+            OsString::from("x86_64-unknown-linux-gnu"),
+            OsString::from("src/lib.rs"),
+        ])
+        .expect("parse");
+
+        assert_eq!(
+            super::public_cache_allowed(Some(dir.path()), &parsed, None),
+            Some(false),
+            "a non-registry unit gets the missing-marker answer"
+        );
+    }
 }

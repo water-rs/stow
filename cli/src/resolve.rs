@@ -464,14 +464,83 @@ fn resolve_reachable_cached_rows<'a>(
 ) -> stow_types::error::Result<ReachableRows<'a>> {
     let IndexedRows {
         candidates,
-        candidate_index,
         chain_rows,
-        chain_index,
     } = partition_cached_rows(key_pairs, rows)?;
 
-    // Reachability fixpoint over the union of candidates and chain rows:
-    // a node is reachable when every dependency identity it references is a
-    // reachable node. Nodes are addressed as (is_chain, index).
+    let (reachable_candidates, reachable_chain) = reachable_indices(&candidates, &chain_rows);
+
+    let mut kept_candidates = Vec::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if reachable_candidates.contains(&index) {
+            kept_candidates.push(candidate);
+        }
+    }
+    let mut kept_chain = Vec::new();
+    for (index, chain_row) in chain_rows.into_iter().enumerate() {
+        if reachable_chain.contains(&index) {
+            kept_chain.push(chain_row);
+        }
+    }
+
+    let candidate_by_c_metadata = by_c_metadata(&kept_candidates, |candidate| candidate.row);
+    let chain_by_c_metadata = by_c_metadata(&kept_chain, |chain_row| chain_row.row);
+    Ok(ReachableRows {
+        candidates: kept_candidates,
+        candidate_by_c_metadata,
+        chain_rows: kept_chain,
+        chain_by_c_metadata,
+    })
+}
+
+/// `c_metadata` → the indices of every row carrying it. A slice can hold
+/// two rows under one `c_metadata` (a linked and an unlinked unit shape),
+/// and a dependency edge — which records `c_metadata` alone — is
+/// satisfied by any of them (stow#578, mirroring the consume-side walk in
+/// stow#581).
+fn by_c_metadata<'a, Row>(
+    rows: &[Row],
+    row_of: impl Fn(&Row) -> &'a ArtifactIndexRow,
+) -> BTreeMap<String, Vec<usize>> {
+    let mut map = BTreeMap::<String, Vec<usize>>::new();
+    for (index, entry) in rows.iter().enumerate() {
+        map.entry(row_of(entry).c_metadata.as_str().to_owned())
+            .or_default()
+            .push(index);
+    }
+    map
+}
+
+/// Reachability fixpoint over the union of candidates and chain rows: a
+/// node is reachable when every dependency identity it references is a
+/// reachable node. Nodes are addressed as (`is_chain`, index); the result
+/// is the reachable index set per side.
+///
+/// Dependency identities record the `--extern` alias — the lib target
+/// name, which `[lib] name` may rename away from the package name rows
+/// are keyed on (stow#578) — so the recorded name is not an edge key at
+/// all. `c_metadata` is: it identifies the dep artifact uniquely, and an
+/// edge is satisfied when any row carrying it is reachable.
+fn reachable_indices<'a>(
+    candidates: &[ReachableCandidateRow<'a>],
+    chain_rows: &[ChainRow<'a>],
+) -> (BTreeSet<usize>, BTreeSet<usize>) {
+    let candidate_by_c_metadata = by_c_metadata(candidates, |candidate| candidate.row);
+    let chain_by_c_metadata = by_c_metadata(chain_rows, |chain_row| chain_row.row);
+    let edge_reachable = |identity: &DependencyIdentity,
+                          reachable_candidates: &BTreeSet<usize>,
+                          reachable_chain: &BTreeSet<usize>| {
+        candidate_by_c_metadata
+            .get(identity.c_metadata.as_str())
+            .is_some_and(|indices| {
+                indices
+                    .iter()
+                    .any(|index| reachable_candidates.contains(index))
+            })
+            || chain_by_c_metadata
+                .get(identity.c_metadata.as_str())
+                .is_some_and(|indices| indices.iter().any(|index| reachable_chain.contains(index)))
+    };
+
     let mut reachable_candidates = BTreeSet::<usize>::new();
     let mut reachable_chain = BTreeSet::<usize>::new();
     let mut progressed = true;
@@ -480,16 +549,7 @@ fn resolve_reachable_cached_rows<'a>(
         let reach_check = |identity: &DependencyIdentity,
                            reachable_candidates: &BTreeSet<usize>,
                            reachable_chain: &BTreeSet<usize>| {
-            let key = (
-                canonical_crate_name(&identity.crate_name),
-                identity.c_metadata.clone(),
-            );
-            candidate_index
-                .get(&key)
-                .is_some_and(|index| reachable_candidates.contains(index))
-                || chain_index
-                    .get(&key)
-                    .is_some_and(|index| reachable_chain.contains(index))
+            edge_reachable(identity, reachable_candidates, reachable_chain)
         };
         for (index, candidate) in candidates.iter().enumerate() {
             if reachable_candidates.contains(&index) {
@@ -518,42 +578,7 @@ fn resolve_reachable_cached_rows<'a>(
             }
         }
     }
-
-    let mut kept_candidates = Vec::new();
-    let mut kept_candidate_index = BTreeMap::new();
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        if reachable_candidates.contains(&index) {
-            kept_candidate_index.insert(
-                (
-                    canonical_crate_name(candidate.row.crate_name.as_str()),
-                    candidate.row.c_metadata.as_str().to_owned(),
-                ),
-                kept_candidates.len(),
-            );
-            kept_candidates.push(candidate);
-        }
-    }
-    let mut kept_chain = Vec::new();
-    let mut kept_chain_index = BTreeMap::new();
-    for (index, chain_row) in chain_rows.into_iter().enumerate() {
-        if reachable_chain.contains(&index) {
-            kept_chain_index.insert(
-                (
-                    canonical_crate_name(chain_row.row.crate_name.as_str()),
-                    chain_row.row.c_metadata.as_str().to_owned(),
-                ),
-                kept_chain.len(),
-            );
-            kept_chain.push(chain_row);
-        }
-    }
-
-    Ok(ReachableRows {
-        candidates: kept_candidates,
-        candidate_index: kept_candidate_index,
-        chain_rows: kept_chain,
-        chain_index: kept_chain_index,
-    })
+    (reachable_candidates, reachable_chain)
 }
 
 /// Partition index rows by request match: rows whose (package, features)
@@ -632,9 +657,7 @@ fn partition_cached_rows<'a>(
 
     Ok(IndexedRows {
         candidates,
-        candidate_index,
         chain_rows,
-        chain_index,
     })
 }
 
@@ -698,23 +721,24 @@ struct ChainRow<'a> {
 }
 
 /// Index rows partitioned by request match — semantic candidates and
-/// chain-only rows, each indexed by (canonical crate name, `c_metadata`).
+/// chain-only rows, each a node's (row, recorded dep edges).
 #[derive(Debug)]
 struct IndexedRows<'a> {
     candidates: Vec<ReachableCandidateRow<'a>>,
-    candidate_index: BTreeMap<(String, String), usize>,
     chain_rows: Vec<ChainRow<'a>>,
-    chain_index: BTreeMap<(String, String), usize>,
 }
 
 /// Reachability result: semantic candidates plus the chain-only rows their
 /// closures may traverse, both restricted to fully-resolvable nodes.
+/// Dependency edges key on `c_metadata` alone — the recorded dep name is
+/// the `--extern` alias, which `[lib] name` may rename away from the
+/// row's package name (stow#578).
 #[derive(Debug)]
 struct ReachableRows<'a> {
     candidates: Vec<ReachableCandidateRow<'a>>,
-    candidate_index: BTreeMap<(String, String), usize>,
+    candidate_by_c_metadata: BTreeMap<String, Vec<usize>>,
     chain_rows: Vec<ChainRow<'a>>,
-    chain_index: BTreeMap<(String, String), usize>,
+    chain_by_c_metadata: BTreeMap<String, Vec<usize>>,
 }
 
 impl ReachableRows<'_> {
@@ -724,7 +748,7 @@ impl ReachableRows<'_> {
     fn closure_artifacts(&self, selected: &BTreeSet<usize>) -> Vec<PrefetchArtifactRow> {
         let mut visited_candidates = BTreeSet::<usize>::new();
         let mut visited_chain = BTreeSet::<usize>::new();
-        let mut artifacts = BTreeMap::<(String, String), &ArtifactIndexRow>::new();
+        let mut artifacts = BTreeMap::<(String, String, &str), &ArtifactIndexRow>::new();
         let mut stack: Vec<(bool, usize)> = selected.iter().map(|&index| (false, index)).collect();
         while let Some((is_chain, index)) = stack.pop() {
             let (row, identities) = if is_chain {
@@ -744,17 +768,28 @@ impl ReachableRows<'_> {
                 (
                     canonical_crate_name(row.crate_name.as_str()),
                     row.c_metadata.as_str().to_owned(),
+                    row.bundle_digest.as_str(),
                 ),
                 row,
             );
             for identity in identities {
-                let key = (
-                    canonical_crate_name(&identity.crate_name),
-                    identity.c_metadata.clone(),
-                );
-                if let Some(&dependency_index) = self.candidate_index.get(&key) {
+                // The edge records `c_metadata` alone — every row carrying
+                // it (a slice may hold linked and unlinked unit shapes
+                // under one `c_metadata`) is a member of the closure.
+                for &dependency_index in self
+                    .candidate_by_c_metadata
+                    .get(identity.c_metadata.as_str())
+                    .into_iter()
+                    .flatten()
+                {
                     stack.push((false, dependency_index));
-                } else if let Some(&dependency_index) = self.chain_index.get(&key) {
+                }
+                for &dependency_index in self
+                    .chain_by_c_metadata
+                    .get(identity.c_metadata.as_str())
+                    .into_iter()
+                    .flatten()
+                {
                     stack.push((true, dependency_index));
                 }
             }
@@ -1332,6 +1367,96 @@ mod tests {
         let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
 
         assert!(reachable.candidates.is_empty());
+    }
+
+    #[test]
+    fn reachable_rows_follow_edges_to_renamed_lib_packages() {
+        // stow#578: a dependency edge records the `--extern` alias — the
+        // lib target name (`debug_unreachable`) — while the row is keyed
+        // by package (`new_debug_unreachable`). `c_metadata` is still the
+        // edge's unique identity, so the dep row must stay reachable and
+        // ride along in the prefetch closure.
+        let consumer_key = key("consumer", "1.0.0");
+        let renamed_key = key("new_debug_unreachable", "1.0.6");
+        let key_pairs = BTreeSet::from([
+            (consumer_key, "[]".to_owned()),
+            (renamed_key, "[]".to_owned()),
+        ]);
+        let rows = vec![
+            row(
+                "new_debug_unreachable",
+                "1.0.6",
+                "01f363aa41893bdd",
+                &[],
+                &[],
+            ),
+            row(
+                "consumer",
+                "1.0.0",
+                "1c0d7420b566b7a2",
+                &[],
+                &[("debug_unreachable", "01f363aa41893bdd")],
+            ),
+        ];
+
+        let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
+
+        assert_eq!(reachable.candidates.len(), 2);
+        let consumer_index = reachable
+            .candidates
+            .iter()
+            .position(|candidate| candidate.row.crate_name.as_str() == "consumer")
+            .expect("consumer candidate");
+        let closure = reachable.closure_artifacts(&BTreeSet::from([consumer_index]));
+        let names = closure
+            .iter()
+            .map(|row| (row.crate_name.as_str(), row.c_metadata.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains(&("consumer", "1c0d7420b566b7a2")));
+        assert!(names.contains(&("new_debug_unreachable", "01f363aa41893bdd")));
+    }
+
+    /// Two rows may carry one `c_metadata` (linked and unlinked unit
+    /// shapes of the same artifact): the dep edge that names it is
+    /// satisfied by either, and the closure fetches both.
+    #[test]
+    fn an_edge_reaches_every_row_sharing_its_c_metadata() {
+        let consumer_key = key("consumer", "1.0.0");
+        let key_pairs = BTreeSet::from([(consumer_key, "[]".to_owned())]);
+        let shape = |kind| stow_types::public_cache::UnitShape {
+            side: stow_types::public_cache::UnitSide::Target,
+            invocation: stow_types::public_cache::UnitInvocation::Target,
+            kind,
+        };
+        let mut linked = row("dep-linked", "1.0.0", "72e2ded9fa67e0a1", &[], &[]);
+        linked.unit_shape = Some(shape(stow_types::public_cache::UnitKind::Linked));
+        let mut unlinked = row("dep-unlinked", "1.0.0", "72e2ded9fa67e0a1", &[], &[]);
+        unlinked.unit_shape = Some(shape(stow_types::public_cache::UnitKind::Unlinked));
+        let rows = vec![
+            row(
+                "consumer",
+                "1.0.0",
+                "1c0d7420b566b7a2",
+                &[],
+                &[("dep", "72e2ded9fa67e0a1")],
+            ),
+            linked,
+            unlinked,
+        ];
+
+        let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
+
+        assert_eq!(reachable.candidates.len(), 1);
+        assert_eq!(reachable.chain_rows.len(), 2);
+        let closure = reachable.closure_artifacts(&BTreeSet::from([0]));
+        assert_eq!(
+            closure
+                .iter()
+                .map(|row| row.crate_name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["consumer", "dep-linked", "dep-unlinked"]),
+            "every row carrying the edge's c_metadata joins the closure"
+        );
     }
 
     #[test]

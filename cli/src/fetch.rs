@@ -967,6 +967,34 @@ mod tests {
         (manifest, files)
     }
 
+    /// stow#578: the bundle's `crate_name` is the package name — an
+    /// invocation whose lib target is renamed (`[lib] name`) validates
+    /// under the package name its registry path carries, never under the
+    /// lib name rustc reports.
+    #[test]
+    fn validate_bundle_identity_matches_the_package_name() {
+        let (manifest, files) = declared_bundle_parts();
+        let bundle = super::ArtifactBundle { manifest, files };
+
+        super::validate_bundle_identity(
+            &bundle,
+            "demo",
+            "aabbccddeeff0011",
+            "aarch64-apple-darwin",
+            "1.91.1",
+        )
+        .expect("the package name is the bundle's identity");
+        let error = super::validate_bundle_identity(
+            &bundle,
+            "debug_unreachable",
+            "aabbccddeeff0011",
+            "aarch64-apple-darwin",
+            "1.91.1",
+        )
+        .expect_err("a lib name that is not the package name must not match");
+        assert!(error.to_string().contains("crate mismatch"), "{error}");
+    }
+
     /// A bundle whose `files` map is exactly the declared set, with OCI
     /// manifest and config digests consistent enough to pass
     /// `validate_oci_manifest`.

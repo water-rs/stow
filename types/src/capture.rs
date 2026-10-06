@@ -7,6 +7,7 @@
 //! fact. Keeping the type here means the wrapper side and the collector side
 //! serialize exactly the same shape.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::platform::Profile;
@@ -36,6 +37,16 @@ pub struct CapturedRustcArtifact {
     pub crate_types: Vec<String>,
     /// The `--emit` list rustc was invoked with.
     pub emit: Vec<String>,
+    /// The `--cfg feature="…"` set the invocation compiled — cargo's
+    /// activated features for this unit's side. This is the identity the
+    /// consumer's unit graph reproduces and the published row must be
+    /// labelled with; cargo metadata's `resolve.features` is
+    /// platform-agnostic and side-unified, so it records implicit
+    /// features of optional deps a target never compiles (stow#579).
+    /// Required, not defaulted: the record only ever travels
+    /// wrapper → collector inside one build, so every reader sees the
+    /// same shape the writer built.
+    pub features: BTreeSet<String>,
     /// The `--target` triple rustc was invoked with, when cargo passed one.
     pub target: Option<String>,
     /// Full compile key of this invocation: the 64-hex blake3 stable identity

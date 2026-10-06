@@ -12,6 +12,11 @@
 #                                 (statements, rowsRead, rowsWritten
 #                                 against the in-code budgets) and exits
 #                                 non-zero on any over-budget route.
+#                                 wall_ms is measured and marked SLOW
+#                                 when it breaches, but never gates —
+#                                 this lane's wall is mostly the
+#                                 runner's storage latency, not the
+#                                 code's cost (stow#567).
 #
 # The gate measures scale, not just a budget at one size: the same pass
 # runs at two fixture sizes (100k and 1M queue rows, same shape) and a
@@ -289,7 +294,7 @@ echo "[budget] $migrate_out"
 print_table() {
     jq -r '
         "scheduler budget (queue rows \(.queue_rows), schema v\(.schema_version)):",
-        (.rows[] | "  \(.name | . + " " * (34 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget) wall_ms=\(.wall_ms)/\(.wall_budget)\(if .over_budget then " OVER" else "" end)")
+        (.rows[] | "  \(.name | . + " " * (34 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget) wall_ms=\(.wall_ms)/\(.wall_budget)\(if .over_budget then " OVER" else "" end)\(if .over_wall then " SLOW" else "" end)")
     ' "$1"
 }
 

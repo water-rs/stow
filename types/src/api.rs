@@ -1514,8 +1514,15 @@ pub struct SchedulerBudgetRow {
     /// so it can exceed the drive's measured window. `0` on host and
     /// on drives that never touch the catalog.
     pub d1_elapsed_ms: u64,
-    /// `true` when any of the four budgets is exceeded.
+    /// `true` when any of the three row budgets is exceeded —
+    /// statements, `rowsRead`, `rowsWritten`. Wall time is not in this
+    /// set; see `over_wall`.
     pub over_budget: bool,
+    /// `true` when `wall_ms` exceeded `wall_budget` — reported but
+    /// never gated: the local workerd lane's wall clock includes the
+    /// runner's storage latency (the in-window `db.sync()` durability
+    /// barrier on its SQLite), which is not the code's cost.
+    pub over_wall: bool,
     /// The per-statement log the totals are summed over.
     pub log: Vec<SchedulerBudgetStatement>,
 }

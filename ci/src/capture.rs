@@ -352,13 +352,17 @@ async fn serve_consumed_artifact(
             bundle.compile_key
         ));
     }
+    // The bundle's `crate_name` is the package name — compare against the
+    // stable identity's, which was derived from the registry source path.
+    // `original_parsed.crate_name` is the lib name `[lib] name` may have
+    // renamed (stow#578).
     if stow_types::public_cache::canonical_crate_name(&bundle.crate_name)
-        != stow_types::public_cache::canonical_crate_name(&original_parsed.crate_name)
+        != stow_types::public_cache::canonical_crate_name(&stable_identity.crate_name)
     {
         return Err(stow_types::stow_error!(
             "consume-store entry carries crate `{}` but the invocation is compiling `{}` — a staged bundle must match the unit it is served for",
             bundle.crate_name,
-            original_parsed.crate_name
+            stable_identity.crate_name
         ));
     }
 
@@ -416,6 +420,7 @@ async fn consumed_capture_record(
             .map(|(_, version)| version),
         crate_types: original_parsed.crate_types.clone(),
         emit: rewritten_parsed.emit.iter().cloned().collect(),
+        features: original_parsed.features.clone(),
         // The resolved triple, not the argv's: the publish stage checks
         // this claim against the index slice the bundle came from, and a
         // host unit's argv carries no `--target` to name it with.
@@ -504,6 +509,7 @@ fn observed_capture_record(
             .map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
+        features: parsed.features.clone(),
         target: parsed.target.clone(),
         // Observed units carry no stable identity; cargo's ephemeral
         // `-C metadata` is the only key they ever had.
@@ -787,7 +793,7 @@ async fn materialize_original_output_aliases(
         capture_dir,
     )
     .await?;
-    touch_invoked_timestamp_alias(original_parsed).await?;
+    touch_invoked_timestamp_alias(original_parsed, &identity.crate_name).await?;
     Ok(())
 }
 
@@ -871,18 +877,24 @@ pub async fn detect_rustc_toolchain(
     })
 }
 
-async fn touch_invoked_timestamp_alias(parsed: &ParsedRustcArgs) -> stow_types::error::Result<()> {
+/// Touch cargo's `invoked.timestamp` for a served unit. `package_name` is
+/// the stable identity's crate name — the PACKAGE name the registry
+/// source path carried — because cargo names the fingerprint dir
+/// `<pkg>-<meta>` and a `[lib] name` rename means `parsed.crate_name`
+/// (the lib target name) is not it (stow#578).
+async fn touch_invoked_timestamp_alias(
+    parsed: &ParsedRustcArgs,
+    package_name: &str,
+) -> stow_types::error::Result<()> {
     let Some(out_dir) = parsed.out_dir.as_ref() else {
         return Ok(());
     };
     let Some(profile_dir) = out_dir.parent() else {
         return Ok(());
     };
-    let fingerprint_dir = profile_dir.join(".fingerprint").join(format!(
-        "{}{}",
-        parsed.crate_name.replace('_', "-"),
-        parsed.extra_filename
-    ));
+    let fingerprint_dir = profile_dir
+        .join(".fingerprint")
+        .join(format!("{package_name}{}", parsed.extra_filename));
     let timestamp_path = fingerprint_dir.join("invoked.timestamp");
     smol::unblock(move || {
         std::fs::create_dir_all(&fingerprint_dir).wrap_err_with(|| {
@@ -1040,6 +1052,7 @@ async fn build_capture_record(
             .map(|(_, version)| version),
         crate_types: parsed.crate_types.clone(),
         emit: parsed.emit.iter().cloned().collect(),
+        features: parsed.features.clone(),
         target: parsed.target.clone(),
         compile_key,
         c_metadata,
@@ -1480,6 +1493,64 @@ mod tests {
     };
     use stow_types::rustc::ParsedRustcArgs;
 
+    /// stow#579: the record carries the invocation's own feature set —
+    /// the `--cfg feature="…"` args rustc compiled — which is what the
+    /// published row is labelled with, not cargo metadata's
+    /// platform-agnostic resolve features.
+    #[test]
+    fn the_record_stamps_the_invocations_feature_set() {
+        let _guard = env_guard();
+        // `ParsedRustcArgs::parse` folds RUSTFLAGS in; the sandbox never
+        // leaks them, so neither may the test.
+        let rustflags = std::env::var_os("RUSTFLAGS");
+        let encoded = std::env::var_os("CARGO_ENCODED_RUSTFLAGS");
+        unsafe {
+            std::env::remove_var("RUSTFLAGS");
+            std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
+        }
+        let parsed = ParsedRustcArgs::parse(
+            &[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "aarch64-apple-darwin",
+                "--cfg",
+                "feature=\"a\"",
+                "--cfg",
+                "feature=\"b\"",
+                "--cfg",
+                "unix",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+            ]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>(),
+        )
+        .expect("parse argv");
+        unsafe {
+            match rustflags {
+                Some(value) => std::env::set_var("RUSTFLAGS", value),
+                None => std::env::remove_var("RUSTFLAGS"),
+            }
+            match encoded {
+                Some(value) => std::env::set_var("CARGO_ENCODED_RUSTFLAGS", value),
+                None => std::env::remove_var("CARGO_ENCODED_RUSTFLAGS"),
+            }
+        }
+
+        let record = super::observed_capture_record(&parsed, "abc123", 0).expect("record");
+        assert_eq!(
+            record.features,
+            BTreeSet::from(["a".to_owned(), "b".to_owned()]),
+            "`unix` is a cfg, not a feature"
+        );
+    }
+
     fn parsed_lib(crate_name: &str, out_dir: PathBuf, extra_filename: &str) -> ParsedRustcArgs {
         ParsedRustcArgs {
             crate_name: crate_name.to_owned(),
@@ -1829,6 +1900,7 @@ mod tests {
                 "link".to_owned(),
                 "metadata".to_owned(),
             ],
+            features: BTreeSet::new(),
             target: Some("aarch64-apple-darwin".to_owned()),
             compile_key: format!("{c_metadata}deadbeef"),
             c_metadata: c_metadata.to_owned(),
@@ -2275,5 +2347,28 @@ mod tests {
             std::env::remove_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV);
             std::env::remove_var("CARGO_TARGET_DIR");
         }
+    }
+
+    /// stow#578: cargo names the fingerprint dir after the package
+    /// (`<pkg>-<meta>`), so a `[lib] name` rename must not send the
+    /// timestamp under the lib name the invocation spells.
+    #[test]
+    fn the_timestamp_alias_uses_the_package_fingerprint_name() {
+        smol::block_on(async {
+            let tempdir = tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("debug/deps");
+            let parsed = parsed_lib("debug_unreachable", out_dir, "-0123456789abcdef");
+
+            super::touch_invoked_timestamp_alias(&parsed, "new_debug_unreachable")
+                .await
+                .expect("touch timestamp");
+
+            assert!(
+                tempdir
+                    .path()
+                    .join("debug/.fingerprint/new_debug_unreachable-0123456789abcdef/invoked.timestamp")
+                    .exists()
+            );
+        });
     }
 }
