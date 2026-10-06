@@ -1517,6 +1517,10 @@ mod tests {
                         Ok((mut stream, _)) => {
                             served += 1;
                             *seen.lock().expect("request count") = served;
+                            // Windows hands accepted sockets the
+                            // listener's nonblocking mode; the stream's
+                            // own timeouts bound it instead.
+                            stream.set_nonblocking(false).expect("blocking stream");
                             stream
                                 .set_read_timeout(Some(STREAM_BOUND))
                                 .expect("read timeout");
