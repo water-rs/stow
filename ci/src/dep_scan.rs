@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
-use cargo_metadata::{Metadata, Package, PackageId, Target, TargetKind};
+use cargo_metadata::{Metadata, Package, Target, TargetKind};
 use sha2::Digest as _;
 use stow_types::api::BuildTaskPayload;
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
@@ -176,36 +176,30 @@ pub async fn scan_artifacts(
     })
 }
 
-/// The registry library packages of the task's resolved closure —
-/// `(canonical crate name, version, resolved features)` — the candidates
-/// the consumption prefetch may substitute a verified published artifact
-/// for. Kept `pub(crate)` so `consume` resolves candidates against exactly
-/// the same `cargo metadata` invocation the scan runs.
-pub async fn consumable_packages(
-    workspace: &BuildWorkspace,
-    task: &BuildTaskPayload,
-) -> stow_types::error::Result<Vec<ConsumablePackage>> {
-    let metadata = cargo_metadata(workspace).await?;
-    Ok(package_index(&metadata, task)
-        .into_values()
-        .flat_map(BTreeMap::into_values)
-        .filter(|package| package.registry)
-        .map(|package| ConsumablePackage {
-            crate_name: package.name.clone(),
-            version: package.version.clone(),
-            features: package.features,
+/// The task's dependency pins as consumption-prefetch candidates —
+/// `(canonical crate name, version, features)` of every dep unit the
+/// task compiles. A pin's feature set is the published identity the
+/// dep's own task was built at, so it is exactly what a correctly
+/// labelled row carries; `cargo metadata`'s platform-agnostic resolve
+/// features are not (stow#579).
+pub fn consumable_packages(task: &BuildTaskPayload) -> Vec<ConsumablePackage> {
+    task.dep_pins
+        .iter()
+        .map(|pin| ConsumablePackage {
+            crate_name: pin.crate_name.as_str().to_owned(),
+            version: pin.version.as_semver().clone(),
+            features: pin.features_json.features().to_vec().into_iter().collect(),
         })
-        .collect())
+        .collect()
 }
 
-/// One registry library package of the task's resolved closure — a
-/// consumption-prefetch candidate.
+/// One dependency pin of the task — a consumption-prefetch candidate.
 pub struct ConsumablePackage {
     /// Canonical package name.
     pub(crate) crate_name: String,
-    /// Resolved package version.
+    /// Pinned package version.
     pub(crate) version: cargo_metadata::semver::Version,
-    /// Features the task's resolution activates on it.
+    /// The feature set the dep's own task published it under.
     pub(crate) features: BTreeSet<String>,
 }
 
@@ -499,7 +493,8 @@ fn reject_foreign_compiled_units(
         {
             continue;
         }
-        let features = package
+        let features = artifact
+            .captured
             .features
             .iter()
             .cloned()
@@ -754,9 +749,16 @@ fn resolve_artifact(
         stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
     })?;
     let dependencies = resolve_dependencies(cx, artifact_index)?;
+    // The row's feature set is the `--cfg feature="…"` list the wrapper
+    // recorded at rustc exit — the same invocation identity the consumer's
+    // unit graph reproduces when it looks the artifact up. Cargo
+    // metadata's resolve features are not this set: they are
+    // platform-agnostic and side-unified, and they keep the implicit
+    // feature of an optional dep this target never compiled, which is
+    // exactly the mislabelling stow#579 recorded.
     let features_json = serde_json::to_string(
         &artifact
-            .package
+            .captured
             .features
             .iter()
             .cloned()
@@ -987,12 +989,11 @@ async fn cargo_metadata(workspace: &BuildWorkspace) -> stow_types::error::Result
 type PackageIndex = BTreeMap<String, BTreeMap<String, IndexedPackage>>;
 
 fn package_index(metadata: &Metadata, task: &BuildTaskPayload) -> PackageIndex {
-    let resolve_features = resolve_feature_map(metadata);
     let mut index = PackageIndex::new();
     for package in metadata
         .packages
         .iter()
-        .filter_map(|package| indexed_package(package, resolve_features.get(&package.id), task))
+        .filter_map(|package| indexed_package(package, task))
     {
         // rustc's `--crate-name` is always underscored, but cargo reports a
         // library target's name verbatim — `cfg-if`, `ansi-width`. Indexing by
@@ -1027,28 +1028,6 @@ fn package_for_capture<'a>(
     }
 }
 
-fn resolve_feature_map(metadata: &Metadata) -> BTreeMap<PackageId, BTreeSet<String>> {
-    metadata
-        .resolve
-        .as_ref()
-        .map(|resolve| {
-            resolve
-                .nodes
-                .iter()
-                .map(|node| {
-                    (
-                        node.id.clone(),
-                        node.features
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<BTreeSet<_>>(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default()
-}
-
 /// The task feature set `indexed_package`/`package_has_library_target`
 /// evaluate `required-features` against.
 pub fn task_feature_set(task: &BuildTaskPayload) -> BTreeSet<String> {
@@ -1066,11 +1045,7 @@ pub fn package_has_library_target(package: &Package, task_features: &BTreeSet<St
         .is_some()
 }
 
-fn indexed_package(
-    package: &Package,
-    features: Option<&BTreeSet<String>>,
-    task: &BuildTaskPayload,
-) -> Option<IndexedPackage> {
+fn indexed_package(package: &Package, task: &BuildTaskPayload) -> Option<IndexedPackage> {
     let task_features = task_feature_set(task);
     let target = package
         .targets
@@ -1085,51 +1060,16 @@ fn indexed_package(
 
     let (target, crate_types, _artifact_kind) = target?;
 
-    let resolved_features = features.cloned().unwrap_or_default();
-    let declared_features = package.features.keys().cloned().collect::<BTreeSet<_>>();
-    let features = package_feature_set(
-        package.name.as_str(),
-        &resolved_features,
-        &declared_features,
-        &task_features,
-        task,
-    );
-
     Some(IndexedPackage {
         name: package.name.clone().into_inner(),
         version: package.version.clone(),
         lib_target_name: target.name.clone(),
         crate_types,
-        features,
         registry: package
             .source
             .as_ref()
             .is_some_and(|source| source.to_string().starts_with("registry+")),
     })
-}
-
-fn package_feature_set(
-    package_name: &str,
-    resolved_features: &BTreeSet<String>,
-    declared_features: &BTreeSet<String>,
-    task_features: &BTreeSet<String>,
-    task: &BuildTaskPayload,
-) -> BTreeSet<String> {
-    if !resolved_features.is_empty() {
-        return resolved_features.clone();
-    }
-    if package_name == task.crate_name {
-        // The task's requested features only count where the package
-        // actually declares them — `default` included. A feature-less crate
-        // registers `[]`, matching the resolved feature set the consumer's
-        // semantic lookup computes, instead of a `["default"]` row that can
-        // never be hit.
-        return task_features
-            .intersection(declared_features)
-            .cloned()
-            .collect();
-    }
-    BTreeSet::new()
 }
 
 fn preferred_target<'a>(
@@ -1276,7 +1216,6 @@ struct IndexedPackage {
     version: cargo_metadata::semver::Version,
     lib_target_name: String,
     crate_types: Vec<RustCrateType>,
-    features: BTreeSet<String>,
     /// Whether the package comes from a registry. Only a registry package
     /// has an identity the cache publishes under, so only a registry
     /// package can be served a published artifact instead of compiled.
@@ -1345,7 +1284,7 @@ mod tests {
 
     use super::{
         IndexedPackage, ResolvedArtifact, SelectedCapturedArtifact, output_owner_index,
-        package_feature_set, resolve_artifact, select_captured_artifact, select_captured_artifacts,
+        resolve_artifact, select_captured_artifact, select_captured_artifacts,
     };
     use stow_types::capture::{
         CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput,
@@ -1373,7 +1312,6 @@ mod tests {
             version: semver::Version::parse("1.1.4").expect("version"),
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
-            features: BTreeSet::new(),
             registry: true,
         };
         let first = SelectedCapturedArtifact {
@@ -1439,7 +1377,6 @@ mod tests {
             version: semver::Version::parse("0.4.2").expect("version"),
             lib_target_name: "equator_macro".to_owned(),
             crate_types: vec![RustCrateType::ProcMacro],
-            features: BTreeSet::new(),
             registry: true,
         };
         let first = SelectedCapturedArtifact {
@@ -1485,6 +1422,7 @@ mod tests {
             crate_version: Some("0.4.2".to_owned()),
             crate_types: vec!["proc-macro".to_owned()],
             emit: vec!["dep-info".to_owned(), "link".to_owned()],
+            features: BTreeSet::new(),
             target: Some("aarch64-apple-darwin".to_owned()),
             compile_key: "ab".repeat(32),
             c_metadata: "0c5856ca18b3a9e0".to_owned(),
@@ -1525,7 +1463,6 @@ mod tests {
             version: semver::Version::parse("1.1.4").expect("version"),
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
-            features: BTreeSet::new(),
             registry: true,
         };
         let first = SelectedCapturedArtifact {
@@ -1577,7 +1514,6 @@ mod tests {
             version: semver::Version::parse("1.0.26").expect("version"),
             lib_target_name: "unicode_ident".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
-            features: BTreeSet::new(),
             registry: true,
         };
         let mut check_capture = captured(
@@ -1651,7 +1587,6 @@ mod tests {
             version: semver::Version::parse("1.1.4").expect("version"),
             lib_target_name: "aho_corasick".to_owned(),
             crate_types: vec![RustCrateType::Rlib],
-            features: BTreeSet::new(),
             registry: true,
         };
         let mut first_capture = captured(
@@ -1834,11 +1769,7 @@ mod tests {
     /// A `link`-phase record attributed to `name`@`version` — the shape a
     /// compiled foreign unit arrives in.
     fn foreign_lib_unit(name: &str, version: &str, features: &[&str]) -> SelectedCapturedArtifact {
-        let mut package = indexed(name, version);
-        package.features = features
-            .iter()
-            .map(|feature| (*feature).to_owned())
-            .collect();
+        let package = indexed(name, version);
         let mut captured = raw_lib_capture(
             name,
             "ef4a079a8dc04c32",
@@ -1849,6 +1780,10 @@ mod tests {
             )),
         );
         captured.emit = vec!["dep-info".to_owned(), "link".to_owned()];
+        captured.features = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
         captured.compile_key = "ab".repeat(32);
         SelectedCapturedArtifact {
             package,
@@ -1950,7 +1885,6 @@ mod tests {
             // As cargo reports it: verbatim, hyphens and all.
             lib_target_name: name.to_owned(),
             crate_types: vec![RustCrateType::Lib],
-            features: BTreeSet::new(),
             registry: true,
         }
     }
@@ -1989,26 +1923,27 @@ mod tests {
         claimed_compile_key: &str,
         claimed_stable_c_metadata: &str,
     ) -> SelectedCapturedArtifact {
-        let mut package = indexed("serde_json", "1.0.149");
-        package.features = ["default".to_owned(), "std".to_owned()]
+        let package = indexed("serde_json", "1.0.149");
+        let mut captured = raw_lib_capture(
+            "serde_json",
+            "consumer-raw",
+            vec![CapturedDependencyIdentity {
+                crate_name: "itoa".to_owned(),
+                path: leaf_output.to_owned(),
+                compile_key: claimed_compile_key.to_owned(),
+                stable_c_metadata: claimed_stable_c_metadata.to_owned(),
+            }],
+            PathBuf::from(
+                "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libserde_json-raw.rmeta",
+            ),
+        );
+        captured.features = ["default".to_owned(), "std".to_owned()]
             .into_iter()
             .collect();
         SelectedCapturedArtifact {
             package,
             artifact_kind: ArtifactKind::Rlib,
-            captured: raw_lib_capture(
-                "serde_json",
-                "consumer-raw",
-                vec![CapturedDependencyIdentity {
-                    crate_name: "itoa".to_owned(),
-                    path: leaf_output.to_owned(),
-                    compile_key: claimed_compile_key.to_owned(),
-                    stable_c_metadata: claimed_stable_c_metadata.to_owned(),
-                }],
-                PathBuf::from(
-                    "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libserde_json-raw.rmeta",
-                ),
-            ),
+            captured,
             dependency_aliases: Vec::new(),
         }
     }
@@ -2026,6 +1961,7 @@ mod tests {
             crate_version: None,
             crate_types: vec!["lib".to_owned()],
             emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
+            features: BTreeSet::new(),
             target: Some("aarch64-apple-darwin".to_owned()),
             compile_key: String::new(),
             c_metadata: c_metadata.to_owned(),
@@ -2112,6 +2048,36 @@ mod tests {
         assert_eq!(consumer.dependencies[0].stable_c_metadata, "leaf-raw");
     }
 
+    /// stow#579: the row's `features_json` is the invocation's own
+    /// `--cfg feature="…"` set. Cargo metadata's resolve features for the
+    /// same package would report `["fs", "net", "windows-sys"]` — the
+    /// `windows-sys` implicit feature of an optional dep that only
+    /// `cfg(windows)` compiles — which labels the artifact with an
+    /// identity no consumer's unit graph ever computes.
+    #[test]
+    fn the_resolved_artifact_is_labelled_with_the_captured_feature_set() {
+        let mut capture = captured("tokio", "1797fe20bc19a8bf", "/tmp/workspace/target/deps");
+        capture.features = ["fs".to_owned(), "net".to_owned()].into_iter().collect();
+        let selected = [SelectedCapturedArtifact {
+            package: indexed("tokio", "1.53.2"),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: capture,
+            dependency_aliases: Vec::new(),
+        }];
+        let output_owners = output_owner_index(&selected, &[]).expect("owners");
+        let mut resolved = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        let mut cx = super::ResolveCx {
+            selected: &selected,
+            consumed: &[],
+            output_owners: &output_owners,
+            resolved: &mut resolved,
+            visiting: &mut visiting,
+        };
+        let artifact = resolve_artifact(&mut cx, 0).expect("resolve");
+        assert_eq!(artifact.features_json, "[\"fs\",\"net\"]");
+    }
+
     fn captured(crate_name: &str, c_metadata: &str, out_dir: &str) -> CapturedRustcArtifact {
         captured_with_target(
             crate_name,
@@ -2144,6 +2110,7 @@ mod tests {
             crate_version: None,
             crate_types: vec!["rlib".to_owned()],
             emit: vec!["dep-info".to_owned(), "link".to_owned()],
+            features: BTreeSet::new(),
             target: target.map(ToOwned::to_owned),
             compile_key: String::new(),
             c_metadata: c_metadata.to_owned(),
@@ -2166,113 +2133,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dependency_without_resolved_features_does_not_inherit_root_task_features() {
-        let task = BuildTaskPayload {
-            task_id: "serde-1.0.228-task".to_owned(),
-            attempt: 1,
-            crate_name: stow_types::identity::CrateName::parse("serde").unwrap(),
-            version: stow_types::identity::CrateVersion::new(
-                semver::Version::parse("1.0.228").unwrap(),
-            ),
-            features_json: stow_types::identity::FeaturesJson::canonicalize(vec![
-                "default".to_owned(),
-                "derive".to_owned(),
-                "serde_derive".to_owned(),
-                "std".to_owned(),
-            ])
-            .unwrap(),
-            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
-            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
-            preserve_lockfile: false,
-            host_side: false,
-            dep_pins: Vec::new(),
-        };
-        let task_features = ["default", "derive", "serde_derive", "std"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-
-        let serde_declared = [
-            "alloc",
-            "default",
-            "derive",
-            "rc",
-            "serde_derive",
-            "std",
-            "unstable",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-        assert_eq!(
-            package_feature_set(
-                "unicode-ident",
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                &task_features,
-                &task,
-            ),
-            BTreeSet::new()
-        );
-        assert_eq!(
-            package_feature_set(
-                "serde",
-                &BTreeSet::new(),
-                &serde_declared,
-                &task_features,
-                &task,
-            ),
-            task_features
-        );
-    }
-
-    #[test]
-    fn task_features_are_intersected_with_declared_features() {
-        let task = BuildTaskPayload {
-            task_id: "itoa-1.0.18-task".to_owned(),
-            attempt: 1,
-            crate_name: stow_types::identity::CrateName::parse("itoa").unwrap(),
-            version: stow_types::identity::CrateVersion::new(
-                semver::Version::parse("1.0.18").unwrap(),
-            ),
-            features_json: stow_types::identity::FeaturesJson::canonicalize(vec![
-                "default".to_owned(),
-            ])
-            .unwrap(),
-            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
-            rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
-            preserve_lockfile: false,
-            host_side: false,
-            dep_pins: Vec::new(),
-        };
-        let task_features = BTreeSet::from(["default".to_owned()]);
-
-        // itoa declares no features at all: `["default"]` must collapse to
-        // `[]` rather than registering a row the semantic lookup can never
-        // match.
-        assert_eq!(
-            package_feature_set(
-                "itoa",
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                &task_features,
-                &task,
-            ),
-            BTreeSet::new()
-        );
-        // A package that declares `default` plus other features keeps only
-        // the declared subset of what the task requested.
-        let declared = ["alloc", "default", "std"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            package_feature_set("itoa", &BTreeSet::new(), &declared, &task_features, &task,),
-            BTreeSet::from(["default".to_owned()])
-        );
-    }
-
     fn selected_with_output(
         path: PathBuf,
         snapshot_path: Option<PathBuf>,
@@ -2284,7 +2144,6 @@ mod tests {
                 version: semver::Version::parse("1.0.18").expect("version"),
                 lib_target_name: "itoa".to_owned(),
                 crate_types: vec![RustCrateType::Lib],
-                features: BTreeSet::new(),
                 registry: true,
             },
             artifact_kind: ArtifactKind::Rlib,
@@ -2293,6 +2152,7 @@ mod tests {
                 crate_version: Some("1.0.18".to_owned()),
                 crate_types: vec!["lib".to_owned()],
                 emit: vec!["dep-info".to_owned(), "link".to_owned()],
+                features: BTreeSet::new(),
                 target: Some("aarch64-apple-darwin".to_owned()),
                 compile_key: "deadbeef".to_owned(),
                 c_metadata: "47d1962f861b84d6".to_owned(),
