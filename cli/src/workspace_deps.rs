@@ -222,6 +222,12 @@ pub fn resolve_lockfile_graph(
 /// cargo's graph; units for a target other than `target` are never
 /// nodes (stow serves one target's units), so they are filtered by
 /// `platform` rather than merged.
+///
+/// # Errors
+///
+/// Fails when cargo rejects the invocation or reports a unit-graph
+/// format version this code does not understand, and when the graph's
+/// own consistency checks trip — see [`expanded_dependency_graph`].
 #[tracing::instrument(name = "stow.workspace_deps.unit_graph", skip_all)]
 pub async fn resolve_exact_dependency_graph(
     manifest_path: &Path,
@@ -280,8 +286,30 @@ pub async fn resolve_exact_dependency_graph(
             String::from_utf8_lossy(&unit_graph.stderr).trim()
         ));
     }
+    expanded_dependency_graph(&unit_graph.stdout, target, toolchain)
+}
+
+/// The read half of [`resolve_exact_dependency_graph`].
+///
+/// Turns captured `cargo <subcommand> --unit-graph` stdout into the
+/// entries, direct dependencies and local manifests.
+/// `target` is the triple cargo was given, `None` when the build is
+/// native. Exposed so the trusted builder's consumption set can be
+/// exercised against a graph fixture without spawning cargo (stow#586).
+///
+/// # Errors
+///
+/// Fails when the JSON is not a unit-graph document, the graph's
+/// `version` is not 1, a `dependencies`/`roots` index is out of bounds,
+/// or a graph unit is unreachable from the roots — cargo reporting a
+/// graph this code does not understand is an error, never a guess.
+pub fn expanded_dependency_graph(
+    unit_graph_json: &[u8],
+    target: Option<&str>,
+    toolchain: &str,
+) -> stow_types::error::Result<ExpandedDependencyGraph> {
     let graph: UnitGraph<'_> =
-        serde_json::from_slice(&unit_graph.stdout).wrap_err("parse cargo --unit-graph JSON")?;
+        serde_json::from_slice(unit_graph_json).wrap_err("parse cargo --unit-graph JSON")?;
     if graph.version != 1 {
         return Err(stow_types::stow_error!(
             "cargo --unit-graph reported version {} (toolchain {toolchain}); only version 1 is understood",

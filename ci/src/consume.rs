@@ -60,9 +60,10 @@ pub async fn slices_for_task(
 }
 
 /// Fetch and stage the published artifacts this task's dependencies can be
-/// served from: every signed-index row naming a dep pin at the same
-/// version and feature set — never the task crate itself, which the task
-/// exists to compile.
+/// served from: every signed-index row matching a unit of the build
+/// workspace's own cargo unit graph — name, version, activated feature
+/// set and side — which the caller computed from the same cargo
+/// invocations the build phases run (stow#586).
 ///
 /// Rows whose dep-identity does not match this build's resolution are not
 /// excluded here — the wrapper's compile-key lookup is what decides a hit;
@@ -78,12 +79,10 @@ pub async fn slices_for_task(
 /// propagates — see [`build_consume::StageFailure`].
 pub async fn prefetch(
     task: &BuildTaskPayload,
+    packages: Vec<dep_scan::ConsumablePackage>,
     store_dir: &Path,
 ) -> Result<Consumption, build_consume::StageFailure> {
     let unavailable = build_consume::StageFailure::Unavailable;
-    // The consumable set is the task's dep pins — the published identities
-    // the pins were resolved at — so it needs no resolution of its own.
-    let packages = dep_scan::consumable_packages(task);
 
     // Everything past here is the CLI's verified-download chain, and that
     // chain's HTTP client resolves DNS through a Tokio reactor. The build
@@ -142,7 +141,7 @@ async fn stage_candidates(
     let unavailable = build_consume::StageFailure::Unavailable;
     let config = ConsumeConfig::load().map_err(unavailable)?;
     let slices = slices_for_task(&config, task).await.map_err(unavailable)?;
-    let candidates = candidates(&slices, packages, task);
+    let candidates = candidates(&slices, packages);
 
     // The prefetch pulls bundle blobs straight from GHCR by digest — the
     // offline-edge build never touches the byte path (stow#455). One
@@ -197,15 +196,12 @@ async fn stage_candidates(
     })
 }
 
-/// The `(slice, row)` pairs a build may serve: rows matching a registry
-/// library package of the closure by canonical name, exact version and
-/// resolved feature set — with the task crate's own artifact excluded, so
-/// a re-run after a successful publish can never consume the very artifact
-/// the task must produce.
+/// The `(slice, row)` pairs a build may serve: rows matching a unit of
+/// the build's own unit graph by canonical name, exact version,
+/// activated feature set, and unit-graph side.
 fn candidates<'a>(
     slices: &'a [IndexSlice],
     packages: &[dep_scan::ConsumablePackage],
-    task: &BuildTaskPayload,
 ) -> Vec<(&'a IndexSlice, &'a ArtifactIndexRow)> {
     let packages_by_name: BTreeMap<String, Vec<&dep_scan::ConsumablePackage>> = {
         let mut map: BTreeMap<String, Vec<&dep_scan::ConsumablePackage>> = BTreeMap::new();
@@ -232,63 +228,27 @@ fn candidates<'a>(
             let matches_package = candidates.iter().any(|package| {
                 package.version.to_string() == row.version.to_string()
                     && package.features == features
+                    && package_matches_side(package, row)
             });
             if !matches_package {
-                continue;
-            }
-            let is_task_crate = crate_name == canonical_crate_name(task.crate_name.as_str())
-                && row.version == task.version;
-            if is_task_crate {
                 continue;
             }
             selected.push((slice, row));
         }
     }
-
-    // A pin names only the task's direct dep edges — they double as the
-    // scheduler's dependency DAG — so a dep the build reaches
-    // transitively (an unconditional `[dependencies]` entry under a
-    // pinned crate, like windows-sys pulling windows-link) carries no
-    // pin (stow#581). The row it was published under is still the exact
-    // identity this build compiles: each selected row's
-    // `dependency_c_metadata_json` records the `--extern` identities its
-    // own build consumed, keyed by the dep artifact's `c_metadata`.
-    // Follow those edges until no new row appears. The recorded name is
-    // the extern alias, which `[lib] name` can rename away from the
-    // package name — `c_metadata` alone identifies the dep's row.
-    let mut visited: BTreeSet<String> = selected
-        .iter()
-        .map(|(_, row)| row.compile_key.clone())
-        .collect();
-    let mut cursor = 0;
-    while cursor < selected.len() {
-        let dependencies = selected[cursor]
-            .1
-            .dependency_c_metadata_json
-            .entries()
-            .iter()
-            .map(|identity| identity.c_metadata.as_str().to_owned())
-            .collect::<Vec<_>>();
-        cursor += 1;
-        for dep_c_metadata in dependencies {
-            for slice in slices {
-                for row in &slice.index.rows {
-                    if row.c_metadata.as_str() != dep_c_metadata
-                        || !visited.insert(row.compile_key.clone())
-                    {
-                        continue;
-                    }
-                    let is_task_crate = canonical_crate_name(row.crate_name.as_str())
-                        == canonical_crate_name(task.crate_name.as_str())
-                        && row.version == task.version;
-                    if !is_task_crate {
-                        selected.push((slice, row));
-                    }
-                }
-            }
-        }
-    }
     selected
+}
+
+/// Whether the row's unit shape sits on the side the unit-graph entry
+/// needs — a host entry is served only by a host-side row (the
+/// proc-macro/build-dep shape), never by the same package's target-side
+/// row. Rows published before `unit_shape` was recorded carry `None` and
+/// stay eligible on either side: the compile-key lookup still decides
+/// the hit, and a wrong-shape fetch only wastes a download.
+fn package_matches_side(package: &dep_scan::ConsumablePackage, row: &ArtifactIndexRow) -> bool {
+    row.unit_shape.as_ref().is_none_or(|shape| {
+        (shape.side == stow_types::public_cache::UnitSide::Host) == package.host_side
+    })
 }
 
 /// One row through the CLI's own verified-download chain: the bundle blob
@@ -340,7 +300,8 @@ async fn fetch_and_stage(
 
 #[cfg(test)]
 mod tests {
-    use stow_types::api::{BuildDepPin, BuildTaskPayload};
+    use std::collections::BTreeSet;
+
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
         CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
@@ -348,6 +309,9 @@ mod tests {
     };
     use stow_types::index::{ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow};
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+
+    use crate::dep_scan;
 
     /// The chain this module reuses resolves DNS through a Tokio reactor
     /// and panics — "there is no reactor running" — without one, while the
@@ -367,37 +331,35 @@ mod tests {
         assert!(has_reactor, "the network phase ran without a Tokio reactor");
     }
 
-    /// stow#579: a row is consumable by the dep pin's feature set — the
-    /// identity the dep's own task published it at — so the row the
-    /// invocation's `--cfg feature=` set labels hits, while a row still
-    /// carrying cargo metadata's platform-agnostic resolve features (an
-    /// implicit feature of a dep this target never compiles) does not.
+    /// stow#586: a row is consumable only at the unit-graph identity —
+    /// canonical name, exact version, the activated feature set AND the
+    /// side. A host-side entry matches a host-shaped row and never the
+    /// same package's target shape; a row published before `unit_shape`
+    /// was recorded carries `None` and stays eligible on either side;
+    /// and a row still labelled with cargo metadata's platform-agnostic
+    /// resolve features (a feature this target never compiles, stow#579)
+    /// does not match the graph's activated set.
     #[test]
-    fn candidates_match_the_dep_pins_feature_set() {
-        let pin_features = ["fs".to_owned(), "net".to_owned()];
-        let task = BuildTaskPayload {
-            task_id: "consumer-1.0.0".to_owned(),
-            attempt: 1,
-            crate_name: CrateName::parse("consumer").unwrap(),
-            version: CrateVersion::new(semver::Version::new(1, 0, 0)),
-            features_json: FeaturesJson::default(),
-            target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
-            rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
-            preserve_lockfile: false,
-            host_side: false,
-            dep_pins: vec![BuildDepPin {
-                crate_name: CrateName::parse("tokio").unwrap(),
-                version: CrateVersion::new(semver::Version::new(1, 53, 2)),
-                features_json: FeaturesJson::canonicalize(pin_features.to_vec()).unwrap(),
+    fn candidates_match_the_unit_graphs_side_and_features() {
+        let packages = vec![
+            dep_scan::ConsumablePackage {
+                crate_name: "windows-link".to_owned(),
+                version: semver::Version::new(0, 2, 1),
+                features: BTreeSet::new(),
+                host_side: true,
+            },
+            dep_scan::ConsumablePackage {
+                crate_name: "tokio".to_owned(),
+                version: semver::Version::new(1, 53, 2),
+                features: BTreeSet::from(["fs".to_owned(), "net".to_owned()]),
                 host_side: false,
-            }],
-        };
-        let packages = crate::dep_scan::consumable_packages(&task);
-        assert_eq!(packages.len(), 1);
+            },
+        ];
 
-        let row = |features: &[&str], c_metadata: &str| {
-            index_row("tokio", "1.53.2", c_metadata, features, &[])
-        };
+        let mut host_row = index_row("windows-link", "0.2.1", "aaaaaaaaaaaaaaaa", &[], None);
+        host_row.unit_shape = Some(shape(UnitSide::Host));
+        let mut target_row = index_row("windows-link", "0.2.1", "bbbbbbbbbbbbbbbb", &[], None);
+        target_row.unit_shape = Some(shape(UnitSide::Target));
         let slice = stow_cli::build_consume::IndexSlice {
             manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
             index: ArtifactIndex {
@@ -407,30 +369,46 @@ mod tests {
                     rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
                     generated_at: String::new(),
                     generation: 1,
-                    row_count: 2,
+                    row_count: 5,
                 },
                 rows: vec![
-                    row(&["fs", "net", "windows-sys"], "0123456789abcdef"),
-                    row(&["fs", "net"], "123456789abcdef0"),
+                    host_row,
+                    target_row,
+                    index_row("windows-link", "0.2.1", "cccccccccccccccc", &[], None),
+                    index_row("tokio", "1.53.2", "dddddddddddddddd", &["fs", "net"], None),
+                    index_row(
+                        "tokio",
+                        "1.53.2",
+                        "eeeeeeeeeeeeeeee",
+                        &["fs", "net", "windows-sys"],
+                        None,
+                    ),
                 ],
             },
         };
 
         let slices = [slice];
-        let hits = super::candidates(&slices, &packages, &task);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].1.c_metadata.as_str(), "123456789abcdef0");
+        let hits = super::candidates(&slices, &packages);
+        let staged = hits
+            .iter()
+            .map(|(_, row)| row.c_metadata.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            staged,
+            BTreeSet::from(["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "dddddddddddddddd"]),
+            "host-shaped and shapeless windows-link rows and the exactly-labelled tokio row stage; the target shape and the metadata-labelled row do not"
+        );
     }
 
     /// An index row fixture: `compile_key` hashes to `c_metadata`'s prefix
-    /// (canonical rows are keyed so), and `deps` carry the
-    /// `(extern-name, c_metadata)` identities a published row records.
+    /// (canonical rows are keyed so); `side` sets the row's `unit_shape`,
+    /// `None` modelling a row published before shapes were recorded.
     fn index_row(
         name: &str,
         version: &str,
         c_metadata: &str,
         features: &[&str],
-        deps: &[(&str, &str)],
+        side: Option<UnitSide>,
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
             crate_name: CrateName::parse(name).unwrap(),
@@ -439,17 +417,7 @@ mod tests {
                 features.iter().map(|f| (*f).to_owned()).collect(),
             )
             .unwrap(),
-            dependency_c_metadata_json: DependencyCMetadataJson::canonicalize(
-                deps.iter()
-                    .map(
-                        |(name, meta)| stow_types::identity::DependencyCMetadataIdentity {
-                            crate_name: CrateName::parse(*name).unwrap(),
-                            c_metadata: CMetadata::parse(*meta).unwrap(),
-                        },
-                    )
-                    .collect(),
-            )
-            .unwrap(),
+            dependency_c_metadata_json: DependencyCMetadataJson::canonicalize(vec![]).unwrap(),
             c_metadata: CMetadata::parse(c_metadata).unwrap(),
             compile_key: format!("{c_metadata}{c_metadata}{c_metadata}"),
             bundle_digest: "sha256:".to_owned() + &"ab".repeat(32),
@@ -465,92 +433,16 @@ mod tests {
                 strip: StripLevel::None,
             },
             emit: vec![],
-            unit_shape: None,
+            unit_shape: side.map(shape),
             min_glibc: None,
         }
     }
 
-    /// stow#581: pins cover only the task's direct dep edges — a dep the
-    /// build reaches transitively through a pinned crate (winapi-util's
-    /// `cfg(windows)` windows-sys pin pulling windows-sys's unconditional
-    /// windows-link) carries no pin of its own. The published row's
-    /// recorded `--extern` identities still name it by `c_metadata`, and
-    /// candidates must follow those edges or the unit compiles and fails
-    /// the foreign-unit scan.
-    #[test]
-    fn candidates_cover_deps_reached_transitively() {
-        let task = BuildTaskPayload {
-            task_id: "winapi-util-0.1.11".to_owned(),
-            attempt: 1,
-            crate_name: CrateName::parse("winapi-util").unwrap(),
-            version: CrateVersion::new(semver::Version::new(0, 1, 11)),
-            features_json: FeaturesJson::default(),
-            target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
-            rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
-            preserve_lockfile: false,
-            host_side: true,
-            dep_pins: vec![BuildDepPin {
-                crate_name: CrateName::parse("windows-sys").unwrap(),
-                version: CrateVersion::new(semver::Version::new(0, 61, 2)),
-                features_json: FeaturesJson::canonicalize(vec![
-                    "Win32_Foundation".to_owned(),
-                    "Win32_Storage_FileSystem".to_owned(),
-                    "Win32_System_Console".to_owned(),
-                    "Win32_System_SystemInformation".to_owned(),
-                ])
-                .unwrap(),
-                host_side: true,
-            }],
-        };
-        let packages = crate::dep_scan::consumable_packages(&task);
-        assert_eq!(packages.len(), 1);
-
-        let slice = stow_cli::build_consume::IndexSlice {
-            manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
-            index: ArtifactIndex {
-                header: ArtifactIndexHeader {
-                    format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
-                    target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
-                    rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
-                    generated_at: String::new(),
-                    generation: 1,
-                    row_count: 3,
-                },
-                rows: vec![
-                    // windows-sys's published row records the dep edge as
-                    // the extern alias (`windows_link`), not the package
-                    // name — the c_metadata alone carries the edge.
-                    index_row(
-                        "windows-sys",
-                        "0.61.2",
-                        "aaaaaaaaaaaaaaaa",
-                        &[
-                            "Win32_Foundation",
-                            "Win32_Storage_FileSystem",
-                            "Win32_System_Console",
-                            "Win32_System_SystemInformation",
-                        ],
-                        &[("windows_link", "bbbbbbbbbbbbbbbb")],
-                    ),
-                    index_row("windows-link", "0.2.1", "bbbbbbbbbbbbbbbb", &[], &[]),
-                    index_row("unrelated", "1.0.0", "cccccccccccccccc", &[], &[]),
-                ],
-            },
-        };
-
-        let slices = [slice];
-        let hits = super::candidates(&slices, &packages, &task);
-        let staged = hits
-            .iter()
-            .map(|(_, row)| (row.crate_name.as_str(), row.c_metadata.as_str()))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            staged,
-            std::collections::BTreeSet::from([
-                ("windows-sys", "aaaaaaaaaaaaaaaa"),
-                ("windows-link", "bbbbbbbbbbbbbbbb"),
-            ]),
-            "the transitive dep the pin never names rides along on the pinned row's dep edge"
-        );
+    fn shape(side: UnitSide) -> UnitShape {
+        UnitShape {
+            side,
+            invocation: UnitInvocation::Native,
+            kind: UnitKind::Linked,
+        }
     }
 }
