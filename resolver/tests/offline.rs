@@ -2418,3 +2418,94 @@ fn a_failed_source_fetch_joins_workers_and_releases_the_scratch() {
         },
     );
 }
+
+/// stow#588's production shape through a real offline resolve:
+/// `alloc-stdlib` 0.3.0 [] depends on `alloc-no-stdlib` 2.0.4, and only
+/// the second consumer enables that dep's `unsafe` feature. Cargo
+/// unifies the dep's feature set per consumer graph, so the two resolves
+/// carry the same `alloc-stdlib` node tuple — and the Merkle task ids
+/// must still separate because the dependency subgraphs differ.
+#[test]
+fn merkle_context_propagates_from_offline_resolve() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "alloc-no-stdlib",
+            version: "2.0.4",
+            deps: vec![],
+            features: &[("unsafe", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "alloc-stdlib",
+            version: "0.3.0",
+            deps: vec![("alloc-no-stdlib", "2", &[])],
+            features: &[],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let (_home, resolver) = resolver_at(&reg);
+    let targets = ["aarch64-unknown-linux-gnu".to_owned()];
+    let rustc = pinned_rustc_version();
+
+    let consumer = |dir: &Path, dependencies: Value| {
+        let manifest = project(dir, &dependencies);
+        resolver
+            .resolve(&manifest, &ResolveOptions::default(), &targets)
+            .unwrap()
+    };
+    let plain = consumer(
+        &work.path().join("consumer-a"),
+        json!({ "alloc-stdlib": "0.3" }),
+    );
+    let unsafe_ = consumer(
+        &work.path().join("consumer-b"),
+        json!({
+            "alloc-stdlib": "0.3",
+            "alloc-no-stdlib": { "version": "2", "features": ["unsafe"] },
+        }),
+    );
+
+    // The dep really resolved at the two feature sets cargo unified —
+    // the test asserts on real input, not a constructed difference.
+    let dep_features = |out: &[(String, stow_resolver::StowResolveOutput)]| {
+        let mut features = units_named(out, "alloc-no-stdlib")[0].features.clone();
+        features.sort();
+        features
+    };
+    assert_eq!(dep_features(&plain), Vec::<String>::new());
+    assert_eq!(dep_features(&unsafe_), vec!["unsafe".to_owned()]);
+
+    let parent = |out: &[(String, stow_resolver::StowResolveOutput)]| {
+        let graph = stow_resolver::resolved_task_graph(&out[0].1.units, rustc).unwrap();
+        let index = graph
+            .nodes()
+            .iter()
+            .position(|node| node.identity.crate_name == "alloc-stdlib")
+            .expect("alloc-stdlib is a node");
+        (
+            graph.nodes()[index].identity.clone(),
+            graph.dependency_identity(index).unwrap().clone(),
+            graph.task_id(index).unwrap().to_owned(),
+        )
+    };
+    let (plain_identity, plain_digest, plain_id) = parent(&plain);
+    let (unsafe_identity, unsafe_digest, unsafe_id) = parent(&unsafe_);
+    assert_eq!(
+        plain_identity, unsafe_identity,
+        "same crate, version, features, target, rustc and side"
+    );
+    assert_ne!(
+        plain_digest, unsafe_digest,
+        "the dependency subgraphs differ, so the digests differ"
+    );
+    assert_ne!(plain_id, unsafe_id);
+}

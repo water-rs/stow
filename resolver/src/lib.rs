@@ -26,7 +26,7 @@ mod units;
 
 pub use enqueue::{
     RequestPlanParts, TaskGraph, TaskNode, enqueue_requests_from_output, enqueue_requests_inner,
-    request_plan_parts,
+    request_plan_parts, resolved_task_graph,
 };
 pub use prepare::{
     GitCommit, PreparedSourceTree, RelativeSourcePath, SourcePreparation, project_fetch_ref,
