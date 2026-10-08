@@ -9,6 +9,13 @@
 //! parsed from the same file. No GitHub API, crates.io, Cloudflare, or
 //! edge request leaves the machine — there is no network stub for any
 //! of them to reach.
+//!
+//! The steps run under bash with the tools of their runner (GNU
+//! userland, a `python3` with `tomllib`), exactly as their Linux runners
+//! execute them; every job of the five entrypoints runs on
+//! `ubuntu-latest` (`entrypoints_run_on_linux_runners`), so the suite
+//! runs on Linux hosts only.
+#![cfg(target_os = "linux")]
 
 mod support;
 
@@ -1039,4 +1046,31 @@ fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
         fields.get("rustc_version").map(String::as_str),
         Some("1.99.0")
     );
+}
+
+/// The five entrypoints' every job runs on a Linux runner — the
+/// premise that confines this bash-driven suite to Linux hosts.
+#[test]
+fn entrypoints_run_on_linux_runners() {
+    for file in [
+        "preheat-cron.yml",
+        "preheat-admin.yml",
+        "preheat-missed.yml",
+        "preheat-projects.yml",
+        "index-publish-cron.yml",
+    ] {
+        let workflow = load_workflow(file);
+        let jobs = field(&workflow, "jobs")
+            .and_then(serde_yml::Value::as_mapping)
+            .unwrap_or_else(|| panic!("{file} declares no jobs"));
+        for (name, job) in jobs {
+            let runner = field(job, "runs-on").map(scalar);
+            assert_eq!(
+                runner.as_deref(),
+                Some("ubuntu-latest"),
+                "{file} job {} runs on {runner:?}",
+                scalar(name)
+            );
+        }
+    }
 }
