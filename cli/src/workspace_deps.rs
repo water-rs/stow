@@ -64,6 +64,46 @@ pub struct ExpandedDependencyGraph {
     /// root are inputs too, so the persisted copy verifies these on
     /// load instead of trying to name them in the cache key.
     pub local_manifests: Vec<LocalManifestHash>,
+    /// The raw `cargo --unit-graph` stdout this graph was expanded
+    /// from — the build stage's dependency-context check projects this
+    /// onto the shared [`stow_types::unit_graph::TaskUnit`] model
+    /// (stow#588). Empty on rows decoded from a pre-588 cache.
+    #[serde(default)]
+    pub raw_unit_graph: Vec<u8>,
+}
+
+impl ExpandedDependencyGraph {
+    /// The units cargo's unit graph compiled, in the shared task-unit
+    /// model — the identity lens `resolved_task_graph` projects (stow#588).
+    ///
+    /// `target` is the triple cargo was given (`None` for the native
+    /// spelling), `host_triple` the runner family's host triple the
+    /// `platform: null` units compile for.
+    ///
+    /// # Errors
+    /// Re-parse failures and the conversion's consistency checks — see
+    /// [`unit_graph_task_units`]. An empty `raw_unit_graph` (a graph
+    /// decoded from a pre-588 cache) is an error, not an empty answer.
+    pub fn task_units(
+        &self,
+        target: Option<&str>,
+        host_triple: &str,
+    ) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
+        if self.raw_unit_graph.is_empty() {
+            return Err(stow_types::stow_error!(
+                "expanded dependency graph carries no raw unit graph (a pre-588 cached row) — cannot derive task units"
+            ));
+        }
+        let graph: UnitGraph<'_> = serde_json::from_slice(&self.raw_unit_graph)
+            .wrap_err("parse cargo --unit-graph JSON")?;
+        if graph.version != 1 {
+            return Err(stow_types::stow_error!(
+                "cargo --unit-graph reported version {}; only version 1 is understood",
+                graph.version
+            ));
+        }
+        unit_graph_task_units(&graph, target, host_triple)
+    }
 }
 
 /// A manifest cargo read, recorded with its blake3 so a later cache
@@ -286,7 +326,9 @@ pub async fn resolve_exact_dependency_graph(
             String::from_utf8_lossy(&unit_graph.stderr).trim()
         ));
     }
-    expanded_dependency_graph(&unit_graph.stdout, target, toolchain)
+    let mut graph = expanded_dependency_graph(&unit_graph.stdout, target, toolchain)?;
+    graph.raw_unit_graph = unit_graph.stdout;
+    Ok(graph)
 }
 
 /// The read half of [`resolve_exact_dependency_graph`].
@@ -321,6 +363,11 @@ pub fn expanded_dependency_graph(
         entries,
         direct_dependencies,
         local_manifests,
+        // `resolve_exact_dependency_graph` fills this from the stdout
+        // it already holds; direct parse callers get an empty marker —
+        // `task_units` fails on it rather than answering without the
+        // raw graph.
+        raw_unit_graph: Vec::new(),
     })
 }
 
@@ -600,9 +647,108 @@ fn unit_sides(graph: &UnitGraph<'_>, target: Option<&str>) -> stow_types::error:
     Ok(sides)
 }
 
-/// Bounds-checked unit index — an out-of-range `roots`/`dependencies`
-/// index is cargo reporting a graph we do not understand, not a unit
-/// to skip.
+/// Project one unit graph onto the shared [`stow_types::unit_graph::TaskUnit`]
+/// model — the same shape `stow-resolver`'s `emit.rs` assigns, so the
+/// build stage's dependency-context check resolves onto the same task
+/// identities the resolver mints (stow#588).
+///
+/// `target` is the triple cargo was given (`None` native); `host_triple`
+/// is the platform `platform: null` units compile for — the runner
+/// family's host triple on the trusted builder. Side and platform
+/// mirror `emit.rs`: compile-script units always key host-side at the
+/// host triple, run units take their owning lib's side and platform,
+/// and a lib reachable only from host-kinded units is host-side while a
+/// both-reachable lib is target-side (the shadow-twin dedup shape).
+fn unit_graph_task_units(
+    graph: &UnitGraph<'_>,
+    target: Option<&str>,
+    host_triple: &str,
+) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
+    use stow_types::unit_graph::{TaskUnit, TaskUnitDep, TaskUnitKey, TaskUnitKind, TaskUnitSide};
+    let sides = unit_sides(graph, target)?;
+    let mut converted: Vec<Option<TaskUnit>> = Vec::with_capacity(graph.units.len());
+    for (index, unit) in graph.units.iter().enumerate() {
+        let kind = if unit.mode == "run-custom-build" {
+            TaskUnitKind::RunBuildScript
+        } else if unit.target.kind == ["custom-build"] {
+            TaskUnitKind::BuildScript
+        } else if unit.target.kind.iter().any(|kind| LIB_KINDS.contains(kind))
+            && COMPILE_MODES.contains(&unit.mode)
+        {
+            TaskUnitKind::Lib
+        } else {
+            // Bins, tests, benches, examples and doctest units compile
+            // nothing the cache serves — the resolver drops them too.
+            converted.push(None);
+            continue;
+        };
+        if sides[index] == 0 {
+            // A unit for a target other than the served one is never a
+            // node — `unit_sides` marks it and the expanded entries skip
+            // it; the lean model drops it the same way.
+            converted.push(None);
+            continue;
+        }
+        let (name, version, crates_io) = parse_pkg_id(unit.pkg_id);
+        // A build-script *compile* unit is host-side by construction;
+        // a `run-custom-build` unit takes its owning lib's side, which
+        // is exactly what its `platform` records under a spelled target
+        // and what the host-kinded BFS marks under a native one. A
+        // both-reachable lib is the deduped target-side unit a host
+        // consumer's shadow edge reaches.
+        let side = if kind == TaskUnitKind::BuildScript || sides[index] == HOST {
+            TaskUnitSide::Host
+        } else {
+            TaskUnitSide::Target
+        };
+        converted.push(Some(TaskUnit {
+            key: TaskUnitKey {
+                // `pkg_id` is the full cargo package id — source
+                // included — exactly what `PackageIdSpec` stringifies.
+                pkg: unit.pkg_id.to_owned(),
+                platform: unit.platform.unwrap_or(host_triple).to_owned(),
+                side,
+                kind,
+            },
+            name: name.to_owned(),
+            version: version.to_owned(),
+            features: unit
+                .features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            is_crates_io: crates_io,
+            deps: Vec::new(),
+        }));
+    }
+    let mut units = Vec::with_capacity(converted.iter().flatten().count());
+    for (index, unit) in graph.units.iter().enumerate() {
+        let Some(base) = converted[index].clone() else {
+            continue;
+        };
+        let mut deps = Vec::with_capacity(unit.dependencies.len());
+        for dependency in &unit.dependencies {
+            let dep_index = info_at_index(graph, dependency.index)?;
+            let dep_unit = &graph.units[dep_index];
+            let Some(dep_base) = &converted[dep_index] else {
+                return Err(stow_types::stow_error!(
+                    "cargo --unit-graph unit `{}` depends on unit {} — a target kind the task-unit model does not carry",
+                    unit.pkg_id,
+                    dep_unit.pkg_id,
+                ));
+            };
+            let (name, version, _) = parse_pkg_id(dep_unit.pkg_id);
+            deps.push(TaskUnitDep {
+                key: dep_base.key.clone(),
+                name: name.to_owned(),
+                version: version.to_owned(),
+            });
+        }
+        units.push(TaskUnit { deps, ..base });
+    }
+    Ok(units)
+}
+
 fn info_at_index(graph: &UnitGraph<'_>, index: u32) -> stow_types::error::Result<usize> {
     let index = index as usize;
     if index >= graph.units.len() {

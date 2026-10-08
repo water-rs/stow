@@ -1001,6 +1001,7 @@ mod tests {
     fn declared_bundle_parts() -> (ArtifactBundleManifest, BTreeMap<String, Vec<u8>>) {
         let output_contents = b"demo-artifact".to_vec();
         let config = ArtifactBlobConfig {
+            dependency_identity: None,
             compile_key: "compile-key".to_owned(),
             crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
             crate_version: stow_types::identity::CrateVersion::new(

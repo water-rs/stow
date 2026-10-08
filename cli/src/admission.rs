@@ -389,6 +389,9 @@ mod tests {
             downloads: 0,
             source: EnqueueSource::CacheMiss,
             depends_on: Vec::new(),
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("fixture leaf"),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             preserve_lockfile: false,
             host_side: false,
         }

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use oci_client::manifest::OciImageManifest;
-use stow_types::api::{BuildDepPin, BuildTaskPayload, EnqueueDependency, EnqueueRequest};
+use stow_types::api::{BuildTaskPayload, EnqueueDependency, EnqueueRequest};
 use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 use stow_types::index::{ArtifactIndexRow, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
@@ -916,19 +916,11 @@ fn task_payload(task_id: &str, request: &EnqueueRequest) -> BuildTaskPayload {
         rustc_version: request.rustc_version.clone(),
         preserve_lockfile: request.preserve_lockfile,
         host_side: request.host_side,
-        dependency_identity: request.dependency_identity.clone(),
-        dep_pins: request
-            .depends_on
-            .iter()
-            .map(|dep| BuildDepPin {
-                crate_name: dep.crate_name.clone(),
-                version: dep.version.clone(),
-                features_json: dep.features_json.clone(),
-                host_side: dep.host_side,
-                target: dep.target.clone(),
-                dependency_identity: dep.dependency_identity.clone(),
-            })
-            .collect(),
+        // The resolver emitted this node's whole transitive dependency
+        // closure on the request — covered nodes included — so the
+        // dispatched payload reproduces the context the folded graph
+        // already pruned out of the wave (stow#588).
+        dependency_subgraph: request.dependency_subgraph.clone(),
     }
 }
 
@@ -1861,6 +1853,19 @@ mod tests {
         let dependency_identity =
             stow_types::identity::DependencyIdentity::from_task_ids(ids.iter().map(String::as_str))
                 .expect("dependency identity");
+        let dependency_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: (0..depends_on.len() as u32).collect(),
+            nodes: depends_on
+                .iter()
+                .map(|dep| stow_types::api::SubgraphNode {
+                    crate_name: dep.crate_name.clone(),
+                    version: dep.version.clone(),
+                    features_json: dep.features_json.clone(),
+                    host_side: dep.host_side,
+                    deps: Vec::new(),
+                })
+                .collect(),
+        };
         EnqueueRequest {
             crate_name: CrateName::parse(crate_name).expect("crate name"),
             version: CrateVersion(semver::Version::new(1, 0, 0)),
@@ -1872,6 +1877,7 @@ mod tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on,
             dependency_identity,
+            dependency_subgraph,
             preserve_lockfile: false,
             host_side,
         }
@@ -2056,13 +2062,24 @@ mod tests {
             &[("helper", "x86_64-unknown-linux-gnu", true)],
         );
         let payload = super::task_payload(&parent.task_id(), &parent);
-        assert_eq!(payload.dependency_identity, parent.dependency_identity);
-        assert_eq!(payload.dep_pins[0].target, parent.depends_on[0].target);
+        let graph = payload
+            .verified_dependency_graph()
+            .expect("payload subgraph verifies against task_id");
         assert_eq!(
-            payload.dep_pins[0].dependency_identity,
-            parent.depends_on[0].dependency_identity
+            graph.dependency_identity(0).expect("root digest"),
+            &parent.dependency_identity
         );
-        assert!(payload.dep_pins[0].host_side);
+        let helper = payload
+            .dependency_subgraph
+            .nodes
+            .iter()
+            .find(|node| node.host_side)
+            .expect("host-side dep node");
+        assert_eq!(helper.crate_name.as_str(), "helper");
+        assert_eq!(
+            graph.dependency_identity(1).expect("dep digest"),
+            &parent.depends_on[0].dependency_identity
+        );
     }
 
     /// A layer spans every CI target, and each slice holds only its own

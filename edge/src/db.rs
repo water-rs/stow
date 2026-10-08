@@ -379,6 +379,10 @@ impl FullArtifactRow {
             version: decoded.version,
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
+            // stow#588: the artifacts table stores no digest column —
+            // a row decoded here is the archive's older shape, so its
+            // contextual coverage answer is `None`.
+            dependency_identity: None,
             oci_reference: self.oci_reference,
             oci_digest: self.oci_digest,
             has_native: self.has_native != 0,
@@ -463,6 +467,8 @@ impl IndexArtifactRow {
             version: decoded.version,
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
+            // stow#588: same archive row shape — no digest column.
+            dependency_identity: None,
             c_metadata: decoded.c_metadata,
             compile_key: self.compile_key,
             bundle_digest: self.bundle_digest,
@@ -967,6 +973,33 @@ pub async fn take_dependency_graph_misses(
         let depends_on: Vec<stow_types::api::EnqueueDependency> =
             serde_json::from_str(row.depends_on_json.as_str())
                 .map_err(|error| format!("draining miss depends_on_json: {error}"))?;
+        // stow#588: the digest mints from the dep edges the row stores
+        // — same derivation `validate_dependency_identity` checks — and
+        // the subgraph is the leaf-only shape the miss table can carry
+        // (direct deps, no transitive edges; the scheduler storage
+        // rework owns recording the full closure).
+        let dependency_identity = stow_types::identity::DependencyIdentity::from_task_ids(
+            depends_on
+                .iter()
+                .map(|dep| dep.task_id())
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str),
+        )
+        .map_err(|error| format!("draining miss dependency_identity: {error}"))?;
+        let dependency_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: (0..depends_on.len() as u32).collect(),
+            nodes: depends_on
+                .iter()
+                .map(|dep| stow_types::api::SubgraphNode {
+                    crate_name: dep.crate_name.clone(),
+                    version: dep.version.clone(),
+                    features_json: dep.features_json.clone(),
+                    host_side: dep.host_side,
+                    deps: Vec::new(),
+                })
+                .collect(),
+        };
         requests.push(EnqueueRequest {
             crate_name,
             version,
@@ -976,6 +1009,8 @@ pub async fn take_dependency_graph_misses(
             downloads: row.seen_count,
             source: stow_types::api::EnqueueSource::CacheMiss,
             depends_on,
+            dependency_identity,
+            dependency_subgraph,
             preserve_lockfile: false,
             host_side: row.host_side != 0,
         });
@@ -1124,6 +1159,7 @@ mod sqlite_tests {
 
     fn artifact_record_with(c_metadata: &str, oci_digest: &str) -> ArtifactRecord {
         ArtifactRecord {
+            dependency_identity: None,
             compile_key: format!("{c_metadata}{c_metadata}"),
             c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
             extra_filename: format!("-{c_metadata}"),
@@ -1162,6 +1198,9 @@ mod sqlite_tests {
 
     fn enqueue_request(crate_name: &str, version: &str, features: &[&str]) -> EnqueueRequest {
         EnqueueRequest {
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             crate_name: crate_name.parse().expect("valid crate name"),
             version: version.parse().expect("valid semver"),
             features_json: stow_types::identity::FeaturesJson::canonicalize(
@@ -1204,6 +1243,8 @@ mod sqlite_tests {
         // stow#317: the recorded miss keeps the edges the admitting
         // request carried so the drain re-mints it with them.
         request.depends_on = vec![stow_types::api::EnqueueDependency {
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
             crate_name: CrateName::parse("syn").expect("dep name"),
             version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
             features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
@@ -1312,6 +1353,8 @@ mod sqlite_tests {
         let mut host_request = request.clone();
         host_request.host_side = true;
         request.depends_on = vec![stow_types::api::EnqueueDependency {
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
             crate_name: CrateName::parse("heck").expect("dep name"),
             version: CrateVersion::new(semver::Version::parse("0.5.0").expect("dep version")),
             features_json: FeaturesJson::canonicalize(Vec::new()).expect("dep features"),

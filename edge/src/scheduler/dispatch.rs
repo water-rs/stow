@@ -57,7 +57,7 @@ pub async fn trigger_build(
         "rustc_version": task.rustc_version,
         "host_side": task.host_side,
         "preserve_lockfile": task.preserve_lockfile,
-        "dep_pins": task.dep_pins,
+        "dependency_subgraph": task.dependency_subgraph,
     });
     let response = send_workflow_dispatch(
         &WorkflowDispatch {

@@ -170,7 +170,11 @@ fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
             target: target(triple),
             rustc_version: rustc(version_rustc),
             host_side,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
         }],
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
+        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         host_side,
         preserve_lockfile: false,
     }
@@ -197,7 +201,11 @@ fn base_dep_request(combo_index: usize, combo: DepCombo) -> EnqueueRequest {
             target: target(triple),
             rustc_version: rustc(version_rustc),
             host_side,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
         }],
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
+        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         host_side,
         preserve_lockfile: false,
     }

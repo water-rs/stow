@@ -170,6 +170,8 @@ fn request_on(
     depends_on: Vec<EnqueueDependency>,
 ) -> EnqueueRequest {
     EnqueueRequest {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
+        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         crate_name: crate_name.parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
@@ -189,6 +191,7 @@ fn task_id_on(crate_name: &str, target: &str) -> String {
 
 fn dependency(crate_name: &str) -> EnqueueDependency {
     EnqueueDependency {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: crate_name.parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
@@ -2928,12 +2931,14 @@ fn gate_pub_rows() -> Vec<stow_types::api::PublishedSliceRow> {
         .iter()
         .flat_map(|name| full().iter().map(|s| (name, *s)).collect::<Vec<_>>())
         .map(|(name, s)| stow_types::api::PublishedSliceRow {
+            dependency_identity: None,
             crate_name: name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
             unit_shape: Some(s),
         })
         .chain(std::iter::once(stow_types::api::PublishedSliceRow {
+            dependency_identity: None,
             crate_name: "dep-short".parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -3927,6 +3932,7 @@ async fn publish(db: &DurableDb, crate_name: &str) {
     let rows = [UnitKind::Linked, UnitKind::Unlinked]
         .iter()
         .map(|kind| stow_types::api::PublishedSliceRow {
+            dependency_identity: None,
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -3945,6 +3951,7 @@ async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: 
     let rows = shapes
         .iter()
         .map(|shape| stow_types::api::PublishedSliceRow {
+            dependency_identity: None,
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -4196,6 +4203,7 @@ fn dep_slice_rows(crate_name: &str) -> Vec<stow_types::api::PublishedSliceRow> {
     [UnitKind::Linked, UnitKind::Unlinked]
         .iter()
         .map(|kind| stow_types::api::PublishedSliceRow {
+            dependency_identity: None,
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -4687,6 +4695,7 @@ async fn republishing_a_slice_replaces_its_membership() {
 async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
     let host_dep = EnqueueDependency {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: "heck".parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
@@ -4748,6 +4757,7 @@ async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
 async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
     let host_dep = EnqueueDependency {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: "heck".parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
@@ -4801,6 +4811,7 @@ async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
 async fn a_host_side_dependent_needs_both_shapes_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
     let host_dep = EnqueueDependency {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: "heck".parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
@@ -4861,6 +4872,7 @@ async fn a_larger_slice_reports_whole() {
     let rows = (0..REPORT_ROWS)
         .flat_map(|index| {
             [UnitKind::Linked, UnitKind::Unlinked].map(|kind| stow_types::api::PublishedSliceRow {
+                dependency_identity: None,
                 crate_name: format!("crate-{index}").parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),

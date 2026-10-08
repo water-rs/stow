@@ -32,5 +32,6 @@ pub mod rustc;
 pub mod task_graph;
 pub mod transient;
 pub mod trusted_builder;
+pub mod unit_graph;
 pub mod upload_plan;
 pub mod versioning;

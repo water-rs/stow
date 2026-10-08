@@ -297,6 +297,198 @@ fn node_target(node_key: &ExpandedNodeKey, target_typed: &TargetTriple) -> Targe
 /// only once every dependency is servable, which is the queue gate's
 /// release signal. Each dep names the dep's own platform: the runner
 /// family's host triple for host-side units.
+/// One expanded node's canonical task id under `digest` — the same
+/// `TaskNodeIdentity` formula the resolver's [`EnqueueDependency`]
+/// entries mint.
+fn expanded_task_id(
+    node_key: &ExpandedNodeKey,
+    features_json: &str,
+    target_typed: &TargetTriple,
+    rustc_version_typed: &WireRustcVersion,
+    digest: &stow_types::identity::DependencyIdentity,
+) -> Result<String, ResolverError> {
+    Ok(stow_types::task_graph::TaskNodeIdentity {
+        crate_name: node_key.package.crate_name.clone(),
+        version: CrateVersion::new(node_key.package.version.clone()),
+        features_json: parse_canonical_features_json(features_json)?,
+        target: node_target(node_key, target_typed),
+        rustc_version: rustc_version_typed.clone(),
+        host_side: node_key.host_side,
+    }
+    .task_id(digest))
+}
+
+/// Every expanded node's dependency digest, computed bottom-up over the
+/// whole graph so a cached node's dep entry still mints the digest its
+/// own children commit to (stow#588).
+fn expanded_digests(
+    feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
+    dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+    target_typed: &TargetTriple,
+    rustc_version_typed: &WireRustcVersion,
+) -> Result<BTreeMap<ExpandedNodeKey, stow_types::identity::DependencyIdentity>, ResolverError> {
+    fn visit(
+        node_key: &ExpandedNodeKey,
+        feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
+        dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+        target_typed: &TargetTriple,
+        rustc_version_typed: &WireRustcVersion,
+        memo: &mut BTreeMap<ExpandedNodeKey, stow_types::identity::DependencyIdentity>,
+        visiting: &mut BTreeSet<ExpandedNodeKey>,
+    ) -> Result<(), ResolverError> {
+        if memo.contains_key(node_key) {
+            return Ok(());
+        }
+        if !visiting.insert(node_key.clone()) {
+            return Err(ResolverError::from(format!(
+                "dependency cycle reaches {} {}",
+                node_key.package.crate_name, node_key.package.version
+            )));
+        }
+        let mut child_ids = Vec::new();
+        if let Some(children) = dependency_keys_by_key.get(node_key) {
+            for dep_key in children {
+                visit(
+                    dep_key,
+                    feature_json_by_key,
+                    dependency_keys_by_key,
+                    target_typed,
+                    rustc_version_typed,
+                    memo,
+                    visiting,
+                )?;
+                let raw = feature_json_by_key.get(dep_key).ok_or_else(|| {
+                    ResolverError::from(format!(
+                        "missing serialized feature set for dependency {} {}",
+                        dep_key.package.crate_name, dep_key.package.version
+                    ))
+                })?;
+                let dep_digest = memo
+                    .get(dep_key)
+                    .expect("visit inserts the dep's digest before returning");
+                child_ids.push(expanded_task_id(
+                    dep_key,
+                    raw,
+                    target_typed,
+                    rustc_version_typed,
+                    dep_digest,
+                )?);
+            }
+        }
+        visiting.remove(node_key);
+        let digest = stow_types::identity::DependencyIdentity::from_task_ids(
+            child_ids.iter().map(String::as_str),
+        )
+        .map_err(|error| {
+            ResolverError::from(format!(
+                "hash dep task ids of {} {}: {error}",
+                node_key.package.crate_name, node_key.package.version
+            ))
+        })?;
+        memo.insert(node_key.clone(), digest);
+        Ok(())
+    }
+
+    let mut memo = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    let keys: Vec<ExpandedNodeKey> = feature_json_by_key.keys().cloned().collect();
+    for node_key in &keys {
+        visit(
+            node_key,
+            feature_json_by_key,
+            dependency_keys_by_key,
+            target_typed,
+            rustc_version_typed,
+            &mut memo,
+            &mut visiting,
+        )?;
+    }
+    Ok(memo)
+}
+
+/// The compact dependency subgraph a dispatch payload carries: the
+/// node's transitive closure over the expanded graph, each member's
+/// children wired as indexes (stow#588). A dep the expanded graph does
+/// not list — a covered leaf the coverage prune removed — contributes
+/// its identity only.
+fn expanded_subgraph(
+    node_key: &ExpandedNodeKey,
+    feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
+    dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+) -> Result<stow_types::api::TaskSubgraph, ResolverError> {
+    let mut closure = BTreeSet::new();
+    let mut frontier = dependency_keys_by_key
+        .get(node_key)
+        .map(|children| children.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    while let Some(next) = frontier.pop() {
+        if closure.insert(next.clone()) {
+            if let Some(children) = dependency_keys_by_key.get(&next) {
+                frontier.extend(children.iter().cloned());
+            }
+        }
+    }
+    let wire_index = |dep_key: &ExpandedNodeKey| -> Result<u32, ResolverError> {
+        closure
+            .iter()
+            .position(|key| key == dep_key)
+            .ok_or_else(|| {
+                ResolverError::from(format!(
+                    "dep {} {} escapes {} {}'s dependency closure",
+                    dep_key.package.crate_name,
+                    dep_key.package.version,
+                    node_key.package.crate_name,
+                    node_key.package.version,
+                ))
+            })
+            .and_then(|rank| {
+                u32::try_from(rank).map_err(|_| {
+                    ResolverError::from(format!(
+                        "dependency closure of {} {} exceeds the u32 wire index space",
+                        node_key.package.crate_name, node_key.package.version
+                    ))
+                })
+            })
+    };
+    let mut nodes = Vec::with_capacity(closure.len());
+    for member in &closure {
+        let features_json = feature_json_by_key.get(member).ok_or_else(|| {
+            ResolverError::from(format!(
+                "missing serialized feature set for {} {}",
+                member.package.crate_name, member.package.version
+            ))
+        })?;
+        let deps = dependency_keys_by_key
+            .get(member)
+            .map(|children| {
+                children
+                    .iter()
+                    .map(wire_index)
+                    .collect::<Result<Vec<u32>, ResolverError>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        nodes.push(stow_types::api::SubgraphNode {
+            crate_name: member.package.crate_name.clone(),
+            version: CrateVersion::new(member.package.version.clone()),
+            features_json: parse_canonical_features_json(features_json)?,
+            host_side: member.host_side,
+            deps,
+        });
+    }
+    let root_deps = dependency_keys_by_key
+        .get(node_key)
+        .map(|children| {
+            children
+                .iter()
+                .map(wire_index)
+                .collect::<Result<Vec<u32>, ResolverError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(stow_types::api::TaskSubgraph { root_deps, nodes })
+}
+
 fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
     dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
@@ -305,6 +497,12 @@ fn build_enqueue_requests(
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
 ) -> Result<Vec<EnqueueRequest>, ResolverError> {
+    let digests = expanded_digests(
+        feature_json_by_key,
+        dependency_keys_by_key,
+        target_typed,
+        rustc_version_typed,
+    )?;
     let mut requests = Vec::<EnqueueRequest>::new();
     for node_key in dependency_keys_by_key.keys() {
         let features_json = feature_json_by_key.get(node_key).cloned().ok_or_else(|| {
@@ -324,6 +522,17 @@ fn build_enqueue_requests(
                     dep_key.package.crate_name, dep_key.package.version
                 ))
             })?;
+            // A dep the graph does not expand — a covered row pruned
+            // before enqueue — commits to a leaf context the digest
+            // memo cannot refute; its own subtree is not observable
+            // here.
+            let dep_digest = digests.get(dep_key).cloned().map_or_else(
+                || {
+                    stow_types::identity::DependencyIdentity::leaf()
+                        .map_err(|error| ResolverError::from(error.to_string()))
+                },
+                Ok,
+            )?;
             depends_on.push(EnqueueDependency {
                 crate_name: dep_key.package.crate_name.clone(),
                 version: CrateVersion::new(dep_key.package.version.clone()),
@@ -331,6 +540,7 @@ fn build_enqueue_requests(
                 target: node_target(dep_key, target_typed),
                 rustc_version: rustc_version_typed.clone(),
                 host_side: dep_key.host_side,
+                dependency_identity: dep_digest,
             });
         }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
@@ -343,6 +553,17 @@ fn build_enqueue_requests(
             downloads: 0,
             source,
             depends_on,
+            dependency_identity: digests.get(node_key).cloned().ok_or_else(|| {
+                ResolverError::from(format!(
+                    "no dependency digest for {} {}",
+                    node_key.package.crate_name, node_key.package.version
+                ))
+            })?,
+            dependency_subgraph: expanded_subgraph(
+                node_key,
+                feature_json_by_key,
+                dependency_keys_by_key,
+            )?,
             preserve_lockfile: false,
             host_side: node_key.host_side,
         });
@@ -1663,6 +1884,9 @@ mod tests {
         features: &[&str],
     ) -> stow_types::api::EnqueueRequest {
         stow_types::api::EnqueueRequest {
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             crate_name: crate_name.parse().expect("valid crate name"),
             version: version.parse().expect("valid semver"),
             features_json: stow_types::identity::FeaturesJson::canonicalize(

@@ -900,6 +900,25 @@ fn missed_enqueue_request(
         .map_err(|error| stow_error!("top_missed features_json {features_json:?}: {error}"))?;
     let depends_on: Vec<EnqueueDependency> = serde_json::from_str(depends_on_json)
         .map_err(|error| stow_error!("top_missed depends_on_json {depends_on_json:?}: {error}"))?;
+    // stow#588: the miss row records each direct dep's own resolved
+    // digest — the identity the dep's task id commits to — but no
+    // transitive closure, so the subgraph this request can carry is the
+    // direct-deps shape (each dep as a leaf). A dep whose stored digest
+    // is non-leaf cannot be re-derived here; the recorded digest is the
+    // only evidence and `validate_dependency_identity` still binds it.
+    let dependency_subgraph = stow_types::api::TaskSubgraph {
+        root_deps: (0..depends_on.len() as u32).collect(),
+        nodes: depends_on
+            .iter()
+            .map(|dep| stow_types::api::SubgraphNode {
+                crate_name: dep.crate_name.clone(),
+                version: dep.version.clone(),
+                features_json: dep.features_json.clone(),
+                host_side: dep.host_side,
+                deps: Vec::new(),
+            })
+            .collect(),
+    };
     let request = EnqueueRequest {
         crate_name: CrateName::parse(crate_name)
             .map_err(|error| stow_error!("top_missed crate_name: {error}"))?,
@@ -916,6 +935,7 @@ fn missed_enqueue_request(
         depends_on,
         dependency_identity: DependencyIdentity::parse(dependency_identity)
             .map_err(|error| stow_error!("top_missed dependency_identity: {error}"))?,
+        dependency_subgraph,
         preserve_lockfile: false,
         host_side: host_side
             .parse::<bool>()

@@ -391,6 +391,7 @@ fn submit_task(rustc: &str, counter: u64) -> Result<EnqueueRequest, String> {
         depends_on: Vec::new(),
         dependency_identity: stow_types::identity::DependencyIdentity::leaf()
             .map_err(|error| format!("fixture dependency identity: {error}"))?,
+        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         host_side: false,
         preserve_lockfile: false,
     })

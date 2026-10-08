@@ -942,6 +942,9 @@ mod tests {
         super::queue::enqueue(
             db,
             &[EnqueueRequest {
+                dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                    .expect("leaf digest"),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 crate_name: "alpha".parse().expect("alpha crate"),
                 version: "1.0.0".parse().expect("alpha version"),
                 features_json: FeaturesJson::default(),

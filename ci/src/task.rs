@@ -322,38 +322,45 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         dependencies.insert(task.crate_name.as_str().to_owned(), dependency);
         (dependencies, BTreeMap::new())
     };
-    // Every dependency edge the scheduler gated becomes an exact pin on
-    // the wrapper: `=<version>` with the dep's published feature set, in
-    // the section matching the side its consumers compile it on. Without
-    // the pins the wrapper's own resolution can land on a narrower
-    // feature set than the dep task published — cargo compiles the dep
-    // under a key nobody published and dep_scan fails the build
-    // (stow#431). Cargo's unification can only widen a pinned set, and
-    // everything the task crate requests of the dep is already inside it
-    // by construction.
+    // Every node of the dispatched dependency subgraph becomes an exact
+    // pin on the wrapper: `=<version>` with the node's published feature
+    // set, in the section matching the side its consumers compile it on
+    // (stow#588). The whole transitive closure has to be pinned, not
+    // just the task's direct deps: cargo's unification can only widen a
+    // declared set, so an unpinned grandchild another consumer widened
+    // resolves narrower here and the dep task's key no longer matches
+    // the published context. Without the pins the wrapper's own
+    // resolution can land on a narrower feature set than the dep task
+    // published — cargo compiles the dep under a key nobody published
+    // and dep_scan fails the build (stow#431).
     //
     // The table key cannot be the crate name: a closure that carries two
     // semver-incompatible versions of one crate (`syn` 1 and 2 is common)
-    // — or a pin that shares the task crate's name at another version —
+    // — or a node that shares the task crate's name at another version —
     // would keep only the last insert. Each pin keys on a unique
-    // `<name>-v<version>` alias and names the package in `package`.
-    for pin in &task.dep_pins {
-        let selection = TaskFeatureSelection::from_features_json(&pin.features_json);
+    // `<name>-v<version>` alias and names the package in `package`. Two
+    // pins of one crate+version cannot share a section: the subgraph
+    // comes from a single resolve, whose units key per
+    // (package, version, features) per side and platform — an alias
+    // collision inside a section is a real error, not an ambiguity to
+    // disambiguate.
+    for node in &task.dependency_subgraph.nodes {
+        let selection = TaskFeatureSelection::from_features_json(&node.features_json);
         let pinned = Dependency {
-            version: format!("={}", pin.version),
-            package: Some(pin.crate_name.as_str().to_owned()),
+            version: format!("={}", node.version),
+            package: Some(node.crate_name.as_str().to_owned()),
             default_features: selection.no_default_features.then_some(false),
             features: selection.features,
         };
-        let section = if pin.host_side {
+        let section = if node.host_side {
             &mut build_dependencies
         } else {
             &mut dependencies
         };
         let alias = format!(
             "{}-v{}",
-            pin.crate_name.as_str(),
-            pin.version.to_string().replace('.', "_")
+            node.crate_name.as_str(),
+            node.version.to_string().replace('.', "_")
         );
         if section.insert(alias.clone(), pinned).is_some() {
             return Err(stow_types::stow_error!(
@@ -1952,7 +1959,7 @@ mod tests {
     use flate2::Compression;
     use tempfile::TempDir;
 
-    use stow_types::api::{BuildDepPin, BuildTaskPayload};
+    use stow_types::api::{BuildTaskPayload, SubgraphNode, TaskSubgraph};
     use stow_types::identity::{
         CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
     };
@@ -2004,7 +2011,20 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
             host_side: false,
-            dep_pins: Vec::new(),
+            dependency_subgraph: TaskSubgraph::default(),
+        }
+    }
+
+    /// A subgraph carrying only the task's direct deps as leaves —
+    /// enough to exercise the wrapper manifest's pin section/alias
+    /// rules; the build-stage checks a full subgraph against the
+    /// toolchain's own unit graph instead.
+    fn leaf_pins(nodes: Vec<SubgraphNode>) -> TaskSubgraph {
+        TaskSubgraph {
+            root_deps: (0..nodes.len())
+                .map(|index| u32::try_from(index).expect("test node count fits u32"))
+                .collect(),
+            nodes,
         }
     }
 
@@ -2076,8 +2096,8 @@ mod tests {
     #[test]
     fn wrapper_manifest_pins_task_dependencies_to_their_published_identities() {
         let mut task = task_with_features(&["derive"]);
-        task.dep_pins = vec![
-            BuildDepPin {
+        task.dependency_subgraph = leaf_pins(vec![
+            SubgraphNode {
                 crate_name: CrateName::parse("serde_core").expect("crate name"),
                 version: CrateVersion::new(semver::Version::parse("1.0.228").expect("version")),
                 features_json: FeaturesJson::canonicalize(vec![
@@ -2086,15 +2106,17 @@ mod tests {
                 ])
                 .expect("features"),
                 host_side: false,
+                deps: Vec::new(),
             },
-            BuildDepPin {
+            SubgraphNode {
                 crate_name: CrateName::parse("syn").expect("crate name"),
                 version: CrateVersion::new(semver::Version::parse("2.0.106").expect("version")),
                 features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                     .expect("features"),
                 host_side: true,
+                deps: Vec::new(),
             },
-        ];
+        ]);
         let manifest: toml::Table =
             toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
                 .expect("generated manifest parses");
@@ -2140,23 +2162,25 @@ mod tests {
     #[test]
     fn wrapper_manifest_keeps_duplicate_crate_names_under_distinct_aliases() {
         let mut task = task_with_features(&["derive"]);
-        let pin = |version: &str, host_side: bool| BuildDepPin {
+        let pin = |version: &str, host_side: bool| SubgraphNode {
             crate_name: CrateName::parse("syn").expect("crate name"),
             version: CrateVersion::new(semver::Version::parse(version).expect("version")),
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             host_side,
+            deps: Vec::new(),
         };
-        task.dep_pins = vec![
+        task.dependency_subgraph = leaf_pins(vec![
             pin("1.0.109", false),
             pin("2.0.106", false),
-            BuildDepPin {
+            SubgraphNode {
                 crate_name: task.crate_name.clone(),
                 version: CrateVersion::new(semver::Version::parse("9.9.9").expect("version")),
                 features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
                 host_side: false,
+                deps: Vec::new(),
             },
-        ];
+        ]);
         let manifest: toml::Table =
             toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
                 .expect("generated manifest parses");

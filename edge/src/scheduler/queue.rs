@@ -61,11 +61,14 @@ pub struct QueuedTask {
     /// wrapper package's dependency as the unit's consumers compile it.
     pub host_side: bool,
     pub preserve_lockfile: bool,
-    /// The task's `queue_dependencies` rows at claim time — the published
-    /// identity of every dep the unit needs. Dispatch carries them to
-    /// `BuildTaskPayload.dep_pins` so the generated wrapper package pins
-    /// each dep to the identity its own task published.
-    pub dep_pins: Vec<stow_types::api::BuildDepPin>,
+    /// The task's dependency subgraph at claim time, rebuilt from its
+    /// `queue_dependencies` rows (stow#588). Dispatch carries it to
+    /// `BuildTaskPayload.dependency_subgraph` so the generated wrapper
+    /// package pins the dep closure. The table stores direct-dep edges
+    /// only — a dep's own children are not recoverable here, so each
+    /// subgraph node lands as a leaf; the scheduler's storage rework is
+    /// owned by a follow-up task.
+    pub dependency_subgraph: stow_types::api::TaskSubgraph,
 }
 
 // Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
@@ -3872,7 +3875,7 @@ async fn claim_dispatchable_row(
         rustc_version: row.rustc_version,
         host_side: row.host_side != 0,
         preserve_lockfile: row.preserve_lockfile != 0,
-        dep_pins: Vec::new(),
+        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
     }))
 }
 
@@ -3979,10 +3982,12 @@ pub async fn claim_dispatchable_tasks(
     Ok(claimed)
 }
 
-/// Fill each claimed task's `dep_pins` from its `queue_dependencies` rows:
-/// the (name, version, unified features, side) the dep's own task was
-/// published at, which is exactly what the dependent's wrapper manifest
-/// pins so its resolve lands on the published unit (stow#431).
+/// Fill each claimed task's `dependency_subgraph` from its
+/// `queue_dependencies` rows: the (name, version, unified features, side)
+/// the dep's own task was published at — exactly what the dependent's
+/// wrapper manifest pins so its resolve lands on the published unit
+/// (stow#431). The rows carry direct-dep edges only, so each node is a
+/// leaf here (stow#588; scheduler storage rework is a follow-up).
 async fn load_claimed_dep_pins(
     db: &DurableDb,
     claimed: &mut [QueuedTask],
@@ -4004,10 +4009,14 @@ async fn load_claimed_dep_pins(
         .fetch_all::<DepPinRow>()
         .await
         .map_err(|error| format!("load claimed task dep pins: {error}"))?;
-    let mut by_task: std::collections::HashMap<String, Vec<stow_types::api::BuildDepPin>> =
+    let mut by_task: std::collections::HashMap<String, Vec<stow_types::api::SubgraphNode>> =
         std::collections::HashMap::new();
     for row in rows {
-        let pin = stow_types::api::BuildDepPin {
+        // queue_dependencies stores the task's direct-dep edges only:
+        // each row is a subgraph node whose own `deps` stay empty — the
+        // dep's children are not in the table (see `QueuedTask::
+        // dependency_subgraph`).
+        let node = stow_types::api::SubgraphNode {
             crate_name: CrateName::parse(row.dep_crate_name).map_err(|error| {
                 QueueError::Invariant(format!(
                     "dep pin for {}: invalid crate name: {error}",
@@ -4037,12 +4046,18 @@ async fn load_claimed_dep_pins(
                 ))
             })?,
             host_side: row.dep_host_side != 0,
+            deps: Vec::new(),
         };
-        by_task.entry(row.task_id).or_default().push(pin);
+        by_task.entry(row.task_id).or_default().push(node);
     }
     for task in claimed.iter_mut() {
-        if let Some(pins) = by_task.remove(&task.task_id) {
-            task.dep_pins = pins;
+        if let Some(nodes) = by_task.remove(&task.task_id) {
+            task.dependency_subgraph = stow_types::api::TaskSubgraph {
+                root_deps: (0..nodes.len())
+                    .map(|index| u32::try_from(index).expect("dep rows fit u32"))
+                    .collect(),
+                nodes,
+            };
         }
     }
     Ok(())

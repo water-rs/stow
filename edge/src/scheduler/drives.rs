@@ -2121,6 +2121,8 @@ fn submit_batch_named(
     let dep = dep_request;
     let (_resync_crate, resync_version) = crate_identity(101);
     let resync = EnqueueRequest {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
+        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         crate_name: resync_name.parse().expect("resync crate"),
         version: resync_version.parse().expect("resync version"),
         features_json: FeaturesJson::default(),
@@ -2196,6 +2198,8 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
     let target = stow_types::api::CI_TARGET_TRIPLES[0];
     let rustc = "1.86.0";
     let root_task = EnqueueRequest {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
+        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         crate_name: crate_name.parse().expect("request crate"),
         version: version.parse().expect("request version"),
         features_json: FeaturesJson::default(),
@@ -2573,6 +2577,7 @@ const fn feed_event_deps(k: u32) -> [u32; 2] {
 /// submit runs (stow#523).
 fn feed_event_requests() -> Vec<EnqueueRequest> {
     let dep_edge = |d: u32| EnqueueDependency {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: feed_event_dep_name(d).parse().expect("event dep crate"),
         version: "1.0.0".parse().expect("event dep version"),
         features_json: FeaturesJson::default(),
@@ -2582,6 +2587,9 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
     };
     (0..FEED_EVENT_DEPS)
         .map(|d| EnqueueRequest {
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             crate_name: feed_event_dep_name(d).parse().expect("event dep crate"),
             version: "1.0.0".parse().expect("event dep version"),
             features_json: FeaturesJson::default(),
@@ -2596,6 +2604,9 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
         .chain((0..FEED_EVENT_ROOTS).map(|k| {
             let [first, second] = feed_event_deps(k);
             EnqueueRequest {
+                dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                    .expect("leaf digest"),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 crate_name: feed_event_root_name(k).parse().expect("event root crate"),
                 version: "1.0.0".parse().expect("event root version"),
                 features_json: FeaturesJson::default(),
@@ -2889,6 +2900,7 @@ async fn clear_feed_event_subgraph(db: &DurableDb) -> Result<(), String> {
 fn dep_request(n: u32) -> EnqueueDependency {
     let (crate_name, version) = crate_identity(n);
     EnqueueDependency {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: crate_name.parse().expect("dep crate"),
         version: version.parse().expect("dep version"),
         features_json: FeaturesJson::default(),
@@ -2926,6 +2938,7 @@ fn full_slice_report() -> Vec<PublishedSliceRow> {
             node_shapes(false, target)
                 .into_iter()
                 .map(move |shape| PublishedSliceRow {
+                    dependency_identity: None,
                     crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
                     version: "1.0.0".parse().expect("full version"),
                     features_json: FeaturesJson::default(),
@@ -2955,6 +2968,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
         let n = first + (live - 1 - i) * 9;
         let (crate_name, version) = crate_identity(n);
         retired.push(PublishedSliceRow {
+            dependency_identity: None,
             crate_name: crate_name.parse().expect("retire crate"),
             version: version.parse().expect("retire version"),
             features_json: FeaturesJson::default(),
@@ -2966,6 +2980,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
             node_shapes(false, target)
                 .into_iter()
                 .map(|shape| PublishedSliceRow {
+                    dependency_identity: None,
                     crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
                     version: "9.9.9".parse().expect("delta version"),
                     features_json: FeaturesJson::default(),

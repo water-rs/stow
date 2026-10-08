@@ -259,7 +259,7 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
-            dep_pins: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         }
     }
 
@@ -284,6 +284,8 @@ mod tests {
 
     fn planned(crate_name: &str, version: &str) -> PlannedArtifact {
         let mut artifact = PlannedArtifact {
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
             compile_key: "0".repeat(64),
             crate_name: CrateName::parse(crate_name).unwrap(),
             crate_version: CrateVersion::new(semver::Version::parse(version).unwrap()),

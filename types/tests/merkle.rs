@@ -1,20 +1,19 @@
-//! Merkle task identity over resolver unit graphs (stow#588):
-//! `resolved_task_graph` lifts a resolve's `StowUnit`s into the shared
+//! Merkle task identity over unit graphs (stow#588):
+//! `resolved_task_graph` lifts a resolve's `TaskUnit`s into the shared
 //! `ResolvedTaskGraph`, whose task ids commit to each node's whole
 //! dependency subgraph.
 //!
-//! The fixtures here are synthetic `StowUnit` values — the shape
-//! `emit.rs` produces from a real resolve — so the identity machinery is
-//! exercised without cargo. `tests/offline.rs` covers the same shape
+//! The fixtures here are synthetic `TaskUnit` values — the shape a unit
+//! source (`stow-resolver`'s cargo resolve, `stow-cli`'s `--unit-graph`
+//! conversion) produces — so the identity machinery is exercised without
+//! cargo. `stow-resolver`'s `tests/offline.rs` covers the same shape
 //! end-to-end on a real resolve.
 
-use cargo::core::PackageIdSpec;
-use cargo::core::dependency::DepKind;
-use cargo_util_schemas::core::SourceKind;
-use stow_resolver::{StowDep, StowSide, StowUnit, StowUnitKey, StowUnitKind, resolved_task_graph};
 use stow_types::identity::WireRustcVersion;
 use stow_types::task_graph::ResolvedTaskGraph;
-use url::Url;
+use stow_types::unit_graph::{
+    TaskUnit, TaskUnitDep, TaskUnitKey, TaskUnitKind, TaskUnitSide, resolved_task_graph,
+};
 
 /// The requested target triple — what consumer-side units compile on.
 const TARGET: &str = "aarch64-unknown-linux-gnu";
@@ -25,68 +24,69 @@ fn rustc() -> WireRustcVersion {
     WireRustcVersion::parse("1.99.0").unwrap()
 }
 
+fn pkg(name: &str, version: &str) -> String {
+    format!("registry+https://github.com/rust-lang/crates.io-index#{name}@{version}")
+}
+
 fn key(
     name: &str,
     version: &str,
     platform: &str,
-    side: StowSide,
-    kind: StowUnitKind,
-) -> StowUnitKey {
-    StowUnitKey {
-        pkg: PackageIdSpec::parse(&format!("{name}@{version}")).unwrap(),
+    side: TaskUnitSide,
+    kind: TaskUnitKind,
+) -> TaskUnitKey {
+    TaskUnitKey {
+        pkg: pkg(name, version),
         platform: platform.to_owned(),
         side,
         kind,
     }
 }
 
-fn dep(name: &str, version: &str, platform: &str, side: StowSide, kind: StowUnitKind) -> StowDep {
-    StowDep {
+fn dep(
+    name: &str,
+    version: &str,
+    platform: &str,
+    side: TaskUnitSide,
+    kind: TaskUnitKind,
+) -> TaskUnitDep {
+    TaskUnitDep {
         key: key(name, version, platform, side, kind),
         name: name.to_owned(),
         version: version.to_owned(),
-        dep_kind: DepKind::Normal,
     }
 }
 
-fn build_dep(name: &str, version: &str) -> StowDep {
-    let mut dep = dep(name, version, HOST, StowSide::Host, StowUnitKind::Lib);
-    dep.dep_kind = DepKind::Build;
-    dep
+fn build_dep(name: &str, version: &str) -> TaskUnitDep {
+    dep(name, version, HOST, TaskUnitSide::Host, TaskUnitKind::Lib)
 }
 
-fn dep_of(unit: &StowUnit, dep_kind: DepKind) -> StowDep {
-    StowDep {
+fn dep_of(unit: &TaskUnit) -> TaskUnitDep {
+    TaskUnitDep {
         key: unit.key.clone(),
         name: unit.name.clone(),
         version: unit.version.clone(),
-        dep_kind,
     }
 }
 
-fn pkg_sources(name: &str, version: &str) -> (tempfile::TempDir, PackageIdSpec, PackageIdSpec) {
+/// Same name+version from a registry source and a path source — the
+/// package id's source half is what keeps the units distinct.
+fn pkg_sources(name: &str, version: &str) -> (tempfile::TempDir, String, String) {
     let dir = tempfile::tempdir().unwrap();
-    let pkg = key(name, version, TARGET, StowSide::Target, StowUnitKind::Lib).pkg;
-    let registry = pkg
-        .clone()
-        .with_url(Url::parse("https://github.com/rust-lang/crates.io-index").unwrap())
-        .with_kind(SourceKind::Registry);
-    let path = pkg
-        .with_url(Url::from_directory_path(dir.path()).unwrap())
-        .with_kind(SourceKind::Path);
+    let registry = pkg(name, version);
+    let path = format!("path+file://{}#{name}@{version}", dir.path().display());
     (dir, registry, path)
 }
 
 fn unit(
-    key: StowUnitKey,
+    key: TaskUnitKey,
     name: &str,
     version: &str,
     features: &[&str],
     is_crates_io: bool,
-    deps: Vec<StowDep>,
-) -> StowUnit {
-    StowUnit {
-        unit_kind: key.kind,
+    deps: Vec<TaskUnitDep>,
+) -> TaskUnit {
+    TaskUnit {
         key,
         name: name.to_owned(),
         version: version.to_owned(),
@@ -100,9 +100,15 @@ fn unit(
 }
 
 /// A target-side crates.io lib unit.
-fn lib(name: &str, version: &str, features: &[&str], deps: Vec<StowDep>) -> StowUnit {
+fn lib(name: &str, version: &str, features: &[&str], deps: Vec<TaskUnitDep>) -> TaskUnit {
     unit(
-        key(name, version, TARGET, StowSide::Target, StowUnitKind::Lib),
+        key(
+            name,
+            version,
+            TARGET,
+            TaskUnitSide::Target,
+            TaskUnitKind::Lib,
+        ),
         name,
         version,
         features,
@@ -112,9 +118,9 @@ fn lib(name: &str, version: &str, features: &[&str], deps: Vec<StowDep>) -> Stow
 }
 
 /// A host-side crates.io unit — a lib dep or a build-script compile unit.
-fn host_unit(name: &str, version: &str, kind: StowUnitKind, deps: Vec<StowDep>) -> StowUnit {
+fn host_unit(name: &str, version: &str, kind: TaskUnitKind, deps: Vec<TaskUnitDep>) -> TaskUnit {
     unit(
-        key(name, version, HOST, StowSide::Host, kind),
+        key(name, version, HOST, TaskUnitSide::Host, kind),
         name,
         version,
         &[],
@@ -147,8 +153,8 @@ fn separate_resolves_mint_distinct_ids_for_distinct_subgraphs() {
                     "alloc-no-stdlib",
                     "2.0.4",
                     TARGET,
-                    StowSide::Target,
-                    StowUnitKind::Lib,
+                    TaskUnitSide::Target,
+                    TaskUnitKind::Lib,
                 )],
             ),
             lib("alloc-no-stdlib", "2.0.4", dep_features, vec![]),
@@ -184,15 +190,15 @@ fn unit_and_edge_ordering_do_not_change_identity() {
                 "dep-a",
                 "1.0.0",
                 TARGET,
-                StowSide::Target,
-                StowUnitKind::Lib,
+                TaskUnitSide::Target,
+                TaskUnitKind::Lib,
             ),
             dep(
                 "dep-b",
                 "1.0.0",
                 TARGET,
-                StowSide::Target,
-                StowUnitKind::Lib,
+                TaskUnitSide::Target,
+                TaskUnitKind::Lib,
             ),
         ];
         if reverse {
@@ -240,10 +246,10 @@ fn host_and_build_script_edges_join_the_digest() {
             host_unit(
                 "root",
                 "1.0.0",
-                StowUnitKind::BuildScript,
+                TaskUnitKind::BuildScript,
                 vec![build_dep("host-dep", "1.0.0")],
             ),
-            host_unit("host-dep", "1.0.0", StowUnitKind::Lib, vec![]),
+            host_unit("host-dep", "1.0.0", TaskUnitKind::Lib, vec![]),
         ],
         &rustc(),
     )
@@ -270,9 +276,15 @@ fn host_and_build_script_edges_join_the_digest() {
                 "root",
                 "1.0.0",
                 &[],
-                vec![dep("pm", "1.0.0", HOST, StowSide::Host, StowUnitKind::Lib)],
+                vec![dep(
+                    "pm",
+                    "1.0.0",
+                    HOST,
+                    TaskUnitSide::Host,
+                    TaskUnitKind::Lib,
+                )],
             ),
-            host_unit("pm", "1.0.0", StowUnitKind::Lib, vec![]),
+            host_unit("pm", "1.0.0", TaskUnitKind::Lib, vec![]),
         ],
         &rustc(),
     )
@@ -295,8 +307,8 @@ fn missing_lib_endpoints_self_edges_and_cycles_fail() {
                 "ghost",
                 "1.0.0",
                 TARGET,
-                StowSide::Target,
-                StowUnitKind::Lib,
+                TaskUnitSide::Target,
+                TaskUnitKind::Lib,
             )],
         )],
         &rustc(),
@@ -312,7 +324,7 @@ fn missing_lib_endpoints_self_edges_and_cycles_fail() {
             host_unit(
                 "root",
                 "1.0.0",
-                StowUnitKind::BuildScript,
+                TaskUnitKind::BuildScript,
                 vec![build_dep("ghost", "2.0.0")],
             ),
         ],
@@ -331,8 +343,8 @@ fn missing_lib_endpoints_self_edges_and_cycles_fail() {
                 "selfish",
                 "1.0.0",
                 TARGET,
-                StowSide::Target,
-                StowUnitKind::Lib,
+                TaskUnitSide::Target,
+                TaskUnitKind::Lib,
             )],
         )],
         &rustc(),
@@ -353,8 +365,8 @@ fn missing_lib_endpoints_self_edges_and_cycles_fail() {
                     "b",
                     "1.0.0",
                     TARGET,
-                    StowSide::Target,
-                    StowUnitKind::Lib,
+                    TaskUnitSide::Target,
+                    TaskUnitKind::Lib,
                 )],
             ),
             lib(
@@ -365,8 +377,8 @@ fn missing_lib_endpoints_self_edges_and_cycles_fail() {
                     "a",
                     "1.0.0",
                     TARGET,
-                    StowSide::Target,
-                    StowUnitKind::Lib,
+                    TaskUnitSide::Target,
+                    TaskUnitKind::Lib,
                 )],
             ),
         ],
@@ -390,8 +402,8 @@ fn non_registry_units_traverse_without_minting_nodes() {
                     "middle",
                     "1.0.0",
                     TARGET,
-                    StowSide::Target,
-                    StowUnitKind::Lib,
+                    TaskUnitSide::Target,
+                    TaskUnitKind::Lib,
                 )],
             ),
             unit(
@@ -399,8 +411,8 @@ fn non_registry_units_traverse_without_minting_nodes() {
                     "middle",
                     "1.0.0",
                     TARGET,
-                    StowSide::Target,
-                    StowUnitKind::Lib,
+                    TaskUnitSide::Target,
+                    TaskUnitKind::Lib,
                 ),
                 "middle",
                 "1.0.0",
@@ -410,8 +422,8 @@ fn non_registry_units_traverse_without_minting_nodes() {
                     "inner",
                     "1.0.0",
                     TARGET,
-                    StowSide::Target,
-                    StowUnitKind::Lib,
+                    TaskUnitSide::Target,
+                    TaskUnitKind::Lib,
                 )],
             ),
             lib("inner", "1.0.0", &[], vec![]),
@@ -435,22 +447,12 @@ fn dependency_endpoints_preserve_package_source() {
     let inner = lib("inner", "1.0.0", &[], vec![]);
     let mut registry_unit = lib("middle", "1.0.0", &[], vec![]);
     registry_unit.key.pkg = registry;
-    let mut path_unit = lib(
-        "middle",
-        "1.0.0",
-        &[],
-        vec![dep_of(&inner, DepKind::Normal)],
-    );
+    let mut path_unit = lib("middle", "1.0.0", &[], vec![dep_of(&inner)]);
     path_unit.key.pkg = path;
     path_unit.is_crates_io = false;
 
     for (endpoint, expected) in [(&registry_unit, "middle"), (&path_unit, "inner")] {
-        let root = lib(
-            "root",
-            "1.0.0",
-            &[],
-            vec![dep_of(endpoint, DepKind::Normal)],
-        );
+        let root = lib("root", "1.0.0", &[], vec![dep_of(endpoint)]);
         let mut units = vec![
             root,
             registry_unit.clone(),
@@ -470,12 +472,7 @@ fn dependency_endpoints_preserve_package_source() {
     }
 
     // A same-tuple unit from another source is not the declared endpoint.
-    let root = lib(
-        "root",
-        "1.0.0",
-        &[],
-        vec![dep_of(&registry_unit, DepKind::Normal)],
-    );
+    let root = lib("root", "1.0.0", &[], vec![dep_of(&registry_unit)]);
     let error = resolved_task_graph(&[root, path_unit, inner], &rustc()).unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains("middle"), "{message}");
@@ -489,22 +486,22 @@ fn dependency_endpoints_preserve_package_source() {
 #[test]
 fn build_script_owner_preserves_package_source() {
     let (_dir, registry, path) = pkg_sources("root", "1.0.0");
-    let registry_dep = host_unit("registry-dep", "1.0.0", StowUnitKind::Lib, vec![]);
-    let path_dep = host_unit("path-dep", "1.0.0", StowUnitKind::Lib, vec![]);
+    let registry_dep = host_unit("registry-dep", "1.0.0", TaskUnitKind::Lib, vec![]);
+    let path_dep = host_unit("path-dep", "1.0.0", TaskUnitKind::Lib, vec![]);
     let mut root = lib("root", "1.0.0", &[], vec![]);
     root.key.pkg = registry.clone();
     let mut registry_script = host_unit(
         "root",
         "1.0.0",
-        StowUnitKind::BuildScript,
-        vec![dep_of(&registry_dep, DepKind::Build)],
+        TaskUnitKind::BuildScript,
+        vec![dep_of(&registry_dep)],
     );
     registry_script.key.pkg = registry;
     let mut path_script = host_unit(
         "root",
         "1.0.0",
-        StowUnitKind::BuildScript,
-        vec![dep_of(&path_dep, DepKind::Build)],
+        TaskUnitKind::BuildScript,
+        vec![dep_of(&path_dep)],
     );
     path_script.key.pkg = path;
     path_script.is_crates_io = false;
@@ -525,10 +522,16 @@ fn build_script_owner_preserves_package_source() {
 #[test]
 fn optional_shadow_preserves_package_source() {
     let (_dir, registry, path) = pkg_sources("middle", "1.0.0");
-    let mut host = host_unit("middle", "1.0.0", StowUnitKind::Lib, vec![]);
+    let mut host = host_unit("middle", "1.0.0", TaskUnitKind::Lib, vec![]);
     host.key.pkg = registry.clone();
     let mut target = unit(
-        key("middle", "1.0.0", HOST, StowSide::Target, StowUnitKind::Lib),
+        key(
+            "middle",
+            "1.0.0",
+            HOST,
+            TaskUnitSide::Target,
+            TaskUnitKind::Lib,
+        ),
         "middle",
         "1.0.0",
         &["native"],
@@ -544,8 +547,8 @@ fn optional_shadow_preserves_package_source() {
     let script = host_unit(
         "root",
         "1.0.0",
-        StowUnitKind::BuildScript,
-        vec![dep_of(&host, DepKind::Build)],
+        TaskUnitKind::BuildScript,
+        vec![dep_of(&host)],
     );
     let mut units = vec![root, script, host, other_source, target];
     let forward = resolved_task_graph(&units, &rustc()).unwrap();
