@@ -77,6 +77,19 @@ pub fn validate_plan(
                 task.rustc_version
             ));
         }
+        // stow#588: the digest claim is the claim that matters most —
+        // an artifact built under a different dependency context is a
+        // different artifact the cache must never serve under this
+        // task's id.
+        if artifact.dependency_identity != *closure.dependency_identity() {
+            return Err(stow_types::stow_error!(
+                "planned artifact {} claims dependency_identity {} but the publisher verified {} for task {}",
+                artifact.oci_reference,
+                artifact.dependency_identity,
+                closure.dependency_identity(),
+                task.task_id,
+            ));
+        }
         if !closure.contains(
             artifact.crate_name.as_str(),
             artifact.crate_version.as_semver(),

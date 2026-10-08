@@ -150,6 +150,24 @@ pub async fn create_workspace(
     })
 }
 
+/// A `BuildWorkspace` view of a directory the caller already owns —
+/// the publisher's pristine resolution workspace (stow#588). Its
+/// manifest is `create_resolution_workspace`'s return, its workspace
+/// root the manifest's parent, and it has no capture dir or bundled
+/// lockfile to check.
+pub(crate) fn resolution_build_workspace(
+    manifest_path: PathBuf,
+    workspace_root: PathBuf,
+) -> BuildWorkspace {
+    BuildWorkspace {
+        _tempdir: None,
+        manifest_path,
+        workspace_root,
+        capture_dir: PathBuf::new(),
+        bundled_lockfile: None,
+    }
+}
+
 /// Write the generated wrapper package that makes the task crate a
 /// registry dependency: an empty lib target plus a manifest whose only
 /// dependency is `name = "=version"` carrying the task's exact feature
@@ -599,11 +617,10 @@ fn lockfile_packages(
 /// build.
 async fn stage_consumption_store(
     task: &BuildTaskPayload,
-    workspace: &BuildWorkspace,
-    cargo_subcommand: CargoSubcommand,
+    unit_graphs: &[PhaseUnitGraph],
 ) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
     let store_dir = TempDir::new()?;
-    let packages = match consumption_packages(task, workspace, cargo_subcommand).await {
+    let packages = match consumption_packages(task, unit_graphs) {
         Ok(packages) => packages,
         // Consumption is an optimization: a workspace whose unit graph
         // cannot be read builds exactly as one without a cache.
@@ -632,6 +649,17 @@ async fn stage_consumption_store(
     Ok(staged.map_or_else(|| (None, None), |path| (Some(store_dir), Some(path))))
 }
 
+/// One cargo `--unit-graph` answer for one phase×invocation spelling,
+/// kept whole: the consumable set reads `entries` and the
+/// dependency-context check reads `raw_unit_graph` (stow#588).
+pub(crate) struct PhaseUnitGraph {
+    phase: CargoSubcommand,
+    invocation: CargoInvocation,
+    /// The spelled `--target`, `None` for the native spelling.
+    target: Option<String>,
+    graph: stow_cli::ExpandedDependencyGraph,
+}
+
 /// The units this build's workspace will compile, read from cargo's own
 /// unit graphs — the consumable set (stow#589). Each graph is computed
 /// with the same argv a phase runs (`cargo_phase_args`, minus the
@@ -644,12 +672,12 @@ async fn stage_consumption_store(
 /// recorded dep edges reach only lib `--extern`s — the graph covers the
 /// whole resolved closure, build-script deps and transitives included,
 /// at the identities cargo will actually compile them at.
-async fn consumption_packages(
+pub(crate) async fn phase_unit_graphs(
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
     cargo_subcommand: CargoSubcommand,
-) -> stow_types::error::Result<Vec<dep_scan::ConsumablePackage>> {
-    let mut entries = Vec::new();
+) -> stow_types::error::Result<Vec<PhaseUnitGraph>> {
+    let mut graphs = Vec::new();
     for &phase in cargo_phases(cargo_subcommand) {
         for &invocation in phase_invocations(task) {
             let phase_args = cargo_phase_args(workspace, task, phase, invocation).await?;
@@ -666,10 +694,195 @@ async fn consumption_packages(
                 task.rustc_version.as_str(),
             )
             .await?;
-            entries.extend(graph.entries);
+            graphs.push(PhaseUnitGraph {
+                phase,
+                invocation,
+                target: passes_target.then(|| task.target.as_str().to_owned()),
+                graph,
+            });
         }
     }
+    Ok(graphs)
+}
+
+/// The consumable set across every phase×invocation unit graph.
+fn consumption_packages(
+    task: &BuildTaskPayload,
+    unit_graphs: &[PhaseUnitGraph],
+) -> stow_types::error::Result<Vec<dep_scan::ConsumablePackage>> {
+    let mut entries = Vec::new();
+    for unit_graph in unit_graphs {
+        entries.extend(unit_graph.graph.entries.iter().cloned());
+    }
     Ok(dep_scan::consumable_packages(task, &entries))
+}
+
+/// The compiled dependency-context gate (stow#588): every phase×invocation
+/// unit graph must resolve the task's own node to the same `task_id` the
+/// dispatch claims — the wrapper's pins reproduce the transitive feature
+/// context, so the task node mints only when the compiled graph carries
+/// the dispatched subgraph.
+///
+/// For a host-side task the explicit (`--target <host triple>`) spelling
+/// defines identity: it is the resolve shape the resolver minted the
+/// dispatch from. The native spelling compiles the same task unit
+/// context — the pinned manifest makes cross-side feature unification
+/// impossible (host pins live in `[build-dependencies]`, target pins in
+/// `[dependencies]`, each at an exact set) — and dedup-shadow edges let
+/// a shared unit serve both sides at one identity, so the task node id
+/// must agree there too. A disagreement is cargo compiling the task
+/// under a context nobody dispatched, and publishing its artifact under
+/// `task_id` would mislabel the cache.
+pub(crate) fn verify_dependency_context(
+    task: &BuildTaskPayload,
+    unit_graphs: &[PhaseUnitGraph],
+) -> stow_types::error::Result<()> {
+    let expected = task.verified_dependency_graph()?;
+    let host_triple = stow_types::api::runner_family(task.target.as_str())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "task {} {} targets {} — no runner family names its host triple",
+                task.crate_name.as_str(),
+                task.version,
+                task.target
+            )
+        })?
+        .host_triple();
+    for unit_graph in unit_graphs {
+        let units = unit_graph
+            .graph
+            .task_units(unit_graph.target.as_deref(), host_triple)
+            .map_err(|error| {
+                stow_types::stow_error!(
+                    "task {} {} ({}): {} {} unit graph does not convert: {error}",
+                    task.crate_name.as_str(),
+                    task.version,
+                    task.target,
+                    unit_graph.phase.as_str(),
+                    unit_graph.invocation.spelling(),
+                )
+            })?;
+        let actual = stow_types::unit_graph::resolved_task_graph(&units, &task.rustc_version)
+            .map_err(|error| {
+                stow_types::stow_error!(
+                    "task {} {} ({}): {} {} unit graph does not resolve: {error}",
+                    task.crate_name.as_str(),
+                    task.version,
+                    task.target,
+                    unit_graph.phase.as_str(),
+                    unit_graph.invocation.spelling(),
+                )
+            })?;
+        let identity = task.task_node_identity();
+        let found = actual
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.identity == identity)
+            .collect::<Vec<_>>();
+        if found.is_empty() {
+            return Err(stow_types::stow_error!(
+                "task {} {} ({}): {} {} unit graph has no node with the task identity \
+                 (crate {} version {} features {:?} target {} rustc {} host_side {})",
+                task.crate_name.as_str(),
+                task.version,
+                task.target,
+                unit_graph.phase.as_str(),
+                unit_graph.invocation.spelling(),
+                task.crate_name.as_str(),
+                task.version,
+                task.features_json.features(),
+                task.target,
+                task.rustc_version,
+                task.host_side,
+            ));
+        }
+        if found
+            .iter()
+            .any(|(index, _)| actual.task_id(*index) == Some(task.task_id.as_str()))
+        {
+            continue;
+        }
+        let difference = first_context_difference(&expected, &actual);
+        return Err(stow_types::stow_error!(
+            "task {} {} ({}): {} {} unit graph compiles a different dependency context — {difference}",
+            task.crate_name.as_str(),
+            task.version,
+            task.target,
+            unit_graph.phase.as_str(),
+            unit_graph.invocation.spelling(),
+        ));
+    }
+    Ok(())
+}
+
+/// The first node where the dispatched and compiled graphs disagree:
+/// its expected and actual task ids plus the children ids on both
+/// sides, so the mismatch names the crate that resolved differently.
+fn first_context_difference(
+    expected: &stow_types::task_graph::ResolvedTaskGraph,
+    actual: &stow_types::task_graph::ResolvedTaskGraph,
+) -> String {
+    for (index, node) in expected.nodes().iter().enumerate() {
+        let expected_children = node
+            .dependencies
+            .iter()
+            .filter_map(|dep| expected.task_id(*dep))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut named = None;
+        let mut diverged = None;
+        for (other_index, other) in actual.nodes().iter().enumerate() {
+            if other.identity != node.identity {
+                continue;
+            }
+            let actual_children = other
+                .dependencies
+                .iter()
+                .filter_map(|dep| actual.task_id(*dep))
+                .collect::<std::collections::BTreeSet<_>>();
+            if actual_children == expected_children {
+                named = Some(other_index);
+                break;
+            }
+            diverged.get_or_insert(other_index);
+        }
+        if named.is_some() {
+            continue;
+        }
+        let expected_id = expected
+            .task_id(index)
+            .map_or_else(|| "<unresolved>".to_owned(), str::to_owned);
+        let expected_kids = expected_children.into_iter().collect::<Vec<_>>().join(", ");
+        return if let Some(other_index) = diverged {
+            let actual_children = actual.nodes()[other_index]
+                .dependencies
+                .iter()
+                .filter_map(|dep| actual.task_id(*dep))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "node {} {} ({}): expected id `{}` children [{}]; actual id `{}` children [{}]",
+                node.identity.crate_name.as_str(),
+                node.identity.version,
+                node.identity.target,
+                expected_id,
+                expected_kids,
+                actual.task_id(other_index).unwrap_or("<unresolved>"),
+                actual_children,
+            )
+        } else {
+            format!(
+                "node {} {} ({}): expected id `{}` children [{}]; the compiled graph has no such node",
+                node.identity.crate_name.as_str(),
+                node.identity.version,
+                node.identity.target,
+                expected_id,
+                expected_kids,
+            )
+        };
+    }
+    "the dispatched subgraph's every node resolved identically; the task id still differs"
+        .to_owned()
 }
 
 pub async fn build(
@@ -686,8 +899,14 @@ pub async fn build(
     fetch_workspace_dependencies(task, &workspace).await?;
 
     let cargo_subcommand = cargo_subcommand()?;
-    let (_consume_store_dir, consume_store) =
-        stage_consumption_store(task, &workspace, cargo_subcommand).await?;
+    // Cargo's own unit graphs are computed once for the whole build:
+    // the dependency-context check must see exactly what every phase
+    // and spelling will compile (stow#588), and consumption reads the
+    // same answers — a graph that cannot be produced fails the build,
+    // not just the cache path.
+    let unit_graphs = phase_unit_graphs(task, &workspace, cargo_subcommand).await?;
+    verify_dependency_context(task, &unit_graphs)?;
+    let (_consume_store_dir, consume_store) = stage_consumption_store(task, &unit_graphs).await?;
 
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
         .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;
@@ -775,7 +994,7 @@ pub async fn build(
 /// connection an untrusted build script still attempts audited. Feature
 /// flags don't exist on `fetch`: it downloads the full dependency closure
 /// for every feature and every target.
-async fn fetch_workspace_dependencies(
+pub(crate) async fn fetch_workspace_dependencies(
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
 ) -> stow_types::error::Result<()> {
@@ -980,7 +1199,7 @@ async fn run_sandboxed_phase(
 /// (`-C debuginfo` applied or not), and consumers on each invocation
 /// key on their own.
 #[derive(Clone, Copy)]
-enum CargoInvocation {
+pub(crate) enum CargoInvocation {
     /// Decide from the task's target triple — `--target` only for a
     /// cross build, the spelling a non-host-side task always uses.
     Task,
@@ -993,6 +1212,17 @@ enum CargoInvocation {
     /// `-C debuginfo` to the host half whenever `--target` is present,
     /// even to the host triple itself).
     Explicit,
+}
+
+impl CargoInvocation {
+    /// The argv spelling, for error messages.
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::Task => "task-spelled",
+            Self::Native => "native",
+            Self::Explicit => "explicit --target",
+        }
+    }
 }
 
 /// The invocations a task's phases each run under. A host-side task
@@ -1669,7 +1899,7 @@ impl TaskFeatureSelection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CargoSubcommand {
+pub(crate) enum CargoSubcommand {
     Build,
     Check,
     Test,
@@ -1732,7 +1962,7 @@ pub async fn target_is_host(target: &str) -> stow_types::error::Result<bool> {
     Ok(host == target)
 }
 
-fn cargo_subcommand() -> stow_types::error::Result<CargoSubcommand> {
+pub(crate) fn cargo_subcommand() -> stow_types::error::Result<CargoSubcommand> {
     match std::env::var(STOW_BUILD_CARGO_SUBCOMMAND_ENV)
         .ok()
         .as_deref()

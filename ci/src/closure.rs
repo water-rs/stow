@@ -46,11 +46,13 @@ use crate::task;
 /// `(crate name, version)` pairs the task may publish, plus the subset
 /// whose library target the trusted pipeline compiles — the plan must carry
 /// a build-phase artifact for each of those, not merely stay inside the
-/// closure.
+/// closure. `dependency_identity` is the Merkle digest the pristine
+/// workspace's own unit graphs verified against the task id (stow#588).
 #[derive(Debug)]
 pub struct DependencyClosure {
     packages: BTreeSet<(String, semver::Version)>,
     lib_packages: BTreeSet<(String, semver::Version)>,
+    dependency_identity: stow_types::identity::DependencyIdentity,
 }
 
 impl DependencyClosure {
@@ -67,19 +69,31 @@ impl DependencyClosure {
         &self.lib_packages
     }
 
+    /// The dependency-context digest the publisher verified from its own
+    /// workspace — every planned artifact's `dependency_identity` must
+    /// equal it.
+    #[must_use]
+    pub const fn dependency_identity(&self) -> &stow_types::identity::DependencyIdentity {
+        &self.dependency_identity
+    }
+
     #[must_use]
     pub fn package_count(&self) -> usize {
         self.packages.len()
     }
 
     #[cfg(test)]
-    pub(crate) const fn from_packages(
+    pub(crate) fn from_packages(
         packages: BTreeSet<(String, semver::Version)>,
         lib_packages: BTreeSet<(String, semver::Version)>,
     ) -> Self {
         Self {
             packages,
             lib_packages,
+            // Test closures carry no derived graph; the leaf digest stands
+            // in for the digest a real `resolve` would have verified.
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf digest"),
         }
     }
 }
@@ -96,7 +110,35 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
 
     let compiled = compiled_packages(task, &manifest_path).await?;
     let metadata = package_metadata(task, &manifest_path).await?;
-    let closure = build_closure(task, &compiled, &metadata)?;
+    let mut closure = build_closure(task, &compiled, &metadata)?;
+
+    // stow#588: the publisher verifies the dependency context the same
+    // way the build job does — the pristine wrapper workspace's own
+    // `cargo --unit-graph` answers projected onto the shared task-unit
+    // model must mint the dispatched task id in every phase and
+    // invocation spelling. The workspace was just written; populate the
+    // registry first exactly as the build does, then read the same
+    // graphs with the same argv path.
+    let workspace = task::resolution_build_workspace(
+        manifest_path.clone(),
+        manifest_path
+            .parent()
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "resolution workspace manifest {} has no parent",
+                    manifest_path.display()
+                )
+            })?
+            .to_path_buf(),
+    );
+    task::fetch_workspace_dependencies(task, &workspace).await?;
+    let unit_graphs = task::phase_unit_graphs(task, &workspace, task::cargo_subcommand()?).await?;
+    task::verify_dependency_context(task, &unit_graphs)?;
+    closure.dependency_identity = task
+        .verified_dependency_graph()?
+        .dependency_identity(0)
+        .ok_or_else(|| stow_types::stow_error!("verified dependency graph has no root digest"))?
+        .clone();
     tracing::info!(
         crate_name = %task.crate_name,
         version = %task.version,
@@ -161,6 +203,9 @@ fn build_closure(
     Ok(DependencyClosure {
         packages: publishable,
         lib_packages,
+        // Set once the pristine workspace's unit graphs verify — a
+        // placeholder `resolve` never reaches callers.
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
     })
 }
 
