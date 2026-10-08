@@ -69,9 +69,14 @@ impl Miss {
             rustc_version: request.rustc_version.as_str().to_owned(),
             kind: String::new(),
             path: MissPath::Graph,
-            depends_on_json: serde_json::to_string(&request.depends_on)
-                .expect("enqueue dependencies serialize"),
-            dependency_identity: request.dependency_identity.to_string(),
+            depends_on_json: serde_json::to_string(
+                &request.depends_on().expect("subgraph resolves"),
+            )
+            .expect("enqueue dependencies serialize"),
+            dependency_identity: request
+                .dependency_identity()
+                .expect("derived digest")
+                .to_string(),
             host_side: request.host_side,
         }
     }
@@ -183,10 +188,10 @@ mod tests {
             rustc_version: RUSTC.parse().expect("rustc"),
             downloads: 0,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("fixture leaf"),
-            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             preserve_lockfile: false,
             host_side: false,
         }
@@ -210,7 +215,7 @@ mod tests {
                 "",
                 "graph",
                 "[]",
-                request.dependency_identity.as_str(),
+                request.dependency_identity().expect("digest").as_str(),
                 "false",
             ]
         );
@@ -221,30 +226,22 @@ mod tests {
     #[test]
     fn graph_miss_carries_dep_edges() {
         let mut request = enqueue_request();
-        request.depends_on = vec![stow_types::api::EnqueueDependency {
-            crate_name: CrateName::parse("syn").expect("dep name"),
-            version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
-            features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
-                .expect("dep features"),
-            target: TARGET.parse().expect("dep target"),
-            rustc_version: RUSTC.parse().expect("dep rustc"),
-            host_side: false,
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("dep leaf"),
-        }];
-        let ids: Vec<_> = request
-            .depends_on
-            .iter()
-            .map(stow_types::api::EnqueueDependency::task_id)
-            .collect();
-        request.dependency_identity =
-            stow_types::identity::DependencyIdentity::from_task_ids(ids.iter().map(String::as_str))
-                .expect("digest");
+        request.dependency_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: CrateName::parse("syn").expect("dep name"),
+                version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
+                features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
+                    .expect("dep features"),
+                host_side: false,
+                deps: Vec::new(),
+            }],
+        };
         let miss = Miss::graph(&request);
         let blobs = miss.blobs();
         let deps: Vec<stow_types::api::EnqueueDependency> =
             serde_json::from_str(blobs[8]).expect("depends_on blob parses");
-        assert_eq!(deps, request.depends_on);
+        assert_eq!(deps, request.depends_on().expect("deps"));
     }
 
     #[test]

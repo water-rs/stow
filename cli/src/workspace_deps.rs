@@ -502,6 +502,24 @@ struct UnitDependency<'a> {
     index: u32,
     #[serde(borrow)]
     extern_crate_name: &'a str,
+    /// `kind: "build"` marks a build-dependency edge; normal edges carry
+    /// `kind: null` or no entry at all.
+    #[serde(borrow, default)]
+    dep_kinds: Vec<UnitDepKind<'a>>,
+}
+
+#[derive(Deserialize)]
+struct UnitDepKind<'a> {
+    #[serde(borrow)]
+    kind: Option<&'a str>,
+}
+
+/// A build-dependency edge — its dep unit is always host-side.
+fn is_build_dep_edge(dependency: &UnitDependency<'_>) -> bool {
+    dependency
+        .dep_kinds
+        .iter()
+        .any(|entry| entry.kind == Some("build"))
 }
 
 /// `flag` or `flag=…` appears in `args`.
@@ -666,7 +684,17 @@ fn unit_graph_task_units(
 ) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
     use stow_types::unit_graph::{TaskUnit, TaskUnitDep, TaskUnitKey, TaskUnitKind, TaskUnitSide};
     let sides = unit_sides(graph, target)?;
-    let mut converted: Vec<Option<TaskUnit>> = Vec::with_capacity(graph.units.len());
+    // Under the native spelling (`--target` not given) cargo dedups a
+    // lib reachable at the same features from host-kinded and
+    // target-kinded consumers into ONE unit — but the resolver mints
+    // two, a host key and a target key, with `dedup_shadow_edges`
+    // pointing host consumers at the target twin. Re-split every
+    // both-reachable lib into the twin pair so this projection mints
+    // the same identities the resolver did (stow#588). Only the Lib
+    // kind splits: build-script compile units are always host, and run
+    // units stay interior on the host side either way.
+    let native = target.is_none();
+    let mut converted: Vec<Vec<TaskUnit>> = Vec::with_capacity(graph.units.len());
     for (index, unit) in graph.units.iter().enumerate() {
         let kind = if unit.mode == "run-custom-build" {
             TaskUnitKind::RunBuildScript
@@ -679,34 +707,24 @@ fn unit_graph_task_units(
         } else {
             // Bins, tests, benches, examples and doctest units compile
             // nothing the cache serves — the resolver drops them too.
-            converted.push(None);
+            converted.push(Vec::new());
             continue;
         };
         if sides[index] == 0 {
             // A unit for a target other than the served one is never a
             // node — `unit_sides` marks it and the expanded entries skip
             // it; the lean model drops it the same way.
-            converted.push(None);
+            converted.push(Vec::new());
             continue;
         }
         let (name, version, crates_io) = parse_pkg_id(unit.pkg_id);
-        // A build-script *compile* unit is host-side by construction;
-        // a `run-custom-build` unit takes its owning lib's side, which
-        // is exactly what its `platform` records under a spelled target
-        // and what the host-kinded BFS marks under a native one. A
-        // both-reachable lib is the deduped target-side unit a host
-        // consumer's shadow edge reaches.
-        let side = if kind == TaskUnitKind::BuildScript || sides[index] == HOST {
-            TaskUnitSide::Host
-        } else {
-            TaskUnitSide::Target
-        };
-        converted.push(Some(TaskUnit {
+        let platform = unit.platform.unwrap_or(host_triple).to_owned();
+        let emit = |side: TaskUnitSide| TaskUnit {
             key: TaskUnitKey {
                 // `pkg_id` is the full cargo package id — source
                 // included — exactly what `PackageIdSpec` stringifies.
                 pkg: unit.pkg_id.to_owned(),
-                platform: unit.platform.unwrap_or(host_triple).to_owned(),
+                platform: platform.clone(),
                 side,
                 kind,
             },
@@ -719,32 +737,69 @@ fn unit_graph_task_units(
                 .collect(),
             is_crates_io: crates_io,
             deps: Vec::new(),
-        }));
-    }
-    let mut units = Vec::with_capacity(converted.iter().flatten().count());
-    for (index, unit) in graph.units.iter().enumerate() {
-        let Some(base) = converted[index].clone() else {
-            continue;
         };
-        let mut deps = Vec::with_capacity(unit.dependencies.len());
-        for dependency in &unit.dependencies {
-            let dep_index = info_at_index(graph, dependency.index)?;
-            let dep_unit = &graph.units[dep_index];
-            let Some(dep_base) = &converted[dep_index] else {
-                return Err(stow_types::stow_error!(
-                    "cargo --unit-graph unit `{}` depends on unit {} — a target kind the task-unit model does not carry",
-                    unit.pkg_id,
-                    dep_unit.pkg_id,
-                ));
-            };
-            let (name, version, _) = parse_pkg_id(dep_unit.pkg_id);
-            deps.push(TaskUnitDep {
-                key: dep_base.key.clone(),
-                name: name.to_owned(),
-                version: version.to_owned(),
-            });
+        // A build-script *compile* unit is host-side by construction;
+        // a `run-custom-build` unit takes its owning lib's side, which
+        // is exactly what its `platform` records under a spelled target
+        // and what the host-kinded BFS marks under a native one. A
+        // both-reachable lib is the deduped unit a host consumer's
+        // shadow edge reaches — under the native spelling it becomes
+        // the twin pair the resolver emitted.
+        let emitted = if kind == TaskUnitKind::BuildScript || sides[index] == HOST {
+            vec![emit(TaskUnitSide::Host)]
+        } else if native && kind == TaskUnitKind::Lib && sides[index] & HOST != 0 {
+            vec![emit(TaskUnitSide::Host), emit(TaskUnitSide::Target)]
+        } else {
+            vec![emit(TaskUnitSide::Target)]
+        };
+        converted.push(emitted);
+    }
+    let mut units = Vec::with_capacity(converted.iter().map(Vec::len).sum());
+    for (index, unit) in graph.units.iter().enumerate() {
+        if converted[index].is_empty() {
+            continue;
         }
-        units.push(TaskUnit { deps, ..base });
+        for base in converted[index].iter().cloned() {
+            let mut deps = Vec::with_capacity(unit.dependencies.len());
+            for dependency in &unit.dependencies {
+                let dep_index = info_at_index(graph, dependency.index)?;
+                let dep_unit = &graph.units[dep_index];
+                let dep_units = &converted[dep_index];
+                // A build-dependency edge lands on the dep's host twin;
+                // every other edge lands on the dep unit of the
+                // consumer's own side. A dep that emitted exactly one
+                // unit serves either edge kind — the reachability BFS
+                // already guarantees the side it compiled on.
+                let want = if is_build_dep_edge(dependency) {
+                    TaskUnitSide::Host
+                } else {
+                    base.key.side
+                };
+                let dep_base = dep_units
+                    .iter()
+                    .find(|dep| dep.key.side == want)
+                    .or(if dep_units.len() == 1 {
+                        dep_units.first()
+                    } else {
+                        None
+                    })
+                    .ok_or_else(|| {
+                        stow_types::stow_error!(
+                            "cargo --unit-graph unit `{}` depends on unit {} — no task unit on the {:?} side",
+                            unit.pkg_id,
+                            dep_unit.pkg_id,
+                            want,
+                        )
+                    })?;
+                let (name, version, _) = parse_pkg_id(dep_unit.pkg_id);
+                deps.push(TaskUnitDep {
+                    key: dep_base.key.clone(),
+                    name: name.to_owned(),
+                    version: version.to_owned(),
+                });
+            }
+            units.push(TaskUnit { deps, ..base });
+        }
     }
     Ok(units)
 }

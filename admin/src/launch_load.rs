@@ -388,10 +388,10 @@ fn submit_task(rustc: &str, counter: u64) -> Result<EnqueueRequest, String> {
             .map_err(|error| format!("rustc: {error}"))?,
         downloads: 0,
         source: EnqueueSource::CrateUpdate,
-        depends_on: Vec::new(),
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-            .map_err(|error| format!("fixture dependency identity: {error}"))?,
-        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+        dependency_subgraph: stow_types::api::TaskSubgraph {
+            root_deps: Vec::new(),
+            nodes: Vec::new(),
+        },
         host_side: false,
         preserve_lockfile: false,
     })

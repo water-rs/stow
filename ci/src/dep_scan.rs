@@ -2017,7 +2017,10 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
-            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
         }
     }
 
@@ -2291,7 +2294,10 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
             preserve_lockfile: false,
             host_side: false,
-            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
         };
         let packages = super::consumable_packages(&task, &graph.entries);
         let found = packages

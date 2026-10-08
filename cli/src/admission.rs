@@ -388,10 +388,10 @@ mod tests {
             rustc_version: "1.92.0".parse().expect("rustc"),
             downloads: 0,
             source: EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("fixture leaf"),
-            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             preserve_lockfile: false,
             host_side: false,
         }

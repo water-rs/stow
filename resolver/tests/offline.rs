@@ -812,7 +812,8 @@ fn a_host_tasks_closure_pins_deduped_packages_at_target_sides() {
             .iter()
             .find(|request| request.crate_name.as_str() == request_crate)
             .unwrap_or_else(|| panic!("{request_crate} has an enqueue request"))
-            .depends_on
+            .depends_on()
+            .expect("derived dep edges")
             .iter()
             .filter(|dep| dep.crate_name.as_str() == dep_crate)
             .map(|dep| dep.host_side)

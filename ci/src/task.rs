@@ -2241,7 +2241,10 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
             host_side: false,
-            dependency_subgraph: TaskSubgraph::default(),
+            dependency_subgraph: TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
         }
     }
 

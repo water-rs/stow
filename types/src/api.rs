@@ -196,7 +196,7 @@ pub const DISPATCH_INPUT_LIMIT: usize = 65_535;
 /// `platform` at `CompileKind::Host` mapped to the runner family's host
 /// triple (`resolver/src/emit.rs`), and `EnqueueDependency::target`,
 /// which carries the dep node's platform verbatim.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TaskSubgraph {
     /// The indexes into `nodes` of the task node's direct dependencies.
     /// Field renames keep the wire small: the payload rides one
@@ -262,20 +262,23 @@ impl TaskSubgraph {
                 frontier.extend(nodes[next].dependencies.iter().copied());
             }
         }
+        // Graph index → wire rank — one lookup per edge, not a scan of
+        // the reachable set per edge.
+        let wire_ranks: BTreeMap<usize, u32> = reachable
+            .iter()
+            .enumerate()
+            .map(|(rank, &index)| {
+                u32::try_from(rank)
+                    .map(|rank| (index, rank))
+                    .map_err(|_| stow_error!("task subgraph edge index {rank} does not fit u32"))
+            })
+            .collect::<crate::error::Result<BTreeMap<usize, u32>>>()?;
         let wire_index = |graph_index: usize| -> crate::error::Result<u32> {
-            reachable
-                .iter()
-                .position(|&index| index == graph_index)
-                .ok_or_else(|| {
-                    stow_error!(
-                        "task subgraph edge {graph_index} escapes the root's dependency closure"
-                    )
-                })
-                .and_then(|rank| {
-                    u32::try_from(rank).map_err(|_| {
-                        stow_error!("task subgraph edge index {rank} does not fit u32")
-                    })
-                })
+            wire_ranks.get(&graph_index).copied().ok_or_else(|| {
+                stow_error!(
+                    "task subgraph edge {graph_index} escapes the root's dependency closure"
+                )
+            })
         };
         let root_deps = nodes[root]
             .dependencies
@@ -326,7 +329,13 @@ impl TaskSubgraph {
             dependencies: self
                 .root_deps
                 .iter()
-                .map(|&dep| usize::try_from(dep).map_err(|error| stow_error!("{error}")))
+                .map(|&dep| {
+                    // Wire index → resolved index: `resolve` inserts the
+                    // root first, so every wire node lands at index + 1,
+                    // the same shift a `SubgraphNode::deps` entry gets.
+                    let index = usize::try_from(dep).map_err(|error| stow_error!("{error}"))?;
+                    Ok(index + 1)
+                })
                 .collect::<crate::error::Result<Vec<usize>>>()?,
         });
         for node in &self.nodes {
@@ -514,26 +523,14 @@ pub struct EnqueueRequest {
     pub downloads: u64,
     /// Source of the enqueue request.
     pub source: EnqueueSource,
-    /// The task's own dependencies — the crate units this task's build
-    /// needs published before it may dispatch. Edges point from the
-    /// dependent at its dependencies, each named at the dep's own
-    /// (target, rustc) identity — a host unit's platform is the runner
-    /// family's host triple.
-    #[serde(default)]
-    pub depends_on: Vec<EnqueueDependency>,
-    /// The Merkle digest committing to this node's own dependency
-    /// subgraph — `depends_on`'s child task ids hashed — and the segment
-    /// its canonical task id carries (stow#588). No default: the digest
-    /// is derived from an actual resolved graph.
-    pub dependency_identity: DependencyIdentity,
     /// The node's whole transitive dependency closure in compact wire
-    /// form — what `BuildTaskPayload` dispatches to the builder so the
-    /// wrapper reproduces the context this digest commits to (stow#588).
-    /// `depends_on` is only the first hop: a covered dep's own children
-    /// still have to resolve at the same identities inside the builder's
-    /// generated package. No default: the subgraph is derived from an
-    /// actual resolved graph.
-    ///
+    /// form — the request's single context source (stow#588). The
+    /// direct-dependency edges [`EnqueueRequest::depends_on`] derives
+    /// are only the first hop: a covered dep's own children still have
+    /// to resolve at the same identities inside the builder's generated
+    /// package, and covered nodes are never enqueued, so the scheduler
+    /// cannot rebuild this closure from its own stored edges. No
+    /// default: the subgraph is derived from an actual resolved graph.
     pub dependency_subgraph: TaskSubgraph,
     /// Whether the node compiles for the build host (a proc-macro, build
     /// dependency, or build-script unit) rather than for the consumer's
@@ -594,10 +591,9 @@ impl EnqueueDependency {
 }
 
 impl EnqueueRequest {
-    /// The node's canonical task id — the identity tuple plus the
-    /// dependency-context digest (stow#588).
+    /// The node's own task identity, the fields `task_id` commits to.
     #[must_use]
-    pub fn task_id(&self) -> String {
+    pub fn task_node_identity(&self) -> TaskNodeIdentity {
         TaskNodeIdentity {
             crate_name: self.crate_name.clone(),
             version: self.version.clone(),
@@ -606,34 +602,69 @@ impl EnqueueRequest {
             rustc_version: self.rustc_version.clone(),
             host_side: self.host_side,
         }
-        .task_id(&self.dependency_identity)
     }
 
-    /// Check that `depends_on`'s child task ids hash to the declared
-    /// [`EnqueueRequest::dependency_identity`]. A request whose digest
-    /// disagrees names a dependency context it does not carry; minting
-    /// a task id from it would claim a graph that never existed.
+    /// The node's resolved dependency graph, derived from the carried
+    /// subgraph — the request's single context source (stow#588).
     ///
     /// # Errors
-    /// The dep-edge ids cannot be hashed, or the recomputed digest
-    /// disagrees with the declared one.
-    pub fn validate_dependency_identity(&self) -> crate::error::Result<()> {
-        let ids: Vec<String> = self
-            .depends_on
+    /// The subgraph cannot resolve (bad index, cycle, unmapped target).
+    pub fn resolved_dependency_graph(&self) -> crate::error::Result<ResolvedTaskGraph> {
+        self.dependency_subgraph.resolve(&self.task_node_identity())
+    }
+
+    /// The Merkle digest committing to this node's dependency subgraph —
+    /// the segment its canonical task id carries, re-derived from the
+    /// carried subgraph rather than stored (stow#588).
+    ///
+    /// # Errors
+    /// The subgraph cannot resolve, or yields no root digest.
+    pub fn dependency_identity(&self) -> crate::error::Result<DependencyIdentity> {
+        self.resolved_dependency_graph()?
+            .dependency_identity(0)
+            .cloned()
+            .ok_or_else(|| stow_error!("resolved dependency graph yields no root digest"))
+    }
+
+    /// The node's canonical task id — the identity tuple plus the
+    /// derived dependency-context digest (stow#588).
+    ///
+    /// # Errors
+    /// The subgraph cannot resolve.
+    pub fn task_id(&self) -> crate::error::Result<String> {
+        Ok(self
+            .task_node_identity()
+            .task_id(&self.dependency_identity()?))
+    }
+
+    /// The task's own dependencies — the root node's direct-dependency
+    /// edges, each named at the dep's own (target, rustc) identity and
+    /// carrying the dep's derived digest. Derived from the carried
+    /// subgraph, never stored (stow#588).
+    ///
+    /// # Errors
+    /// The subgraph cannot resolve.
+    pub fn depends_on(&self) -> crate::error::Result<Vec<EnqueueDependency>> {
+        let graph = self.resolved_dependency_graph()?;
+        let nodes = graph.nodes();
+        nodes[0]
+            .dependencies
             .iter()
-            .map(EnqueueDependency::task_id)
-            .collect();
-        let actual = DependencyIdentity::from_task_ids(ids.iter().map(String::as_str))
-            .map_err(|error| stow_error!("hash dep task ids: {error}"))?;
-        if actual != self.dependency_identity {
-            return Err(stow_error!(
-                "{} {} declares dependency_identity {} but its dep edges hash to {actual}",
-                self.crate_name.as_str(),
-                self.version,
-                self.dependency_identity,
-            ));
-        }
-        Ok(())
+            .map(|&dep| {
+                let node = &nodes[dep];
+                Ok(EnqueueDependency {
+                    crate_name: node.identity.crate_name.clone(),
+                    version: node.identity.version.clone(),
+                    features_json: node.identity.features_json.clone(),
+                    target: node.identity.target.clone(),
+                    rustc_version: node.identity.rustc_version.clone(),
+                    host_side: node.identity.host_side,
+                    dependency_identity: graph.dependency_identity(dep).cloned().ok_or_else(
+                        || stow_error!("resolved dependency graph yields no digest for node {dep}"),
+                    )?,
+                })
+            })
+            .collect()
     }
 }
 

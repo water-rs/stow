@@ -932,16 +932,29 @@ fn missed_enqueue_request(
             .parse()
             .map_err(|error| stow_error!("top_missed misses `{misses}`: {error}"))?,
         source: EnqueueSource::CacheMiss,
-        depends_on,
-        dependency_identity: DependencyIdentity::parse(dependency_identity)
-            .map_err(|error| stow_error!("top_missed dependency_identity: {error}"))?,
         dependency_subgraph,
         preserve_lockfile: false,
         host_side: host_side
             .parse::<bool>()
             .map_err(|error| stow_error!("top_missed host_side: {error}"))?,
     };
-    request.validate_dependency_identity()?;
+    // The row's stored digest stays bound where it can be checked: a
+    // dep-free request derives the leaf digest, so anything else is a
+    // corrupt row. A dep-carrying row's subgraph records each dep as a
+    // leaf — the real transitive context the miss row cannot carry — so
+    // the recorded digest is the only evidence there and is parsed for
+    // format. Edge-placeholder (stow#588): the scheduler-storage task
+    // owns a faithful miss-row subgraph.
+    let recorded = DependencyIdentity::parse(dependency_identity)
+        .map_err(|error| stow_error!("top_missed dependency_identity: {error}"))?;
+    if depends_on.is_empty() {
+        let derived = request.dependency_identity()?;
+        if derived != recorded {
+            return Err(stow_error!(
+                "top_missed dependency_identity {recorded} does not match the derived identity {derived}"
+            ));
+        }
+    }
     Ok(request)
 }
 
@@ -1100,7 +1113,10 @@ async fn plan(
                     task.crate_name.as_str().to_owned(),
                     task.version.to_string(),
                     task.features_json.raw(),
-                    task.depends_on.len().to_string(),
+                    task.depends_on()
+                        .expect("planned task subgraph resolves")
+                        .len()
+                        .to_string(),
                     if task.preserve_lockfile {
                         "source".to_owned()
                     } else {
@@ -1344,12 +1360,10 @@ mod tests {
         assert_eq!(request.downloads, 42);
         assert_eq!(request.source, EnqueueSource::CacheMiss);
         assert!(!request.preserve_lockfile);
-        assert_eq!(request.depends_on.len(), 1);
-        assert_eq!(request.depends_on[0].crate_name.as_str(), "syn");
-        assert_eq!(
-            request.depends_on[0].target.as_str(),
-            "x86_64-unknown-linux-gnu"
-        );
+        let depends_on = request.depends_on().expect("derived deps");
+        assert_eq!(depends_on.len(), 1);
+        assert_eq!(depends_on[0].crate_name.as_str(), "syn");
+        assert_eq!(depends_on[0].target.as_str(), "x86_64-unknown-linux-gnu");
 
         let leaf = stow_types::identity::DependencyIdentity::leaf().expect("leaf");
         let request = missed_enqueue_request(
@@ -1359,11 +1373,11 @@ mod tests {
         )
         .expect("edge-less entry maps");
         assert_eq!(
-            request.depends_on,
+            request.depends_on().expect("derived deps"),
             [] as [stow_types::api::EnqueueDependency; 0]
         );
         assert!(request.host_side);
-        assert_eq!(request.dependency_identity, leaf);
+        assert_eq!(request.dependency_identity().expect("digest"), leaf);
     }
 
     /// A malformed element fails loudly rather than submitting a

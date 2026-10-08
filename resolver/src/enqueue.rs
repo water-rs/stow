@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 
 use cargo::CargoResult;
-use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource};
+use stow_types::api::{EnqueueRequest, EnqueueSource};
 use stow_types::identity::WireRustcVersion;
 use stow_types::task_graph::ResolvedTaskGraph;
 use stow_types::unit_graph::{TaskUnit, TaskUnitDep, TaskUnitKey, TaskUnitKind, TaskUnitSide};
@@ -201,27 +201,8 @@ pub fn enqueue_requests_inner(
             continue;
         }
         uncovered.insert(task_id.to_owned());
-        let depends_on = node
-            .dependencies
-            .iter()
-            .map(|dep_index| {
-                let dep = &graph.nodes()[*dep_index].identity;
-                Ok(EnqueueDependency {
-                    crate_name: dep.crate_name.clone(),
-                    version: dep.version.clone(),
-                    features_json: dep.features_json.clone(),
-                    target: dep.target.clone(),
-                    rustc_version: dep.rustc_version.clone(),
-                    host_side: dep.host_side,
-                    dependency_identity: graph
-                        .dependency_identity(*dep_index)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("resolved node {dep_index} has no dependency digest")
-                        })?
-                        .clone(),
-                })
-            })
-            .collect::<CargoResult<Vec<_>>>()?;
+        // `depends_on` and `dependency_identity` derive from the carried
+        // subgraph — the request's single context source (stow#588).
         requests.push(EnqueueRequest {
             crate_name: node.identity.crate_name.clone(),
             version: node.identity.version.clone(),
@@ -230,12 +211,7 @@ pub fn enqueue_requests_inner(
             rustc_version: node.identity.rustc_version.clone(),
             downloads,
             source,
-            depends_on,
-            dependency_identity: graph
-                .dependency_identity(index)
-                .ok_or_else(|| anyhow::anyhow!("resolved node {index} has no dependency digest"))?
-                .clone(),
-            dependency_subgraph: stow_types::api::TaskSubgraph::from_resolved(&graph, index)
+            dependency_subgraph: stow_types::api::TaskSubgraph::from_resolved(graph, index)
                 .map_err(|error| anyhow::anyhow!("{error}"))?,
             preserve_lockfile: false,
             host_side: node.identity.host_side,

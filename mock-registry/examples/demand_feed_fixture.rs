@@ -36,9 +36,8 @@ use std::path::PathBuf;
 
 use stow_types::api::{
     DEMAND_FEED_BATCH_PREFIX, DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageBuilder,
-    DemandFeedPageRequest, EnqueueDependency, EnqueueRequest, EnqueueSource, QueueSelector,
-    SchedulerDemandEntry, SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash,
-    task_id,
+    DemandFeedPageRequest, EnqueueRequest, EnqueueSource, QueueSelector, SchedulerDemandEntry,
+    SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash, task_id,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -163,18 +162,16 @@ fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
         rustc_version: rustc(version_rustc),
         downloads: 1_000_000 - u64::try_from(n).expect("consumer index fits u64"),
         source: EnqueueSource::CacheMiss,
-        depends_on: vec![EnqueueDependency {
-            crate_name: crate_name(&base_name(dep_index)),
-            version: crate_version("1.0.0"),
-            features_json: FeaturesJson::default(),
-            target: target(triple),
-            rustc_version: rustc(version_rustc),
-            host_side,
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
-        }],
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
-        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+        dependency_subgraph: stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: crate_name(&base_name(dep_index)),
+                version: crate_version("1.0.0"),
+                features_json: FeaturesJson::default(),
+                host_side,
+                deps: Vec::new(),
+            }],
+        },
         host_side,
         preserve_lockfile: false,
     }
@@ -194,18 +191,16 @@ fn base_dep_request(combo_index: usize, combo: DepCombo) -> EnqueueRequest {
         rustc_version: rustc(version_rustc),
         downloads: 2_000_000 - u64::try_from(combo_index).expect("combo index fits u64"),
         source: EnqueueSource::CacheMiss,
-        depends_on: vec![EnqueueDependency {
-            crate_name: crate_name(&anchor_name(combo_index)),
-            version: crate_version("1.0.0"),
-            features_json: FeaturesJson::default(),
-            target: target(triple),
-            rustc_version: rustc(version_rustc),
-            host_side,
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
-        }],
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
-        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+        dependency_subgraph: stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: crate_name(&anchor_name(combo_index)),
+                version: crate_version("1.0.0"),
+                features_json: FeaturesJson::default(),
+                host_side,
+                deps: Vec::new(),
+            }],
+        },
         host_side,
         preserve_lockfile: false,
     }

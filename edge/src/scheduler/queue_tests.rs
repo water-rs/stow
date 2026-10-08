@@ -160,18 +160,31 @@ fn semantic_identity(crate_name: &str) -> SemanticTaskIdentity {
     }
 }
 
+/// Test subgraph carrying `deps` as the root's direct leaf deps
+/// (stow#588).
+fn subgraph_of(deps: &[stow_types::api::EnqueueDependency]) -> stow_types::api::TaskSubgraph {
+    stow_types::api::TaskSubgraph {
+        root_deps: (0..deps.len() as u32).collect(),
+        nodes: deps
+            .iter()
+            .map(|dep| stow_types::api::SubgraphNode {
+                crate_name: dep.crate_name.clone(),
+                version: dep.version.clone(),
+                features_json: dep.features_json.clone(),
+                host_side: dep.host_side,
+                deps: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
 fn request(crate_name: &str, depends_on: Vec<EnqueueDependency>) -> EnqueueRequest {
     request_on(crate_name, TARGET, depends_on)
 }
 
-fn request_on(
-    crate_name: &str,
-    target: &str,
-    depends_on: Vec<EnqueueDependency>,
-) -> EnqueueRequest {
+fn request_on(crate_name: &str, target: &str, deps: Vec<EnqueueDependency>) -> EnqueueRequest {
     EnqueueRequest {
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
-        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+        dependency_subgraph: subgraph_of(&deps),
         crate_name: crate_name.parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
@@ -179,7 +192,6 @@ fn request_on(
         rustc_version: RUSTC.parse().expect("valid rustc version"),
         downloads: 0,
         source: EnqueueSource::CacheMiss,
-        depends_on,
         preserve_lockfile: false,
         host_side: false,
     }
@@ -191,12 +203,12 @@ fn task_id_on(crate_name: &str, target: &str) -> String {
 
 fn dependency(crate_name: &str) -> EnqueueDependency {
     EnqueueDependency {
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: crate_name.parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
         target: TARGET.parse().expect("valid target triple"),
         rustc_version: RUSTC.parse().expect("valid rustc version"),
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         host_side: false,
     }
 }
@@ -4695,13 +4707,13 @@ async fn republishing_a_slice_replaces_its_membership() {
 async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
     let host_dep = EnqueueDependency {
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: "heck".parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
         target: TARGET.parse().expect("valid target triple"),
         rustc_version: RUSTC.parse().expect("valid rustc version"),
         host_side: true,
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
     };
     enqueue(
         &db,
@@ -4757,13 +4769,13 @@ async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
 async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
     let host_dep = EnqueueDependency {
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: "heck".parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
         target: TARGET.parse().expect("valid target triple"),
         rustc_version: RUSTC.parse().expect("valid rustc version"),
         host_side: true,
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
     };
     enqueue(&db, &[request("consumer", vec![host_dep])])
         .await
@@ -4811,13 +4823,13 @@ async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
 async fn a_host_side_dependent_needs_both_shapes_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
     let host_dep = EnqueueDependency {
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: "heck".parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
         target: TARGET.parse().expect("valid target triple"),
         rustc_version: RUSTC.parse().expect("valid rustc version"),
         host_side: true,
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
     };
     let mut owner = request("proc-macro-crate", vec![host_dep]);
     owner.host_side = true;

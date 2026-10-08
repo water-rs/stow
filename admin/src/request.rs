@@ -479,7 +479,7 @@ mod tests {
             )
             .expect("plan");
             assert_eq!(plan.roots[0].task_id.as_deref(), Some(root_id.as_str()));
-            assert_eq!(plan.tasks[0].task_id(), root_id);
+            assert_eq!(plan.tasks[0].task_id().expect("task id"), root_id);
         }
     }
 
@@ -542,13 +542,18 @@ mod tests {
         .expect("plan");
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].crate_name.as_str(), "serde");
-        assert_eq!(plan.tasks[0].task_id(), root_id);
-        assert_eq!(plan.tasks[0].depends_on.len(), 1);
+        assert_eq!(plan.tasks[0].task_id().expect("task id"), root_id);
+        assert_eq!(plan.tasks[0].depends_on().expect("deps").len(), 1);
         assert_eq!(
-            plan.tasks[0].depends_on[0].crate_name.as_str(),
+            plan.tasks[0].depends_on().expect("deps")[0]
+                .crate_name
+                .as_str(),
             "serde_core"
         );
-        assert_eq!(plan.tasks[0].depends_on[0].task_id(), dep_id);
+        assert_eq!(
+            plan.tasks[0].depends_on().expect("deps")[0].task_id(),
+            dep_id
+        );
         assert_eq!(plan.closure_size, 1);
         assert!(!plan.roots[0].cached);
     }

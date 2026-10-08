@@ -918,9 +918,12 @@ async fn enqueue_inner(
             continue;
         }
         // Each named dep's task id resolves here once — the edge rows
-        // `dep_edges` builds key on them.
-        let dep_task_ids = request
-            .depends_on
+        // `dep_edges` builds key on them. The request derives its dep
+        // edges from the carried subgraph (stow#588).
+        let deps = request
+            .depends_on()
+            .map_err(|error| QueueError::Invariant(format!("derive dep edges: {error}")))?;
+        let dep_task_ids = deps
             .iter()
             .map(|dependency| {
                 task_id(
@@ -1068,13 +1071,12 @@ async fn probe_task_statuses(
 /// shapes for the gate and a self-edge rejection — the checks
 /// `sync_task_dependencies` ran per dep before each edge INSERT.
 fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
-    let mut edges = Vec::with_capacity(entry.request.depends_on.len());
-    for (dependency, dep_task_id) in entry
+    let request_deps = entry
         .request
-        .depends_on
-        .iter()
-        .zip(entry.dep_task_ids.iter())
-    {
+        .depends_on()
+        .map_err(|error| QueueError::Invariant(format!("derive dep edges: {error}")))?;
+    let mut edges = Vec::with_capacity(request_deps.len());
+    for (dependency, dep_task_id) in request_deps.iter().zip(entry.dep_task_ids.iter()) {
         let dep_features = dependency.features_json.raw();
         let dep_version = dependency.version.to_string();
         // The gate needs every required unit shape of the dep's
@@ -1168,7 +1170,12 @@ fn plan_enqueue(
         // A re-request without dependency info (exact/semantic miss
         // paths always send an empty list) must not erase ordering
         // edges a graph-analysis enqueue established.
-        if entry.request.depends_on.is_empty() {
+        if entry
+            .request
+            .depends_on()
+            .map_err(|error| QueueError::Invariant(format!("derive dep edges: {error}")))?
+            .is_empty()
+        {
             continue;
         }
         let edges = dep_edges(entry)?;
@@ -3875,7 +3882,10 @@ async fn claim_dispatchable_row(
         rustc_version: row.rustc_version,
         host_side: row.host_side != 0,
         preserve_lockfile: row.preserve_lockfile != 0,
-        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+        dependency_subgraph: stow_types::api::TaskSubgraph {
+            root_deps: Vec::new(),
+            nodes: Vec::new(),
+        },
     }))
 }
 

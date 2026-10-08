@@ -107,6 +107,11 @@ pub struct ManualArgs {
     /// wave's and are not adopted.
     #[arg(long, value_parser = parse_adopt_since)]
     adopt_since: Option<time::OffsetDateTime>,
+    /// Resolve the cohort, encode every wave payload and report the
+    /// dispatch-input sizes, then exit — nothing is dispatched and no
+    /// GitHub token or dispatch URL is needed (stow#588).
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// `--adopt-since`'s RFC 3339 parse.
@@ -225,15 +230,6 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
                 .map_err(|error| stow_error!("--targets `{target}`: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let dispatch = match &args.dispatch_url {
-        Some(url) => Dispatch::Local {
-            base: url.trim_end_matches('/').to_owned(),
-        },
-        None => Dispatch::GitHub {
-            token: crate::github_token().await?,
-        },
-    };
-
     let resolved = resolve_sources(&args, &targets, &rustc_version).await?;
     if resolved.requests.is_empty() {
         if !resolved.unresolved_projects.is_empty() {
@@ -247,6 +243,19 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
         return Ok(());
     }
     let (mut nodes, edges) = build_graph(resolved.requests)?;
+
+    if args.dry_run {
+        return dry_run_report(&nodes);
+    }
+
+    let dispatch = match &args.dispatch_url {
+        Some(url) => Dispatch::Local {
+            base: url.trim_end_matches('/').to_owned(),
+        },
+        None => Dispatch::GitHub {
+            token: crate::github_token().await?,
+        },
+    };
 
     let base = crate::index_cmd::registry_base()?;
     let session = base.session();
@@ -362,10 +371,11 @@ fn build_graph(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<Manua
     let mut nodes: BTreeMap<String, NodeRun> = BTreeMap::new();
     let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for request in requests {
-        request.validate_dependency_identity()?;
-        let id = node_task_id(&request);
+        // Resolving the carried subgraph is the identity check — it
+        // fails on an unresolvable closure before the id is keyed.
+        let id = node_task_id(&request)?;
         let deps = request
-            .depends_on
+            .depends_on()?
             .iter()
             .map(dep_task_id)
             .collect::<BTreeSet<_>>();
@@ -732,8 +742,8 @@ async fn load_crate_list(
 }
 
 /// A request's own task id — the `run-name` every dispatched run
-/// carries.
-fn node_task_id(request: &EnqueueRequest) -> String {
+/// carries. Deriving it resolves the carried subgraph (stow#588).
+fn node_task_id(request: &EnqueueRequest) -> stow_types::error::Result<String> {
     request.task_id()
 }
 
@@ -901,6 +911,70 @@ pub async fn published_slice_rows(
         ));
     }
     Ok(Some(index.rows))
+}
+
+/// `--dry-run`: encode every wave node into its dispatch payload and
+/// report the input sizes. Encoding goes through
+/// `BuildTaskPayload::encode_dispatch_task`, so an oversized subgraph
+/// fails here exactly where a real dispatch would (stow#588).
+fn dry_run_report(nodes: &BTreeMap<String, NodeRun>) -> stow_types::error::Result<()> {
+    let mut lengths = Vec::with_capacity(nodes.len());
+    // (subgraph node count, encoded length, crate, target) of the
+    // payload carrying the most dependency nodes.
+    let mut largest_nodes: Option<(usize, usize, &str, &str)> = None;
+    let mut max_len = 0usize;
+    let mut max_len_task = String::new();
+    // Per-target maxima — the question the dry run answers is whether
+    // any target's largest payload is near the dispatch input cap.
+    let mut per_target_max: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
+    for (id, node) in nodes {
+        let payload = task_payload(id, &node.request);
+        let encoded = payload.encode_dispatch_task()?;
+        let len = encoded.len();
+        lengths.push(len);
+        if len > max_len {
+            max_len = len;
+            max_len_task = id.clone();
+        }
+        let target = node.request.target.as_str();
+        let slot = per_target_max.entry(target).or_insert((0, id.as_str()));
+        if len > slot.0 {
+            *slot = (len, id.as_str());
+        }
+        let node_count = payload.dependency_subgraph.nodes.len();
+        if largest_nodes.is_none_or(|(count, _, _, _)| node_count > count) {
+            largest_nodes = Some((
+                node_count,
+                len,
+                node.request.crate_name.as_str(),
+                node.request.target.as_str(),
+            ));
+        }
+    }
+    lengths.sort_unstable();
+    let p99 = lengths
+        .get(lengths.len().saturating_mul(99).saturating_add(99) / 100 - 1)
+        .copied()
+        .unwrap_or(0);
+    let mut out = format!(
+        "dry run: {} payload(s), none dispatched\n  encoded task input: max {} bytes, p99 {} bytes (cap {})",
+        lengths.len(),
+        max_len,
+        p99,
+        stow_types::api::DISPATCH_INPUT_LIMIT,
+    );
+    let _ = writeln!(out, "  largest encoded payload: {max_len_task}");
+    for (target, (len, id)) in &per_target_max {
+        let _ = writeln!(out, "  {target}: max {len} bytes — {id}");
+    }
+    if let Some((count, len, krate, target)) = largest_nodes {
+        let _ = writeln!(
+            out,
+            "  most dependency nodes: {count} — {krate} for {target} ({len} bytes)"
+        );
+    }
+    render::emit_line(&out);
+    Ok(())
 }
 
 /// The dispatch's payload — `BuildTaskPayload` exactly as the scheduler
@@ -1298,7 +1372,10 @@ impl Dispatch {
     async fn send(&self, payload: &BuildTaskPayload) -> stow_types::error::Result<u64> {
         match self {
             Self::GitHub { token } => {
-                let task_json = serde_json::to_string(payload)?;
+                // The 65,535-char dispatch input cap is checked here —
+                // at the producer — so an oversized subgraph fails the
+                // wave before GitHub ever sees it (stow#588).
+                let task_json = payload.encode_dispatch_task()?;
                 let response: WorkflowDispatchResponse = crate::github::post(
                     token,
                     &format!("actions/workflows/{WORKFLOW_FILE}/dispatches"),
@@ -1836,6 +1913,9 @@ mod tests {
         host_side: bool,
         deps: &[(&str, &str, bool)],
     ) -> EnqueueRequest {
+        // Fixture deps carry no children of their own — each is a
+        // leaf-context node, so `depends_on()`/`dependency_identity()`
+        // derive the same ids the old stored fields did (stow#588).
         let depends_on: Vec<_> = deps
             .iter()
             .map(|(name, dep_target, dep_host)| EnqueueDependency {
@@ -1849,10 +1929,6 @@ mod tests {
                     .expect("leaf identity"),
             })
             .collect();
-        let ids: Vec<_> = depends_on.iter().map(EnqueueDependency::task_id).collect();
-        let dependency_identity =
-            stow_types::identity::DependencyIdentity::from_task_ids(ids.iter().map(String::as_str))
-                .expect("dependency identity");
         let dependency_subgraph = stow_types::api::TaskSubgraph {
             root_deps: (0..depends_on.len() as u32).collect(),
             nodes: depends_on
@@ -1875,8 +1951,6 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.99.0").expect("rustc"),
             downloads: 0,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on,
-            dependency_identity,
             dependency_subgraph,
             preserve_lockfile: false,
             host_side,
@@ -1892,15 +1966,18 @@ mod tests {
         // leaf <- mid <- top, plus an unrelated independent node.
         let mid = request("mid", T, false, &[("leaf", T, false)]);
         let mut top = request("top", T, false, &[("mid", T, false)]);
-        top.depends_on[0].dependency_identity = mid.dependency_identity.clone();
-        let ids: Vec<_> = top
-            .depends_on
-            .iter()
-            .map(EnqueueDependency::task_id)
-            .collect();
-        top.dependency_identity =
-            stow_types::identity::DependencyIdentity::from_task_ids(ids.iter().map(String::as_str))
-                .expect("top identity");
+        // mid's own child rides inside top's subgraph — the derived
+        // digest then matches mid's real task id.
+        top.dependency_subgraph
+            .nodes
+            .push(stow_types::api::SubgraphNode {
+                crate_name: CrateName::parse("leaf").expect("dep name"),
+                version: CrateVersion(semver::Version::new(1, 0, 0)),
+                features_json: stow_types::identity::FeaturesJson::default(),
+                host_side: false,
+                deps: Vec::new(),
+            });
+        top.dependency_subgraph.nodes[0].deps = vec![1];
         let requests = vec![
             request("leaf", T, false, &[]),
             mid,
@@ -1908,7 +1985,7 @@ mod tests {
             request("other", T, false, &[]),
         ];
         let (mut nodes, edges) = build_graph(requests).expect("valid graph");
-        let ids = |name: &str| node_task_id(request_by_name(name, &nodes));
+        let ids = |name: &str| node_task_id(request_by_name(name, &nodes)).expect("task id");
         let (leaf, mid, top, other) = (ids("leaf"), ids("mid"), ids("top"), ids("other"));
 
         nodes.get_mut(&leaf).expect("leaf").failed = true;
@@ -1963,7 +2040,7 @@ mod tests {
             emit: vec!["link".to_owned(), "metadata".to_owned()],
             min_glibc: None,
             unit_shape: Some(shape),
-            dependency_identity: Some(request.dependency_identity.clone()),
+            dependency_identity: Some(request.dependency_identity().expect("digest")),
         }
     }
 
@@ -1972,8 +2049,8 @@ mod tests {
         const T: &str = "x86_64-unknown-linux-gnu";
         let left = request("parent", T, false, &[("left", T, false)]);
         let right = request("parent", T, false, &[("right", T, false)]);
-        let left_id = left.task_id();
-        let right_id = right.task_id();
+        let left_id = left.task_id().expect("left id");
+        let right_id = right.task_id().expect("right id");
         assert_ne!(left_id, right_id);
         let (nodes, edges) = build_graph(vec![left, right]).expect("valid contexts");
         assert_eq!(nodes.len(), 2);
@@ -1988,8 +2065,9 @@ mod tests {
             false,
             &[("child", "x86_64-unknown-linux-gnu", false)],
         );
-        parent.dependency_identity =
-            stow_types::identity::DependencyIdentity::leaf().expect("leaf");
+        // A subgraph whose edges escape its own closure cannot
+        // resolve — the request is rejected rather than keyed.
+        parent.dependency_subgraph.root_deps = vec![9];
         assert!(build_graph(vec![parent]).is_err());
     }
 
@@ -2006,11 +2084,11 @@ mod tests {
             .collect::<Vec<_>>();
         let covered =
             super::covered_slice_nodes(&rows, &target, &left.rustc_version).expect("coverage");
-        assert!(covered.contains(&left.task_id()));
-        assert!(!covered.contains(&right.task_id()));
+        assert!(covered.contains(&left.task_id().expect("left id")));
+        assert!(!covered.contains(&right.task_id().expect("right id")));
 
         let mut mixed = rows;
-        mixed[0].dependency_identity = Some(right.dependency_identity);
+        mixed[0].dependency_identity = Some(right.dependency_identity().expect("right digest"));
         assert!(
             super::covered_slice_nodes(&mixed, &target, &left.rustc_version)
                 .expect("mixed coverage")
@@ -2041,7 +2119,7 @@ mod tests {
         );
         let complete =
             super::covered_slice_nodes(&rows, &target, &host.rustc_version).expect("host coverage");
-        assert!(complete.contains(&host.task_id()));
+        assert!(complete.contains(&host.task_id().expect("host id")));
         let partial = rows
             .into_iter()
             .filter(|row| row.unit_shape.expect("shape").invocation == UnitInvocation::Native)
@@ -2061,13 +2139,13 @@ mod tests {
             false,
             &[("helper", "x86_64-unknown-linux-gnu", true)],
         );
-        let payload = super::task_payload(&parent.task_id(), &parent);
+        let payload = super::task_payload(&parent.task_id().expect("parent id"), &parent);
         let graph = payload
             .verified_dependency_graph()
             .expect("payload subgraph verifies against task_id");
         assert_eq!(
             graph.dependency_identity(0).expect("root digest"),
-            &parent.dependency_identity
+            &parent.dependency_identity().expect("parent digest")
         );
         let helper = payload
             .dependency_subgraph
@@ -2078,7 +2156,7 @@ mod tests {
         assert_eq!(helper.crate_name.as_str(), "helper");
         assert_eq!(
             graph.dependency_identity(1).expect("dep digest"),
-            &parent.depends_on[0].dependency_identity
+            &parent.depends_on().expect("deps")[0].dependency_identity
         );
     }
 
@@ -2212,7 +2290,12 @@ mod tests {
         .expect("valid graph");
         let ids: BTreeMap<&str, String> = ["won", "lost", "flying", "stale"]
             .into_iter()
-            .map(|name| (name, node_task_id(request_by_name(name, &nodes))))
+            .map(|name| {
+                (
+                    name,
+                    node_task_id(request_by_name(name, &nodes)).expect("task id"),
+                )
+            })
             .collect();
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
 
@@ -2273,7 +2356,7 @@ mod tests {
         const T: &str = "x86_64-unknown-linux-gnu";
         let (mut nodes, _) =
             build_graph(vec![request("bound", T, false, &[])]).expect("valid graph");
-        let task = node_task_id(request_by_name("bound", &nodes));
+        let task = node_task_id(request_by_name("bound", &nodes)).expect("task id");
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
         nodes.get_mut(&task).expect("node").workflow_run_id = Some(50);
         nodes.get_mut(&task).expect("node").dispatched = true;
@@ -2397,7 +2480,7 @@ mod tests {
             &[],
         )])
         .expect("valid graph");
-        let id = node_task_id(request_by_name("undone", &nodes));
+        let id = node_task_id(request_by_name("undone", &nodes)).expect("task id");
         let unresolved = vec!["https://github.com/a/one: fetch failed".to_owned()];
         let message = finish_report(
             &nodes,

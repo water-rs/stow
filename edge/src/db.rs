@@ -973,20 +973,10 @@ pub async fn take_dependency_graph_misses(
         let depends_on: Vec<stow_types::api::EnqueueDependency> =
             serde_json::from_str(row.depends_on_json.as_str())
                 .map_err(|error| format!("draining miss depends_on_json: {error}"))?;
-        // stow#588: the digest mints from the dep edges the row stores
-        // — same derivation `validate_dependency_identity` checks — and
-        // the subgraph is the leaf-only shape the miss table can carry
-        // (direct deps, no transitive edges; the scheduler storage
-        // rework owns recording the full closure).
-        let dependency_identity = stow_types::identity::DependencyIdentity::from_task_ids(
-            depends_on
-                .iter()
-                .map(|dep| dep.task_id())
-                .collect::<Vec<_>>()
-                .iter()
-                .map(String::as_str),
-        )
-        .map_err(|error| format!("draining miss dependency_identity: {error}"))?;
+        // stow#588 edge-placeholder: the miss table stores only direct
+        // dep edges, so the subgraph is the leaf-only shape it can
+        // carry (the scheduler storage rework owns recording the full
+        // closure); the request derives its edges and digest from it.
         let dependency_subgraph = stow_types::api::TaskSubgraph {
             root_deps: (0..depends_on.len() as u32).collect(),
             nodes: depends_on
@@ -1008,8 +998,6 @@ pub async fn take_dependency_graph_misses(
             rustc_version,
             downloads: row.seen_count,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on,
-            dependency_identity,
             dependency_subgraph,
             preserve_lockfile: false,
             host_side: row.host_side != 0,
@@ -1062,7 +1050,10 @@ pub async fn set_dependency_graph_misses_queued(
 /// track demand) without touching `queued_at`: a miss already handed to the
 /// scheduler stays marked as sent.
 pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(), DbError> {
-    let depends_on_json = serde_json::to_string(&request.depends_on)
+    let depends_on = request
+        .depends_on()
+        .map_err(|error| format!("derive admitted miss depends_on: {error}"))?;
+    let depends_on_json = serde_json::to_string(&depends_on)
         .map_err(|error| format!("serialize admitted miss depends_on: {error}"))?;
     db.query(
         "INSERT INTO dependency_graph_misses \
@@ -1198,9 +1189,10 @@ mod sqlite_tests {
 
     fn enqueue_request(crate_name: &str, version: &str, features: &[&str]) -> EnqueueRequest {
         EnqueueRequest {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
-            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             crate_name: crate_name.parse().expect("valid crate name"),
             version: version.parse().expect("valid semver"),
             features_json: stow_types::identity::FeaturesJson::canonicalize(
@@ -1214,7 +1206,6 @@ mod sqlite_tests {
             rustc_version: RUSTC.parse().expect("valid rustc version"),
             downloads: 0,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
             preserve_lockfile: false,
             host_side: false,
         }
@@ -1242,17 +1233,17 @@ mod sqlite_tests {
         let mut request = enqueue_request("serde", "1.0.5", &["derive"]);
         // stow#317: the recorded miss keeps the edges the admitting
         // request carried so the drain re-mints it with them.
-        request.depends_on = vec![stow_types::api::EnqueueDependency {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
-            crate_name: CrateName::parse("syn").expect("dep name"),
-            version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
-            features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
-                .expect("dep features"),
-            target: TARGET.parse().expect("dep target"),
-            rustc_version: RUSTC.parse().expect("dep rustc"),
-            host_side: false,
-        }];
+        request.dependency_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: CrateName::parse("syn").expect("dep name"),
+                version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
+                features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
+                    .expect("dep features"),
+                host_side: false,
+                deps: Vec::new(),
+            }],
+        };
 
         // No admission has been recorded — nothing is drainable, and no
         // rows exist at all.
@@ -1277,7 +1268,10 @@ mod sqlite_tests {
             .expect("take misses");
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].crate_name.as_str(), "serde");
-        assert_eq!(drained[0].depends_on, request.depends_on);
+        assert_eq!(
+            drained[0].depends_on().expect("drained deps"),
+            request.depends_on().expect("request deps")
+        );
         // Draining marks the row queued, so a later drain cannot resend it.
         assert_eq!(
             take_dependency_graph_misses(&db, 10)
@@ -1352,16 +1346,16 @@ mod sqlite_tests {
         let mut request = enqueue_request("heck", "0.5.0", &[]);
         let mut host_request = request.clone();
         host_request.host_side = true;
-        request.depends_on = vec![stow_types::api::EnqueueDependency {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
-            crate_name: CrateName::parse("heck").expect("dep name"),
-            version: CrateVersion::new(semver::Version::parse("0.5.0").expect("dep version")),
-            features_json: FeaturesJson::canonicalize(Vec::new()).expect("dep features"),
-            target: TARGET.parse().expect("dep target"),
-            rustc_version: RUSTC.parse().expect("dep rustc"),
-            host_side: true,
-        }];
+        request.dependency_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: CrateName::parse("heck").expect("dep name"),
+                version: CrateVersion::new(semver::Version::parse("0.5.0").expect("dep version")),
+                features_json: FeaturesJson::canonicalize(Vec::new()).expect("dep features"),
+                host_side: true,
+                deps: Vec::new(),
+            }],
+        };
 
         record_admitted_miss(&db, &request)
             .await

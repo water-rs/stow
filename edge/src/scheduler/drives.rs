@@ -2102,6 +2102,24 @@ fn submit_batch(shape: FixtureShape) -> Vec<EnqueueRequest> {
 /// identities would move the later drives from the insert path they
 /// measure onto a resync one (stow#452 — the merge-queue probe caught
 /// the trusted drive resyncing the accept drive's task set).
+/// Test subgraph carrying `deps` as the root's direct leaf deps
+/// (stow#588).
+fn subgraph_of(deps: &[stow_types::api::EnqueueDependency]) -> stow_types::api::TaskSubgraph {
+    stow_types::api::TaskSubgraph {
+        root_deps: (0..deps.len() as u32).collect(),
+        nodes: deps
+            .iter()
+            .map(|dep| stow_types::api::SubgraphNode {
+                crate_name: dep.crate_name.clone(),
+                version: dep.version.clone(),
+                features_json: dep.features_json.clone(),
+                host_side: dep.host_side,
+                deps: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
 fn submit_accept_batch(shape: FixtureShape) -> Vec<EnqueueRequest> {
     submit_batch_named(
         shape,
@@ -2121,8 +2139,6 @@ fn submit_batch_named(
     let dep = dep_request;
     let (_resync_crate, resync_version) = crate_identity(101);
     let resync = EnqueueRequest {
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
-        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         crate_name: resync_name.parse().expect("resync crate"),
         version: resync_version.parse().expect("resync version"),
         features_json: FeaturesJson::default(),
@@ -2130,17 +2146,22 @@ fn submit_batch_named(
         rustc_version: "1.86.0".parse().expect("resync rustc"),
         downloads: 10,
         source: EnqueueSource::CacheMiss,
-        depends_on: (0..30).map(|k| dep(shape.dep_row(k))).collect(),
+        dependency_subgraph: subgraph_of(
+            &(0..30).map(|k| dep(shape.dep_row(k))).collect::<Vec<_>>(),
+        ),
         preserve_lockfile: false,
         host_side: false,
     };
     let mut fresh = resync.clone();
     fresh.crate_name = fresh_name.parse().expect("fresh crate");
-    fresh.depends_on = vec![dep(shape.dep_row(31))];
+    fresh.dependency_subgraph = subgraph_of(&vec![dep(shape.dep_row(31))]);
     let mut human = resync.clone();
     human.crate_name = human_name.parse().expect("human crate");
     human.source = EnqueueSource::HumanRequest;
-    human.depends_on = Vec::new();
+    human.dependency_subgraph = stow_types::api::TaskSubgraph {
+        root_deps: Vec::new(),
+        nodes: Vec::new(),
+    };
     vec![resync, fresh, human]
 }
 
@@ -2198,8 +2219,6 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
     let target = stow_types::api::CI_TARGET_TRIPLES[0];
     let rustc = "1.86.0";
     let root_task = EnqueueRequest {
-        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
-        dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         crate_name: crate_name.parse().expect("request crate"),
         version: version.parse().expect("request version"),
         features_json: FeaturesJson::default(),
@@ -2207,7 +2226,7 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
         rustc_version: rustc.parse().expect("request rustc"),
         downloads: 1,
         source: EnqueueSource::HumanRequest,
-        depends_on: vec![dep_request(shape.dep_row(2))],
+        dependency_subgraph: subgraph_of(&vec![dep_request(shape.dep_row(2))]),
         preserve_lockfile: false,
         host_side: false,
     };
@@ -2587,9 +2606,10 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
     };
     (0..FEED_EVENT_DEPS)
         .map(|d| EnqueueRequest {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
-            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             crate_name: feed_event_dep_name(d).parse().expect("event dep crate"),
             version: "1.0.0".parse().expect("event dep version"),
             features_json: FeaturesJson::default(),
@@ -2597,16 +2617,12 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
             rustc_version: "1.86.0".parse().expect("event dep rustc"),
             downloads: 1,
             source: EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
             preserve_lockfile: false,
             host_side: false,
         })
         .chain((0..FEED_EVENT_ROOTS).map(|k| {
             let [first, second] = feed_event_deps(k);
             EnqueueRequest {
-                dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                    .expect("leaf digest"),
-                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 crate_name: feed_event_root_name(k).parse().expect("event root crate"),
                 version: "1.0.0".parse().expect("event root version"),
                 features_json: FeaturesJson::default(),
@@ -2614,7 +2630,7 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
                 rustc_version: "1.86.0".parse().expect("event root rustc"),
                 downloads: 1,
                 source: EnqueueSource::CacheMiss,
-                depends_on: vec![dep_edge(first), dep_edge(second)],
+                dependency_subgraph: subgraph_of(&vec![dep_edge(first), dep_edge(second)]),
                 preserve_lockfile: false,
                 host_side: false,
             }

@@ -4,8 +4,8 @@ use std::future::Future;
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
 use stow_types::api::{
-    CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueDependency, EnqueueRequest,
-    EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
+    CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueRequest, EnqueueSource,
+    QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::{
@@ -497,12 +497,6 @@ fn build_enqueue_requests(
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
 ) -> Result<Vec<EnqueueRequest>, ResolverError> {
-    let digests = expanded_digests(
-        feature_json_by_key,
-        dependency_keys_by_key,
-        target_typed,
-        rustc_version_typed,
-    )?;
     let mut requests = Vec::<EnqueueRequest>::new();
     for node_key in dependency_keys_by_key.keys() {
         let features_json = feature_json_by_key.get(node_key).cloned().ok_or_else(|| {
@@ -514,35 +508,6 @@ fn build_enqueue_requests(
         if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
             continue;
         }
-        let mut depends_on = Vec::with_capacity(dependency_keys_by_key[node_key].len());
-        for dep_key in &dependency_keys_by_key[node_key] {
-            let raw = feature_json_by_key.get(dep_key).ok_or_else(|| {
-                ResolverError::from(format!(
-                    "missing serialized feature set for dependency {} {}",
-                    dep_key.package.crate_name, dep_key.package.version
-                ))
-            })?;
-            // A dep the graph does not expand — a covered row pruned
-            // before enqueue — commits to a leaf context the digest
-            // memo cannot refute; its own subtree is not observable
-            // here.
-            let dep_digest = digests.get(dep_key).cloned().map_or_else(
-                || {
-                    stow_types::identity::DependencyIdentity::leaf()
-                        .map_err(|error| ResolverError::from(error.to_string()))
-                },
-                Ok,
-            )?;
-            depends_on.push(EnqueueDependency {
-                crate_name: dep_key.package.crate_name.clone(),
-                version: CrateVersion::new(dep_key.package.version.clone()),
-                features_json: parse_canonical_features_json(raw)?,
-                target: node_target(dep_key, target_typed),
-                rustc_version: rustc_version_typed.clone(),
-                host_side: dep_key.host_side,
-                dependency_identity: dep_digest,
-            });
-        }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
         requests.push(EnqueueRequest {
             crate_name: node_key.package.crate_name.clone(),
@@ -552,13 +517,6 @@ fn build_enqueue_requests(
             rustc_version: rustc_version_typed.clone(),
             downloads: 0,
             source,
-            depends_on,
-            dependency_identity: digests.get(node_key).cloned().ok_or_else(|| {
-                ResolverError::from(format!(
-                    "no dependency digest for {} {}",
-                    node_key.package.crate_name, node_key.package.version
-                ))
-            })?,
             dependency_subgraph: expanded_subgraph(
                 node_key,
                 feature_json_by_key,
@@ -1884,9 +1842,10 @@ mod tests {
         features: &[&str],
     ) -> stow_types::api::EnqueueRequest {
         stow_types::api::EnqueueRequest {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
-            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             crate_name: crate_name.parse().expect("valid crate name"),
             version: version.parse().expect("valid semver"),
             features_json: stow_types::identity::FeaturesJson::canonicalize(
@@ -1900,7 +1859,6 @@ mod tests {
             rustc_version: "1.85.0".parse().expect("valid rustc version"),
             downloads: 0,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
             preserve_lockfile: false,
             host_side: false,
         }
@@ -1972,7 +1930,8 @@ mod tests {
                 (
                     request.crate_name.as_str().to_owned(),
                     request
-                        .depends_on
+                        .depends_on()
+                        .expect("deps")
                         .iter()
                         .map(|dependency| dependency.crate_name.as_str().to_owned())
                         .collect::<Vec<_>>(),
@@ -2025,14 +1984,15 @@ mod tests {
         );
         let consumer = by_name["consumer"];
         assert_eq!(consumer.target.as_str(), "wasm32-unknown-unknown");
-        assert_eq!(consumer.depends_on.len(), 1);
-        assert_eq!(consumer.depends_on[0].crate_name.as_str(), "macro-crate");
+        let consumer_deps = consumer.depends_on().expect("deps");
+        assert_eq!(consumer_deps.len(), 1);
+        assert_eq!(consumer_deps[0].crate_name.as_str(), "macro-crate");
         assert!(
-            consumer.depends_on[0].host_side,
+            consumer_deps[0].host_side,
             "the edge names the side the dependent needs"
         );
         assert_eq!(
-            consumer.depends_on[0].target.as_str(),
+            consumer_deps[0].target.as_str(),
             "x86_64-unknown-linux-gnu",
             "the edge names the dep's own platform"
         );
@@ -2065,7 +2025,9 @@ mod tests {
             "aarch64-apple-darwin"
         );
         assert_eq!(
-            by_name["consumer"].depends_on[0].target.as_str(),
+            by_name["consumer"].depends_on().expect("deps")[0]
+                .target
+                .as_str(),
             "aarch64-apple-darwin"
         );
     }
