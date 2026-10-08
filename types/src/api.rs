@@ -12,11 +12,13 @@ use utoipa::ToSchema;
 use crate::artifact::{ArtifactKind, RustCrateType};
 use crate::glibc::GlibcVersion;
 use crate::identity::{
-    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
-    WireRustcVersion,
+    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, DependencyIdentity, FeaturesJson,
+    TargetTriple, WireRustcVersion,
 };
 use crate::index::ArtifactIndexRow;
 use crate::platform::Profile;
+use crate::stow_error;
+use crate::task_graph::TaskNodeIdentity;
 
 /// The compilation target triples the trusted CI build fleet covers.
 ///
@@ -167,6 +169,12 @@ pub struct BuildTaskPayload {
     /// published feature set compiles the dep again and fails the
     /// foreign-unit scan (stow#431).
     pub dep_pins: Vec<BuildDepPin>,
+    /// The Merkle digest committing to this task's own dependency
+    /// subgraph — the same digest the task id encodes — so the build's
+    /// published labels record the exact context it was built under
+    /// (stow#588). No default: every payload is derived from a resolved
+    /// task graph.
+    pub dependency_identity: DependencyIdentity,
 }
 
 /// One dependency edge of a build task — a crate's published identity.
@@ -186,6 +194,12 @@ pub struct BuildDepPin {
     /// `build-dependencies` entry (host side — the shape proc-macro and
     /// build-script deps compile at) or a `dependencies` entry.
     pub host_side: bool,
+    /// Compilation target triple the dep's task mints on — the runner
+    /// family's host triple for host-side units.
+    pub target: TargetTriple,
+    /// The dep's own dependency digest — the Merkle context its
+    /// published identity commits to (stow#588).
+    pub dependency_identity: DependencyIdentity,
 }
 
 /// One artifact a trusted build published.
@@ -221,6 +235,11 @@ pub struct ArtifactRecord {
     /// JSON-encoded dependency `c_metadata` identities captured from rustc
     /// --extern inputs; sorted by `(crate_name, c_metadata)`.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// The Merkle dependency digest the artifact was built under
+    /// (stow#588). `None` on archive rows recorded before the digest
+    /// existed — `None` answers no contextual coverage query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_identity: Option<DependencyIdentity>,
     /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
@@ -284,6 +303,11 @@ pub struct EnqueueRequest {
     /// family's host triple.
     #[serde(default)]
     pub depends_on: Vec<EnqueueDependency>,
+    /// The Merkle digest committing to this node's own dependency
+    /// subgraph — `depends_on`'s child task ids hashed — and the segment
+    /// its canonical task id carries (stow#588). No default: the digest
+    /// is derived from an actual resolved graph.
+    pub dependency_identity: DependencyIdentity,
     /// Whether the node compiles for the build host (a proc-macro, build
     /// dependency, or build-script unit) rather than for the consumer's
     /// target. Host-side tasks mint on the runner family's host triple and
@@ -319,6 +343,71 @@ pub struct EnqueueDependency {
     /// compile host units at. Defaults to false — a target-side dep.
     #[serde(default)]
     pub host_side: bool,
+    /// The dep's own dependency digest — the Merkle context its task id
+    /// commits to (stow#588). No default: the digest is derived from the
+    /// dep's actual resolved subgraph.
+    pub dependency_identity: DependencyIdentity,
+}
+
+impl EnqueueDependency {
+    /// The dep node's canonical task id — its identity tuple plus its
+    /// own dependency-context digest.
+    #[must_use]
+    pub fn task_id(&self) -> String {
+        TaskNodeIdentity {
+            crate_name: self.crate_name.clone(),
+            version: self.version.clone(),
+            features_json: self.features_json.clone(),
+            target: self.target.clone(),
+            rustc_version: self.rustc_version.clone(),
+            host_side: self.host_side,
+        }
+        .task_id(&self.dependency_identity)
+    }
+}
+
+impl EnqueueRequest {
+    /// The node's canonical task id — the identity tuple plus the
+    /// dependency-context digest (stow#588).
+    #[must_use]
+    pub fn task_id(&self) -> String {
+        TaskNodeIdentity {
+            crate_name: self.crate_name.clone(),
+            version: self.version.clone(),
+            features_json: self.features_json.clone(),
+            target: self.target.clone(),
+            rustc_version: self.rustc_version.clone(),
+            host_side: self.host_side,
+        }
+        .task_id(&self.dependency_identity)
+    }
+
+    /// Check that `depends_on`'s child task ids hash to the declared
+    /// [`EnqueueRequest::dependency_identity`]. A request whose digest
+    /// disagrees names a dependency context it does not carry; minting
+    /// a task id from it would claim a graph that never existed.
+    ///
+    /// # Errors
+    /// The dep-edge ids cannot be hashed, or the recomputed digest
+    /// disagrees with the declared one.
+    pub fn validate_dependency_identity(&self) -> crate::error::Result<()> {
+        let ids: Vec<String> = self
+            .depends_on
+            .iter()
+            .map(EnqueueDependency::task_id)
+            .collect();
+        let actual = DependencyIdentity::from_task_ids(ids.iter().map(String::as_str))
+            .map_err(|error| stow_error!("hash dep task ids: {error}"))?;
+        if actual != self.dependency_identity {
+            return Err(stow_error!(
+                "{} {} declares dependency_identity {} but its dep edges hash to {actual}",
+                self.crate_name.as_str(),
+                self.version,
+                self.dependency_identity,
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Where an enqueue request originated.
@@ -1332,6 +1421,11 @@ pub struct PublishedSliceRow {
     /// `None` only on reports serialized before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_shape: Option<crate::public_cache::UnitShape>,
+    /// The Merkle dependency digest the row was built under (stow#588).
+    /// `None` on reports serialized before the field existed — such
+    /// rows satisfy no contextual coverage clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_identity: Option<DependencyIdentity>,
 }
 
 /// Body the edge forwards to the scheduler's `/index/published` — one

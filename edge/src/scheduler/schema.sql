@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS queue (
     -- host unit), 0 for a target-side node. Part of the identity: the
     -- same crate legitimately exists at both sides of one triple.
     host_side INTEGER NOT NULL DEFAULT 0,
+    -- NULL is historical context that was never recorded, not a leaf.
+    dependency_identity TEXT,
     -- Repair latch: 1 once a `completed` row has been re-queued because a
     -- dependent's edge required unit shapes its published rows never
     -- covered (shapeless legacy rows satisfy no gate clause). The
@@ -125,7 +127,7 @@ CREATE TABLE IF NOT EXISTS queue (
     -- excludes the under-floor bulk before any rank or wake walk
     -- reaches it.
     dispatch_eligible INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
+    UNIQUE(crate_name, version, features_json, target, rustc_version, host_side, dependency_identity)
 );
 
 -- Status and lane are the queue's hot predicates: status() groups by them,
@@ -153,6 +155,7 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     dep_features_json TEXT NOT NULL DEFAULT '',
     dep_target TEXT NOT NULL DEFAULT '',
     dep_rustc_version TEXT NOT NULL DEFAULT '',
+    dep_dependency_identity TEXT,
     -- The side of the dep the dependent needs. -1 marks an edge written
     -- before the side model whose side the migration could not derive
     -- (a dep on the family host triple under an owner on the same
@@ -509,6 +512,7 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
+    dependency_identity TEXT,
     -- The unit shape the row serves — the builder-recorded side, cargo
     -- invocation spelling, and link kind the dependency gate compares an
     -- edge's required shapes against. -1 on all three legs marks a row
@@ -518,7 +522,7 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     unit_side INTEGER NOT NULL DEFAULT -1,
     unit_invocation INTEGER NOT NULL DEFAULT -1,
     unit_linked INTEGER NOT NULL DEFAULT -1,
-    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked)
+    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked)
 );
 
 -- Human-lane daily spend: one row per UTC date counting tasks enqueued

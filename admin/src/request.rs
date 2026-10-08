@@ -14,10 +14,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
-use stow_resolver::TaskNode;
 use stow_types::api::{
     CI_TARGET_TRIPLES, CrateRequestStatus, EnqueueRequest, EnqueueSource, RequestDispatch,
-    RequestOutcome, RequestOutcomeReport, RequestRootOutcome, task_id,
+    RequestOutcome, RequestOutcomeReport, RequestRootOutcome,
 };
 use stow_types::identity::TargetTriple;
 use stow_types::stow_error;
@@ -177,17 +176,12 @@ async fn plan_request(
     })?;
 
     let mut parts = Vec::with_capacity(outputs.len());
-    let mut all_nodes = BTreeSet::new();
     for (target, output) in &outputs {
-        let target_parts = stow_resolver::request_plan_parts(
-            &output.units,
-            &output.roots,
-            &crate_name,
-            &version,
-            target,
-        )
-        .map_err(|error| stow_error!("plan {crate_name} {version} for {target}: {error:#}"))?;
-        all_nodes.extend(target_parts.nodes.iter().cloned());
+        let target_parts =
+            stow_resolver::request_plan_parts(&output.units, &output.roots, target, &rustc_version)
+                .map_err(|error| {
+                    stow_error!("plan {crate_name} {version} for {target}: {error:#}")
+                })?;
         parts.push((target.clone(), target_parts));
     }
 
@@ -203,12 +197,8 @@ async fn plan_request(
         trust: &trust,
     };
     let covered_ids = crate::manual::covered_nodes(&catalog, &targets, &rustc_version).await?;
-    let covered: BTreeSet<TaskNode> = all_nodes
-        .into_iter()
-        .filter(|node| covered_ids.contains(&node_task_id(node, &rustc_version)))
-        .collect();
 
-    assemble_plan(parts, &covered, &rustc_version, dispatch.max_closure)
+    assemble_plan(parts, &covered_ids, dispatch.max_closure)
 }
 
 /// Plan parts + the covered set → the outcome report's tasks and roots.
@@ -219,8 +209,7 @@ async fn plan_request(
 /// single-target uncovered closure is what `max_closure` caps.
 fn assemble_plan(
     parts: Vec<(String, stow_resolver::RequestPlanParts)>,
-    covered: &BTreeSet<TaskNode>,
-    rustc_version: &stow_types::identity::WireRustcVersion,
+    covered: &BTreeSet<String>,
     max_closure: u32,
 ) -> stow_types::error::Result<RequestPlan> {
     let mut tasks = Vec::new();
@@ -231,15 +220,12 @@ fn assemble_plan(
         let target = TargetTriple::parse(&target)
             .map_err(|error| stow_error!("plan target `{target}`: {error}"))?;
         let root_cached = target_parts
-            .root_key
+            .root_task_id
             .as_ref()
-            .is_some_and(|key| covered.contains(key));
+            .is_some_and(|id| covered.contains(id));
         roots.push(RequestRootOutcome {
             target: target.clone(),
-            task_id: target_parts
-                .root_key
-                .as_ref()
-                .map(|key| node_task_id(key, rustc_version)),
+            task_id: target_parts.root_task_id.clone(),
             cached: root_cached,
         });
         if root_cached {
@@ -247,13 +233,12 @@ fn assemble_plan(
             continue;
         }
         let (requests, uncovered) = stow_resolver::enqueue_requests_inner(
-            &target_parts.nodes,
-            &target_parts.edges,
+            &target_parts.graph,
             covered,
-            rustc_version,
             EnqueueSource::HumanRequest,
             0,
-        );
+        )
+        .map_err(|error| stow_error!("plan {target} requests: {error:#}"))?;
         counts.push((target, uncovered.len()));
         closure_size = closure_size.max(uncovered.len());
         tasks.extend(requests);
@@ -270,19 +255,6 @@ fn assemble_plan(
         counts,
         closure_size,
     })
-}
-
-/// The scheduler task id `node` mints — the id `enqueue` deduplicates
-/// on and the record's root lookups key on.
-fn node_task_id(node: &TaskNode, rustc_version: &stow_types::identity::WireRustcVersion) -> String {
-    task_id(
-        node.crate_name.as_str(),
-        &node.version.to_string(),
-        &node.features_json,
-        &node.target,
-        rustc_version.as_str(),
-        node.host_side,
-    )
 }
 
 /// `POST /api/v1/scheduler/requests/{request_id}/outcome` — the report
@@ -417,10 +389,11 @@ fn render_plan(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
-    use stow_resolver::{RequestPlanParts, TaskNode};
+    use stow_resolver::RequestPlanParts;
     use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, WireRustcVersion};
+    use stow_types::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
 
     use super::*;
 
@@ -439,25 +412,30 @@ mod tests {
         }
     }
 
-    fn node(crate_name: &str, version: &str, target: &str, host_side: bool) -> TaskNode {
-        TaskNode {
-            crate_name: CrateName::parse(crate_name).expect("name"),
-            version: CrateVersion::new(semver::Version::parse(version).expect("version")),
-            features_json: "[\"default\"]".to_owned(),
-            target: target.to_owned(),
-            host_side,
+    /// One leaf [`ResolvedTaskNode`] at the node's identity tuple.
+    fn node(crate_name: &str, version: &str, target: &str, host_side: bool) -> ResolvedTaskNode {
+        ResolvedTaskNode {
+            identity: TaskNodeIdentity {
+                crate_name: CrateName::parse(crate_name).expect("name"),
+                version: CrateVersion::new(semver::Version::parse(version).expect("version")),
+                features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                    .expect("features"),
+                target: TargetTriple::parse(target).expect("target"),
+                rustc_version: WireRustcVersion::parse("1.99.0").expect("rustc"),
+                host_side,
+            },
+            dependencies: vec![],
         }
     }
 
     fn parts(
         target: &str,
-        nodes: BTreeSet<TaskNode>,
-        root_key: Option<TaskNode>,
+        graph: ResolvedTaskGraph,
+        root_task_id: Option<String>,
     ) -> RequestPlanParts {
         RequestPlanParts {
-            nodes,
-            edges: BTreeMap::new(),
-            root_key,
+            graph,
+            root_task_id,
             root_target: target.to_owned(),
             root_host_side: false,
         }
@@ -475,44 +453,57 @@ mod tests {
         assert_eq!(decoded.max_closure, 150);
     }
 
-    /// `node_task_id` mints the id the scheduler's queue assigns — the
-    /// roots the job reports key on exactly it.
+    /// The root outcome reports exactly the task id the emitted request
+    /// mints — lib and proc-macro roots alike, on either side of the
+    /// host boundary.
     #[test]
-    fn node_task_id_matches_api_minting() {
-        let node = node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false);
-        let id = node_task_id(&node, &WireRustcVersion::parse("1.99.0").expect("rustc"));
-        assert_eq!(
-            id,
-            task_id(
-                "serde",
-                "1.0.219",
-                "[\"default\"]",
-                "x86_64-unknown-linux-gnu",
-                "1.99.0",
-                false
+    fn root_outcome_task_id_equals_the_emitted_requests() {
+        for host_side in [false, true] {
+            let target = if host_side {
+                // The proc-macro root's lib unit keys on the runner
+                // family's host triple.
+                "x86_64-unknown-linux-gnu"
+            } else {
+                "aarch64-unknown-linux-gnu"
+            };
+            let graph =
+                ResolvedTaskGraph::resolve(vec![node("pm", "1.0.0", target, host_side)]).unwrap();
+            let root_id = graph.task_id(0).unwrap().to_owned();
+            let plan = assemble_plan(
+                vec![(
+                    target.to_owned(),
+                    parts(target, graph, Some(root_id.clone())),
+                )],
+                &BTreeSet::new(),
+                150,
             )
-        );
+            .expect("plan");
+            assert_eq!(plan.roots[0].task_id.as_deref(), Some(root_id.as_str()));
+            assert_eq!(plan.tasks[0].task_id(), root_id);
+        }
     }
 
     /// A covered lib root reports `cached` and its whole closure is
     /// skipped — the request lane does not rebuild what the published
-    /// index already serves.
+    /// index already serves. Coverage keys on the node's contextual
+    /// task id.
     #[test]
     fn covered_root_reports_cached_and_enqueues_nothing() {
-        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let root = node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false);
-        let covered: BTreeSet<TaskNode> = BTreeSet::from([root.clone()]);
+        let graph = ResolvedTaskGraph::resolve(vec![node(
+            "serde",
+            "1.0.219",
+            "x86_64-unknown-linux-gnu",
+            false,
+        )])
+        .unwrap();
+        let root_id = graph.task_id(0).unwrap().to_owned();
+        let covered: BTreeSet<String> = BTreeSet::from([root_id.clone()]);
         let plan = assemble_plan(
             vec![(
                 "x86_64-unknown-linux-gnu".to_owned(),
-                parts(
-                    "x86_64-unknown-linux-gnu",
-                    BTreeSet::from([root]),
-                    Some(node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false)),
-                ),
+                parts("x86_64-unknown-linux-gnu", graph, Some(root_id)),
             )],
             &covered,
-            &rustc,
             150,
         )
         .expect("plan");
@@ -532,33 +523,32 @@ mod tests {
     /// nodes — here the dep is published so only the root builds.
     #[test]
     fn uncovered_root_enqueues_the_uncovered_closure() {
-        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let root = node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false);
         let dep = node("serde_core", "1.0.219", "x86_64-unknown-linux-gnu", false);
-        let mut edges = BTreeMap::new();
-        edges.insert(root.clone(), BTreeSet::from([dep.clone()]));
-        let mut parts_value = parts(
-            "x86_64-unknown-linux-gnu",
-            BTreeSet::from([root.clone(), dep.clone()]),
-            Some(root),
-        );
-        parts_value.edges = edges;
+        let mut root = node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false);
+        root.dependencies = vec![0];
+        let graph = ResolvedTaskGraph::resolve(vec![dep, root]).unwrap();
+        let dep_id = graph.task_id(0).unwrap().to_owned();
+        let root_id = graph.task_id(1).unwrap().to_owned();
         // The dep is published; only the root's own task remains.
-        let covered: BTreeSet<TaskNode> = BTreeSet::from([dep]);
+        let covered: BTreeSet<String> = BTreeSet::from([dep_id.clone()]);
         let plan = assemble_plan(
-            vec![("x86_64-unknown-linux-gnu".to_owned(), parts_value)],
+            vec![(
+                "x86_64-unknown-linux-gnu".to_owned(),
+                parts("x86_64-unknown-linux-gnu", graph, Some(root_id.clone())),
+            )],
             &covered,
-            &rustc,
             150,
         )
         .expect("plan");
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].crate_name.as_str(), "serde");
+        assert_eq!(plan.tasks[0].task_id(), root_id);
         assert_eq!(plan.tasks[0].depends_on.len(), 1);
         assert_eq!(
             plan.tasks[0].depends_on[0].crate_name.as_str(),
             "serde_core"
         );
+        assert_eq!(plan.tasks[0].depends_on[0].task_id(), dep_id);
         assert_eq!(plan.closure_size, 1);
         assert!(!plan.roots[0].cached);
     }
@@ -567,15 +557,19 @@ mod tests {
     /// outcome reads `closure_queued` — and its deps still enqueue.
     #[test]
     fn no_lib_root_reports_no_task_id_but_enqueues() {
-        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let dep = node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false);
+        let graph = ResolvedTaskGraph::resolve(vec![node(
+            "serde",
+            "1.0.219",
+            "x86_64-unknown-linux-gnu",
+            false,
+        )])
+        .unwrap();
         let plan = assemble_plan(
             vec![(
                 "x86_64-unknown-linux-gnu".to_owned(),
-                parts("x86_64-unknown-linux-gnu", BTreeSet::from([dep]), None),
+                parts("x86_64-unknown-linux-gnu", graph, None),
             )],
             &BTreeSet::new(),
-            &rustc,
             150,
         )
         .expect("plan");
@@ -587,20 +581,17 @@ mod tests {
     /// with this reason rather than a hung queue.
     #[test]
     fn closure_over_cap_fails() {
-        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let root = node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false);
         let dep = node("serde_core", "1.0.219", "x86_64-unknown-linux-gnu", false);
+        let mut root = node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false);
+        root.dependencies = vec![0];
+        let graph = ResolvedTaskGraph::resolve(vec![dep, root]).unwrap();
+        let root_id = graph.task_id(1).unwrap().to_owned();
         let error = assemble_plan(
             vec![(
                 "x86_64-unknown-linux-gnu".to_owned(),
-                parts(
-                    "x86_64-unknown-linux-gnu",
-                    BTreeSet::from([root, dep]),
-                    Some(node("serde", "1.0.219", "x86_64-unknown-linux-gnu", false)),
-                ),
+                parts("x86_64-unknown-linux-gnu", graph, Some(root_id)),
             )],
             &BTreeSet::new(),
-            &rustc,
             1,
         )
         .err()

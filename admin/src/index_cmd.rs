@@ -848,12 +848,14 @@ fn semantic_rows(index: &ArtifactIndex) -> Vec<PublishedSliceRow> {
             version: row.version.clone(),
             features_json: row.features_json.clone(),
             unit_shape: row.unit_shape,
+            dependency_identity: row.dependency_identity.clone(),
         })
         .filter(|row| {
             seen.insert((
                 row.crate_name.as_str().to_owned(),
                 row.version.to_string(),
                 row.features_json.raw(),
+                row.dependency_identity.clone(),
                 row.unit_shape,
             ))
         })
@@ -868,12 +870,14 @@ fn row_key(
     String,
     String,
     String,
+    Option<stow_types::identity::DependencyIdentity>,
     Option<stow_types::public_cache::UnitShape>,
 ) {
     (
         row.crate_name.as_str().to_owned(),
         row.version.to_string(),
         row.features_json.raw(),
+        row.dependency_identity.clone(),
         row.unit_shape,
     )
 }
@@ -1154,6 +1158,9 @@ mod tests {
     fn record(task_id: &str) -> ArtifactRecord {
         let c_metadata = CMetadata::parse(task_id).expect("c_metadata");
         ArtifactRecord {
+            dependency_identity: Some(
+                stow_types::identity::DependencyIdentity::leaf().expect("fixture leaf"),
+            ),
             compile_key: format!("key-{task_id}"),
             c_metadata,
             extra_filename: String::new(),

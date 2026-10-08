@@ -45,6 +45,7 @@ use crate::units::{StowResolveOutput, StowUnitKind};
 /// Feature set + lockfile inputs for one resolve — the knobs the lanes
 /// carry into `resolve_crate`/`resolve_github_project` today.
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent Cargo switches, not a state machine.
 pub struct ResolveOptions {
     /// Seed features (`-F` flags); empty for the admin lanes.
     pub features: Vec<String>,
@@ -60,6 +61,8 @@ pub struct ResolveOptions {
     /// Contents of the root `Cargo.lock` the caller dropped — yanked
     /// admission + git pins. `None` when the tree never had a lockfile.
     pub dropped_lockfile: Option<String>,
+    /// Keep a published crate's bundled lockfile for an operator submit.
+    pub preserve_lockfile: bool,
 }
 
 /// What an admin resolve lane learns about the source: publish-shape
@@ -451,7 +454,7 @@ impl Resolver {
         let outputs = self
             .resolve_crate_units(crate_name, version, &ResolveOptions::default(), targets)
             .await?;
-        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
+        Self::source_resolve(&outputs, rustc_version, downloads)
     }
 
     /// Resolve one published `.crate` into its raw per-target unit
@@ -501,7 +504,7 @@ impl Resolver {
         opts: &ResolveOptions,
         targets: &[String],
     ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
-        let tree = crate::fetch::prepare_project_tree(package_dir, true)?;
+        let tree = crate::fetch::prepare_project_tree(package_dir, !opts.preserve_lockfile)?;
         let opts = ResolveOptions {
             members_are_crates_io: true,
             dropped_lockfile: tree.dropped_lockfile,
@@ -561,7 +564,7 @@ impl Resolver {
             ..ResolveOptions::default()
         };
         let outputs = self.resolve(&tree.manifest_path, &opts, targets)?;
-        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
+        Self::source_resolve(&outputs, rustc_version, downloads)
     }
 
     /// The admin local-dirs lane: a project tree already on disk. Its
@@ -587,7 +590,7 @@ impl Resolver {
             ..ResolveOptions::default()
         };
         let outputs = self.resolve(&tree.manifest_path, &opts, targets)?;
-        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
+        Self::source_resolve(&outputs, rustc_version, downloads)
     }
 
     /// `source_resolve` parity: per-target unit outputs → per-target
@@ -596,7 +599,7 @@ impl Resolver {
         outputs: &[(String, StowResolveOutput)],
         rustc_version: &WireRustcVersion,
         downloads: u64,
-    ) -> SourceResolve {
+    ) -> CargoResult<SourceResolve> {
         let mut has_binary = false;
         let mut has_library = false;
         let mut batches = Vec::with_capacity(outputs.len());
@@ -610,15 +613,14 @@ impl Resolver {
                 rustc_version,
                 EnqueueSource::CrateUpdate,
                 downloads,
-            )
-            .expect("emit_units emits well-formed units");
+            )?;
             batches.push((target.clone(), requests));
         }
-        SourceResolve {
+        Ok(SourceResolve {
             has_binary,
             has_library,
             targets: batches,
-        }
+        })
     }
 }
 

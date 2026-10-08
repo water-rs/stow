@@ -389,6 +389,8 @@ fn submit_task(rustc: &str, counter: u64) -> Result<EnqueueRequest, String> {
         downloads: 0,
         source: EnqueueSource::CrateUpdate,
         depends_on: Vec::new(),
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+            .map_err(|error| format!("fixture dependency identity: {error}"))?,
         host_side: false,
         preserve_lockfile: false,
     })

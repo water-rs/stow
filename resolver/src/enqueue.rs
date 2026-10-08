@@ -59,17 +59,42 @@ pub fn serialize_feature_set(features: &BTreeSet<String>) -> CargoResult<String>
     serde_json::to_string(&sorted).map_err(anyhow::Error::from)
 }
 
-/// Decode a canonical features JSON string back into the typed form.
-fn features_json(raw: &str) -> FeaturesJson {
-    decode_features_json(raw).expect("canonical features json")
-}
-
-/// The fallible half of [`features_json`] — malformed JSON or a
-/// non-canonical list is an error, so a caller minting an identity can
-/// never default a feature set silently.
+/// The fallible half of decoding a canonical features JSON string —
+/// malformed JSON or a non-canonical list is an error, so a caller
+/// minting an identity can never default a feature set silently.
 fn decode_features_json(raw: &str) -> CargoResult<FeaturesJson> {
     let features: Vec<String> = serde_json::from_str(raw).context("canonical features json")?;
     FeaturesJson::from_sorted(features).map_err(anyhow::Error::from)
+}
+
+/// A unit's raw six-field task node.
+fn node_of(unit: &StowUnit) -> CargoResult<TaskNode> {
+    Ok(TaskNode {
+        crate_name: CrateName::parse(unit.name.clone()).map_err(anyhow::Error::from)?,
+        version: CrateVersion::new(
+            semver::Version::parse(&unit.version).context("resolver emits semver versions")?,
+        ),
+        features_json: serialize_feature_set(
+            &unit.features.iter().cloned().collect::<BTreeSet<_>>(),
+        )?,
+        target: unit.key.platform.clone(),
+        host_side: unit.key.side == StowSide::Host,
+    })
+}
+
+/// The shared typed identity of a raw [`TaskNode`] under `rustc_version`.
+fn task_identity(
+    node: &TaskNode,
+    rustc_version: &WireRustcVersion,
+) -> CargoResult<TaskNodeIdentity> {
+    Ok(TaskNodeIdentity {
+        crate_name: node.crate_name.clone(),
+        version: node.version.clone(),
+        features_json: decode_features_json(&node.features_json)?,
+        target: TargetTriple::parse(&node.target)?,
+        rustc_version: rustc_version.clone(),
+        host_side: node.host_side,
+    })
 }
 
 /// The lib-unit graph the wave machinery works on: every task node and
@@ -96,19 +121,6 @@ pub fn task_graph(units: &[StowUnit]) -> CargoResult<TaskGraph> {
         }
     }
     let by_key = |key: &StowUnitKey| libs.get(key).copied();
-    let node_of = |unit: &StowUnit| -> CargoResult<TaskNode> {
-        Ok(TaskNode {
-            crate_name: CrateName::parse(unit.name.clone()).map_err(anyhow::Error::from)?,
-            version: CrateVersion::new(
-                semver::Version::parse(&unit.version).context("resolver emits semver versions")?,
-            ),
-            features_json: serialize_feature_set(
-                &unit.features.iter().cloned().collect::<BTreeSet<_>>(),
-            )?,
-            target: unit.key.platform.clone(),
-            host_side: unit.key.side == StowSide::Host,
-        })
-    };
     // One unit's direct lib edges: its normal-dep libs plus the build-dep
     // libs its build-script compile unit links (dedup'd by feature set as
     // `emit_units` produced it). A dep ref of kind Lib that resolves to no
@@ -247,14 +259,7 @@ pub fn resolved_task_graph(
             })?);
         }
         resolved.push(ResolvedTaskNode {
-            identity: TaskNodeIdentity {
-                crate_name: node.crate_name.clone(),
-                version: node.version.clone(),
-                features_json: decode_features_json(&node.features_json)?,
-                target: TargetTriple::parse(&node.target)?,
-                rustc_version: rustc_version.clone(),
-                host_side: node.host_side,
-            },
+            identity: task_identity(node, rustc_version)?,
             dependencies,
         });
     }
@@ -318,32 +323,22 @@ fn dedup_shadow_edges<'u>(
     Ok(extra_edges)
 }
 
-/// A unit's canonical features JSON — the root task key's feature
-/// payload when `request_plan_parts` locates the root's lib unit.
-fn unit_features(units: &[StowUnit], key: &crate::units::StowUnitKey) -> Option<String> {
-    let unit = units.iter().find(|unit| &unit.key == key)?;
-    serialize_feature_set(&unit.features.iter().cloned().collect::<BTreeSet<_>>()).ok()
-}
-
-/// The enqueue-free half of the request lane's plan.
+/// One target's resolved graph and the request's library root.
 ///
-/// The task graph plus the root task's key, target triple, and cargo
-/// side. The root is the requested crate's lib unit; when the only lib
-/// root is a proc-macro the lib lives on the host side, so its task
-/// keys on the runner family's host triple.
+/// The root is the requested crate's lib unit; when the
+/// only lib root is a proc-macro the lib lives on the host side, so its
+/// task keys on the runner family's host triple.
 #[derive(Debug)]
 pub struct RequestPlanParts {
-    /// Every task node in the resolved closure.
-    pub nodes: BTreeSet<TaskNode>,
-    /// Task-level dependency edges between nodes.
-    pub edges: BTreeMap<TaskNode, BTreeSet<TaskNode>>,
-    /// The requested crate's lib-unit task key, at the platform its
-    /// `roots` entry carries.
-    pub root_key: Option<TaskNode>,
-    /// `root_key`'s triple, or the requested target when there is no lib
-    /// root.
+    /// The resolve's task graph with Merkle identities (stow#588).
+    pub graph: ResolvedTaskGraph,
+    /// The requested crate's lib-unit task id — `None` for a
+    /// binary-only root, which legitimately mints no lib task.
+    pub root_task_id: Option<String>,
+    /// The root unit's platform, or the requested target when there is
+    /// no lib root.
     pub root_target: String,
-    /// `root_key`'s cargo side — true only for a proc-macro root, whose
+    /// The root's cargo side — true only for a proc-macro root, whose
     /// lib unit lives on the host side of its own resolve.
     pub root_host_side: bool,
 }
@@ -351,115 +346,140 @@ pub struct RequestPlanParts {
 /// Assemble [`RequestPlanParts`] from one target's resolve output.
 ///
 /// # Errors
-/// [`task_graph`] failures — malformed units.
+/// As [`resolved_task_graph`], plus a declared lib root whose complete
+/// [`crate::units::StowUnitKey`] finds no unit or whose unit minted no
+/// node.
 pub fn request_plan_parts(
     units: &[StowUnit],
     roots: &[crate::units::StowUnitKey],
-    crate_name: &str,
-    version: &semver::Version,
     target: &str,
+    rustc_version: &WireRustcVersion,
 ) -> CargoResult<RequestPlanParts> {
-    let (nodes, edges) = task_graph(units)?;
-    let root_key = roots
-        .iter()
-        .find(|key| key.kind == StowUnitKind::Lib)
+    let graph = resolved_task_graph(units, rustc_version)?;
+    let root_key = roots.iter().find(|key| key.kind == StowUnitKind::Lib);
+    let root_task_id = root_key
         .map(|key| {
-            Ok::<_, anyhow::Error>(TaskNode {
-                crate_name: CrateName::parse(crate_name)?,
-                version: CrateVersion::new(version.clone()),
-                features_json: unit_features(units, key).unwrap_or_default(),
-                target: key.platform.clone(),
-                host_side: key.side == StowSide::Host,
-            })
+            let unit = units.iter().find(|unit| &unit.key == key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "declared lib root {} ({}, {:?}) has no unit in this resolve",
+                    key.pkg,
+                    key.platform,
+                    key.side,
+                )
+            })?;
+            let node = node_of(unit)?;
+            let identity = task_identity(&node, rustc_version)?;
+            let index = graph
+                .nodes()
+                .iter()
+                .position(|resolved| resolved.identity == identity)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "root unit {} {} minted no task node in this resolve",
+                        unit.name,
+                        unit.version,
+                    )
+                })?;
+            graph
+                .task_id(index)
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("resolved node {index} has no task id"))
         })
         .transpose()?;
-    let (root_target, root_host_side) = root_key.as_ref().map_or_else(
+    let (root_target, root_host_side) = root_key.map_or_else(
         || (target.to_owned(), false),
-        |key| (key.target.clone(), key.host_side),
+        |key| (key.platform.clone(), key.side == StowSide::Host),
     );
     Ok(RequestPlanParts {
-        nodes,
-        edges,
-        root_key,
+        graph,
+        root_task_id,
         root_target,
         root_host_side,
     })
 }
 
-/// Assemble the enqueue batch for a resolve output: `(requests, nodes)`.
+/// Assemble the enqueue batch for one resolve output: `(requests,
+/// uncovered task ids)`.
 ///
 /// # Errors
-/// As [`task_graph`].
+/// As [`resolved_task_graph`].
 pub fn enqueue_requests_from_output(
     units: &[StowUnit],
     rustc_version: &WireRustcVersion,
     source: EnqueueSource,
     downloads: u64,
-) -> CargoResult<(Vec<EnqueueRequest>, BTreeSet<TaskNode>)> {
-    let (nodes, edges) = task_graph(units)?;
-    Ok(enqueue_requests_inner(
-        &nodes,
-        &edges,
-        &BTreeSet::new(),
-        rustc_version,
-        source,
-        downloads,
-    ))
+) -> CargoResult<(Vec<EnqueueRequest>, BTreeSet<String>)> {
+    let graph = resolved_task_graph(units, rustc_version)?;
+    enqueue_requests_inner(&graph, &BTreeSet::new(), source, downloads)
 }
 
-/// Emit one [`EnqueueRequest`] per uncovered node.
+/// Emit requests for graph nodes absent from contextual coverage.
 ///
-/// `depends_on` carries the node's own task deps — the lib units its
-/// build links — so a dependent dispatches only once its dependencies
-/// are servable, which is the queue gate's release signal. Each dep
-/// names the dep's own platform: the runner family's host triple for
-/// host-side units.
+/// Coverage matching is exact contextual identity — the node's
+/// Merkle task id — so a row published under a different dependency
+/// context never counts as covering.
 ///
-/// # Panics
-/// The resolver only emits CI triples and runner-family hosts, which
-/// always parse.
-#[must_use]
+/// `depends_on` carries each child's own fields plus the digest the
+/// graph computed for it, so the queue gate releases on the exact
+/// published context rather than a bare tuple. Each dep names the dep's
+/// own platform: the runner family's host triple for host-side units.
+///
+/// # Errors
+/// A `resolve`d graph is complete by construction; `CargoResult` keeps
+/// the call chain uniform.
 pub fn enqueue_requests_inner(
-    nodes: &BTreeSet<TaskNode>,
-    edges: &BTreeMap<TaskNode, BTreeSet<TaskNode>>,
-    covered: &BTreeSet<TaskNode>,
-    rustc_version: &WireRustcVersion,
+    graph: &ResolvedTaskGraph,
+    covered_ids: &BTreeSet<String>,
     source: EnqueueSource,
     downloads: u64,
-) -> (Vec<EnqueueRequest>, BTreeSet<TaskNode>) {
-    let uncovered: BTreeSet<TaskNode> = nodes
-        .iter()
-        .filter(|n| !covered.contains(*n))
-        .cloned()
-        .collect();
+) -> CargoResult<(Vec<EnqueueRequest>, BTreeSet<String>)> {
     let mut requests = Vec::new();
-    for node in &uncovered {
-        let depends_on = edges
-            .get(node)
-            .into_iter()
-            .flatten()
-            .map(|dep| EnqueueDependency {
-                crate_name: dep.crate_name.clone(),
-                version: dep.version.clone(),
-                features_json: features_json(&dep.features_json),
-                target: TargetTriple::parse(&dep.target)
-                    .expect("resolver emits CI or host triples"),
-                rustc_version: rustc_version.clone(),
-                host_side: dep.host_side,
+    let mut uncovered = BTreeSet::new();
+    for (index, node) in graph.nodes().iter().enumerate() {
+        let task_id = graph
+            .task_id(index)
+            .ok_or_else(|| anyhow::anyhow!("resolved node {index} has no task id"))?;
+        if covered_ids.contains(task_id) {
+            continue;
+        }
+        uncovered.insert(task_id.to_owned());
+        let depends_on = node
+            .dependencies
+            .iter()
+            .map(|dep_index| {
+                let dep = &graph.nodes()[*dep_index].identity;
+                Ok(EnqueueDependency {
+                    crate_name: dep.crate_name.clone(),
+                    version: dep.version.clone(),
+                    features_json: dep.features_json.clone(),
+                    target: dep.target.clone(),
+                    rustc_version: dep.rustc_version.clone(),
+                    host_side: dep.host_side,
+                    dependency_identity: graph
+                        .dependency_identity(*dep_index)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("resolved node {dep_index} has no dependency digest")
+                        })?
+                        .clone(),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<CargoResult<Vec<_>>>()?;
         requests.push(EnqueueRequest {
-            crate_name: node.crate_name.clone(),
-            version: node.version.clone(),
-            features_json: features_json(&node.features_json),
-            target: TargetTriple::parse(&node.target).expect("resolver emits CI or host triples"),
-            rustc_version: rustc_version.clone(),
+            crate_name: node.identity.crate_name.clone(),
+            version: node.identity.version.clone(),
+            features_json: node.identity.features_json.clone(),
+            target: node.identity.target.clone(),
+            rustc_version: node.identity.rustc_version.clone(),
             downloads,
             source,
             depends_on,
+            dependency_identity: graph
+                .dependency_identity(index)
+                .ok_or_else(|| anyhow::anyhow!("resolved node {index} has no dependency digest"))?
+                .clone(),
             preserve_lockfile: false,
-            host_side: node.host_side,
+            host_side: node.identity.host_side,
         });
     }
-    (requests, uncovered)
+    Ok((requests, uncovered))
 }

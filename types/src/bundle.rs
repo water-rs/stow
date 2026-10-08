@@ -263,6 +263,11 @@ pub struct ArtifactBlobConfig {
     pub features_json: FeaturesJson,
     /// Sorted dependency identities driving the cache key.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// The Merkle dependency digest the bundle was built under
+    /// (stow#588). `None` on bundles written before the digest existed —
+    /// `None` answers no contextual coverage query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_identity: Option<crate::identity::DependencyIdentity>,
     /// JSON-encoded compile keys of dependencies.
     pub dependency_compile_keys_json: String,
     /// Cargo profile.
