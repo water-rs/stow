@@ -212,14 +212,9 @@ fn mint_admissions(
     let minute = now_minute();
     let mut admissions = Vec::with_capacity(requests.len());
     for request in requests {
-        let task_id = scheduler::queue::task_id(
-            request.crate_name.as_str(),
-            &request.version.to_string(),
-            request.features_json.raw().as_str(),
-            request.target.as_str(),
-            request.rustc_version.as_str(),
-            request.host_side,
-        );
+        let task_id = request.task_id().map_err(|error| {
+            GetArtifactError::BadRequestWithMessage(format!("enqueue task id: {error}"))
+        })?;
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
         let challenge = admission::issue_challenge(
@@ -1697,14 +1692,9 @@ pub async fn enqueue_admitted_task(
     }
     // The challenge binds task_id to the request's canonical identity;
     // recompute it so a verified ticket always forwards what it minted.
-    let derived_task_id = scheduler::queue::task_id(
-        ticket.request.crate_name.as_str(),
-        &ticket.request.version.to_string(),
-        ticket.request.features_json.raw().as_str(),
-        ticket.request.target.as_str(),
-        ticket.request.rustc_version.as_str(),
-        ticket.request.host_side,
-    );
+    let derived_task_id = ticket.request.task_id().map_err(|error| {
+        GetArtifactError::BadRequestWithMessage(format!("enqueue task id: {error}"))
+    })?;
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
         return Err(GetArtifactError::Unauthorized);

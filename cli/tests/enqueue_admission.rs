@@ -36,7 +36,7 @@ const ADMISSIONS_RESPONSE: &str = r#"[{
         "rustc_version": "1.85.0",
         "downloads": 0,
         "source": "CacheMiss",
-        "depends_on": [],
+        "dependency_subgraph": {"n": []},
         "preserve_lockfile": false
     }
 }]"#;

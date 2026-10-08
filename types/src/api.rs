@@ -179,9 +179,11 @@ pub struct BuildTaskPayload {
 }
 
 /// GitHub caps every `workflow_dispatch` call's inputs at 65,535
-/// characters together; the serialized [`BuildTaskPayload`] is by far the
-/// largest of them, so producers encode through
-/// [`BuildTaskPayload::encode_dispatch_task`] and fail before GitHub does.
+/// characters together.
+///
+/// The serialized [`BuildTaskPayload`] is by far the largest input, so
+/// producers encode through [`BuildTaskPayload::encode_dispatch_task`]
+/// and fail before GitHub does.
 pub const DISPATCH_INPUT_LIMIT: usize = 65_535;
 
 /// A build task's dependency subgraph in compact wire form (stow#588).
@@ -191,7 +193,7 @@ pub const DISPATCH_INPUT_LIMIT: usize = 65_535;
 /// rustc and target are derived, never carried. rustc is the task's own
 /// `rustc_version`; a node's target is the task's `target` for a
 /// target-side node and the runner family's host triple
-/// ([`runner_family`]`(task.target).host_triple()`) for a host-side node.
+/// (`runner_family(task.target).host_triple()`) for a host-side node.
 /// That matches the resolver, which keys every host unit's
 /// `platform` at `CompileKind::Host` mapped to the runner family's host
 /// triple (`resolver/src/emit.rs`), and `EnqueueDependency::target`,

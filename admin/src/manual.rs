@@ -934,7 +934,7 @@ fn dry_run_report(nodes: &BTreeMap<String, NodeRun>) -> stow_types::error::Resul
         lengths.push(len);
         if len > max_len {
             max_len = len;
-            max_len_task = id.clone();
+            max_len_task.clone_from(id);
         }
         let target = node.request.target.as_str();
         let slot = per_target_max.entry(target).or_insert((0, id.as_str()));
@@ -1930,7 +1930,7 @@ mod tests {
             })
             .collect();
         let dependency_subgraph = stow_types::api::TaskSubgraph {
-            root_deps: (0..depends_on.len() as u32).collect(),
+            root_deps: (0..u32::try_from(depends_on.len()).expect("test dep count")).collect(),
             nodes: depends_on
                 .iter()
                 .map(|dep| stow_types::api::SubgraphNode {

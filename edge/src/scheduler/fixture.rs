@@ -668,17 +668,30 @@ pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), Qu
     let target_case = target_case_sql("n");
     let node_invocation = target_invocation_case("n");
     db.query(&format!(
-        "WITH RECURSIVE seq(n) AS ({seq}) \
+        "WITH RECURSIVE seq(n) AS ({seq}), \
+         rows(target, rustc_version, generation, crate_name, version, features_json, \
+              unit_side, unit_invocation, unit_linked) AS ( \
+            SELECT {target_case}, \
+                   CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
+                   1, 'crate' || (n / {CRATE_NAME_ROWS}), '1.' || (n / 20000) || '.' || (n % 500), '[]', \
+                   CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
+                   CASE WHEN n % 10 = 0 THEN part ELSE {node_invocation} END, \
+                   CASE WHEN n % 10 = 0 THEN 1 ELSE part END \
+            FROM seq, (SELECT 0 AS part UNION ALL SELECT 1 AS part)) \
          INSERT OR IGNORE INTO published_slice_rows \
              (target, rustc_version, generation, crate_name, version, features_json, \
               unit_side, unit_invocation, unit_linked) \
-         SELECT {target_case}, \
-                CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                1, 'crate' || (n / {CRATE_NAME_ROWS}), '1.' || (n / 20000) || '.' || (n % 500), '[]', \
-                CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
-                CASE WHEN n % 10 = 0 THEN part ELSE {node_invocation} END, \
-                CASE WHEN n % 10 = 0 THEN 1 ELSE part END \
-         FROM seq, (SELECT 0 AS part UNION ALL SELECT 1 AS part)",
+         SELECT target, rustc_version, generation, crate_name, version, features_json, \
+                unit_side, unit_invocation, unit_linked \
+         FROM rows \
+         WHERE NOT EXISTS ( \
+            SELECT 1 FROM published_slice_rows p \
+            WHERE p.target = rows.target AND p.rustc_version = rows.rustc_version \
+              AND p.generation = rows.generation AND p.crate_name = rows.crate_name \
+              AND p.version = rows.version AND p.features_json = rows.features_json \
+              AND p.dependency_identity IS NULL \
+              AND p.unit_side = rows.unit_side AND p.unit_invocation = rows.unit_invocation \
+              AND p.unit_linked = rows.unit_linked)",
         seq = seq_sql(lo, hi),
     ))
     .execute()

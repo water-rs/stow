@@ -3,7 +3,6 @@ use std::future::Future;
 use std::num::{NonZero, NonZeroU32};
 
 use skyzen_services::durable::{Alarm, DbValue, DurableDb};
-pub use stow_types::api::task_id;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
     QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus,
@@ -925,27 +924,13 @@ async fn enqueue_inner(
             .map_err(|error| QueueError::Invariant(format!("derive dep edges: {error}")))?;
         let dep_task_ids = deps
             .iter()
-            .map(|dependency| {
-                task_id(
-                    dependency.crate_name.as_str(),
-                    dependency.version.to_string().as_str(),
-                    dependency.features_json.raw().as_str(),
-                    dependency.target.as_str(),
-                    dependency.rustc_version.as_str(),
-                    dependency.host_side,
-                )
-            })
+            .map(stow_types::api::EnqueueDependency::task_id)
             .collect();
         prepared.push(Prepared {
             request,
-            task_id: task_id(
-                &identity.crate_name,
-                &identity.version,
-                identity.features_json.as_str(),
-                &identity.target,
-                &identity.rustc_version,
-                identity.host_side,
-            ),
+            task_id: request
+                .task_id()
+                .map_err(|error| QueueError::Invariant(format!("derive task id: {error}")))?,
             identity,
             dep_task_ids,
         });

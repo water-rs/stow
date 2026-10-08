@@ -778,10 +778,12 @@ fn unit_graph_task_units(
                 let dep_base = dep_units
                     .iter()
                     .find(|dep| dep.key.side == want)
-                    .or(if dep_units.len() == 1 {
-                        dep_units.first()
-                    } else {
-                        None
+                    .or_else(|| {
+                        if dep_units.len() == 1 {
+                            dep_units.first()
+                        } else {
+                            None
+                        }
                     })
                     .ok_or_else(|| {
                         stow_types::stow_error!(

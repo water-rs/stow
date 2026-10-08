@@ -287,125 +287,6 @@ fn node_target(node_key: &ExpandedNodeKey, target_typed: &TargetTriple) -> Targe
     TargetTriple::parse(triple).expect("triples come from the runner family")
 }
 
-/// Turn an exact graph (`feature_json_by_key` + `dependency_keys_by_key`)
-/// into one [`EnqueueRequest`] per node the cache does not already cover.
-/// `source` decides the scheduler lane the tasks land in: the miss path
-/// passes [`EnqueueSource::CacheMiss`], the human request API passes
-/// [`EnqueueSource::HumanRequest`].
-///
-/// `depends_on` carries the node's own task deps — a dependent dispatches
-/// only once every dependency is servable, which is the queue gate's
-/// release signal. Each dep names the dep's own platform: the runner
-/// family's host triple for host-side units.
-/// One expanded node's canonical task id under `digest` — the same
-/// `TaskNodeIdentity` formula the resolver's [`EnqueueDependency`]
-/// entries mint.
-fn expanded_task_id(
-    node_key: &ExpandedNodeKey,
-    features_json: &str,
-    target_typed: &TargetTriple,
-    rustc_version_typed: &WireRustcVersion,
-    digest: &stow_types::identity::DependencyIdentity,
-) -> Result<String, ResolverError> {
-    Ok(stow_types::task_graph::TaskNodeIdentity {
-        crate_name: node_key.package.crate_name.clone(),
-        version: CrateVersion::new(node_key.package.version.clone()),
-        features_json: parse_canonical_features_json(features_json)?,
-        target: node_target(node_key, target_typed),
-        rustc_version: rustc_version_typed.clone(),
-        host_side: node_key.host_side,
-    }
-    .task_id(digest))
-}
-
-/// Every expanded node's dependency digest, computed bottom-up over the
-/// whole graph so a cached node's dep entry still mints the digest its
-/// own children commit to (stow#588).
-fn expanded_digests(
-    feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
-    dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
-    target_typed: &TargetTriple,
-    rustc_version_typed: &WireRustcVersion,
-) -> Result<BTreeMap<ExpandedNodeKey, stow_types::identity::DependencyIdentity>, ResolverError> {
-    fn visit(
-        node_key: &ExpandedNodeKey,
-        feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
-        dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
-        target_typed: &TargetTriple,
-        rustc_version_typed: &WireRustcVersion,
-        memo: &mut BTreeMap<ExpandedNodeKey, stow_types::identity::DependencyIdentity>,
-        visiting: &mut BTreeSet<ExpandedNodeKey>,
-    ) -> Result<(), ResolverError> {
-        if memo.contains_key(node_key) {
-            return Ok(());
-        }
-        if !visiting.insert(node_key.clone()) {
-            return Err(ResolverError::from(format!(
-                "dependency cycle reaches {} {}",
-                node_key.package.crate_name, node_key.package.version
-            )));
-        }
-        let mut child_ids = Vec::new();
-        if let Some(children) = dependency_keys_by_key.get(node_key) {
-            for dep_key in children {
-                visit(
-                    dep_key,
-                    feature_json_by_key,
-                    dependency_keys_by_key,
-                    target_typed,
-                    rustc_version_typed,
-                    memo,
-                    visiting,
-                )?;
-                let raw = feature_json_by_key.get(dep_key).ok_or_else(|| {
-                    ResolverError::from(format!(
-                        "missing serialized feature set for dependency {} {}",
-                        dep_key.package.crate_name, dep_key.package.version
-                    ))
-                })?;
-                let dep_digest = memo
-                    .get(dep_key)
-                    .expect("visit inserts the dep's digest before returning");
-                child_ids.push(expanded_task_id(
-                    dep_key,
-                    raw,
-                    target_typed,
-                    rustc_version_typed,
-                    dep_digest,
-                )?);
-            }
-        }
-        visiting.remove(node_key);
-        let digest = stow_types::identity::DependencyIdentity::from_task_ids(
-            child_ids.iter().map(String::as_str),
-        )
-        .map_err(|error| {
-            ResolverError::from(format!(
-                "hash dep task ids of {} {}: {error}",
-                node_key.package.crate_name, node_key.package.version
-            ))
-        })?;
-        memo.insert(node_key.clone(), digest);
-        Ok(())
-    }
-
-    let mut memo = BTreeMap::new();
-    let mut visiting = BTreeSet::new();
-    let keys: Vec<ExpandedNodeKey> = feature_json_by_key.keys().cloned().collect();
-    for node_key in &keys {
-        visit(
-            node_key,
-            feature_json_by_key,
-            dependency_keys_by_key,
-            target_typed,
-            rustc_version_typed,
-            &mut memo,
-            &mut visiting,
-        )?;
-    }
-    Ok(memo)
-}
-
 /// The compact dependency subgraph a dispatch payload carries: the
 /// node's transitive closure over the expanded graph, each member's
 /// children wired as indexes (stow#588). A dep the expanded graph does
@@ -422,10 +303,10 @@ fn expanded_subgraph(
         .map(|children| children.iter().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     while let Some(next) = frontier.pop() {
-        if closure.insert(next.clone()) {
-            if let Some(children) = dependency_keys_by_key.get(&next) {
-                frontier.extend(children.iter().cloned());
-            }
+        if closure.insert(next.clone())
+            && let Some(children) = dependency_keys_by_key.get(&next)
+        {
+            frontier.extend(children.iter().cloned());
         }
     }
     let wire_index = |dep_key: &ExpandedNodeKey| -> Result<u32, ResolverError> {
@@ -489,6 +370,11 @@ fn expanded_subgraph(
     Ok(stow_types::api::TaskSubgraph { root_deps, nodes })
 }
 
+/// Turn an exact graph (`feature_json_by_key` + `dependency_keys_by_key`)
+/// into one [`EnqueueRequest`] per node the cache does not already cover.
+/// `source` decides the scheduler lane the tasks land in: the miss path
+/// passes [`EnqueueSource::CacheMiss`], the human request API passes
+/// [`EnqueueSource::HumanRequest`].
 fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
     dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,

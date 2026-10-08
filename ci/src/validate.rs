@@ -359,6 +359,29 @@ mod tests {
         .unwrap();
     }
 
+    /// stow#588: a plan claiming a dependency identity other than the
+    /// one the publisher verified is a different artifact — reject it.
+    #[test]
+    fn rejects_a_plan_whose_dependency_identity_differs() {
+        let mut artifact = planned("demo", "1.0.0");
+        artifact.dependency_identity =
+            stow_types::identity::DependencyIdentity::from_task_ids(["foreign-dep-1.0.0-x"])
+                .expect("foreign digest");
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &[artifact],
+            &closure(&[("demo", "1.0.0")]),
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error}").contains("dependency_identity"),
+            "the rejection names the differing claim: {error}"
+        );
+    }
+
     #[test]
     fn rejects_crate_outside_closure() {
         let plan = vec![planned("demo", "1.0.0"), planned("serde", "1.0.210")];

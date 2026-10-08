@@ -23,6 +23,8 @@
 mod capture;
 mod closure;
 mod consume;
+#[cfg(test)]
+mod context_tests;
 mod dep_scan;
 mod local_server;
 mod plan;

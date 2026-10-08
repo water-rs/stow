@@ -978,7 +978,10 @@ pub async fn take_dependency_graph_misses(
         // carry (the scheduler storage rework owns recording the full
         // closure); the request derives its edges and digest from it.
         let dependency_subgraph = stow_types::api::TaskSubgraph {
-            root_deps: (0..depends_on.len() as u32).collect(),
+            root_deps: (0..u32::try_from(depends_on.len()).map_err(|_| {
+                "draining miss depends_on_json: more direct deps than u32::MAX".to_owned()
+            })?)
+                .collect(),
             nodes: depends_on
                 .iter()
                 .map(|dep| stow_types::api::SubgraphNode {

@@ -907,7 +907,9 @@ fn missed_enqueue_request(
     // is non-leaf cannot be re-derived here; the recorded digest is the
     // only evidence and `validate_dependency_identity` still binds it.
     let dependency_subgraph = stow_types::api::TaskSubgraph {
-        root_deps: (0..depends_on.len() as u32).collect(),
+        root_deps: (0..u32::try_from(depends_on.len())
+            .map_err(|_| stow_error!("top_missed depends_on_json too long"))?)
+            .collect(),
         nodes: depends_on
             .iter()
             .map(|dep| stow_types::api::SubgraphNode {
