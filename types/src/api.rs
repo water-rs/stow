@@ -422,20 +422,34 @@ pub fn task_id(
     rustc_version: &str,
     host_side: bool,
 ) -> String {
+    let base = task_id_prefix(crate_name, version, features_json, target, rustc_version);
+    if host_side {
+        format!("{base}-host")
+    } else {
+        base
+    }
+}
+
+/// The `<crate>-<version>-<features hash>-<target>-<rustc>` prefix every
+/// task id shares — [`task_id`] appends `-host`,
+/// [`crate::task_graph::TaskNodeIdentity::task_id`] inserts the
+/// dependency digest before it.
+pub(crate) fn task_id_prefix(
+    crate_name: &str,
+    version: &str,
+    features_json: &str,
+    target: &str,
+    rustc_version: &str,
+) -> String {
     let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
-    let base = format!(
+    format!(
         "{}-{}-{}-{}-{}",
         crate_name,
         version,
         features_hash,
         target.replace('-', "_"),
         rustc_version.replace('-', "_")
-    );
-    if host_side {
-        format!("{base}-host")
-    } else {
-        base
-    }
+    )
 }
 
 /// Completion the edge's `POST /api/v1/github/workflow-run` handler sends

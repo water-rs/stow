@@ -24,6 +24,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::error::Context as _;
+
 /// Errors produced while parsing wire identity values.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
@@ -62,6 +64,9 @@ pub enum IdentityError {
     /// Dependency identities not sorted by `(crate_name, c_metadata)`.
     #[error("dependency_c_metadata_json must be sorted by (crate_name, c_metadata)")]
     UnsortedDependencyIdentities,
+    /// A dependency-identity digest is not exactly 64 lowercase hex digits.
+    #[error("invalid dependency_identity `{0}`: must be exactly 64 lowercase ASCII hex digits")]
+    InvalidDependencyIdentity(String),
 }
 
 fn validate_crate_name(value: &str) -> Result<(), IdentityError> {
@@ -148,6 +153,17 @@ fn validate_features_sorted(features: &[String]) -> Result<(), IdentityError> {
             return Err(IdentityError::UnsortedFeatures);
         }
         previous = Some(feature.as_str());
+    }
+    Ok(())
+}
+
+fn validate_dependency_identity(value: &str) -> Result<(), IdentityError> {
+    if value.len() != 64
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+    {
+        return Err(IdentityError::InvalidDependencyIdentity(value.to_owned()));
     }
     Ok(())
 }
@@ -620,6 +636,47 @@ impl<'de> Deserialize<'de> for DependencyCMetadataJson {
     }
 }
 
+string_newtype!(
+    /// The BLAKE3 digest of a node's sorted, deduplicated direct
+    /// dependency task ids — the Merkle commitment a resolved task id
+    /// carries (stow#588). Exactly 64 lowercase ASCII hex digits.
+    DependencyIdentity,
+    validate_dependency_identity,
+    InvalidDependencyIdentity
+);
+
+impl DependencyIdentity {
+    /// The key-derivation context separating dependency digests from
+    /// every other BLAKE3 use in stow.
+    const DOMAIN: &'static str = "stow.task-dependencies.v1";
+
+    /// The digest committing to a node's direct dependencies: the task
+    /// ids sorted and deduplicated — input ordering and repeated edges
+    /// change nothing — serialized as a JSON array and hashed under
+    /// [`Self::DOMAIN`].
+    ///
+    /// # Errors
+    /// Fails only if `serde_json` cannot serialize a `Vec<&str>`, or a
+    /// computed digest fails shape validation.
+    pub fn from_task_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> crate::error::Result<Self> {
+        let mut sorted: Vec<&str> = ids.into_iter().collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let bytes = serde_json::to_vec(&sorted).wrap_err("serialize dependency task ids")?;
+        let digest = hex::encode(blake3::derive_key(Self::DOMAIN, &bytes));
+        Ok(Self::parse(digest)?)
+    }
+
+    /// The digest a node with no dependencies carries — the canonical
+    /// hash of the empty id list, computed like every other digest.
+    ///
+    /// # Errors
+    /// Mirrors [`Self::from_task_ids`].
+    pub fn leaf() -> crate::error::Result<Self> {
+        Self::from_task_ids(std::iter::empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,5 +793,60 @@ mod tests {
         assert_eq!(value.entries().len(), 1);
         let serialized = serde_json::to_value(&value).unwrap();
         assert_eq!(serialized, serde_json::Value::String(raw.to_owned()));
+    }
+
+    #[test]
+    fn dependency_identity_is_64_lowercase_hex() {
+        let digest = DependencyIdentity::parse(blake3::hash(b"children").to_hex().to_string())
+            .expect("a blake3 hex digest validates");
+        let serialized = serde_json::to_value(&digest).unwrap();
+        assert_eq!(
+            serde_json::from_value::<DependencyIdentity>(serialized).unwrap(),
+            digest
+        );
+        for invalid in [
+            "",
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &"A".repeat(64),
+            &"g".repeat(64),
+            &format!("{} ", "a".repeat(63)),
+        ] {
+            assert!(
+                DependencyIdentity::parse(invalid).is_err(),
+                "`{invalid}` must not validate"
+            );
+        }
+    }
+
+    /// Ordering and repeated ids change nothing — the canonical hash
+    /// input is the sorted, deduplicated array.
+    #[test]
+    fn from_task_ids_ignores_ordering_and_repetition() {
+        let expected = DependencyIdentity::from_task_ids(["a", "b", "c"]).unwrap();
+        for ids in [
+            vec!["c", "b", "a"],
+            vec!["b", "a", "a", "c", "b"],
+            vec!["a", "b", "c"],
+        ] {
+            assert_eq!(DependencyIdentity::from_task_ids(ids).unwrap(), expected);
+        }
+        let changed = DependencyIdentity::from_task_ids(["a", "b", "d"]).unwrap();
+        assert_ne!(
+            changed, expected,
+            "a different child set hashes differently"
+        );
+    }
+
+    /// A leaf hashes the canonical empty array under the same domain —
+    /// no special-cased constant.
+    #[test]
+    fn leaf_hashes_the_canonical_empty_list() {
+        let canonical = hex::encode(blake3::derive_key(DependencyIdentity::DOMAIN, b"[]"));
+        assert_eq!(DependencyIdentity::leaf().unwrap().as_str(), canonical);
+        assert_eq!(
+            DependencyIdentity::leaf().unwrap(),
+            DependencyIdentity::from_task_ids([]).unwrap()
+        );
     }
 }

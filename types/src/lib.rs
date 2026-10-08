@@ -29,6 +29,7 @@ pub mod public_cache;
 pub mod records;
 pub mod registry;
 pub mod rustc;
+pub mod task_graph;
 pub mod transient;
 pub mod trusted_builder;
 pub mod upload_plan;
