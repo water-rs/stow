@@ -295,7 +295,7 @@ pub async fn resolve_exact_dependency_graph(
 /// entries, direct dependencies and local manifests.
 /// `target` is the triple cargo was given, `None` when the build is
 /// native. Exposed so the trusted builder's consumption set can be
-/// exercised against a graph fixture without spawning cargo (stow#586).
+/// exercised against a graph fixture without spawning cargo (stow#589).
 ///
 /// # Errors
 ///

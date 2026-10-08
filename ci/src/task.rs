@@ -626,7 +626,7 @@ async fn stage_consumption_store(
 }
 
 /// The units this build's workspace will compile, read from cargo's own
-/// unit graphs — the consumable set (stow#586). Each graph is computed
+/// unit graphs — the consumable set (stow#589). Each graph is computed
 /// with the same argv a phase runs (`cargo_phase_args`, minus the
 /// subcommand, plus `--unit-graph`) under every invocation spelling the
 /// task's phases use — native and `--target` for a host-side task, the

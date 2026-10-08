@@ -52,7 +52,7 @@ mod workspace_deps;
 
 use stow_shim as wrapper_shim;
 /// `cargo --unit-graph` reads — the build stage computes its consumable
-/// set from the workspace's own unit graphs (stow#586).
+/// set from the workspace's own unit graphs (stow#589).
 pub use workspace_deps::{
     ExpandedDependencyGraph, expanded_dependency_graph, resolve_exact_dependency_graph,
 };

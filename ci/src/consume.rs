@@ -63,7 +63,7 @@ pub async fn slices_for_task(
 /// served from: every signed-index row matching a unit of the build
 /// workspace's own cargo unit graph — name, version, activated feature
 /// set and side — which the caller computed from the same cargo
-/// invocations the build phases run (stow#586).
+/// invocations the build phases run (stow#589).
 ///
 /// Rows whose dep-identity does not match this build's resolution are not
 /// excluded here — the wrapper's compile-key lookup is what decides a hit;
@@ -331,7 +331,7 @@ mod tests {
         assert!(has_reactor, "the network phase ran without a Tokio reactor");
     }
 
-    /// stow#586: a row is consumable only at the unit-graph identity —
+    /// stow#589: a row is consumable only at the unit-graph identity —
     /// canonical name, exact version, the activated feature set AND the
     /// side. A host-side entry matches a host-shaped row and never the
     /// same package's target shape; a row published before `unit_shape`

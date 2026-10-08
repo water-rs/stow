@@ -180,7 +180,7 @@ pub async fn scan_artifacts(
 /// graph compiles, at the per-side feature set cargo activated for it —
 /// the same identities a consumer's build computes, so a dep the build
 /// can compile is always staged and one it cannot is never fetched
-/// (stow#586). The task crate itself is excluded: a re-run after a
+/// (stow#589). The task crate itself is excluded: a re-run after a
 /// successful publish must never consume the artifact the task exists
 /// to produce.
 pub fn consumable_packages(
@@ -2249,7 +2249,7 @@ mod tests {
         });
     }
 
-    /// stow#586: the consumable set is the build workspace's own cargo
+    /// stow#589: the consumable set is the build workspace's own cargo
     /// unit graph — a build-script dep lands host-side and a transitive
     /// dep of a pinned crate lands target-side, each at the feature set
     /// cargo activated — while the task crate itself never becomes
@@ -2258,20 +2258,27 @@ mod tests {
     /// `direct-dep` and build-dep `host-dep`.
     #[test]
     fn consumable_packages_follow_the_builds_unit_graph() {
-        // `path+` units' manifests are hashed at parse — point the
-        // wrapper's pkg id at a real manifest.
+        // `path+` units' manifests are hashed at parse — the wrapper's
+        // pkg id must name a real manifest, and a spaced directory
+        // exercises the file-URL percent-encoding `path_pkg_root`
+        // decodes.
         let tempdir = tempfile::tempdir().expect("tempdir");
+        let project = tempdir.path().join("wrapper workspace");
+        std::fs::create_dir(&project).expect("wrapper dir");
         std::fs::write(
-            tempdir.path().join("Cargo.toml"),
+            project.join("Cargo.toml"),
             "[package]\nname = \"stow-ci-wrapper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
         )
         .expect("write wrapper manifest");
-        let wrapper_pkg = format!(
-            "path+file://{}#stow-ci-wrapper@0.0.0",
-            tempdir.path().display()
-        );
-        let graph_json = UNIT_GRAPH_JSON.replace("@WRAPPER@", &wrapper_pkg);
-        let graph = stow_cli::expanded_dependency_graph(graph_json.as_bytes(), None, "1.99.0")
+        let wrapper_url = url::Url::from_directory_path(&project).expect("dir url");
+        let wrapper_pkg = format!("path+{wrapper_url}#stow-ci-wrapper@0.0.0");
+        let mut graph_json: serde_json::Value =
+            serde_json::from_str(UNIT_GRAPH_JSON).expect("fixture parses");
+        for index in [0usize, 1] {
+            graph_json["units"][index]["pkg_id"] = serde_json::Value::String(wrapper_pkg.clone());
+        }
+        let graph_json = serde_json::to_vec(&graph_json).expect("serialize fixture");
+        let graph = stow_cli::expanded_dependency_graph(&graph_json, None, "1.99.0")
             .expect("unit graph parses");
 
         let task = BuildTaskPayload {
