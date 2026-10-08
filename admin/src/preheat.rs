@@ -22,6 +22,11 @@ use crate::render::{self, Output, Table};
 const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_ENV: &str = "CF_ANALYTICS_TOKEN";
 const CF_ANALYTICS_SQL_BASE: &str = "https://api.cloudflare.com/client/v4";
+/// Test-only seam (stow#593): the Analytics Engine base URL. Production
+/// never sets it and the const below stays the only live endpoint; the
+/// workflow-entrypoint e2e points it at a loopback fixture so a
+/// `preheat missed` run can be asserted end to end without Cloudflare.
+const CF_ANALYTICS_SQL_BASE_ENV: &str = "STOW_CF_ANALYTICS_SQL_BASE";
 // The SQL API itself times queries out at 30 s; the client bound sits just
 // above that so a slow query reports the server's error, not a local cutoff.
 const CF_ANALYTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
@@ -844,7 +849,9 @@ async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMisse
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let token = std::env::var(CF_ANALYTICS_TOKEN_ENV)
         .map_err(|_| stow_error!("missing {CF_ANALYTICS_TOKEN_ENV}"))?;
-    let url = format!("{CF_ANALYTICS_SQL_BASE}/accounts/{account_id}/analytics_engine/sql");
+    let base = std::env::var(CF_ANALYTICS_SQL_BASE_ENV)
+        .unwrap_or_else(|_| CF_ANALYTICS_SQL_BASE.to_owned());
+    let url = format!("{base}/accounts/{account_id}/analytics_engine/sql");
     let mut client = zenwave::client().timeout(CF_ANALYTICS_TIMEOUT);
     let response = client
         .post(&url)
