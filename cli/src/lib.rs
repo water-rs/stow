@@ -49,7 +49,13 @@ mod stats;
 mod supervisor;
 mod verify;
 mod workspace_deps;
+
 use stow_shim as wrapper_shim;
+/// `cargo --unit-graph` reads — the build stage computes its consumable
+/// set from the workspace's own unit graphs (stow#589).
+pub use workspace_deps::{
+    ExpandedDependencyGraph, expanded_dependency_graph, resolve_exact_dependency_graph,
+};
 
 /// The supervisor wire protocol, so a peer decoding frames — a stub
 /// supervisor standing in for the real one in integration tests — uses

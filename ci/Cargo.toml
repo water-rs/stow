@@ -56,5 +56,8 @@ async-net = "2"
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "0.1.9"
 
+[dev-dependencies]
+url = "2"
+
 [lints]
 workspace = true
