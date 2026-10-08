@@ -841,6 +841,26 @@ struct TopMissedRow {
     top_missed: Vec<String>,
 }
 
+/// The `STOW_CF_ANALYTICS_SQL_BASE` override, pinned to loopback: the
+/// request carries `CF_ANALYTICS_TOKEN` in `Authorization`, so a remote
+/// override would hand the token to whoever it names.
+fn loopback_sql_base(base: &str) -> stow_types::error::Result<String> {
+    let parsed = url::Url::parse(base)
+        .map_err(|error| stow_error!("{CF_ANALYTICS_SQL_BASE_ENV} {base:?}: {error}"))?;
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if !loopback {
+        return Err(stow_error!(
+            "{CF_ANALYTICS_SQL_BASE_ENV} must name a loopback host, got {base:?}"
+        ));
+    }
+    Ok(base.trim_end_matches('/').to_owned())
+}
+
 /// Run the top-missed query against the Analytics Engine SQL API.
 /// `CF_ACCOUNT_ID` and `CF_ANALYTICS_TOKEN` (an API token with
 /// `Account Analytics: Read`) are both required.
@@ -849,8 +869,10 @@ async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMisse
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let token = std::env::var(CF_ANALYTICS_TOKEN_ENV)
         .map_err(|_| stow_error!("missing {CF_ANALYTICS_TOKEN_ENV}"))?;
-    let base = std::env::var(CF_ANALYTICS_SQL_BASE_ENV)
-        .unwrap_or_else(|_| CF_ANALYTICS_SQL_BASE.to_owned());
+    let base = match std::env::var(CF_ANALYTICS_SQL_BASE_ENV) {
+        Ok(base) => loopback_sql_base(&base)?,
+        Err(_) => CF_ANALYTICS_SQL_BASE.to_owned(),
+    };
     let url = format!("{base}/accounts/{account_id}/analytics_engine/sql");
     let mut client = zenwave::client().timeout(CF_ANALYTICS_TIMEOUT);
     let response = client
@@ -1224,6 +1246,23 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
 #[cfg(test)]
 mod tests {
     use super::{ci_targets, missed_enqueue_request, top_missed_query};
+
+    #[test]
+    fn analytics_sql_base_override_is_loopback_only() {
+        assert_eq!(
+            super::loopback_sql_base("http://127.0.0.1:9000/").unwrap(),
+            "http://127.0.0.1:9000"
+        );
+        super::loopback_sql_base("http://localhost:1").unwrap();
+        super::loopback_sql_base("http://[::1]:1").unwrap();
+        for remote in [
+            "https://api.cloudflare.com/client/v4",
+            "http://10.0.0.1",
+            "not a url",
+        ] {
+            super::loopback_sql_base(remote).expect_err(remote);
+        }
+    }
     use stow_types::api::EnqueueSource;
     use stow_types::identity::WireRustcVersion;
 
