@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use crate::capture::{
     STOW_BUILD_TARGET_DIR_REMAP_ENV, STOW_BUILD_WRAPPER_CRATE_NAME_ENV, StowCaptureCommand,
 };
 use crate::consume;
+use crate::dep_scan;
 use crate::retry::retry_with_backoff;
 use crate::workspace_mirror;
 use stow_shim as wrapper_shim;
@@ -590,9 +592,24 @@ fn lockfile_packages(
 /// build.
 async fn stage_consumption_store(
     task: &BuildTaskPayload,
+    workspace: &BuildWorkspace,
+    cargo_subcommand: CargoSubcommand,
 ) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
     let store_dir = TempDir::new()?;
-    let staged = match consume::prefetch(task, store_dir.path()).await {
+    let packages = match consumption_packages(task, workspace, cargo_subcommand).await {
+        Ok(packages) => packages,
+        // Consumption is an optimization: a workspace whose unit graph
+        // cannot be read builds exactly as one without a cache.
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task.task_id,
+                %error,
+                "cache consumption unavailable; building without it"
+            );
+            return Ok((None, None));
+        }
+    };
+    let staged = match consume::prefetch(task, packages, store_dir.path()).await {
         Ok(consumption) if consumption.artifacts > 0 => Some(consumption.store_dir),
         Ok(_) => None,
         Err(stow_cli::build_consume::StageFailure::Unavailable(error)) => {
@@ -608,6 +625,46 @@ async fn stage_consumption_store(
     Ok(staged.map_or_else(|| (None, None), |path| (Some(store_dir), Some(path))))
 }
 
+/// The units this build's workspace will compile, read from cargo's own
+/// unit graphs — the consumable set (stow#589). Each graph is computed
+/// with the same argv a phase runs (`cargo_phase_args`, minus the
+/// subcommand, plus `--unit-graph`) under every invocation spelling the
+/// task's phases use — native and `--target` for a host-side task, the
+/// task spelling otherwise — because the spelling changes which units
+/// cargo compiles, on which side, at which feature set.
+///
+/// Scheduler pins name only the task's direct dep edges, and a row's
+/// recorded dep edges reach only lib `--extern`s — the graph covers the
+/// whole resolved closure, build-script deps and transitives included,
+/// at the identities cargo will actually compile them at.
+async fn consumption_packages(
+    task: &BuildTaskPayload,
+    workspace: &BuildWorkspace,
+    cargo_subcommand: CargoSubcommand,
+) -> stow_types::error::Result<Vec<dep_scan::ConsumablePackage>> {
+    let mut entries = Vec::new();
+    for &phase in cargo_phases(cargo_subcommand) {
+        for &invocation in phase_invocations(task) {
+            let phase_args = cargo_phase_args(workspace, task, phase, invocation).await?;
+            let passes_target = invocation_passes_target(task, invocation).await?;
+            let graph = stow_cli::resolve_exact_dependency_graph(
+                workspace.manifest_path(),
+                phase.as_str(),
+                &phase_args[1..]
+                    .iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>(),
+                passes_target.then(|| task.target.as_str()),
+                workspace.workspace_root(),
+                task.rustc_version.as_str(),
+            )
+            .await?;
+            entries.extend(graph.entries);
+        }
+    }
+    Ok(dep_scan::consumable_packages(task, &entries))
+}
+
 pub async fn build(
     task: &BuildTaskPayload,
     output_dir: &Path,
@@ -621,7 +678,9 @@ pub async fn build(
 
     fetch_workspace_dependencies(task, &workspace).await?;
 
-    let (_consume_store_dir, consume_store) = stage_consumption_store(task).await?;
+    let cargo_subcommand = cargo_subcommand()?;
+    let (_consume_store_dir, consume_store) =
+        stage_consumption_store(task, &workspace, cargo_subcommand).await?;
 
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
         .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;
@@ -631,7 +690,6 @@ pub async fn build(
         "stow-ci://workspace"
     );
     let rustflags = merged_rustflags(&remap_flag);
-    let cargo_subcommand = cargo_subcommand()?;
 
     let capture_wrapper = std::env::current_exe().map_err(|error| {
         stow_types::stow_error!("resolve current stow-build executable: {error}")
