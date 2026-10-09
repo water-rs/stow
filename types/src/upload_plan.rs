@@ -12,8 +12,8 @@ use crate::api::ArtifactRecord;
 use crate::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use crate::bundle::ArtifactBundleFile;
 use crate::identity::{
-    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
-    WireRustcVersion,
+    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, DependencyIdentity, FeaturesJson,
+    TargetTriple, WireRustcVersion,
 };
 use crate::platform::Profile;
 
@@ -34,6 +34,8 @@ pub struct PlannedArtifact {
     pub features_json: FeaturesJson,
     /// Sorted dependency identities driving the cache key.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// Build-stage claim of the task's resolved dependency context.
+    pub dependency_identity: DependencyIdentity,
     /// JSON-encoded compile keys of dependencies.
     pub dependency_compile_keys_json: String,
     /// Compilation target triple.
@@ -139,6 +141,7 @@ pub fn build_artifact_records(
             version: plan.crate_version.clone(),
             features_json: plan.features_json.clone(),
             dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
+            dependency_identity: Some(plan.dependency_identity.clone()),
             oci_reference: plan.oci_reference.clone(),
             oci_digest: published.oci_digest.clone(),
             has_native: plan.native.is_some(),

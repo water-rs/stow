@@ -942,6 +942,10 @@ mod tests {
         super::queue::enqueue(
             db,
             &[EnqueueRequest {
+                dependency_subgraph: stow_types::api::TaskSubgraph {
+                    root_deps: Vec::new(),
+                    nodes: Vec::new(),
+                },
                 crate_name: "alpha".parse().expect("alpha crate"),
                 version: "1.0.0".parse().expect("alpha version"),
                 features_json: FeaturesJson::default(),
@@ -949,7 +953,6 @@ mod tests {
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 downloads: 0,
                 source: EnqueueSource::CacheMiss,
-                depends_on: Vec::new(),
                 preserve_lockfile: false,
                 host_side: false,
             }],

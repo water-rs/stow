@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use async_process::Command;
 use cargo_metadata::{Metadata, Package, Target, TargetKind};
 use sha2::Digest as _;
-use stow_types::api::BuildTaskPayload;
+use stow_types::api::{BuildTaskPayload, ResolvedDependencyGraphEntry};
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
 
@@ -176,31 +176,46 @@ pub async fn scan_artifacts(
     })
 }
 
-/// The task's dependency pins as consumption-prefetch candidates —
-/// `(canonical crate name, version, features)` of every dep unit the
-/// task compiles. A pin's feature set is the published identity the
-/// dep's own task was built at, so it is exactly what a correctly
-/// labelled row carries; `cargo metadata`'s platform-agnostic resolve
-/// features are not (stow#579).
-pub fn consumable_packages(task: &BuildTaskPayload) -> Vec<ConsumablePackage> {
-    task.dep_pins
+/// The consumable set: every registry unit this build's own cargo unit
+/// graph compiles, at the per-side feature set cargo activated for it —
+/// the same identities a consumer's build computes, so a dep the build
+/// can compile is always staged and one it cannot is never fetched
+/// (stow#589). The task crate itself is excluded: a re-run after a
+/// successful publish must never consume the artifact the task exists
+/// to produce.
+pub fn consumable_packages(
+    task: &BuildTaskPayload,
+    entries: &[ResolvedDependencyGraphEntry],
+) -> Vec<ConsumablePackage> {
+    entries
         .iter()
-        .map(|pin| ConsumablePackage {
-            crate_name: pin.crate_name.as_str().to_owned(),
-            version: pin.version.as_semver().clone(),
-            features: pin.features_json.features().to_vec().into_iter().collect(),
+        .filter(|entry| {
+            entry.crate_name.as_str() != task.crate_name.as_str()
+                || &entry.version != task.version.as_semver()
+        })
+        .map(|entry| ConsumablePackage {
+            crate_name: entry.crate_name.as_str().to_owned(),
+            version: entry.version.clone(),
+            features: entry.features.iter().cloned().collect(),
+            host_side: entry.host_side,
         })
         .collect()
 }
 
-/// One dependency pin of the task — a consumption-prefetch candidate.
+/// One unit of the build workspace's own unit graph — a
+/// consumption-prefetch candidate.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConsumablePackage {
     /// Canonical package name.
     pub(crate) crate_name: String,
-    /// Pinned package version.
-    pub(crate) version: cargo_metadata::semver::Version,
-    /// The feature set the dep's own task published it under.
+    /// Resolved package version.
+    pub(crate) version: semver::Version,
+    /// The feature set cargo activated for this unit — the identity the
+    /// dep's own task published it under.
     pub(crate) features: BTreeSet<String>,
+    /// Which half of the unit graph the unit compiles on: proc-macros,
+    /// build dependencies and their subtree are host-side.
+    pub(crate) host_side: bool,
 }
 
 /// Re-hash every output of every selected capture — the snapshot when the
@@ -2002,7 +2017,10 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
-            dep_pins: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
         }
     }
 
@@ -2233,4 +2251,153 @@ mod tests {
                 .expect("snapshot bytes match the recorded digest");
         });
     }
+
+    /// stow#589: the consumable set is the build workspace's own cargo
+    /// unit graph — a build-script dep lands host-side and a transitive
+    /// dep of a pinned crate lands target-side, each at the feature set
+    /// cargo activated — while the task crate itself never becomes
+    /// consumable. The fixture is the graph `cargo --unit-graph` emits
+    /// for a native spelling of a target-side task whose manifest pins
+    /// `direct-dep` and build-dep `host-dep`.
+    #[test]
+    fn consumable_packages_follow_the_builds_unit_graph() {
+        // `path+` units' manifests are hashed at parse — the wrapper's
+        // pkg id must name a real manifest, and a spaced directory
+        // exercises the file-URL percent-encoding `path_pkg_root`
+        // decodes.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let project = tempdir.path().join("wrapper workspace");
+        std::fs::create_dir(&project).expect("wrapper dir");
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"stow-ci-wrapper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write wrapper manifest");
+        let wrapper_url = url::Url::from_directory_path(&project).expect("dir url");
+        let wrapper_pkg = format!("path+{wrapper_url}#stow-ci-wrapper@0.0.0");
+        let mut graph_json: serde_json::Value =
+            serde_json::from_str(UNIT_GRAPH_JSON).expect("fixture parses");
+        for index in [0usize, 1] {
+            graph_json["units"][index]["pkg_id"] = serde_json::Value::String(wrapper_pkg.clone());
+        }
+        let graph_json = serde_json::to_vec(&graph_json).expect("serialize fixture");
+        let graph = stow_cli::expanded_dependency_graph(
+            &graph_json,
+            None,
+            "x86_64-unknown-linux-gnu",
+            &stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
+        )
+        .expect("unit graph parses");
+
+        let task = BuildTaskPayload {
+            task_id: "task-crate-1.2.3".to_owned(),
+            attempt: 1,
+            crate_name: stow_types::identity::CrateName::parse("task-crate").unwrap(),
+            version: stow_types::identity::CrateVersion::new(semver::Version::new(1, 2, 3)),
+            features_json: stow_types::identity::FeaturesJson::default(),
+            target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin").unwrap(),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
+            preserve_lockfile: false,
+            host_side: false,
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
+        };
+        let packages = super::consumable_packages(&task, &graph.entries);
+        let found = packages
+            .iter()
+            .map(|package| {
+                (
+                    package.crate_name.as_str(),
+                    package.version.to_string(),
+                    package.features.iter().cloned().collect::<Vec<_>>(),
+                    package.host_side,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            found,
+            BTreeSet::from([
+                (
+                    "direct-dep",
+                    "2.0.0".to_owned(),
+                    vec!["compress".to_owned()],
+                    false
+                ),
+                ("host-dep", "3.1.0".to_owned(), vec![], true),
+                ("transitive-dep", "0.4.0".to_owned(), vec![], false),
+            ]),
+            "the whole closure — build-script deps host-side, transitives target-side — is consumable at activated features"
+        );
+    }
+
+    /// The `cargo --unit-graph` shape a native-spelling phase emits for a
+    /// target-side task: the generated wrapper's lib unit (root) spells
+    /// the task crate as a normal dep and hangs `[build-dependencies]`
+    /// under its own custom-build unit. `@WRAPPER@` fills in the path pkg
+    /// id, which must name a real manifest.
+    const UNIT_GRAPH_JSON: &str = r#"{
+        "version": 1,
+        "units": [
+            {
+                "pkg_id": "@WRAPPER@",
+                "target": {"kind": ["lib"]},
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": [],
+                "dependencies": [
+                    {"index": 1, "extern_crate_name": "stow_ci_wrapper"},
+                    {"index": 2, "extern_crate_name": "task_crate"}
+                ]
+            },
+            {
+                "pkg_id": "@WRAPPER@",
+                "target": {"kind": ["custom-build"]},
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": [],
+                "dependencies": [
+                    {"index": 4, "extern_crate_name": "host_dep"}
+                ]
+            },
+            {
+                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#task-crate@1.2.3",
+                "target": {"kind": ["lib"]},
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": ["std"],
+                "dependencies": [
+                    {"index": 3, "extern_crate_name": "direct_dep"}
+                ]
+            },
+            {
+                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#direct-dep@2.0.0",
+                "target": {"kind": ["lib"]},
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": ["compress"],
+                "dependencies": [
+                    {"index": 5, "extern_crate_name": "transitive_dep"}
+                ]
+            },
+            {
+                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#host-dep@3.1.0",
+                "target": {"kind": ["lib"]},
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": [],
+                "dependencies": []
+            },
+            {
+                "pkg_id": "registry+https://github.com/rust-lang/crates.io-index#transitive-dep@0.4.0",
+                "target": {"kind": ["lib"]},
+                "platform": "aarch64-apple-darwin",
+                "mode": "build",
+                "features": [],
+                "dependencies": []
+            }
+        ],
+        "roots": [0]
+    }"#;
 }

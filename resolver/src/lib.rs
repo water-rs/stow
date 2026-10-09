@@ -25,13 +25,14 @@ pub mod shim;
 mod units;
 
 pub use enqueue::{
-    RequestPlanParts, TaskGraph, TaskNode, enqueue_requests_from_output, enqueue_requests_inner,
-    request_plan_parts,
+    RequestPlanParts, enqueue_requests_from_output, enqueue_requests_inner, request_plan_parts,
+    resolved_task_graph,
 };
 pub use prepare::{
     GitCommit, PreparedSourceTree, RelativeSourcePath, SourcePreparation, project_fetch_ref,
 };
 pub use session::{ResolveOptions, Resolver, SourceResolve};
+pub use stow_types::unit_graph::{TaskGraph, TaskNode};
 pub use units::{
     SpecsAndResolvedFeatures, StowDep, StowResolveOutput, StowSide, StowUnit, StowUnitKey,
     StowUnitKind,

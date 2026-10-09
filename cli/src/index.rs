@@ -447,6 +447,7 @@ mod tests {
 
     fn test_row(c_metadata: &str) -> ArtifactIndexRow {
         ArtifactIndexRow {
+            dependency_identity: None,
             crate_name: CrateName::parse("serde").expect("crate name"),
             version: CrateVersion::new(Version::new(1, 0, 219)),
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])

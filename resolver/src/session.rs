@@ -45,6 +45,7 @@ use crate::units::{StowResolveOutput, StowUnitKind};
 /// Feature set + lockfile inputs for one resolve — the knobs the lanes
 /// carry into `resolve_crate`/`resolve_github_project` today.
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent Cargo switches, not a state machine.
 pub struct ResolveOptions {
     /// Seed features (`-F` flags); empty for the admin lanes.
     pub features: Vec<String>,
@@ -60,6 +61,8 @@ pub struct ResolveOptions {
     /// Contents of the root `Cargo.lock` the caller dropped — yanked
     /// admission + git pins. `None` when the tree never had a lockfile.
     pub dropped_lockfile: Option<String>,
+    /// Keep a published crate's bundled lockfile for an operator submit.
+    pub preserve_lockfile: bool,
 }
 
 /// What an admin resolve lane learns about the source: publish-shape
@@ -125,7 +128,13 @@ impl Resolver {
         let dir = tempfile::tempdir().context("resolver scratch dir")?;
         let cargo_home = dir.path().join("cargo-home");
         std::fs::create_dir_all(&cargo_home).context("cargo home")?;
-        Self::setup(dir, cargo_home, rustc_version, shim_source)
+        Self::setup(
+            dir,
+            cargo_home,
+            rustc_version.as_str(),
+            rustc_version,
+            shim_source,
+        )
     }
 
     /// A session whose `CARGO_HOME` is a caller-owned directory — still
@@ -145,12 +154,42 @@ impl Resolver {
     ) -> CargoResult<Self> {
         std::fs::create_dir_all(&cargo_home).context("cargo home")?;
         let dir = tempfile::tempdir().context("resolver scratch dir")?;
-        Self::setup(dir, cargo_home, rustc_version, shim_source)
+        Self::setup(
+            dir,
+            cargo_home,
+            rustc_version.as_str(),
+            rustc_version,
+            shim_source,
+        )
+    }
+
+    /// Like [`Resolver::with_cargo_home`], but the toolchain is probed
+    /// under `toolchain`, a rustup name that need not equal the pinned
+    /// version — e.g. the name of the toolchain actually running the
+    /// caller (`RUSTUP_TOOLCHAIN`, or `rustup show active-toolchain`)
+    /// when that toolchain's rustc *is* the pinned release. The probed
+    /// rustc's release is still verified against `rustc_version`, so a
+    /// name resolving to a different compiler is refused. Production
+    /// callers keep [`Resolver::new`]/[`Resolver::with_cargo_home`],
+    /// which resolve the toolchain by the pinned version itself.
+    ///
+    /// # Errors
+    /// As [`Resolver::with_cargo_home`].
+    pub fn with_cargo_home_and_toolchain(
+        cargo_home: PathBuf,
+        toolchain: &str,
+        rustc_version: &WireRustcVersion,
+        shim_source: PathBuf,
+    ) -> CargoResult<Self> {
+        std::fs::create_dir_all(&cargo_home).context("cargo home")?;
+        let dir = tempfile::tempdir().context("resolver scratch dir")?;
+        Self::setup(dir, cargo_home, toolchain, rustc_version, shim_source)
     }
 
     fn setup(
         dir: tempfile::TempDir,
         cargo_home: PathBuf,
+        toolchain: &str,
         rustc_version: &WireRustcVersion,
         shim_source: PathBuf,
     ) -> CargoResult<Self> {
@@ -159,7 +198,7 @@ impl Resolver {
         // --toolchain` resolves that toolchain's real binary, and
         // `RUSTUP_AUTO_INSTALL=0` keeps an absent toolchain a failure
         // instead of a download.
-        let requested = rustc_version.as_str();
+        let requested = toolchain;
         let output = std::process::Command::new("rustup")
             .args(["which", "--toolchain", requested, "rustc"])
             .env("RUSTUP_AUTO_INSTALL", "0")
@@ -202,10 +241,11 @@ impl Resolver {
         // custom-linked toolchain or a stale rustup dir that reports
         // anything else gives the tasks facts from a different compiler.
         anyhow::ensure!(
-            release == requested,
+            release == rustc_version.as_str(),
             "rustc `{requested}` resolves to {} reporting release {release} — \
-             the toolchain's release must equal the pinned version",
-            rustc.display()
+             the toolchain's release must equal the pinned version {}",
+            rustc.display(),
+            rustc_version.as_str()
         );
         let version = semver::Version::parse(release)
             .with_context(|| format!("rustc release `{release}` is not semver"))?;
@@ -350,8 +390,22 @@ impl Resolver {
         opts: &ResolveOptions,
         targets: &[String],
     ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
+        // `default` inside the feature list is the lanes' spelling of
+        // "the package's default feature set", which
+        // `uses_default_features` already carries — the callers derive
+        // `no_default_features` from its absence. Cargo's `-F` grammar
+        // has no implicit `default` to activate: it accepts the name
+        // only when the manifest declares it, so passing the literal
+        // through rejects a feature-less package that cargo itself
+        // accepts (`TASK_FEATURES='["default"]'` over `itoa`).
+        let features: Vec<String> = opts
+            .features
+            .iter()
+            .filter(|feature| feature.as_str() != "default")
+            .cloned()
+            .collect();
         let cli_features = CliFeatures::from_command_line(
-            &opts.features,
+            &features,
             opts.all_features,
             !opts.no_default_features,
         )?;
@@ -451,7 +505,7 @@ impl Resolver {
         let outputs = self
             .resolve_crate_units(crate_name, version, &ResolveOptions::default(), targets)
             .await?;
-        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
+        Self::source_resolve(&outputs, rustc_version, downloads)
     }
 
     /// Resolve one published `.crate` into its raw per-target unit
@@ -501,7 +555,7 @@ impl Resolver {
         opts: &ResolveOptions,
         targets: &[String],
     ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
-        let tree = crate::fetch::prepare_project_tree(package_dir, true)?;
+        let tree = crate::fetch::prepare_project_tree(package_dir, !opts.preserve_lockfile)?;
         let opts = ResolveOptions {
             members_are_crates_io: true,
             dropped_lockfile: tree.dropped_lockfile,
@@ -561,7 +615,7 @@ impl Resolver {
             ..ResolveOptions::default()
         };
         let outputs = self.resolve(&tree.manifest_path, &opts, targets)?;
-        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
+        Self::source_resolve(&outputs, rustc_version, downloads)
     }
 
     /// The admin local-dirs lane: a project tree already on disk. Its
@@ -587,7 +641,7 @@ impl Resolver {
             ..ResolveOptions::default()
         };
         let outputs = self.resolve(&tree.manifest_path, &opts, targets)?;
-        Ok(Self::source_resolve(&outputs, rustc_version, downloads))
+        Self::source_resolve(&outputs, rustc_version, downloads)
     }
 
     /// `source_resolve` parity: per-target unit outputs → per-target
@@ -596,7 +650,7 @@ impl Resolver {
         outputs: &[(String, StowResolveOutput)],
         rustc_version: &WireRustcVersion,
         downloads: u64,
-    ) -> SourceResolve {
+    ) -> CargoResult<SourceResolve> {
         let mut has_binary = false;
         let mut has_library = false;
         let mut batches = Vec::with_capacity(outputs.len());
@@ -610,15 +664,14 @@ impl Resolver {
                 rustc_version,
                 EnqueueSource::CrateUpdate,
                 downloads,
-            )
-            .expect("emit_units emits well-formed units");
+            )?;
             batches.push((target.clone(), requests));
         }
-        SourceResolve {
+        Ok(SourceResolve {
             has_binary,
             has_library,
             targets: batches,
-        }
+        })
     }
 }
 

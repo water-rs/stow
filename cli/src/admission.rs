@@ -388,7 +388,10 @@ mod tests {
             rustc_version: "1.92.0".parse().expect("rustc"),
             downloads: 0,
             source: EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             preserve_lockfile: false,
             host_side: false,
         }
@@ -413,7 +416,10 @@ mod tests {
 
     #[test]
     fn solver_finds_nonce_at_difficulty_eight() {
-        let admission = test_admission("serde-1.0.0-deadbeef-x86_64_unknown_linux_gnu-1_92_0", 8);
+        let admission = test_admission(
+            "serde-1.0.0-deadbeef-x86_64_unknown_linux_gnu-1_92_0-d0123ab5",
+            8,
+        );
         let budget = full_budget();
         let nonce = solve_nonce(&admission, &budget, &running()).expect("nonce found within bound");
         assert!(

@@ -320,6 +320,10 @@ Required GitHub Actions secrets:
   token against it.
 - `CF_ANALYTICS_TOKEN` → Worker `CF_ANALYTICS_TOKEN` — the
   Analytics-Engine-read API token `GET /api/v1/stats` queries with.
+- `STOW_GITHUB_WEBHOOK_SECRET` → Worker `STOW_GITHUB_WEBHOOK_SECRET` —
+  the HMAC key of the repository's `workflow_run` webhook (see GitHub
+  webhook below); the repository secret and the webhook's secret hold
+  the same value.
 
 Deploying by hand (with the same environment variables exported) is
 equivalent:

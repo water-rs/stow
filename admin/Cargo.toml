@@ -54,6 +54,9 @@ bytes = "1"
 # The demand-feed transport mock serves the same maintained axum the
 # mock-registry already pins (stow#523).
 axum = "0.8"
+# The workflow-entrypoint harness parses the real Actions YAML (stow#593);
+# serde_yml is the maintained serde_yaml successor (serde_yaml is archived).
+serde_yml = "0.0.12"
 
 [lints]
 workspace = true

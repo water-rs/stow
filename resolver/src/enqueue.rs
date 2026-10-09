@@ -11,243 +11,90 @@
 //! interior — they happen inside the owning lib's task and mint no task
 //! of their own.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
-use anyhow::Context as _;
 use cargo::CargoResult;
-use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource};
-use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
+use stow_types::api::{EnqueueRequest, EnqueueSource};
+use stow_types::identity::WireRustcVersion;
+use stow_types::task_graph::ResolvedTaskGraph;
+use stow_types::unit_graph::{TaskUnit, TaskUnitDep, TaskUnitKey, TaskUnitKind, TaskUnitSide};
 
 use crate::units::{StowSide, StowUnit, StowUnitKind};
 
-/// A node in the per-platform task graph — the task's identity minus
-/// `rustc_version` (shared by the wave).
-///
-/// Crate, version, resolved feature set, the triple the unit compiles
-/// on, and the cargo side the unit lives on. Host-side units
-/// (proc-macros, build dependencies) key at the runner family's host
-/// triple, not the consumer's target — and carry `host_side` so they
-/// stay distinct from a target-side node at the same triple.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TaskNode {
-    /// Crate name.
-    pub crate_name: CrateName,
-    /// Crate version.
-    pub version: CrateVersion,
-    /// Canonical features JSON (sorted array).
-    pub features_json: String,
-    /// Compilation target triple the unit keys on.
-    pub target: String,
-    /// Whether the unit lives on the host side of the build graph.
-    pub host_side: bool,
-}
-
-/// The lib-unit graph the wave machinery works on: every task node and
-/// its task-level dependency edges.
-pub type TaskGraph = (BTreeSet<TaskNode>, BTreeMap<TaskNode, BTreeSet<TaskNode>>);
-
-/// Serialize a feature set into the canonical JSON the wire carries —
-/// a sorted array. `serde_json` has no Set impl with ordering, so sort
-/// explicitly.
-///
-/// # Errors
-/// A `BTreeSet<String>` cannot fail to serialize; `CargoResult` keeps
-/// the call chain uniform.
-pub fn serialize_feature_set(features: &BTreeSet<String>) -> CargoResult<String> {
-    let sorted: Vec<&String> = features.iter().collect();
-    serde_json::to_string(&sorted).map_err(anyhow::Error::from)
-}
-
-/// Decode a canonical features JSON string back into the typed form.
-fn features_json(raw: &str) -> FeaturesJson {
-    let features: Vec<String> = serde_json::from_str(raw).expect("canonical features json");
-    FeaturesJson::from_sorted(features).expect("serialize_feature_set sorted")
-}
-
-/// The lib-unit graph the wave machinery works on: every task node and
-/// its task-level dependency edges.
-///
-/// # Errors
-/// A unit whose feature set cannot serialize.
-pub fn task_graph(units: &[StowUnit]) -> CargoResult<TaskGraph> {
-    // Index once — dep and build-script lookups used to re-scan `units`
-    // inside per-unit loops, which is quadratic on a zed-sized resolve.
-    let mut libs: HashMap<(&str, &str, &str, StowSide), &StowUnit> =
-        HashMap::with_capacity(units.len());
-    let mut scripts: HashMap<(&str, &str, &[String]), &StowUnit> =
-        HashMap::with_capacity(units.len());
-    for unit in units {
-        match unit.key.kind {
-            StowUnitKind::Lib => {
-                libs.entry((
-                    unit.name.as_str(),
-                    unit.version.as_str(),
-                    unit.key.platform.as_str(),
-                    unit.key.side,
-                ))
-                .or_insert(unit);
-            }
-            StowUnitKind::BuildScript => {
-                scripts
-                    .entry((unit.name.as_str(), unit.version.as_str(), &unit.features))
-                    .or_insert(unit);
-            }
-            StowUnitKind::RunBuildScript => {}
-        }
-    }
-    let by_key = |name: &str, version: &str, platform: &str, side| {
-        libs.get(&(name, version, platform, side)).copied()
-    };
-    let node_of = |unit: &StowUnit| -> CargoResult<TaskNode> {
-        Ok(TaskNode {
-            crate_name: CrateName::parse(unit.name.clone()).map_err(anyhow::Error::from)?,
-            version: CrateVersion::new(
-                semver::Version::parse(&unit.version).context("resolver emits semver versions")?,
-            ),
-            features_json: serialize_feature_set(
-                &unit.features.iter().cloned().collect::<BTreeSet<_>>(),
-            )?,
-            target: unit.key.platform.clone(),
-            host_side: unit.key.side == StowSide::Host,
-        })
-    };
-    // One unit's direct lib edges: its normal-dep libs plus the build-dep
-    // libs its build-script compile unit links (dedup'd by feature set as
-    // `emit_units` produced it).
-    let raw_deps = |unit: &StowUnit| -> Vec<&StowUnit> {
-        let mut direct: Vec<&StowUnit> = unit
+/// The lean unit model the shared projection reads — `stow-resolver`'s
+/// cargo-typed [`StowUnit`] converted once at the boundary so
+/// `stow-build`'s real `--unit-graph` resolves project onto the same
+/// task identities (stow#588).
+fn lean_unit(unit: &StowUnit) -> TaskUnit {
+    TaskUnit {
+        key: lean_key(&unit.key),
+        name: unit.name.clone(),
+        version: unit.version.clone(),
+        features: unit.features.clone(),
+        is_crates_io: unit.is_crates_io,
+        deps: unit
             .deps
             .iter()
-            .filter(|dep| dep.key.kind == StowUnitKind::Lib)
-            .filter_map(|dep| by_key(&dep.name, &dep.version, &dep.key.platform, dep.key.side))
-            .collect();
-        let compile = scripts.get(&(&unit.name, &unit.version, &unit.features));
-        if let Some(compile) = compile {
-            direct.extend(
-                compile
-                    .deps
-                    .iter()
-                    .filter(|dep| dep.key.kind == StowUnitKind::Lib)
-                    .filter_map(|dep| {
-                        by_key(&dep.name, &dep.version, &dep.key.platform, dep.key.side)
-                    }),
-            );
-        }
-        direct
-    };
-    let mut nodes = BTreeSet::new();
-    let mut edges = BTreeMap::<TaskNode, BTreeSet<TaskNode>>::new();
-    for unit in units {
-        if unit.key.kind != StowUnitKind::Lib || !unit.is_crates_io {
-            continue;
-        }
-        let node = node_of(unit)?;
-        nodes.insert(node.clone());
-        let entry = edges.entry(node.clone()).or_default();
-        // Non-crates.io units (project members, path deps, git packages)
-        // carry the resolve's edges but mint no task — a project's own
-        // crates are the way into the crates.io graph. Walk through them
-        // so a node's deps are the crates.io libs on the far side.
-        let mut seen = BTreeSet::new();
-        let mut stack = raw_deps(unit);
-        while let Some(dep_unit) = stack.pop() {
-            if !seen.insert(&dep_unit.key) {
-                continue;
-            }
-            if dep_unit.is_crates_io {
-                entry.insert(node_of(dep_unit)?);
-            } else {
-                stack.extend(raw_deps(dep_unit));
-            }
-        }
-        entry.remove(&node);
+            .map(|dep| TaskUnitDep {
+                key: lean_key(&dep.key),
+                name: dep.name.clone(),
+                version: dep.version.clone(),
+            })
+            .collect(),
     }
-    for (node, shadows) in dedup_shadow_edges(units, raw_deps, by_key, node_of)? {
-        edges.entry(node).or_default().extend(shadows);
-    }
-    Ok((nodes, edges))
 }
 
-/// Mirror the consumer's shared-dep dedup inside the task's own
-/// resolve: a lib reachable through host-side edges that also has a
-/// target-side unit resolves to the deduped unit in a consumer's
-/// build, so the task carries the target unit as a normal dep edge —
-/// the wrapper then pins it under `[dependencies]` at the target
-/// unit's feature set, which is the identity a consumer computes.
-/// Without the pin the wrapper resolves the host subtree alone and
-/// the task publishes dep identities no consumer links (stow#506).
-fn dedup_shadow_edges<'u>(
-    units: &'u [StowUnit],
-    raw_deps: impl Fn(&'u StowUnit) -> Vec<&'u StowUnit>,
-    by_key: impl Fn(&str, &str, &str, StowSide) -> Option<&'u StowUnit>,
-    node_of: impl Fn(&StowUnit) -> CargoResult<TaskNode>,
-) -> CargoResult<BTreeMap<TaskNode, BTreeSet<TaskNode>>> {
-    let mut extra_edges = BTreeMap::<TaskNode, BTreeSet<TaskNode>>::new();
-    for unit in units {
-        if unit.key.kind != StowUnitKind::Lib || !unit.is_crates_io {
-            continue;
-        }
-        let node = node_of(unit)?;
-        let mut seen = BTreeSet::new();
-        seen.insert(&unit.key);
-        let mut stack: Vec<&StowUnit> = raw_deps(unit)
-            .into_iter()
-            .filter(|dep| dep.key.side == StowSide::Host)
-            .collect();
-        let mut shadows = BTreeSet::new();
-        while let Some(dep_unit) = stack.pop() {
-            if !seen.insert(&dep_unit.key) {
-                continue;
-            }
-            if dep_unit.is_crates_io
-                && let Some(target) = by_key(
-                    &dep_unit.name,
-                    &dep_unit.version,
-                    &dep_unit.key.platform,
-                    StowSide::Target,
-                )
-                && target.is_crates_io
-            {
-                shadows.insert(node_of(target)?);
-            }
-            stack.extend(
-                raw_deps(dep_unit)
-                    .into_iter()
-                    .filter(|dep| dep.key.side == StowSide::Host),
-            );
-        }
-        shadows.remove(&node);
-        extra_edges.entry(node).or_default().extend(shadows);
+fn lean_key(key: &crate::units::StowUnitKey) -> TaskUnitKey {
+    TaskUnitKey {
+        // `PackageIdSpec`'s Display carries the package's source url
+        // (cargo fills `url` from `source_id` in `PackageId::to_spec`),
+        // so the key is the full cargo package id, source included.
+        pkg: key.pkg.to_string(),
+        platform: key.platform.clone(),
+        side: match key.side {
+            StowSide::Target => TaskUnitSide::Target,
+            StowSide::Host => TaskUnitSide::Host,
+            StowSide::Artifact => TaskUnitSide::Artifact,
+        },
+        kind: match key.kind {
+            StowUnitKind::Lib => TaskUnitKind::Lib,
+            StowUnitKind::BuildScript => TaskUnitKind::BuildScript,
+            StowUnitKind::RunBuildScript => TaskUnitKind::RunBuildScript,
+        },
     }
-    Ok(extra_edges)
 }
 
-/// A unit's canonical features JSON — the root task key's feature
-/// payload when `request_plan_parts` locates the root's lib unit.
-fn unit_features(units: &[StowUnit], key: &crate::units::StowUnitKey) -> Option<String> {
-    let unit = units.iter().find(|unit| &unit.key == key)?;
-    serialize_feature_set(&unit.features.iter().cloned().collect::<BTreeSet<_>>()).ok()
-}
-
-/// The enqueue-free half of the request lane's plan.
+/// The Merkle task identity of one resolve's unit graph (stow#588) —
+/// the shared projection in `stow-types` run over this resolve's
+/// converted units.
 ///
-/// The task graph plus the root task's key, target triple, and cargo
-/// side. The root is the requested crate's lib unit; when the only lib
-/// root is a proc-macro the lib lives on the host side, so its task
-/// keys on the runner family's host triple.
+/// # Errors
+/// As [`stow_types::unit_graph::resolved_task_graph`].
+pub fn resolved_task_graph(
+    units: &[StowUnit],
+    rustc_version: &WireRustcVersion,
+) -> CargoResult<ResolvedTaskGraph> {
+    let lean: Vec<TaskUnit> = units.iter().map(lean_unit).collect();
+    stow_types::unit_graph::resolved_task_graph(&lean, rustc_version)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// One target's resolved graph and the request's library root.
+///
+/// The root is the requested crate's lib unit; when the
+/// only lib root is a proc-macro the lib lives on the host side, so its
+/// task keys on the runner family's host triple.
 #[derive(Debug)]
 pub struct RequestPlanParts {
-    /// Every task node in the resolved closure.
-    pub nodes: BTreeSet<TaskNode>,
-    /// Task-level dependency edges between nodes.
-    pub edges: BTreeMap<TaskNode, BTreeSet<TaskNode>>,
-    /// The requested crate's lib-unit task key, at the platform its
-    /// `roots` entry carries.
-    pub root_key: Option<TaskNode>,
-    /// `root_key`'s triple, or the requested target when there is no lib
-    /// root.
+    /// The resolve's task graph with Merkle identities (stow#588).
+    pub graph: ResolvedTaskGraph,
+    /// The requested crate's lib-unit task id — `None` for a
+    /// binary-only root, which legitimately mints no lib task.
+    pub root_task_id: Option<String>,
+    /// The root unit's platform, or the requested target when there is
+    /// no lib root.
     pub root_target: String,
-    /// `root_key`'s cargo side — true only for a proc-macro root, whose
+    /// The root's cargo side — true only for a proc-macro root, whose
     /// lib unit lives on the host side of its own resolve.
     pub root_host_side: bool,
 }
@@ -255,115 +102,120 @@ pub struct RequestPlanParts {
 /// Assemble [`RequestPlanParts`] from one target's resolve output.
 ///
 /// # Errors
-/// [`task_graph`] failures — malformed units.
+/// As [`resolved_task_graph`], plus a declared lib root whose complete
+/// [`crate::units::StowUnitKey`] finds no unit or whose unit minted no
+/// node.
 pub fn request_plan_parts(
     units: &[StowUnit],
     roots: &[crate::units::StowUnitKey],
-    crate_name: &str,
-    version: &semver::Version,
     target: &str,
+    rustc_version: &WireRustcVersion,
 ) -> CargoResult<RequestPlanParts> {
-    let (nodes, edges) = task_graph(units)?;
-    let root_key = roots
-        .iter()
-        .find(|key| key.kind == StowUnitKind::Lib)
+    let graph = resolved_task_graph(units, rustc_version)?;
+    let root_key = roots.iter().find(|key| key.kind == StowUnitKind::Lib);
+    let root_task_id = root_key
         .map(|key| {
-            Ok::<_, anyhow::Error>(TaskNode {
-                crate_name: CrateName::parse(crate_name)?,
-                version: CrateVersion::new(version.clone()),
-                features_json: unit_features(units, key).unwrap_or_default(),
-                target: key.platform.clone(),
-                host_side: key.side == StowSide::Host,
-            })
+            let unit = units.iter().find(|unit| &unit.key == key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "declared lib root {} ({}, {:?}) has no unit in this resolve",
+                    key.pkg,
+                    key.platform,
+                    key.side,
+                )
+            })?;
+            let node = stow_types::unit_graph::task_node(&lean_unit(unit))
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let identity = stow_types::unit_graph::task_identity(&node, rustc_version)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let index = graph
+                .nodes()
+                .iter()
+                .position(|resolved| resolved.identity == identity)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "root unit {} {} minted no task node in this resolve",
+                        unit.name,
+                        unit.version,
+                    )
+                })?;
+            graph
+                .task_id(index)
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("resolved node {index} has no task id"))
         })
         .transpose()?;
-    let (root_target, root_host_side) = root_key.as_ref().map_or_else(
+    let (root_target, root_host_side) = root_key.map_or_else(
         || (target.to_owned(), false),
-        |key| (key.target.clone(), key.host_side),
+        |key| (key.platform.clone(), key.side == StowSide::Host),
     );
     Ok(RequestPlanParts {
-        nodes,
-        edges,
-        root_key,
+        graph,
+        root_task_id,
         root_target,
         root_host_side,
     })
 }
 
-/// Assemble the enqueue batch for a resolve output: `(requests, nodes)`.
+/// Assemble the enqueue batch for one resolve output: `(requests,
+/// uncovered task ids)`.
 ///
 /// # Errors
-/// As [`task_graph`].
+/// As [`resolved_task_graph`].
 pub fn enqueue_requests_from_output(
     units: &[StowUnit],
     rustc_version: &WireRustcVersion,
     source: EnqueueSource,
     downloads: u64,
-) -> CargoResult<(Vec<EnqueueRequest>, BTreeSet<TaskNode>)> {
-    let (nodes, edges) = task_graph(units)?;
-    Ok(enqueue_requests_inner(
-        &nodes,
-        &edges,
-        &BTreeSet::new(),
-        rustc_version,
-        source,
-        downloads,
-    ))
+) -> CargoResult<(Vec<EnqueueRequest>, BTreeSet<String>)> {
+    let graph = resolved_task_graph(units, rustc_version)?;
+    enqueue_requests_inner(&graph, &BTreeSet::new(), source, downloads)
 }
 
-/// Emit one [`EnqueueRequest`] per uncovered node.
+/// Emit requests for graph nodes absent from contextual coverage.
 ///
-/// `depends_on` carries the node's own task deps — the lib units its
-/// build links — so a dependent dispatches only once its dependencies
-/// are servable, which is the queue gate's release signal. Each dep
-/// names the dep's own platform: the runner family's host triple for
-/// host-side units.
+/// Coverage matching is exact contextual identity — the node's
+/// Merkle task id — so a row published under a different dependency
+/// context never counts as covering.
 ///
-/// # Panics
-/// The resolver only emits CI triples and runner-family hosts, which
-/// always parse.
-#[must_use]
+/// `depends_on` carries each child's own fields plus the digest the
+/// graph computed for it, so the queue gate releases on the exact
+/// published context rather than a bare tuple. Each dep names the dep's
+/// own platform: the runner family's host triple for host-side units.
+///
+/// # Errors
+/// A `resolve`d graph is complete by construction; `CargoResult` keeps
+/// the call chain uniform.
 pub fn enqueue_requests_inner(
-    nodes: &BTreeSet<TaskNode>,
-    edges: &BTreeMap<TaskNode, BTreeSet<TaskNode>>,
-    covered: &BTreeSet<TaskNode>,
-    rustc_version: &WireRustcVersion,
+    graph: &ResolvedTaskGraph,
+    covered_ids: &BTreeSet<String>,
     source: EnqueueSource,
     downloads: u64,
-) -> (Vec<EnqueueRequest>, BTreeSet<TaskNode>) {
-    let uncovered: BTreeSet<TaskNode> = nodes
-        .iter()
-        .filter(|n| !covered.contains(*n))
-        .cloned()
-        .collect();
+) -> CargoResult<(Vec<EnqueueRequest>, BTreeSet<String>)> {
     let mut requests = Vec::new();
-    for node in &uncovered {
-        let depends_on = edges
-            .get(node)
-            .into_iter()
-            .flatten()
-            .map(|dep| EnqueueDependency {
-                crate_name: dep.crate_name.clone(),
-                version: dep.version.clone(),
-                features_json: features_json(&dep.features_json),
-                target: TargetTriple::parse(&dep.target)
-                    .expect("resolver emits CI or host triples"),
-                rustc_version: rustc_version.clone(),
-                host_side: dep.host_side,
-            })
-            .collect::<Vec<_>>();
+    let mut uncovered = BTreeSet::new();
+    for (index, node) in graph.nodes().iter().enumerate() {
+        let task_id = graph
+            .task_id(index)
+            .ok_or_else(|| anyhow::anyhow!("resolved node {index} has no task id"))?;
+        if covered_ids.contains(task_id) {
+            continue;
+        }
+        uncovered.insert(task_id.to_owned());
+        // `depends_on` and `dependency_identity` derive from the carried
+        // subgraph — the request's single context source (stow#588).
         requests.push(EnqueueRequest {
-            crate_name: node.crate_name.clone(),
-            version: node.version.clone(),
-            features_json: features_json(&node.features_json),
-            target: TargetTriple::parse(&node.target).expect("resolver emits CI or host triples"),
-            rustc_version: rustc_version.clone(),
+            crate_name: node.identity.crate_name.clone(),
+            version: node.identity.version.clone(),
+            features_json: node.identity.features_json.clone(),
+            target: node.identity.target.clone(),
+            rustc_version: node.identity.rustc_version.clone(),
             downloads,
             source,
-            depends_on,
+            dependency_subgraph: stow_types::api::TaskSubgraph::from_resolved(graph, index)
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
             preserve_lockfile: false,
-            host_side: node.host_side,
+            host_side: node.identity.host_side,
         });
     }
-    (requests, uncovered)
+    Ok((requests, uncovered))
 }

@@ -36,7 +36,8 @@ impl MissPath {
 /// One cache miss — one Analytics Engine data point.
 ///
 /// The blob tuple is fixed-width — `(event, crate_name, version,
-/// features_json, target, rustc_version, kind, path, depends_on_json)`
+/// features_json, target, rustc_version, kind, path, depends_on_json,
+/// dependency_identity, host_side, task_id)`
 /// — and a slot a surface cannot observe stays empty rather than
 /// shifting positions.
 #[derive(Debug)]
@@ -53,6 +54,12 @@ pub struct Miss {
     /// re-mints `depends_on` from (stow#317). Empty when the lookup
     /// surface never saw the graph.
     depends_on_json: String,
+    dependency_identity: String,
+    host_side: bool,
+    /// The missed unit's full contextual task id — `preheat missed`
+    /// promotes by id through the submit-by-id route (stow#588). Empty
+    /// when the lookup surface never re-derived one.
+    task_id: String,
 }
 
 impl Miss {
@@ -66,14 +73,24 @@ impl Miss {
             rustc_version: request.rustc_version.as_str().to_owned(),
             kind: String::new(),
             path: MissPath::Graph,
-            depends_on_json: serde_json::to_string(&request.depends_on).unwrap_or_default(),
+            depends_on_json: serde_json::to_string(
+                &request.depends_on().expect("subgraph resolves"),
+            )
+            .expect("enqueue dependencies serialize"),
+            dependency_identity: request
+                .dependency_identity()
+                .expect("derived digest")
+                .to_string(),
+            host_side: request.host_side,
+            task_id: request.task_id().expect("derived task id"),
         }
     }
 
     /// The data point's blob tuple, in the dataset's column order:
     /// `(event, crate_name, version, features_json, target,
-    /// rustc_version, kind, path, depends_on_json)`.
-    pub fn blobs(&self) -> [&str; 9] {
+    /// rustc_version, kind, path, depends_on_json, dependency_identity,
+    /// host_side, task_id)`.
+    pub fn blobs(&self) -> [&str; 12] {
         [
             MISS_EVENT,
             &self.crate_name,
@@ -84,6 +101,9 @@ impl Miss {
             &self.kind,
             self.path.as_str(),
             &self.depends_on_json,
+            &self.dependency_identity,
+            if self.host_side { "true" } else { "false" },
+            &self.task_id,
         ]
     }
 
@@ -139,7 +159,7 @@ impl MissLog for skyzen_cloudflare::worker::AnalyticsEngineDataset {
 #[derive(Debug, Default)]
 pub struct RecordingMissLog {
     /// One rendered blob tuple per `write_miss` call.
-    pub points: std::sync::Mutex<Vec<[String; 9]>>,
+    pub points: std::sync::Mutex<Vec<[String; 12]>>,
 }
 
 #[cfg(test)]
@@ -175,7 +195,10 @@ mod tests {
             rustc_version: RUSTC.parse().expect("rustc"),
             downloads: 0,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             preserve_lockfile: false,
             host_side: false,
         }
@@ -185,7 +208,8 @@ mod tests {
     /// request carries no artifact kind, so the slot stays empty.
     #[test]
     fn graph_miss_point_shape() {
-        let miss = Miss::graph(&enqueue_request());
+        let request = enqueue_request();
+        let miss = Miss::graph(&request);
         assert_eq!(
             miss.blobs(),
             [
@@ -197,7 +221,10 @@ mod tests {
                 "1.85.0",
                 "",
                 "graph",
-                "[]"
+                "[]",
+                request.dependency_identity().expect("digest").as_str(),
+                "false",
+                request.task_id().expect("task id").as_str(),
             ]
         );
     }
@@ -207,20 +234,22 @@ mod tests {
     #[test]
     fn graph_miss_carries_dep_edges() {
         let mut request = enqueue_request();
-        request.depends_on = vec![stow_types::api::EnqueueDependency {
-            crate_name: CrateName::parse("syn").expect("dep name"),
-            version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
-            features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
-                .expect("dep features"),
-            target: TARGET.parse().expect("dep target"),
-            rustc_version: RUSTC.parse().expect("dep rustc"),
-            host_side: false,
-        }];
+        request.dependency_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: CrateName::parse("syn").expect("dep name"),
+                version: CrateVersion::new(semver::Version::parse("3.0.6").expect("dep version")),
+                features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
+                    .expect("dep features"),
+                host_side: false,
+                deps: Vec::new(),
+            }],
+        };
         let miss = Miss::graph(&request);
         let blobs = miss.blobs();
         let deps: Vec<stow_types::api::EnqueueDependency> =
             serde_json::from_str(blobs[8]).expect("depends_on blob parses");
-        assert_eq!(deps, request.depends_on);
+        assert_eq!(deps, request.depends_on().expect("deps"));
     }
 
     #[test]

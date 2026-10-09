@@ -833,7 +833,11 @@ async fn read_prev_sidecar(
 /// column existed) reports as shapeless and covers nothing. A measured
 /// row above the sysroot's glibc floor publishes in the index but a
 /// baseline host cannot load it, so it releases no dependent — the same
-/// rule the catalog's coverage oracle applies (stow#336).
+/// rule the catalog's coverage oracle applies (stow#336). A row carrying
+/// no dependency digest (every archive row registered before stow#588)
+/// satisfies no contextual coverage clause either, so it is not slice
+/// membership: filtered here, on the index side, it can also never
+/// appear in a delta's added or retired set.
 fn semantic_rows(index: &ArtifactIndex) -> Vec<PublishedSliceRow> {
     let mut seen = std::collections::BTreeSet::new();
     index
@@ -843,17 +847,21 @@ fn semantic_rows(index: &ArtifactIndex) -> Vec<PublishedSliceRow> {
             row.min_glibc
                 .is_none_or(|floor| floor <= stow_types::glibc::GLIBC_BASELINE)
         })
-        .map(|row| PublishedSliceRow {
-            crate_name: row.crate_name.clone(),
-            version: row.version.clone(),
-            features_json: row.features_json.clone(),
-            unit_shape: row.unit_shape,
+        .filter_map(|row| {
+            Some(PublishedSliceRow {
+                crate_name: row.crate_name.clone(),
+                version: row.version.clone(),
+                features_json: row.features_json.clone(),
+                unit_shape: row.unit_shape,
+                dependency_identity: row.dependency_identity.clone()?,
+            })
         })
         .filter(|row| {
             seen.insert((
                 row.crate_name.as_str().to_owned(),
                 row.version.to_string(),
                 row.features_json.raw(),
+                row.dependency_identity.clone(),
                 row.unit_shape,
             ))
         })
@@ -868,12 +876,14 @@ fn row_key(
     String,
     String,
     String,
+    stow_types::identity::DependencyIdentity,
     Option<stow_types::public_cache::UnitShape>,
 ) {
     (
         row.crate_name.as_str().to_owned(),
         row.version.to_string(),
         row.features_json.raw(),
+        row.dependency_identity.clone(),
         row.unit_shape,
     )
 }
@@ -1154,6 +1164,9 @@ mod tests {
     fn record(task_id: &str) -> ArtifactRecord {
         let c_metadata = CMetadata::parse(task_id).expect("c_metadata");
         ArtifactRecord {
+            dependency_identity: Some(
+                stow_types::identity::DependencyIdentity::leaf().expect("fixture leaf"),
+            ),
             compile_key: format!("key-{task_id}"),
             c_metadata,
             extra_filename: String::new(),
@@ -1417,6 +1430,65 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    /// An archive row registered before stow#588 carries no dependency
+    /// digest: it satisfies no coverage clause, so it is not slice
+    /// membership — `semantic_rows` filters it, and a delta between two
+    /// such indexes never names it as added or retired.
+    #[test]
+    fn rows_without_a_dependency_digest_are_not_slice_membership() {
+        let archive = || {
+            let mut row = record_to_index_row(&record("eeee5555")).expect("archive row");
+            row.dependency_identity = None;
+            row
+        };
+        let mut old_digest_row = record_to_index_row(&record("ffff6666")).expect("old digest row");
+        old_digest_row.dependency_identity = Some(
+            stow_types::identity::DependencyIdentity::from_task_ids(["task-a"]).expect("digest"),
+        );
+        let mut new_digest_row = record_to_index_row(&record("aaaa7777")).expect("new digest row");
+        new_digest_row.dependency_identity = Some(
+            stow_types::identity::DependencyIdentity::from_task_ids(["task-b"]).expect("digest"),
+        );
+        let old_digest = old_digest_row
+            .dependency_identity
+            .clone()
+            .expect("old digest");
+        let new_digest = new_digest_row
+            .dependency_identity
+            .clone()
+            .expect("new digest");
+
+        let previous = prev_index(vec![archive(), old_digest_row.clone()], 7);
+        let prev_rows = semantic_rows(&previous);
+        assert_eq!(
+            prev_rows.len(),
+            1,
+            "the digest-less archive row is filtered"
+        );
+        assert_eq!(prev_rows[0].dependency_identity, old_digest);
+
+        // The delta a later `index report` computes: prev and current
+        // both carry the archive row; only the new digest row diffs.
+        let current = prev_index(vec![archive(), old_digest_row, new_digest_row], 8);
+        let current_rows = semantic_rows(&current);
+        assert_eq!(current_rows.len(), 2);
+        let current_keys: std::collections::BTreeSet<_> =
+            current_rows.iter().map(row_key).collect();
+        let previous_keys: std::collections::BTreeSet<_> = prev_rows.iter().map(row_key).collect();
+        let added: Vec<_> = current_rows
+            .iter()
+            .filter(|row| !previous_keys.contains(&row_key(row)))
+            .collect();
+        assert!(
+            !prev_rows
+                .iter()
+                .any(|row| !current_keys.contains(&row_key(row))),
+            "the archive row is never retired"
+        );
+        assert_eq!(added.len(), 1, "only the new digest row is added");
+        assert_eq!(added[0].dependency_identity, new_digest);
     }
 
     /// The `.prev` rule is exact: generation 1 is the slice's first

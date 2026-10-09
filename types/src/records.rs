@@ -141,6 +141,7 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> Option<ArtifactIndexRow> 
         version: record.version.clone(),
         features_json: record.features_json.clone(),
         dependency_c_metadata_json: record.dependency_c_metadata_json.clone(),
+        dependency_identity: record.dependency_identity.clone(),
         c_metadata: record.c_metadata.clone(),
         compile_key: record.compile_key.clone(),
         bundle_digest: record.bundle_digest.clone(),
@@ -218,6 +219,7 @@ mod tests {
             version: CrateVersion::new(Version::new(1, 0, 219)),
             features_json: FeaturesJson::canonicalize(vec![]).expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
+            dependency_identity: None,
             oci_reference: "ghcr.io/water-rs/stow-cache:serde.1.0.219-x86_64-unknown-linux-gnu"
                 .to_owned(),
             oci_digest: "sha256:deadbeef".to_owned(),

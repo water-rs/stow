@@ -19,13 +19,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const RUSTC_VERSION: &str = "1.85.0";
-const ADMISSION_TASK_ID: &str = "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0";
+const ADMISSION_TASK_ID: &str = "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0-d9f3a7c1";
 const ADMISSION_CHALLENGE: &str = "0123456789abcdef";
 
 /// The admissions payload the edge mints for this analysis's misses —
 /// one zero-difficulty admission the CLI must redeem.
 const ADMISSIONS_RESPONSE: &str = r#"[{
-    "task_id": "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0",
+    "task_id": "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0-d9f3a7c1",
     "challenge": "0123456789abcdef",
     "difficulty": 0,
     "request": {
@@ -36,7 +36,7 @@ const ADMISSIONS_RESPONSE: &str = r#"[{
         "rustc_version": "1.85.0",
         "downloads": 0,
         "source": "CacheMiss",
-        "depends_on": [],
+        "dependency_subgraph": {"n": []},
         "preserve_lockfile": false
     }
 }]"#;
@@ -263,7 +263,8 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for the drained /api/v1/enqueue post"
+            "timed out waiting for the drained /api/v1/enqueue post{}",
+            drain_diagnostics(&dir.path().join("target"))
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -294,6 +295,119 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         Some("cfg-if"),
         "the ticket must carry the admission's canonical request: {body}"
     );
+}
+
+/// A drain that cannot admit its journal must say so in its own log:
+/// the entries go back under the journal's name for a later drain and
+/// the failure is named on stderr — the two facts a `stow-drain.log`
+/// must carry so the failure is never silent (stow#588).
+#[test]
+fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
+    seed_empty_index_slice(cache.path());
+
+    // A guaranteed-dead edge: bind a free port, drop the listener, and
+    // the drain's admission post is refused for the whole test.
+    let dead_edge = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        drop(listener);
+        url
+    };
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+        .arg("build")
+        .current_dir(dir.path())
+        .env("CARGO_HOME", cargo_home.path())
+        .env("STOW_EDGE_URL", &dead_edge)
+        .env("STOW_CACHE_DIR", cache.path())
+        .env("STOW_VERIFY_MODE", "github-ci")
+        .env_remove("STOW_CONFIG_BLOB")
+        .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
+        .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("CARGO_INCREMENTAL", "0")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run stow-cli build");
+    assert!(
+        output.status.success(),
+        "stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The detached drain runs after `stow build` returns: poll its log
+    // for the named failure and the journal back under its own name.
+    let target_dir = dir.path().join("target");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    loop {
+        let log = std::fs::read_to_string(target_dir.join("stow-drain.log")).unwrap_or_default();
+        let journal_restored = std::fs::read_dir(&target_dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("stow-misses.stow-") && name.ends_with(".jsonl")
+            })
+        });
+        if log.contains("could not admit the miss journal's units") && journal_restored {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the named drain failure{}",
+            drain_diagnostics(&target_dir)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Forensics for a drain that never posted: the detached child's
+/// stderr log tail plus every journal/claim/context file left under
+/// `target_dir`, so a timeout panic names what the drain saw.
+fn drain_diagnostics(target_dir: &Path) -> String {
+    use std::fmt::Write as _;
+    let mut report = String::new();
+    let log = target_dir.join("stow-drain.log");
+    match std::fs::read(&log) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(4096)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let _ = write!(
+                report,
+                "\nstow-drain.log (last {} bytes):\n{tail}",
+                text.len().min(4096)
+            );
+        }
+        Err(error) => {
+            let _ = write!(report, "\nstow-drain.log: unreadable ({error})");
+        }
+    }
+    report.push_str("\njournal dir:");
+    if let Ok(entries) = std::fs::read_dir(target_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("stow-misses.")
+                || name.starts_with(".draining-")
+                || name.starts_with("stow-context.")
+            {
+                let size = entry.metadata().map_or(0, |meta| meta.len());
+                let _ = write!(report, "\n  {name} ({size} bytes)");
+            }
+        }
+    }
+    report
 }
 
 /// The tools dir `stow setup` produces for the wrapper: the
@@ -411,7 +525,8 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for the drained /api/v1/enqueue post"
+            "timed out waiting for the drained /api/v1/enqueue post{}",
+            drain_diagnostics(&target_dir)
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

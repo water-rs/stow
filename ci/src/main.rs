@@ -23,6 +23,8 @@
 mod capture;
 mod closure;
 mod consume;
+#[cfg(test)]
+mod context_tests;
 mod dep_scan;
 mod local_server;
 mod plan;
@@ -113,7 +115,13 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
     async_fs::create_dir_all(output_dir).await?;
     let built = task::build(&task, output_dir).await?;
     let report = dep_scan::scan_artifacts(&built, &task).await?;
-    let upload_plan = plan::build_upload_plan(&report.artifacts, &report.consumed).await?;
+    let dependency_identity = task
+        .verified_dependency_graph()?
+        .dependency_identity(0)
+        .ok_or_else(|| stow_types::stow_error!("verified dependency graph has no root digest"))?
+        .clone();
+    let upload_plan =
+        plan::build_upload_plan(&report.artifacts, &report.consumed, &dependency_identity).await?;
     stage::write_build_output(output_dir, &task, &report, &upload_plan).await?;
     tracing::info!(
         task_id = %task.task_id,

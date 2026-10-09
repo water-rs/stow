@@ -36,9 +36,8 @@ use std::path::PathBuf;
 
 use stow_types::api::{
     DEMAND_FEED_BATCH_PREFIX, DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageBuilder,
-    DemandFeedPageRequest, EnqueueDependency, EnqueueRequest, EnqueueSource, QueueSelector,
-    SchedulerDemandEntry, SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash,
-    task_id,
+    DemandFeedPageRequest, EnqueueRequest, EnqueueSource, QueueSelector, SchedulerDemandEntry,
+    SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -119,31 +118,21 @@ fn anchor_name(combo_index: usize) -> String {
     format!("fixture-anchor-{combo_index:02}")
 }
 
-/// One consumer's queue task key, from its own identity — the single
-/// task_id computation every expectation/readback file shares.
-fn consumer_task_id(n: usize) -> String {
-    let (name, version, feats, triple, version_rustc, host_side) = identity(n);
-    task_id(
-        &name,
-        &version,
-        &FeaturesJson::canonicalize(feats).expect("features").raw(),
-        triple,
-        version_rustc,
-        host_side,
-    )
+/// One consumer's queue task key — the id its own `EnqueueRequest`
+/// derives from the subgraph it carries, the single task_id
+/// computation every expectation/readback file shares (stow#588: the
+/// id commits to the dependency digest).
+fn consumer_task_id(n: usize, combos: &[DepCombo]) -> String {
+    enqueue_request(n, combos)
+        .task_id()
+        .expect("consumer task id")
 }
 
-/// One base row's queue task key, from its combo position.
+/// One base row's queue task key — the id its own request derives.
 fn base_task_id(combo_index: usize, combo: DepCombo) -> String {
-    let (triple, version_rustc, host_side) = combo;
-    task_id(
-        &base_name(combo_index),
-        "1.0.0",
-        "[]",
-        triple,
-        version_rustc,
-        host_side,
-    )
+    base_dep_request(combo_index, combo)
+        .task_id()
+        .expect("base task id")
 }
 
 fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
@@ -163,14 +152,30 @@ fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
         rustc_version: rustc(version_rustc),
         downloads: 1_000_000 - u64::try_from(n).expect("consumer index fits u64"),
         source: EnqueueSource::CacheMiss,
-        depends_on: vec![EnqueueDependency {
-            crate_name: crate_name(&base_name(dep_index)),
-            version: crate_version("1.0.0"),
-            features_json: FeaturesJson::default(),
-            target: target(triple),
-            rustc_version: rustc(version_rustc),
-            host_side,
-        }],
+        // The subgraph must carry the base's real subtree: the edge's
+        // `depends_on_task_id` commits to the dep's digest, and the
+        // base row's own id digests {anchor} — an empty `deps` here
+        // would mint a different dep id, miss the queue join, and the
+        // demand walk would never reach the base row (stow#588).
+        dependency_subgraph: stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![
+                stow_types::api::SubgraphNode {
+                    crate_name: crate_name(&base_name(dep_index)),
+                    version: crate_version("1.0.0"),
+                    features_json: FeaturesJson::default(),
+                    host_side,
+                    deps: vec![1],
+                },
+                stow_types::api::SubgraphNode {
+                    crate_name: crate_name(&anchor_name(dep_index)),
+                    version: crate_version("1.0.0"),
+                    features_json: FeaturesJson::default(),
+                    host_side,
+                    deps: Vec::new(),
+                },
+            ],
+        },
         host_side,
         preserve_lockfile: false,
     }
@@ -190,14 +195,16 @@ fn base_dep_request(combo_index: usize, combo: DepCombo) -> EnqueueRequest {
         rustc_version: rustc(version_rustc),
         downloads: 2_000_000 - u64::try_from(combo_index).expect("combo index fits u64"),
         source: EnqueueSource::CacheMiss,
-        depends_on: vec![EnqueueDependency {
-            crate_name: crate_name(&anchor_name(combo_index)),
-            version: crate_version("1.0.0"),
-            features_json: FeaturesJson::default(),
-            target: target(triple),
-            rustc_version: rustc(version_rustc),
-            host_side,
-        }],
+        dependency_subgraph: stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: crate_name(&anchor_name(combo_index)),
+                version: crate_version("1.0.0"),
+                features_json: FeaturesJson::default(),
+                host_side,
+                deps: Vec::new(),
+            }],
+        },
         host_side,
         preserve_lockfile: false,
     }
@@ -352,7 +359,7 @@ fn expectations_json(
     for (n, delta) in consumer_delta.iter().enumerate() {
         let (name, ..) = identity(n);
         expectations.push(serde_json::json!({
-            "task_id": consumer_task_id(n),
+            "task_id": consumer_task_id(n, combos),
             "crate_name": name,
             "expected_delta": delta,
         }));
@@ -557,7 +564,7 @@ fn main() {
         .iter()
         .enumerate()
         .map(|(index, combo)| base_task_id(index, *combo))
-        .chain((0..CONSUMERS).map(consumer_task_id))
+        .chain((0..CONSUMERS).map(|n| consumer_task_id(n, &combos)))
         .collect();
     let queries: Vec<String> = task_ids
         .chunks(SELECTOR_CHUNK)

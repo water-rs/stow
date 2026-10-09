@@ -4704,6 +4704,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyml"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3302702afa434ffa30847a83305f0a69d6abd74293b6554c18ec85c7ef30c980"
+dependencies = [
+ "anyhow",
+ "version_check",
+]
+
+[[package]]
 name = "libz-sys"
 version = "1.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7044,6 +7054,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yml"
+version = "0.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59e2dd588bf1597a252c3b920e0143eb99b0f76e4e082f4c92ce34fbc9e71ddd"
+dependencies = [
+ "indexmap 2.14.2",
+ "itoa",
+ "libyml",
+ "memchr",
+ "ryu",
+ "serde",
+ "version_check",
+]
+
+[[package]]
 name = "serial_test"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7801,6 +7826,7 @@ dependencies = [
  "serde",
  "serde_html_form",
  "serde_json",
+ "serde_yml",
  "sha2 0.11.0",
  "stow-oci",
  "stow-resolver",
@@ -7835,6 +7861,7 @@ dependencies = [
  "heel",
  "hex",
  "hmac 0.13.0",
+ "http",
  "reflink",
  "rustls",
  "semver",
@@ -7845,6 +7872,7 @@ dependencies = [
  "smol",
  "stow-cli",
  "stow-oci",
+ "stow-resolver",
  "stow-shim",
  "stow-types",
  "tar",
@@ -7853,6 +7881,7 @@ dependencies = [
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "url",
  "utoipa",
  "walkdir",
  "zenwave",
@@ -8067,6 +8096,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "object 0.39.1",
+ "petgraph",
  "semver",
  "serde",
  "serde_json",

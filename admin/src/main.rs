@@ -710,26 +710,43 @@ async fn submit_command(
         TargetTriple::parse(args.target).map_err(|error| stow_error!("submit target: {error}"))?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version)
         .map_err(|error| stow_error!("submit rustc_version: {error}"))?;
-    // The submit lane posts exactly the identity the operator names — it
-    // never inspects targets, so an operator can name a crate publishing
-    // no library target and the request lands as a task the generated
-    // wrapper package declares as a dependency. Cargo ignores a bin-only
-    // dependency, so nothing compiles and the publish stage's closure
-    // resolution fails the task — an operator's mistake, reported as one,
-    // rather than designed around. The ranked and resolved lanes filter
-    // bin-only crates; this one reports what it was told.
-    let requests = vec![EnqueueRequest {
-        crate_name,
-        version,
-        features_json,
-        target,
-        rustc_version,
-        downloads: args.downloads,
-        source: stow_types::api::EnqueueSource::CacheMiss,
-        depends_on: Vec::new(),
-        preserve_lockfile: args.preserve_lockfile,
-        host_side: false,
-    }];
+    let requests = tokio::task::spawn_blocking(move || {
+        let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
+        let seed = features_json.features().to_vec();
+        let outputs = pool
+            .runtime()
+            .block_on(pool.resolver().resolve_crate_units(
+                crate_name.as_str(),
+                version.as_semver(),
+                &stow_resolver::ResolveOptions {
+                    no_default_features: !seed.iter().any(|feature| feature == "default"),
+                    features: seed,
+                    preserve_lockfile: args.preserve_lockfile,
+                    ..stow_resolver::ResolveOptions::default()
+                },
+                &[target.to_string()],
+            ))
+            .map_err(|error| stow_error!("submit resolve: {error:#}"))?;
+        let mut requests = Vec::new();
+        for (_, resolved) in outputs {
+            let (mut tasks, _) = stow_resolver::enqueue_requests_from_output(
+                &resolved.units,
+                &rustc_version,
+                stow_types::api::EnqueueSource::CacheMiss,
+                args.downloads,
+            )
+            .map_err(|error| stow_error!("submit task graph: {error:#}"))?;
+            for task in &mut tasks {
+                task.preserve_lockfile = args.preserve_lockfile
+                    && task.crate_name == crate_name
+                    && task.version == version;
+            }
+            requests.extend(tasks);
+        }
+        Ok::<_, stow_types::error::Error>(requests)
+    })
+    .await
+    .map_err(|error| stow_error!("submit resolver task: {error}"))??;
     render::mutation(
         output,
         args.yes,

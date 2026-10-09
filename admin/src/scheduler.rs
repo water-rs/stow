@@ -112,11 +112,15 @@ async fn budget(
         // the probe reports the seed done, not on the first response.
         // `reset` is only sent on the first call; sending it again
         // would restart the wipe it begins.
+        //
+        // There is no call-count bound: every phase's range is finite
+        // and a call that ran a step always moves the cursor, so the
+        // exact bound is progress itself — a call that returns without
+        // advancing (phase, n) is the stall, and it names both.
         let mut first = true;
         let mut attempts = 0u8;
-        let mut seeded = false;
-        let mut cursor = (0u64, 0u64, 0u64);
-        for _ in 0..1024 {
+        let mut progress: Option<(String, u64)> = None;
+        loop {
             // The seed is resumable from its `settings` cursor, so a
             // transient workerd failure (a dropped dev-runtime stub
             // connection) retries the same step rather than restarting.
@@ -141,25 +145,28 @@ async fn budget(
             };
             attempts = 0;
             eprintln!(
-                "[budget] seed: queue={} deps={} slices={} done={}",
-                seed.queue_rows, seed.dependency_rows, seed.slice_rows, seed.done
+                "[budget] seed: phase={} n={} queue={} deps={} slices={} done={}",
+                seed.phase,
+                seed.n,
+                seed.queue_rows,
+                seed.dependency_rows,
+                seed.slice_rows,
+                seed.done
             );
             first = false;
-            cursor = (seed.queue_rows, seed.dependency_rows, seed.slice_rows);
+            let position = (seed.phase.clone(), seed.n);
+            if !seed.done && progress.as_ref() == Some(&position) {
+                // A call that ran but moved nothing — budgeting a
+                // partial fixture is worse than failing here.
+                return Err(stow_types::error::Error::msg(format!(
+                    "scheduler seed stalled: phase={} n={} unchanged across calls",
+                    seed.phase, seed.n
+                )));
+            }
+            progress = Some(position);
             if seed.done {
-                seeded = true;
                 break;
             }
-        }
-        if !seeded {
-            // A loop that runs out without `done` was measuring a
-            // partial fixture — fail here instead of reporting budget
-            // numbers against a fraction of the intended queue.
-            return Err(stow_types::error::Error::msg(format!(
-                "scheduler seed never reported done after 1024 calls; \
-                 seed cursor: queue={} deps={} slices={}",
-                cursor.0, cursor.1, cursor.2
-            )));
         }
     }
     let report: SchedulerBudgetReport = edge

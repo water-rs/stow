@@ -4,8 +4,8 @@ use std::future::Future;
 use semver::{Version, VersionReq};
 use skyzen_services::Db;
 use stow_types::api::{
-    CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueDependency, EnqueueRequest,
-    EnqueueSource, QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
+    CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueRequest, EnqueueSource,
+    QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::{
@@ -243,6 +243,28 @@ pub async fn expand_scheduler_requests(
     let rustc_version_typed =
         WireRustcVersion::parse(rustc_version).map_err(|error| error.to_string())?;
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
+    // Every entry's dependency subgraph is client-supplied — minted
+    // off the build's own `cargo --unit-graph` — so a dep the coverage
+    // prune drops still carries its real context (stow#588).
+    let mut subgraph_by_key = BTreeMap::<ExpandedNodeKey, stow_types::api::TaskSubgraph>::new();
+    for entry in expanded_entries {
+        let key = ExpandedNodeKey {
+            package: PackageKey {
+                crate_name: entry.crate_name.clone(),
+                version: entry.version.clone(),
+            },
+            host_side: entry.host_side,
+        };
+        if subgraph_by_key
+            .insert(key, entry.dependency_subgraph.clone())
+            .is_some()
+        {
+            return Err(ResolverError::Invariant(format!(
+                "duplicate expanded dependency graph entry for {} {}",
+                entry.crate_name, entry.version
+            )));
+        }
+    }
     // A consumer target outside `CI_TARGET_TRIPLES` has no runner
     // family, so its host units have no host triple to mint on —
     // refuse rather than mint nodes that block their dependents.
@@ -262,6 +284,7 @@ pub async fn expand_scheduler_requests(
     let requests = build_enqueue_requests(
         &exact_graph.feature_json_by_key,
         &exact_graph.dependency_keys_by_key,
+        &subgraph_by_key,
         &semantic_keys,
         &target_typed,
         &rustc_version_typed,
@@ -292,14 +315,10 @@ fn node_target(node_key: &ExpandedNodeKey, target_typed: &TargetTriple) -> Targe
 /// `source` decides the scheduler lane the tasks land in: the miss path
 /// passes [`EnqueueSource::CacheMiss`], the human request API passes
 /// [`EnqueueSource::HumanRequest`].
-///
-/// `depends_on` carries the node's own task deps — a dependent dispatches
-/// only once every dependency is servable, which is the queue gate's
-/// release signal. Each dep names the dep's own platform: the runner
-/// family's host triple for host-side units.
 fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
     dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+    subgraph_by_key: &BTreeMap<ExpandedNodeKey, stow_types::api::TaskSubgraph>,
     cached_semantic_keys: &BTreeSet<(ExpandedNodeKey, String)>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
@@ -316,25 +335,8 @@ fn build_enqueue_requests(
         if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
             continue;
         }
-        let mut depends_on = Vec::with_capacity(dependency_keys_by_key[node_key].len());
-        for dep_key in &dependency_keys_by_key[node_key] {
-            let raw = feature_json_by_key.get(dep_key).ok_or_else(|| {
-                ResolverError::from(format!(
-                    "missing serialized feature set for dependency {} {}",
-                    dep_key.package.crate_name, dep_key.package.version
-                ))
-            })?;
-            depends_on.push(EnqueueDependency {
-                crate_name: dep_key.package.crate_name.clone(),
-                version: CrateVersion::new(dep_key.package.version.clone()),
-                features_json: parse_canonical_features_json(raw)?,
-                target: node_target(dep_key, target_typed),
-                rustc_version: rustc_version_typed.clone(),
-                host_side: dep_key.host_side,
-            });
-        }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
-        requests.push(EnqueueRequest {
+        let request = EnqueueRequest {
             crate_name: node_key.package.crate_name.clone(),
             version: CrateVersion::new(node_key.package.version.clone()),
             features_json: features_json_typed,
@@ -342,10 +344,26 @@ fn build_enqueue_requests(
             rustc_version: rustc_version_typed.clone(),
             downloads: 0,
             source,
-            depends_on,
+            dependency_subgraph: subgraph_by_key.get(node_key).cloned().ok_or_else(|| {
+                format!(
+                    "missing dependency subgraph for {} {}",
+                    node_key.package.crate_name, node_key.package.version
+                )
+            })?,
             preserve_lockfile: false,
             host_side: node_key.host_side,
-        });
+        };
+        // Re-derive every id the subgraph yields: a wire that does not
+        // resolve is refused rather than minted (stow#588). The
+        // declared-id check rides the ticket path — `/api/v1/enqueue`
+        // already refuses `ticket.task_id != request.task_id()`.
+        request.resolved_dependency_graph().map_err(|error| {
+            ResolverError::BadRequest(format!(
+                "dependency subgraph for {} {} does not resolve: {error}",
+                node_key.package.crate_name, node_key.package.version
+            ))
+        })?;
+        requests.push(request);
     }
     Ok(requests)
 }
@@ -1268,6 +1286,7 @@ mod tests {
                         version: libm_key.version.clone(),
                         host_side: false,
                     }],
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
@@ -1275,6 +1294,7 @@ mod tests {
                     features: Vec::new(),
                     host_side: false,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
             ],
         )
@@ -1339,6 +1359,7 @@ mod tests {
                             host_side: true,
                         },
                     ],
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: syn_key.crate_name.clone(),
@@ -1346,6 +1367,7 @@ mod tests {
                     features: vec!["parsing".to_owned()],
                     host_side: false,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: syn_key.crate_name.clone(),
@@ -1353,6 +1375,7 @@ mod tests {
                     features: vec!["full".to_owned(), "parsing".to_owned()],
                     host_side: true,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
             ],
         )
@@ -1663,6 +1686,10 @@ mod tests {
         features: &[&str],
     ) -> stow_types::api::EnqueueRequest {
         stow_types::api::EnqueueRequest {
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             crate_name: crate_name.parse().expect("valid crate name"),
             version: version.parse().expect("valid semver"),
             features_json: stow_types::identity::FeaturesJson::canonicalize(
@@ -1676,9 +1703,72 @@ mod tests {
             rustc_version: "1.85.0".parse().expect("valid rustc version"),
             downloads: 0,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
             preserve_lockfile: false,
             host_side: false,
+        }
+    }
+
+    /// Subgraphs minted off the exact graph the same way the wire
+    /// carries them — each node's closure, covered nodes with their own
+    /// feature set (stow#588).
+    fn subgraphs(
+        graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+        features: &BTreeMap<ExpandedNodeKey, String>,
+    ) -> BTreeMap<ExpandedNodeKey, stow_types::api::TaskSubgraph> {
+        graph
+            .keys()
+            .map(|key| (key.clone(), subgraph_for(key, graph, features)))
+            .collect()
+    }
+
+    fn subgraph_for(
+        node_key: &ExpandedNodeKey,
+        graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+        features: &BTreeMap<ExpandedNodeKey, String>,
+    ) -> stow_types::api::TaskSubgraph {
+        let mut closure = BTreeSet::new();
+        let mut frontier: Vec<ExpandedNodeKey> =
+            graph.get(node_key).into_iter().flatten().cloned().collect();
+        while let Some(next) = frontier.pop() {
+            if closure.insert(next.clone()) {
+                frontier.extend(graph.get(&next).into_iter().flatten().cloned());
+            }
+        }
+        let wire_index = |dep: &ExpandedNodeKey| {
+            u32::try_from(
+                closure
+                    .iter()
+                    .position(|key| key == dep)
+                    .expect("dep in closure"),
+            )
+            .expect("wire index")
+        };
+        let nodes = closure
+            .iter()
+            .map(|member| stow_types::api::SubgraphNode {
+                crate_name: member.package.crate_name.clone(),
+                version: stow_types::identity::CrateVersion::new(member.package.version.clone()),
+                features_json: features
+                    .get(member)
+                    .map(|raw| super::parse_canonical_features_json(raw).expect("features parse"))
+                    .unwrap_or_default(),
+                host_side: member.host_side,
+                deps: graph
+                    .get(member)
+                    .into_iter()
+                    .flatten()
+                    .map(wire_index)
+                    .collect(),
+            })
+            .collect();
+        stow_types::api::TaskSubgraph {
+            root_deps: graph
+                .get(node_key)
+                .into_iter()
+                .flatten()
+                .map(wire_index)
+                .collect(),
+            nodes,
         }
     }
 
@@ -1736,6 +1826,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features(&graph),
             &graph,
+            &subgraphs(&graph, &features(&graph)),
             &covered(&["b"]),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1748,7 +1839,8 @@ mod tests {
                 (
                     request.crate_name.as_str().to_owned(),
                     request
-                        .depends_on
+                        .depends_on()
+                        .expect("deps")
                         .iter()
                         .map(|dependency| dependency.crate_name.as_str().to_owned())
                         .collect::<Vec<_>>(),
@@ -1778,6 +1870,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
+            &subgraphs(&graph, &features),
             &BTreeSet::new(),
             &"wasm32-unknown-unknown".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1801,14 +1894,15 @@ mod tests {
         );
         let consumer = by_name["consumer"];
         assert_eq!(consumer.target.as_str(), "wasm32-unknown-unknown");
-        assert_eq!(consumer.depends_on.len(), 1);
-        assert_eq!(consumer.depends_on[0].crate_name.as_str(), "macro-crate");
+        let consumer_deps = consumer.depends_on().expect("deps");
+        assert_eq!(consumer_deps.len(), 1);
+        assert_eq!(consumer_deps[0].crate_name.as_str(), "macro-crate");
         assert!(
-            consumer.depends_on[0].host_side,
+            consumer_deps[0].host_side,
             "the edge names the side the dependent needs"
         );
         assert_eq!(
-            consumer.depends_on[0].target.as_str(),
+            consumer_deps[0].target.as_str(),
             "x86_64-unknown-linux-gnu",
             "the edge names the dep's own platform"
         );
@@ -1825,6 +1919,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
+            &subgraphs(&graph, &features),
             &BTreeSet::new(),
             &"aarch64-apple-ios".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1841,7 +1936,9 @@ mod tests {
             "aarch64-apple-darwin"
         );
         assert_eq!(
-            by_name["consumer"].depends_on[0].target.as_str(),
+            by_name["consumer"].depends_on().expect("deps")[0]
+                .target
+                .as_str(),
             "aarch64-apple-darwin"
         );
     }
@@ -2170,6 +2267,7 @@ mod sqlite_tests {
                 features: Vec::new(),
                 host_side: false,
                 dependencies: Vec::new(),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             })
             .collect::<Vec<_>>();
 
@@ -2217,6 +2315,7 @@ mod sqlite_tests {
                 features: Vec::new(),
                 host_side: false,
                 dependencies: Vec::new(),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             })
             .collect::<Vec<_>>();
 

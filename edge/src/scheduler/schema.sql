@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS queue (
     -- host unit), 0 for a target-side node. Part of the identity: the
     -- same crate legitimately exists at both sides of one triple.
     host_side INTEGER NOT NULL DEFAULT 0,
+    -- NULL is historical context that was never recorded, not a leaf.
+    dependency_identity TEXT,
     -- Repair latch: 1 once a `completed` row has been re-queued because a
     -- dependent's edge required unit shapes its published rows never
     -- covered (shapeless legacy rows satisfy no gate clause). The
@@ -125,7 +127,7 @@ CREATE TABLE IF NOT EXISTS queue (
     -- excludes the under-floor bulk before any rank or wake walk
     -- reaches it.
     dispatch_eligible INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
+    UNIQUE(crate_name, version, features_json, target, rustc_version, host_side, dependency_identity)
 );
 
 -- Status and lane are the queue's hot predicates: status() groups by them,
@@ -153,6 +155,7 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     dep_features_json TEXT NOT NULL DEFAULT '',
     dep_target TEXT NOT NULL DEFAULT '',
     dep_rustc_version TEXT NOT NULL DEFAULT '',
+    dep_dependency_identity TEXT,
     -- The side of the dep the dependent needs. -1 marks an edge written
     -- before the side model whose side the migration could not derive
     -- (a dep on the family host triple under an owner on the same
@@ -184,6 +187,34 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     dep_side_known INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
+);
+
+-- The content-addressed dependency node store (stow#588): one row per
+-- distinct task-subgraph node any accepted enqueue request carried,
+-- keyed by the node's canonical task id. `children_json` is the JSON
+-- array of the node's direct-dependency task ids — an encoded column,
+-- not an edge table, because the only read is the dispatch walk's
+-- level-by-level expansion: one json_each-bounded SELECT per BFS level
+-- returns identities and children together, where an edge table would
+-- pay a second same-shape lookup per level for no extra reach (the
+-- queue_dependencies table already serves the gate's edge traversal).
+-- Inserted with insert-or-ignore semantics at submit: dedup is by task
+-- id, so storage grows with distinct nodes, not with requests.
+CREATE TABLE IF NOT EXISTS task_nodes (
+    task_id TEXT PRIMARY KEY,
+    crate_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    target TEXT NOT NULL,
+    rustc_version TEXT NOT NULL,
+    host_side INTEGER NOT NULL DEFAULT 0,
+    -- The Merkle dependency digest this node's task id commits to —
+    -- every node in the store carries it; NULL belongs to tables whose
+    -- context is historical, never here.
+    dependency_identity TEXT NOT NULL,
+    -- JSON array of this node's direct-dependency task ids, in the
+    -- resolved graph's edge order. `[]` for a leaf.
+    children_json TEXT NOT NULL DEFAULT '[]'
 );
 
 -- One demand batch's durable record (stow#522): the batch/window
@@ -509,6 +540,11 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
+    -- The Merkle dependency digest the row was built under (stow#588).
+    -- NOT NULL since v15: a row without it satisfies no coverage clause,
+    -- so the rebuild drops context-free rows and reports that carry
+    -- none are refused — the column is `=` everywhere, never `IS`.
+    dependency_identity TEXT NOT NULL,
     -- The unit shape the row serves — the builder-recorded side, cargo
     -- invocation spelling, and link kind the dependency gate compares an
     -- edge's required shapes against. -1 on all three legs marks a row
@@ -518,7 +554,7 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     unit_side INTEGER NOT NULL DEFAULT -1,
     unit_invocation INTEGER NOT NULL DEFAULT -1,
     unit_linked INTEGER NOT NULL DEFAULT -1,
-    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked)
+    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked)
 );
 
 -- Human-lane daily spend: one row per UTC date counting tasks enqueued

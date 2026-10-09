@@ -1,12 +1,11 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 
-use stow_types::api::{EnqueueDependency, EnqueueRequest, EnqueueSource};
+use stow_types::api::{EnqueueRequest, EnqueueSource};
 use stow_types::identity::FeaturesJson;
 
 use super::{
     AlarmPlan, CoverageOracle, Dispatch, SchedulerSettings, SemanticTaskIdentity, next_alarm,
-    task_id,
 };
 use crate::errors::QueueError;
 use crate::scheduler::test_db::{
@@ -45,9 +44,13 @@ const TEST_WINDOW_MINUTES: u32 = 60;
 
 const STALE_DISPATCH_MINUTES: u32 = 60;
 
-async fn assert_parent_status(db: &DurableDb, expected: stow_types::api::QueueTaskStatus) {
+async fn assert_parent_status(
+    db: &DurableDb,
+    expected: stow_types::api::QueueTaskStatus,
+    deps: &[EnqueueRequest],
+) {
     assert_eq!(
-        super::task_status(db, &task_id_on("parent", TARGET))
+        super::task_status(db, &task_id_with("parent", TARGET, deps))
             .await
             .expect("read parent status")
             .expect("parent row")
@@ -160,16 +163,52 @@ fn semantic_identity(crate_name: &str) -> SemanticTaskIdentity {
     }
 }
 
-fn request(crate_name: &str, depends_on: Vec<EnqueueDependency>) -> EnqueueRequest {
+/// Test subgraph carrying `deps` as the root's direct deps — each
+/// given as its own request so the dep node embeds the dep's real
+/// transitive subgraph and digests to the task id the dep's row
+/// minted (stow#588). `dependency("x")` covers the leaf case; a
+/// non-leaf dep is its own full `request(...)`.
+fn subgraph_of(deps: &[EnqueueRequest]) -> stow_types::api::TaskSubgraph {
+    let mut root_deps = Vec::with_capacity(deps.len());
+    let mut nodes = Vec::new();
+    for dep in deps {
+        let base = u32::try_from(nodes.len()).expect("test node count");
+        root_deps.push(base);
+        // The dep's own wire nodes shift by `base + 1`: its node takes
+        // slot `base`, its subgraph's nodes follow.
+        let remap = |index: &u32| index + base + 1;
+        nodes.push(stow_types::api::SubgraphNode {
+            crate_name: dep.crate_name.clone(),
+            version: dep.version.clone(),
+            features_json: dep.features_json.clone(),
+            host_side: dep.host_side,
+            deps: dep
+                .dependency_subgraph
+                .root_deps
+                .iter()
+                .map(remap)
+                .collect(),
+        });
+        nodes.extend(dep.dependency_subgraph.nodes.iter().map(|node| {
+            stow_types::api::SubgraphNode {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                host_side: node.host_side,
+                deps: node.deps.iter().map(remap).collect(),
+            }
+        }));
+    }
+    stow_types::api::TaskSubgraph { root_deps, nodes }
+}
+
+fn request(crate_name: &str, depends_on: &[EnqueueRequest]) -> EnqueueRequest {
     request_on(crate_name, TARGET, depends_on)
 }
 
-fn request_on(
-    crate_name: &str,
-    target: &str,
-    depends_on: Vec<EnqueueDependency>,
-) -> EnqueueRequest {
+fn request_on(crate_name: &str, target: &str, deps: &[EnqueueRequest]) -> EnqueueRequest {
     EnqueueRequest {
+        dependency_subgraph: subgraph_of(deps),
         crate_name: crate_name.parse().expect("valid crate name"),
         version: VERSION.parse().expect("valid semver"),
         features_json: FeaturesJson::default(),
@@ -177,35 +216,68 @@ fn request_on(
         rustc_version: RUSTC.parse().expect("valid rustc version"),
         downloads: 0,
         source: EnqueueSource::CacheMiss,
-        depends_on,
         preserve_lockfile: false,
         host_side: false,
     }
 }
 
+/// The task id a leaf-rooted request mints — what `enqueue` writes for
+/// `request_on(crate_name, target, &[])` (stow#588: ids carry the
+/// derived dependency-context digest).
 fn task_id_on(crate_name: &str, target: &str) -> String {
-    task_id(crate_name, VERSION, FEATURES, target, RUSTC, false)
+    request_on(crate_name, target, &[])
+        .task_id()
+        .expect("derived test task id")
 }
 
-fn dependency(crate_name: &str) -> EnqueueDependency {
-    EnqueueDependency {
-        crate_name: crate_name.parse().expect("valid crate name"),
-        version: VERSION.parse().expect("valid semver"),
-        features_json: FeaturesJson::default(),
-        target: TARGET.parse().expect("valid target triple"),
-        rustc_version: RUSTC.parse().expect("valid rustc version"),
-        host_side: false,
-    }
+/// The task id `request_on(crate_name, target, deps)` mints — for
+/// nodes enqueued with a non-empty dep set the leaf form does not
+/// apply.
+fn task_id_with(crate_name: &str, target: &str, deps: &[EnqueueRequest]) -> String {
+    request_on(crate_name, target, deps)
+        .task_id()
+        .expect("derived test task id")
+}
+
+/// A leaf dep as its own request — `request(name, &[])` mints the
+/// leaf-context id the dep's queue row carries.
+fn dependency(crate_name: &str) -> EnqueueRequest {
+    request(crate_name, &[])
+}
+
+/// The dependency-context identity a leaf dep's own subgraph resolves
+/// to — what its `queue_dependencies` edge records and what a slice
+/// row must carry for the gate to release on it (stow#588).
+fn dep_identity(crate_name: &str) -> stow_types::identity::DependencyIdentity {
+    dependency(crate_name)
+        .dependency_identity()
+        .expect("dep identity")
+}
+
+/// A host-side leaf dep as its own request — minted at the consumer
+/// family's host triple with `host_side`, the same identity its node
+/// resolves to inside the consumer's subgraph (stow#588).
+fn host_dependency_on(consumer_target: &str, crate_name: &str) -> EnqueueRequest {
+    let mut dep = request_on(
+        crate_name,
+        stow_types::api::runner_family(consumer_target)
+            .expect("consumer family")
+            .host_triple(),
+        &[],
+    );
+    dep.host_side = true;
+    dep
 }
 
 /// Force a row into an in-flight status with a deterministic `updated_at`
 /// — a state no public queue function produces (claim always stamps
 /// `datetime('now')`), so one raw UPDATE is required.
 async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &str) {
-    db.query("UPDATE queue SET status = ?, updated_at = ? WHERE task_id = ?")
+    db.query("UPDATE queue SET status = ?, updated_at = ?               WHERE crate_name = ? AND target = ?")
         .bind(status.to_owned())
         .bind(ROW_TS.to_owned())
-        .bind(task_id_on(crate_name, target))
+        .bind(crate_name.to_owned())
+        .bind(target)
         .execute()
         .await
         .expect("mark task active");
@@ -258,7 +330,7 @@ async fn set_first_requested_at_on(
 #[tokio::test]
 async fn active_only_wakes_at_lease_expiry() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("alpha", Vec::new())])
+    enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
     mark_active(&db, "alpha", TARGET, "running").await;
@@ -275,10 +347,10 @@ async fn active_only_wakes_at_lease_expiry() {
 #[tokio::test]
 async fn pending_blocked_by_active_dependency_wakes_at_lease_expiry() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     mark_active(&db, "dep", TARGET, "dispatched").await;
@@ -295,12 +367,9 @@ async fn pending_blocked_by_active_dependency_wakes_at_lease_expiry() {
 #[tokio::test]
 async fn exhausted_capacity_with_eligible_pending_wakes_at_lease_expiry() {
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("busy", Vec::new()), request("waiting", Vec::new())],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("busy", &[]), request("waiting", &[])])
+        .await
+        .expect("enqueue");
     mark_active(&db, "busy", TARGET, "dispatched").await;
     set_first_requested_at(&db, "waiting", PAST_TS).await;
 
@@ -324,7 +393,7 @@ async fn exhausted_capacity_with_eligible_pending_wakes_at_lease_expiry() {
 #[tokio::test]
 async fn fully_gated_submit_arms_no_alarm() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("parent", vec![dependency("dep-missing")])])
+    enqueue(&db, &[request("parent", &[dependency("dep-missing")])])
         .await
         .expect("enqueue gated submit");
 
@@ -341,7 +410,7 @@ async fn fully_gated_submit_arms_no_alarm() {
 #[tokio::test]
 async fn dispatchable_submit_arms_at_now() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("ready", Vec::new())])
+    enqueue(&db, &[request("ready", &[])])
         .await
         .expect("enqueue ready");
     set_first_requested_at(&db, "ready", PAST_TS).await;
@@ -358,7 +427,7 @@ async fn dispatchable_submit_arms_at_now() {
 #[tokio::test]
 async fn paused_with_nothing_in_flight_deletes_alarm() {
     let db = memory_db().await.expect("memory db");
-    super::enqueue(&db, &[request("waiting", Vec::new())], &paused_settings())
+    super::enqueue(&db, &[request("waiting", &[])], &paused_settings())
         .await
         .expect("enqueue");
     set_first_requested_at(&db, "waiting", PAST_TS).await;
@@ -378,7 +447,7 @@ async fn paused_with_in_flight_row_wakes_at_lease_expiry() {
     let db = memory_db().await.expect("memory db");
     super::enqueue(
         &db,
-        &[request("busy", Vec::new()), request("waiting", Vec::new())],
+        &[request("busy", &[]), request("waiting", &[])],
         &paused_settings(),
     )
     .await
@@ -397,7 +466,7 @@ async fn paused_with_in_flight_row_wakes_at_lease_expiry() {
 #[tokio::test]
 async fn submit_while_paused_enqueues_but_claims_nothing() {
     let db = memory_db().await.expect("memory db");
-    let inserted = super::enqueue(&db, &[request("waiting", Vec::new())], &paused_settings())
+    let inserted = super::enqueue(&db, &[request("waiting", &[])], &paused_settings())
         .await
         .expect("enqueue while paused");
     assert_eq!(inserted, 1);
@@ -415,7 +484,7 @@ async fn submit_while_paused_enqueues_but_claims_nothing() {
 #[tokio::test]
 async fn paused_claim_still_recovers_stale_in_flight_row() {
     let db = memory_db().await.expect("memory db");
-    super::enqueue(&db, &[request("busy", Vec::new())], &paused_settings())
+    super::enqueue(&db, &[request("busy", &[])], &paused_settings())
         .await
         .expect("enqueue");
     mark_active(&db, "busy", TARGET, "dispatched").await;
@@ -436,7 +505,7 @@ async fn paused_claim_still_recovers_stale_in_flight_row() {
 #[tokio::test]
 async fn eligible_pending_with_capacity_wakes_at_eligibility() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("ready", Vec::new())])
+    enqueue(&db, &[request("ready", &[])])
         .await
         .expect("enqueue");
     set_first_requested_at_on(&db, "ready", TARGET, ROW_TS, 30).await;
@@ -455,7 +524,7 @@ async fn eligible_pending_with_capacity_wakes_at_eligibility() {
 #[tokio::test]
 async fn overdue_pending_with_capacity_wakes_now() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("ready", Vec::new())])
+    enqueue(&db, &[request("ready", &[])])
         .await
         .expect("enqueue");
     set_first_requested_at(&db, "ready", PAST_TS).await;
@@ -473,7 +542,7 @@ async fn overdue_pending_with_capacity_wakes_now() {
 fn request_with_downloads(crate_name: &str, downloads: u64) -> EnqueueRequest {
     EnqueueRequest {
         downloads,
-        ..request(crate_name, Vec::new())
+        ..request(crate_name, &[])
     }
 }
 
@@ -506,17 +575,17 @@ fn token() -> crate::github_app::InstallationToken {
 #[tokio::test]
 async fn repeated_requests_do_not_overtake_older_pending_tasks() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("old", Vec::new())])
+    enqueue(&db, &[request("old", &[])])
         .await
         .expect("enqueue old");
-    enqueue(&db, &[request("spam", Vec::new())])
+    enqueue(&db, &[request("spam", &[])])
         .await
         .expect("enqueue spam");
     set_first_requested_at(&db, "old", PAST_TS).await;
     // Hammer the newer task: under the removed request_count ordering it
     // would outrank the older row; under first-seen FIFO it cannot.
     for _ in 0..20 {
-        enqueue(&db, &[request("spam", Vec::new())])
+        enqueue(&db, &[request("spam", &[])])
             .await
             .expect("re-request spam");
     }
@@ -534,7 +603,7 @@ async fn repeated_requests_do_not_overtake_older_pending_tasks() {
 #[tokio::test]
 async fn higher_priority_value_claims_before_older_first_seen() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("old", Vec::new())])
+    enqueue(&db, &[request("old", &[])])
         .await
         .expect("enqueue old");
     enqueue(&db, &[request_with_downloads("popular", 10_000)])
@@ -554,10 +623,10 @@ async fn higher_priority_value_claims_before_older_first_seen() {
 #[tokio::test]
 async fn equal_value_claims_in_first_seen_order() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("young", Vec::new())])
+    enqueue(&db, &[request("young", &[])])
         .await
         .expect("enqueue young");
-    enqueue(&db, &[request("old", Vec::new())])
+    enqueue(&db, &[request("old", &[])])
         .await
         .expect("enqueue old");
     set_first_requested_at(&db, "old", PAST_TS).await;
@@ -585,10 +654,10 @@ async fn value_bands_preserve_lane_then_family_precedence() {
     // Worst case for the bands: the miss/Windows row is the oldest
     // and carries the largest admissible downloads; band order must
     // still dominate.
-    let mut miss_win = request_on("miss-win", WINDOWS_TARGET, Vec::new());
+    let mut miss_win = request_on("miss-win", WINDOWS_TARGET, &[]);
     miss_win.downloads = i64::MAX as u64;
     enqueue(&db, &[miss_win]).await.expect("enqueue miss-win");
-    enqueue(&db, &[request("miss-lin", Vec::new())])
+    enqueue(&db, &[request("miss-lin", &[])])
         .await
         .expect("enqueue miss-lin");
     enqueue(
@@ -596,11 +665,11 @@ async fn value_bands_preserve_lane_then_family_precedence() {
         &[
             EnqueueRequest {
                 source: EnqueueSource::HumanRequest,
-                ..request_on("human-lin", TARGET, Vec::new())
+                ..request_on("human-lin", TARGET, &[])
             },
             EnqueueRequest {
                 source: EnqueueSource::HumanRequest,
-                ..request_on("human-win", WINDOWS_TARGET, Vec::new())
+                ..request_on("human-win", WINDOWS_TARGET, &[])
             },
         ],
     )
@@ -648,9 +717,9 @@ async fn value_extremes_stay_within_i64_and_order() {
         &[
             EnqueueRequest {
                 source: EnqueueSource::HumanRequest,
-                ..request_on("max", WINDOWS_TARGET, Vec::new())
+                ..request_on("max", WINDOWS_TARGET, &[])
             },
-            request("min", Vec::new()),
+            request("min", &[]),
         ],
     )
     .await
@@ -752,10 +821,7 @@ async fn floor_admits_only_scored_rows() {
     set_floor(&db, super::VALUE_BAND).await;
     enqueue(
         &db,
-        &[
-            request("lin", Vec::new()),
-            request_on("win", WINDOWS_TARGET, Vec::new()),
-        ],
+        &[request("lin", &[]), request_on("win", WINDOWS_TARGET, &[])],
     )
     .await
     .expect("enqueue");
@@ -783,10 +849,7 @@ async fn floor_admits_only_scored_rows() {
     set_floor(&db, super::VALUE_BAND + 1).await;
     enqueue(
         &db,
-        &[
-            request("lin", Vec::new()),
-            request_on("win", WINDOWS_TARGET, Vec::new()),
-        ],
+        &[request("lin", &[]), request_on("win", WINDOWS_TARGET, &[])],
     )
     .await
     .expect("enqueue");
@@ -818,9 +881,9 @@ async fn floor_never_blocks_the_human_lane() {
         &[
             EnqueueRequest {
                 source: EnqueueSource::HumanRequest,
-                ..request("human", Vec::new())
+                ..request("human", &[])
             },
-            request("miss", Vec::new()),
+            request("miss", &[]),
         ],
     )
     .await
@@ -850,10 +913,10 @@ async fn floor_preserves_the_tie_order() {
     enqueue(
         &db,
         &[
-            request_on("cee", WINDOWS_TARGET, Vec::new()),
-            request_on("aye", WINDOWS_TARGET, Vec::new()),
-            request_on("bee", WINDOWS_TARGET, Vec::new()),
-            request("lin", Vec::new()),
+            request_on("cee", WINDOWS_TARGET, &[]),
+            request_on("aye", WINDOWS_TARGET, &[]),
+            request_on("bee", WINDOWS_TARGET, &[]),
+            request("lin", &[]),
         ],
     )
     .await
@@ -905,9 +968,7 @@ async fn under_floor_rows_never_arm_the_alarm() {
     // Without a floor the row is eligible now — the alarm arms at
     // `now`.
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("low", Vec::new())])
-        .await
-        .expect("enqueue");
+    enqueue(&db, &[request("low", &[])]).await.expect("enqueue");
     set_first_requested_at(&db, "low", PAST_TS).await;
     let armed = next_alarm(&db, ROW_TS_MS, &claim_settings())
         .await
@@ -919,9 +980,7 @@ async fn under_floor_rows_never_arm_the_alarm() {
     // requeue arm exists either.
     let db = memory_db().await.expect("memory db");
     set_floor(&db, 1).await;
-    enqueue(&db, &[request("low", Vec::new())])
-        .await
-        .expect("enqueue");
+    enqueue(&db, &[request("low", &[])]).await.expect("enqueue");
     set_first_requested_at(&db, "low", PAST_TS).await;
     let plan = next_alarm(&db, ROW_TS_MS, &claim_settings())
         .await
@@ -946,7 +1005,7 @@ async fn under_floor_bulk_arms_no_wake_and_starves_no_page() {
     let db = memory_db().await.expect("memory db");
     set_floor(&db, 1).await;
     let bulk = (0..300)
-        .map(|n| request(&format!("under{n}"), Vec::new()))
+        .map(|n| request(&format!("under{n}"), &[]))
         .collect::<Vec<_>>();
     enqueue(&db, &bulk).await.expect("enqueue under-floor bulk");
     // Half the bulk parks behind a future wake — immediate and
@@ -971,7 +1030,7 @@ async fn under_floor_bulk_arms_no_wake_and_starves_no_page() {
     );
     // The one row over the floor claims on the first page —
     // the floor is an index equality, not a scan the bulk can starve.
-    enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
+    enqueue(&db, &[request_on("win", WINDOWS_TARGET, &[])])
         .await
         .expect("enqueue the eligible row");
     set_first_requested_at_on(
@@ -994,7 +1053,7 @@ async fn under_floor_bulk_arms_no_wake_and_starves_no_page() {
 async fn demand_can_cross_the_floor() {
     let db = memory_db().await.expect("memory db");
     set_floor(&db, 1).await;
-    enqueue(&db, &[request("rise", Vec::new())])
+    enqueue(&db, &[request("rise", &[])])
         .await
         .expect("enqueue");
     set_first_requested_at(&db, "rise", PAST_TS).await;
@@ -1026,7 +1085,7 @@ async fn demand_can_cross_the_floor() {
 async fn promotion_grants_the_human_exemption() {
     let db = memory_db().await.expect("memory db");
     set_floor(&db, 1).await;
-    enqueue(&db, &[request("prom", Vec::new())])
+    enqueue(&db, &[request("prom", &[])])
         .await
         .expect("enqueue");
     assert_eq!(flag_of(&db, "prom").await, 0);
@@ -1057,10 +1116,7 @@ async fn retry_preserves_the_eligibility_flag() {
     set_floor(&db, 1).await;
     enqueue(
         &db,
-        &[
-            request("low", Vec::new()),
-            request_on("win", WINDOWS_TARGET, Vec::new()),
-        ],
+        &[request("low", &[]), request_on("win", WINDOWS_TARGET, &[])],
     )
     .await
     .expect("enqueue");
@@ -1106,11 +1162,11 @@ async fn operator_floor_change_backfills_eligibility() {
     enqueue(
         &db,
         &[
-            request("lin", Vec::new()),
-            request_on("win", WINDOWS_TARGET, Vec::new()),
+            request("lin", &[]),
+            request_on("win", WINDOWS_TARGET, &[]),
             EnqueueRequest {
                 source: EnqueueSource::HumanRequest,
-                ..request("human", Vec::new())
+                ..request("human", &[])
             },
         ],
     )
@@ -1152,10 +1208,7 @@ async fn failed_backfill_retries_under_the_same_floor() {
     super::migrate(&db, &settings()).await.expect("migrate");
     enqueue(
         &db,
-        &[
-            request("lin", Vec::new()),
-            request_on("win", WINDOWS_TARGET, Vec::new()),
-        ],
+        &[request("lin", &[]), request_on("win", WINDOWS_TARGET, &[])],
     )
     .await
     .expect("enqueue");
@@ -1218,10 +1271,7 @@ async fn migrate_recovers_the_prior_schema() {
     super::migrate(&db, &settings()).await.expect("migrate");
     enqueue(
         &db,
-        &[
-            request("lin", Vec::new()),
-            request_on("win", WINDOWS_TARGET, Vec::new()),
-        ],
+        &[request("lin", &[]), request_on("win", WINDOWS_TARGET, &[])],
     )
     .await
     .expect("enqueue");
@@ -1275,12 +1325,9 @@ async fn migrate_recovers_the_prior_schema() {
 #[tokio::test]
 async fn list_tasks_reports_value_as_exact_decimal() {
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("wide-a", Vec::new()), request("wide-b", Vec::new())],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("wide-a", &[]), request("wide-b", &[])])
+        .await
+        .expect("enqueue");
     // Literals inside the statement text parse as i64 in SQLite —
     // the only wide-integer channel, since a bound parameter would
     // cross the lossy numeric transport.
@@ -1341,10 +1388,10 @@ async fn migrate_backfills_value_to_match_fresh_rows() {
         &[
             EnqueueRequest {
                 source: EnqueueSource::HumanRequest,
-                ..request("human", Vec::new())
+                ..request("human", &[])
             },
-            request_on("win", WINDOWS_TARGET, Vec::new()),
-            request("lin", Vec::new()),
+            request_on("win", WINDOWS_TARGET, &[]),
+            request("lin", &[]),
         ],
     )
     .await
@@ -1427,9 +1474,10 @@ async fn apply(
     super::apply_demand(db, &demand_batch(batch_id, entries)).await
 }
 
-async fn demand_of(db: &DurableDb, task_id: &str) -> i64 {
-    db.query("SELECT demand FROM queue WHERE task_id = ?")
-        .bind(task_id.to_owned())
+async fn demand_of(db: &DurableDb, crate_name: &str, target: &str) -> i64 {
+    db.query("SELECT demand FROM queue WHERE crate_name = ? AND target = ?")
+        .bind(crate_name.to_owned())
+        .bind(target.to_owned())
         .fetch_scalar::<i64>()
         .await
         .expect("demand read")
@@ -1451,10 +1499,10 @@ async fn demand_walks_the_unbuilt_dependency_closure() {
     enqueue(
         &db,
         &[
-            request("leaf", Vec::new()),
-            request("mid", vec![dependency("leaf")]),
-            request("root", vec![dependency("mid")]),
-            request("other", Vec::new()),
+            request("leaf", &[]),
+            request("mid", &[dependency("leaf")]),
+            request("root", &[request("mid", &[dependency("leaf")])]),
+            request("other", &[]),
         ],
     )
     .await
@@ -1466,9 +1514,9 @@ async fn demand_walks_the_unbuilt_dependency_closure() {
     assert!(report.applied);
     assert_eq!(report.touched_tasks, 3);
     for name in ["root", "mid", "leaf"] {
-        assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 5, "{name}");
+        assert_eq!(demand_of(&db, name, TARGET).await, 5, "{name}");
     }
-    assert_eq!(demand_of(&db, &task_id_on("other", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "other", TARGET).await, 0);
     // The closure's value rows carry the delta — the ordering
     // operand, not a side column.
     let value = db
@@ -1489,10 +1537,16 @@ async fn demand_dedupes_diamond_paths() {
     enqueue(
         &db,
         &[
-            request("c", Vec::new()),
-            request("a", vec![dependency("c")]),
-            request("b", vec![dependency("c")]),
-            request("root", vec![dependency("a"), dependency("b")]),
+            request("c", &[]),
+            request("a", &[dependency("c")]),
+            request("b", &[dependency("c")]),
+            request(
+                "root",
+                &[
+                    request("a", &[dependency("c")]),
+                    request("b", &[dependency("c")]),
+                ],
+            ),
         ],
     )
     .await
@@ -1502,7 +1556,7 @@ async fn demand_dedupes_diamond_paths() {
         .await
         .expect("demand");
     assert_eq!(report.touched_tasks, 4);
-    assert_eq!(demand_of(&db, &task_id_on("c", TARGET)).await, 7);
+    assert_eq!(demand_of(&db, "c", TARGET).await, 7);
     // Acceptance consumes the staged set in the same statement
     // (stow#523): an accepted batch's replay reads the header only.
     assert_eq!(contribution_rows(&db, "h0").await, 0);
@@ -1516,9 +1570,9 @@ async fn demand_touches_both_compile_sides_of_one_identity() {
     let db = memory_db().await.expect("memory db");
     let host = EnqueueRequest {
         host_side: true,
-        ..request("dual", Vec::new())
+        ..request("dual", &[])
     };
-    enqueue(&db, &[request("dual", Vec::new()), host])
+    enqueue(&db, &[request("dual", &[]), host])
         .await
         .expect("enqueue");
 
@@ -1527,8 +1581,13 @@ async fn demand_touches_both_compile_sides_of_one_identity() {
         .expect("demand");
     assert_eq!(report.touched_tasks, 2);
     for host_side in [false, true] {
-        let id = task_id("dual", VERSION, FEATURES, TARGET, RUSTC, host_side);
-        assert_eq!(demand_of(&db, &id).await, 3, "host_side={host_side}");
+        let demand: i64 = db
+            .query("SELECT demand FROM queue WHERE crate_name = 'dual' AND host_side = ?")
+            .bind(i64::from(host_side))
+            .fetch_scalar()
+            .await
+            .expect("host demand");
+        assert_eq!(demand, 3, "host_side={host_side}");
     }
 }
 
@@ -1541,13 +1600,13 @@ async fn demand_stops_at_built_in_flight_and_met_edges() {
     enqueue(
         &db,
         &[
-            request("done", Vec::new()),
-            request("live", Vec::new()),
-            request("leaf", Vec::new()),
-            request("met-dep", Vec::new()),
+            request("done", &[]),
+            request("live", &[]),
+            request("leaf", &[]),
+            request("met-dep", &[]),
             request(
                 "root",
-                vec![
+                &[
                     dependency("done"),
                     dependency("live"),
                     dependency("met-dep"),
@@ -1562,11 +1621,20 @@ async fn demand_stops_at_built_in_flight_and_met_edges() {
     // An edge whose dep the index already answered: met edges are
     // not part of the unbuilt closure even when the row behind
     // them is still pending.
+    let root_id = task_id_with(
+        "root",
+        TARGET,
+        &[
+            dependency("done"),
+            dependency("live"),
+            dependency("met-dep"),
+        ],
+    );
     db.query(
         "UPDATE queue_dependencies SET dep_met = 1 \
                   WHERE task_id = ? AND dep_crate_name = 'met-dep'",
     )
-    .bind(task_id_on("root", TARGET))
+    .bind(root_id.clone())
     .execute()
     .await
     .expect("met edge");
@@ -1574,7 +1642,7 @@ async fn demand_stops_at_built_in_flight_and_met_edges() {
     mark_active(&db, "leaf", TARGET, "failed").await;
     db.query("INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_met, dep_side_known) \
                   VALUES (?, ?, 'leaf', ?, '[]', ?, ?, 0, 1, 2, 0, 1)")
-            .bind(task_id_on("root", TARGET))
+            .bind(root_id.clone())
             .bind(task_id_on("leaf", TARGET))
             .bind(VERSION)
             .bind(TARGET)
@@ -1587,10 +1655,10 @@ async fn demand_stops_at_built_in_flight_and_met_edges() {
         .await
         .expect("demand");
     assert_eq!(report.touched_tasks, 2, "root and the failed dep only");
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 4);
-    assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 4);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 4);
+    assert_eq!(demand_of(&db, "leaf", TARGET).await, 4);
     for name in ["done", "live", "met-dep"] {
-        assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 0, "{name}");
+        assert_eq!(demand_of(&db, name, TARGET).await, 0, "{name}");
     }
 }
 
@@ -1603,9 +1671,9 @@ async fn demand_sums_distinct_identities_and_survives_cycles() {
     enqueue(
         &db,
         &[
-            request("shared", Vec::new()),
-            request("r1", vec![dependency("shared")]),
-            request("r2", vec![dependency("shared")]),
+            request("shared", &[]),
+            request("r1", &[dependency("shared")]),
+            request("r2", &[dependency("shared")]),
         ],
     )
     .await
@@ -1618,25 +1686,33 @@ async fn demand_sums_distinct_identities_and_survives_cycles() {
     .await
     .expect("demand");
     assert_eq!(report.touched_tasks, 3);
-    assert_eq!(demand_of(&db, &task_id_on("shared", TARGET)).await, 7);
+    assert_eq!(demand_of(&db, "shared", TARGET).await, 7);
 
     // a ↔ b: the UNION dedup closes the cycle; each side gets the
     // delta once.
-    enqueue(
-        &db,
-        &[
-            request("cyc-a", vec![dependency("cyc-b")]),
-            request("cyc-b", vec![dependency("cyc-a")]),
-        ],
-    )
-    .await
-    .expect("enqueue cycle");
+    // The resolver never emits a cycle, so the walk's UNION dedup is
+    // exercised with hand-written edges on leaf rows instead.
+    let cyc_a = request("cyc-a", &[]);
+    let cyc_b = request("cyc-b", &[]);
+    enqueue(&db, &[cyc_a.clone(), cyc_b.clone()])
+        .await
+        .expect("enqueue cycle");
+    for (owner, dep) in [(&cyc_a, &cyc_b), (&cyc_b, &cyc_a)] {
+        db.query(
+            "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_met)                  VALUES (?, ?, 0)",
+        )
+        .bind(owner.task_id().expect("owner id"))
+        .bind(dep.task_id().expect("dep id"))
+        .execute()
+        .await
+        .expect("cycle edge");
+    }
     let report = apply(&db, "h1", vec![demand_entry("cyc-a", 2)])
         .await
         .expect("cycle demand");
     assert_eq!(report.touched_tasks, 2);
     for name in ["cyc-a", "cyc-b"] {
-        assert_eq!(demand_of(&db, &task_id_on(name, TARGET)).await, 2, "{name}");
+        assert_eq!(demand_of(&db, name, TARGET).await, 2, "{name}");
     }
 }
 
@@ -1646,7 +1722,7 @@ async fn demand_sums_distinct_identities_and_survives_cycles() {
 #[tokio::test]
 async fn demand_replay_is_idempotent_and_batches_accumulate() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("root", Vec::new())])
+    enqueue(&db, &[request("root", &[])])
         .await
         .expect("enqueue");
 
@@ -1658,7 +1734,7 @@ async fn demand_replay_is_idempotent_and_batches_accumulate() {
         .await
         .expect("replay");
     assert!(!replay.applied);
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 5);
     // The staged set retired at acceptance — the replay answered
     // from the header alone.
     assert_eq!(contribution_rows(&db, "hour-1").await, 0);
@@ -1683,7 +1759,7 @@ async fn demand_replay_is_idempotent_and_batches_accumulate() {
         .await
         .expect("next hour");
     assert!(next.applied);
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 10);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 10);
 }
 
 /// A delivery's cost is proportional to its own rows, not the
@@ -1696,7 +1772,7 @@ async fn demand_replay_is_idempotent_and_batches_accumulate() {
 async fn demand_cost_stays_proportional_with_preexisting_history() {
     async fn seeded(history: u64) -> (DurableDb, StatementLog) {
         let (db, log) = counting_memory_db().await.expect("counting db");
-        enqueue(&db, &[request("root", Vec::new())])
+        enqueue(&db, &[request("root", &[])])
             .await
             .expect("enqueue");
         // A long ledger built by real deliveries — every row
@@ -1726,8 +1802,8 @@ async fn demand_cost_stays_proportional_with_preexisting_history() {
     let (small, small_log) = seeded(3).await;
     let (large, large_log) = seeded(300).await;
     let root = task_id_on("root", TARGET);
-    assert_eq!(demand_of(&small, &root).await, 6);
-    assert_eq!(demand_of(&large, &root).await, 600);
+    assert_eq!(demand_of(&small, "root", TARGET).await, 6);
+    assert_eq!(demand_of(&large, "root", TARGET).await, 600);
 
     let small_issued = issued_new_batch(&small, &small_log).await;
     let large_issued = issued_new_batch(&large, &large_log).await;
@@ -1735,8 +1811,8 @@ async fn demand_cost_stays_proportional_with_preexisting_history() {
         small_issued, large_issued,
         "history never enters the request"
     );
-    assert_eq!(demand_of(&small, &root).await, 9);
-    assert_eq!(demand_of(&large, &root).await, 603);
+    assert_eq!(demand_of(&small, "root", TARGET).await, 9);
+    assert_eq!(demand_of(&large, "root", TARGET).await, 603);
 
     // Every batch-keyed predicate is an index probe, not a ledger
     // scan — on reprepare's staging clear and on the acceptance
@@ -1778,7 +1854,7 @@ async fn demand_cost_stays_proportional_with_preexisting_history() {
         .await
         .expect("re-deliver crashed batch");
     assert!(report.applied, "the reprepare accepts");
-    assert_eq!(demand_of(&small, &root).await, 16, "6 + 3 + 7");
+    assert_eq!(demand_of(&small, "root", TARGET).await, 16, "6 + 3 + 7");
     assert_eq!(batch_state(&small, "crashed").await, "accepted");
 }
 
@@ -1878,7 +1954,7 @@ async fn db_plan(db: &DurableDb, sql: &str, binds: &[&str]) -> Vec<String> {
 #[tokio::test]
 async fn demand_survives_resubmit_and_promotion() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("root", Vec::new())])
+    enqueue(&db, &[request("root", &[])])
         .await
         .expect("enqueue");
     apply(&db, "h0", vec![demand_entry("root", 9)])
@@ -1887,10 +1963,10 @@ async fn demand_survives_resubmit_and_promotion() {
 
     // Re-request: the enqueue path's key refresh recomputes value
     // with the demand operand.
-    enqueue(&db, &[request("root", Vec::new())])
+    enqueue(&db, &[request("root", &[])])
         .await
         .expect("resubmit");
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 9);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 9);
     let value = db
         .query("SELECT value FROM queue WHERE task_id = ?")
         .bind(task_id_on("root", TARGET))
@@ -1911,7 +1987,7 @@ async fn demand_survives_resubmit_and_promotion() {
     )
     .await
     .expect("promote");
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 9);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 9);
     let value = db
         .query("SELECT value FROM queue WHERE task_id = ?")
         .bind(task_id_on("root", TARGET))
@@ -1928,7 +2004,7 @@ async fn demand_survives_resubmit_and_promotion() {
 #[tokio::test]
 async fn demand_over_band_bound_fails_without_writes() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("root", Vec::new())])
+    enqueue(&db, &[request("root", &[])])
         .await
         .expect("enqueue");
 
@@ -1937,7 +2013,7 @@ async fn demand_over_band_bound_fails_without_writes() {
         .await
         .expect_err("over-bound demand must fail");
     assert!(error.to_string().contains("priority band"), "{error}");
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 0);
     assert_eq!(contribution_rows(&db, "h0").await, 0);
 
     // Exactly at the bound is admissible.
@@ -1948,16 +2024,13 @@ async fn demand_over_band_bound_fails_without_writes() {
     )
     .await
     .expect("at-bound demand");
-    assert_eq!(
-        demand_of(&db, &task_id_on("root", TARGET)).await,
-        super::PRIORITY_MAX
-    );
+    assert_eq!(demand_of(&db, "root", TARGET).await, super::PRIORITY_MAX);
 
     // A human-lane Windows root at the maximum wire delta: bands +
     // MAX(0,priority) + i64::MAX could not fit i64, so the typed
     // per-row bound must reject it *before* `raw_value` is
     // computed — never on the overflowed sum.
-    let mut human = request_on("hwin", WINDOWS_TARGET, Vec::new());
+    let mut human = request_on("hwin", WINDOWS_TARGET, &[]);
     human.source = EnqueueSource::HumanRequest;
     enqueue(&db, &[human]).await.expect("enqueue human root");
     let error = apply(
@@ -1972,7 +2045,7 @@ async fn demand_over_band_bound_fails_without_writes() {
     .await
     .expect_err("i64::MAX delta must fail the band bound");
     assert!(error.to_string().contains("priority band"), "{error}");
-    assert_eq!(demand_of(&db, &task_id_on("hwin", WINDOWS_TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "hwin", WINDOWS_TARGET).await, 0);
     assert_eq!(contribution_rows(&db, "h2").await, 0);
 }
 
@@ -1986,10 +2059,7 @@ async fn demand_conflicting_same_id_payload_fails_before_writes() {
     let db = memory_db().await.expect("memory db");
     enqueue(
         &db,
-        &[
-            request("root", vec![dependency("mid")]),
-            request("mid", Vec::new()),
-        ],
+        &[request("root", &[dependency("mid")]), request("mid", &[])],
     )
     .await
     .expect("enqueue");
@@ -2013,8 +2083,8 @@ async fn demand_conflicting_same_id_payload_fails_before_writes() {
     // Nothing moved: demands and the batch record are exactly
     // what the first delivery established — the staged set stayed
     // retired.
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 5);
-    assert_eq!(demand_of(&db, &task_id_on("mid", TARGET)).await, 5);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 5);
+    assert_eq!(demand_of(&db, "mid", TARGET).await, 5);
     assert_eq!(contribution_rows(&db, "h0").await, 0);
     assert_eq!(batch_rows(&db, "h0").await, 1);
 }
@@ -2028,10 +2098,7 @@ async fn demand_replay_uses_the_frozen_set_not_the_live_closure() {
     let db = memory_db().await.expect("memory db");
     enqueue(
         &db,
-        &[
-            request("leaf", Vec::new()),
-            request("root", vec![dependency("leaf")]),
-        ],
+        &[request("leaf", &[]), request("root", &[dependency("leaf")])],
     )
     .await
     .expect("enqueue");
@@ -2044,7 +2111,7 @@ async fn demand_replay_uses_the_frozen_set_not_the_live_closure() {
     // find no roots), and a new unbuilt task enters the closure —
     // `extra` is now a live `dep_met = 0` dep of `leaf`.
     mark_active(&db, "root", TARGET, "completed").await;
-    enqueue(&db, &[request("extra", Vec::new())])
+    enqueue(&db, &[request("extra", &[])])
         .await
         .expect("enqueue extra");
     db.query(
@@ -2062,7 +2129,7 @@ async fn demand_replay_uses_the_frozen_set_not_the_live_closure() {
         .expect("replay");
     assert!(!replay.applied);
     assert_eq!(replay.touched_tasks, 2);
-    assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "extra", TARGET).await, 0);
     // Acceptance already retired the staged rows — the frozen
     // answer lives in the header, not staging.
     assert_eq!(contribution_rows(&db, "h0").await, 0);
@@ -2075,7 +2142,7 @@ async fn demand_replay_uses_the_frozen_set_not_the_live_closure() {
 #[tokio::test]
 async fn demand_empty_accepted_batch_stays_empty() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("other", Vec::new())])
+    enqueue(&db, &[request("other", &[])])
         .await
         .expect("enqueue");
 
@@ -2088,7 +2155,7 @@ async fn demand_empty_accepted_batch_stays_empty() {
 
     // The root becoming eligible later does not retro-apply: the
     // frozen empty set is what replays.
-    enqueue(&db, &[request("absent", Vec::new())])
+    enqueue(&db, &[request("absent", &[])])
         .await
         .expect("enqueue late root");
     let replay = apply(&db, "h0", vec![demand_entry("absent", 9)])
@@ -2096,7 +2163,7 @@ async fn demand_empty_accepted_batch_stays_empty() {
         .expect("replay");
     assert!(!replay.applied);
     assert_eq!(replay.touched_tasks, 0);
-    assert_eq!(demand_of(&db, &task_id_on("absent", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "absent", TARGET).await, 0);
     assert_eq!(contribution_rows(&db, "h0").await, 0);
 
     apply(&db, "h0", vec![demand_entry("absent", 8)])
@@ -2116,10 +2183,7 @@ async fn demand_unaccepted_draft_retry_recomputes_the_live_closure() {
     let db = memory_db().await.expect("memory db");
     enqueue(
         &db,
-        &[
-            request("leaf", Vec::new()),
-            request("root", vec![dependency("leaf")]),
-        ],
+        &[request("leaf", &[]), request("root", &[dependency("leaf")])],
     )
     .await
     .expect("enqueue");
@@ -2128,24 +2192,30 @@ async fn demand_unaccepted_draft_retry_recomputes_the_live_closure() {
     // staged row exist, nothing accepted, nothing folded.
     let entries = vec![demand_entry("root", 9)];
     db_insert_batch_record(&db, "h0", &planted_input_hash(&entries), 2, "prepared").await;
-    db_insert_contribution(&db, &task_id_on("root", TARGET), "h0", 9).await;
+    db_insert_contribution(
+        &db,
+        &task_id_with("root", TARGET, &[dependency("leaf")]),
+        "h0",
+        9,
+    )
+    .await;
     db_insert_contribution(&db, &task_id_on("leaf", TARGET), "h0", 9).await;
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
-    assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 0);
+    assert_eq!(demand_of(&db, "leaf", TARGET).await, 0);
 
     // The graph moves before the retry: `leaf` completes (out of
     // the live closure) and `extra` joins it — while another
     // legitimate batch accepts against the same nodes, proof the
     // draft's staging reserved no demand.
     mark_active(&db, "leaf", TARGET, "completed").await;
-    enqueue(&db, &[request("extra", Vec::new())])
+    enqueue(&db, &[request("extra", &[])])
         .await
         .expect("enqueue extra");
     db.query(
         "INSERT INTO queue_dependencies \
              (task_id, depends_on_task_id, dep_met) VALUES (?, ?, 0)",
     )
-    .bind(task_id_on("root", TARGET))
+    .bind(task_id_with("root", TARGET, &[dependency("leaf")]))
     .bind(task_id_on("extra", TARGET))
     .execute()
     .await
@@ -2157,13 +2227,12 @@ async fn demand_unaccepted_draft_retry_recomputes_the_live_closure() {
     let retry = apply(&db, "h0", entries).await.expect("retry");
     assert!(retry.applied);
     assert_eq!(retry.touched_tasks, 2, "root + extra, not leaf");
-    let root = task_id_on("root", TARGET);
-    assert_eq!(demand_of(&db, &root).await, 12, "9 + 3 from h1");
-    assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 12);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 12, "9 + 3 from h1");
+    assert_eq!(demand_of(&db, "extra", TARGET).await, 12);
     // `leaf` completed before either acceptance: h1's live closure
     // skipped it, and the draft's staged row for it was cleared —
     // its demand is 0, not the staged 9.
-    assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "leaf", TARGET).await, 0);
     // The recomputed set accepted — and consumed its staging in
     // the same statement.
     assert_eq!(contribution_rows(&db, "h0").await, 0, "staged set retired");
@@ -2179,10 +2248,7 @@ async fn demand_failed_staging_leaves_no_fold_and_retries_cleanly() {
     let db = memory_db().await.expect("memory db");
     enqueue(
         &db,
-        &[
-            request("leaf", Vec::new()),
-            request("root", vec![dependency("leaf")]),
-        ],
+        &[request("leaf", &[]), request("root", &[dependency("leaf")])],
     )
     .await
     .expect("enqueue");
@@ -2191,11 +2257,17 @@ async fn demand_failed_staging_leaves_no_fold_and_retries_cleanly() {
     // and only part of the event's rows landed.
     let entries = vec![demand_entry("root", 5)];
     db_insert_batch_record(&db, "h0", &planted_input_hash(&entries), 2, "prepared").await;
-    db_insert_contribution(&db, &task_id_on("root", TARGET), "h0", 5).await;
+    db_insert_contribution(
+        &db,
+        &task_id_with("root", TARGET, &[dependency("leaf")]),
+        "h0",
+        5,
+    )
+    .await;
 
     // No acceptance happened, so no queue row moved and no demand
     // was reserved — a whole different batch accepts freely.
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 0);
     apply(&db, "h1", vec![demand_entry("root", 2)])
         .await
         .expect("independent batch");
@@ -2203,9 +2275,12 @@ async fn demand_failed_staging_leaves_no_fold_and_retries_cleanly() {
     let retry = apply(&db, "h0", entries).await.expect("retry");
     assert!(retry.applied);
     assert_eq!(retry.touched_tasks, 2);
-    let root = task_id_on("root", TARGET);
-    assert_eq!(demand_of(&db, &root).await, 7, "5 recomputed + 2 from h1");
-    assert_eq!(demand_of(&db, &task_id_on("leaf", TARGET)).await, 7);
+    assert_eq!(
+        demand_of(&db, "root", TARGET).await,
+        7,
+        "5 recomputed + 2 from h1"
+    );
+    assert_eq!(demand_of(&db, "leaf", TARGET).await, 7);
     assert_eq!(contribution_rows(&db, "h0").await, 0, "staged set retired");
 }
 
@@ -2218,10 +2293,7 @@ async fn demand_accepted_replay_writes_nothing_after_graph_changes() {
     let (db, log) = counting_memory_db().await.expect("counting db");
     enqueue(
         &db,
-        &[
-            request("leaf", Vec::new()),
-            request("root", vec![dependency("leaf")]),
-        ],
+        &[request("leaf", &[]), request("root", &[dependency("leaf")])],
     )
     .await
     .expect("enqueue");
@@ -2231,7 +2303,7 @@ async fn demand_accepted_replay_writes_nothing_after_graph_changes() {
     assert_eq!(first.touched_tasks, 2);
 
     mark_active(&db, "root", TARGET, "completed").await;
-    enqueue(&db, &[request("extra", Vec::new())])
+    enqueue(&db, &[request("extra", &[])])
         .await
         .expect("enqueue extra");
 
@@ -2246,8 +2318,8 @@ async fn demand_accepted_replay_writes_nothing_after_graph_changes() {
         issued.iter().all(|s| s.rows_written == 0),
         "an accepted replay must not write: {issued:?}"
     );
-    assert_eq!(demand_of(&db, &task_id_on("extra", TARGET)).await, 0);
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 4);
+    assert_eq!(demand_of(&db, "extra", TARGET).await, 0);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 4);
 }
 
 /// The acceptance statement is statement-atomic: force the
@@ -2259,7 +2331,7 @@ async fn demand_accepted_replay_writes_nothing_after_graph_changes() {
 #[tokio::test]
 async fn demand_acceptance_trigger_failure_rolls_back_everything() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("root", Vec::new())])
+    enqueue(&db, &[request("root", &[])])
         .await
         .expect("enqueue");
     let root = task_id_on("root", TARGET);
@@ -2283,13 +2355,17 @@ async fn demand_acceptance_trigger_failure_rolls_back_everything() {
     );
 
     assert_eq!(batch_state(&db, "h0").await, "prepared");
-    assert_eq!(demand_of(&db, &root).await, 0, "the fold rolled back");
+    assert_eq!(
+        demand_of(&db, "root", TARGET).await,
+        0,
+        "the fold rolled back"
+    );
     assert_eq!(contribution_rows(&db, "h0").await, 1);
 
     // And the retry path still works on the rolled-back draft.
     let report = apply(&db, "h0", entries).await.expect("retry");
     assert!(report.applied);
-    assert_eq!(demand_of(&db, &root).await, 9);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 9);
 }
 
 /// A closure whose serialized set would exceed the workerd 2 MiB
@@ -2347,14 +2423,23 @@ async fn demand_multi_chunk_closure_is_atomic_end_to_end() {
     let (db, _log) = counting_memory_db_raw().await.expect("counting db");
     let mut requests: Vec<EnqueueRequest> = Vec::with_capacity(CHAIN);
     for i in 0..CHAIN {
-        let deps = if i + 1 < CHAIN {
-            vec![dependency(&format!("chain-{}", i + 1))]
-        } else {
-            Vec::new()
-        };
-        requests.push(request(&format!("chain-{i}"), deps));
+        requests.push(request(&format!("chain-{i}"), &[]));
     }
     enqueue(&db, &requests).await.expect("enqueue chain");
+    // The chain's edges are hand-written: each request carries its
+    // real transitive subgraph on the wire, so 30k nested
+    // `EnqueueRequest`s would square the fixture for no coverage —
+    // the walk reads `queue_dependencies`, not the mint.
+    for i in 0..CHAIN - 1 {
+        db.query(
+            "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_met)                  VALUES (?, ?, 0)",
+        )
+        .bind(requests[i].task_id().expect("owner id"))
+        .bind(requests[i + 1].task_id().expect("dep id"))
+        .execute()
+        .await
+        .expect("chain edge");
+    }
 
     // The staged set this event would produce: one serialized
     // snapshot of it measures past the 2 MiB bound the old
@@ -2441,9 +2526,9 @@ async fn sabotage_later_chunk_then_recover(db: &DurableDb, chunks: &[String], ch
         "earlier chunks landed, the sabotaged one did not: {staged_so_far}"
     );
     assert_eq!(batch_state(db, "big").await, "prepared");
-    assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 0);
+    assert_eq!(demand_of(db, "chain-0", TARGET).await, 0);
     assert_eq!(
-        demand_of(db, &task_id_on(&format!("chain-{}", chain - 1), TARGET)).await,
+        demand_of(db, &format!("chain-{}", chain - 1), TARGET).await,
         0,
         "no queue fold without acceptance"
     );
@@ -2463,9 +2548,9 @@ async fn sabotage_later_chunk_then_recover(db: &DurableDb, chunks: &[String], ch
     // statement.
     assert_eq!(contribution_rows(db, "big").await, 0);
     assert_eq!(batch_state(db, "big").await, "accepted");
-    assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 2);
+    assert_eq!(demand_of(db, "chain-0", TARGET).await, 2);
     assert_eq!(
-        demand_of(db, &task_id_on(&format!("chain-{}", chain - 1), TARGET)).await,
+        demand_of(db, &format!("chain-{}", chain - 1), TARGET).await,
         2
     );
 
@@ -2476,7 +2561,7 @@ async fn sabotage_later_chunk_then_recover(db: &DurableDb, chunks: &[String], ch
         .expect("accepted replay");
     assert!(!replay.applied);
     assert_eq!(replay.touched_tasks, chain as u64);
-    assert_eq!(demand_of(db, &task_id_on("chain-0", TARGET)).await, 2);
+    assert_eq!(demand_of(db, "chain-0", TARGET).await, 2);
 }
 
 /// Persisted demand counts against the resubmit writer's band:
@@ -2487,12 +2572,9 @@ async fn sabotage_later_chunk_then_recover(db: &DurableDb, chunks: &[String], ch
 #[tokio::test]
 async fn demand_at_bound_then_rising_resubmit_is_refused() {
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("bound", Vec::new()), request("fine", Vec::new())],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("bound", &[]), request("fine", &[])])
+        .await
+        .expect("enqueue");
     apply(
         &db,
         "h0",
@@ -2502,7 +2584,7 @@ async fn demand_at_bound_then_rising_resubmit_is_refused() {
     .expect("at-bound demand");
 
     // downloads 1000 → new priority 1 > PRIORITY_MAX - demand = 0.
-    let mut resubmit = request("bound", Vec::new());
+    let mut resubmit = request("bound", &[]);
     resubmit.downloads = 1000;
     let error = enqueue(&db, &[resubmit])
         .await
@@ -2514,10 +2596,7 @@ async fn demand_at_bound_then_rising_resubmit_is_refused() {
 
     // Nothing changed: demand, downloads and request count are the
     // pre-resubmit values.
-    assert_eq!(
-        demand_of(&db, &task_id_on("bound", TARGET)).await,
-        super::PRIORITY_MAX
-    );
+    assert_eq!(demand_of(&db, "bound", TARGET).await, super::PRIORITY_MAX);
     let downloads: i64 = db
         .query("SELECT downloads FROM queue WHERE task_id = ?")
         .bind(task_id_on("bound", TARGET))
@@ -2534,7 +2613,7 @@ async fn demand_at_bound_then_rising_resubmit_is_refused() {
 
     // Below the bound the same resubmit is ordinary: the sibling
     // takes downloads 5000 → priority 5, demand still folded.
-    let mut ok = request("fine", Vec::new());
+    let mut ok = request("fine", &[]);
     ok.downloads = 5000;
     enqueue(&db, &[ok]).await.expect("below-bound resubmit");
     let priority: i64 = db
@@ -2563,7 +2642,7 @@ async fn demand_at_bound_human_resubmit_spends_no_budget() {
     }
 
     let db = memory_db().await.expect("memory db");
-    let mut human = request("bound", Vec::new());
+    let mut human = request("bound", &[]);
     human.source = EnqueueSource::HumanRequest;
     enqueue(&db, &[human.clone()]).await.expect("human enqueue");
     assert_eq!(spent(&db).await, 1, "the first submit charged once");
@@ -2589,10 +2668,7 @@ async fn demand_at_bound_human_resubmit_spends_no_budget() {
     assert_eq!(spent(&db).await, 1, "trusted path spends nothing either");
 
     // Queue state is the pre-resubmit truth.
-    assert_eq!(
-        demand_of(&db, &task_id_on("bound", TARGET)).await,
-        super::PRIORITY_MAX
-    );
+    assert_eq!(demand_of(&db, "bound", TARGET).await, super::PRIORITY_MAX);
     let downloads: i64 = db
         .query("SELECT downloads FROM queue WHERE task_id = ?")
         .bind(task_id_on("bound", TARGET))
@@ -2620,12 +2696,9 @@ async fn demand_orders_exactly_above_the_js_safe_integer() {
         value: i64,
     }
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("less", Vec::new()), request("more", Vec::new())],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("less", &[]), request("more", &[])])
+        .await
+        .expect("enqueue");
     let js_safe = 9_007_199_254_740_992_u64; // 2^53
     assert!(js_safe + 2 <= super::PRIORITY_MAX as u64);
     apply(
@@ -2669,7 +2742,7 @@ async fn demand_orders_exactly_above_the_js_safe_integer() {
 #[tokio::test]
 async fn demand_on_an_unknown_identity_is_a_noop() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("root", Vec::new())])
+    enqueue(&db, &[request("root", &[])])
         .await
         .expect("enqueue");
     let report = apply(&db, "h0", vec![demand_entry("absent", 5)])
@@ -2679,7 +2752,7 @@ async fn demand_on_an_unknown_identity_is_a_noop() {
     assert_eq!(report.touched_tasks, 0);
     assert_eq!(contribution_rows(&db, "h0").await, 0);
     assert_eq!(batch_state(&db, "h0").await, "accepted");
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 0);
 }
 
 /// Malformed batches fail at validation, before any queue read or
@@ -2688,7 +2761,7 @@ async fn demand_on_an_unknown_identity_is_a_noop() {
 #[tokio::test]
 async fn demand_rejects_malformed_batches() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("root", Vec::new())])
+    enqueue(&db, &[request("root", &[])])
         .await
         .expect("enqueue");
 
@@ -2709,7 +2782,7 @@ async fn demand_rejects_malformed_batches() {
     apply(&db, "h0", vec![demand_entry("root", u64::MAX)])
         .await
         .expect_err("u64 delta must fail");
-    assert_eq!(demand_of(&db, &task_id_on("root", TARGET)).await, 0);
+    assert_eq!(demand_of(&db, "root", TARGET).await, 0);
 }
 
 /// With the macOS slot count spent mid-pass, the pass skips the
@@ -2721,9 +2794,9 @@ async fn macos_cap_skips_macos_rows_but_claims_other_families() {
     enqueue(
         &db,
         &[
-            request_on("mac-one", MACOS_TARGET, Vec::new()),
-            request_on("mac-two", MACOS_TARGET, Vec::new()),
-            request_on("lin", TARGET, Vec::new()),
+            request_on("mac-one", MACOS_TARGET, &[]),
+            request_on("mac-two", MACOS_TARGET, &[]),
+            request_on("lin", TARGET, &[]),
         ],
     )
     .await
@@ -2760,10 +2833,10 @@ async fn macos_cap_skips_macos_rows_but_claims_other_families() {
 #[tokio::test]
 async fn windows_tasks_claim_before_linux_within_a_lane() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request_on("lin", TARGET, Vec::new())])
+    enqueue(&db, &[request_on("lin", TARGET, &[])])
         .await
         .expect("enqueue linux");
-    enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
+    enqueue(&db, &[request_on("win", WINDOWS_TARGET, &[])])
         .await
         .expect("enqueue windows");
     set_first_requested_at(&db, "lin", PAST_TS).await;
@@ -2789,8 +2862,8 @@ async fn saturated_macos_family_wakes_at_lease_expiry() {
     enqueue(
         &db,
         &[
-            request_on("mac-busy", MACOS_TARGET, Vec::new()),
-            request_on("mac-waiting", MACOS_TARGET, Vec::new()),
+            request_on("mac-busy", MACOS_TARGET, &[]),
+            request_on("mac-waiting", MACOS_TARGET, &[]),
         ],
     )
     .await
@@ -2821,14 +2894,14 @@ async fn saturated_macos_family_wakes_at_lease_expiry() {
 #[tokio::test]
 async fn human_lane_still_claims_first_regardless_of_family() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request_on("win", WINDOWS_TARGET, Vec::new())])
+    enqueue(&db, &[request_on("win", WINDOWS_TARGET, &[])])
         .await
         .expect("enqueue windows");
     enqueue(
         &db,
         &[EnqueueRequest {
             source: EnqueueSource::HumanRequest,
-            ..request_on("lin", TARGET, Vec::new())
+            ..request_on("lin", TARGET, &[])
         }],
     )
     .await
@@ -2853,7 +2926,7 @@ async fn a_target_no_runner_builds_never_enters_the_queue() {
     // dies before any job starts — no job, no log, no completion
     // report, and the slot held until the stale sweep reclaims it.
     let db = memory_db().await.expect("memory db");
-    let mut unrunnable = request("serde", Vec::new());
+    let mut unrunnable = request("serde", &[]);
     unrunnable.target = "aarch64-unknown-linux-musl"
         .parse()
         .expect("valid target triple");
@@ -2875,7 +2948,7 @@ async fn a_target_no_runner_builds_never_enters_the_queue() {
 async fn a_ci_target_still_enters_the_queue() {
     let db = memory_db().await.expect("memory db");
 
-    let inserted = enqueue(&db, &[request("serde", Vec::new())])
+    let inserted = enqueue(&db, &[request("serde", &[])])
         .await
         .expect("enqueue");
 
@@ -2891,25 +2964,19 @@ async fn a_ci_target_still_enters_the_queue() {
 async fn a_submit_reports_only_the_records_it_inserted() {
     let db = memory_db().await.expect("memory db");
 
-    let inserted = enqueue(
-        &db,
-        &[request("alpha", Vec::new()), request("beta", Vec::new())],
-    )
-    .await
-    .expect("enqueue pair");
+    let inserted = enqueue(&db, &[request("alpha", &[]), request("beta", &[])])
+        .await
+        .expect("enqueue pair");
     assert_eq!(inserted, 2);
 
-    let resync = enqueue(&db, &[request("alpha", Vec::new())])
+    let resync = enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("resync");
     assert_eq!(resync, 0, "a resync lands no new row");
 
-    let mixed = enqueue(
-        &db,
-        &[request("beta", Vec::new()), request("gamma", Vec::new())],
-    )
-    .await
-    .expect("mixed submit");
+    let mixed = enqueue(&db, &[request("beta", &[]), request("gamma", &[])])
+        .await
+        .expect("mixed submit");
     assert_eq!(mixed, 1, "only the newcomer counts");
 }
 
@@ -2928,12 +2995,14 @@ fn gate_pub_rows() -> Vec<stow_types::api::PublishedSliceRow> {
         .iter()
         .flat_map(|name| full().iter().map(|s| (name, *s)).collect::<Vec<_>>())
         .map(|(name, s)| stow_types::api::PublishedSliceRow {
+            dependency_identity: dep_identity(name),
             crate_name: name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
             unit_shape: Some(s),
         })
         .chain(std::iter::once(stow_types::api::PublishedSliceRow {
+            dependency_identity: dep_identity("dep-short"),
             crate_name: "dep-short".parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -2960,11 +3029,11 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
 
     // A transient failure leaves the unpublished dependency pending
     // behind its retry backoff, so its parent waits unblocked.
-    enqueue(&db, &[request("dep-failed", Vec::new())])
+    enqueue(&db, &[request("dep-failed", &[])])
         .await
         .expect("enqueue dep");
     fail_dependency_at_attempt(&db, "dep-failed", 1).await;
-    enqueue(&db, &[request("dep-fpub", Vec::new())])
+    enqueue(&db, &[request("dep-fpub", &[])])
         .await
         .expect("enqueue published dep");
     db.query("UPDATE queue SET status = 'failed' WHERE task_id = ?")
@@ -2999,14 +3068,17 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
             "INSERT INTO queue_dependencies \
                  (task_id, depends_on_task_id, dep_crate_name, dep_version, \
                   dep_features_json, dep_target, dep_rustc_version, \
-                  dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
-                 VALUES (?, ?, ?, '1.0.0', '[]', ?, ?, 0, ?, ?, ?)",
+                  dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_side_known) \
+                 VALUES (?, ?, ?, '1.0.0', '[]', ?, ?, 0, ?, ?, ?, ?)",
         )
         .bind(task_id_on("pair", TARGET))
         .bind(task_id_on(dep, TARGET))
         .bind(dep.to_owned())
         .bind(TARGET.to_owned())
         .bind(RUSTC.to_owned())
+        .bind(
+            dep_identity(dep).to_string(),
+        )
         .bind(invocations)
         .bind(shapes)
         .bind(side_known)
@@ -3027,13 +3099,13 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
     let inserted = enqueue(
         &db,
         &[
-            request("free", Vec::new()),
-            request("met", vec![dependency("dep-met")]),
-            request("short", vec![dependency("dep-short")]),
-            request("stalled", vec![dependency("dep-failed")]),
-            request("mystery", Vec::new()),
-            request("twin", vec![dependency("dep-met"), dependency("dep-short")]),
-            request("pair", Vec::new()),
+            request("free", &[]),
+            request("met", &[dependency("dep-met")]),
+            request("short", &[dependency("dep-short")]),
+            request("stalled", &[dependency("dep-failed")]),
+            request("mystery", &[]),
+            request("twin", &[dependency("dep-met"), dependency("dep-short")]),
+            request("pair", &[]),
         ],
     )
     .await
@@ -3053,10 +3125,18 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
         // cannot block, while the unmet edge still gates the owner.
         ("pair", 0, 0),
     ] {
+        let deps: Vec<EnqueueRequest> = match name {
+            "met" => vec![dependency("dep-met")],
+            "short" => vec![dependency("dep-short")],
+            "stalled" => vec![dependency("dep-failed")],
+            "twin" => vec![dependency("dep-met"), dependency("dep-short")],
+            _ => Vec::new(),
+        };
+        let id = task_id_with(name, TARGET, &deps);
         for (column, expected) in [("deps_met", deps_met), ("blocked", blocked)] {
             let stored = db
                 .query(&format!("SELECT {column} FROM queue WHERE task_id = ?"))
-                .bind(task_id_on(name, TARGET))
+                .bind(id.clone())
                 .fetch_scalar::<i64>()
                 .await
                 .expect("stored gate flag");
@@ -3072,7 +3152,7 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
 #[tokio::test]
 async fn failed_build_retries_behind_its_backoff() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("flaky", Vec::new())])
+    enqueue(&db, &[request("flaky", &[])])
         .await
         .expect("enqueue");
     set_first_requested_at(&db, "flaky", PAST_TS).await;
@@ -3116,7 +3196,7 @@ async fn failed_build_retries_behind_its_backoff() {
 
     // The backoff gates the retry — nothing claims it now — and a
     // re-request neither resurrects nor clears the gate.
-    enqueue(&db, &[request("flaky", Vec::new())])
+    enqueue(&db, &[request("flaky", &[])])
         .await
         .expect("re-request");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -3133,7 +3213,7 @@ async fn failed_build_retries_behind_its_backoff() {
 #[tokio::test]
 async fn failed_build_at_the_attempt_cap_parks_failed() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("flaky", Vec::new())])
+    enqueue(&db, &[request("flaky", &[])])
         .await
         .expect("enqueue");
     set_first_requested_at(&db, "flaky", PAST_TS).await;
@@ -3168,7 +3248,7 @@ async fn failed_build_at_the_attempt_cap_parks_failed() {
     );
 
     // A re-request is a no-op: `failed` never resurrects.
-    enqueue(&db, &[request("flaky", Vec::new())])
+    enqueue(&db, &[request("flaky", &[])])
         .await
         .expect("re-request");
     assert_eq!(row_column(&db, "flaky", "status").await, "failed");
@@ -3187,7 +3267,7 @@ async fn failed_build_at_the_attempt_cap_parks_failed() {
 #[tokio::test]
 async fn human_rerequest_resurrects_completed_and_claims() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("stale-glibc", Vec::new())])
+    enqueue(&db, &[request("stale-glibc", &[])])
         .await
         .expect("enqueue");
     set_first_requested_at(&db, "stale-glibc", PAST_TS).await;
@@ -3214,7 +3294,7 @@ async fn human_rerequest_resurrects_completed_and_claims() {
     .expect("complete");
 
     // A miss-lane re-request is a no-op against a completed row.
-    enqueue(&db, &[request("stale-glibc", Vec::new())])
+    enqueue(&db, &[request("stale-glibc", &[])])
         .await
         .expect("miss re-request");
     assert!(
@@ -3229,7 +3309,7 @@ async fn human_rerequest_resurrects_completed_and_claims() {
     // against — the rebuild claims.
     let human = EnqueueRequest {
         source: EnqueueSource::HumanRequest,
-        ..request("stale-glibc", Vec::new())
+        ..request("stale-glibc", &[])
     };
     super::enqueue_trusted(&db, &[human], &claim_settings())
         .await
@@ -3313,7 +3393,7 @@ async fn github_app_token_store_overwrites_singleton_row() {
 fn human_request(crate_name: &str) -> EnqueueRequest {
     EnqueueRequest {
         source: EnqueueSource::HumanRequest,
-        ..request(crate_name, Vec::new())
+        ..request(crate_name, &[])
     }
 }
 
@@ -3324,7 +3404,7 @@ fn human_request(crate_name: &str) -> EnqueueRequest {
 #[tokio::test]
 async fn a_preheat_re_request_does_not_rebuild_a_completed_task() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("alpha", Vec::new())])
+    enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -3344,7 +3424,7 @@ async fn a_preheat_re_request_does_not_rebuild_a_completed_task() {
         &db,
         &[EnqueueRequest {
             source: EnqueueSource::CrateUpdate,
-            ..request("alpha", Vec::new())
+            ..request("alpha", &[])
         }],
     )
     .await
@@ -3376,7 +3456,7 @@ async fn a_preheat_re_request_does_not_rebuild_a_completed_task() {
 #[tokio::test]
 async fn a_preheat_re_request_retries_a_failed_task() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("alpha", Vec::new())])
+    enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -3396,7 +3476,7 @@ async fn a_preheat_re_request_retries_a_failed_task() {
         &db,
         &[EnqueueRequest {
             source: EnqueueSource::CrateUpdate,
-            ..request("alpha", Vec::new())
+            ..request("alpha", &[])
         }],
     )
     .await
@@ -3422,11 +3502,11 @@ async fn claim_retires_tasks_the_catalog_already_covers() {
     enqueue(
         &db,
         &[
-            request("covered", Vec::new()),
-            request("uncovered", Vec::new()),
+            request("covered", &[]),
+            request("uncovered", &[]),
             EnqueueRequest {
                 preserve_lockfile: true,
-                ..request("lockfile", Vec::new())
+                ..request("lockfile", &[])
             },
         ],
     )
@@ -3465,7 +3545,7 @@ async fn claim_retires_tasks_the_catalog_already_covers() {
 }
 
 fn crate_task_id(crate_name: &str) -> String {
-    task_id(crate_name, VERSION, FEATURES, TARGET, RUSTC, false)
+    task_id_on(crate_name, TARGET)
 }
 
 /// Both rows are eligible to claim here: the miss row is aged past the
@@ -3474,7 +3554,7 @@ fn crate_task_id(crate_name: &str) -> String {
 #[tokio::test]
 async fn human_task_dispatches_before_older_miss_task() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("missed", Vec::new())])
+    enqueue(&db, &[request("missed", &[])])
         .await
         .expect("enqueue miss");
     enqueue(&db, &[human_request("asked")])
@@ -3495,7 +3575,7 @@ async fn human_task_dispatches_before_older_miss_task() {
 #[tokio::test]
 async fn human_task_bypasses_dispatch_min_age() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("missed", Vec::new())])
+    enqueue(&db, &[request("missed", &[])])
         .await
         .expect("enqueue miss");
     enqueue(&db, &[human_request("asked")])
@@ -3516,7 +3596,7 @@ async fn human_task_bypasses_dispatch_min_age() {
 #[tokio::test]
 async fn human_rerequest_promotes_miss_task() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("asked", Vec::new())])
+    enqueue(&db, &[request("asked", &[])])
         .await
         .expect("enqueue miss");
     let status = super::task_status(&db, &crate_task_id("asked"))
@@ -3541,7 +3621,7 @@ async fn miss_rerequest_never_demotes_human_task() {
     enqueue(&db, &[human_request("asked")])
         .await
         .expect("enqueue human");
-    enqueue(&db, &[request("asked", Vec::new())])
+    enqueue(&db, &[request("asked", &[])])
         .await
         .expect("re-request through miss path");
 
@@ -3591,12 +3671,9 @@ async fn pending_human_task_makes_alarm_eligible_now() {
 #[tokio::test]
 async fn status_reports_human_pending_separately() {
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("missed", Vec::new()), human_request("asked")],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("missed", &[]), human_request("asked")])
+        .await
+        .expect("enqueue");
 
     let status = super::status(&db).await.expect("status");
     assert_eq!(status.pending, 2);
@@ -3714,7 +3791,7 @@ async fn human_lane_position_orders_values_above_js_safe_integer() {
 #[tokio::test]
 async fn task_status_omits_position_outside_pending_human_lane() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("missed", Vec::new())])
+    enqueue(&db, &[request("missed", &[])])
         .await
         .expect("enqueue");
 
@@ -3739,10 +3816,10 @@ async fn task_status_omits_position_outside_pending_human_lane() {
 #[tokio::test]
 async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("alpha", Vec::new())])
+    enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
-    let id = task_id("alpha", VERSION, FEATURES, TARGET, RUSTC, false);
+    let id = task_id_on("alpha", TARGET);
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
@@ -3805,7 +3882,7 @@ async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
 #[tokio::test]
 async fn stale_report_for_a_superseded_attempt_leaves_the_live_row_untouched() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("alpha", Vec::new())])
+    enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -3880,7 +3957,7 @@ async fn stale_report_for_a_superseded_attempt_leaves_the_live_row_untouched() {
 #[tokio::test]
 async fn duplicate_report_for_the_current_attempt_conflicts() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("alpha", Vec::new())])
+    enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -3927,6 +4004,7 @@ async fn publish(db: &DurableDb, crate_name: &str) {
     let rows = [UnitKind::Linked, UnitKind::Unlinked]
         .iter()
         .map(|kind| stow_types::api::PublishedSliceRow {
+            dependency_identity: dep_identity(crate_name),
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -3945,6 +4023,7 @@ async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: 
     let rows = shapes
         .iter()
         .map(|shape| stow_types::api::PublishedSliceRow {
+            dependency_identity: dep_identity(crate_name),
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -3963,7 +4042,7 @@ async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: 
 #[tokio::test]
 async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -3984,7 +4063,7 @@ async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
     .await
     .expect("complete dep");
 
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -4011,7 +4090,7 @@ async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
 #[tokio::test]
 async fn dependent_waits_while_a_failed_dependency_retries() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -4034,7 +4113,7 @@ async fn dependent_waits_while_a_failed_dependency_retries() {
     // The dep is already `pending` behind its retry backoff —
     // retrying, not terminal — and the parent's submit is a no-op
     // against it.
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     assert_eq!(row_column(&db, "dep", "status").await, "pending");
@@ -4056,10 +4135,10 @@ async fn dependent_waits_while_a_failed_dependency_retries() {
 #[tokio::test]
 async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -4099,7 +4178,7 @@ async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
     // Stored status stays `pending`; the read paths surface `blocked`
     // with the failed dependency's task id.
     assert_eq!(row_column(&db, "parent", "status").await, "pending");
-    let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+    let parent = super::task_status(&db, &task_id_with("parent", TARGET, &[dependency("dep")]))
         .await
         .expect("read parent status")
         .expect("parent row");
@@ -4142,7 +4221,7 @@ async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
     assert_eq!(affected, 1, "only the failed dep moves");
     assert_eq!(row_column(&db, "dep", "status").await, "pending");
     assert_eq!(row_column(&db, "dep", "CAST(attempt AS TEXT)").await, "1");
-    let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+    let parent = super::task_status(&db, &task_id_with("parent", TARGET, &[dependency("dep")]))
         .await
         .expect("read parent status after retry")
         .expect("parent row");
@@ -4159,8 +4238,9 @@ async fn gate_counters(db: &DurableDb, crate_name: &str) -> (i64, i64) {
         deps_met: i64,
     }
     let counters = db
-        .query("SELECT unpublished_deps, deps_met FROM queue WHERE task_id = ?")
-        .bind(task_id_on(crate_name, TARGET))
+        .query("SELECT unpublished_deps, deps_met FROM queue                 WHERE crate_name = ? AND target = ?")
+        .bind(crate_name.to_owned())
+        .bind(TARGET)
         .fetch_one::<GateCounters>()
         .await
         .expect("read gate counters");
@@ -4196,6 +4276,7 @@ fn dep_slice_rows(crate_name: &str) -> Vec<stow_types::api::PublishedSliceRow> {
     [UnitKind::Linked, UnitKind::Unlinked]
         .iter()
         .map(|kind| stow_types::api::PublishedSliceRow {
+            dependency_identity: dep_identity(crate_name),
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -4213,10 +4294,7 @@ async fn enqueue_writes_each_edge_s_answer_and_counts_unpublished_deps() {
     let db = memory_db().await.expect("memory db");
     enqueue(
         &db,
-        &[
-            request("served-dep", Vec::new()),
-            request("absent-dep", Vec::new()),
-        ],
+        &[request("served-dep", &[]), request("absent-dep", &[])],
     )
     .await
     .expect("enqueue deps");
@@ -4226,7 +4304,7 @@ async fn enqueue_writes_each_edge_s_answer_and_counts_unpublished_deps() {
         &db,
         &[request(
             "parent",
-            vec![dependency("served-dep"), dependency("absent-dep")],
+            &[dependency("served-dep"), dependency("absent-dep")],
         )],
     )
     .await
@@ -4249,10 +4327,7 @@ async fn a_slice_delta_flips_the_matched_edges_and_moves_the_counter() {
     let db = memory_db().await.expect("memory db");
     enqueue(
         &db,
-        &[
-            request("first-dep", Vec::new()),
-            request("second-dep", Vec::new()),
-        ],
+        &[request("first-dep", &[]), request("second-dep", &[])],
     )
     .await
     .expect("enqueue deps");
@@ -4261,7 +4336,7 @@ async fn a_slice_delta_flips_the_matched_edges_and_moves_the_counter() {
         &db,
         &[request(
             "parent",
-            vec![dependency("first-dep"), dependency("second-dep")],
+            &[dependency("first-dep"), dependency("second-dep")],
         )],
     )
     .await
@@ -4309,10 +4384,10 @@ async fn a_slice_delta_flips_the_matched_edges_and_moves_the_counter() {
 #[tokio::test]
 async fn a_slice_delta_retire_flips_the_edges_back_and_increments_the_counter() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     publish(&db, "dep").await;
@@ -4374,15 +4449,21 @@ async fn fail_dependency_at_attempt(db: &DurableDb, name: &str, attempt: u32) {
     .expect("complete dependency failure");
 }
 
+/// The three-dep parent shape `fatal_blocker`/`net_zero` enqueue.
+fn parent_deps() -> Vec<EnqueueRequest> {
+    vec![
+        dependency("fatal-dep"),
+        dependency("dep-a"),
+        dependency("dep-b"),
+    ]
+}
+
 #[tokio::test]
 async fn net_zero_slice_flips_refresh_blocked_and_replays_preserve_counters() {
     let db = memory_db().await.expect("memory db");
     enqueue(
         &db,
-        &[
-            request("failed-dep", Vec::new()),
-            request("other-dep", Vec::new()),
-        ],
+        &[request("failed-dep", &[]), request("other-dep", &[])],
     )
     .await
     .expect("enqueue deps");
@@ -4391,7 +4472,7 @@ async fn net_zero_slice_flips_refresh_blocked_and_replays_preserve_counters() {
         &db,
         &[request(
             "parent",
-            vec![dependency("failed-dep"), dependency("other-dep")],
+            &[dependency("failed-dep"), dependency("other-dep")],
         )],
     )
     .await
@@ -4408,10 +4489,17 @@ async fn net_zero_slice_flips_refresh_blocked_and_replays_preserve_counters() {
         edge_flags(&db).await,
         vec![("failed-dep".to_owned(), 0), ("other-dep".to_owned(), 1),]
     );
-    let parent = super::task_status(&db, &task_id_on("parent", TARGET))
-        .await
-        .expect("read parent status")
-        .expect("parent row");
+    let parent = super::task_status(
+        &db,
+        &task_id_with(
+            "parent",
+            TARGET,
+            &[dependency("failed-dep"), dependency("other-dep")],
+        ),
+    )
+    .await
+    .expect("read parent status")
+    .expect("parent row");
     assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Blocked);
     assert_eq!(super::status(&db).await.expect("status").blocked, 1);
 
@@ -4444,9 +4532,9 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
     enqueue(
         &db,
         &[
-            request("fatal-dep", Vec::new()),
-            request("dep-a", Vec::new()),
-            request("dep-b", Vec::new()),
+            request("fatal-dep", &[]),
+            request("dep-a", &[]),
+            request("dep-b", &[]),
         ],
     )
     .await
@@ -4460,7 +4548,7 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
         &db,
         &[request(
             "parent",
-            vec![
+            &[
                 dependency("fatal-dep"),
                 dependency("dep-a"),
                 dependency("dep-b"),
@@ -4478,7 +4566,12 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
     assert_eq!(claimed[0].crate_name, "fatal-dep");
     fail_dependency_at_attempt(&db, "fatal-dep", super::MAX_BUILD_ATTEMPTS).await;
     assert_eq!(gate_counters(&db, "parent").await, (1, 0));
-    assert_parent_status(&db, stow_types::api::QueueTaskStatus::Blocked).await;
+    assert_parent_status(
+        &db,
+        stow_types::api::QueueTaskStatus::Blocked,
+        &parent_deps(),
+    )
+    .await;
 
     let mut retired = dep_slice_rows("dep-a");
     retired.extend(dep_slice_rows("dep-b"));
@@ -4494,7 +4587,12 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
     .await
     .expect("clear fatal and retire two nonfatal deps");
     assert_eq!(gate_counters(&db, "parent").await, (2, 0));
-    assert_parent_status(&db, stow_types::api::QueueTaskStatus::Pending).await;
+    assert_parent_status(
+        &db,
+        stow_types::api::QueueTaskStatus::Pending,
+        &parent_deps(),
+    )
+    .await;
 
     super::record_published_slice(
         &db,
@@ -4508,7 +4606,12 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
     .await
     .expect("reintroduce fatal blocker and serve nonfatal deps");
     assert_eq!(gate_counters(&db, "parent").await, (1, 0));
-    assert_parent_status(&db, stow_types::api::QueueTaskStatus::Blocked).await;
+    assert_parent_status(
+        &db,
+        stow_types::api::QueueTaskStatus::Blocked,
+        &parent_deps(),
+    )
+    .await;
 
     super::record_published_slice(
         &db,
@@ -4522,7 +4625,12 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
     .await
     .expect("retire a nonfatal dependency while fatal remains unmet");
     assert_eq!(gate_counters(&db, "parent").await, (2, 0));
-    assert_parent_status(&db, stow_types::api::QueueTaskStatus::Blocked).await;
+    assert_parent_status(
+        &db,
+        stow_types::api::QueueTaskStatus::Blocked,
+        &parent_deps(),
+    )
+    .await;
 }
 
 /// The counter stays live on non-pending rows: an edge flip against
@@ -4532,10 +4640,10 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
 #[tokio::test]
 async fn the_counter_tracks_flips_on_a_claimed_owner_too() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     mark_active(&db, "parent", TARGET, "dispatched").await;
@@ -4556,10 +4664,10 @@ async fn the_counter_tracks_flips_on_a_claimed_owner_too() {
 #[tokio::test]
 async fn dependent_is_not_blocked_by_a_failed_dependency_the_slice_already_serves() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     publish(&db, "dep").await;
@@ -4567,7 +4675,7 @@ async fn dependent_is_not_blocked_by_a_failed_dependency_the_slice_already_serve
     // The dependency's row is failed and republished — an operator
     // re-ran it after the slice went live and it failed again.
     mark_active(&db, "dep", TARGET, "failed").await;
-    let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+    let parent = super::task_status(&db, &task_id_with("parent", TARGET, &[dependency("dep")]))
         .await
         .expect("read parent status")
         .expect("parent row");
@@ -4586,10 +4694,10 @@ async fn dependent_is_not_blocked_by_a_failed_dependency_the_slice_already_serve
 #[tokio::test]
 async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -4656,10 +4764,10 @@ async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published(
 #[tokio::test]
 async fn republishing_a_slice_replaces_its_membership() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
-    enqueue(&db, &[request("later", vec![dependency("other")])])
+    enqueue(&db, &[request("later", &[dependency("other")])])
         .await
         .expect("enqueue later");
     publish(&db, "dep").await;
@@ -4686,20 +4794,13 @@ async fn republishing_a_slice_replaces_its_membership() {
 #[tokio::test]
 async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
-    let host_dep = EnqueueDependency {
-        crate_name: "heck".parse().expect("valid crate name"),
-        version: VERSION.parse().expect("valid semver"),
-        features_json: FeaturesJson::default(),
-        target: TARGET.parse().expect("valid target triple"),
-        rustc_version: RUSTC.parse().expect("valid rustc version"),
-        host_side: true,
-    };
+    let host_dep = host_dependency_on("wasm32-unknown-unknown", "heck");
     enqueue(
         &db,
         &[request_on(
             "consumer",
             "wasm32-unknown-unknown",
-            vec![host_dep],
+            &[host_dep],
         )],
     )
     .await
@@ -4747,15 +4848,8 @@ async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
 #[tokio::test]
 async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
-    let host_dep = EnqueueDependency {
-        crate_name: "heck".parse().expect("valid crate name"),
-        version: VERSION.parse().expect("valid semver"),
-        features_json: FeaturesJson::default(),
-        target: TARGET.parse().expect("valid target triple"),
-        rustc_version: RUSTC.parse().expect("valid rustc version"),
-        host_side: true,
-    };
-    enqueue(&db, &[request("consumer", vec![host_dep])])
+    let host_dep = host_dependency_on(TARGET, "heck");
+    enqueue(&db, &[request("consumer", &[host_dep])])
         .await
         .expect("enqueue consumer");
 
@@ -4800,15 +4894,8 @@ async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
 #[tokio::test]
 async fn a_host_side_dependent_needs_both_shapes_of_a_host_dep() {
     let db = memory_db().await.expect("memory db");
-    let host_dep = EnqueueDependency {
-        crate_name: "heck".parse().expect("valid crate name"),
-        version: VERSION.parse().expect("valid semver"),
-        features_json: FeaturesJson::default(),
-        target: TARGET.parse().expect("valid target triple"),
-        rustc_version: RUSTC.parse().expect("valid rustc version"),
-        host_side: true,
-    };
-    let mut owner = request("proc-macro-crate", vec![host_dep]);
+    let host_dep = host_dependency_on(TARGET, "heck");
+    let mut owner = request("proc-macro-crate", &[host_dep]);
     owner.host_side = true;
     enqueue(&db, &[owner])
         .await
@@ -4861,6 +4948,7 @@ async fn a_larger_slice_reports_whole() {
     let rows = (0..REPORT_ROWS)
         .flat_map(|index| {
             [UnitKind::Linked, UnitKind::Unlinked].map(|kind| stow_types::api::PublishedSliceRow {
+                dependency_identity: dep_identity(&format!("crate-{index}")),
                 crate_name: format!("crate-{index}").parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
@@ -4873,7 +4961,7 @@ async fn a_larger_slice_reports_whole() {
         .expect("record wide slice");
 
     let last = format!("crate-{}", REPORT_ROWS - 1);
-    enqueue(&db, &[request("parent", vec![dependency(&last)])])
+    enqueue(&db, &[request("parent", &[dependency(&last)])])
         .await
         .expect("enqueue parent");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -4898,8 +4986,8 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
     // above the committed one, then the writer dies before the flip.
     db.query(
         "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json) \
-             VALUES (?, ?, 2, 'stale', '1.0.0', '[]')",
+             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity) \
+             VALUES (?, ?, 2, 'stale', '1.0.0', '[]', 'd0deadbeef')",
     )
     .bind(TARGET.to_owned())
     .bind(RUSTC.to_owned())
@@ -4928,10 +5016,10 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
         "the live set is exactly the second report's rows, both shapes"
     );
 
-    enqueue(&db, &[request("stale-dep", vec![dependency("stale")])])
+    enqueue(&db, &[request("stale-dep", &[dependency("stale")])])
         .await
         .expect("enqueue stale dependent");
-    enqueue(&db, &[request("fresh-dep", vec![dependency("dep")])])
+    enqueue(&db, &[request("fresh-dep", &[dependency("dep")])])
         .await
         .expect("enqueue fresh dependent");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -4948,11 +5036,11 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
 #[tokio::test]
 async fn an_unresolvable_dependency_edge_reports_blocked_with_unknown_identity() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     db.query("UPDATE queue_dependencies SET dep_crate_name = '' WHERE task_id = ?")
-        .bind(task_id_on("parent", TARGET))
+        .bind(task_id_with("parent", TARGET, &[dependency("dep")]))
         .execute()
         .await
         .expect("erase dep identity");
@@ -4960,7 +5048,7 @@ async fn an_unresolvable_dependency_edge_reports_blocked_with_unknown_identity()
     // production writer of an unresolved identity is the dev-era
     // migration backfill, which recomputes the flag itself — replay
     // that owner refresh here.
-    super::refresh_deps_met_tasks(&db, &[task_id_on("parent", TARGET)])
+    super::refresh_deps_met_tasks(&db, &[task_id_with("parent", TARGET, &[dependency("dep")])])
         .await
         .expect("recompute blocked after identity erase");
 
@@ -4968,7 +5056,7 @@ async fn an_unresolvable_dependency_edge_reports_blocked_with_unknown_identity()
         .await
         .expect("claim with unknown edge");
     assert!(claimed.is_empty());
-    let parent = super::task_status(&db, &task_id_on("parent", TARGET))
+    let parent = super::task_status(&db, &task_id_with("parent", TARGET, &[dependency("dep")]))
         .await
         .expect("read parent status")
         .expect("parent row");
@@ -5076,7 +5164,7 @@ async fn seed_failed_retry_cycle(db: &DurableDb, id: &str, cycle: &str) {
 #[tokio::test]
 async fn two_retry_cycles_keep_distinct_failure_evidence() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("flaky", Vec::new())])
+    enqueue(&db, &[request("flaky", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("flaky", TARGET);
@@ -5130,7 +5218,7 @@ async fn two_retry_cycles_keep_distinct_failure_evidence() {
 #[tokio::test]
 async fn delayed_old_run_cannot_complete_new_bound_generation() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("flaky", Vec::new())])
+    enqueue(&db, &[request("flaky", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("flaky", TARGET);
@@ -5184,7 +5272,7 @@ async fn delayed_old_run_cannot_complete_new_bound_generation() {
 #[tokio::test]
 async fn early_completion_is_acknowledged_then_applied_after_exact_binding() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("early", Vec::new())])
+    enqueue(&db, &[request("early", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("early", TARGET);
@@ -5215,7 +5303,7 @@ async fn early_completion_is_acknowledged_then_applied_after_exact_binding() {
 #[tokio::test]
 async fn duplicate_early_delivery_is_idempotent_and_replay_conflicts_after_apply() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("replay", Vec::new())])
+    enqueue(&db, &[request("replay", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("replay", TARGET);
@@ -5247,7 +5335,7 @@ async fn duplicate_early_delivery_is_idempotent_and_replay_conflicts_after_apply
 #[tokio::test]
 async fn response_loss_reclaim_drops_unbound_event_before_new_claim() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("lost", Vec::new())])
+    enqueue(&db, &[request("lost", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("lost", TARGET);
@@ -5300,7 +5388,7 @@ async fn response_loss_reclaim_drops_unbound_event_before_new_claim() {
 #[tokio::test]
 async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("fenced", Vec::new())])
+    enqueue(&db, &[request("fenced", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("fenced", TARGET);
@@ -5378,7 +5466,7 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
 #[tokio::test]
 async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("purged", Vec::new())])
+    enqueue(&db, &[request("purged", &[])])
         .await
         .expect("enqueue A");
     let id = task_id_on("purged", TARGET);
@@ -5416,7 +5504,7 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
     )
     .await
     .expect("purge A");
-    enqueue(&db, &[request("purged", Vec::new())])
+    enqueue(&db, &[request("purged", &[])])
         .await
         .expect("enqueue B");
     let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -5458,7 +5546,7 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
 #[tokio::test]
 async fn late_failure_cannot_match_purged_recreated_generation() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("recreated", Vec::new())])
+    enqueue(&db, &[request("recreated", &[])])
         .await
         .expect("enqueue A");
     let id = task_id_on("recreated", TARGET);
@@ -5487,7 +5575,7 @@ async fn late_failure_cannot_match_purged_recreated_generation() {
     )
     .await
     .expect("purge A");
-    enqueue(&db, &[request("recreated", Vec::new())])
+    enqueue(&db, &[request("recreated", &[])])
         .await
         .expect("enqueue B");
     let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -5513,7 +5601,7 @@ async fn late_failure_cannot_match_purged_recreated_generation() {
 #[tokio::test]
 async fn binding_clears_orphan_pending_run_before_normal_completion() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("orphan", Vec::new())])
+    enqueue(&db, &[request("orphan", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("orphan", TARGET);
@@ -5561,7 +5649,7 @@ async fn binding_clears_orphan_pending_run_before_normal_completion() {
 #[tokio::test]
 async fn persisted_bound_pending_event_recovers_after_restart() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("restart", Vec::new())])
+    enqueue(&db, &[request("restart", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("restart", TARGET);
@@ -5605,13 +5693,13 @@ async fn full_queue_refuses_miss_lane_but_not_human_or_trusted() {
     };
     super::enqueue(
         &db,
-        &[request("one", Vec::new()), request("two", Vec::new())],
+        &[request("one", &[]), request("two", &[])],
         &cap_settings,
     )
     .await
     .expect("enqueue up to the cap");
 
-    let error = super::enqueue(&db, &[request("three", Vec::new())], &cap_settings)
+    let error = super::enqueue(&db, &[request("three", &[])], &cap_settings)
         .await
         .expect_err("a miss-lane submit over a full queue must be refused");
     assert!(matches!(
@@ -5624,7 +5712,7 @@ async fn full_queue_refuses_miss_lane_but_not_human_or_trusted() {
         .await
         .expect("human-lane enqueue bypasses the pending cap");
     // And so is a trusted (repo-writer) submit of miss-lane work.
-    super::enqueue_trusted(&db, &[request("four", Vec::new())], &cap_settings)
+    super::enqueue_trusted(&db, &[request("four", &[])], &cap_settings)
         .await
         .expect("trusted submit bypasses the pending cap");
     assert_eq!(super::status(&db).await.expect("status").pending, 4);
@@ -5666,7 +5754,7 @@ async fn human_daily_budget_refuses_the_submit_that_would_exceed_it() {
         .expect("a smaller submit still fits the remaining budget");
 
     // Miss-lane work never spends the human budget.
-    super::enqueue(&db, &[request("missed", Vec::new())], &budget_settings)
+    super::enqueue(&db, &[request("missed", &[])], &budget_settings)
         .await
         .expect("miss-lane enqueue is not budget-gated");
     // …and a submit bigger than the whole budget fails without
@@ -5695,18 +5783,15 @@ async fn human_daily_budget_refuses_the_submit_that_would_exceed_it() {
 #[tokio::test]
 async fn tasks_status_surfaces_lockfile() {
     let db = memory_db().await.expect("memory db");
-    let mut locked = request("locked", Vec::new());
+    let mut locked = request("locked", &[]);
     locked.preserve_lockfile = true;
-    enqueue(&db, &[request("plain", Vec::new()), locked])
+    enqueue(&db, &[request("plain", &[]), locked])
         .await
         .expect("enqueue");
 
     let statuses = super::tasks_status(
         &db,
-        &[
-            task_id("plain", VERSION, FEATURES, TARGET, RUSTC, false),
-            task_id("locked", VERSION, FEATURES, TARGET, RUSTC, false),
-        ],
+        &[task_id_on("plain", TARGET), task_id_on("locked", TARGET)],
     )
     .await
     .expect("tasks status");
@@ -5739,17 +5824,21 @@ fn filter_selector(selector: stow_types::api::QueueSelector) -> stow_types::api:
 
 /// One column of one queue row, for post-mutation assertions.
 async fn row_column(db: &DurableDb, crate_name: &str, column: &str) -> String {
-    db.query(&format!("SELECT {column} FROM queue WHERE task_id = ?"))
-        .bind(task_id_on(crate_name, TARGET))
-        .fetch_scalar::<String>()
-        .await
-        .expect("row column")
+    db.query(&format!(
+        "SELECT {column} FROM queue WHERE crate_name = ? AND target = ?"
+    ))
+    .bind(crate_name.to_owned())
+    .bind(TARGET)
+    .fetch_scalar::<String>()
+    .await
+    .expect("row column")
 }
 
 /// Whether a queue row exists at all — purge assertions.
 async fn row_exists(db: &DurableDb, crate_name: &str) -> bool {
-    db.query("SELECT count(*) FROM queue WHERE task_id = ?")
-        .bind(task_id_on(crate_name, TARGET))
+    db.query("SELECT count(*) FROM queue WHERE crate_name = ? AND target = ?")
+        .bind(crate_name.to_owned())
+        .bind(TARGET)
         .fetch_scalar::<i64>()
         .await
         .expect("row count")
@@ -5759,12 +5848,9 @@ async fn row_exists(db: &DurableDb, crate_name: &str) -> bool {
 #[tokio::test]
 async fn list_tasks_filters_by_status_crate_and_ids() {
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("alpha", Vec::new()), request("beta", Vec::new())],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("alpha", &[]), request("beta", &[])])
+        .await
+        .expect("enqueue");
     mark_active(&db, "beta", TARGET, "failed").await;
 
     let failed = super::list_tasks(
@@ -5801,12 +5887,9 @@ async fn list_tasks_filters_by_status_crate_and_ids() {
 #[tokio::test]
 async fn retry_returns_failed_rows_to_pending() {
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("alpha", Vec::new()), request("beta", Vec::new())],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("alpha", &[]), request("beta", &[])])
+        .await
+        .expect("enqueue");
     mark_active(&db, "alpha", TARGET, "failed").await;
     db.query("UPDATE queue SET error_msg = 'boom' WHERE task_id = ?")
         .bind(task_id_on("alpha", TARGET))
@@ -5840,9 +5923,9 @@ async fn retry_returns_failed_rows_to_pending_with_a_fresh_attempt() {
     enqueue(
         &db,
         &[
-            request("alpha", Vec::new()),
-            request("beta", Vec::new()),
-            request("gamma", Vec::new()),
+            request("alpha", &[]),
+            request("beta", &[]),
+            request("gamma", &[]),
         ],
     )
     .await
@@ -5885,26 +5968,19 @@ async fn retry_returns_failed_rows_to_pending_with_a_fresh_attempt() {
 #[tokio::test]
 async fn retry_selects_by_rustc_and_target() {
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("alpha", Vec::new()), request("beta", Vec::new())],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("alpha", &[]), request("beta", &[])])
+        .await
+        .expect("enqueue");
     mark_active(&db, "alpha", TARGET, "failed").await;
     mark_active(&db, "beta", TARGET, "failed").await;
     // A failed row at a different rustc — the selector must not
     // reach it.
-    let other_rustc = task_id("other-rustc", VERSION, FEATURES, TARGET, "1.86.0", false);
-    enqueue(
-        &db,
-        &[EnqueueRequest {
-            rustc_version: "1.86.0".parse().expect("rustc"),
-            ..request("other-rustc", Vec::new())
-        }],
-    )
-    .await
-    .expect("enqueue other-rustc");
+    let other = EnqueueRequest {
+        rustc_version: "1.86.0".parse().expect("rustc"),
+        ..request("other-rustc", &[])
+    };
+    let other_rustc = other.task_id().expect("other-rustc task id");
+    enqueue(&db, &[other]).await.expect("enqueue other-rustc");
     db.query("UPDATE queue SET status = 'failed' WHERE task_id = ?")
         .bind(other_rustc.clone())
         .execute()
@@ -5943,9 +6019,9 @@ async fn cancel_fails_pending_and_dispatched_rows() {
     enqueue(
         &db,
         &[
-            request("alpha", Vec::new()),
-            request("beta", Vec::new()),
-            request("gamma", Vec::new()),
+            request("alpha", &[]),
+            request("beta", &[]),
+            request("gamma", &[]),
         ],
     )
     .await
@@ -5989,18 +6065,11 @@ async fn cancel_fails_pending_and_dispatched_rows() {
 #[tokio::test]
 async fn promote_moves_miss_lane_pending_to_human() {
     let db = memory_db().await.expect("memory db");
-    let mut human = request("human", Vec::new());
+    let mut human = request("human", &[]);
     human.source = EnqueueSource::HumanRequest;
-    enqueue(
-        &db,
-        &[
-            request("alpha", Vec::new()),
-            request("beta", Vec::new()),
-            human,
-        ],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("alpha", &[]), request("beta", &[]), human])
+        .await
+        .expect("enqueue");
     mark_active(&db, "beta", TARGET, "dispatched").await;
 
     let affected = super::apply_mutation(
@@ -6027,10 +6096,10 @@ async fn purge_deletes_only_old_terminal_rows() {
     enqueue(
         &db,
         &[
-            request("old-done", Vec::new()),
-            request("old-failed", Vec::new()),
-            request("fresh-failed", Vec::new()),
-            request("live", Vec::new()),
+            request("old-done", &[]),
+            request("old-failed", &[]),
+            request("fresh-failed", &[]),
+            request("live", &[]),
         ],
     )
     .await
@@ -6079,7 +6148,7 @@ async fn purge_deletes_only_old_terminal_rows() {
 #[tokio::test]
 async fn mutations_reject_an_empty_selector() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("alpha", Vec::new())])
+    enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
     let denied = super::apply_mutation(
@@ -6096,15 +6165,11 @@ async fn mutations_reject_an_empty_selector() {
 #[tokio::test]
 async fn admin_status_reports_lanes_in_flight_and_targets() {
     let db = memory_db().await.expect("memory db");
-    let mut human = request("human", Vec::new());
+    let mut human = request("human", &[]);
     human.source = EnqueueSource::HumanRequest;
     enqueue(
         &db,
-        &[
-            request("miss-a", Vec::new()),
-            request("miss-b", Vec::new()),
-            human,
-        ],
+        &[request("miss-a", &[]), request("miss-b", &[]), human],
     )
     .await
     .expect("enqueue");
@@ -6437,7 +6502,7 @@ async fn assert_migrated_outcome_history(db: &DurableDb) {
 #[tokio::test]
 async fn migrate_migrates_a_dev_era_queue_and_backfills_edge_masks() {
     let db = memory_db_raw().await.expect("raw memory db");
-    let owner = task_id_on("parent", TARGET);
+    let owner = task_id_with("parent", TARGET, &[dependency("dep")]);
     let dep = task_id_on("dep", TARGET);
     seed_legacy_inflight_claims(&db, &owner, &dep).await;
 
@@ -6652,8 +6717,8 @@ async fn migrate_derives_dev_era_edge_sides_from_triples() {
     for (index, (owner_target, dep_target)) in cases.iter().enumerate() {
         let owner = format!("owner{index}");
         let dep = format!("dep{index}");
-        let owner_id = task_id(&owner, VERSION, FEATURES, owner_target, RUSTC, false);
-        let dep_id = task_id(&dep, VERSION, FEATURES, dep_target, RUSTC, false);
+        let owner_id = task_id_on(&owner, owner_target);
+        let dep_id = task_id_on(&dep, dep_target);
         db.query(
                 "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version) \
                  VALUES (?, ?, '1.0.0', '[]', ?, '1.85.0'), (?, ?, '1.0.0', '[]', ?, '1.85.0')",
@@ -6857,11 +6922,7 @@ async fn a_saturated_macos_backlog_does_not_starve_other_families() {
         + 1;
     let mut requests = Vec::with_capacity(overflow);
     for index in 0..overflow {
-        requests.push(request_on(
-            &format!("mac{index:05}"),
-            MACOS_TARGET,
-            Vec::new(),
-        ));
+        requests.push(request_on(&format!("mac{index:05}"), MACOS_TARGET, &[]));
     }
     // The backlog exceeds `max_queue_pending` — the trusted route
     // skips the cap, which is also how production's backlog got
@@ -6869,7 +6930,7 @@ async fn a_saturated_macos_backlog_does_not_starve_other_families() {
     super::enqueue_trusted(&db, &requests, &settings())
         .await
         .expect("enqueue macos backlog");
-    super::enqueue_trusted(&db, &[request_on("lin", TARGET, Vec::new())], &settings())
+    super::enqueue_trusted(&db, &[request_on("lin", TARGET, &[])], &settings())
         .await
         .expect("enqueue linux");
     // Order the macOS backlog strictly ahead of the Linux row in
@@ -6913,7 +6974,7 @@ async fn a_saturated_macos_backlog_does_not_starve_other_families() {
 async fn a_small_slot_pass_reads_one_page_not_the_frontier() {
     let (db, log) = counting_memory_db().await.expect("counting db");
     let requests: Vec<EnqueueRequest> = (0..2_000)
-        .map(|i| request(&format!("frontier-{i:04}"), Vec::new()))
+        .map(|i| request(&format!("frontier-{i:04}"), &[]))
         .collect();
     // The backlog sits at `max_queue_pending`; the trusted route
     // admits it regardless.
@@ -6962,12 +7023,23 @@ async fn a_small_slot_pass_reads_one_page_not_the_frontier() {
 #[tokio::test]
 async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    // Owner on iOS, dep on the macOS family's host triple — the
+    // unambiguous case `derive_edge_side` resolves to a host unit.
+    let dep = host_dependency_on("aarch64-apple-ios", "dep");
+    let host_target = dep.target.as_str().to_owned();
+    enqueue(&db, std::slice::from_ref(&dep))
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
-        .await
-        .expect("enqueue parent");
+    enqueue(
+        &db,
+        &[request_on(
+            "parent",
+            "aarch64-apple-ios",
+            std::slice::from_ref(&dep),
+        )],
+    )
+    .await
+    .expect("enqueue parent");
     // The spelling the migration writes on an edge whose required
     // side it could not derive.
     db.query("UPDATE queue_dependencies SET dep_host_side = -1")
@@ -6993,25 +7065,61 @@ async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
     )
     .await
     .expect("complete dep");
-    publish(&db, "dep").await;
+    publish_shapes(
+        &db,
+        "dep",
+        &host_target,
+        &[
+            shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+            shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+            shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+            shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+        ],
+    )
+    .await;
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim with unestablished edge");
     assert!(claimed.is_empty(), "a -1 edge satisfies no published row");
 
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    // The request path never rewrites edges: a task id's edge set is a
+    // function of the id (stow#588), so a resubmit of the same id
+    // carries nothing new — the failing-closed row is the migration's
+    // job, and it stamps `dep_side_known = 0` to mark that.
+    db.query("UPDATE queue_dependencies SET dep_side_known = 0")
+        .execute()
         .await
-        .expect("re-request parent resyncs the edge");
+        .expect("stamp edge side unknown");
+    enqueue(
+        &db,
+        &[request_on(
+            "parent",
+            "aarch64-apple-ios",
+            std::slice::from_ref(&dep),
+        )],
+    )
+    .await
+    .expect("re-request parent leaves the edge alone");
     let side = db
         .query("SELECT dep_host_side FROM queue_dependencies")
         .fetch_scalar::<i64>()
         .await
         .expect("edge side");
-    assert_eq!(side, 0);
+    assert_eq!(side, -1, "the request path does not repair edges");
+
+    super::derive_dev_era_edge_sides(&db)
+        .await
+        .expect("migration derives the edge side");
+    let side = db
+        .query("SELECT dep_host_side FROM queue_dependencies")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("edge side");
+    assert_eq!(side, 1);
 
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
         .await
-        .expect("claim after resync");
+        .expect("claim after migration resync");
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].crate_name, "parent");
 }
@@ -7024,10 +7132,10 @@ async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
 #[tokio::test]
 async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", vec![dependency("dep")])])
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
     mark_active(&db, "dep", TARGET, "completed").await;
@@ -7108,7 +7216,7 @@ async fn queue_counters(db: &DurableDb, crate_name: &str) -> QueueCounters {
 /// Seed a row as failed with known counters so the assertions about
 /// what one chunk did to it are exact.
 async fn seed_failed(db: &DurableDb, crate_name: &str, attempt: i64, request_count: i64) {
-    enqueue(db, &[request(crate_name, Vec::new())])
+    enqueue(db, &[request(crate_name, &[])])
         .await
         .expect("seed enqueue");
     db.query(
@@ -7136,9 +7244,9 @@ async fn a_chunk_never_revives_a_failed_dependency() {
     enqueue(
         &db,
         &[
-            request("p1", vec![dependency("dep")]),
-            request("p2", vec![dependency("dep")]),
-            request("p3", vec![dependency("dep")]),
+            request("p1", &[dependency("dep")]),
+            request("p2", &[dependency("dep")]),
+            request("p3", &[dependency("dep")]),
         ],
     )
     .await
@@ -7166,10 +7274,7 @@ async fn dep_request_never_revives_a_failed_dep_in_one_chunk() {
 
     enqueue(
         &db,
-        &[
-            request("dep", Vec::new()),
-            request("parent", vec![dependency("dep")]),
-        ],
+        &[request("dep", &[]), request("parent", &[dependency("dep")])],
     )
     .await
     .expect("enqueue dep then parent");
@@ -7196,10 +7301,7 @@ async fn parent_request_before_its_failed_dep_in_one_chunk() {
 
     enqueue(
         &db,
-        &[
-            request("parent", vec![dependency("dep")]),
-            request("dep", Vec::new()),
-        ],
+        &[request("parent", &[dependency("dep")]), request("dep", &[])],
     )
     .await
     .expect("enqueue parent then dep");
@@ -7227,9 +7329,9 @@ async fn a_submit_chunk_issues_a_constant_statement_count() {
         .map(|i| {
             request(
                 &format!("req-{i}"),
-                (0..3)
+                &(0..3)
                     .map(|k| dependency(&format!("dep-{i}-{k}")))
-                    .collect(),
+                    .collect::<Vec<_>>(),
             )
         })
         .collect();
@@ -7240,14 +7342,16 @@ async fn a_submit_chunk_issues_a_constant_statement_count() {
         .expect("enqueue chunk");
 
     let issued = log.lock().expect("log").len() - base;
-    // Eight: edge delete + edge insert + edge-flag probe + task
-    // insert + task update + dep-requeue + `deps_met` refresh +
-    // `dispatch_key` refresh, each a single statement over the
-    // whole chunk regardless of request count.
+    // Ten: node-store upsert (two bounded json_each batches over the
+    // chunk's ~3000-node batch) + edge delete + edge insert +
+    // edge-flag probe + task insert + task update + dep-requeue +
+    // `deps_met` refresh + `dispatch_key` refresh, each a bounded
+    // statement count over the whole chunk regardless of request
+    // count.
     assert!(
-        issued <= 8,
+        issued <= 10,
         "a 1000-request chunk must stay a constant statement count \
-             (measured 8), got {issued}"
+             (measured 10), got {issued}"
     );
 }
 
@@ -7278,7 +7382,7 @@ async fn seed_outcomes(
     // own retry backoff already hides it from the claim this
     // seeding is about to run.
     let requests: Vec<EnqueueRequest> = (0..count)
-        .map(|i| request_on(&format!("outcome-{batch}-{i}"), target, Vec::new()))
+        .map(|i| request_on(&format!("outcome-{batch}-{i}"), target, &[]))
         .collect();
     super::enqueue_trusted(db, &requests, &wide_claim_settings())
         .await
@@ -7347,7 +7451,7 @@ async fn freeze_gates_dispatch_but_not_enqueue_and_clear_resumes() {
         .expect("set freeze");
 
     // Enqueue is unaffected — misses keep arriving.
-    enqueue(&db, &[request("frozen-miss", Vec::new())])
+    enqueue(&db, &[request("frozen-miss", &[])])
         .await
         .expect("enqueue while frozen");
     // Dispatch is not: the claim gate answers empty no matter what
@@ -7515,7 +7619,7 @@ async fn a_completion_reads_a_constant_row_count_as_the_window_fills() {
         // The measured completion: a live task reports a failure,
         // then the trip evaluation runs — the production handler's
         // exact read path.
-        enqueue(&db, &[request("measured", Vec::new())])
+        enqueue(&db, &[request("measured", &[])])
             .await
             .expect("enqueue");
         let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -7572,15 +7676,15 @@ fn resolved_report(attempt: u32, crate_name: &str) -> stow_types::api::RequestOu
     use stow_types::api::{RequestOutcome, RequestOutcomeReport, RequestRootOutcome};
     let task = EnqueueRequest {
         source: EnqueueSource::HumanRequest,
-        ..request(crate_name, vec![dependency("dep")])
+        ..request(crate_name, &[dependency("dep")])
     };
     RequestOutcomeReport {
         attempt,
         outcome: RequestOutcome::Resolved {
-            tasks: vec![task],
+            tasks: vec![task.clone()],
             roots: vec![RequestRootOutcome {
                 target: TARGET.parse().expect("target"),
-                task_id: Some(task_id_on(crate_name, TARGET)),
+                task_id: Some(task.task_id().expect("resolved task id")),
                 cached: false,
             }],
         },
@@ -7734,7 +7838,7 @@ async fn request_run_update_refuses_a_stale_attempt() {
 #[tokio::test]
 async fn request_outcome_enqueues_and_settles_the_record() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", Vec::new())])
+    enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
     let admission = admission("req-crate");
@@ -7760,13 +7864,13 @@ async fn request_outcome_enqueues_and_settles_the_record() {
     // The root task landed as a pending human-lane row.
     let lane: String = db
         .query("SELECT lane FROM queue WHERE task_id = ?")
-        .bind(task_id_on("req-crate", TARGET))
+        .bind(task_id_with("req-crate", TARGET, &[dependency("dep")]))
         .fetch_scalar::<String>()
         .await
         .expect("read task lane");
     let status_row: String = db
         .query("SELECT status FROM queue WHERE task_id = ?")
-        .bind(task_id_on("req-crate", TARGET))
+        .bind(task_id_with("req-crate", TARGET, &[dependency("dep")]))
         .fetch_scalar::<String>()
         .await
         .expect("read task status");
@@ -7922,7 +8026,7 @@ async fn sample_count(db: &DurableDb, crate_name: &str) -> i64 {
 #[tokio::test]
 async fn build_duration_samples_the_immutable_claim_instant() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("durable", Vec::new())])
+    enqueue(&db, &[request("durable", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("durable", TARGET);
@@ -7944,7 +8048,7 @@ async fn build_duration_samples_the_immutable_claim_instant() {
     let pinned = row_column(&db, "durable", "claimed_at").await;
     // The resubmission: `apply_batched_updates` rewrites
     // `updated_at` on the in-flight row.
-    enqueue(&db, &[request("durable", Vec::new())])
+    enqueue(&db, &[request("durable", &[])])
         .await
         .expect("in-flight resubmission");
     let claimed_at = row_column(&db, "durable", "claimed_at").await;
@@ -7982,7 +8086,7 @@ async fn build_duration_samples_the_immutable_claim_instant() {
 #[tokio::test]
 async fn deferred_completion_measures_duration_at_received_at() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("deferred", Vec::new())])
+    enqueue(&db, &[request("deferred", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("deferred", TARGET);
@@ -8038,7 +8142,7 @@ async fn deferred_completion_measures_duration_at_received_at() {
 #[tokio::test]
 async fn backward_completion_span_fails_without_polluting_stats() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("skewed", Vec::new())])
+    enqueue(&db, &[request("skewed", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("skewed", TARGET);
@@ -8120,11 +8224,11 @@ async fn reentry_fixture() -> (DurableDb, String) {
     enqueue(
         &db,
         &[
-            request("retried", Vec::new()),
-            request("failed-dispatch", Vec::new()),
-            request("stale", Vec::new()),
-            request("shaped", Vec::new()),
-            request("waiter", vec![dependency("shaped")]),
+            request("retried", &[]),
+            request("failed-dispatch", &[]),
+            request("stale", &[]),
+            request("shaped", &[]),
+            request("waiter", &[dependency("shaped")]),
         ],
     )
     .await
@@ -8264,10 +8368,10 @@ async fn build_stats_median_is_a_real_median_over_a_bounded_window() {
     let versions = ["1.0.0", "1.1.0", "1.2.0"];
     let minutes = [1, 2, 100];
     for (version, minutes_ago) in versions.iter().zip(minutes) {
-        let mut request = request_on("median", TARGET, Vec::new());
+        let mut request = request_on("median", TARGET, &[]);
         request.version = version.parse().expect("semver");
+        let id = request.task_id().expect("request task id");
         enqueue(&db, &[request]).await.expect("enqueue");
-        let id = stow_types::api::task_id("median", version, FEATURES, TARGET, RUSTC, false);
         complete_success_at_minutes(&db, &id, &format!("run-{version}"), minutes_ago).await;
     }
     let stats = build_stats(&db, "median").await.expect("stats row");
@@ -8282,10 +8386,10 @@ async fn build_stats_median_is_a_real_median_over_a_bounded_window() {
     // completions to overflow it leave exactly the bound.
     for round in 0..(super::BUILD_SAMPLE_WINDOW + 3) {
         let version = format!("2.0.{round}");
-        let mut request = request_on("median", TARGET, Vec::new());
+        let mut request = request_on("median", TARGET, &[]);
         request.version = version.parse().expect("semver");
+        let id = request.task_id().expect("request task id");
         enqueue(&db, &[request]).await.expect("enqueue");
-        let id = stow_types::api::task_id("median", &version, FEATURES, TARGET, RUSTC, false);
         complete_success_at_minutes(&db, &id, &format!("run-b{round}"), 3).await;
     }
     assert_eq!(
@@ -8305,7 +8409,7 @@ async fn build_stats_median_is_a_real_median_over_a_bounded_window() {
 #[tokio::test]
 async fn stale_duplicate_and_failed_reports_never_sample() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("fenced", Vec::new())])
+    enqueue(&db, &[request("fenced", &[])])
         .await
         .expect("enqueue");
     let id = task_id_on("fenced", TARGET);
@@ -8350,7 +8454,7 @@ async fn stale_duplicate_and_failed_reports_never_sample() {
         "rejected reports added no samples"
     );
 
-    enqueue(&db, &[request("failonly", Vec::new())])
+    enqueue(&db, &[request("failonly", &[])])
         .await
         .expect("enqueue");
     let fail_id = task_id_on("failonly", TARGET);
@@ -8393,11 +8497,11 @@ async fn cheaper_expected_build_claims_first_inside_a_band() {
     .expect("seed pricey stats");
     let expensive = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
-        ..request("pricey", Vec::new())
+        ..request("pricey", &[])
     };
     let cheap = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
-        ..request("cheap", Vec::new())
+        ..request("cheap", &[])
     };
     enqueue(&db, &[expensive, cheap]).await.expect("enqueue");
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -8419,11 +8523,11 @@ async fn cheaper_expected_build_claims_first_inside_a_band() {
     let human = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
         source: EnqueueSource::HumanRequest,
-        ..request("hpricey", Vec::new())
+        ..request("hpricey", &[])
     };
     let miss = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
-        ..request("mcheap", Vec::new())
+        ..request("mcheap", &[])
     };
     super::enqueue_trusted(&db, &[human, miss], &settings())
         .await
@@ -8444,11 +8548,11 @@ async fn equal_scores_keep_fifo_order() {
     let db = memory_db().await.expect("memory db");
     let first = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
-        ..request("fifo-first", Vec::new())
+        ..request("fifo-first", &[])
     };
     let second = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
-        ..request("fifo-second", Vec::new())
+        ..request("fifo-second", &[])
     };
     enqueue(&db, &[first, second]).await.expect("enqueue");
     db.query(
@@ -8493,15 +8597,15 @@ async fn refreshed_scores_price_their_own_crate_target() {
     .expect("seed stats");
     let dear = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
-        ..request("dear", Vec::new())
+        ..request("dear", &[])
     };
     let cheap = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
-        ..request("cheap", Vec::new())
+        ..request("cheap", &[])
     };
     let mac = stow_types::api::EnqueueRequest {
         downloads: 5_000_000,
-        ..request_on("cheap", MACOS_TARGET, Vec::new())
+        ..request_on("cheap", MACOS_TARGET, &[])
     };
     enqueue(&db, &[dear, cheap, mac]).await.expect("enqueue");
 
@@ -8518,12 +8622,9 @@ async fn refreshed_scores_price_their_own_crate_target() {
     };
     // A resubmit recomputes each touched row's key: a broken probe
     // leaves every row at 'dear''s cost and the prefixes tie.
-    enqueue(
-        &db,
-        &[request("dear", Vec::new()), request("cheap", Vec::new())],
-    )
-    .await
-    .expect("resubmit");
+    enqueue(&db, &[request("dear", &[]), request("cheap", &[])])
+        .await
+        .expect("resubmit");
     assert!(
         prefix(&db, "cheap", TARGET).await < prefix(&db, "dear", TARGET).await,
         "refreshed keys price each row's own cost"
@@ -8635,7 +8736,7 @@ async fn insert_cost_probe_seeks_stats_by_pk_only() {
     .expect("seed stats history");
     let plan = db
         .query(&format!("EXPLAIN QUERY PLAN {}", super::INSERT_COST_PROBE))
-        .bind(super::enqueue_json(&[request("probe", Vec::new())]).expect("json"))
+        .bind(super::enqueue_json(&[request("probe", &[])]).expect("json"))
         .fetch_all::<PlanRow>()
         .await
         .expect("explain cost probe");
@@ -8658,12 +8759,9 @@ async fn insert_cost_probe_seeks_stats_by_pk_only() {
 #[tokio::test]
 async fn refresh_writer_preserves_exactness_beyond_f64() {
     let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[request("priced", Vec::new()), request("plain", Vec::new())],
-    )
-    .await
-    .expect("enqueue");
+    enqueue(&db, &[request("priced", &[]), request("plain", &[])])
+        .await
+        .expect("enqueue");
     let near = 9_007_199_254_740_992_i64;
     // Wide operands bind as TEXT with a CAST — an i64 bind would
     // itself cross the JSON number boundary and truncate.
@@ -8758,4 +8856,890 @@ async fn migration_adds_claim_stamp_and_cost_tables() {
             .expect("cost table columns");
         assert!(!columns.is_empty(), "{table} exists");
     }
+}
+
+// ==================== stow#588: identity rebuild + node-store dispatch walk ====================
+
+/// The version-14 `queue` table: every column the identity copy carries,
+/// minus `dependency_identity`, under the six-field UNIQUE that could
+/// merge two contexts sharing an identity tuple.
+const V14_QUEUE_DDL: &str = "CREATE TABLE queue (
+    task_id TEXT PRIMARY KEY,
+    crate_name TEXT NOT NULL, version TEXT NOT NULL, features_json TEXT NOT NULL,
+    target TEXT NOT NULL, rustc_version TEXT NOT NULL,
+    downloads INTEGER NOT NULL DEFAULT 0, miss_count INTEGER NOT NULL DEFAULT 0,
+    request_count INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending', error_msg TEXT,
+    preserve_lockfile INTEGER NOT NULL DEFAULT 0,
+    lane TEXT NOT NULL DEFAULT 'miss',
+    dispatch_attempts INTEGER NOT NULL DEFAULT 0, attempt INTEGER NOT NULL DEFAULT 1,
+    generation_id TEXT NOT NULL DEFAULT '',
+    not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
+    first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    github_run_id TEXT, host_side INTEGER NOT NULL DEFAULT 0,
+    shape_requeue INTEGER NOT NULL DEFAULT 0, unpublished_deps INTEGER NOT NULL DEFAULT 0,
+    deps_met INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0,
+    wake_at TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
+    dispatch_family TEXT NOT NULL DEFAULT '', value INTEGER NOT NULL DEFAULT 0,
+    demand INTEGER NOT NULL DEFAULT 0, dispatch_key TEXT NOT NULL DEFAULT '',
+    claimed_at TEXT, dispatch_eligible INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
+)";
+
+/// The version-14 edge table — every current column minus
+/// `dep_dependency_identity`, which only the rebuild's ALTER adds.
+const V14_DEPS_DDL: &str = "CREATE TABLE queue_dependencies (
+    task_id TEXT NOT NULL, depends_on_task_id TEXT NOT NULL,
+    dep_crate_name TEXT NOT NULL DEFAULT '', dep_version TEXT NOT NULL DEFAULT '',
+    dep_features_json TEXT NOT NULL DEFAULT '', dep_target TEXT NOT NULL DEFAULT '',
+    dep_rustc_version TEXT NOT NULL DEFAULT '',
+    dep_host_side INTEGER NOT NULL DEFAULT 0,
+    dep_invocations INTEGER NOT NULL DEFAULT 0, dep_shapes INTEGER NOT NULL DEFAULT 0,
+    dep_met INTEGER NOT NULL DEFAULT 0, dep_side_known INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, depends_on_task_id)
+)";
+
+/// The version-14 slice-membership table — the nine immutable membership
+/// columns, primary key carrying no `dependency_identity`.
+const V14_SLICE_ROWS_DDL: &str = "CREATE TABLE published_slice_rows (
+    target TEXT NOT NULL, rustc_version TEXT NOT NULL, generation INTEGER NOT NULL,
+    crate_name TEXT NOT NULL, version TEXT NOT NULL, features_json TEXT NOT NULL,
+    unit_side INTEGER NOT NULL DEFAULT -1, unit_invocation INTEGER NOT NULL DEFAULT -1,
+    unit_linked INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json,
+                 unit_side, unit_invocation, unit_linked)
+)";
+
+/// Build a version-14 database: current schema for the untouched tables,
+/// the three rebuilt tables in their legacy shapes, the version stamp
+/// at 14.
+async fn seed_v14_db() -> DurableDb {
+    let db = memory_db_raw().await.expect("raw memory db");
+    for statement in [
+        include_str!("schema.sql"),
+        "DROP TABLE queue",
+        "DROP TABLE queue_dependencies",
+        "DROP TABLE published_slice_rows",
+        V14_QUEUE_DDL,
+        V14_DEPS_DDL,
+        V14_SLICE_ROWS_DDL,
+        "INSERT INTO scheduler_schema_version (id, version) VALUES (1, 14)",
+    ] {
+        db.query(statement)
+            .execute()
+            .await
+            .unwrap_or_else(|error| panic!("v14 seed step failed: {error}\n{statement}"));
+    }
+    db
+}
+
+/// Insert one legacy queue row of the given status carrying a value in
+/// every preserved column; `seq` keeps task ids distinct and ordered.
+async fn seed_v14_row(db: &DurableDb, seq: i64, status: &str, extra: &str) {
+    db.query(&format!(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, downloads, miss_count, request_count, priority, status,
+            error_msg, preserve_lockfile, lane, dispatch_attempts, attempt,
+            generation_id, not_before, first_requested_at, created_at, updated_at,
+            github_run_id, host_side, shape_requeue, unpublished_deps, deps_met,
+            blocked, wake_at, dispatch_family, value, demand, dispatch_key,
+            claimed_at, dispatch_eligible)
+         VALUES ('v14-task-{seq:05}', 'crate{seq}', '1.0.0', '[\"default\"]',
+            'x86_64-unknown-linux-gnu', '1.85.0', 10 + {seq}, {seq}, 2, {seq},
+            '{status}', {extra}, 0, 'miss', 1, 3, 'gen-{seq}',
+            '2024-01-01 00:00:00', '2024-01-02 00:00:00', '2024-01-03 00:00:00',
+            '2024-01-04 00:00:00', 'run-{seq}', 0, 1, 2, 0, 1,
+            '2024-01-05 00:00:00', 'linux', 100 + {seq}, 5, 'key-{seq}',
+            '2024-01-06 00:00:00', 0)"
+    ))
+    .execute()
+    .await
+    .expect("seed v14 row");
+}
+
+/// Rows of every queue status, one dependency edge and one slice row —
+/// the preservation matrix the rebuild must carry verbatim.
+#[derive(skyzen::FromRow)]
+struct Migrated {
+    status: String,
+    downloads: i64,
+    miss_count: i64,
+    request_count: i64,
+    priority: i64,
+    attempt: i64,
+    generation_id: String,
+    github_run_id: Option<String>,
+    lane: String,
+    demand: i64,
+    claimed_at: Option<String>,
+    not_before: String,
+    dependency_identity: Option<String>,
+    error_msg: Option<String>,
+}
+
+/// Every immutable column the copy must carry, asserted per seeded row.
+/// `demand` is the demand association; the derived rank columns (`value`,
+/// `dispatch_key`, `wake_at`, …) are legitimately recomputed by the gate
+/// backfill, never carried — they are not asserted.
+fn assert_v14_row(row: &Migrated, seq: i64) {
+    assert_eq!(row.downloads, 10 + seq, "downloads preserved");
+    assert_eq!(row.miss_count, seq, "miss_count preserved");
+    assert_eq!(row.request_count, 2);
+    assert_eq!(row.priority, seq);
+    assert_eq!(row.attempt, 3, "attempt preserved");
+    assert_eq!(row.generation_id, format!("gen-{seq}"));
+    let run_id = format!("run-{seq}");
+    assert_eq!(row.github_run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(row.lane, "miss");
+    assert_eq!(row.demand, 5, "demand association preserved");
+    assert_eq!(row.claimed_at.as_deref(), Some("2024-01-06 00:00:00"));
+    assert_eq!(row.not_before, "2024-01-01 00:00:00");
+    assert_eq!(
+        row.dependency_identity, None,
+        "historical context stays NULL, never guessed"
+    );
+    assert_eq!(row.error_msg.as_deref(), Some("seeded-error"));
+}
+
+#[tokio::test]
+async fn migration_from_a_v14_database_preserves_every_row_edge_and_null_context() {
+    let db = seed_v14_db().await;
+    for (seq, status) in ["pending", "dispatched", "running", "completed", "failed"]
+        .iter()
+        .enumerate()
+    {
+        seed_v14_row(
+            &db,
+            i64::try_from(seq).expect("seq") + 1,
+            status,
+            "'seeded-error'",
+        )
+        .await;
+    }
+    db.query(
+        "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_crate_name)
+         VALUES ('v14-task-00001', 'v14-task-00002', 'crate2')",
+    )
+    .execute()
+    .await
+    .expect("seed v14 edge");
+    db.query(
+        "INSERT INTO published_slice_rows
+            (target, rustc_version, generation, crate_name, version, features_json,
+             unit_side, unit_invocation, unit_linked)
+         VALUES ('x86_64-unknown-linux-gnu', '1.85.0', 7, 'crate2', '1.0.0',
+             '[\"default\"]', 1, 2, 0)",
+    )
+    .execute()
+    .await
+    .expect("seed v14 slice row");
+
+    let report = super::migrate(&db, &settings()).await.expect("migrate");
+    assert_eq!(
+        (report.before, report.after),
+        (14, super::SCHEMA_VERSION),
+        "v14 → SCHEMA_VERSION in one pass under the small fixture"
+    );
+
+    // Every status row landed with every immutable column verbatim and
+    // context NULL — never guessed.
+    let rows = db
+        .query(
+            "SELECT status, downloads, miss_count, request_count, priority, attempt,
+                generation_id, github_run_id, lane, demand,
+                claimed_at, not_before, dependency_identity, error_msg FROM queue ORDER BY task_id",
+        )
+        .fetch_all::<Migrated>()
+        .await
+        .expect("read migrated rows");
+    assert_eq!(rows.len(), 5, "every legacy row survived the copy");
+    let mut statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        ["completed", "dispatched", "failed", "pending", "running"]
+    );
+    for (index, row) in rows.iter().enumerate() {
+        assert_v14_row(row, i64::try_from(index + 1).expect("seq"));
+    }
+    // The edge row carried through unchanged; the slice row dropped at
+    // the swap — `published_slice_rows.dependency_identity` is NOT NULL
+    // post-v15, and a context-free row satisfies no coverage clause.
+    let edge = db
+        .query("SELECT COUNT(*) FROM queue_dependencies WHERE task_id = 'v14-task-00001' AND depends_on_task_id = 'v14-task-00002' AND dep_dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("edge row");
+    assert_eq!(edge, 1, "dependency edge preserved, context NULL");
+    let slice = db
+        .query("SELECT COUNT(*) FROM published_slice_rows")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("slice rows");
+    assert_eq!(slice, 0, "context-free slice rows drop at the swap");
+    // Status counters repopulated by the copy's inserts.
+    let pending = db
+        .query("SELECT n FROM queue_status_counts WHERE status = 'pending'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("pending count");
+    assert_eq!(pending, 1);
+}
+
+/// A migrate call's bounded copy leaves the rest for the next call: an
+/// interrupted run keeps the live `queue` untouched (old code keeps
+/// reading and writing the real table at every moment — the shadow
+/// `queue_v15` is a mirror, never a serving table), the cursor resumes,
+/// and `after` answers `SCHEMA_VERSION` only once the shadow verified
+/// and swapped in. Writes that land between batches — a fresh submit,
+/// status updates on rows both sides of the cursor, a completion, a
+/// delete — are mirrored by the copy's triggers and survive the swap
+/// with their latest values.
+#[tokio::test]
+async fn migration_identity_copy_resumes_after_an_interrupted_batch_run() {
+    let db = seed_v14_db().await;
+    // One call moves at most IDENTITY_COPY_BATCHES_PER_CALL × 1000 rows;
+    // seed one row over that so the first call cannot finish.
+    let rows = super::IDENTITY_COPY_BATCH_ROWS
+        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
+        + 1;
+    db.query(&format!(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
+            '[\"default\"]', 'x86_64-unknown-linux-gnu', '1.85.0',
+            CASE x % 5 WHEN 0 THEN 'pending' WHEN 1 THEN 'completed'
+             WHEN 2 THEN 'failed' WHEN 3 THEN 'dispatched' ELSE 'running' END,
+            'miss'
+         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
+               SELECT x FROM n) AS g"
+    ))
+    .execute()
+    .await
+    .expect("seed bulk v14 rows");
+
+    let first = super::migrate(&db, &settings())
+        .await
+        .expect("first migrate");
+    assert_eq!(
+        (first.before, first.after),
+        (14, 14),
+        "an incomplete copy must not report SCHEMA_VERSION: {first:?}"
+    );
+    // The live table keeps its name and full row count mid-copy —
+    // nothing was renamed aside — and the shadow holds the copied
+    // prefix beside it.
+    let live_rows = db
+        .query("SELECT COUNT(*) FROM queue")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("live count");
+    assert_eq!(live_rows, rows, "live queue untouched during the copy");
+    let shadow_rows = db
+        .query("SELECT COUNT(*) FROM queue_v15")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("shadow count");
+    assert!(
+        0 < shadow_rows && shadow_rows < rows,
+        "partial copy in the shadow"
+    );
+
+    // Live writes land between the batches — the mirror triggers make
+    // each shadow row the newest write.
+    // A fresh submit whose id sorts below the cursor: only the mirror
+    // can carry it across (the cursor never walks back).
+    db.query(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         VALUES ('aaa-live-insert', 'livecrate', '2.0.0', '[]',
+            'aarch64-apple-darwin', '1.85.0', 'pending', 'miss')",
+    )
+    .execute()
+    .await
+    .expect("live insert mid-copy");
+    // A status update on an already-copied row must overwrite the
+    // shadow's stale copy (`failed`: a terminal status no migrate step
+    // rewrites).
+    db.query("UPDATE queue SET status = 'failed', attempt = 9 WHERE task_id = 'bulk-000001'")
+        .execute()
+        .await
+        .expect("update copied row");
+    // A completion touching a task the cursor has not reached: the
+    // mirror writes it before the copy's IGNORE can see it.
+    db.query(
+        "UPDATE queue SET status = 'completed', github_run_id = 'run-late', \
+            miss_count = 77 WHERE task_id = 'bulk-008001'",
+    )
+    .execute()
+    .await
+    .expect("complete uncopied row");
+    // A delete on an already-copied row must retire its shadow row too.
+    db.query("DELETE FROM queue WHERE task_id = 'bulk-000002'")
+        .execute()
+        .await
+        .expect("delete copied row");
+
+    // Retry finishes the copy and swaps the shadow in.
+    let second = super::migrate(&db, &settings())
+        .await
+        .expect("migrate retry");
+    assert_eq!((second.before, second.after), (14, super::SCHEMA_VERSION));
+    let total = db
+        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("count migrated rows");
+    assert_eq!(
+        total, rows,
+        "insert+delete cancel, every row has NULL context"
+    );
+    let shadow_gone = db
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v15'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("shadow probe");
+    assert_eq!(shadow_gone, 0, "swap drops the shadow tables");
+    let mirror_gone = db
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'v15_%_mirror_%'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("mirror probe");
+    assert_eq!(mirror_gone, 0, "swap drops the mirror triggers");
+    assert_interleaved_writes_survived(&db, rows).await;
+
+    // Already migrated: a third pass is a pure no-op.
+    let third = super::migrate(&db, &settings())
+        .await
+        .expect("idempotent migrate");
+    assert_eq!(
+        (third.before, third.after),
+        (super::SCHEMA_VERSION, super::SCHEMA_VERSION)
+    );
+}
+
+/// Every interleaved write survived the swap with its latest value:
+/// mirrored rows always beat the copy's stale reads.
+async fn assert_interleaved_writes_survived(db: &DurableDb, rows: i64) {
+    let fresh = db
+        .query(
+            "SELECT COUNT(*) FROM queue WHERE task_id = 'aaa-live-insert' AND status = 'pending'",
+        )
+        .fetch_scalar::<i64>()
+        .await
+        .expect("mirrored insert");
+    assert_eq!(fresh, 1, "live insert below the cursor mirrored in");
+    let updated = db
+        .query("SELECT status || ':' || attempt FROM queue WHERE task_id = 'bulk-000001'")
+        .fetch_scalar::<String>()
+        .await
+        .expect("updated row");
+    assert_eq!(
+        updated, "failed:9",
+        "update on a copied row beats the stale copy"
+    );
+    let completed = db
+        .query(
+            "SELECT status || ':' || miss_count || ':' || github_run_id \
+                FROM queue WHERE task_id = 'bulk-008001'",
+        )
+        .fetch_scalar::<String>()
+        .await
+        .expect("completed row");
+    assert_eq!(
+        completed, "completed:77:run-late",
+        "completion on a not-yet-copied row survives the swap"
+    );
+    let deleted = db
+        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000002'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("deleted row");
+    assert_eq!(deleted, 0, "delete on a copied row retires its shadow");
+    // Status counters recomputed on the swapped table: 1601 seeded
+    // `completed` rows (x % 5 == 1 over x = 1..8001) minus the one the
+    // update moved to `failed`; the not-yet-copied completion stays
+    // `completed`, and the delete hit another `failed` row.
+    let completed_count = db
+        .query("SELECT n FROM queue_status_counts WHERE status = 'completed'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("completed count");
+    assert_eq!(completed_count, rows / 5, "counts recomputed post-swap");
+}
+
+/// A live write that lands inside a range a copy batch has already
+/// verified stays invisible to the swap: the mirror triggers keep the
+/// verified range equal on both sides, so the final tick's tail-only
+/// verify still sees no difference and the swap completes.
+#[tokio::test]
+async fn migration_swap_tolerates_writes_into_an_already_verified_range() {
+    let db = seed_v14_db().await;
+    let rows = super::IDENTITY_COPY_BATCH_ROWS
+        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
+        + 1;
+    db.query(&format!(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
+            '[]', 'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss'
+         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
+               SELECT x FROM n) AS g"
+    ))
+    .execute()
+    .await
+    .expect("seed v14 rows");
+
+    // The first call copies and verifies every range up to
+    // 'bulk-008000' and leaves the copy in flight.
+    let first = super::migrate(&db, &settings())
+        .await
+        .expect("first migrate");
+    assert_eq!((first.before, first.after), (14, 14), "copy in flight");
+
+    // Writes land inside the first batch's range — verified ticks ago:
+    // an update, a fresh insert that sorts below the cursor, and a
+    // delete. The mirror, not a re-verify, keeps the range equal.
+    db.query("UPDATE queue SET status = 'failed', attempt = 4 WHERE task_id = 'bulk-000500'")
+        .execute()
+        .await
+        .expect("update inside verified range");
+    db.query(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         VALUES ('bulk-000500a', 'latecrate', '3.0.0', '[]',
+            'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss')",
+    )
+    .execute()
+    .await
+    .expect("insert inside verified range");
+    db.query("DELETE FROM queue WHERE task_id = 'bulk-000501'")
+        .execute()
+        .await
+        .expect("delete inside verified range");
+
+    // The swap sees no difference and completes.
+    let second = super::migrate(&db, &settings())
+        .await
+        .expect("swap migrate");
+    assert_eq!((second.before, second.after), (14, super::SCHEMA_VERSION));
+    let status = db
+        .query("SELECT status || '/' || attempt FROM queue WHERE task_id = 'bulk-000500'")
+        .fetch_scalar::<String>()
+        .await
+        .expect("updated row");
+    assert_eq!(status, "failed/4");
+    let inserted = db
+        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000500a' AND status = 'pending'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("inserted row");
+    assert_eq!(inserted, 1, "insert mirrored into the verified range");
+    let deleted = db
+        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000501'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("deleted row");
+    assert_eq!(deleted, 0, "delete mirrored out of the verified range");
+}
+
+/// Drive the queue copy's remaining batches to exhaustion with the same
+/// bound probe, copy statement and cursor write the migrate loop runs —
+/// the state a crash leaves when it dies after its last batch commit
+/// but before the verify+swap tick: copy complete, live `queue` intact.
+async fn drain_queue_identity_copy(db: &DurableDb) {
+    loop {
+        let cursor = db
+            .query("SELECT value FROM settings WHERE key = 'migrate_queue_identity_cursor'")
+            .fetch_scalar_optional::<String>()
+            .await
+            .expect("read cursor")
+            .unwrap_or_default();
+        let bound: Option<String> = db
+            .query(
+                "SELECT MAX(task_id) FROM ( \
+                     SELECT task_id FROM queue \
+                     WHERE task_id > ? ORDER BY task_id LIMIT ?)",
+            )
+            .bind(cursor.clone())
+            .bind(super::IDENTITY_COPY_BATCH_ROWS)
+            .fetch_scalar::<Option<String>>()
+            .await
+            .expect("bound probe");
+        let Some(bound) = bound else {
+            break;
+        };
+        db.query(include_str!("copy_queue_dependency_identity.sql"))
+            .bind(cursor.clone())
+            .bind(super::IDENTITY_COPY_BATCH_ROWS)
+            .execute()
+            .await
+            .expect("drain batch");
+        // The drain replays what the migrate loop ran before the
+        // crash: the copied range verified in the same step.
+        let mut verify = db.query(include_str!("verify_queue_dependency_identity.sql"));
+        for _ in 0..5 {
+            verify = verify
+                .bind(cursor.clone())
+                .bind(bound.clone())
+                .bind(bound.clone());
+        }
+        assert_eq!(
+            verify.fetch_scalar::<i64>().await.expect("drain verify"),
+            0,
+            "drained range verifies equal"
+        );
+        db.query(
+            "INSERT INTO settings (key, value) \
+             VALUES ('migrate_queue_identity_cursor', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(bound)
+        .execute()
+        .await
+        .expect("advance cursor");
+    }
+}
+
+/// Seed enough v14 rows that one migrate call leaves the copy in
+/// flight, then drain the rest so the next migrate call owns the
+/// verify+swap tail alone.
+async fn seed_and_drain_queue_copy(db: &DurableDb) -> i64 {
+    let rows = super::IDENTITY_COPY_BATCH_ROWS
+        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
+        + 1;
+    db.query(&format!(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
+            '[]', 'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss'
+         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
+               SELECT x FROM n) AS g"
+    ))
+    .execute()
+    .await
+    .expect("seed v14 rows");
+    let report = super::migrate(db, &settings())
+        .await
+        .expect("first migrate");
+    assert_eq!((report.before, report.after), (14, 14), "copy in flight");
+    drain_queue_identity_copy(db).await;
+    rows
+}
+
+/// A call that dies after the copy's last batch but inside the
+/// verify+swap tick commits nothing on the Durable Object (the tick is
+/// the atomic unit): the live `queue` stays intact and serving, and the
+/// next migrate call re-verifies and completes the swap.
+#[tokio::test]
+async fn migration_swap_crash_after_copy_leaves_live_and_recovers() {
+    let db = seed_v14_db().await;
+    let rows = seed_and_drain_queue_copy(&db).await;
+
+    // "Between verify and swap" is the uncommitted crash: nothing wrote,
+    // so the live table is still the serving table.
+    let live = db
+        .query("SELECT COUNT(*) FROM queue")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("live intact");
+    assert_eq!(live, rows, "live queue still serving every row");
+
+    let report = super::migrate(&db, &settings())
+        .await
+        .expect("migrate completes");
+    assert_eq!((report.before, report.after), (14, super::SCHEMA_VERSION));
+    let migrated = db
+        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("count post-swap");
+    assert_eq!(migrated, rows);
+}
+
+/// The deeper crash: the swap's `DROP TABLE queue` committed (eager
+/// backend) and the call died before the rename. `queue` absent with
+/// `queue_v15` present is the one resumable state — the next migrate
+/// call finishes the tail rather than wedging.
+#[tokio::test]
+async fn migration_swap_crash_between_drop_and_rename_resumes() {
+    let db = seed_v14_db().await;
+    let rows = seed_and_drain_queue_copy(&db).await;
+
+    // Simulate the committed prefix of the swap tick.
+    db.query("DROP TABLE queue")
+        .execute()
+        .await
+        .expect("crash prefix: drop live queue");
+
+    let report = super::migrate(&db, &settings())
+        .await
+        .expect("migrate resumes the swap tail");
+    assert_eq!((report.before, report.after), (14, super::SCHEMA_VERSION));
+    let migrated = db
+        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("count post-resume");
+    assert_eq!(migrated, rows, "swap tail restores every copied row");
+    let shadow_gone = db
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v15'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("shadow probe");
+    assert_eq!(shadow_gone, 0);
+}
+
+/// One `sqlite_master` row for the schema-parity assertion.
+#[derive(skyzen::FromRow)]
+struct SchemaObject {
+    kind: String,
+    name: String,
+    tbl_name: String,
+    sql: Option<String>,
+}
+
+/// The database's full `sqlite_master` listing, minus SQLite internals.
+async fn schema_objects(db: &DurableDb) -> Vec<SchemaObject> {
+    db.query(
+        "SELECT type AS kind, name, tbl_name, sql FROM sqlite_master \
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    )
+    .fetch_all::<SchemaObject>()
+    .await
+    .expect("schema dump")
+}
+
+/// The swapped database's schema must equal what `schema.sql` builds on
+/// a fresh database: same tables, indexes and triggers, same column
+/// lists — and for the two swapped tables byte-equal `sqlite_master`
+/// definitions once name and quoting normalize.
+#[tokio::test]
+async fn migration_swapped_schema_matches_a_fresh_database() {
+    let db = seed_v14_db().await;
+    seed_v14_row(&db, 1, "pending", "NULL").await;
+    super::migrate(&db, &settings()).await.expect("migrate");
+    let fresh = memory_db_raw().await.expect("fresh db");
+    super::migrate(&fresh, &settings())
+        .await
+        .expect("fresh migrate");
+
+    let migrated = schema_objects(&db).await;
+    let reference = schema_objects(&fresh).await;
+    let shape = |rows: &[SchemaObject]| {
+        rows.iter()
+            .map(|row| (row.kind.clone(), row.name.clone(), row.tbl_name.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shape(&migrated),
+        shape(&reference),
+        "same tables, indexes and triggers as a fresh database"
+    );
+    // `ALTER`-appended columns (e.g. queue_dependencies' identity
+    // column) legitimately sit at different positions in the stored
+    // DDL; compare column sets instead of text for non-swapped tables.
+    for table in ["queue", "published_slice_rows", "queue_dependencies"] {
+        assert_eq!(
+            super::table_columns(&db, table).await.expect("table_info"),
+            super::table_columns(&fresh, table)
+                .await
+                .expect("table_info"),
+            "{table} column set equals a fresh database's"
+        );
+    }
+    // The swapped tables' stored DDL is byte-equal modulo the shadow
+    // rename's quoting: same column order, same constraints.
+    let normalize = |sql: &str| {
+        sql.replace('"', "")
+            .replace("IF NOT EXISTS", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for table in ["queue", "published_slice_rows"] {
+        let got = migrated
+            .iter()
+            .find(|row| row.kind == "table" && row.name == table)
+            .and_then(|row| row.sql.as_deref())
+            .expect("migrated table ddl");
+        let want = reference
+            .iter()
+            .find(|row| row.kind == "table" && row.name == table)
+            .and_then(|row| row.sql.as_deref())
+            .expect("fresh table ddl");
+        assert_eq!(
+            normalize(got),
+            normalize(want),
+            "{table} stored DDL matches schema.sql"
+        );
+    }
+}
+
+/// Two tasks whose dependency closures meet at a shared grandchild
+/// produce two distinct dispatch subgraphs — each rebuilding to exactly
+/// its own task id under the payload's verify (stow#588 node store).
+#[tokio::test]
+async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
+    let db = memory_db().await.expect("memory db");
+    let shared = dependency("shared-gc");
+    let aunt = request("aunt-a", std::slice::from_ref(&shared));
+    let uncle = request("uncle-b", std::slice::from_ref(&shared));
+    let first = request("ctx-a", std::slice::from_ref(&aunt));
+    let second = request("ctx-b", std::slice::from_ref(&uncle));
+    enqueue(
+        &db,
+        &[
+            shared.clone(),
+            aunt.clone(),
+            uncle.clone(),
+            first.clone(),
+            second.clone(),
+        ],
+    )
+    .await
+    .expect("enqueue chain");
+
+    // Publish every dependency so both contexts release — `shared-gc`
+    // first so `aunt`'s and `uncle`'s own edges meet before they publish.
+    for dep_request in [&shared, &aunt, &uncle] {
+        db.query("UPDATE queue SET status = 'completed' WHERE task_id = ?")
+            .bind(dep_request.task_id().expect("dep task id"))
+            .execute()
+            .await
+            .expect("complete dep");
+    }
+    // A slice report replaces the generation's rows wholesale, so all
+    // published rows land in one call. Every invocation spelling and
+    // kind is covered: an edge asks for the shapes its own context
+    // spells.
+    let slice_rows = [&shared, &aunt, &uncle]
+        .iter()
+        .flat_map(|dep_request| {
+            let crate_name = dep_request.crate_name.as_str().to_owned();
+            let identity = dep_request.dependency_identity().expect("dep identity");
+            [UnitInvocation::Native, UnitInvocation::Target]
+                .iter()
+                .flat_map(|invocation| {
+                    [UnitKind::Linked, UnitKind::Unlinked]
+                        .iter()
+                        .map(|kind| stow_types::api::PublishedSliceRow {
+                            dependency_identity: identity.clone(),
+                            crate_name: crate_name.parse().expect("crate name"),
+                            version: VERSION.parse().expect("semver"),
+                            features_json: FeaturesJson::default(),
+                            unit_shape: Some(shape(UnitSide::Target, *invocation, *kind)),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    super::record_published_slice(&db, TARGET, RUSTC, None, None, &slice_rows, &[])
+        .await
+        .expect("publish dep slice");
+
+    let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let mut verified = Vec::new();
+    for task in &claimed {
+        if !task.task_id.starts_with("ctx-") {
+            continue;
+        }
+        // The payload path: subgraph + the task's own identity re-derive
+        // the claimed task id.
+        let payload = stow_types::api::BuildTaskPayload {
+            task_id: task.task_id.clone(),
+            attempt: task.attempt,
+            crate_name: task.crate_name.parse().expect("crate name"),
+            version: stow_types::identity::CrateVersion::new(
+                task.version.parse().expect("version"),
+            ),
+            features_json: FeaturesJson::from_sorted(
+                serde_json::from_str::<Vec<String>>(&task.features_json).expect("features"),
+            )
+            .expect("canonical features"),
+            target: task.target.parse().expect("target"),
+            rustc_version: task.rustc_version.parse().expect("rustc"),
+            preserve_lockfile: false,
+            host_side: task.host_side,
+            dependency_subgraph: task.dependency_subgraph.clone(),
+        };
+        let graph = payload.verified_dependency_graph().expect("verify");
+        assert_eq!(
+            graph.task_id(0),
+            Some(task.task_id.as_str()),
+            "walked subgraph re-derives the claimed task id"
+        );
+        verified.push(task.dependency_subgraph.clone());
+    }
+    assert_eq!(verified.len(), 2, "both contexts claimed");
+    assert_ne!(
+        verified[0], verified[1],
+        "shared grandchildren do not collapse the two contexts"
+    );
+}
+
+/// A node the store lost fails the claim hard, naming the missing id —
+/// never a leaf substitute (stow#588).
+#[tokio::test]
+async fn dispatch_fails_on_a_missing_node_naming_it() {
+    let db = memory_db().await.expect("memory db");
+    let leaf = dependency("lost-leaf");
+    let owner = request("walk-owner", std::slice::from_ref(&leaf));
+    let missing_id = leaf.task_id().expect("leaf task id");
+    enqueue(&db, &[leaf.clone(), owner.clone()])
+        .await
+        .expect("enqueue");
+    // Publish the leaf so the gate releases the owner — the walk, not
+    // the gate, is what must fail.
+    let leaf_name = leaf.crate_name.as_str().to_owned();
+    db.query("UPDATE queue SET status = 'completed' WHERE task_id = ?")
+        .bind(missing_id.clone())
+        .execute()
+        .await
+        .expect("complete leaf");
+    let rows = [UnitKind::Linked, UnitKind::Unlinked]
+        .iter()
+        .map(|kind| stow_types::api::PublishedSliceRow {
+            dependency_identity: leaf.dependency_identity().expect("leaf identity"),
+            crate_name: leaf_name.parse().expect("crate name"),
+            version: VERSION.parse().expect("semver"),
+            features_json: FeaturesJson::default(),
+            unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+        })
+        .collect::<Vec<_>>();
+    super::record_published_slice(&db, TARGET, RUSTC, None, None, &rows, &[])
+        .await
+        .expect("publish leaf slice");
+
+    // Delete the leaf's node row: the store can no longer serve it.
+    db.query("DELETE FROM task_nodes WHERE task_id = ?")
+        .bind(missing_id.clone())
+        .execute()
+        .await
+        .expect("drop node row");
+
+    let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let owner_id = owner.task_id().expect("owner task id");
+    assert!(
+        !claimed.iter().any(|task| task.task_id == owner_id),
+        "the broken task must not dispatch"
+    );
+    let error: String = db
+        .query("SELECT status || '|' || COALESCE(error_msg, '') FROM queue WHERE task_id = ?")
+        .bind(owner_id)
+        .fetch_scalar::<String>()
+        .await
+        .expect("owner row");
+    assert!(
+        error.starts_with("failed|") && error.contains(&missing_id),
+        "the hard dispatch error names the missing node id: {error}"
+    );
 }

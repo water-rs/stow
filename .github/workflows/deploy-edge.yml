@@ -1,7 +1,9 @@
 name: deploy-edge
 
-# The edge deploys a tested commit only: the trigger is a green `Test` run on
-# main, and a manual dispatch must name a commit that has one. The deploy is
+# The edge deploys a tested commit only: the trigger is a green `Test` run of
+# a push to main (a main → dev backmerge PR's `pull_request` run also reports
+# head branch `main`, and must not deploy the same commit twice), and a manual
+# dispatch must name a commit that has one. The deploy is
 # four jobs — no runner is ever held waiting:
 #
 #   prepare          upload the new version (`wrangler versions upload` via
@@ -83,7 +85,9 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success')
     outputs:
       baseline_version: ${{ steps.versions.outputs.baseline_version }}
       candidate_version: ${{ steps.versions.outputs.candidate_version }}
@@ -165,6 +169,7 @@ jobs:
             GITHUB_APP_PRIVATE_KEY:STOW_APP_PRIVATE_KEY \
             STOW_POW_CHALLENGE_SECRET:STOW_POW_CHALLENGE_SECRET \
             TURNSTILE_SECRET_KEY:STOW_TURNSTILE_SECRET_KEY \
+            STOW_GITHUB_WEBHOOK_SECRET:STOW_GITHUB_WEBHOOK_SECRET \
             CF_ANALYTICS_TOKEN:CF_ANALYTICS_TOKEN; do
             name=${pair%%:*}
             repo_secret=${pair##*:}
@@ -180,6 +185,7 @@ jobs:
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.STOW_APP_PRIVATE_KEY }}
           STOW_POW_CHALLENGE_SECRET: ${{ secrets.STOW_POW_CHALLENGE_SECRET }}
           TURNSTILE_SECRET_KEY: ${{ secrets.STOW_TURNSTILE_SECRET_KEY }}
+          STOW_GITHUB_WEBHOOK_SECRET: ${{ secrets.STOW_GITHUB_WEBHOOK_SECRET }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
 
       - name: Read the baseline and candidate version ids
@@ -226,7 +232,7 @@ jobs:
           deploy_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           echo "DEPLOY_START=$deploy_start" >> "$GITHUB_ENV"
           echo "deploy_start=$deploy_start" >> "$GITHUB_OUTPUT"
-          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@0%"
+          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$BASELINE_VERSION@100%" "$CANDIDATE_VERSION@0%"
 
       # `stow-admin` comes from the commit's signed toolchain image.
       - uses: ./.github/actions/stow-toolchain
@@ -312,7 +318,8 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$CANDIDATE_VERSION@$CANARY_SHARE%"
+        run: |
+          wrangler versions deploy --config "$WRANGLER_CONFIG" --yes "$BASELINE_VERSION@$((100 - CANARY_SHARE))%" "$CANDIDATE_VERSION@$CANARY_SHARE%"
 
       # Any post-upload failure leaves the candidate in the deployment;
       # roll back to the baseline. `CANDIDATE_VERSION` is only set once a

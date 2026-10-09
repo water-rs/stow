@@ -91,11 +91,43 @@ fn normalized_args<'a>(action: &str, cargo_args: &'a [OsString]) -> Vec<&'a [u8]
 /// Member manifests leave the key — the entry's recorded local-manifest
 /// hashes verify them on load.
 pub fn cache_key(project: &crate::cargo_cmd::ProjectContext) -> stow_types::error::Result<String> {
+    key_of(&KeyInputs {
+        action: &project.action,
+        cargo_args: &project.cargo_args,
+        current_dir: &project.current_dir,
+        manifest_path: &project.manifest_path,
+        workspace_root: &project.workspace_root,
+        target: &project.target,
+        target_given: project.target_given,
+        rustc_version: &project.rustc_version,
+    })
+}
+
+/// The invocation fields [`cache_key`] hashes, borrowed for one
+/// computation. A `ProjectContext` supplies them for the live build;
+/// the miss-journal drain rebuilds them from the journal's context
+/// sidecar so it can recompute the same key over the project's
+/// *current* files — the same function of the same inputs is the same
+/// graph, a different key is a changed project (stow#588).
+pub struct KeyInputs<'a> {
+    pub action: &'a str,
+    pub cargo_args: &'a [OsString],
+    pub current_dir: &'a Path,
+    pub manifest_path: &'a Path,
+    pub workspace_root: &'a Path,
+    pub target: &'a str,
+    pub target_given: bool,
+    pub rustc_version: &'a str,
+}
+
+/// [`cache_key`] over a borrowed input set — the single function both
+/// the build and the drain's memo check call.
+pub fn key_of(project: &KeyInputs<'_>) -> stow_types::error::Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(b"stow-lockfile-graph-cache-v8");
     hasher.update(project.action.as_bytes());
     hasher.update(&[0]);
-    for arg in normalized_args(&project.action, &project.cargo_args) {
+    for arg in normalized_args(project.action, project.cargo_args) {
         hasher.update(arg);
         hasher.update(&[0]);
     }
@@ -115,7 +147,7 @@ pub fn cache_key(project: &crate::cargo_cmd::ProjectContext) -> stow_types::erro
     hasher.update(&[u8::from(project.target_given)]);
     hasher.update(project.rustc_version.as_bytes());
     hasher.update(&[0]);
-    let workspace_root = project.workspace_root.as_path();
+    let workspace_root = project.workspace_root;
     hash_file_if_present(&mut hasher, &workspace_root.join("Cargo.lock"))?;
     hash_file_if_present(&mut hasher, &manifest_path)?;
     // Cargo reads its effective rustflags, linker, target and profile
@@ -139,7 +171,7 @@ pub fn cache_key(project: &crate::cargo_cmd::ProjectContext) -> stow_types::erro
     // each `--config` value — hashed as cargo sees them (source label
     // + parsed form).
     for (name, document) in
-        crate::mold::cargo_config_documents(&project.current_dir, &project.cargo_args)
+        crate::mold::cargo_config_documents(project.current_dir, project.cargo_args)
     {
         hasher.update(name.as_bytes());
         hasher.update(&[0]);
@@ -327,7 +359,8 @@ mod tests {
             &[],
             Some("x86_64-unknown-linux-gnu"),
             &zed,
-            "rustc",
+            "x86_64-unknown-linux-gnu",
+            &stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
         ))
         .expect("resolve zed");
         let json = serde_json::to_string(&graph).expect("encode");
