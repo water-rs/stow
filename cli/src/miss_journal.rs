@@ -300,10 +300,16 @@ pub fn spawn_drain(target_dir: &Path) {
     {
         use std::os::unix::process::CommandExt as _;
         // A session of its own: a `SIGINT`/`SIGTERM` aimed at the
-        // build's process group never kills the drain mid-claim.
+        // build's process group never kills the drain mid-claim. And a
+        // nicer scheduling slot: the drain re-runs `cargo build
+        // --unit-graph` as background work — at interactive priority it
+        // competes with the user's next build for CPU, so it runs below
+        // it (`setpriority` best-effort; a failure leaves the drain no
+        // worse than before).
         unsafe {
             command.pre_exec(|| {
                 libc::setsid();
+                libc::setpriority(libc::PRIO_PROCESS, 0, 15);
                 Ok(())
             });
         }
@@ -311,8 +317,10 @@ pub fn spawn_drain(target_dir: &Path) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
-        // DETACHED_PROCESS | CREATE_NO_WINDOW: no console flashes open.
-        command.creation_flags(0x0000_0008 | 0x0000_0200);
+        // DETACHED_PROCESS | CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS:
+        // no console flashes open, and the drain's re-derivation builds
+        // yield to the user's foreground builds (0x0000_4000).
+        command.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0000_4000);
     }
     if let Err(error) = command.spawn() {
         tracing::warn!(error = %error, "could not spawn the miss drain");
