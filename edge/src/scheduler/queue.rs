@@ -3000,6 +3000,34 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
     }
 }
 
+/// `AND <column> IN ('<family>', …)` — "every family except the
+/// saturated one" rendered as equality over `RunnerFamily::ALL` minus
+/// `full_family`, derived from the type so a new family can never drift
+/// from the exclusion, and never `!=` or `NOT IN`. On `idx_queue_wake`
+/// the family column is the last equality column before the `wake_at`
+/// range, where an inequality cannot bound the range — SQLite falls
+/// back to reading every eligible pending row, which made a burst of N
+/// future-wake misses cost N reads on every alarm pass and every
+/// deliver. The IN list expands into one seek per surviving family, so
+/// each probe reads only the families that can dispatch (stow#588).
+/// `None` — no family saturated — renders no filter at all.
+fn dispatch_family_in_sql(column: &str, full_family: Option<RunnerFamily>) -> String {
+    let Some(full) = full_family else {
+        return String::new();
+    };
+    let families = RunnerFamily::ALL
+        .iter()
+        .filter(|family| **family != full)
+        .map(|family| format!("'{}'", dispatch_family_label(*family)))
+        .collect::<Vec<_>>();
+    if families.is_empty() {
+        // A one-family runner set whose only family is saturated: no
+        // row can dispatch — a literal false keeps the probe's shape.
+        return "AND 0".to_owned();
+    }
+    format!("AND {column} IN ({})", families.join(", "))
+}
+
 /// `queue.value` as a SQL expression — the persisted raw integer the
 /// dispatch rank divides by expected cost: precedence bands over the
 /// baseline `priority` plus accumulated `demand` (stow#522 — kept
@@ -4553,12 +4581,7 @@ pub(super) const CLAIM_MAX_PAGES: usize = 8;
 /// ORDER BY and LIMIT — shared by the paged claim walk and the
 /// floor probe's bounded frontier so the two can't drift (stow#525).
 fn dispatchable_page_sql(columns: &str, full_family: Option<RunnerFamily>) -> String {
-    let family_filter = full_family.map_or_else(String::new, |family| {
-        format!(
-            "AND q.dispatch_family != '{}'",
-            dispatch_family_label(family)
-        )
-    });
+    let family_filter = dispatch_family_in_sql("q.dispatch_family", full_family);
     format!(
         "SELECT {columns} FROM queue q \
          WHERE q.status = 'pending' AND q.deps_met = 1 \
@@ -5795,9 +5818,12 @@ async fn earliest_pending_eligible_ms(
     // `wake_at` range means under-floor rows are outside the index
     // span the probes walk — a queue of them arms nothing immediate
     // and contributes nothing to the deferred MIN's read set.
-    let family_filter = full_family.map_or_else(String::new, |family| {
-        format!("AND dispatch_family != '{}'", dispatch_family_label(family))
-    });
+    // The family exclusion renders as `dispatch_family IN (…)` — the
+    // remaining families as equality, so SQLite expands the list into
+    // one seek per family and each `wake_at` range stays bounded
+    // (stow#588). `!=` would leave the range unbounded: every eligible
+    // pending row read, on every alarm pass and every deliver.
+    let family_filter = dispatch_family_in_sql("dispatch_family", full_family);
     // The plan is a pure function of `now_ms`; bind the rendered clock
     // rather than calling wall-clock `datetime('now')` inside the probes.
     let now = db
