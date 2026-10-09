@@ -21,7 +21,8 @@ struct QueuedDependencyGraphMissRow {
     rustc_version: String,
     host_side: i64,
     seen_count: u64,
-    depends_on_json: String,
+    subgraph_json: Option<String>,
+    task_id: Option<String>,
 }
 
 // URL-path inputs (from `Params::get(...)`) come in as `&str` and have not
@@ -896,10 +897,17 @@ struct CoveredIdentityRow {
     min_glibc: Option<String>,
 }
 
-pub async fn take_dependency_graph_misses(
-    db: &Db,
-    limit: usize,
-) -> Result<Vec<EnqueueRequest>, DbError> {
+/// The outcome of one admitted-miss drain: the requests re-minted from
+/// stored subgraphs, plus how many rows were consumed without one —
+/// historical rows carry NULL context and are never promoted to a
+/// guessed one; they drain as an explicit skip (stow#588).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MissDrain {
+    pub requests: Vec<EnqueueRequest>,
+    pub skipped: usize,
+}
+
+pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissDrain, DbError> {
     let limit =
         i64::try_from(limit).map_err(|_| format!("miss drain limit exceeds i64: {limit}"))?;
     // Opportunistic cleanup: rows already handed to the scheduler stop
@@ -920,7 +928,7 @@ pub async fn take_dependency_graph_misses(
     // channel for unadmitted misses.
     let rows = db
         .query(
-            "SELECT crate_name, version, features_json, target, rustc_version, host_side, seen_count, depends_on_json \
+            "SELECT crate_name, version, features_json, target, rustc_version, host_side, seen_count, subgraph_json, task_id \
              FROM dependency_graph_misses \
              WHERE admitted_at IS NOT NULL AND queued_at IS NULL \
              ORDER BY seen_count DESC, last_seen_at DESC, first_seen_at ASC \
@@ -931,7 +939,10 @@ pub async fn take_dependency_graph_misses(
         .await
         .map_err(|error| format!("select dependency graph misses for draining: {error}"))?;
 
-    let mut requests = Vec::with_capacity(rows.len());
+    let mut drain = MissDrain {
+        requests: Vec::with_capacity(rows.len()),
+        skipped: 0,
+    };
     for row in rows {
         db.query(
             "UPDATE dependency_graph_misses \
@@ -949,64 +960,71 @@ pub async fn take_dependency_graph_misses(
         .await
         .map_err(|error| format!("mark dependency graph miss queued: {error}"))?;
 
-        let crate_name = stow_types::identity::CrateName::parse(row.crate_name.as_str())
-            .map_err(|error| format!("draining miss crate_name `{}`: {error}", row.crate_name))?;
-        let version = stow_types::identity::CrateVersion::new(
-            Version::parse(row.version.as_str())
-                .map_err(|error| format!("draining miss version `{}`: {error}", row.version))?,
-        );
-        let features_json: Vec<String> = serde_json::from_str(row.features_json.as_str())
-            .map_err(|error| format!("draining miss features_json: {error}"))?;
-        let features_json = stow_types::identity::FeaturesJson::from_sorted(features_json)
-            .map_err(|error| format!("draining miss features_json: {error}"))?;
-        let target = stow_types::identity::TargetTriple::parse(row.target.as_str())
-            .map_err(|error| format!("draining miss target `{}`: {error}", row.target))?;
-        let rustc_version = stow_types::identity::WireRustcVersion::parse(
-            row.rustc_version.as_str(),
-        )
-        .map_err(|error| {
-            format!(
-                "draining miss rustc_version `{}`: {error}",
-                row.rustc_version
-            )
-        })?;
-        let depends_on: Vec<stow_types::api::EnqueueDependency> =
-            serde_json::from_str(row.depends_on_json.as_str())
-                .map_err(|error| format!("draining miss depends_on_json: {error}"))?;
-        // stow#588 edge-placeholder: the miss table stores only direct
-        // dep edges, so the subgraph is the leaf-only shape it can
-        // carry (the scheduler storage rework owns recording the full
-        // closure); the request derives its edges and digest from it.
-        let dependency_subgraph = stow_types::api::TaskSubgraph {
-            root_deps: (0..u32::try_from(depends_on.len()).map_err(|_| {
-                "draining miss depends_on_json: more direct deps than u32::MAX".to_owned()
-            })?)
-                .collect(),
-            nodes: depends_on
-                .iter()
-                .map(|dep| stow_types::api::SubgraphNode {
-                    crate_name: dep.crate_name.clone(),
-                    version: dep.version.clone(),
-                    features_json: dep.features_json.clone(),
-                    host_side: dep.host_side,
-                    deps: Vec::new(),
-                })
-                .collect(),
-        };
-        requests.push(EnqueueRequest {
-            crate_name,
-            version,
-            features_json,
-            target,
-            rustc_version,
-            downloads: row.seen_count,
-            source: stow_types::api::EnqueueSource::CacheMiss,
-            dependency_subgraph,
-            preserve_lockfile: false,
-            host_side: row.host_side != 0,
-        });
+        match miss_request(&row).map_err(|error| error.to_string())? {
+            Some(request) => drain.requests.push(request),
+            None => drain.skipped += 1,
+        }
     }
-    Ok(requests)
+    Ok(drain)
+}
+
+/// Re-mint one miss row's `EnqueueRequest` from the subgraph its
+/// verified admission stored — `None` is an explicit skip: NULL context
+/// (a historical row), an undecodable subgraph, or a stored task id
+/// that disagrees with what the subgraph derives is never promoted to
+/// a guessed context (stow#588). Field decode failures are errors.
+fn miss_request(row: &QueuedDependencyGraphMissRow) -> Result<Option<EnqueueRequest>, DbError> {
+    let crate_name = stow_types::identity::CrateName::parse(row.crate_name.as_str())
+        .map_err(|error| format!("draining miss crate_name `{}`: {error}", row.crate_name))?;
+    let version = stow_types::identity::CrateVersion::new(
+        Version::parse(row.version.as_str())
+            .map_err(|error| format!("draining miss version `{}`: {error}", row.version))?,
+    );
+    let features_json: Vec<String> = serde_json::from_str(row.features_json.as_str())
+        .map_err(|error| format!("draining miss features_json: {error}"))?;
+    let features_json = stow_types::identity::FeaturesJson::from_sorted(features_json)
+        .map_err(|error| format!("draining miss features_json: {error}"))?;
+    let target = stow_types::identity::TargetTriple::parse(row.target.as_str())
+        .map_err(|error| format!("draining miss target `{}`: {error}", row.target))?;
+    let rustc_version = stow_types::identity::WireRustcVersion::parse(row.rustc_version.as_str())
+        .map_err(|error| {
+        format!(
+            "draining miss rustc_version `{}`: {error}",
+            row.rustc_version
+        )
+    })?;
+    let Some(subgraph_json) = row.subgraph_json.as_deref() else {
+        return Ok(None);
+    };
+    let dependency_subgraph = match serde_json::from_str::<stow_types::api::TaskSubgraph>(
+        subgraph_json,
+    ) {
+        Ok(subgraph) => subgraph,
+        Err(error) => {
+            tracing::warn!(%error, crate_name = %row.crate_name, "skipping a miss drain row with undecodable subgraph");
+            return Ok(None);
+        }
+    };
+    let request = EnqueueRequest {
+        crate_name,
+        version,
+        features_json,
+        target,
+        rustc_version,
+        downloads: row.seen_count,
+        source: stow_types::api::EnqueueSource::CacheMiss,
+        dependency_subgraph,
+        preserve_lockfile: false,
+        host_side: row.host_side != 0,
+    };
+    let derived_task_id = request
+        .task_id()
+        .map_err(|error| format!("draining miss task id: {error}"))?;
+    if row.task_id.as_deref() != Some(derived_task_id.as_str()) {
+        tracing::warn!(crate_name = %row.crate_name, task_id = %derived_task_id, stored = ?row.task_id, "skipping a miss drain row whose stored task id disagrees with its subgraph");
+        return Ok(None);
+    }
+    Ok(Some(request))
 }
 
 /// Flip the `queued_at` marker for the misses matching `requests`.
@@ -1058,15 +1076,21 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
         .map_err(|error| format!("derive admitted miss depends_on: {error}"))?;
     let depends_on_json = serde_json::to_string(&depends_on)
         .map_err(|error| format!("serialize admitted miss depends_on: {error}"))?;
+    let subgraph_json = serde_json::to_string(&request.dependency_subgraph)
+        .map_err(|error| format!("serialize admitted miss subgraph: {error}"))?;
+    let task_id = request
+        .task_id()
+        .map_err(|error| format!("derive admitted miss task id: {error}"))?;
     db.query(
         "INSERT INTO dependency_graph_misses \
-         (crate_name, version, features_json, target, rustc_version, host_side, depends_on_json, seen_count, first_seen_at, last_seen_at, admitted_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
+         (crate_name, version, features_json, target, rustc_version, host_side, depends_on_json, subgraph_json, task_id, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
          ON CONFLICT(crate_name, version, features_json, target, rustc_version, host_side) \
          DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), \
              depends_on_json = CASE WHEN excluded.depends_on_json IN ('', '[]') \
                  THEN dependency_graph_misses.depends_on_json \
-                 ELSE excluded.depends_on_json END",
+                 ELSE excluded.depends_on_json END, \
+             subgraph_json = excluded.subgraph_json, task_id = excluded.task_id",
     )
     .bind(request.crate_name.as_str())
     .bind(request.version.to_string())
@@ -1075,6 +1099,8 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
     .bind(request.rustc_version.as_str())
     .bind(i64::from(request.host_side))
     .bind(depends_on_json)
+    .bind(subgraph_json)
+    .bind(task_id)
     .execute()
     .await
     .map_err(|error| format!("record admitted miss: {error}"))?;
@@ -1097,6 +1123,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0008_min_glibc.sql"),
         include_str!("../migrations/0009_unit_shape.sql"),
         include_str!("../migrations/0010_miss_host_side.sql"),
+        include_str!("../migrations/0011_miss_subgraph.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1253,7 +1280,8 @@ mod sqlite_tests {
         assert_eq!(
             take_dependency_graph_misses(&db, 10)
                 .await
-                .expect("take misses"),
+                .expect("take misses")
+                .requests,
             Vec::<EnqueueRequest>::new()
         );
 
@@ -1268,7 +1296,8 @@ mod sqlite_tests {
 
         let drained = take_dependency_graph_misses(&db, 10)
             .await
-            .expect("take misses");
+            .expect("take misses")
+            .requests;
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].crate_name.as_str(), "serde");
         assert_eq!(
@@ -1279,7 +1308,8 @@ mod sqlite_tests {
         assert_eq!(
             take_dependency_graph_misses(&db, 10)
                 .await
-                .expect("take misses"),
+                .expect("take misses")
+                .requests,
             Vec::<EnqueueRequest>::new()
         );
 
@@ -1290,7 +1320,8 @@ mod sqlite_tests {
             .expect("restore queued marker");
         let redrained = take_dependency_graph_misses(&db, 10)
             .await
-            .expect("take misses");
+            .expect("take misses")
+            .requests;
         assert_eq!(redrained.len(), 1);
     }
 
@@ -1319,7 +1350,8 @@ mod sqlite_tests {
         // its `queued_at` marker — the scheduler still owns it.
         let drained = take_dependency_graph_misses(&db, 10)
             .await
-            .expect("take misses");
+            .expect("take misses")
+            .requests;
         assert_eq!(drained.len(), 1);
         record_admitted_miss(&db, &request)
             .await
@@ -1331,9 +1363,46 @@ mod sqlite_tests {
         assert_eq!(
             take_dependency_graph_misses(&db, 10)
                 .await
-                .expect("take misses"),
+                .expect("take misses")
+                .requests,
             Vec::<EnqueueRequest>::new()
         );
+    }
+
+    /// A historical row — `admitted_at` set but no stored subgraph —
+    /// drains as an explicit skip: it is consumed (`queued_at` marked),
+    /// counted in the drain, and never promoted to a guessed context
+    /// (stow#588).
+    #[tokio::test]
+    async fn a_row_without_a_stored_subgraph_drains_as_a_skip() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_migrations(&db).await;
+        db.query(
+            "INSERT INTO dependency_graph_misses \
+             (crate_name, version, features_json, target, rustc_version, host_side, depends_on_json, seen_count, admitted_at) \
+             VALUES ('serde', '1.0.5', '[]', 'x86_64-unknown-linux-gnu', '1.85.0', 0, '[]', 3, datetime('now'))",
+        )
+        .execute()
+        .await
+        .expect("seed historical miss");
+
+        let drain = take_dependency_graph_misses(&db, 10)
+            .await
+            .expect("take misses");
+        assert_eq!(drain.requests, Vec::<EnqueueRequest>::new());
+        assert_eq!(drain.skipped, 1);
+        assert_eq!(
+            miss_count_where(&db, "queued_at IS NOT NULL").await,
+            1,
+            "the skipped row is consumed, not left to retry forever"
+        );
+        // Nothing drainable remains: the row does not keep coming back.
+        let drain = take_dependency_graph_misses(&db, 10)
+            .await
+            .expect("take misses");
+        assert_eq!(drain.requests.len() + drain.skipped, 0);
     }
 
     /// A host miss and a target miss at one semantic identity are two
@@ -1370,7 +1439,8 @@ mod sqlite_tests {
         assert_eq!(miss_count_where(&db, "1 = 1").await, 2);
         let mut drained = take_dependency_graph_misses(&db, 10)
             .await
-            .expect("take misses");
+            .expect("take misses")
+            .requests;
         drained.sort_by_key(|drain| drain.host_side);
         assert_eq!(drained.len(), 2);
         assert!(!drained[0].host_side);

@@ -1641,13 +1641,22 @@ pub async fn mint_miss_admissions(
 async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
     const DRAIN_MISS_BATCH: usize = 64;
 
-    let drained = match db::take_dependency_graph_misses(db, DRAIN_MISS_BATCH).await {
-        Ok(drained) => drained,
+    let drain = match db::take_dependency_graph_misses(db, DRAIN_MISS_BATCH).await {
+        Ok(drain) => drain,
         Err(error) => {
             tracing::error!(%error, "failed to drain admitted dependency-graph misses");
             return;
         }
     };
+    // Historical rows carry no stored subgraph — they drained as an
+    // explicit skip, counted here, never re-minted (stow#588).
+    if drain.skipped > 0 {
+        tracing::info!(
+            skipped = drain.skipped,
+            "miss drain skipped rows with no stored context"
+        );
+    }
+    let drained = drain.requests;
     if drained.is_empty() {
         return;
     }
