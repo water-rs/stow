@@ -2884,11 +2884,12 @@ checksum = "33"
                 capture_dir,
                 bundled_lockfile: None,
             };
+            let exe = std::env::consts::EXE_SUFFIX;
             let wrappers = stow_shim::WrapperShimPaths {
-                rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),
-                cc_launcher: tools_dir.path().join("stow-cc-launcher"),
-                cc_compiler: tools_dir.path().join("stow-cc"),
-                cxx_compiler: tools_dir.path().join("stow-cxx"),
+                rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
+                cc_launcher: tools_dir.path().join(format!("stow-cc-launcher{exe}")),
+                cc_compiler: tools_dir.path().join(format!("stow-cc{exe}")),
+                cxx_compiler: tools_dir.path().join(format!("stow-cxx{exe}")),
             };
             let wrapper = std::env::current_exe().expect("current exe");
             let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
@@ -2967,11 +2968,12 @@ checksum = "33"
                 capture_dir,
                 bundled_lockfile: None,
             };
+            let exe = std::env::consts::EXE_SUFFIX;
             let wrappers = stow_shim::WrapperShimPaths {
-                rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),
-                cc_launcher: tools_dir.path().join("stow-cc-launcher"),
-                cc_compiler: tools_dir.path().join("stow-cc"),
-                cxx_compiler: tools_dir.path().join("stow-cxx"),
+                rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
+                cc_launcher: tools_dir.path().join(format!("stow-cc-launcher{exe}")),
+                cc_compiler: tools_dir.path().join(format!("stow-cc{exe}")),
+                cxx_compiler: tools_dir.path().join(format!("stow-cxx{exe}")),
             };
             let wrapper = std::env::current_exe().expect("current exe");
 

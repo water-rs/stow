@@ -322,8 +322,14 @@ fn build_binaries() -> (PathBuf, PathBuf) {
         let status = build.status().expect("build stow-build and stow-cli");
         assert!(status.success(), "cargo build stow-build failed");
         (
-            workspace.join("target/debug/stow-cli"),
-            workspace.join("target/debug/stow-build"),
+            workspace.join(format!(
+                "target/debug/stow-cli{}",
+                std::env::consts::EXE_SUFFIX
+            )),
+            workspace.join(format!(
+                "target/debug/stow-build{}",
+                std::env::consts::EXE_SUFFIX
+            )),
         )
     })
     .clone()
