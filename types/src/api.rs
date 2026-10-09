@@ -12,11 +12,14 @@ use utoipa::ToSchema;
 use crate::artifact::{ArtifactKind, RustCrateType};
 use crate::glibc::GlibcVersion;
 use crate::identity::{
-    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
-    WireRustcVersion,
+    CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, DependencyIdentity, FeaturesJson,
+    TargetTriple, WireRustcVersion,
 };
 use crate::index::ArtifactIndexRow;
 use crate::platform::Profile;
+use crate::stow_error;
+use crate::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
+use std::collections::BTreeSet;
 
 /// The compilation target triples the trusted CI build fleet covers.
 ///
@@ -159,33 +162,273 @@ pub struct BuildTaskPayload {
     /// as target-side tasks.
     #[serde(default)]
     pub host_side: bool,
-    /// The task's dependency pins: the identities the deps were published
-    /// at. The generated wrapper package declares each pin as an exact
-    /// dependency (`=<version>`, the request-global unified feature set, the
-    /// side's manifest section) so cargo resolves the dep's unit at the same
-    /// identity its own task published — a resolve that stops short of the
-    /// published feature set compiles the dep again and fails the
-    /// foreign-unit scan (stow#431).
-    pub dep_pins: Vec<BuildDepPin>,
+    /// The task's whole dependency subgraph: the graph inputs of every
+    /// transitive dependency node plus the root's direct-dependency
+    /// indexes (stow#588). The generated wrapper package pins every node
+    /// (`=<version>`, the node's own feature set, in the manifest section
+    /// matching its side) so the wrapper's resolve reproduces the
+    /// dispatched context exactly — a direct-pin-only manifest would let
+    /// a transitively widened dep resolve narrower than its published
+    /// identity.
+    ///
+    /// The wire form carries inputs only; identities are always
+    /// re-derived by [`ResolvedTaskGraph::resolve`], and
+    /// [`Self::verified_dependency_graph`] fails unless the derived root
+    /// id equals `task_id`.
+    pub dependency_subgraph: TaskSubgraph,
 }
 
-/// One dependency edge of a build task — a crate's published identity.
+/// GitHub caps every `workflow_dispatch` call's inputs at 65,535
+/// characters together.
 ///
-/// Carried on [`BuildTaskPayload`] so the generated wrapper package can pin
-/// the dep to the identity its own task published rather than whatever the
-/// wrapper's resolution would pick.
+/// The serialized [`BuildTaskPayload`] is by far the largest input, so
+/// producers encode through [`BuildTaskPayload::encode_dispatch_task`]
+/// and fail before GitHub does.
+pub const DISPATCH_INPUT_LIMIT: usize = 65_535;
+
+/// A build task's dependency subgraph in compact wire form (stow#588).
+///
+/// Carries only the graph inputs a [`ResolvedTaskGraph::resolve`] needs:
+/// crate, version, features and side per node, plus dep-edge indexes —
+/// rustc and target are derived, never carried. rustc is the task's own
+/// `rustc_version`; a node's target is the task's `target` for a
+/// target-side node and the runner family's host triple
+/// (`runner_family(task.target).host_triple()`) for a host-side node.
+/// That matches the resolver, which keys every host unit's
+/// `platform` at `CompileKind::Host` mapped to the runner family's host
+/// triple (`resolver/src/emit.rs`), and `EnqueueDependency::target`,
+/// which carries the dep node's platform verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct TaskSubgraph {
+    /// The indexes into `nodes` of the task node's direct dependencies.
+    /// Field renames keep the wire small: the payload rides one
+    /// `workflow_dispatch` input and the cap above is shared.
+    #[serde(rename = "r", default, skip_serializing_if = "Vec::is_empty")]
+    pub root_deps: Vec<u32>,
+    /// Every transitive dependency node, in a stable order (the
+    /// dependency's own nodes; the task's node itself is implicit — its
+    /// identity comes from the [`BuildTaskPayload`] fields).
+    #[serde(rename = "n")]
+    pub nodes: Vec<SubgraphNode>,
+}
+
+/// One transitive dependency node's graph inputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct BuildDepPin {
+pub struct SubgraphNode {
     /// The dependency's crate name as known to crates.io.
+    #[serde(rename = "n")]
     pub crate_name: CrateName,
-    /// The version the dependency's task published at.
+    /// The version its task published at.
+    #[serde(rename = "v")]
     pub version: CrateVersion,
-    /// The request-global unified feature set the dep was published under.
+    /// The resolved feature set the node compiles with.
+    #[serde(rename = "f")]
     pub features_json: FeaturesJson,
-    /// Which side of the target's unit graph the pin belongs to: a
-    /// `build-dependencies` entry (host side — the shape proc-macro and
-    /// build-script deps compile at) or a `dependencies` entry.
+    /// Whether the node lives on the host side of the consumer's unit
+    /// graph.
+    #[serde(rename = "h", default, skip_serializing_if = "std::ops::Not::not")]
     pub host_side: bool,
+    /// Indexes into [`TaskSubgraph::nodes`] naming this node's direct
+    /// dependencies.
+    #[serde(rename = "d", default, skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<u32>,
+}
+
+impl TaskSubgraph {
+    /// Build the wire form from a resolved task graph: `root` is the
+    /// index of the task's own node in `graph.nodes()`; the subgraph is
+    /// the root's whole transitive dependency closure — covered nodes
+    /// included, since the builder's pins must reproduce them too.
+    ///
+    /// Wire node order is the resolved graph's canonical order
+    /// restricted to the reachable set, so `resolve` reproduces the same
+    /// indexes.
+    ///
+    /// # Errors
+    /// `root` out of range, or a dep index that does not fit the wire's
+    /// `u32` (a graph that large cannot ride a dispatch input anyway).
+    pub fn from_resolved(graph: &ResolvedTaskGraph, root: usize) -> crate::error::Result<Self> {
+        let nodes = graph.nodes();
+        if root >= nodes.len() {
+            return Err(stow_error!(
+                "task subgraph root index {root} out of range ({} nodes)",
+                nodes.len()
+            ));
+        }
+        // The task's dependency closure, minus the root itself, in graph
+        // order. Wire index = rank inside this list.
+        let mut reachable = BTreeSet::new();
+        let mut frontier = nodes[root].dependencies.clone();
+        while let Some(next) = frontier.pop() {
+            if reachable.insert(next) {
+                frontier.extend(nodes[next].dependencies.iter().copied());
+            }
+        }
+        // Graph index → wire rank — one lookup per edge, not a scan of
+        // the reachable set per edge.
+        let wire_ranks: BTreeMap<usize, u32> = reachable
+            .iter()
+            .enumerate()
+            .map(|(rank, &index)| {
+                u32::try_from(rank)
+                    .map(|rank| (index, rank))
+                    .map_err(|_| stow_error!("task subgraph edge index {rank} does not fit u32"))
+            })
+            .collect::<crate::error::Result<BTreeMap<usize, u32>>>()?;
+        let wire_index = |graph_index: usize| -> crate::error::Result<u32> {
+            wire_ranks.get(&graph_index).copied().ok_or_else(|| {
+                stow_error!(
+                    "task subgraph edge {graph_index} escapes the root's dependency closure"
+                )
+            })
+        };
+        let root_deps = nodes[root]
+            .dependencies
+            .iter()
+            .map(|&dep| wire_index(dep))
+            .collect::<crate::error::Result<Vec<u32>>>()?;
+        let mut out = Vec::with_capacity(reachable.len());
+        for index in &reachable {
+            let node = &nodes[*index];
+            out.push(SubgraphNode {
+                crate_name: node.identity.crate_name.clone(),
+                version: node.identity.version.clone(),
+                features_json: node.identity.features_json.clone(),
+                host_side: node.identity.host_side,
+                deps: node
+                    .dependencies
+                    .iter()
+                    .map(|&dep| wire_index(dep))
+                    .collect::<crate::error::Result<Vec<u32>>>()?,
+            });
+        }
+        Ok(Self {
+            root_deps,
+            nodes: out,
+        })
+    }
+
+    /// Expand the wire inputs into the node list
+    /// [`ResolvedTaskGraph::resolve`] consumes: index 0 is the task's own
+    /// node (`root`), then every [`SubgraphNode`] in wire order.
+    ///
+    /// # Errors
+    /// `runner_family(root.target)` returning `None` — the subgraph's
+    /// host-side nodes key at the family's host triple — or a wire
+    /// index past the node list.
+    pub fn resolve(&self, root: &TaskNodeIdentity) -> crate::error::Result<ResolvedTaskGraph> {
+        let host_triple = runner_family(root.target.as_str())
+            .ok_or_else(|| {
+                stow_error!(
+                    "task target `{}` maps to no runner family — host-side subgraph nodes have no host triple to key on",
+                    root.target
+                )
+            })?
+            .host_triple();
+        let mut nodes = Vec::with_capacity(self.nodes.len() + 1);
+        nodes.push(ResolvedTaskNode {
+            identity: root.clone(),
+            dependencies: self
+                .root_deps
+                .iter()
+                .map(|&dep| {
+                    // Wire index → resolved index: `resolve` inserts the
+                    // root first, so every wire node lands at index + 1,
+                    // the same shift a `SubgraphNode::deps` entry gets.
+                    let index = usize::try_from(dep).map_err(|error| stow_error!("{error}"))?;
+                    Ok(index + 1)
+                })
+                .collect::<crate::error::Result<Vec<usize>>>()?,
+        });
+        for node in &self.nodes {
+            nodes.push(ResolvedTaskNode {
+                identity: TaskNodeIdentity {
+                    crate_name: node.crate_name.clone(),
+                    version: node.version.clone(),
+                    features_json: node.features_json.clone(),
+                    target: TargetTriple::parse(if node.host_side {
+                        host_triple
+                    } else {
+                        root.target.as_str()
+                    })?,
+                    rustc_version: root.rustc_version.clone(),
+                    host_side: node.host_side,
+                },
+                dependencies: node
+                    .deps
+                    .iter()
+                    .map(|&dep| {
+                        let index = usize::try_from(dep).map_err(|error| stow_error!("{error}"))?;
+                        Ok(index + 1)
+                    })
+                    .collect::<crate::error::Result<Vec<usize>>>()?,
+            });
+        }
+        ResolvedTaskGraph::resolve(nodes)
+    }
+}
+
+impl BuildTaskPayload {
+    /// The task's own node identity, the fields `task_id` commits to.
+    #[must_use]
+    pub fn task_node_identity(&self) -> TaskNodeIdentity {
+        TaskNodeIdentity {
+            crate_name: self.crate_name.clone(),
+            version: self.version.clone(),
+            features_json: self.features_json.clone(),
+            target: self.target.clone(),
+            rustc_version: self.rustc_version.clone(),
+            host_side: self.host_side,
+        }
+    }
+
+    /// Re-derive the task's dependency graph from the carried subgraph.
+    ///
+    /// # Errors
+    /// Fails when the subgraph cannot resolve, and unless the derived
+    /// root's task id equals `task_id` — the payload's own digest check.
+    pub fn verified_dependency_graph(&self) -> crate::error::Result<ResolvedTaskGraph> {
+        let graph = self
+            .dependency_subgraph
+            .resolve(&self.task_node_identity())?;
+        let derived = graph
+            .task_id(0)
+            .ok_or_else(|| stow_error!("resolved dependency subgraph has no root node"))?;
+        if derived != self.task_id {
+            return Err(stow_error!(
+                "task {} {} ({}): payload task_id `{}` does not match the derived root id `{derived}` of its dependency subgraph",
+                self.crate_name,
+                self.version,
+                self.target,
+                self.task_id,
+            ));
+        }
+        Ok(graph)
+    }
+
+    /// Serialize the payload for dispatch, failing before GitHub's
+    /// per-invocation inputs cap does.
+    ///
+    /// # Errors
+    /// Serialization failure, or an encoded payload over
+    /// [`DISPATCH_INPUT_LIMIT`] — the error names the crate, version,
+    /// target, node count and encoded length.
+    pub fn encode_dispatch_task(&self) -> crate::error::Result<String> {
+        let encoded = serde_json::to_string(self)
+            .map_err(|error| stow_error!("serialize build task payload: {error}"))?;
+        if encoded.len() > DISPATCH_INPUT_LIMIT {
+            return Err(stow_error!(
+                "build task {} {} on {} encodes to {} characters across {} dependency nodes — over the {}-character workflow_dispatch input cap",
+                self.crate_name,
+                self.version,
+                self.target,
+                encoded.len(),
+                self.dependency_subgraph.nodes.len(),
+                DISPATCH_INPUT_LIMIT,
+            ));
+        }
+        Ok(encoded)
+    }
 }
 
 /// One artifact a trusted build published.
@@ -221,6 +464,11 @@ pub struct ArtifactRecord {
     /// JSON-encoded dependency `c_metadata` identities captured from rustc
     /// --extern inputs; sorted by `(crate_name, c_metadata)`.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// The Merkle dependency digest the artifact was built under
+    /// (stow#588). `None` on archive rows recorded before the digest
+    /// existed — `None` answers no contextual coverage query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_identity: Option<DependencyIdentity>,
     /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
@@ -277,13 +525,15 @@ pub struct EnqueueRequest {
     pub downloads: u64,
     /// Source of the enqueue request.
     pub source: EnqueueSource,
-    /// The task's own dependencies — the crate units this task's build
-    /// needs published before it may dispatch. Edges point from the
-    /// dependent at its dependencies, each named at the dep's own
-    /// (target, rustc) identity — a host unit's platform is the runner
-    /// family's host triple.
-    #[serde(default)]
-    pub depends_on: Vec<EnqueueDependency>,
+    /// The node's whole transitive dependency closure in compact wire
+    /// form — the request's single context source (stow#588). The
+    /// direct-dependency edges [`EnqueueRequest::depends_on`] derives
+    /// are only the first hop: a covered dep's own children still have
+    /// to resolve at the same identities inside the builder's generated
+    /// package, and covered nodes are never enqueued, so the scheduler
+    /// cannot rebuild this closure from its own stored edges. No
+    /// default: the subgraph is derived from an actual resolved graph.
+    pub dependency_subgraph: TaskSubgraph,
     /// Whether the node compiles for the build host (a proc-macro, build
     /// dependency, or build-script unit) rather than for the consumer's
     /// target. Host-side tasks mint on the runner family's host triple and
@@ -319,6 +569,105 @@ pub struct EnqueueDependency {
     /// compile host units at. Defaults to false — a target-side dep.
     #[serde(default)]
     pub host_side: bool,
+    /// The dep's own dependency digest — the Merkle context its task id
+    /// commits to (stow#588). No default: the digest is derived from the
+    /// dep's actual resolved subgraph.
+    pub dependency_identity: DependencyIdentity,
+}
+
+impl EnqueueDependency {
+    /// The dep node's canonical task id — its identity tuple plus its
+    /// own dependency-context digest.
+    #[must_use]
+    pub fn task_id(&self) -> String {
+        TaskNodeIdentity {
+            crate_name: self.crate_name.clone(),
+            version: self.version.clone(),
+            features_json: self.features_json.clone(),
+            target: self.target.clone(),
+            rustc_version: self.rustc_version.clone(),
+            host_side: self.host_side,
+        }
+        .task_id(&self.dependency_identity)
+    }
+}
+
+impl EnqueueRequest {
+    /// The node's own task identity, the fields `task_id` commits to.
+    #[must_use]
+    pub fn task_node_identity(&self) -> TaskNodeIdentity {
+        TaskNodeIdentity {
+            crate_name: self.crate_name.clone(),
+            version: self.version.clone(),
+            features_json: self.features_json.clone(),
+            target: self.target.clone(),
+            rustc_version: self.rustc_version.clone(),
+            host_side: self.host_side,
+        }
+    }
+
+    /// The node's resolved dependency graph, derived from the carried
+    /// subgraph — the request's single context source (stow#588).
+    ///
+    /// # Errors
+    /// The subgraph cannot resolve (bad index, cycle, unmapped target).
+    pub fn resolved_dependency_graph(&self) -> crate::error::Result<ResolvedTaskGraph> {
+        self.dependency_subgraph.resolve(&self.task_node_identity())
+    }
+
+    /// The Merkle digest committing to this node's dependency subgraph —
+    /// the segment its canonical task id carries, re-derived from the
+    /// carried subgraph rather than stored (stow#588).
+    ///
+    /// # Errors
+    /// The subgraph cannot resolve, or yields no root digest.
+    pub fn dependency_identity(&self) -> crate::error::Result<DependencyIdentity> {
+        self.resolved_dependency_graph()?
+            .dependency_identity(0)
+            .cloned()
+            .ok_or_else(|| stow_error!("resolved dependency graph yields no root digest"))
+    }
+
+    /// The node's canonical task id — the identity tuple plus the
+    /// derived dependency-context digest (stow#588).
+    ///
+    /// # Errors
+    /// The subgraph cannot resolve.
+    pub fn task_id(&self) -> crate::error::Result<String> {
+        Ok(self
+            .task_node_identity()
+            .task_id(&self.dependency_identity()?))
+    }
+
+    /// The task's own dependencies — the root node's direct-dependency
+    /// edges, each named at the dep's own (target, rustc) identity and
+    /// carrying the dep's derived digest. Derived from the carried
+    /// subgraph, never stored (stow#588).
+    ///
+    /// # Errors
+    /// The subgraph cannot resolve.
+    pub fn depends_on(&self) -> crate::error::Result<Vec<EnqueueDependency>> {
+        let graph = self.resolved_dependency_graph()?;
+        let nodes = graph.nodes();
+        nodes[0]
+            .dependencies
+            .iter()
+            .map(|&dep| {
+                let node = &nodes[dep];
+                Ok(EnqueueDependency {
+                    crate_name: node.identity.crate_name.clone(),
+                    version: node.identity.version.clone(),
+                    features_json: node.identity.features_json.clone(),
+                    target: node.identity.target.clone(),
+                    rustc_version: node.identity.rustc_version.clone(),
+                    host_side: node.identity.host_side,
+                    dependency_identity: graph.dependency_identity(dep).cloned().ok_or_else(
+                        || stow_error!("resolved dependency graph yields no digest for node {dep}"),
+                    )?,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Where an enqueue request originated.
@@ -402,40 +751,26 @@ pub struct AdmissionRequest {
     pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
 }
 
-/// Canonical scheduler task identity — the blake3-derived id `enqueue`
-/// deduplicates on and `build-crate.yml`'s `run-name` carries.
-///
-/// The workflow-run webhook maps a finished run back to the task by this
-/// id. It lives in this crate so `stow-admin`'s manual driver mints
-/// exactly the ids the scheduler queue assigns.
-///
-/// `host_side` carries the unit's compile side: the same crate
-/// legitimately exists as both a target-side node and a host-side node at
-/// the host triple — a `-host` suffix distinguishes them while leaving
-/// every pre-existing target-side id spelled exactly as before.
-#[must_use]
-pub fn task_id(
+/// The `<crate>-<version>-<features hash>-<target>-<rustc>` prefix every
+/// task id shares — [`crate::task_graph::TaskNodeIdentity::task_id`]
+/// inserts the `-d<dependency digest>` segment and appends `-host` —
+/// there is no digest-less spelling of a task id (stow#588).
+pub(crate) fn task_id_prefix(
     crate_name: &str,
     version: &str,
     features_json: &str,
     target: &str,
     rustc_version: &str,
-    host_side: bool,
 ) -> String {
     let features_hash = blake3::hash(features_json.as_bytes()).to_hex().to_string();
-    let base = format!(
+    format!(
         "{}-{}-{}-{}-{}",
         crate_name,
         version,
         features_hash,
         target.replace('-', "_"),
         rustc_version.replace('-', "_")
-    );
-    if host_side {
-        format!("{base}-host")
-    } else {
-        base
-    }
+    )
 }
 
 /// Completion the edge's `POST /api/v1/github/workflow-run` handler sends
@@ -510,6 +845,11 @@ pub struct ResolvedDependencyGraphEntry {
     pub host_side: bool,
     /// Direct dependencies of this package.
     pub dependencies: Vec<ResolvedDependencyGraphDependency>,
+    /// This node's dependency subgraph, projected from the build's own
+    /// `cargo --unit-graph` — the wire `resolve` re-derives the node's
+    /// task id from, so a forged or leaf-shaped context is refused
+    /// (stow#588).
+    pub dependency_subgraph: TaskSubgraph,
 }
 
 /// The dispatch freeze — the scheduler's "builds are failing
@@ -1318,6 +1658,10 @@ pub struct PublishedSliceRow {
     /// `None` only on reports serialized before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_shape: Option<crate::public_cache::UnitShape>,
+    /// The Merkle dependency digest the row was built under (stow#588) —
+    /// required: an index row without one is filtered before it ever
+    /// reaches this wire, so a stored or reported row always carries it.
+    pub dependency_identity: DependencyIdentity,
 }
 
 /// Body the edge forwards to the scheduler's `/index/published` — one
@@ -1440,8 +1784,8 @@ pub struct SchedulerSeedRequest {
 
 /// What the seed reports back. A request carries one chunk of work, so
 /// the caller loops until `done` — `seeded` says whether this call
-/// wrote fixture rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// wrote fixture rows, and `(phase, n)` is its progress witness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerSeedReport {
     /// Rows `queue` holds now.
     pub queue_rows: u64,
@@ -1454,6 +1798,13 @@ pub struct SchedulerSeedReport {
     pub seeded: bool,
     /// Whether the fixture is fully seeded (or was already populated).
     pub done: bool,
+    /// The seed cursor's phase after this call (`queue`, `edges_*`,
+    /// `nodes`, `slices`, `deps`, `feed_*`, `reset`, `done`) — with
+    /// `n`, the caller's progress witness: a call that returns the same
+    /// `(phase, n)` twice advanced nothing.
+    pub phase: String,
+    /// The phase's position after this call.
+    pub n: u64,
 }
 
 /// One statement's real Durable Object cursor counters — the units
@@ -2321,6 +2672,40 @@ pub struct SchedulerSubmitResponse {
     /// Requests dropped during canonicalization (unpublished version or
     /// unresolvable `depends_on`).
     pub dropped: u32,
+}
+
+/// One task the submit-by-id lane promotes: a task id whose nodes are
+/// already in the scheduler's node store, with the miss demand the
+/// promoted row keeps for ranking (stow#588).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmitTaskIdEntry {
+    /// The full contextual task id the node store holds.
+    pub task_id: String,
+    /// The demand the queue row records (`downloads` on the minted
+    /// request).
+    pub downloads: u64,
+}
+
+/// Body of `POST /api/v1/scheduler/tasks/submit-ids`.
+///
+/// The scheduler resolves each id's subgraph from its node store; an id
+/// the store does not hold is reported as unknown and never re-minted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmitTaskIdsRequest {
+    /// The task ids to promote, in submit order.
+    pub tasks: Vec<SubmitTaskIdEntry>,
+}
+
+/// Response of `POST /api/v1/scheduler/tasks/submit-ids`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmitTaskIdsResponse {
+    /// Ids accepted for submission.
+    pub submitted: u32,
+    /// Brand-new queue rows inserted; the rest of `submitted` updated or
+    /// merged into existing rows.
+    pub inserted: u32,
+    /// Ids the node store does not hold — reported, never re-minted.
+    pub unknown: Vec<String>,
 }
 
 /// Response of `GET /api/v1/admin/coverage/{crate}` — per-CI-target

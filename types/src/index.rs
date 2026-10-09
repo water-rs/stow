@@ -33,7 +33,10 @@ use crate::platform::Profile;
 /// v3 makes `ArtifactIndexHeader::generation` required — a defaulted `0`
 /// would silently accept an index that predates the field and claim a
 /// delta base the report path cannot honor.
-pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 3;
+///
+/// v4 binds current rows to resolved dependency context. Older readers
+/// must reject it instead of merging distinct contexts by compile key.
+pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 4;
 
 /// Media type of the index's single OCI layer — the zstd-compressed
 /// [`ArtifactIndex`] JSON.
@@ -95,6 +98,11 @@ pub struct ArtifactIndexRow {
     /// Sorted `(crate_name, c_metadata)` identities of the dependencies
     /// this artifact was built against — the transitive-closure chain.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
+    /// The Merkle dependency digest the artifact was built under
+    /// (stow#588). `None` on archive rows recorded before the digest
+    /// existed — `None` answers no contextual coverage query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_identity: Option<crate::identity::DependencyIdentity>,
     /// Cargo's `-C metadata` value — the exact cache lookup key.
     pub c_metadata: CMetadata,
     /// Blake3 compile key of this artifact. A row is *canonical* — the
@@ -354,6 +362,7 @@ mod tests {
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
+            dependency_identity: None,
             c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
             compile_key: format!("{c_metadata}{c_metadata}"),
             bundle_digest: format!("sha256:{c_metadata:0>64}"),

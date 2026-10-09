@@ -3,7 +3,6 @@ use std::future::Future;
 use std::num::{NonZero, NonZeroU32};
 
 use skyzen_services::durable::{Alarm, DbValue, DurableDb};
-pub use stow_types::api::task_id;
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
     QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus,
@@ -61,11 +60,14 @@ pub struct QueuedTask {
     /// wrapper package's dependency as the unit's consumers compile it.
     pub host_side: bool,
     pub preserve_lockfile: bool,
-    /// The task's `queue_dependencies` rows at claim time — the published
-    /// identity of every dep the unit needs. Dispatch carries them to
-    /// `BuildTaskPayload.dep_pins` so the generated wrapper package pins
-    /// each dep to the identity its own task published.
-    pub dep_pins: Vec<stow_types::api::BuildDepPin>,
+    /// The task's dependency subgraph at claim time, rebuilt from its
+    /// `queue_dependencies` rows (stow#588). Dispatch carries it to
+    /// `BuildTaskPayload.dependency_subgraph` so the generated wrapper
+    /// package pins the dep closure. The table stores direct-dep edges
+    /// only — a dep's own children are not recoverable here, so each
+    /// subgraph node lands as a leaf; the scheduler's storage rework is
+    /// owned by a follow-up task.
+    pub dependency_subgraph: stow_types::api::TaskSubgraph,
 }
 
 // Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
@@ -302,10 +304,27 @@ struct BatchedInsert {
     target: String,
     rustc_version: String,
     host_side: u8,
+    dependency_identity: String,
     downloads: i64,
     priority: i64,
     preserve_lockfile: u8,
     lane: &'static str,
+}
+
+/// One node-store row for the bulk `INSERT OR IGNORE INTO task_nodes`:
+/// the node's canonical identity plus its dependency digest and the
+/// JSON-encoded list of its direct-dependency task ids (stow#588).
+#[derive(Clone, serde::Serialize)]
+struct BatchedNodeRow {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+    host_side: u8,
+    dependency_identity: String,
+    children_json: String,
 }
 
 /// One stored edge's readiness as probed for an insert chunk: whether
@@ -439,6 +458,7 @@ struct BatchedDepEdge {
     dep_target: String,
     dep_rustc_version: String,
     dep_host_side: u8,
+    dep_dependency_identity: String,
     dep_invocations: i64,
     dep_shapes: i64,
 }
@@ -658,9 +678,9 @@ async fn apply_batched_inserts(
         let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, dependency_identity, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
-                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
+                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'dependency_identity', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
                         1, lower(hex(randomblob(16))), e ->> 'first_requested_at', \
                         e ->> 'created_at', \
@@ -701,70 +721,24 @@ async fn apply_batched_inserts(
     Ok(inserted)
 }
 
-/// Sync the dependency edges of every task the chunk resynced as a
-/// delta, not a rewrite: the DELETE drops only edges the task's new
-/// report no longer carries — a reported edge whose stored columns
-/// already match survives untouched, so a resubmit with an unchanged
-/// dependency set writes nothing. Rewriting wholesale (delete all +
-/// reinsert) billed `2 × edges` rows per resubmit; at ~20k submits a
-/// day with production-size dep lists that was the dominant rows-written
-/// source. A content-changed edge counts as dropped and the INSERT
-/// re-adds it with the new columns; a legacy `dep_side_known = 0` row
-/// never matches a resolver-written report, so it is deleted and
-/// reinserted as known rather than left failing closed.
-async fn apply_batched_dependency_sync(
-    db: &DurableDb,
-    resync_ids: &[String],
-    edges: &[BatchedDepEdge],
-) -> Result<(), QueueError> {
-    for chunk in resync_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
-        // The reported edge set is scoped to the tasks in this chunk so
-        // a keep-check never consults another chunk's report.
-        let chunk_ids: std::collections::HashSet<&str> = chunk.iter().map(String::as_str).collect();
-        let chunk_edges: Vec<&BatchedDepEdge> = edges
-            .iter()
-            .filter(|edge| chunk_ids.contains(edge.task_id.as_str()))
-            .collect();
-        db.query(
-            "DELETE FROM queue_dependencies \
-             WHERE task_id IN (SELECT value FROM json_each(?)) \
-               AND (dep_side_known != 1 OR NOT EXISTS ( \
-                   SELECT 1 FROM (SELECT value AS e FROM json_each(?)) AS j \
-                   WHERE j.e ->> 'task_id' = queue_dependencies.task_id \
-                     AND j.e ->> 'depends_on_task_id' = queue_dependencies.depends_on_task_id \
-                     AND j.e ->> 'dep_crate_name' = queue_dependencies.dep_crate_name \
-                     AND j.e ->> 'dep_version' = queue_dependencies.dep_version \
-                     AND j.e ->> 'dep_features_json' = queue_dependencies.dep_features_json \
-                     AND j.e ->> 'dep_target' = queue_dependencies.dep_target \
-                     AND j.e ->> 'dep_rustc_version' = queue_dependencies.dep_rustc_version \
-                     AND j.e ->> 'dep_host_side' = queue_dependencies.dep_host_side \
-                     AND j.e ->> 'dep_invocations' = queue_dependencies.dep_invocations \
-                     AND j.e ->> 'dep_shapes' = queue_dependencies.dep_shapes \
-               ))",
-        )
-        .bind(enqueue_json(chunk)?)
-        .bind(enqueue_json(&chunk_edges)?)
-        .execute()
-        .await
-        .map_err(|error| format!("clear dropped task dependencies: {error}"))?;
-    }
-    insert_dep_edges(db, edges).await?;
-    Ok(())
-}
-
-/// Insert the resync's surviving edges, each carrying its `dep_met` —
-/// the slice answer at insert time, the same EXISTS the gate used to
-/// evaluate — so the owner's `unpublished_deps` count and every later
-/// slice-delta flip read a stored flag instead of re-joining the
-/// published rows per edge.
+/// Insert the edges of the tasks this request inserts, each carrying
+/// its `dep_met` — the slice answer at insert time, the same EXISTS
+/// the gate used to evaluate — so the owner's `unpublished_deps`
+/// count and every later slice-delta flip read a stored flag instead
+/// of re-joining the published rows per edge. `ON CONFLICT` tolerates
+/// a stale edge row outliving its queue row (edges are a function of
+/// the owner task id, so the row is identical by construction), and
+/// the slice deltas' `dep_met` maintenance keeps it current while the
+/// owner is gone.
 async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<(), QueueError> {
     for chunk in edges.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(&format!(
             "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_met, dep_side_known) \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_met, dep_side_known) \
              SELECT d.task_id, d.depends_on_task_id, d.dep_crate_name, \
                     d.dep_version, d.dep_features_json, d.dep_target, \
-                    d.dep_rustc_version, d.dep_host_side, d.dep_invocations, \
+                    d.dep_rustc_version, d.dep_host_side, d.dep_dependency_identity, \
+                    d.dep_invocations, \
                     d.dep_shapes, CASE WHEN {unpub} THEN 0 ELSE 1 END, 1 \
              FROM (SELECT e ->> 'task_id' AS task_id, \
                          e ->> 'depends_on_task_id' AS depends_on_task_id, \
@@ -774,6 +748,7 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
                          e ->> 'dep_target' AS dep_target, \
                          e ->> 'dep_rustc_version' AS dep_rustc_version, \
                          e ->> 'dep_host_side' AS dep_host_side, \
+                         e ->> 'dep_dependency_identity' AS dep_dependency_identity, \
                          e ->> 'dep_invocations' AS dep_invocations, \
                          e ->> 'dep_shapes' AS dep_shapes \
                    FROM (SELECT value AS e FROM json_each(?))) AS d \
@@ -785,6 +760,31 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
         .execute()
         .await
         .map_err(|error| format!("insert task dependencies: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Upsert every resolved-subgraph node into `task_nodes` — the
+/// submit-side half of the node store (stow#588). `INSERT OR IGNORE`:
+/// a task id is a content address, so a node another request already
+/// wrote is identical by construction and skipped. Batched by JSON
+/// like every enqueue write; the per-node payload is fixed-width plus
+/// one `children_json` array.
+async fn upsert_task_nodes(db: &DurableDb, rows: &[BatchedNodeRow]) -> Result<(), QueueError> {
+    for chunk in rows.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        db.query(
+            "INSERT OR IGNORE INTO task_nodes \
+             (task_id, crate_name, version, features_json, target, rustc_version, host_side, dependency_identity, children_json) \
+             SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', \
+                    e ->> 'features_json', e ->> 'target', e ->> 'rustc_version', \
+                    e ->> 'host_side', e ->> 'dependency_identity', \
+                    e ->> 'children_json' \
+             FROM (SELECT value AS e FROM json_each(?)) e",
+        )
+        .bind(enqueue_json(chunk)?)
+        .execute()
+        .await
+        .map_err(|error| format!("upsert task nodes: {error}"))?;
     }
     Ok(())
 }
@@ -914,34 +914,36 @@ async fn enqueue_inner(
             );
             continue;
         }
-        // Each named dep's task id resolves here once — the edge rows
-        // `dep_edges` builds key on them.
-        let dep_task_ids = request
-            .depends_on
+        // The request's subgraph resolves once: the task id, dep edges
+        // and node-store rows all derive from that one resolution — the
+        // validation `resolve` runs (indexes, self-edges, cycles) is the
+        // refusal for a request whose declared context cannot re-derive
+        // its ids (stow#588).
+        let graph = request.resolved_dependency_graph().map_err(|error| {
+            QueueError::Invariant(format!("resolve dependency subgraph: {error}"))
+        })?;
+        let deps = request
+            .depends_on()
+            .map_err(|error| QueueError::Invariant(format!("derive dep edges: {error}")))?;
+        let dep_task_ids = deps
             .iter()
-            .map(|dependency| {
-                task_id(
-                    dependency.crate_name.as_str(),
-                    dependency.version.to_string().as_str(),
-                    dependency.features_json.raw().as_str(),
-                    dependency.target.as_str(),
-                    dependency.rustc_version.as_str(),
-                    dependency.host_side,
-                )
-            })
+            .map(stow_types::api::EnqueueDependency::task_id)
             .collect();
+        let nodes = node_store_rows(&graph)?;
+        let root_dependency_identity = graph
+            .dependency_identity(0)
+            .ok_or_else(|| QueueError::Invariant("root node yields no digest".into()))?
+            .to_string();
         prepared.push(Prepared {
             request,
-            task_id: task_id(
-                &identity.crate_name,
-                &identity.version,
-                identity.features_json.as_str(),
-                &identity.target,
-                &identity.rustc_version,
-                identity.host_side,
-            ),
+            task_id: request
+                .task_id()
+                .map_err(|error| QueueError::Invariant(format!("derive task id: {error}")))?,
             identity,
+            deps,
             dep_task_ids,
+            root_dependency_identity,
+            nodes,
         });
     }
     if prepared.is_empty() {
@@ -973,6 +975,16 @@ async fn enqueue_inner(
     // priority that cannot exceed `compute_priority`'s own bound, so
     // only the update set needs the probe.
     check_update_band_bound(db, &plan.updates).await?;
+    // The content-addressed node store: every submit upserts every
+    // node of each request's resolved subgraph, root included, so a
+    // claimed task's `dependency_subgraph` can later be rebuilt by
+    // walking task ids alone (stow#588). Insert-or-ignore — dedup is
+    // by task id; storage grows with distinct nodes, not requests.
+    let node_rows: Vec<BatchedNodeRow> = prepared
+        .iter()
+        .flat_map(|entry| entry.nodes.iter().cloned())
+        .collect();
+    upsert_task_nodes(db, &node_rows).await?;
     // The human lane spends from a per-UTC-day budget — a mutating
     // charge, so it runs only after every read-only preflight above
     // has passed; a refused resubmit must not consume budget.
@@ -997,29 +1009,182 @@ async fn enqueue_inner(
             budget: u64::from(settings.human_daily_task_budget),
         });
     }
-    let resync_ids: Vec<String> = plan.resync.keys().cloned().collect();
-    let edges: Vec<BatchedDepEdge> = plan.resync.into_values().flatten().collect();
-    apply_batched_dependency_sync(db, &resync_ids, &edges).await?;
+    let edge_owner_ids: Vec<String> = plan.edge_inserts.keys().cloned().collect();
+    let edges: Vec<BatchedDepEdge> = plan.edge_inserts.into_values().flatten().collect();
+    insert_dep_edges(db, &edges).await?;
     let inserted = apply_batched_inserts(db, settings, &plan.inserts).await?;
     apply_batched_updates(db, settings, &plan.updates).await?;
 
-    // The batch's edge set is settled — refresh the gate answer on
-    // pre-existing tasks whose edges the sync rewrote. Fresh inserts
-    // computed theirs inside the INSERT; an empty resync set issues
-    // no statement at all.
-    refresh_deps_met_tasks(db, &resync_ids).await?;
+    // The batch's edge set is settled — recount the gate answer on the
+    // tasks the request inserted. Their INSERT already folded the
+    // edges just written, so this only moves a row whose insert hit a
+    // conflict (a stale edge set from a deleted queue row, maintained
+    // by slice deltas in between); an empty set issues no statement.
+    refresh_deps_met_tasks(db, &edge_owner_ids).await?;
 
     u64_to_u32(inserted, "inserted task count")
 }
 
+/// What `submit_task_ids` reports: new queue rows inserted, plus the
+/// submitted ids the node store does not hold — reported as unknown,
+/// never re-minted (stow#588).
+#[derive(Debug, Default)]
+pub struct SubmitTaskIdsOutcome {
+    pub inserted: u32,
+    pub unknown: Vec<String>,
+}
+
+/// `POST /tasks/submit/ids` — the missed lane's promote path (stow#588):
+/// each entry names an exact task id whose nodes a verified admission's
+/// submit already upserted into `task_nodes`. The store is the only
+/// context source — every known id's subgraph is rebuilt by the same
+/// BFS walk dispatch uses and minted into a cache-miss `EnqueueRequest`
+/// with the entry's recorded demand, then enqueued on the trusted lane.
+/// An id the store does not hold is reported as `unknown` — never
+/// re-minted, never a leaf substitute; a store chain that breaks
+/// mid-walk is likewise reported rather than guessed at.
+pub async fn submit_task_ids(
+    db: &DurableDb,
+    entries: &[stow_types::api::SubmitTaskIdEntry],
+    settings: &SchedulerSettings,
+) -> Result<SubmitTaskIdsOutcome, QueueError> {
+    let ids: Vec<String> = entries.iter().map(|entry| entry.task_id.clone()).collect();
+    let (walks, found, failed) = walk_task_ids(db, &ids).await?;
+    let mut broken: std::collections::HashSet<usize> =
+        failed.iter().map(|(index, _)| *index).collect();
+    for (index, slot) in walks.iter().enumerate() {
+        if slot.is_none() && !broken.contains(&index) {
+            broken.insert(index);
+        }
+    }
+    let mut requests = Vec::with_capacity(entries.len());
+    let mut unknown = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(walk) = walks.get(index).and_then(Option::as_ref) else {
+            unknown.push(entry.task_id.clone());
+            continue;
+        };
+        let Some(root) = found.get(&entry.task_id) else {
+            unknown.push(entry.task_id.clone());
+            continue;
+        };
+        let dependency_subgraph = build_task_subgraph(&entry.task_id, walk, &found)
+            .map_err(|error| QueueError::Invariant(format!("submit task ids: {error}")))?;
+        let request = EnqueueRequest {
+            crate_name: CrateName::parse(root.crate_name.as_str()).map_err(|error| {
+                QueueError::Invariant(format!("node {}: {error}", root.task_id))
+            })?,
+            version: CrateVersion::new(semver::Version::parse(&root.version).map_err(|error| {
+                QueueError::Invariant(format!("node {}: {error}", root.task_id))
+            })?),
+            features_json: FeaturesJson::from_sorted(
+                serde_json::from_str(&root.features_json).map_err(|error| {
+                    QueueError::Invariant(format!("node {}: {error}", root.task_id))
+                })?,
+            )
+            .map_err(|error| QueueError::Invariant(format!("node {}: {error}", root.task_id)))?,
+            target: stow_types::identity::TargetTriple::parse(root.target.as_str()).map_err(
+                |error| QueueError::Invariant(format!("node {}: {error}", root.task_id)),
+            )?,
+            rustc_version: stow_types::identity::WireRustcVersion::parse(
+                root.rustc_version.as_str(),
+            )
+            .map_err(|error| QueueError::Invariant(format!("node {}: {error}", root.task_id)))?,
+            downloads: entry.downloads,
+            source: stow_types::api::EnqueueSource::CacheMiss,
+            dependency_subgraph,
+            preserve_lockfile: false,
+            host_side: root.host_side != 0,
+        };
+        // The rebuilt context must re-derive the submitted id exactly —
+        // a store that produces anything else is corrupt, never
+        // re-minted under a fresh id.
+        let derived = request
+            .task_id()
+            .map_err(|error| QueueError::Invariant(format!("derive task id: {error}")))?;
+        if derived != entry.task_id {
+            return Err(QueueError::Invariant(format!(
+                "node store re-derived task id {derived} for submitted {} — refusing to re-mint",
+                entry.task_id
+            )));
+        }
+        requests.push(request);
+    }
+    let inserted = if requests.is_empty() {
+        0
+    } else {
+        enqueue_inner(db, &requests, settings, false).await?
+    };
+    Ok(SubmitTaskIdsOutcome { inserted, unknown })
+}
+
 /// One request precomputed for the batched enqueue: queue identity,
-/// its deterministic task id, and the resolved task ids of its deps.
+/// its deterministic task id, the resolved deps of its carried
+/// subgraph, and the node-store rows the submit upserts (stow#588).
 struct Prepared<'r> {
     request: &'r EnqueueRequest,
     task_id: String,
     identity: TaskIdentity,
-    /// `task_id` of each `request.depends_on` entry, in the same order.
+    /// The request's direct dependencies, resolved from its carried
+    /// subgraph once.
+    deps: Vec<stow_types::api::EnqueueDependency>,
+    /// `task_id` of each `deps` entry, in the same order.
     dep_task_ids: Vec<String>,
+    /// The root node's dependency digest — what `task_id`'s `-d`
+    /// segment commits to; written to `queue.dependency_identity`.
+    root_dependency_identity: String,
+    /// Every node of the request's resolved subgraph, root included —
+    /// upserted into `task_nodes` by the write phase.
+    nodes: Vec<BatchedNodeRow>,
+}
+
+/// The node-store rows one request's resolved subgraph contributes:
+/// every node of the graph, root included, with its children's task
+/// ids encoded as JSON — the upsert set `enqueue` writes so dispatch
+/// can later walk the closure by task id alone (stow#588).
+fn node_store_rows(
+    graph: &stow_types::task_graph::ResolvedTaskGraph,
+) -> Result<Vec<BatchedNodeRow>, QueueError> {
+    let nodes = graph.nodes();
+    let mut rows = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let task_id = graph
+            .task_id(index)
+            .ok_or_else(|| {
+                QueueError::Invariant(format!("resolved node {index} yields no task id"))
+            })?
+            .to_owned();
+        let dependency_identity = graph
+            .dependency_identity(index)
+            .ok_or_else(|| {
+                QueueError::Invariant(format!("resolved node {index} yields no digest"))
+            })?
+            .to_string();
+        let children = node
+            .dependencies
+            .iter()
+            .map(|&dep| {
+                graph.task_id(dep).map(str::to_owned).ok_or_else(|| {
+                    QueueError::Invariant(format!(
+                        "resolved node {index} dep {dep} yields no task id"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<String>, QueueError>>()?;
+        rows.push(BatchedNodeRow {
+            task_id,
+            crate_name: node.identity.crate_name.as_str().to_owned(),
+            version: node.identity.version.to_string(),
+            features_json: node.identity.features_json.raw(),
+            target: node.identity.target.as_str().to_owned(),
+            rustc_version: node.identity.rustc_version.as_str().to_owned(),
+            host_side: u8::from(node.identity.host_side),
+            dependency_identity,
+            children_json: serde_json::to_string(&children)
+                .map_err(|error| QueueError::Sql(format!("encode node children json: {error}")))?,
+        });
+    }
+    Ok(rows)
 }
 
 /// Everything the write phase emits for one chunk, with the per-request
@@ -1027,9 +1192,11 @@ struct Prepared<'r> {
 struct EnqueuePlan {
     updates: Vec<BatchedUpdate>,
     inserts: Vec<BatchedInsert>,
-    /// Task ids whose edge set is rewritten this chunk — the key set
-    /// feeds the bulk DELETE, the rows the bulk INSERT.
-    resync: BTreeMap<String, Vec<BatchedDepEdge>>,
+    /// Edge sets of the tasks this chunk inserts — keyed by owner task
+    /// id. Only fresh rows get edges: a task id commits to its whole
+    /// dependency subgraph, so an existing id's stored edges are already
+    /// exactly these (stow#588).
+    edge_inserts: BTreeMap<String, Vec<BatchedDepEdge>>,
 }
 
 /// One existence probe for the chunk, over every task id it can
@@ -1062,16 +1229,10 @@ async fn probe_task_statuses(
 }
 
 /// One request's edge rows, fully resolved: the dep's required unit
-/// shapes for the gate and a self-edge rejection — the checks
-/// `sync_task_dependencies` ran per dep before each edge INSERT.
+/// shapes for the gate and a self-edge rejection.
 fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
-    let mut edges = Vec::with_capacity(entry.request.depends_on.len());
-    for (dependency, dep_task_id) in entry
-        .request
-        .depends_on
-        .iter()
-        .zip(entry.dep_task_ids.iter())
-    {
+    let mut edges = Vec::with_capacity(entry.deps.len());
+    for (dependency, dep_task_id) in entry.deps.iter().zip(entry.dep_task_ids.iter()) {
         let dep_features = dependency.features_json.raw();
         let dep_version = dependency.version.to_string();
         // The gate needs every required unit shape of the dep's
@@ -1099,6 +1260,7 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
             dep_target: dependency.target.as_str().to_owned(),
             dep_rustc_version: dependency.rustc_version.as_str().to_owned(),
             dep_host_side: u8::from(dependency.host_side),
+            dep_dependency_identity: dependency.dependency_identity.to_string(),
             dep_invocations,
             dep_shapes,
         });
@@ -1110,11 +1272,11 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
 /// order: each request's own insert/update, then its dep sync. A task
 /// appearing twice in one chunk sees what its earlier occurrence left
 /// (a fresh insert reads as 'pending', a resurrected row as 'pending'),
-/// so duplicates land identically to the row-at-a-time loop. `resync`
-/// keeps the last occurrence's dependency list per task — the old
-/// loop's per-occurrence DELETE+INSERT made the last sync the
-/// surviving one. `statuses` carries the existence probe in and is
-/// advanced to the row each occurrence leaves.
+/// so duplicates land identically to the row-at-a-time loop.
+/// `edge_inserts` holds the first occurrence's dependency list per
+/// task — only a task the chunk inserts can carry new edges. `statuses`
+/// carries the existence probe in and is advanced to the row each
+/// occurrence leaves.
 fn plan_enqueue(
     prepared: &[Prepared<'_>],
     statuses: &mut BTreeMap<String, String>,
@@ -1123,7 +1285,7 @@ fn plan_enqueue(
     let mut plan = EnqueuePlan {
         updates: Vec::new(),
         inserts: Vec::new(),
-        resync: BTreeMap::new(),
+        edge_inserts: BTreeMap::new(),
     };
     for entry in prepared {
         let lane = request_lane(entry.request.source);
@@ -1155,21 +1317,24 @@ fn plan_enqueue(
                 target: entry.identity.target.clone(),
                 rustc_version: entry.identity.rustc_version.clone(),
                 host_side: u8::from(entry.identity.host_side),
+                dependency_identity: entry.root_dependency_identity.clone(),
                 downloads,
                 priority: compute_priority(entry.request.downloads, 0)?,
                 preserve_lockfile: u8::from(entry.request.preserve_lockfile),
                 lane: lane.as_str(),
             });
             statuses.insert(entry.task_id.clone(), "pending".to_owned());
+            // A task id commits to its whole dependency subgraph, so a
+            // task's edge set is a function of the id (stow#588): edges
+            // are written only for the row this request inserts — a
+            // re-enqueue of an existing id can carry nothing new, and
+            // pre-v15 `dep_side_known != 1` rows are the migration's
+            // job, never the request path's.
+            if !entry.deps.is_empty() {
+                let edges = dep_edges(entry)?;
+                plan.edge_inserts.insert(entry.task_id.clone(), edges);
+            }
         }
-        // A re-request without dependency info (exact/semantic miss
-        // paths always send an empty list) must not erase ordering
-        // edges a graph-analysis enqueue established.
-        if entry.request.depends_on.is_empty() {
-            continue;
-        }
-        let edges = dep_edges(entry)?;
-        plan.resync.insert(entry.task_id.clone(), edges);
     }
     plan.updates = updates.into_values().collect();
     Ok(plan)
@@ -2677,6 +2842,7 @@ fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
                AND p.crate_name = {dep}.dep_crate_name \
                AND p.version = {dep}.dep_version \
                AND p.features_json = {dep}.dep_features_json \
+               AND p.dependency_identity = {dep}.dep_dependency_identity \
                AND p.unit_side = {dep}.dep_host_side \
                AND p.unit_invocation BETWEEN 0 AND 1 \
                AND p.unit_linked BETWEEN 0 AND 1 \
@@ -2832,6 +2998,34 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
         RunnerFamily::Windows => "windows",
         RunnerFamily::Linux => "linux",
     }
+}
+
+/// `AND <column> IN ('<family>', …)` — "every family except the
+/// saturated one" rendered as equality over `RunnerFamily::ALL` minus
+/// `full_family`, derived from the type so a new family can never drift
+/// from the exclusion, and never `!=` or `NOT IN`. On `idx_queue_wake`
+/// the family column is the last equality column before the `wake_at`
+/// range, where an inequality cannot bound the range — SQLite falls
+/// back to reading every eligible pending row, which made a burst of N
+/// future-wake misses cost N reads on every alarm pass and every
+/// deliver. The IN list expands into one seek per surviving family, so
+/// each probe reads only the families that can dispatch (stow#588).
+/// `None` — no family saturated — renders no filter at all.
+fn dispatch_family_in_sql(column: &str, full_family: Option<RunnerFamily>) -> String {
+    let Some(full) = full_family else {
+        return String::new();
+    };
+    let families = RunnerFamily::ALL
+        .iter()
+        .filter(|family| **family != full)
+        .map(|family| format!("'{}'", dispatch_family_label(*family)))
+        .collect::<Vec<_>>();
+    if families.is_empty() {
+        // A one-family runner set whose only family is saturated: no
+        // row can dispatch — a literal false keeps the probe's shape.
+        return "AND 0".to_owned();
+    }
+    format!("AND {column} IN ({})", families.join(", "))
 }
 
 /// `queue.value` as a SQL expression — the persisted raw integer the
@@ -3872,7 +4066,10 @@ async fn claim_dispatchable_row(
         rustc_version: row.rustc_version,
         host_side: row.host_side != 0,
         preserve_lockfile: row.preserve_lockfile != 0,
-        dep_pins: Vec::new(),
+        dependency_subgraph: stow_types::api::TaskSubgraph {
+            root_deps: Vec::new(),
+            nodes: Vec::new(),
+        },
     }))
 }
 
@@ -3974,78 +4171,310 @@ pub async fn claim_dispatchable_tasks(
     }
     tracing::info!(selected, "scheduler claim_dispatchable_tasks selected rows");
 
-    load_claimed_dep_pins(db, &mut claimed).await?;
+    load_claimed_subgraphs(db, &mut claimed).await?;
 
     Ok(claimed)
 }
 
-/// Fill each claimed task's `dep_pins` from its `queue_dependencies` rows:
-/// the (name, version, unified features, side) the dep's own task was
-/// published at, which is exactly what the dependent's wrapper manifest
-/// pins so its resolve lands on the published unit (stow#431).
-async fn load_claimed_dep_pins(
+/// One `task_nodes` row as the dispatch walk reads it.
+#[derive(Debug, skyzen::FromRow)]
+struct TaskNodeRow {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+    host_side: i64,
+    children_json: String,
+}
+
+/// The deepest BFS level the node-store walk expands before declaring
+/// the stored graph cyclic — a resolved task graph is acyclic by
+/// construction, so a store that keeps growing past this bound is
+/// corrupt and the walk fails rather than looping.
+const SUBGRAPH_WALK_MAX_LEVELS: usize = 64;
+
+/// The per-level fetch bound: `json_each` over every claimed task's
+/// current frontier in a single statement. A level wider than this —
+/// impossible under real graphs, which stay far narrower — splits into
+/// successive bounded statements of the same shape.
+const SUBGRAPH_WALK_LEVEL_ROWS: usize = 512;
+
+/// Rebuild every claimed task's `BuildTaskPayload.dependency_subgraph`
+/// by walking the `task_nodes` store breadth-first from the task id
+/// (stow#588).
+///
+/// Cost shape: one bounded `task_id IN (…)` SELECT per BFS level shared
+/// by the whole claimed batch — never one query per node — so a pass
+/// costs `O(max depth over the claimed subgraphs)` statements and reads
+/// `O(Σ reachable nodes)` rows. A claimed task whose store chain is
+/// broken (its own node or any reachable node absent) cannot produce a
+/// payload whose `verified_dependency_graph` would hold, so it fails
+/// dispatch with the missing task id named — never a leaf substitute —
+/// and the rest of the batch still dispatches.
+/// Per-task walk state for [`load_claimed_subgraphs`]: the ordered
+/// list of discovered dependency node ids (the future `nodes` array —
+/// the root itself is implicit in the wire), the set for dedup, the
+/// level frontier, and the root node's own children (the future
+/// `root_deps`).
+struct SubgraphWalk {
+    node_ids: Vec<String>,
+    seen: std::collections::HashSet<String>,
+    frontier: Vec<String>,
+    root_children: Vec<String>,
+}
+
+async fn load_claimed_subgraphs(
     db: &DurableDb,
-    claimed: &mut [QueuedTask],
+    claimed: &mut Vec<QueuedTask>,
 ) -> Result<(), QueueError> {
     if claimed.is_empty() {
         return Ok(());
     }
-    let task_ids = claimed
-        .iter()
-        .map(|task| task.task_id.clone())
-        .collect::<Vec<_>>();
-    let rows = db
-        .query(
-            "SELECT task_id, dep_crate_name, dep_version, dep_features_json, dep_host_side \
-             FROM queue_dependencies \
-             WHERE task_id IN (SELECT value FROM json_each(?))",
-        )
-        .bind(enqueue_json(&task_ids)?)
-        .fetch_all::<DepPinRow>()
-        .await
-        .map_err(|error| format!("load claimed task dep pins: {error}"))?;
-    let mut by_task: std::collections::HashMap<String, Vec<stow_types::api::BuildDepPin>> =
-        std::collections::HashMap::new();
-    for row in rows {
-        let pin = stow_types::api::BuildDepPin {
-            crate_name: CrateName::parse(row.dep_crate_name).map_err(|error| {
-                QueueError::Invariant(format!(
-                    "dep pin for {}: invalid crate name: {error}",
-                    row.task_id
-                ))
-            })?,
-            version: CrateVersion::new(semver::Version::parse(&row.dep_version).map_err(
-                |error| {
-                    QueueError::Invariant(format!(
-                        "dep pin for {}: invalid version: {error}",
-                        row.task_id
-                    ))
-                },
-            )?),
-            features_json: FeaturesJson::from_sorted(
-                serde_json::from_str(&row.dep_features_json).map_err(|error| {
-                    QueueError::Invariant(format!(
-                        "dep pin for {}: invalid features: {error}",
-                        row.task_id
-                    ))
-                })?,
-            )
-            .map_err(|error| {
-                QueueError::Invariant(format!(
-                    "dep pin for {}: invalid features: {error}",
-                    row.task_id
-                ))
-            })?,
-            host_side: row.dep_host_side != 0,
-        };
-        by_task.entry(row.task_id).or_default().push(pin);
+    let ids: Vec<String> = claimed.iter().map(|task| task.task_id.clone()).collect();
+    let (mut walks, found, failed) = walk_task_ids(db, &ids).await?;
+    // Fail the unbuildable tasks, naming the missing/unreached node id.
+    for (index, missing) in &failed {
+        let task = &claimed[*index];
+        let error = format!(
+            "node store cannot serve task {}: node {missing} absent ({} nodes walked)",
+            task.task_id,
+            walks[*index].as_ref().map_or(0, |w| w.node_ids.len())
+        );
+        fail_claimed_task(db, &task.task_id, &error).await?;
     }
-    for task in claimed.iter_mut() {
-        if let Some(pins) = by_task.remove(&task.task_id) {
-            task.dep_pins = pins;
+    // Drop failures from the claimed set (descending order keeps
+    // earlier indexes valid); `walks` entries for dropped tasks stay
+    // None and line up with `claimed` afterward.
+    for (index, _) in failed.iter().rev() {
+        claimed.remove(*index);
+        walks.remove(*index);
+    }
+
+    // Build each survivor's wire subgraph: `nodes` in discovery order,
+    // `root_deps` = the root row's children as node indexes. A store
+    // row whose own fields fail to parse is the same class of
+    // corruption as an absent node — fail that task too.
+    let mut build_failed: Vec<usize> = Vec::new();
+    for (index, task) in claimed.iter_mut().enumerate() {
+        let walk = walks[index].take().expect("surviving walk exists");
+        match build_task_subgraph(&task.task_id, &walk, &found) {
+            Ok(subgraph) => task.dependency_subgraph = subgraph,
+            Err(error) => {
+                tracing::error!(task_id = %task.task_id, error = %error, "dispatch subgraph build failed");
+                fail_claimed_task(
+                    db,
+                    &task.task_id,
+                    &format!("node store row invalid for {}: {error}", task.task_id),
+                )
+                .await?;
+                build_failed.push(index);
+            }
         }
     }
+    for index in build_failed.into_iter().rev() {
+        claimed.remove(index);
+    }
     Ok(())
+}
+
+/// The walk half of [`load_claimed_subgraphs`]: level-0 roots in one
+/// `IN` query, then the union-of-frontiers expansion bounded per level,
+/// returning every task's `SubgraphWalk` (None where the walk broke),
+/// the fetched row set, and the (claimed index, missing id) pairs.
+async fn walk_task_ids(
+    db: &DurableDb,
+    task_ids: &[String],
+) -> Result<
+    (
+        Vec<Option<SubgraphWalk>>,
+        std::collections::HashMap<String, TaskNodeRow>,
+        Vec<(usize, String)>,
+    ),
+    QueueError,
+> {
+    let mut found: std::collections::HashMap<String, TaskNodeRow> =
+        std::collections::HashMap::new();
+    for chunk in task_ids.chunks(SUBGRAPH_WALK_LEVEL_ROWS) {
+        for row in fetch_task_nodes(db, chunk).await? {
+            found.insert(row.task_id.clone(), row);
+        }
+    }
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    let mut walks: Vec<Option<SubgraphWalk>> = Vec::with_capacity(task_ids.len());
+    for (index, task_id) in task_ids.iter().enumerate() {
+        let Some(row) = found.get(task_id) else {
+            walks.push(None);
+            failed.push((index, task_id.clone()));
+            continue;
+        };
+        let children = parse_node_children(task_id, &row.children_json)?;
+        walks.push(Some(SubgraphWalk {
+            node_ids: Vec::new(),
+            seen: std::collections::HashSet::from([task_id.clone()]),
+            root_children: children.clone(),
+            frontier: children,
+        }));
+    }
+
+    // BFS levels: the union of every live walk's frontier goes out as
+    // one `IN` query; each walk then consumes its own slice.
+    for _level in 0..SUBGRAPH_WALK_MAX_LEVELS {
+        let union: Vec<String> = walks
+            .iter()
+            .filter_map(|walk| walk.as_ref())
+            .flat_map(|walk| walk.frontier.iter().cloned())
+            .collect();
+        if union.is_empty() {
+            break;
+        }
+        for chunk in union.chunks(SUBGRAPH_WALK_LEVEL_ROWS) {
+            for row in fetch_task_nodes(db, chunk).await? {
+                found.entry(row.task_id.clone()).or_insert(row);
+            }
+        }
+        for (index, slot) in walks.iter_mut().enumerate() {
+            let Some(walk) = slot else { continue };
+            let mut next: Vec<String> = Vec::new();
+            let mut missing: Option<String> = None;
+            for id in walk.frontier.drain(..) {
+                let Some(row) = found.get(&id) else {
+                    missing = Some(id);
+                    break;
+                };
+                if walk.seen.insert(id.clone()) {
+                    let children = parse_node_children(&id, &row.children_json)?;
+                    next.extend(children.into_iter().filter(|c| !walk.seen.contains(c)));
+                    walk.node_ids.push(id);
+                }
+            }
+            if let Some(id) = missing {
+                failed.push((index, id));
+                *slot = None;
+            } else {
+                walk.frontier = next;
+            }
+        }
+    }
+    // Any walk still holding a frontier grew past the level cap — the
+    // stored graph under it is cyclic/corrupt; fail it naming where.
+    for (index, slot) in walks.iter_mut().enumerate() {
+        if let Some(walk) = slot.take() {
+            if walk.frontier.is_empty() {
+                *slot = Some(walk);
+            } else {
+                failed.push((index, walk.frontier[0].clone()));
+            }
+        }
+    }
+    Ok((walks, found, failed))
+}
+
+/// Assemble one claimed task's `TaskSubgraph` from its finished walk —
+/// `nodes` in discovery order, `root_deps` mapped through the same
+/// positions. Any unbuildable store row is reported, never defaulted.
+fn build_task_subgraph(
+    task_id: &str,
+    walk: &SubgraphWalk,
+    found: &std::collections::HashMap<String, TaskNodeRow>,
+) -> Result<stow_types::api::TaskSubgraph, String> {
+    let position: std::collections::HashMap<&str, u32> = walk
+        .node_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), u32::try_from(i).expect("node count fits u32")))
+        .collect();
+    let mut nodes = Vec::with_capacity(walk.node_ids.len());
+    for id in &walk.node_ids {
+        nodes.push(subgraph_node_from_store(&found[id], &position)?);
+    }
+    let root_deps: Vec<u32> = walk
+        .root_children
+        .iter()
+        .filter_map(|id| position.get(id.as_str()).copied())
+        .collect();
+    if root_deps.len() != walk.root_children.len() {
+        return Err(format!("root child missing from walked set for {task_id}"));
+    }
+    Ok(stow_types::api::TaskSubgraph { root_deps, nodes })
+}
+
+/// Persist the hard dispatch failure for one claimed task — the node
+/// store could not serve its subgraph, so it can never verify a
+/// payload; the error message names the offending id.
+async fn fail_claimed_task(db: &DurableDb, task_id: &str, error: &str) -> Result<(), QueueError> {
+    tracing::error!(task_id = %task_id, error = %error, "dispatch subgraph walk failed");
+    db.query(
+        "UPDATE queue SET status = 'failed', error_msg = ?, updated_at = datetime('now')          WHERE task_id = ?",
+    )
+    .bind(error.to_owned())
+    .bind(task_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("mark undispatchable task failed: {error}"))?;
+    Ok(())
+}
+
+/// One bounded `task_id IN (…)` SELECT against the node store — the
+/// only read shape the dispatch walk uses (stow#588).
+async fn fetch_task_nodes(
+    db: &DurableDb,
+    task_ids: &[String],
+) -> Result<Vec<TaskNodeRow>, QueueError> {
+    db.query(
+        "SELECT task_id, crate_name, version, features_json, target, rustc_version, host_side, children_json \
+         FROM task_nodes \
+         WHERE task_id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(enqueue_json(task_ids)?)
+    .fetch_all::<TaskNodeRow>()
+    .await
+    .map_err(|error| format!("fetch task nodes: {error}").into())
+}
+
+/// Decode a node row's `children_json` — the task ids of its direct
+/// dependencies, in stored edge order. A malformed array is a corrupt
+/// store row, an invariant error naming the node.
+fn parse_node_children(task_id: &str, children_json: &str) -> Result<Vec<String>, QueueError> {
+    serde_json::from_str::<Vec<String>>(children_json).map_err(|error| {
+        QueueError::Invariant(format!(
+            "task node {task_id}: invalid children_json: {error}"
+        ))
+    })
+}
+
+/// Project a `task_nodes` row into the wire's `SubgraphNode`, mapping
+/// its children's task ids to positions in this task's node list.
+fn subgraph_node_from_store(
+    row: &TaskNodeRow,
+    position: &std::collections::HashMap<&str, u32>,
+) -> Result<stow_types::api::SubgraphNode, String> {
+    let children =
+        parse_node_children(&row.task_id, &row.children_json).map_err(|error| error.to_string())?;
+    Ok(stow_types::api::SubgraphNode {
+        crate_name: CrateName::parse(row.crate_name.as_str())
+            .map_err(|error| format!("node {}: invalid crate name: {error}", row.task_id))?,
+        version: CrateVersion::new(
+            semver::Version::parse(&row.version)
+                .map_err(|error| format!("node {}: invalid version: {error}", row.task_id))?,
+        ),
+        features_json: FeaturesJson::from_sorted(
+            serde_json::from_str(&row.features_json)
+                .map_err(|error| format!("node {}: invalid features: {error}", row.task_id))?,
+        )
+        .map_err(|error| format!("node {}: invalid features: {error}", row.task_id))?,
+        host_side: row.host_side != 0,
+        deps: children
+            .iter()
+            .map(|id| {
+                position
+                    .get(id.as_str())
+                    .copied()
+                    .ok_or_else(|| format!("node {}: child {id} not in walked set", row.task_id))
+            })
+            .collect::<Result<Vec<u32>, String>>()?,
+    })
 }
 
 /// Retire every candidate row whose semantic identity the artifact
@@ -4152,12 +4581,7 @@ pub(super) const CLAIM_MAX_PAGES: usize = 8;
 /// ORDER BY and LIMIT — shared by the paged claim walk and the
 /// floor probe's bounded frontier so the two can't drift (stow#525).
 fn dispatchable_page_sql(columns: &str, full_family: Option<RunnerFamily>) -> String {
-    let family_filter = full_family.map_or_else(String::new, |family| {
-        format!(
-            "AND q.dispatch_family != '{}'",
-            dispatch_family_label(family)
-        )
-    });
+    let family_filter = dispatch_family_in_sql("q.dispatch_family", full_family);
     format!(
         "SELECT {columns} FROM queue q \
          WHERE q.status = 'pending' AND q.deps_met = 1 \
@@ -5394,9 +5818,12 @@ async fn earliest_pending_eligible_ms(
     // `wake_at` range means under-floor rows are outside the index
     // span the probes walk — a queue of them arms nothing immediate
     // and contributes nothing to the deferred MIN's read set.
-    let family_filter = full_family.map_or_else(String::new, |family| {
-        format!("AND dispatch_family != '{}'", dispatch_family_label(family))
-    });
+    // The family exclusion renders as `dispatch_family IN (…)` — the
+    // remaining families as equality, so SQLite expands the list into
+    // one seek per family and each `wake_at` range stays bounded
+    // (stow#588). `!=` would leave the range unbounded: every eligible
+    // pending row read, on every alarm pass and every deliver.
+    let family_filter = dispatch_family_in_sql("dispatch_family", full_family);
     // The plan is a pure function of `now_ms`; bind the rendered clock
     // rather than calling wall-clock `datetime('now')` inside the probes.
     let now = db
@@ -5535,6 +5962,9 @@ struct SliceRowJson {
     crate_name: String,
     version: String,
     features_json: String,
+    /// The published row's contextual digest (stow#588) — the column
+    /// is NOT NULL, so a stored or reported row always carries one.
+    dependency_identity: String,
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
@@ -5561,6 +5991,7 @@ struct GateIdentity {
     crate_name: String,
     version: String,
     features_json: String,
+    dependency_identity: Option<String>,
     unit_side: i64,
     kind: Option<SliceChangeKind>,
 }
@@ -5570,6 +6001,9 @@ struct NormalizedGateRow {
     crate_name: String,
     version: String,
     features_json: String,
+    /// `None` serializes as JSON null — the match join's `=` never
+    /// binds it, so a context-free row flips no edge (stow#588).
+    dependency_identity: Option<String>,
     unit_side: i64,
     invocations: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5603,11 +6037,12 @@ struct OwnerDelta {
     cleared_blocker: i64,
 }
 
-fn slice_row_key(row: &SliceRowJson) -> (String, String, String, i64, i64, i64) {
+fn slice_row_key(row: &SliceRowJson) -> (String, String, String, String, i64, i64, i64) {
     (
         row.crate_name.clone(),
         row.version.clone(),
         row.features_json.clone(),
+        row.dependency_identity.clone(),
         row.unit_side,
         row.unit_invocation,
         row.unit_linked,
@@ -5639,6 +6074,7 @@ fn normalize_gate_rows(
             crate_name: row.crate_name,
             version: row.version,
             features_json: row.features_json,
+            dependency_identity: Some(row.dependency_identity),
             unit_side: side.to_int(),
             kind,
         };
@@ -5651,6 +6087,7 @@ fn normalize_gate_rows(
             crate_name: identity.crate_name,
             version: identity.version,
             features_json: identity.features_json,
+            dependency_identity: identity.dependency_identity,
             unit_side: identity.unit_side,
             invocations,
             kind: identity.kind,
@@ -5806,13 +6243,16 @@ struct LiveSliceRow {
 
 /// Map report rows onto the stored 6-column identity — `rowid` zeroes
 /// out (only live-read rows carry one) and a missing unit shape writes
-/// the `-1` legs that satisfy no coverage clause.
+/// the `-1` legs that satisfy no coverage clause. Every report row
+/// carries a digest: `PublishedSliceRow.dependency_identity` is
+/// required on the wire, so this map cannot fail on identity.
 fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
     rows.iter()
         .map(|row| SliceRowJson {
             crate_name: row.crate_name.to_string(),
             version: row.version.to_string(),
             features_json: row.features_json.raw(),
+            dependency_identity: row.dependency_identity.to_string(),
             unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
             unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
             unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
@@ -5838,14 +6278,19 @@ async fn apply_slice_delta(
     if !retired.is_empty() {
         let retired_json = serde_json::to_string(retired)
             .map_err(|error| QueueError::Sql(format!("encode slice retire json: {error}")))?;
+        // `json_each` drives: each retired row is one row-value probe
+        // of the table's primary key — the ten-column tuple in PK order,
+        // `dependency_identity` included (NOT NULL post-v15, so row-value
+        // equality is exact; stow#588). One PK lookup per retired row,
+        // proportional to the delta, never a slice scan — and no rowid
+        // second seek.
         db.query(
             "DELETE FROM published_slice_rows \
-             WHERE (target, rustc_version, generation, crate_name, version, features_json, \
-                    unit_side, unit_invocation, unit_linked) IN ( \
-                 SELECT ?, ?, ?, value ->> 'crate_name', value ->> 'version', \
-                        value ->> 'features_json', value ->> 'unit_side', \
-                        value ->> 'unit_invocation', value ->> 'unit_linked' \
-                 FROM json_each(?))",
+             WHERE (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked) IN ( \
+                 SELECT ?, ?, ?, e ->> 'crate_name', e ->> 'version', \
+                        e ->> 'features_json', e ->> 'dependency_identity', \
+                        e ->> 'unit_side', e ->> 'unit_invocation', e ->> 'unit_linked' \
+                 FROM (SELECT value AS e FROM json_each(?)))",
         )
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
@@ -5868,9 +6313,10 @@ async fn apply_slice_delta(
             .map_err(|error| QueueError::Sql(format!("encode slice insert json: {error}")))?;
         db.query(
             "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked) \
+             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked) \
              SELECT ?, ?, ?, e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
-                    e ->> 'unit_side', e ->> 'unit_invocation', e ->> 'unit_linked' \
+                    e ->> 'dependency_identity', e ->> 'unit_side', \
+                    e ->> 'unit_invocation', e ->> 'unit_linked' \
              FROM (SELECT value AS e FROM json_each(?)) \
              WHERE TRUE \
              ON CONFLICT DO NOTHING",
@@ -5907,7 +6353,7 @@ async fn apply_slice_row_delta(
 ) -> Result<Vec<SliceRowJson>, QueueError> {
     let live_rows = db
         .query(
-            "SELECT rowid, crate_name, version, features_json, unit_side, unit_invocation, unit_linked \
+            "SELECT rowid, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked \
              FROM published_slice_rows \
              WHERE target = ? AND rustc_version = ? AND generation = ?",
         )
@@ -5957,9 +6403,10 @@ async fn apply_slice_row_delta(
             .map_err(|error| QueueError::Sql(format!("encode slice insert json: {error}")))?;
         db.query(
             "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked) \
+             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked) \
              SELECT ?, ?, ?, e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
-                    e ->> 'unit_side', e ->> 'unit_invocation', e ->> 'unit_linked' \
+                    e ->> 'dependency_identity', e ->> 'unit_side', \
+                    e ->> 'unit_invocation', e ->> 'unit_linked' \
              FROM (SELECT value AS e FROM json_each(?)) \
              WHERE TRUE \
              ON CONFLICT DO NOTHING",
@@ -6083,6 +6530,7 @@ fn matched_edges_sql(directional_delta: bool) -> String {
           AND d.dep_version = j.c ->> 'version' \
           AND d.dep_features_json = j.c ->> 'features_json' \
           AND d.dep_host_side = j.c ->> 'unit_side' \
+          AND d.dep_dependency_identity = j.c ->> 'dependency_identity' \
           AND (d.dep_invocations & (j.c ->> 'invocations')) != 0 \
           {direction_filter}",
     )
@@ -6228,7 +6676,7 @@ async fn apply_slice_gate_delta(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -6384,6 +6832,26 @@ pub async fn migrate(
         )));
     }
     migrate_schema(db).await?;
+    // The dependency-identity rebuilds run ahead of every other step
+    // (stow#588): `queue` is rebuilt as a shadow copy — the live table
+    // keeps its name and keeps serving every read and write of the old
+    // code while bounded batches copy across repeated migrate calls —
+    // and `published_slice_rows` swaps in one tick (its identity column
+    // is NOT NULL, so every context-free historical row drops and the
+    // shadow's only valid content is empty). While the queue copy is
+    // in flight the remaining steps stay off and the version stamp
+    // holds at its stored value — the report's `after` answers
+    // SCHEMA_VERSION only once both shadows verified and swapped in,
+    // so the deploy gate keeps calling until the rebuild completes.
+    // Reads and writes keep working throughout against the real
+    // tables: mirror triggers follow every live queue write into the
+    // shadow.
+    if !migrate_dependency_identity_rebuilds(db).await? {
+        return Ok(SchemaMigrationReport {
+            before,
+            after: stored_schema_version(db).await?,
+        });
+    }
     migrate_queue_dependencies_columns(db).await?;
     migrate_published_slice_row_shape(db).await?;
     migrate_published_slice_columns(db).await?;
@@ -6410,6 +6878,554 @@ pub async fn migrate(
         before,
         after: SCHEMA_VERSION,
     })
+}
+
+/// Rows one copy statement moves and statements one migrate call makes
+/// during the identity rebuilds — bounded so a call stays well inside
+/// the Durable Object's CPU budget; the operator's repeated migrate
+/// calls (the deploy gate retries until `after` matches) drive the
+/// cursors forward.
+const IDENTITY_COPY_BATCH_ROWS: i64 = 1_000;
+const IDENTITY_COPY_BATCHES_PER_CALL: usize = 8;
+
+/// A table's column names — the probe the rebuild uses to tell whether
+/// the live table carries the identity column yet.
+async fn table_columns(
+    db: &DurableDb,
+    table: &str,
+) -> Result<std::collections::BTreeSet<String>, QueueError> {
+    Ok(db
+        .query(&format!("PRAGMA table_info({table})"))
+        .fetch_all::<QueueTableInfoRow>()
+        .await
+        .map_err(|error| format!("load {table} table_info: {error}"))?
+        .into_iter()
+        .map(|row| row.name)
+        .collect())
+}
+
+/// One stored rebuild cursor from `settings` (`NULL`/`0` means the copy
+/// has not started).
+async fn identity_copy_cursor(db: &DurableDb, key: &str) -> Result<String, QueueError> {
+    Ok(db
+        .query("SELECT value FROM settings WHERE key = ?")
+        .bind(key.to_owned())
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read identity copy cursor {key}: {error}"))?
+        .unwrap_or_default())
+}
+
+async fn set_identity_copy_cursor(
+    db: &DurableDb,
+    key: &str,
+    value: &str,
+) -> Result<(), QueueError> {
+    db.query(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key.to_owned())
+    .bind(value.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("write identity copy cursor {key}: {error}"))?;
+    Ok(())
+}
+
+/// The `queue` half of the version-15 identity rebuild (stow#588): the
+/// task-id uniqueness change is a table rebuild, done as a shadow copy
+/// so the live `queue` keeps its name and keeps serving every read and
+/// write of the running (baseline) code for the whole migration — a
+/// mid-copy `queue` is never a partially populated table.
+///
+/// `queue_v15` — its CREATE TABLE extracted from `schema.sql` itself, so
+/// the shadow's shape cannot drift from a fresh database's — grows
+/// beside the live table. AFTER INSERT/UPDATE/DELETE mirror triggers on
+/// `queue` write every live change into the shadow (`INSERT OR
+/// REPLACE`/`DELETE` keyed on `task_id`), and historical rows copy
+/// across in bounded `task_id`-ordered `INSERT OR IGNORE` batches over
+/// repeated migrate calls — a mirrored row is newer than the copy's
+/// stale read and wins the IGNORE. The shadow also carries
+/// `schema.sql`'s queue indexes from birth, under `v15sh_` build
+/// names: created empty, the copy maintains them incrementally — a
+/// 1M-row `CREATE INDEX` inside the swap tick would cost more than the
+/// rest of the swap combined. **Transient cost:** while the copy runs,
+/// every live `queue` write pays one extra `queue_v15` statement (a
+/// second row written per insert or update, one shadow row deleted
+/// per delete) plus that row's shadow-index maintenance — the mirror
+/// roughly doubles `queue` rowsWritten until the triggers drop at
+/// swap.
+///
+/// Each copy batch also verifies its own task-id range inside the
+/// batch's tick (both directions, plus the NULL-identity audit): a
+/// verified range stays equal because the mirror triggers write every
+/// later change to both sides. So when the cursor is exhausted the
+/// swap's storage tick makes no table-wide comparison and builds no
+/// index — it verifies only the open tail, drops the live table (its
+/// mirror triggers die with it), renames the shadow to `queue`,
+/// strips the `v15sh_` build names off the shadow's already-indexed
+/// indexes via `writable_schema` (SQLite has no ALTER INDEX RENAME; a
+/// `sqlite_master` UPDATE is the metadata-only equivalent), replays
+/// `schema.sql` for the triggers, and recomputes `queue_status_counts`
+/// from the swapped table — the same unbroken-statement atomicity the
+/// enqueue write phase relies on, so the swap lands whole or not at
+/// all. Returns `false` while the copy is incomplete. Historical rows
+/// get `NULL` `dependency_identity` — unknown context, never guessed.
+async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
+    const CURSOR_KEY: &str = "migrate_queue_identity_cursor";
+    let queue = table_columns(db, "queue").await?;
+    let shadow = table_columns(db, "queue_v15").await?;
+    if queue.contains("dependency_identity") {
+        if shadow.is_empty() {
+            // The swapped (or fresh) table — rebuild done. The
+            // shadow's indexes already carry their `schema.sql`
+            // names, so a crash after the rename needs no tail work.
+            return Ok(true);
+        }
+        // Crash recovery: the swap's `DROP TABLE queue` committed on an
+        // eager-commit backend and the call died before the rename;
+        // `migrate_schema` has already recreated `queue` new-shape
+        // (empty — or holding straggler writes that slipped the gap).
+        // The shadow verified before the drop, so it is authoritative:
+        // merge whatever the gap wrote — a straggler insert or update
+        // replaces its shadow copy and keeps its own real digest — then
+        // finish the tail. A straggler *delete* is unmirrored and its
+        // row resurrects; on the Durable Object the swap is one storage
+        // tick and this state can never commit partway, so the gap only
+        // exists on eager-commit backends.
+        db.query(
+            "INSERT OR REPLACE INTO queue_v15 ( \
+                 task_id, crate_name, version, features_json, target, rustc_version, \
+                 downloads, miss_count, request_count, priority, status, error_msg, \
+                 preserve_lockfile, lane, dispatch_attempts, attempt, generation_id, \
+                 not_before, first_requested_at, created_at, updated_at, github_run_id, \
+                 host_side, shape_requeue, unpublished_deps, deps_met, blocked, \
+                 wake_at, dispatch_family, value, demand, dispatch_key, claimed_at, \
+                 dispatch_eligible, dependency_identity \
+             ) SELECT \
+                 task_id, crate_name, version, features_json, target, rustc_version, \
+                 downloads, miss_count, request_count, priority, status, error_msg, \
+                 preserve_lockfile, lane, dispatch_attempts, attempt, generation_id, \
+                 not_before, first_requested_at, created_at, updated_at, github_run_id, \
+                 host_side, shape_requeue, unpublished_deps, deps_met, blocked, \
+                 wake_at, dispatch_family, value, demand, dispatch_key, claimed_at, \
+                 dispatch_eligible, dependency_identity \
+             FROM queue",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("merge straggler queue rows into shadow: {error}"))?;
+        db.query("DROP TABLE queue")
+            .execute()
+            .await
+            .map_err(|error| format!("drop recreated queue for identity swap: {error}"))?;
+        return finish_queue_identity_swap(db, CURSOR_KEY).await;
+    }
+    if queue.is_empty() {
+        return Err(QueueError::Invariant(
+            "queue identity rebuild: no queue and no queue_v15".to_owned(),
+        ));
+    }
+    // Live old-shape queue: grow the shadow beside it.
+    if shadow.is_empty() {
+        db.query(&shadow_create_ddl("queue", "queue_v15"))
+            .execute()
+            .await
+            .map_err(|error| format!("create queue_v15 shadow: {error}"))?;
+    }
+    // The index handoff — one index per call (see the function).
+    handoff_one_queue_index(db).await?;
+    // The mirror triggers re-assert every call while the copy runs:
+    // idempotent, and it closes the crash window between shadow
+    // creation and trigger creation — an unmirrored write gap would
+    // wedge the swap's verify.
+    db.query(include_str!("mirror_queue_identity_triggers.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("install queue identity mirror triggers: {error}"))?;
+    let mut cursor = identity_copy_cursor(db, CURSOR_KEY).await?;
+    for _ in 0..IDENTITY_COPY_BATCHES_PER_CALL {
+        // The batch's upper bound is a separate probe: a mirrored row
+        // already standing in the shadow makes `INSERT OR IGNORE` skip
+        // its stale copy, so the cursor cannot ride on an insert count.
+        let Some(bound) = db
+            .query(
+                "SELECT MAX(task_id) FROM ( \
+                     SELECT task_id FROM queue \
+                     WHERE task_id > ? ORDER BY task_id LIMIT ?)",
+            )
+            .bind(cursor.clone())
+            .bind(IDENTITY_COPY_BATCH_ROWS)
+            .fetch_scalar::<Option<String>>()
+            .await
+            .map_err(|error| format!("probe identity copy bound: {error}"))?
+        else {
+            // Copy exhausted: verify the open tail `(cursor, +inf)` —
+            // every bounded range already verified in its own copy
+            // tick, and the mirror triggers keep a verified range
+            // equal, so nothing table-wide runs here — then swap, the
+            // same storage tick, so verified and swapped are one
+            // decision, never two.
+            verify_queue_identity_range(db, &cursor, None).await?;
+            db.query("DROP TABLE queue")
+                .execute()
+                .await
+                .map_err(|error| format!("drop live queue for identity swap: {error}"))?;
+            return finish_queue_identity_swap(db, CURSOR_KEY).await;
+        };
+        db.query(include_str!("copy_queue_dependency_identity.sql"))
+            .bind(cursor.clone())
+            .bind(IDENTITY_COPY_BATCH_ROWS)
+            .execute()
+            .await
+            .map_err(|error| format!("copy queue rows for identity rebuild: {error}"))?;
+        // Verify this batch's range `(cursor, bound]` in the same
+        // tick: copied and verified are one decision. A verified range
+        // stays equal — later live writes land in both sides via the
+        // mirror — so a failed verify fails the call and the next call
+        // retries this same range from the unchanged cursor.
+        verify_queue_identity_range(db, &cursor, Some(&bound)).await?;
+        set_identity_copy_cursor(db, CURSOR_KEY, &bound).await?;
+        cursor = bound;
+    }
+    Ok(false)
+}
+
+/// A table's `CREATE TABLE` statement pulled out of `schema.sql` and
+/// renamed to its shadow — single source of truth, so the swapped
+/// table's `sqlite_master` entry equals what a fresh database gets.
+fn shadow_create_ddl(live: &str, shadow: &str) -> String {
+    let schema = include_str!("schema.sql");
+    let needle = format!("CREATE TABLE IF NOT EXISTS {live} (");
+    let start = schema
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{needle} not in schema.sql"));
+    let tail = &schema[start..];
+    let end = tail
+        .find("\n);")
+        .unwrap_or_else(|| panic!("{live} create table unterminated in schema.sql"));
+    tail[..end + 3].replacen(&format!("{live} ("), &format!("{shadow} ("), 1)
+}
+
+/// One step of the index handoff, run every migrate call while the
+/// copy is in flight. The shadow builds `schema.sql`'s queue indexes
+/// from birth so the copy maintains them incrementally — building any
+/// of them over the copied 1M-row table inside the swap tick costs
+/// more than the rest of the swap combined. Index names are
+/// schema-global and SQLite has no ALTER INDEX RENAME (and Durable
+/// Objects SQLite has no `writable_schema`), so the live table's
+/// index gives the name up by drop-and-recreate under a `v15live_`
+/// stand-in — one index per call keeps each call's rebuild bounded,
+/// and inside a storage tick the serving table never loses the index.
+/// Once the name is free the shadow's copy goes up under the real
+/// name — which is also what makes the `schema.sql` replay's
+/// `IF NOT EXISTS` skip it for the rest of the migration. The stand-
+/// ins die with the live table at the swap.
+async fn handoff_one_queue_index(db: &DurableDb) -> Result<(), QueueError> {
+    for ddl in queue_index_ddls() {
+        let name = index_name(&ddl);
+        if shadow_has_index(db, &name).await? {
+            continue;
+        }
+        // The live index holding `name` drops first — freeing it —
+        // then its `v15live_` stand-in goes up on `queue`, then the
+        // shadow's copy under the real name. Each is IF EXISTS /
+        // IF NOT EXISTS, so a crash anywhere inside the triple resumes
+        // into the same step; on a Durable Object the whole call is
+        // one tick anyway.
+        db.query(&format!("DROP INDEX IF EXISTS {name}"))
+            .execute()
+            .await
+            .map_err(|error| format!("drop live index {name} for handoff: {error}"))?;
+        db.query(&standin_index_ddl(&ddl, &name))
+            .execute()
+            .await
+            .map_err(|error| format!("stand-in live index for {name}: {error}"))?;
+        db.query(&shadow_index_ddl(&ddl))
+            .execute()
+            .await
+            .map_err(|error| format!("create shadow index {name}: {error}"))?;
+        break;
+    }
+    Ok(())
+}
+
+/// Every `CREATE INDEX` statement `schema.sql` declares `ON queue` —
+/// the secondary set the handoff moves onto the shadow. Statements
+/// are harvested line by line because a later edit could spread one
+/// over several.
+fn queue_index_ddls() -> Vec<String> {
+    let mut ddls = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in include_str!("schema.sql").lines() {
+        match &mut pending {
+            None => {
+                if line.trim_start().starts_with("CREATE INDEX") {
+                    if line.trim_end().ends_with(';') {
+                        if line.contains("ON queue ") || line.contains("ON queue\n") {
+                            ddls.push(line.to_owned());
+                        }
+                    } else {
+                        pending = Some(format!("{line}\n"));
+                    }
+                }
+            }
+            Some(buf) => {
+                buf.push_str(line);
+                buf.push('\n');
+                if line.trim_end().ends_with(';') {
+                    let ddl = pending.take().expect("pending index ddl");
+                    if ddl.contains("ON queue ") || ddl.contains("ON queue\n") {
+                        ddls.push(ddl);
+                    }
+                }
+            }
+        }
+    }
+    ddls
+}
+
+/// The index name a `CREATE INDEX IF NOT EXISTS <name> ...`
+/// `schema.sql` statement declares — everything between the keyword
+/// and the next whitespace.
+fn index_name(ddl: &str) -> String {
+    let head = "CREATE INDEX IF NOT EXISTS ";
+    let name_at = ddl
+        .find(head)
+        .unwrap_or_else(|| panic!("{head} not in index ddl"))
+        + head.len();
+    ddl[name_at..]
+        .split_whitespace()
+        .next()
+        .expect("index name in index ddl")
+        .to_owned()
+}
+
+/// True when the shadow already carries an index named `name` — the
+/// handoff's done-state for that index (`IF NOT EXISTS` would also
+/// match the live table's holder of the same name, so it cannot be
+/// the probe).
+async fn shadow_has_index(db: &DurableDb, name: &str) -> Result<bool, QueueError> {
+    Ok(db
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = ? AND tbl_name = 'queue_v15'",
+        )
+        .bind(name)
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("probe shadow index {name}: {error}"))?
+        != 0)
+}
+
+/// A `schema.sql` queue index statement rewritten onto the shadow:
+/// `ON queue_v15`, name unchanged — the name was freed by the live
+/// index's drop in the same handoff step.
+fn shadow_index_ddl(ddl: &str) -> String {
+    ddl.replacen("ON queue", "ON queue_v15", 1)
+}
+
+/// A `schema.sql` queue index statement renamed to `v15live_<name>`,
+/// still on the live `queue` — the stand-in that keeps the serving
+/// table indexed while its real name is given to the shadow.
+fn standin_index_ddl(ddl: &str, name: &str) -> String {
+    ddl.replacen(name, &format!("v15live_{name}"), 1)
+}
+
+/// The swap's mutating tail, ordered for crash recovery: the live
+/// `queue` drops first — taking the mirror triggers, its counts
+/// triggers and the `v15live_` stand-in indexes with it — so the only
+/// mid-swap crash state is `queue` absent with `queue_v15` present,
+/// which always means "rename pending". The shadow's indexes already
+/// carry their `schema.sql` names — the handoff gave them up during
+/// the copy — so `schema.sql`'s replay only has the queue's triggers
+/// left to recreate (everything else is `IF NOT EXISTS`, a no-op),
+/// and `queue_status_counts` is recomputed wholesale from the swapped
+/// table — the live counters were already consistent, the recompute
+/// is the swap's own audit. Called either right after the drop in the
+/// same statement sequence, or alone from the crash-resume path.
+async fn finish_queue_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<bool, QueueError> {
+    db.query("ALTER TABLE queue_v15 RENAME TO queue")
+        .execute()
+        .await
+        .map_err(|error| format!("rename queue_v15 for identity swap: {error}"))?;
+    db.query(include_str!("schema.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("recreate queue schema after identity swap: {error}"))?;
+    db.query("DELETE FROM queue_status_counts")
+        .execute()
+        .await
+        .map_err(|error| format!("reset status counts for identity swap: {error}"))?;
+    db.query(
+        "INSERT INTO queue_status_counts (status, lane, blocked, n) \
+         SELECT status, lane, blocked, COUNT(*) FROM queue \
+         GROUP BY status, lane, blocked",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("recompute status counts for identity swap: {error}"))?;
+    db.query("DELETE FROM settings WHERE key = ?")
+        .bind(cursor_key)
+        .execute()
+        .await
+        .map_err(|error| format!("clear identity copy cursor: {error}"))?;
+    Ok(true)
+}
+
+/// The verify half of one copy range `(lower, upper]` (a NULL `upper`
+/// is the open tail): the shadow's live-column content must equal the
+/// live table's in both directions and no shadow row may carry a
+/// digest. Runs inside the same storage tick as the copy batch it
+/// gates; a divergence fails the migrate call, and since the cursor
+/// was not yet advanced the next call retries this same range.
+async fn verify_queue_identity_range(
+    db: &DurableDb,
+    lower: &str,
+    upper: Option<&str>,
+) -> Result<(), QueueError> {
+    let mut query = db.query(include_str!("verify_queue_dependency_identity.sql"));
+    for _ in 0..5 {
+        query = query.bind(lower).bind(upper).bind(upper);
+    }
+    let differs = query
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("verify queue identity copy range: {error}"))?;
+    if differs != 0 {
+        return Err(QueueError::Invariant(
+            "queue identity rebuild: queue_v15 shadow diverges from live queue".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The `published_slice_rows` half of the version-15 identity rebuild.
+/// Unlike `queue`, the slice's `dependency_identity` is NOT NULL: a
+/// context-free row satisfies no coverage clause, so historical rows —
+/// all of which predate the column — drop at the swap rather than
+/// carry NULL. The copy therefore degenerates: every row a v14 table
+/// can hold dies by design, the shadow's only valid content is empty,
+/// and the whole rebuild is one atomic tick — shadow create, empty-
+/// shadow audit, drop, rename — so no mirror triggers or cursor
+/// batches are needed (the window they guard does not exist).
+async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
+    const CURSOR_KEY: &str = "migrate_slice_identity_cursor";
+    let rows = table_columns(db, "published_slice_rows").await?;
+    let shadow = table_columns(db, "published_slice_rows_v15").await?;
+    if rows.contains("dependency_identity") {
+        if shadow.is_empty() {
+            return Ok(true);
+        }
+        // Same crash recovery as the queue half: `migrate_schema`
+        // recreated `published_slice_rows` new-shape after the swap's
+        // drop committed and the call died before the rename. The
+        // verified shadow is authoritative — absorb any straggler
+        // writes (new-code rows carry real digests, preserved by the
+        // primary-key replace) and finish the tail.
+        db.query(
+            "INSERT OR REPLACE INTO published_slice_rows_v15 \
+             (target, rustc_version, generation, crate_name, version, features_json, \
+              dependency_identity, unit_side, unit_invocation, unit_linked) \
+             SELECT target, rustc_version, generation, crate_name, version, \
+                    features_json, dependency_identity, unit_side, \
+                    unit_invocation, unit_linked \
+             FROM published_slice_rows \
+             WHERE dependency_identity IS NOT NULL",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("merge straggler slice rows into shadow: {error}"))?;
+        db.query("DROP TABLE published_slice_rows")
+            .execute()
+            .await
+            .map_err(|error| format!("drop recreated slice rows for identity swap: {error}"))?;
+        return finish_slice_identity_swap(db, CURSOR_KEY).await;
+    }
+    if rows.is_empty() {
+        if shadow.is_empty() {
+            return Err(QueueError::Invariant(
+                "slice identity rebuild: no published_slice_rows and no shadow".to_owned(),
+            ));
+        }
+        return finish_slice_identity_swap(db, CURSOR_KEY).await;
+    }
+    if shadow.is_empty() {
+        db.query(&shadow_create_ddl(
+            "published_slice_rows",
+            "published_slice_rows_v15",
+        ))
+        .execute()
+        .await
+        .map_err(|error| format!("create published_slice_rows_v15 shadow: {error}"))?;
+    }
+    // The audit before the drop: nothing may occupy the shadow — a
+    // v14 live table holds no digests to copy and no mirror or merge
+    // could have written here. A non-empty shadow is corruption.
+    verify_slice_identity_copy(db).await?;
+    db.query("DROP TABLE published_slice_rows")
+        .execute()
+        .await
+        .map_err(|error| format!("drop live slice rows for identity swap: {error}"))?;
+    finish_slice_identity_swap(db, CURSOR_KEY).await
+}
+
+/// The slice swap's mutating tail — same crash-resume contract as
+/// [`finish_queue_identity_swap`]: rename the shadow in, replay
+/// `schema.sql`, clear the cursor. (`published_slice_rows` has no
+/// indexes or counters of its own; the schema replay is a no-op past
+/// the rename and stays in the sequence for symmetry with any future
+/// table additions.)
+async fn finish_slice_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<bool, QueueError> {
+    db.query("ALTER TABLE published_slice_rows_v15 RENAME TO published_slice_rows")
+        .execute()
+        .await
+        .map_err(|error| format!("rename slice-rows shadow for identity swap: {error}"))?;
+    db.query(include_str!("schema.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("recreate slice schema after identity swap: {error}"))?;
+    db.query("DELETE FROM settings WHERE key = ?")
+        .bind(cursor_key)
+        .execute()
+        .await
+        .map_err(|error| format!("clear slice identity copy cursor: {error}"))?;
+    Ok(true)
+}
+
+/// The slice rebuild's audit before the live table drops: the shadow
+/// must be empty. A v14 `published_slice_rows` carries no
+/// `dependency_identity` column, so every historical row is
+/// context-free — it satisfies no coverage clause and dies at the
+/// swap rather than violate the NOT NULL shadow. Nothing else can
+/// write the shadow (no mirror triggers exist on this path — the
+/// rebuild is one atomic tick), so a non-empty shadow is corruption.
+async fn verify_slice_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
+    let differs = db
+        .query("SELECT EXISTS (SELECT 1 FROM published_slice_rows_v15) AS differs")
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("verify slice identity copy: {error}"))?;
+    if differs != 0 {
+        return Err(QueueError::Invariant(
+            "slice identity rebuild: shadow holds rows a context-free live set cannot produce"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Both identity rebuilds; `false` while either copy is still in
+/// flight so the caller holds the version stamp. `task_nodes` itself
+/// needs no copy: it is created fresh by `schema.sql` and populated
+/// only by new-code submits — historical rows carry no nodes by
+/// design (unknown context is never re-minted).
+async fn migrate_dependency_identity_rebuilds(db: &DurableDb) -> Result<bool, QueueError> {
+    if !migrate_queue_dependency_identity(db).await? {
+        return Ok(false);
+    }
+    migrate_slice_dependency_identity(db).await
 }
 
 /// The stored schema version, or 0 on a queue that predates the marker
@@ -6884,6 +7900,17 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
                 .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
         }
     }
+    // The dep's contextual digest (stow#588): nullable on purpose —
+    // edges written before the identity model carry NULL, and NULL
+    // satisfies no coverage clause.
+    if !columns.contains("dep_dependency_identity") {
+        db.query("ALTER TABLE queue_dependencies ADD COLUMN dep_dependency_identity TEXT")
+            .execute()
+            .await
+            .map_err(|error| {
+                format!("add queue_dependencies.dep_dependency_identity column: {error}")
+            })?;
+    }
     if !columns.contains("dep_side_known") {
         db.query(
             "ALTER TABLE queue_dependencies ADD COLUMN dep_side_known INTEGER NOT NULL DEFAULT 0",
@@ -7012,7 +8039,7 @@ async fn derive_dev_era_edge_sides(db: &DurableDb) -> Result<(), QueueError> {
         .fetch_all::<UnmaskedEdge>()
         .await
         .map_err(|error| format!("load unestablished dependency edges: {error}"))?;
-    for edge in side_edges {
+    for edge in &side_edges {
         let owner_target = edge.owner_target.as_deref().unwrap_or("");
         let owner_host_side = edge.owner_host_side.unwrap_or(0) != 0;
         let side = derive_edge_side(owner_target, owner_host_side, &edge.dep_target);
@@ -7029,12 +8056,33 @@ async fn derive_dev_era_edge_sides(db: &DurableDb) -> Result<(), QueueError> {
         .bind(side)
         .bind(mask)
         .bind(shapes)
-        .bind(edge.task_id)
-        .bind(edge.depends_on_task_id)
+        .bind(edge.task_id.clone())
+        .bind(edge.depends_on_task_id.clone())
         .execute()
         .await
         .map_err(|error| format!("derive dependency edge side: {error}"))?;
+        // `dep_met` is a stored answer the request path only writes at
+        // edge insert — nothing else re-evaluates a derived edge until
+        // a slice delta happens to touch it, so recount it here with
+        // the same EXISTS the insert evaluates (a second statement:
+        // a SET expression sees the row's old values).
+        db.query(&format!(
+            "UPDATE queue_dependencies \
+             SET dep_met = CASE WHEN {unpub} THEN 0 ELSE 1 END \
+             WHERE task_id = ? AND depends_on_task_id = ?",
+            unpub = dep_edge_unpublished_sql("queue_dependencies"),
+        ))
+        .bind(edge.task_id.clone())
+        .bind(edge.depends_on_task_id.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("recount derived edge coverage: {error}"))?;
     }
+    // The owners' stored counters (`unpublished_deps`/`deps_met`/
+    // `blocked`) follow from the edges just rewritten — recount them
+    // on exactly those rows.
+    let owner_ids: Vec<String> = side_edges.iter().map(|edge| edge.task_id.clone()).collect();
+    refresh_deps_met_tasks(db, &owner_ids).await?;
     Ok(())
 }
 
@@ -7395,16 +8443,6 @@ struct TaskIdRow {
     status: String,
 }
 
-/// One `queue_dependencies` row reduced to a [`QueuedTask`]'s dep pin.
-#[derive(Debug, skyzen::FromRow)]
-struct DepPinRow {
-    task_id: String,
-    dep_crate_name: String,
-    dep_version: String,
-    dep_features_json: String,
-    dep_host_side: i64,
-}
-
 /// One `GROUP BY status, lane, blocked` aggregate row from [`status`].
 #[derive(Debug, skyzen::FromRow)]
 struct StatusLaneCountRow {
@@ -7523,6 +8561,7 @@ mod tests {
             crate_name: "crate".to_owned(),
             version: "1.0.0".to_owned(),
             features_json: "[]".to_owned(),
+            dependency_identity: "dep".to_owned(),
             unit_side,
             unit_invocation,
             unit_linked,

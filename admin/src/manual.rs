@@ -21,13 +21,14 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use oci_client::manifest::OciImageManifest;
-use stow_types::api::{BuildDepPin, BuildTaskPayload, EnqueueDependency, EnqueueRequest, task_id};
+use stow_types::api::{BuildTaskPayload, EnqueueDependency, EnqueueRequest};
 use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 use stow_types::index::{ArtifactIndexRow, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
 use stow_types::records::parse_run_title;
 use stow_types::registry::GHCR_BASE;
 use stow_types::stow_error;
+use stow_types::task_graph::TaskNodeIdentity;
 use stow_types::trusted_builder::{BRANCH, INDEX_CERTIFICATE_IDENTITY, WORKFLOW_FILE};
 use zenwave::{Client, ResponseExt};
 
@@ -106,6 +107,11 @@ pub struct ManualArgs {
     /// wave's and are not adopted.
     #[arg(long, value_parser = parse_adopt_since)]
     adopt_since: Option<time::OffsetDateTime>,
+    /// Resolve the cohort, encode every wave payload and report the
+    /// dispatch-input sizes, then exit — nothing is dispatched and no
+    /// GitHub token or dispatch URL is needed (stow#588).
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// `--adopt-since`'s RFC 3339 parse.
@@ -224,15 +230,6 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
                 .map_err(|error| stow_error!("--targets `{target}`: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let dispatch = match &args.dispatch_url {
-        Some(url) => Dispatch::Local {
-            base: url.trim_end_matches('/').to_owned(),
-        },
-        None => Dispatch::GitHub {
-            token: crate::github_token().await?,
-        },
-    };
-
     let resolved = resolve_sources(&args, &targets, &rustc_version).await?;
     if resolved.requests.is_empty() {
         if !resolved.unresolved_projects.is_empty() {
@@ -245,7 +242,20 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
         render::emit_line("no tasks resolved");
         return Ok(());
     }
-    let (mut nodes, edges) = build_graph(resolved.requests);
+    let (mut nodes, edges) = build_graph(resolved.requests)?;
+
+    if args.dry_run {
+        return dry_run_report(&nodes);
+    }
+
+    let dispatch = match &args.dispatch_url {
+        Some(url) => Dispatch::Local {
+            base: url.trim_end_matches('/').to_owned(),
+        },
+        None => Dispatch::GitHub {
+            token: crate::github_token().await?,
+        },
+    };
 
     let base = crate::index_cmd::registry_base()?;
     let session = base.session();
@@ -349,21 +359,23 @@ fn finish_report(
     }
 }
 
+type ManualTaskGraph = (
+    BTreeMap<String, NodeRun>,
+    BTreeMap<String, BTreeSet<String>>,
+);
+
 /// Fold the wave into the task graph: requests keyed by task id (two
 /// sources can name the same identity — dedupe by id), edges to the
 /// dep's own task id so the graph keyspace is the queue's.
-fn build_graph(
-    requests: Vec<EnqueueRequest>,
-) -> (
-    BTreeMap<String, NodeRun>,
-    BTreeMap<String, BTreeSet<String>>,
-) {
+fn build_graph(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<ManualTaskGraph> {
     let mut nodes: BTreeMap<String, NodeRun> = BTreeMap::new();
     let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for request in requests {
-        let id = node_task_id(&request);
+        // Resolving the carried subgraph is the identity check — it
+        // fails on an unresolvable closure before the id is keyed.
+        let id = node_task_id(&request)?;
         let deps = request
-            .depends_on
+            .depends_on()?
             .iter()
             .map(dep_task_id)
             .collect::<BTreeSet<_>>();
@@ -381,7 +393,7 @@ fn build_graph(
             blocked_by: None,
         });
     }
-    (nodes, edges)
+    Ok((nodes, edges))
 }
 
 /// Layer the uncovered graph: depth 0 is a node whose deps the index
@@ -730,29 +742,15 @@ async fn load_crate_list(
 }
 
 /// A request's own task id — the `run-name` every dispatched run
-/// carries.
-fn node_task_id(request: &EnqueueRequest) -> String {
-    task_id(
-        request.crate_name.as_str(),
-        &request.version.to_string(),
-        &request.features_json.raw(),
-        request.target.as_str(),
-        request.rustc_version.as_str(),
-        request.host_side,
-    )
+/// carries. Deriving it resolves the carried subgraph (stow#588).
+fn node_task_id(request: &EnqueueRequest) -> stow_types::error::Result<String> {
+    request.task_id()
 }
 
 /// The dep's own task id — a dependency edge points at the dep's
 /// identity tuple, exactly as the scheduler computes it.
 fn dep_task_id(dep: &EnqueueDependency) -> String {
-    task_id(
-        dep.crate_name.as_str(),
-        &dep.version.to_string(),
-        &dep.features_json.raw(),
-        dep.target.as_str(),
-        dep.rustc_version.as_str(),
-        dep.host_side,
-    )
+    dep.task_id()
 }
 
 /// The runner-family host triple `target`'s host-side nodes mint on.
@@ -786,57 +784,73 @@ pub async fn covered_nodes(
     .await?;
     for (target, rows) in targets.iter().zip(rows_per_target) {
         let Some(rows) = rows else { continue };
-        // (name, version, features) → the shape set the slice serves.
-        let mut shapes: HashMap<(String, String, String), BTreeSet<_>> = HashMap::new();
-        for row in rows {
-            if let Some(shape) = row.unit_shape {
-                shapes
-                    .entry((
-                        row.crate_name.as_str().to_owned(),
-                        row.version.to_string(),
-                        row.features_json.raw(),
-                    ))
-                    .or_default()
-                    .insert(shape);
-            }
-        }
-        for ((name, version, features), served) in shapes {
-            let invocation = if stow_types::api::runner_family(target.as_str())
-                .is_some_and(|family| family.host_triple() == target.as_str())
-            {
-                UnitInvocation::Native
-            } else {
-                UnitInvocation::Target
-            };
-            if required_unit_shapes(false, invocation)
-                .iter()
-                .all(|shape| served.contains(shape))
-            {
-                covered.insert(task_id(
-                    &name,
-                    &version,
-                    &features,
-                    target.as_str(),
-                    rustc_version.as_str(),
-                    false,
-                ));
-            }
-            if required_unit_shapes(true, invocation)
-                .iter()
-                .all(|shape| served.contains(shape))
-            {
-                covered.insert(task_id(
-                    &name,
-                    &version,
-                    &features,
-                    &host_triple(target),
-                    rustc_version.as_str(),
-                    true,
-                ));
-            }
-        }
+        covered.extend(covered_slice_nodes(&rows, target, rustc_version)?);
     }
     Ok(covered)
+}
+
+fn covered_slice_nodes(
+    rows: &[ArtifactIndexRow],
+    target: &TargetTriple,
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<BTreeSet<String>> {
+    let mut shapes = HashMap::<_, BTreeSet<_>>::new();
+    for row in rows {
+        let (Some(shape), Some(dependency_identity)) =
+            (row.unit_shape, row.dependency_identity.as_ref())
+        else {
+            continue;
+        };
+        let host_side = shape.side == stow_types::public_cache::UnitSide::Host;
+        if host_side && host_triple(target) != target.as_str() {
+            return Err(stow_error!("host row reported in non-host slice {target}"));
+        }
+        let identity = TaskNodeIdentity {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+            target: target.clone(),
+            rustc_version: rustc_version.clone(),
+            host_side,
+        };
+        shapes
+            .entry((identity, dependency_identity.clone()))
+            .or_default()
+            .insert(shape);
+    }
+    let invocation = if host_triple(target) == target.as_str() {
+        UnitInvocation::Native
+    } else {
+        UnitInvocation::Target
+    };
+    Ok(shapes
+        .into_iter()
+        .filter(|((identity, _), served)| {
+            required_unit_shapes(identity.host_side, invocation)
+                .iter()
+                .all(|shape| served.contains(shape))
+        })
+        .map(|((identity, context), _)| identity.task_id(&context))
+        .collect())
+}
+
+pub async fn contextual_coverage(
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<BTreeSet<String>> {
+    let base = crate::index_cmd::registry_base()?;
+    let session = base.session();
+    let trust = crate::index_cmd::records_trust().await?;
+    covered_nodes(
+        &Index {
+            session: &session,
+            base: &base,
+            trust: &trust,
+        },
+        targets,
+        rustc_version,
+    )
+    .await
 }
 
 /// The three handles the index-slice pulls share — `pub` so the
@@ -899,6 +913,70 @@ pub async fn published_slice_rows(
     Ok(Some(index.rows))
 }
 
+/// `--dry-run`: encode every wave node into its dispatch payload and
+/// report the input sizes. Encoding goes through
+/// `BuildTaskPayload::encode_dispatch_task`, so an oversized subgraph
+/// fails here exactly where a real dispatch would (stow#588).
+fn dry_run_report(nodes: &BTreeMap<String, NodeRun>) -> stow_types::error::Result<()> {
+    let mut lengths = Vec::with_capacity(nodes.len());
+    // (subgraph node count, encoded length, crate, target) of the
+    // payload carrying the most dependency nodes.
+    let mut largest_nodes: Option<(usize, usize, &str, &str)> = None;
+    let mut max_len = 0usize;
+    let mut max_len_task = String::new();
+    // Per-target maxima — the question the dry run answers is whether
+    // any target's largest payload is near the dispatch input cap.
+    let mut per_target_max: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
+    for (id, node) in nodes {
+        let payload = task_payload(id, &node.request);
+        let encoded = payload.encode_dispatch_task()?;
+        let len = encoded.len();
+        lengths.push(len);
+        if len > max_len {
+            max_len = len;
+            max_len_task.clone_from(id);
+        }
+        let target = node.request.target.as_str();
+        let slot = per_target_max.entry(target).or_insert((0, id.as_str()));
+        if len > slot.0 {
+            *slot = (len, id.as_str());
+        }
+        let node_count = payload.dependency_subgraph.nodes.len();
+        if largest_nodes.is_none_or(|(count, _, _, _)| node_count > count) {
+            largest_nodes = Some((
+                node_count,
+                len,
+                node.request.crate_name.as_str(),
+                node.request.target.as_str(),
+            ));
+        }
+    }
+    lengths.sort_unstable();
+    let p99 = lengths
+        .get(lengths.len().saturating_mul(99).saturating_add(99) / 100 - 1)
+        .copied()
+        .unwrap_or(0);
+    let mut out = format!(
+        "dry run: {} payload(s), none dispatched\n  encoded task input: max {} bytes, p99 {} bytes (cap {})",
+        lengths.len(),
+        max_len,
+        p99,
+        stow_types::api::DISPATCH_INPUT_LIMIT,
+    );
+    let _ = writeln!(out, "  largest encoded payload: {max_len_task}");
+    for (target, (len, id)) in &per_target_max {
+        let _ = writeln!(out, "  {target}: max {len} bytes — {id}");
+    }
+    if let Some((count, len, krate, target)) = largest_nodes {
+        let _ = writeln!(
+            out,
+            "  most dependency nodes: {count} — {krate} for {target} ({len} bytes)"
+        );
+    }
+    render::emit_line(&out);
+    Ok(())
+}
+
 /// The dispatch's payload — `BuildTaskPayload` exactly as the scheduler
 /// builds it, `attempt` 1 (the manual wave never re-queues in place).
 fn task_payload(task_id: &str, request: &EnqueueRequest) -> BuildTaskPayload {
@@ -912,16 +990,11 @@ fn task_payload(task_id: &str, request: &EnqueueRequest) -> BuildTaskPayload {
         rustc_version: request.rustc_version.clone(),
         preserve_lockfile: request.preserve_lockfile,
         host_side: request.host_side,
-        dep_pins: request
-            .depends_on
-            .iter()
-            .map(|dep| BuildDepPin {
-                crate_name: dep.crate_name.clone(),
-                version: dep.version.clone(),
-                features_json: dep.features_json.clone(),
-                host_side: dep.host_side,
-            })
-            .collect(),
+        // The resolver emitted this node's whole transitive dependency
+        // closure on the request — covered nodes included — so the
+        // dispatched payload reproduces the context the folded graph
+        // already pruned out of the wave (stow#588).
+        dependency_subgraph: request.dependency_subgraph.clone(),
     }
 }
 
@@ -1299,7 +1372,10 @@ impl Dispatch {
     async fn send(&self, payload: &BuildTaskPayload) -> stow_types::error::Result<u64> {
         match self {
             Self::GitHub { token } => {
-                let task_json = serde_json::to_string(payload)?;
+                // The 65,535-char dispatch input cap is checked here —
+                // at the producer — so an oversized subgraph fails the
+                // wave before GitHub ever sees it (stow#588).
+                let task_json = payload.encode_dispatch_task()?;
                 let response: WorkflowDispatchResponse = crate::github::post(
                     token,
                     &format!("actions/workflows/{WORKFLOW_FILE}/dispatches"),
@@ -1837,6 +1913,35 @@ mod tests {
         host_side: bool,
         deps: &[(&str, &str, bool)],
     ) -> EnqueueRequest {
+        // Fixture deps carry no children of their own — each is a
+        // leaf-context node, so `depends_on()`/`dependency_identity()`
+        // derive the same ids the old stored fields did (stow#588).
+        let depends_on: Vec<_> = deps
+            .iter()
+            .map(|(name, dep_target, dep_host)| EnqueueDependency {
+                crate_name: CrateName::parse(*name).expect("dep name"),
+                version: CrateVersion(semver::Version::new(1, 0, 0)),
+                features_json: stow_types::identity::FeaturesJson::default(),
+                target: TargetTriple::parse(*dep_target).expect("dep target"),
+                rustc_version: WireRustcVersion::parse("1.99.0").expect("dep rustc"),
+                host_side: *dep_host,
+                dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                    .expect("leaf identity"),
+            })
+            .collect();
+        let dependency_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: (0..u32::try_from(depends_on.len()).expect("test dep count")).collect(),
+            nodes: depends_on
+                .iter()
+                .map(|dep| stow_types::api::SubgraphNode {
+                    crate_name: dep.crate_name.clone(),
+                    version: dep.version.clone(),
+                    features_json: dep.features_json.clone(),
+                    host_side: dep.host_side,
+                    deps: Vec::new(),
+                })
+                .collect(),
+        };
         EnqueueRequest {
             crate_name: CrateName::parse(crate_name).expect("crate name"),
             version: CrateVersion(semver::Version::new(1, 0, 0)),
@@ -1846,18 +1951,7 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.99.0").expect("rustc"),
             downloads: 0,
             source: stow_types::api::EnqueueSource::CacheMiss,
-            depends_on: deps
-                .iter()
-                .map(|(name, dep_target, dep_host)| EnqueueDependency {
-                    crate_name: CrateName::parse(*name).expect("dep name"),
-                    version: CrateVersion(semver::Version::new(1, 0, 0)),
-                    features_json: stow_types::identity::FeaturesJson::canonicalize(Vec::new())
-                        .expect("dep features"),
-                    target: TargetTriple::parse(*dep_target).expect("dep target"),
-                    rustc_version: WireRustcVersion::parse("1.99.0").expect("dep rustc"),
-                    host_side: *dep_host,
-                })
-                .collect(),
+            dependency_subgraph,
             preserve_lockfile: false,
             host_side,
         }
@@ -1870,14 +1964,28 @@ mod tests {
     fn a_failed_dependency_skips_its_dependents() {
         const T: &str = "x86_64-unknown-linux-gnu";
         // leaf <- mid <- top, plus an unrelated independent node.
+        let mid = request("mid", T, false, &[("leaf", T, false)]);
+        let mut top = request("top", T, false, &[("mid", T, false)]);
+        // mid's own child rides inside top's subgraph — the derived
+        // digest then matches mid's real task id.
+        top.dependency_subgraph
+            .nodes
+            .push(stow_types::api::SubgraphNode {
+                crate_name: CrateName::parse("leaf").expect("dep name"),
+                version: CrateVersion(semver::Version::new(1, 0, 0)),
+                features_json: stow_types::identity::FeaturesJson::default(),
+                host_side: false,
+                deps: Vec::new(),
+            });
+        top.dependency_subgraph.nodes[0].deps = vec![1];
         let requests = vec![
             request("leaf", T, false, &[]),
-            request("mid", T, false, &[("leaf", T, false)]),
-            request("top", T, false, &[("mid", T, false)]),
+            mid,
+            top,
             request("other", T, false, &[]),
         ];
-        let (mut nodes, edges) = build_graph(requests);
-        let ids = |name: &str| node_task_id(request_by_name(name, &nodes));
+        let (mut nodes, edges) = build_graph(requests).expect("valid graph");
+        let ids = |name: &str| node_task_id(request_by_name(name, &nodes)).expect("task id");
         let (leaf, mid, top, other) = (ids("leaf"), ids("mid"), ids("top"), ids("other"));
 
         nodes.get_mut(&leaf).expect("leaf").failed = true;
@@ -1932,7 +2040,124 @@ mod tests {
             emit: vec!["link".to_owned(), "metadata".to_owned()],
             min_glibc: None,
             unit_shape: Some(shape),
+            dependency_identity: Some(request.dependency_identity().expect("digest")),
         }
+    }
+
+    #[test]
+    fn contextual_graph_keeps_equal_parents_over_different_children() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let left = request("parent", T, false, &[("left", T, false)]);
+        let right = request("parent", T, false, &[("right", T, false)]);
+        let left_id = left.task_id().expect("left id");
+        let right_id = right.task_id().expect("right id");
+        assert_ne!(left_id, right_id);
+        let (nodes, edges) = build_graph(vec![left, right]).expect("valid contexts");
+        assert_eq!(nodes.len(), 2);
+        assert_ne!(edges[&left_id], edges[&right_id]);
+    }
+
+    #[test]
+    fn contextual_graph_rejects_relabelled_edges() {
+        let mut parent = request(
+            "parent",
+            "x86_64-unknown-linux-gnu",
+            false,
+            &[("child", "x86_64-unknown-linux-gnu", false)],
+        );
+        // A subgraph whose edges escape its own closure cannot
+        // resolve — the request is rejected rather than keyed.
+        parent.dependency_subgraph.root_deps = vec![9];
+        assert!(build_graph(vec![parent]).is_err());
+    }
+
+    #[test]
+    fn contextual_coverage_does_not_merge_shapes_or_unknown_contexts() {
+        const T: &str = "wasm32-unknown-unknown";
+        let target = TargetTriple::parse(T).expect("target");
+        let left = request("parent", T, false, &[("left", T, false)]);
+        let right = request("parent", T, false, &[("right", T, false)]);
+        let shapes = required_unit_shapes(false, UnitInvocation::Target);
+        let rows = shapes
+            .iter()
+            .map(|shape| row_for(&left, *shape))
+            .collect::<Vec<_>>();
+        let covered =
+            super::covered_slice_nodes(&rows, &target, &left.rustc_version).expect("coverage");
+        assert!(covered.contains(&left.task_id().expect("left id")));
+        assert!(!covered.contains(&right.task_id().expect("right id")));
+
+        let mut mixed = rows;
+        mixed[0].dependency_identity = Some(right.dependency_identity().expect("right digest"));
+        assert!(
+            super::covered_slice_nodes(&mixed, &target, &left.rustc_version)
+                .expect("mixed coverage")
+                .is_empty()
+        );
+        for row in &mut mixed {
+            row.dependency_identity = None;
+        }
+        assert!(
+            super::covered_slice_nodes(&mixed, &target, &left.rustc_version)
+                .expect("historical coverage")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn contextual_host_coverage_requires_both_invocation_spellings() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let target = TargetTriple::parse(T).expect("target");
+        let host = request("helper", T, true, &[]);
+        let rows = required_unit_shapes(true, UnitInvocation::Native)
+            .into_iter()
+            .map(|shape| row_for(&host, shape))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.unit_shape.expect("shape").invocation == UnitInvocation::Target)
+        );
+        let complete =
+            super::covered_slice_nodes(&rows, &target, &host.rustc_version).expect("host coverage");
+        assert!(complete.contains(&host.task_id().expect("host id")));
+        let partial = rows
+            .into_iter()
+            .filter(|row| row.unit_shape.expect("shape").invocation == UnitInvocation::Native)
+            .collect::<Vec<_>>();
+        assert!(
+            super::covered_slice_nodes(&partial, &target, &host.rustc_version)
+                .expect("partial host coverage")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dispatch_payload_preserves_root_and_dependency_contexts() {
+        let parent = request(
+            "parent",
+            "wasm32-unknown-unknown",
+            false,
+            &[("helper", "x86_64-unknown-linux-gnu", true)],
+        );
+        let payload = super::task_payload(&parent.task_id().expect("parent id"), &parent);
+        let graph = payload
+            .verified_dependency_graph()
+            .expect("payload subgraph verifies against task_id");
+        assert_eq!(
+            graph.dependency_identity(0).expect("root digest"),
+            &parent.dependency_identity().expect("parent digest")
+        );
+        let helper = payload
+            .dependency_subgraph
+            .nodes
+            .iter()
+            .find(|node| node.host_side)
+            .expect("host-side dep node");
+        assert_eq!(helper.crate_name.as_str(), "helper");
+        assert_eq!(
+            graph.dependency_identity(1).expect("dep digest"),
+            &parent.depends_on().expect("deps")[0].dependency_identity
+        );
     }
 
     /// A layer spans every CI target, and each slice holds only its own
@@ -1945,7 +2170,8 @@ mod tests {
         let (mut nodes, _) = build_graph(vec![
             request("macro-dep", HOST, true, &[]),
             request("lib", WASM, false, &[]),
-        ]);
+        ])
+        .expect("valid graph");
         for node in nodes.values_mut() {
             node.done = true;
         }
@@ -2060,10 +2286,16 @@ mod tests {
             request("lost", T, false, &[]),
             request("flying", T, false, &[]),
             request("stale", T, false, &[]),
-        ]);
+        ])
+        .expect("valid graph");
         let ids: BTreeMap<&str, String> = ["won", "lost", "flying", "stale"]
             .into_iter()
-            .map(|name| (name, node_task_id(request_by_name(name, &nodes))))
+            .map(|name| {
+                (
+                    name,
+                    node_task_id(request_by_name(name, &nodes)).expect("task id"),
+                )
+            })
             .collect();
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
 
@@ -2122,8 +2354,9 @@ mod tests {
     #[test]
     fn only_the_bound_run_id_releases_on_stale() {
         const T: &str = "x86_64-unknown-linux-gnu";
-        let (mut nodes, _) = build_graph(vec![request("bound", T, false, &[])]);
-        let task = node_task_id(request_by_name("bound", &nodes));
+        let (mut nodes, _) =
+            build_graph(vec![request("bound", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("bound", &nodes)).expect("task id");
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
         nodes.get_mut(&task).expect("node").workflow_run_id = Some(50);
         nodes.get_mut(&task).expect("node").dispatched = true;
@@ -2203,7 +2436,8 @@ mod tests {
                 .iter()
                 .map(|name| request(name, T, false, &[]))
                 .collect(),
-        );
+        )
+        .expect("valid graph");
         for node in nodes.values_mut() {
             node.done = true;
         }
@@ -2244,8 +2478,9 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             false,
             &[],
-        )]);
-        let id = node_task_id(request_by_name("undone", &nodes));
+        )])
+        .expect("valid graph");
+        let id = node_task_id(request_by_name("undone", &nodes)).expect("task id");
         let unresolved = vec!["https://github.com/a/one: fetch failed".to_owned()];
         let message = finish_report(
             &nodes,

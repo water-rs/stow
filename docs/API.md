@@ -118,15 +118,15 @@ target is `cached`.
   "rustc_version": "1.98.1",
   "status": "enqueued",
   "targets": [
-    { "target": "aarch64-apple-darwin", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_darwin-1.98.1", "human_lane_position": 1 },
-    { "target": "aarch64-apple-ios", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios-1.98.1", "human_lane_position": 2 },
-    { "target": "aarch64-apple-ios-sim", "state": "building", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios_sim-1.98.1", "human_lane_position": null },
-    { "target": "aarch64-linux-android", "state": "already_queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_linux_android-1.98.1", "human_lane_position": 3 },
-    { "target": "x86_64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1", "human_lane_position": 4 },
-    { "target": "aarch64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_unknown_linux_gnu-1.98.1", "human_lane_position": 5 },
+    { "target": "aarch64-apple-darwin", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_darwin-1.98.1-d1c4f9…", "human_lane_position": 1 },
+    { "target": "aarch64-apple-ios", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios-1.98.1-d3a8e2b…", "human_lane_position": 2 },
+    { "target": "aarch64-apple-ios-sim", "state": "building", "task_id": "serde_json-1.0.149-4f0a…-aarch64_apple_ios_sim-1.98.1-d5f2c71…", "human_lane_position": null },
+    { "target": "aarch64-linux-android", "state": "already_queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_linux_android-1.98.1-d77b0e4…", "human_lane_position": 3 },
+    { "target": "x86_64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-x86_64_unknown_linux_gnu-1.98.1-da9d3f6…", "human_lane_position": 4 },
+    { "target": "aarch64-unknown-linux-gnu", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_unknown_linux_gnu-1.98.1-d4e6b21…", "human_lane_position": 5 },
     { "target": "x86_64-pc-windows-msvc", "state": "cached", "task_id": null, "human_lane_position": null },
-    { "target": "aarch64-pc-windows-msvc", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_pc_windows_msvc-1.98.1", "human_lane_position": 6 },
-    { "target": "wasm32-unknown-unknown", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-wasm32_unknown_unknown-1.98.1", "human_lane_position": 7 }
+    { "target": "aarch64-pc-windows-msvc", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-aarch64_pc_windows_msvc-1.98.1-d8f0a53…", "human_lane_position": 6 },
+    { "target": "wasm32-unknown-unknown", "state": "queued", "task_id": "serde_json-1.0.149-4f0a…-wasm32_unknown_unknown-1.98.1-d2b9c6d…", "human_lane_position": 7 }
   ],
   "error": null,
   "github_run_id": "123456789",

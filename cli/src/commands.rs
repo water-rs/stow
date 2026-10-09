@@ -797,9 +797,13 @@ fn shim_path(path: &std::path::Path, what: &str) -> stow_types::error::Result<St
 }
 
 fn sibling_binary(current_exe: &Path, name: &str) -> PathBuf {
+    // The on-disk name carries the platform suffix — `stow-build.exe`
+    // beside `stow-cli.exe` on Windows — so a bare join never resolves
+    // there and silently falls back to the runtime itself (stow#588).
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     current_exe
         .parent()
-        .map_or_else(|| PathBuf::from(name), |parent| parent.join(name))
+        .map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name))
 }
 
 /// The compiler the caller configured for `target`, in the order the `cc`

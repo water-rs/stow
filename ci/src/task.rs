@@ -150,6 +150,35 @@ pub async fn create_workspace(
     })
 }
 
+/// A `BuildWorkspace` view of a directory the caller already owns —
+/// the publisher's pristine resolution workspace (stow#588). Its
+/// manifest is `create_resolution_workspace`'s return, its workspace
+/// root the manifest's parent, and it has no capture dir or bundled
+/// lockfile to check.
+pub const fn resolution_build_workspace(
+    manifest_path: PathBuf,
+    workspace_root: PathBuf,
+) -> BuildWorkspace {
+    BuildWorkspace {
+        _tempdir: None,
+        manifest_path,
+        workspace_root,
+        capture_dir: PathBuf::new(),
+        bundled_lockfile: None,
+    }
+}
+
+impl BuildWorkspace {
+    /// Set the capture directory — sandboxed-phase tests build the
+    /// resolution workspace then run a phase, which needs a real one
+    /// (the sandbox grants `capture_dir` and rejects an empty path).
+    #[cfg(test)]
+    pub fn with_capture_dir(mut self, capture_dir: PathBuf) -> Self {
+        self.capture_dir = capture_dir;
+        self
+    }
+}
+
 /// Write the generated wrapper package that makes the task crate a
 /// registry dependency: an empty lib target plus a manifest whose only
 /// dependency is `name = "=version"` carrying the task's exact feature
@@ -160,7 +189,7 @@ pub async fn create_workspace(
 ///
 /// Returns the wrapper manifest path and, under `preserve_lockfile`, the
 /// crate's bundled `Cargo.lock` verbatim for the post-fetch fidelity check.
-async fn write_wrapper_package(
+pub async fn write_wrapper_package(
     task: &BuildTaskPayload,
     wrapper_root: &Path,
     crate_checksum: &str,
@@ -322,38 +351,45 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         dependencies.insert(task.crate_name.as_str().to_owned(), dependency);
         (dependencies, BTreeMap::new())
     };
-    // Every dependency edge the scheduler gated becomes an exact pin on
-    // the wrapper: `=<version>` with the dep's published feature set, in
-    // the section matching the side its consumers compile it on. Without
-    // the pins the wrapper's own resolution can land on a narrower
-    // feature set than the dep task published — cargo compiles the dep
-    // under a key nobody published and dep_scan fails the build
-    // (stow#431). Cargo's unification can only widen a pinned set, and
-    // everything the task crate requests of the dep is already inside it
-    // by construction.
+    // Every node of the dispatched dependency subgraph becomes an exact
+    // pin on the wrapper: `=<version>` with the node's published feature
+    // set, in the section matching the side its consumers compile it on
+    // (stow#588). The whole transitive closure has to be pinned, not
+    // just the task's direct deps: cargo's unification can only widen a
+    // declared set, so an unpinned grandchild another consumer widened
+    // resolves narrower here and the dep task's key no longer matches
+    // the published context. Without the pins the wrapper's own
+    // resolution can land on a narrower feature set than the dep task
+    // published — cargo compiles the dep under a key nobody published
+    // and dep_scan fails the build (stow#431).
     //
     // The table key cannot be the crate name: a closure that carries two
     // semver-incompatible versions of one crate (`syn` 1 and 2 is common)
-    // — or a pin that shares the task crate's name at another version —
+    // — or a node that shares the task crate's name at another version —
     // would keep only the last insert. Each pin keys on a unique
-    // `<name>-v<version>` alias and names the package in `package`.
-    for pin in &task.dep_pins {
-        let selection = TaskFeatureSelection::from_features_json(&pin.features_json);
+    // `<name>-v<version>` alias and names the package in `package`. Two
+    // pins of one crate+version cannot share a section: the subgraph
+    // comes from a single resolve, whose units key per
+    // (package, version, features) per side and platform — an alias
+    // collision inside a section is a real error, not an ambiguity to
+    // disambiguate.
+    for node in &task.dependency_subgraph.nodes {
+        let selection = TaskFeatureSelection::from_features_json(&node.features_json);
         let pinned = Dependency {
-            version: format!("={}", pin.version),
-            package: Some(pin.crate_name.as_str().to_owned()),
+            version: format!("={}", node.version),
+            package: Some(node.crate_name.as_str().to_owned()),
             default_features: selection.no_default_features.then_some(false),
             features: selection.features,
         };
-        let section = if pin.host_side {
+        let section = if node.host_side {
             &mut build_dependencies
         } else {
             &mut dependencies
         };
         let alias = format!(
             "{}-v{}",
-            pin.crate_name.as_str(),
-            pin.version.to_string().replace('.', "_")
+            node.crate_name.as_str(),
+            node.version.to_string().replace('.', "_")
         );
         if section.insert(alias.clone(), pinned).is_some() {
             return Err(stow_types::stow_error!(
@@ -592,23 +628,10 @@ fn lockfile_packages(
 /// build.
 async fn stage_consumption_store(
     task: &BuildTaskPayload,
-    workspace: &BuildWorkspace,
-    cargo_subcommand: CargoSubcommand,
+    unit_graphs: &[PhaseUnitGraph],
 ) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
     let store_dir = TempDir::new()?;
-    let packages = match consumption_packages(task, workspace, cargo_subcommand).await {
-        Ok(packages) => packages,
-        // Consumption is an optimization: a workspace whose unit graph
-        // cannot be read builds exactly as one without a cache.
-        Err(error) => {
-            tracing::warn!(
-                task_id = %task.task_id,
-                %error,
-                "cache consumption unavailable; building without it"
-            );
-            return Ok((None, None));
-        }
-    };
+    let packages = consumption_packages(task, unit_graphs);
     let staged = match consume::prefetch(task, packages, store_dir.path()).await {
         Ok(consumption) if consumption.artifacts > 0 => Some(consumption.store_dir),
         Ok(_) => None,
@@ -625,6 +648,17 @@ async fn stage_consumption_store(
     Ok(staged.map_or_else(|| (None, None), |path| (Some(store_dir), Some(path))))
 }
 
+/// One cargo `--unit-graph` answer for one phase×invocation spelling,
+/// kept whole: the consumable set reads `entries` and the
+/// dependency-context check reads `raw_unit_graph` (stow#588).
+pub struct PhaseUnitGraph {
+    phase: CargoSubcommand,
+    invocation: CargoInvocation,
+    /// The spelled `--target`, `None` for the native spelling.
+    target: Option<String>,
+    graph: stow_cli::ExpandedDependencyGraph,
+}
+
 /// The units this build's workspace will compile, read from cargo's own
 /// unit graphs — the consumable set (stow#589). Each graph is computed
 /// with the same argv a phase runs (`cargo_phase_args`, minus the
@@ -637,12 +671,12 @@ async fn stage_consumption_store(
 /// recorded dep edges reach only lib `--extern`s — the graph covers the
 /// whole resolved closure, build-script deps and transitives included,
 /// at the identities cargo will actually compile them at.
-async fn consumption_packages(
+pub async fn phase_unit_graphs(
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
     cargo_subcommand: CargoSubcommand,
-) -> stow_types::error::Result<Vec<dep_scan::ConsumablePackage>> {
-    let mut entries = Vec::new();
+) -> stow_types::error::Result<Vec<PhaseUnitGraph>> {
+    let mut graphs = Vec::new();
     for &phase in cargo_phases(cargo_subcommand) {
         for &invocation in phase_invocations(task) {
             let phase_args = cargo_phase_args(workspace, task, phase, invocation).await?;
@@ -656,19 +690,221 @@ async fn consumption_packages(
                     .collect::<Vec<_>>(),
                 passes_target.then(|| task.target.as_str()),
                 workspace.workspace_root(),
-                task.rustc_version.as_str(),
+                stow_types::api::runner_family(task.target.as_str())
+                    .ok_or_else(|| {
+                        stow_types::stow_error!(
+                            "task {} {} targets {} — no runner family names its host triple",
+                            task.crate_name.as_str(),
+                            task.version,
+                            task.target
+                        )
+                    })?
+                    .host_triple(),
+                &task.rustc_version,
             )
             .await?;
-            entries.extend(graph.entries);
+            graphs.push(PhaseUnitGraph {
+                phase,
+                invocation,
+                target: passes_target.then(|| task.target.as_str().to_owned()),
+                graph,
+            });
         }
     }
-    Ok(dep_scan::consumable_packages(task, &entries))
+    Ok(graphs)
+}
+
+/// The consumable set across every phase×invocation unit graph.
+fn consumption_packages(
+    task: &BuildTaskPayload,
+    unit_graphs: &[PhaseUnitGraph],
+) -> Vec<dep_scan::ConsumablePackage> {
+    let mut entries = Vec::new();
+    for unit_graph in unit_graphs {
+        entries.extend(unit_graph.graph.entries.iter().cloned());
+    }
+    dep_scan::consumable_packages(task, &entries)
+}
+
+/// The compiled dependency-context gate (stow#588): every phase×invocation
+/// unit graph must resolve the task's own node to the same `task_id` the
+/// dispatch claims — the wrapper's pins reproduce the transitive feature
+/// context, so the task node mints only when the compiled graph carries
+/// the dispatched subgraph.
+///
+/// For a host-side task the explicit (`--target <host triple>`) spelling
+/// defines identity: it is the resolve shape the resolver minted the
+/// dispatch from. The native spelling compiles the same task unit
+/// context — the pinned manifest makes cross-side feature unification
+/// impossible (host pins live in `[build-dependencies]`, target pins in
+/// `[dependencies]`, each at an exact set) — and dedup-shadow edges let
+/// a shared unit serve both sides at one identity, so the task node id
+/// must agree there too. A disagreement is cargo compiling the task
+/// under a context nobody dispatched, and publishing its artifact under
+/// `task_id` would mislabel the cache.
+pub fn verify_dependency_context(
+    task: &BuildTaskPayload,
+    unit_graphs: &[PhaseUnitGraph],
+) -> stow_types::error::Result<()> {
+    let expected = task.verified_dependency_graph()?;
+    let host_triple = stow_types::api::runner_family(task.target.as_str())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "task {} {} targets {} — no runner family names its host triple",
+                task.crate_name.as_str(),
+                task.version,
+                task.target
+            )
+        })?
+        .host_triple();
+    for unit_graph in unit_graphs {
+        let units = unit_graph
+            .graph
+            .task_units(unit_graph.target.as_deref(), host_triple)
+            .map_err(|error| {
+                stow_types::stow_error!(
+                    "task {} {} ({}): {} {} unit graph does not convert: {error}",
+                    task.crate_name.as_str(),
+                    task.version,
+                    task.target,
+                    unit_graph.phase.as_str(),
+                    unit_graph.invocation.spelling(),
+                )
+            })?;
+        let actual = stow_types::unit_graph::resolved_task_graph(&units, &task.rustc_version)
+            .map_err(|error| {
+                stow_types::stow_error!(
+                    "task {} {} ({}): {} {} unit graph does not resolve: {error}",
+                    task.crate_name.as_str(),
+                    task.version,
+                    task.target,
+                    unit_graph.phase.as_str(),
+                    unit_graph.invocation.spelling(),
+                )
+            })?;
+        let identity = task.task_node_identity();
+        let found = actual
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.identity == identity)
+            .collect::<Vec<_>>();
+        if found.is_empty() {
+            return Err(stow_types::stow_error!(
+                "task {} {} ({}): {} {} unit graph has no node with the task identity \
+                 (crate {} version {} features {:?} target {} rustc {} host_side {})",
+                task.crate_name.as_str(),
+                task.version,
+                task.target,
+                unit_graph.phase.as_str(),
+                unit_graph.invocation.spelling(),
+                task.crate_name.as_str(),
+                task.version,
+                task.features_json.features(),
+                task.target,
+                task.rustc_version,
+                task.host_side,
+            ));
+        }
+        if found
+            .iter()
+            .any(|(index, _)| actual.task_id(*index) == Some(task.task_id.as_str()))
+        {
+            continue;
+        }
+        let difference = first_context_difference(&expected, &actual);
+        return Err(stow_types::stow_error!(
+            "task {} {} ({}): {} {} unit graph compiles a different dependency context — {difference}",
+            task.crate_name.as_str(),
+            task.version,
+            task.target,
+            unit_graph.phase.as_str(),
+            unit_graph.invocation.spelling(),
+        ));
+    }
+    Ok(())
+}
+
+/// The first node where the dispatched and compiled graphs disagree:
+/// its expected and actual task ids plus the children ids on both
+/// sides, so the mismatch names the crate that resolved differently.
+fn first_context_difference(
+    expected: &stow_types::task_graph::ResolvedTaskGraph,
+    actual: &stow_types::task_graph::ResolvedTaskGraph,
+) -> String {
+    for (index, node) in expected.nodes().iter().enumerate() {
+        let expected_children = node
+            .dependencies
+            .iter()
+            .filter_map(|dep| expected.task_id(*dep))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut named = None;
+        let mut diverged = None;
+        for (other_index, other) in actual.nodes().iter().enumerate() {
+            if other.identity != node.identity {
+                continue;
+            }
+            let actual_children = other
+                .dependencies
+                .iter()
+                .filter_map(|dep| actual.task_id(*dep))
+                .collect::<std::collections::BTreeSet<_>>();
+            if actual_children == expected_children {
+                named = Some(other_index);
+                break;
+            }
+            diverged.get_or_insert(other_index);
+        }
+        if named.is_some() {
+            continue;
+        }
+        let expected_id = expected
+            .task_id(index)
+            .map_or_else(|| "<unresolved>".to_owned(), str::to_owned);
+        let expected_kids = expected_children.into_iter().collect::<Vec<_>>().join(", ");
+        return diverged.map_or_else(
+            || {
+                format!(
+                    "node {} {} ({}): expected id `{}` children [{}]; the compiled graph has no such node",
+                    node.identity.crate_name.as_str(),
+                    node.identity.version,
+                    node.identity.target,
+                    expected_id,
+                    expected_kids,
+                )
+            },
+            |other_index| {
+                let actual_children = actual.nodes()[other_index]
+                    .dependencies
+                    .iter()
+                    .filter_map(|dep| actual.task_id(*dep))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "node {} {} ({}): expected id `{}` children [{}]; actual id `{}` children [{}]",
+                    node.identity.crate_name.as_str(),
+                    node.identity.version,
+                    node.identity.target,
+                    expected_id,
+                    expected_kids,
+                    actual.task_id(other_index).unwrap_or("<unresolved>"),
+                    actual_children,
+                )
+            },
+        );
+    }
+    "the dispatched subgraph's every node resolved identically; the task id still differs"
+        .to_owned()
 }
 
 pub async fn build(
     task: &BuildTaskPayload,
     output_dir: &Path,
 ) -> stow_types::error::Result<BuiltWorkspace> {
+    // Resolve and verify the run toolchain once per task — a name whose
+    // rustc reports a different release than the pinned `rustc_version`
+    // is refused here, before any phase runs cargo.
+    verified_run_toolchain(task)?;
     let mirror_key = workspace_mirror::MirrorTaskKey {
         target: task.target.as_str().to_owned(),
         rustc_version: task.rustc_version.as_str().to_owned(),
@@ -679,8 +915,14 @@ pub async fn build(
     fetch_workspace_dependencies(task, &workspace).await?;
 
     let cargo_subcommand = cargo_subcommand()?;
-    let (_consume_store_dir, consume_store) =
-        stage_consumption_store(task, &workspace, cargo_subcommand).await?;
+    // Cargo's own unit graphs are computed once for the whole build:
+    // the dependency-context check must see exactly what every phase
+    // and spelling will compile (stow#588), and consumption reads the
+    // same answers — a graph that cannot be produced fails the build,
+    // not just the cache path.
+    let unit_graphs = phase_unit_graphs(task, &workspace, cargo_subcommand).await?;
+    verify_dependency_context(task, &unit_graphs)?;
+    let (_consume_store_dir, consume_store) = stage_consumption_store(task, &unit_graphs).await?;
 
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
         .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;
@@ -762,13 +1004,65 @@ pub async fn build(
     })
 }
 
+/// The rustup *name* the phases run `cargo` under — a different fact
+/// from `task.rustc_version`, which records the release the task's
+/// identity pins, not a toolchain name. `RUSTUP_TOOLCHAIN` already
+/// carries a name when the caller set one — the build workflow's
+/// toolchain step exports it, and a test run inherits the name of the
+/// toolchain executing the suite — and the pinned release is the name
+/// production's no-export env still resolves (`rustup toolchain
+/// install 1.99.0` answers to `1.99.0`). It never asks `rustup show`:
+/// a runner's *default* toolchain is not the task's.
+pub fn run_toolchain(task: &BuildTaskPayload) -> String {
+    std::env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| task.rustc_version.as_str().to_owned())
+}
+
+/// `run_toolchain`'s name, verified once per task against the release
+/// its `rustc` actually reports — the same check `Resolver::setup`
+/// makes. The ambient name is still just a name: a misconfigured
+/// workflow step (or a runner whose `stable` moved past the dispatch's
+/// pin) would otherwise compile the whole task under the wrong release
+/// and only surface at `validate`, which rejects the scanned artifacts
+/// after the build already burned. This refuses before any cargo
+/// invocation, naming the toolchain, its reported release, and the
+/// task's `rustc_version`. `RUSTUP_AUTO_INSTALL=0` keeps a missing name
+/// a refusal instead of a network install.
+pub fn verified_run_toolchain(task: &BuildTaskPayload) -> stow_types::error::Result<String> {
+    let toolchain = run_toolchain(task);
+    let output = std::process::Command::new("rustc")
+        .arg("-vV")
+        .env("RUSTUP_TOOLCHAIN", &toolchain)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .map_err(|error| stow_types::stow_error!("probe run toolchain {toolchain}: {error}"))?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "run toolchain {toolchain}: rustc -vV failed with {}",
+            output.status
+        ));
+    }
+    let verbose = String::from_utf8_lossy(&output.stdout);
+    let release = verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .unwrap_or("<unparsable rustc -vV output>");
+    if release != task.rustc_version.as_str() {
+        return Err(stow_types::stow_error!(
+            "run toolchain {toolchain} reports rustc {release}, \
+             not the task's pinned {}",
+            task.rustc_version.as_str()
+        ));
+    }
+    Ok(toolchain)
+}
+
 /// Phase 0 runs on the host: `cargo fetch` resolves the dependency graph
 /// and populates the registry cache, so the sandboxed phases can run
 /// `--frozen` — no lockfile writes, no index access — with every outbound
 /// connection an untrusted build script still attempts audited. Feature
 /// flags don't exist on `fetch`: it downloads the full dependency closure
 /// for every feature and every target.
-async fn fetch_workspace_dependencies(
+pub async fn fetch_workspace_dependencies(
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
 ) -> stow_types::error::Result<()> {
@@ -783,7 +1077,7 @@ async fn fetch_workspace_dependencies(
     // `preserve_lockfile` the lock's fidelity is proven by the diff check
     // below instead of by the flag.
     let status = fetch
-        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
+        .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
         .status()
         .await
         .map_err(|error| stow_types::stow_error!("run cargo fetch: {error}"))?;
@@ -812,36 +1106,36 @@ async fn fetch_workspace_dependencies(
 }
 
 /// The per-run state every sandboxed phase shares.
-struct PhaseSetup<'a> {
-    workspace: &'a BuildWorkspace,
-    wrappers: &'a wrapper_shim::WrapperShimPaths,
-    runtime_wrapper: &'a Path,
-    capture_wrapper: &'a Path,
-    capture_command: &'a StowCaptureCommand,
-    audit_log: &'a heel::NetworkAuditLog,
-    rustflags: &'a str,
+pub struct PhaseSetup<'a> {
+    pub workspace: &'a BuildWorkspace,
+    pub wrappers: &'a wrapper_shim::WrapperShimPaths,
+    pub runtime_wrapper: &'a Path,
+    pub capture_wrapper: &'a Path,
+    pub capture_command: &'a StowCaptureCommand,
+    pub audit_log: &'a heel::NetworkAuditLog,
+    pub rustflags: &'a str,
     /// The prefetch-staged verified bundle store, when consumption staged
     /// anything: granted read-only to every phase.
-    consume_store: Option<&'a Path>,
+    pub consume_store: Option<&'a Path>,
 }
 
 /// The shared resources one sandboxed phase run draws on — the phase
 /// inputs plus the build's one sandbox (phases share it because creating
 /// one pays the grant-ACL walk over every granted tree, stow#431).
-struct PhaseRun<'a> {
-    setup: &'a PhaseSetup<'a>,
-    sandbox: &'a Sandbox<heel::Audited<heel::AllowAll>>,
+pub struct PhaseRun<'a> {
+    pub setup: &'a PhaseSetup<'a>,
+    pub sandbox: &'a Sandbox<heel::Audited<heel::AllowAll>>,
     /// heel's IPC socket, exported to sandboxed processes so shimmed
     /// commands reach the host.
-    ipc_endpoint: &'a Path,
-    msvc: &'a MsvcToolchain,
+    pub ipc_endpoint: &'a Path,
+    pub msvc: &'a MsvcToolchain,
 }
 
 /// Run one cargo phase inside the build's sandbox, then absorb the capture
 /// records it delivered. A duplicate identity is fatal, and so is cargo
 /// exiting non-zero — the build compiles one crate, and a phase that
 /// cannot finish means the task failed.
-async fn run_sandboxed_phase(
+pub async fn run_sandboxed_phase(
     run: &PhaseRun<'_>,
     task: &BuildTaskPayload,
     phase: CargoSubcommand,
@@ -880,7 +1174,7 @@ async fn run_sandboxed_phase(
         .sandbox
         .command("cargo")
         .args(args)
-        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
+        .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
         .env("RUSTFLAGS", rustflags)
         .env("RUSTC_WRAPPER", path_arg(&setup.wrappers.rustc_wrapper)?)
         .env("CARGO_TARGET_DIR", path_arg(target_dir)?)
@@ -973,7 +1267,7 @@ async fn run_sandboxed_phase(
 /// (`-C debuginfo` applied or not), and consumers on each invocation
 /// key on their own.
 #[derive(Clone, Copy)]
-enum CargoInvocation {
+pub enum CargoInvocation {
     /// Decide from the task's target triple — `--target` only for a
     /// cross build, the spelling a non-host-side task always uses.
     Task,
@@ -986,6 +1280,17 @@ enum CargoInvocation {
     /// `-C debuginfo` to the host half whenever `--target` is present,
     /// even to the host triple itself).
     Explicit,
+}
+
+impl CargoInvocation {
+    /// The argv spelling, for error messages.
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::Task => "task-spelled",
+            Self::Native => "native",
+            Self::Explicit => "explicit --target",
+        }
+    }
 }
 
 /// The invocations a task's phases each run under. A host-side task
@@ -1066,7 +1371,7 @@ async fn invocation_passes_target(
 /// `run_dir` is the parent of every phase's `CARGO_TARGET_DIR`: granting it
 /// once covers them all, since a directory grant reaches children created
 /// after the sandbox exists.
-async fn phase_sandbox(
+pub async fn phase_sandbox(
     setup: &PhaseSetup<'_>,
     run_dir: &Path,
     msvc: &MsvcToolchain,
@@ -1348,7 +1653,7 @@ fn compiler_search_grants() -> Vec<(PathBuf, Access, &'static str)> {
     grants
 }
 
-fn cargo_home() -> stow_types::error::Result<PathBuf> {
+pub fn cargo_home() -> stow_types::error::Result<PathBuf> {
     if let Some(path) = std::env::var_os("CARGO_HOME") {
         return Ok(PathBuf::from(path));
     }
@@ -1357,7 +1662,7 @@ fn cargo_home() -> stow_types::error::Result<PathBuf> {
         .ok_or_else(|| stow_types::stow_error!("cannot determine the cargo home directory"))
 }
 
-fn rustup_home() -> stow_types::error::Result<PathBuf> {
+pub fn rustup_home() -> stow_types::error::Result<PathBuf> {
     if let Some(path) = std::env::var_os("RUSTUP_HOME") {
         return Ok(PathBuf::from(path));
     }
@@ -1520,10 +1825,10 @@ fn toolchain_grant_dirs() -> Vec<PathBuf> {
 /// keeps rustc's own behaviour: the linker is found on PATH, with `LIB`
 /// and `INCLUDE` pointing at the CRT and the Windows SDK.
 #[derive(Debug, Default)]
-struct MsvcToolchain {
+pub struct MsvcToolchain {
     /// `PATH`, `LIB` and `INCLUDE` as the linker needs to see them,
     /// already composed with this process's own values.
-    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     /// The linker's own directory, which holds the DLLs it loads.
     bin_dir: Option<PathBuf>,
 }
@@ -1533,7 +1838,7 @@ impl MsvcToolchain {
     /// a Windows host with no MSVC installation — there the build fails on
     /// its own terms rather than on a missing grant.
     #[cfg(windows)]
-    fn resolve() -> Self {
+    pub fn resolve() -> Self {
         // The host architecture, not the task's: a dependency crate's own
         // units are rlibs and never reach a linker, so the only linking a
         // cross task does is its build scripts and proc macros, which are
@@ -1554,7 +1859,7 @@ impl MsvcToolchain {
     }
 
     #[cfg(not(windows))]
-    fn resolve() -> Self {
+    pub fn resolve() -> Self {
         Self::default()
     }
 
@@ -1627,7 +1932,7 @@ fn create_dir_all_sync(path: &Path) -> stow_types::error::Result<()> {
         .map_err(|error| stow_types::stow_error!("create directory {}: {error}", path.display()))
 }
 
-fn merged_rustflags(remap_flag: &str) -> String {
+pub fn merged_rustflags(remap_flag: &str) -> String {
     match std::env::var("RUSTFLAGS") {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing} {remap_flag}"),
         _ => remap_flag.to_owned(),
@@ -1638,16 +1943,16 @@ fn merged_rustflags(remap_flag: &str) -> String {
 /// it: whether default features stay on, and the explicit feature names
 /// minus the `"default"` marker.
 pub struct TaskFeatureSelection {
-    pub(crate) no_default_features: bool,
-    pub(crate) features: Vec<String>,
+    pub no_default_features: bool,
+    pub features: Vec<String>,
 }
 
 impl TaskFeatureSelection {
-    pub(crate) fn from_task(task: &BuildTaskPayload) -> Self {
+    pub fn from_task(task: &BuildTaskPayload) -> Self {
         Self::from_features_json(&task.features_json)
     }
 
-    pub(crate) fn from_features_json(features_json: &stow_types::identity::FeaturesJson) -> Self {
+    pub fn from_features_json(features_json: &stow_types::identity::FeaturesJson) -> Self {
         // `FeaturesJson` is already validated (sorted + deduplicated + valid
         // feature names) at deserialize time, so we can read the canonical
         // list directly instead of re-parsing.
@@ -1662,13 +1967,13 @@ impl TaskFeatureSelection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CargoSubcommand {
+pub enum CargoSubcommand {
     Build,
     Check,
     Test,
 }
 
-const fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubcommand] {
+pub const fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubcommand] {
     match cargo_subcommand {
         CargoSubcommand::Build => &[CargoSubcommand::Check, CargoSubcommand::Build],
         CargoSubcommand::Check => &[CargoSubcommand::Check],
@@ -1682,7 +1987,7 @@ const fn cargo_phases(cargo_subcommand: CargoSubcommand) -> &'static [CargoSubco
 /// run dir, not the workspace root: the sandbox working dir denies
 /// `process-exec` on every backend, so anything compiled under it could
 /// never run.
-fn phase_target_dir(
+pub fn phase_target_dir(
     run_dir: &Path,
     phase: CargoSubcommand,
     invocation: CargoInvocation,
@@ -1725,7 +2030,7 @@ pub async fn target_is_host(target: &str) -> stow_types::error::Result<bool> {
     Ok(host == target)
 }
 
-fn cargo_subcommand() -> stow_types::error::Result<CargoSubcommand> {
+pub fn cargo_subcommand() -> stow_types::error::Result<CargoSubcommand> {
     match std::env::var(STOW_BUILD_CARGO_SUBCOMMAND_ENV)
         .ok()
         .as_deref()
@@ -1820,7 +2125,7 @@ async fn remove_existing_phase_target_dirs(workspace_root: &Path) -> stow_types:
     Ok(())
 }
 
-fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Result<PathBuf> {
+pub fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Result<PathBuf> {
     let parent = capture_wrapper.parent().ok_or_else(|| {
         stow_types::stow_error!(
             "cannot determine parent directory of capture wrapper {}",
@@ -1891,7 +2196,7 @@ pub async fn create_resolution_workspace(
     Ok(manifest_path)
 }
 
-fn unpack_crate_archive(
+pub fn unpack_crate_archive(
     workspace_root: &Path,
     crate_name: &str,
     crate_version: &str,
@@ -1952,7 +2257,7 @@ mod tests {
     use flate2::Compression;
     use tempfile::TempDir;
 
-    use stow_types::api::{BuildDepPin, BuildTaskPayload};
+    use stow_types::api::{BuildTaskPayload, SubgraphNode, TaskSubgraph};
     use stow_types::identity::{
         CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
     };
@@ -2004,7 +2309,75 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
             host_side: false,
-            dep_pins: Vec::new(),
+            dependency_subgraph: TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
+        }
+    }
+
+    /// The release the ambient run toolchain's `rustc` reports — parsed
+    /// from the same `rustc -vV` probe `verified_run_toolchain` runs.
+    fn active_release() -> WireRustcVersion {
+        let output = std::process::Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .expect("run rustc -vV");
+        let verbose = String::from_utf8_lossy(&output.stdout);
+        let release = verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("release: "))
+            .expect("rustc -vV reports a release");
+        WireRustcVersion::parse(release).expect("active release parses")
+    }
+
+    /// A run toolchain whose `rustc -vV` release differs from the task's
+    /// pinned `rustc_version` is refused by the once-per-task check —
+    /// which both `build` and `closure::resolve` run before their first
+    /// cargo invocation — naming the toolchain, its release, and the
+    /// pinned version.
+    #[test]
+    fn a_mismatched_run_toolchain_is_refused_before_any_cargo() {
+        let mut task = task_with_features(&[]);
+        task.rustc_version = WireRustcVersion::parse("0.0.0").expect("mismatched version parses");
+        let error = super::verified_run_toolchain(&task)
+            .expect_err("a toolchain reporting a different release must be refused");
+        let message = format!("{error}");
+        assert!(
+            message.contains(&super::run_toolchain(&task)),
+            "the refusal must name the run toolchain: {message}"
+        );
+        assert!(
+            message.contains("0.0.0"),
+            "the refusal must name the pinned version: {message}"
+        );
+        assert!(
+            message.contains(&format!("rustc {}", active_release().as_str())),
+            "the refusal must name the reported release: {message}"
+        );
+    }
+
+    /// The same check passes when the toolchain's release equals the
+    /// task's pin, returning the name the phases put on `RUSTUP_TOOLCHAIN`.
+    #[test]
+    fn a_matching_run_toolchain_verifies_and_returns_its_name() {
+        let mut task = task_with_features(&[]);
+        task.rustc_version = active_release();
+        let toolchain = super::verified_run_toolchain(&task)
+            .expect("a toolchain reporting the pinned release verifies");
+        assert_eq!(toolchain, super::run_toolchain(&task));
+    }
+
+    /// A subgraph carrying only the task's direct deps as leaves —
+    /// enough to exercise the wrapper manifest's pin section/alias
+    /// rules; the build-stage checks a full subgraph against the
+    /// toolchain's own unit graph instead.
+    fn leaf_pins(nodes: Vec<SubgraphNode>) -> TaskSubgraph {
+        TaskSubgraph {
+            root_deps: (0..nodes.len())
+                .map(|index| u32::try_from(index).expect("test node count fits u32"))
+                .collect(),
+            nodes,
         }
     }
 
@@ -2076,8 +2449,8 @@ mod tests {
     #[test]
     fn wrapper_manifest_pins_task_dependencies_to_their_published_identities() {
         let mut task = task_with_features(&["derive"]);
-        task.dep_pins = vec![
-            BuildDepPin {
+        task.dependency_subgraph = leaf_pins(vec![
+            SubgraphNode {
                 crate_name: CrateName::parse("serde_core").expect("crate name"),
                 version: CrateVersion::new(semver::Version::parse("1.0.228").expect("version")),
                 features_json: FeaturesJson::canonicalize(vec![
@@ -2086,15 +2459,17 @@ mod tests {
                 ])
                 .expect("features"),
                 host_side: false,
+                deps: Vec::new(),
             },
-            BuildDepPin {
+            SubgraphNode {
                 crate_name: CrateName::parse("syn").expect("crate name"),
                 version: CrateVersion::new(semver::Version::parse("2.0.106").expect("version")),
                 features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                     .expect("features"),
                 host_side: true,
+                deps: Vec::new(),
             },
-        ];
+        ]);
         let manifest: toml::Table =
             toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
                 .expect("generated manifest parses");
@@ -2140,23 +2515,25 @@ mod tests {
     #[test]
     fn wrapper_manifest_keeps_duplicate_crate_names_under_distinct_aliases() {
         let mut task = task_with_features(&["derive"]);
-        let pin = |version: &str, host_side: bool| BuildDepPin {
+        let pin = |version: &str, host_side: bool| SubgraphNode {
             crate_name: CrateName::parse("syn").expect("crate name"),
             version: CrateVersion::new(semver::Version::parse(version).expect("version")),
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             host_side,
+            deps: Vec::new(),
         };
-        task.dep_pins = vec![
+        task.dependency_subgraph = leaf_pins(vec![
             pin("1.0.109", false),
             pin("2.0.106", false),
-            BuildDepPin {
+            SubgraphNode {
                 crate_name: task.crate_name.clone(),
                 version: CrateVersion::new(semver::Version::parse("9.9.9").expect("version")),
                 features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
                 host_side: false,
+                deps: Vec::new(),
             },
-        ];
+        ]);
         let manifest: toml::Table =
             toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
                 .expect("generated manifest parses");
@@ -2507,11 +2884,12 @@ checksum = "33"
                 capture_dir,
                 bundled_lockfile: None,
             };
+            let exe = std::env::consts::EXE_SUFFIX;
             let wrappers = stow_shim::WrapperShimPaths {
-                rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),
-                cc_launcher: tools_dir.path().join("stow-cc-launcher"),
-                cc_compiler: tools_dir.path().join("stow-cc"),
-                cxx_compiler: tools_dir.path().join("stow-cxx"),
+                rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
+                cc_launcher: tools_dir.path().join(format!("stow-cc-launcher{exe}")),
+                cc_compiler: tools_dir.path().join(format!("stow-cc{exe}")),
+                cxx_compiler: tools_dir.path().join(format!("stow-cxx{exe}")),
             };
             let wrapper = std::env::current_exe().expect("current exe");
             let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
@@ -2590,11 +2968,12 @@ checksum = "33"
                 capture_dir,
                 bundled_lockfile: None,
             };
+            let exe = std::env::consts::EXE_SUFFIX;
             let wrappers = stow_shim::WrapperShimPaths {
-                rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),
-                cc_launcher: tools_dir.path().join("stow-cc-launcher"),
-                cc_compiler: tools_dir.path().join("stow-cc"),
-                cxx_compiler: tools_dir.path().join("stow-cxx"),
+                rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
+                cc_launcher: tools_dir.path().join(format!("stow-cc-launcher{exe}")),
+                cc_compiler: tools_dir.path().join(format!("stow-cc{exe}")),
+                cxx_compiler: tools_dir.path().join(format!("stow-cxx{exe}")),
             };
             let wrapper = std::env::current_exe().expect("current exe");
 

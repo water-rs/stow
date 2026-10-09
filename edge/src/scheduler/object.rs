@@ -22,9 +22,9 @@ use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
-use crate::scheduler::budget;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
+use crate::scheduler::{budget, fixture};
 use crate::scheduler::{dispatch, feed, queue};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
@@ -158,6 +158,7 @@ impl DurableObject for Scheduler {
                 "".at(list_tasks),
                 "/submit".post(submit_tasks),
                 "/submit/trusted".post(submit_tasks_trusted),
+                "/submit/ids".post(submit_tasks_by_id),
                 "/retry".post(queue_retry),
                 "/cancel".post(queue_cancel),
                 "/promote".post(queue_promote),
@@ -251,7 +252,7 @@ async fn scheduler_budget_seed(
         );
     }
     Ok(Json(
-        budget::seed(&db, &request, &scheduler_settings(&env)?)
+        fixture::seed(&db, &request, &scheduler_settings(&env)?)
             .await
             .map_err(to_error)?,
     ))
@@ -435,6 +436,49 @@ async fn submit_tasks_trusted(
     Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
 ) -> Result<Json<InsertedResponse>> {
     submit(&env, &db, &alarm, &requests, false).await
+}
+
+/// `POST /tasks/submit/ids` — the trusted submit-by-id lane (stow#588):
+/// the missed lane promotes an admitted miss by its exact task id; the
+/// scheduler rebuilds each subgraph from its node store (never a
+/// re-mint) and reports the ids it does not hold as `unknown`. The
+/// pending-depth cap does not apply — the edge's repo-writer trust
+/// check is the bound — but a frozen queue still refuses.
+async fn submit_tasks_by_id(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(body): Json<stow_types::api::SubmitTaskIdsRequest>,
+) -> Result<Json<stow_types::api::SubmitTaskIdsResponse>> {
+    let settings = scheduler_settings(&env)?;
+    refuse_if_frozen(&db).await?;
+    let outcome = queue::submit_task_ids(&db, &body.tasks, &settings)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                crate::errors::QueueError::QueueFull { .. }
+                | crate::errors::QueueError::HumanDailyBudgetExhausted { .. } => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    if !outcome.unknown.is_empty() {
+        tracing::info!(
+            unknown = outcome.unknown.len(),
+            "submit-by-id: node store misses"
+        );
+    }
+    // Same hand-off as submit: the alarm pass owns dispatch.
+    schedule_alarm(&env, &db, &alarm).await?;
+    Ok(Json(stow_types::api::SubmitTaskIdsResponse {
+        submitted: u32::try_from(body.tasks.len()).map_err(|_| {
+            to_error("submit-ids task count exceeds u32").set_status(StatusCode::PAYLOAD_TOO_LARGE)
+        })?,
+        inserted: outcome.inserted,
+        unknown: outcome.unknown,
+    }))
 }
 
 async fn submit(

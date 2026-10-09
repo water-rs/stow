@@ -569,12 +569,12 @@ pub const DRIVES: &[Drive] = &[
                         task_ids: vec![
                             hex_id(u64::from(FixtureShape::pending_row(600))),
                             hex_id(u64::from(shape.failed_row(0))),
-                            // Human rows 2 and 3 sit on non-Windows
-                            // targets, so their seeded values are
-                            // `2 * VALUE_BAND + n % 7`: the adjacent
-                            // pair 36893574046765006/…65007.
-                            hex_id(2),
-                            hex_id(3),
+                            // Human rows 1993 and 1994 sit in the pin
+                            // window on non-Windows targets, so their
+                            // seeded values are `2 * VALUE_BAND + n % 7`:
+                            // the adjacent pair 36893574046765009/…65010.
+                            hex_id(1993),
+                            hex_id(1994),
                         ],
                         ..QueueSelector::default()
                     },
@@ -587,7 +587,7 @@ pub const DRIVES: &[Drive] = &[
                         .find(|task| task.task_id == hex_id(n))
                         .map(|task| task.value.clone())
                 };
-                for (n, expected) in [(2, "36893574046765006"), (3, "36893574046765007")] {
+                for (n, expected) in [(1993, "36893574046765009"), (1994, "36893574046765010")] {
                     let actual =
                         value_of(n).ok_or_else(|| format!("task {n} missing from the listing"))?;
                     if actual != expected {
@@ -925,7 +925,24 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         name: "POST /admin/enqueue (trusted)",
-        setup: None,
+        setup: Some(|db, shape, settings, _ctx| {
+            Box::pin(async move {
+                // Land the batch's resync entry first so the measured
+                // submit hits it on its derived task id — seeded rows
+                // carry synthetic ids no request can re-mint (stow#588),
+                // so the row the resync probes must come from a real
+                // enqueue. Setup statements are truncated out of the
+                // measurement.
+                queue::enqueue_trusted(db, &submit_batch(shape)[..1], settings)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|inserted| {
+                        (inserted == 1).then_some(()).ok_or_else(|| {
+                            format!("trusted submit setup inserted {inserted}, expected 1")
+                        })
+                    })
+            })
+        }),
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 // One resync + two new identities — the returned count
@@ -937,6 +954,54 @@ pub const DRIVES: &[Drive] = &[
                         (inserted == 2).then_some(()).ok_or_else(|| {
                             format!("trusted submit inserted {inserted}, expected 2")
                         })
+                    })
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // `POST /tasks/submit/ids` — the missed lane's promote-by-id
+        // route (stow#588): per id, a node-store root lookup, the BFS
+        // subgraph rebuild bounded by the id's own subgraph, and the
+        // trusted enqueue. The drive submits the batch setup landed,
+        // so the walk is the full cost and the enqueue half is the
+        // resync path (inserted = 0); an unknown id adds only its
+        // failed root lookup.
+        name: "POST /admin/enqueue (submit-ids)",
+        setup: Some(|db, shape, settings, _ctx| {
+            Box::pin(async move {
+                // Guarantee the node store holds the batch's subgraphs —
+                // the count is whatever an earlier drive left behind.
+                queue::enqueue_trusted(db, &submit_batch(shape), settings)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        }),
+        run: |db, shape, settings, _ctx| {
+            Box::pin(async move {
+                let entries: Vec<stow_types::api::SubmitTaskIdEntry> = submit_batch(shape)
+                    .iter()
+                    .map(|request| {
+                        Ok(stow_types::api::SubmitTaskIdEntry {
+                            task_id: request
+                                .task_id()
+                                .map_err(|error| format!("drive task id: {error}"))?,
+                            downloads: 1,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?;
+                let outcome = queue::submit_task_ids(db, &entries, settings)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                (outcome.inserted == 0 && outcome.unknown.is_empty())
+                    .then_some(())
+                    .ok_or_else(|| {
+                        format!(
+                            "submit-ids inserted {}, unknown {}",
+                            outcome.inserted,
+                            outcome.unknown.len()
+                        )
                     })
             })
         },
@@ -1489,6 +1554,12 @@ pub const DRIVES: &[Drive] = &[
         // peak-wall bound exists to measure. On host the claim runs the
         // same queue code against the empty-catalog oracle — the host
         // gate checks statements and counters only.
+        // The claimed tasks' subgraph rebuild (stow#588) is priced in
+        // the same pass: `load_claimed_subgraphs` pays one bounded
+        // `task_id IN (…)` read per shared BFS level — at most
+        // `SUBGRAPH_WALK_MAX_LEVELS` (64) statements and `O(Σ reachable
+        // nodes)` rows read, bounded by the dispatched tasks' own
+        // subgraphs, never the queue bulk.
         name: "alarm pass",
         setup: None,
         run: |db, _shape, settings, ctx| {
@@ -2102,6 +2173,24 @@ fn submit_batch(shape: FixtureShape) -> Vec<EnqueueRequest> {
 /// identities would move the later drives from the insert path they
 /// measure onto a resync one (stow#452 — the merge-queue probe caught
 /// the trusted drive resyncing the accept drive's task set).
+/// Test subgraph carrying `deps` as the root's direct leaf deps
+/// (stow#588).
+fn subgraph_of(deps: &[stow_types::api::EnqueueDependency]) -> stow_types::api::TaskSubgraph {
+    stow_types::api::TaskSubgraph {
+        root_deps: (0..u32::try_from(deps.len()).expect("test dep count")).collect(),
+        nodes: deps
+            .iter()
+            .map(|dep| stow_types::api::SubgraphNode {
+                crate_name: dep.crate_name.clone(),
+                version: dep.version.clone(),
+                features_json: dep.features_json.clone(),
+                host_side: dep.host_side,
+                deps: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
 fn submit_accept_batch(shape: FixtureShape) -> Vec<EnqueueRequest> {
     submit_batch_named(
         shape,
@@ -2128,17 +2217,22 @@ fn submit_batch_named(
         rustc_version: "1.86.0".parse().expect("resync rustc"),
         downloads: 10,
         source: EnqueueSource::CacheMiss,
-        depends_on: (0..30).map(|k| dep(shape.dep_row(k))).collect(),
+        dependency_subgraph: subgraph_of(
+            &(0..30).map(|k| dep(shape.dep_row(k))).collect::<Vec<_>>(),
+        ),
         preserve_lockfile: false,
         host_side: false,
     };
     let mut fresh = resync.clone();
     fresh.crate_name = fresh_name.parse().expect("fresh crate");
-    fresh.depends_on = vec![dep(shape.dep_row(31))];
+    fresh.dependency_subgraph = subgraph_of(&[dep(shape.dep_row(31))]);
     let mut human = resync.clone();
     human.crate_name = human_name.parse().expect("human crate");
     human.source = EnqueueSource::HumanRequest;
-    human.depends_on = Vec::new();
+    human.dependency_subgraph = stow_types::api::TaskSubgraph {
+        root_deps: Vec::new(),
+        nodes: Vec::new(),
+    };
     vec![resync, fresh, human]
 }
 
@@ -2203,11 +2297,11 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
         rustc_version: rustc.parse().expect("request rustc"),
         downloads: 1,
         source: EnqueueSource::HumanRequest,
-        depends_on: vec![dep_request(shape.dep_row(2))],
+        dependency_subgraph: subgraph_of(&[dep_request(shape.dep_row(2))]),
         preserve_lockfile: false,
         host_side: false,
     };
-    let root_id = queue::task_id(crate_name, version, "[]", target, rustc, false);
+    let root_id = root_task.task_id().expect("derived root task id");
     stow_types::api::RequestOutcomeReport {
         attempt: 1,
         outcome: stow_types::api::RequestOutcome::Resolved {
@@ -2541,20 +2635,32 @@ fn feed_event_dep_name(d: u32) -> String {
     format!("stow-feed-dep-{d:03}")
 }
 
-/// The queued `task_id` an event node mints at — the content-derived
-/// key the enqueue path assigns: `1.0.0` on the node's spread triple
-/// and the drives' pinned rustc, target side. Fixture validation
-/// names rows through this, never through a stored-id lookup.
-fn feed_event_task_id(name: &str, spread: u32) -> String {
-    queue::task_id(name, "1.0.0", "[]", dep_target(spread), "1.86.0", false)
+/// The queued `task_id` event dep `d`'s own request mints — the
+/// digest-bearing id `enqueue_trusted` writes (stow#588). Fixture
+/// validation names rows through the derived id, never a stored-id
+/// lookup.
+fn feed_event_dep_task_id(d: u32) -> String {
+    feed_event_requests()[usize::try_from(d).expect("dep index")]
+        .task_id()
+        .expect("derived dep task id")
 }
 
-/// The whole subgraph's task ids — 256 roots then 128 shared deps —
-/// the exact primary-key set setup validates and cleanup deletes.
+/// The queued `task_id` event root `k`'s request mints — its request
+/// sits after the 128 dep requests in [`feed_event_requests`].
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn feed_event_root_task_id(k: u32) -> String {
+    feed_event_requests()[usize::try_from(FEED_EVENT_DEPS + k).expect("root index")]
+        .task_id()
+        .expect("derived root task id")
+}
+
+/// The whole subgraph's task ids — 128 shared deps then 256 roots, in
+/// request order — the exact primary-key set setup validates and
+/// cleanup deletes.
 fn feed_event_task_ids() -> Vec<String> {
-    (0..FEED_EVENT_ROOTS)
-        .map(|k| feed_event_task_id(&feed_event_root_name(k), k))
-        .chain((0..FEED_EVENT_DEPS).map(|d| feed_event_task_id(&feed_event_dep_name(d), d)))
+    feed_event_requests()
+        .iter()
+        .map(|request| request.task_id().expect("derived event task id"))
         .collect()
 }
 
@@ -2573,6 +2679,7 @@ const fn feed_event_deps(k: u32) -> [u32; 2] {
 /// submit runs (stow#523).
 fn feed_event_requests() -> Vec<EnqueueRequest> {
     let dep_edge = |d: u32| EnqueueDependency {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: feed_event_dep_name(d).parse().expect("event dep crate"),
         version: "1.0.0".parse().expect("event dep version"),
         features_json: FeaturesJson::default(),
@@ -2582,14 +2689,17 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
     };
     (0..FEED_EVENT_DEPS)
         .map(|d| EnqueueRequest {
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
             crate_name: feed_event_dep_name(d).parse().expect("event dep crate"),
             version: "1.0.0".parse().expect("event dep version"),
             features_json: FeaturesJson::default(),
-            target: dep_target(d).parse().expect("event dep target"),
+            target: dep_target(0).parse().expect("event dep target"),
             rustc_version: "1.86.0".parse().expect("event dep rustc"),
             downloads: 1,
             source: EnqueueSource::CacheMiss,
-            depends_on: Vec::new(),
             preserve_lockfile: false,
             host_side: false,
         })
@@ -2599,11 +2709,11 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
                 crate_name: feed_event_root_name(k).parse().expect("event root crate"),
                 version: "1.0.0".parse().expect("event root version"),
                 features_json: FeaturesJson::default(),
-                target: dep_target(k).parse().expect("event root target"),
+                target: dep_target(0).parse().expect("event root target"),
                 rustc_version: "1.86.0".parse().expect("event root rustc"),
                 downloads: 1,
                 source: EnqueueSource::CacheMiss,
-                depends_on: vec![dep_edge(first), dep_edge(second)],
+                dependency_subgraph: subgraph_of(&[dep_edge(first), dep_edge(second)]),
                 preserve_lockfile: false,
                 host_side: false,
             }
@@ -2633,7 +2743,7 @@ fn feed_event_entries(
                         semver::Version::parse("1.0.0").map_err(|e| e.to_string())?,
                     ),
                     features_json: FeaturesJson::default(),
-                    target: TargetTriple::parse(dep_target(k)).map_err(|e| e.to_string())?,
+                    target: TargetTriple::parse(dep_target(0)).map_err(|e| e.to_string())?,
                     rustc_version: WireRustcVersion::parse("1.86.0").map_err(|e| e.to_string())?,
                     demand: 100,
                 })
@@ -2687,12 +2797,11 @@ async fn validate_feed_event_subgraph(db: &DurableDb) -> Result<(), String> {
     }
     let ids_json =
         serde_json::to_string(&ids).map_err(|error| format!("encode event task ids: {error}"))?;
+    let deps_json = serde_json::to_string(&ids[..usize::try_from(FEED_EVENT_DEPS).expect("count")])
+        .map_err(|error| format!("encode event dep ids: {error}"))?;
     let roots_json =
-        serde_json::to_string(&ids[..usize::try_from(FEED_EVENT_ROOTS).expect("count")])
+        serde_json::to_string(&ids[usize::try_from(FEED_EVENT_DEPS).expect("count")..])
             .map_err(|error| format!("encode event root ids: {error}"))?;
-    let deps_json =
-        serde_json::to_string(&ids[usize::try_from(FEED_EVENT_ROOTS).expect("count")..])
-            .map_err(|error| format!("encode event dep ids: {error}"))?;
     let present: i64 = db
         .query("SELECT count(*) FROM queue WHERE task_id IN (SELECT value FROM json_each(?))")
         .bind(ids_json.clone())
@@ -2810,14 +2919,14 @@ async fn validate_feed_event_closures(db: &DurableDb, ids: &[String]) -> Result<
             identities.len()
         ));
     }
-    for (k, root_id) in ids[..usize::try_from(FEED_EVENT_ROOTS).expect("count")]
+    for (k, root_id) in ids[usize::try_from(FEED_EVENT_DEPS).expect("count")..]
         .iter()
         .enumerate()
     {
         let k = u32::try_from(k).expect("root index");
         let mut expected: Vec<String> = feed_event_deps(k)
             .iter()
-            .map(|&d| feed_event_task_id(&feed_event_dep_name(d), d))
+            .map(|&d| feed_event_dep_task_id(d))
             .collect();
         expected.push(root_id.clone());
         expected.sort();
@@ -2827,7 +2936,7 @@ async fn validate_feed_event_closures(db: &DurableDb, ids: &[String]) -> Result<
                 feed_event_root_name(k),
                 "1.0.0".to_owned(),
                 "[]".to_owned(),
-                dep_target(k).to_owned(),
+                dep_target(0).to_owned(),
                 "1.86.0".to_owned(),
             ],
         )
@@ -2889,6 +2998,7 @@ async fn clear_feed_event_subgraph(db: &DurableDb) -> Result<(), String> {
 fn dep_request(n: u32) -> EnqueueDependency {
     let (crate_name, version) = crate_identity(n);
     EnqueueDependency {
+        dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf digest"),
         crate_name: crate_name.parse().expect("dep crate"),
         version: version.parse().expect("dep version"),
         features_json: FeaturesJson::default(),
@@ -2926,6 +3036,7 @@ fn full_slice_report() -> Vec<PublishedSliceRow> {
             node_shapes(false, target)
                 .into_iter()
                 .map(move |shape| PublishedSliceRow {
+                    dependency_identity: format!("{i:064x}").parse().expect("digest"),
                     crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
                     version: "1.0.0".parse().expect("full version"),
                     features_json: FeaturesJson::default(),
@@ -2955,6 +3066,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
         let n = first + (live - 1 - i) * 9;
         let (crate_name, version) = crate_identity(n);
         retired.push(PublishedSliceRow {
+            dependency_identity: format!("{n:064x}").parse().expect("digest"),
             crate_name: crate_name.parse().expect("retire crate"),
             version: version.parse().expect("retire version"),
             features_json: FeaturesJson::default(),
@@ -2966,6 +3078,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
             node_shapes(false, target)
                 .into_iter()
                 .map(|shape| PublishedSliceRow {
+                    dependency_identity: format!("{i:064x}").parse().expect("digest"),
                     crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
                     version: "9.9.9".parse().expect("delta version"),
                     features_json: FeaturesJson::default(),
@@ -3249,8 +3362,9 @@ mod lifecycle_tests {
 mod feed_event_tests {
     use super::{
         FEED_EVENT_NODES, FEED_EVENT_ROOTS, clear_feed_event_subgraph, feed_drive_hour,
-        feed_drive_now_ms, feed_event_dep_name, feed_event_entries, feed_event_root_name,
-        feed_event_task_id, feed_event_task_ids, seed_feed_event_subgraph, seed_feed_hour_sized,
+        feed_drive_now_ms, feed_event_dep_task_id, feed_event_entries, feed_event_root_name,
+        feed_event_root_task_id, feed_event_task_ids, seed_feed_event_subgraph,
+        seed_feed_hour_sized,
     };
     use crate::scheduler::feed;
     use crate::scheduler::fixture::{self, FixtureShape};
@@ -3291,7 +3405,7 @@ mod feed_event_tests {
         for (k, entry) in entries.iter().enumerate() {
             let k = u32::try_from(k).expect("entry index");
             assert_eq!(entry.crate_name.as_str(), feed_event_root_name(k));
-            assert_eq!(entry.target.as_str(), super::dep_target(k));
+            assert_eq!(entry.target.as_str(), super::dep_target(0));
         }
     }
 
@@ -3322,14 +3436,14 @@ mod feed_event_tests {
         // real diamond contributions, not a per-tree count.
         for k in [0_u32, 127, 255] {
             assert_eq!(
-                demand_of(db, &feed_event_task_id(&feed_event_root_name(k), k)).await,
+                demand_of(db, &feed_event_root_task_id(k)).await,
                 100,
                 "root {k} folds its own delta"
             );
         }
         for d in [0_u32, 64, 127] {
             assert_eq!(
-                demand_of(db, &feed_event_task_id(&feed_event_dep_name(d), d)).await,
+                demand_of(db, &feed_event_dep_task_id(d)).await,
                 400,
                 "dep {d} folds its four owners' deltas"
             );

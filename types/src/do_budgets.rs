@@ -254,6 +254,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // submit-by-id (stow#588): resync-path writes; the walk reads
+        // scale with the submitted ids' stored subgraphs.
+        name: "POST /admin/enqueue (submit-ids)",
+        statements: 24,
+        rows_read: 2_000,
+        rows_written: 110,
+        wall_ms: 500,
+    },
+    DriveBudget {
         name: "POST /admin/enqueue (resubmit)",
         statements: 16,
         rows_read: 1_600,
@@ -301,7 +310,11 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // `2 × open slots`, the per-page catalog coverage lookup (a
         // counted-D1 read, not object rows), the per-claim UPDATE and
         // the bounded-concurrent `trigger_build` hop — wall includes
-        // the fan-out's slowest HTTP leg.
+        // the fan-out's slowest HTTP leg. The subgraph rebuild's
+        // `task_nodes` walk is bounded by the claimed tasks' own
+        // dependency closure (stow#588) — the fixture pins that closure
+        // to `{claimed, one leaf}` at every size, so this row measures
+        // stored bulk only and the scale check must report it flat.
         name: "alarm pass",
         statements: 120,
         rows_read: 1_000,
@@ -327,7 +340,9 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // separately so the gate sees the planner and claim walk
         // under a positive persisted floor with under-floor bulk
         // deferred in the flags (stow#525). Setup stamps and teardown
-        // restore live outside the metered window.
+        // restore live outside the metered window. The `task_nodes`
+        // walk shares the hot pass's bound — the claimed tasks'
+        // dependency closure, which the fixture pins flat (stow#588).
         name: "alarm pass (floor claim)",
         statements: 120,
         rows_read: 1_000,

@@ -25,6 +25,7 @@ use crate::dep_scan::{
 pub async fn build_upload_plan(
     scanned: &[ScannedArtifact],
     consumed: &[ConsumedArtifact],
+    dependency_identity: &stow_types::identity::DependencyIdentity,
 ) -> stow_types::error::Result<Vec<PlannedArtifact>> {
     validate_dependency_graph(scanned, consumed)?;
     let mut plans_by_compile_key =
@@ -55,6 +56,7 @@ pub async fn build_upload_plan(
         )?;
 
         let plan = PlannedArtifact {
+            dependency_identity: dependency_identity.clone(),
             compile_key: artifact.captured_compile_key.clone(),
             crate_name,
             crate_version: crate_version_typed,
@@ -551,7 +553,14 @@ mod tests {
         ParsedFileKind, ScannedArtifact, ScannedArtifactDependency, ScannedArtifactOutput,
     };
     use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::identity::DependencyIdentity;
     use stow_types::platform::{PanicStrategy, Profile};
+
+    /// The leaf digest — these tests assert plan assembly, not the
+    /// build-stage context verification that feeds the real value in.
+    fn dependency_identity() -> DependencyIdentity {
+        DependencyIdentity::leaf().expect("leaf digest")
+    }
 
     #[tokio::test]
     async fn upload_plan_preserves_captured_exact_identity() {
@@ -572,7 +581,7 @@ mod tests {
             "[\"default\",\"derive\",\"serde_derive\",\"std\"]".to_owned();
         let scanned = vec![serde_artifact];
 
-        let planned = build_upload_plan(&scanned, &[])
+        let planned = build_upload_plan(&scanned, &[], &dependency_identity())
             .await
             .expect("build upload plan");
         let plan = planned.first().expect("planned artifact");
@@ -607,7 +616,7 @@ mod tests {
             scanned_bitflags_artifact("dba7ec857b47436d", stable_output_path.clone(), 29),
         ];
 
-        let planned = build_upload_plan(&scanned, &[])
+        let planned = build_upload_plan(&scanned, &[], &dependency_identity())
             .await
             .expect("build upload plan");
 
@@ -728,7 +737,7 @@ mod tests {
             rand_core,
         ];
 
-        let planned = build_upload_plan(&scanned, &[])
+        let planned = build_upload_plan(&scanned, &[], &dependency_identity())
             .await
             .expect("build upload plan");
         let rand_core = planned
@@ -793,13 +802,13 @@ mod tests {
             rustc_version: "1.91.1".to_owned(),
             emit: vec!["link".to_owned()],
         }];
-        build_upload_plan(&scanned, &served)
+        build_upload_plan(&scanned, &served, &dependency_identity())
             .await
             .expect("consumed dependency resolves the plan");
 
         let mut mismatched = served.clone();
         mismatched[0].c_metadata = "ffffffffffffffff".to_owned();
-        let error = build_upload_plan(&scanned, &mismatched)
+        let error = build_upload_plan(&scanned, &mismatched, &dependency_identity())
             .await
             .expect_err("an identity the claim does not carry must not satisfy the edge");
         assert!(

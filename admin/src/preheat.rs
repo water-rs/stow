@@ -4,13 +4,12 @@
 use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
-use futures_util::StreamExt as _;
 use stow_types::api::{
-    CI_TARGET_TRIPLES, CrateCoverage, EnqueueDependency, EnqueueRequest, EnqueueSource,
-    PreheatPlanResponse, PreheatPlanTarget, is_ci_target,
+    CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PreheatPlanResponse, PreheatPlanTarget,
+    is_ci_target,
 };
 use stow_types::identity::{
-    CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+    CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
 use stow_types::stow_error;
 use zenwave::{Client, ResponseExt};
@@ -784,17 +783,23 @@ struct BinariesPlan {
 }
 
 /// The Analytics Engine query template; `__LIMIT__`, `__SINCE_DAYS__`,
-/// and `__TARGETS__` are the only substitution points (see the file's own
+/// `__TARGETS__` and `__RUSTC_VERSION__` are the substitution points (see the file's own
 /// comment for why that is safe).
 const TOP_MISSED_SQL: &str = include_str!("../sql/top_missed.sql");
 
 /// Render the top-missed query for a dispatch run. `targets` must already
 /// be validated by [`ci_targets`] — the literals land in the SQL text
 /// unescaped because the SQL API has no bound parameters.
-fn top_missed_query(limit: usize, since_days: u32, targets: &[String]) -> String {
+fn top_missed_query(
+    limit: usize,
+    since_days: u32,
+    targets: &[String],
+    rustc_version: &WireRustcVersion,
+) -> String {
     TOP_MISSED_SQL
         .replace("__LIMIT__", &limit.to_string())
         .replace("__SINCE_DAYS__", &since_days.to_string())
+        .replace("__RUSTC_VERSION__", rustc_version.as_str())
         .replace(
             "__TARGETS__",
             &targets
@@ -833,10 +838,13 @@ pub fn ci_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec
 }
 
 /// One row of the Analytics Engine response: a target and the
-/// `crate;version;features_json;misses` identities `topKWeighted` ranked
+/// Contextual task identities `topKWeighted` ranked
 /// for it.
 #[derive(Debug, serde::Deserialize)]
 struct TopMissedRow {
+    /// The row's target — carried in the query answer but unused here:
+    /// the task id embeds it (stow#588).
+    #[expect(dead_code)]
     target: String,
     top_missed: Vec<String>,
 }
@@ -892,56 +900,37 @@ async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMisse
     Ok(envelope.data)
 }
 
-/// Map one `crate;version;features_json;depends_on_json;misses` element
-/// of a [`TopMissedRow::top_missed`] array to the task it promotes. Every
-/// field came from a validated `EnqueueRequest` on the write path, so a
-/// parse failure here means the dataset diverged from `miss_logger`'s
-/// layout — a bug to fail on, not a row to skip.
-fn missed_enqueue_request(
-    target: &str,
+/// Map one `task_id;misses` element of a [`TopMissedRow::top_missed`]
+/// array to the promote-by-id entry it submits (stow#588). The miss
+/// row's task id is the whole identity — the scheduler re-derives the
+/// subgraph from its node store, so nothing more travels on this lane;
+/// an id the store does not hold comes back as `unknown`, never
+/// re-minted. A parse failure means the dataset diverged from
+/// `miss_logger`'s layout — a bug to fail on, not a row to skip.
+fn missed_task_id_entry(
     entry: &str,
-    rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<EnqueueRequest> {
-    let [crate_name, version, features_json, depends_on_json, misses]: [&str; 5] = entry
-        .split(';')
-        .collect::<Vec<_>>()
-        .try_into()
-        .map_err(|_| {
-            stow_error!(
-                "malformed top_missed entry {entry:?} — expected `crate;version;features_json;depends_on_json;misses`"
-            )
-        })?;
-    let features: Vec<String> = serde_json::from_str(features_json)
-        .map_err(|error| stow_error!("top_missed features_json {features_json:?}: {error}"))?;
-    let depends_on: Vec<EnqueueDependency> = if depends_on_json.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(depends_on_json).map_err(|error| {
-            stow_error!("top_missed depends_on_json {depends_on_json:?}: {error}")
-        })?
-    };
-    Ok(EnqueueRequest {
-        crate_name: CrateName::parse(crate_name)
-            .map_err(|error| stow_error!("top_missed crate_name: {error}"))?,
-        version: TypedCrateVersion::new(semver::Version::parse(version)?),
-        features_json: FeaturesJson::canonicalize(features)
-            .map_err(|error| stow_error!("top_missed features_json: {error}"))?,
-        target: TargetTriple::parse(target)
-            .map_err(|error| stow_error!("top_missed target: {error}"))?,
-        rustc_version: rustc_version.clone(),
+) -> stow_types::error::Result<stow_types::api::SubmitTaskIdEntry> {
+    let [task_id, misses]: [&str; 2] =
+        entry
+            .split(';')
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| {
+                stow_error!(
+                    "malformed top_missed entry {entry:?} - expected a `task_id;misses` pair"
+                )
+            })?;
+    Ok(stow_types::api::SubmitTaskIdEntry {
+        task_id: task_id.to_owned(),
         downloads: misses
             .parse()
             .map_err(|error| stow_error!("top_missed misses `{misses}`: {error}"))?,
-        source: EnqueueSource::CacheMiss,
-        depends_on,
-        preserve_lockfile: false,
-        host_side: false,
     })
 }
 
 async fn missed(
     edge: &Edge,
-    crates_io: &crates_io::CratesIo,
+    _crates_io: &crates_io::CratesIo,
     args: MissedArgs,
     output: Output,
 ) -> stow_types::error::Result<()> {
@@ -954,31 +943,74 @@ async fn missed(
     if args.since_days == 0 {
         return Err(stow_error!("--since-days must be at least 1"));
     }
-    let query = top_missed_query(args.limit, args.since_days, &targets);
+    let query = top_missed_query(args.limit, args.since_days, &targets, &rustc_version);
     let rows = fetch_top_missed(&query).await?;
 
-    let mut requests = Vec::new();
+    let mut entries = Vec::new();
     for row in &rows {
         for entry in &row.top_missed {
-            requests.push(missed_enqueue_request(&row.target, entry, &rustc_version)?);
+            entries.push(missed_task_id_entry(entry)?);
         }
     }
-    if requests.is_empty() {
-        tracing::info!("no missed identities in the window; nothing to submit");
+    if entries.is_empty() {
+        tracing::info!("no missed task ids in the window; nothing to submit");
     }
-    submit_plan(edge, crates_io, requests, args.yes, output).await
+    submit_ids_plan(edge, entries, args.yes, output).await
+}
+
+/// The promote-by-id submit: same dry-run/`--yes` envelope as the
+/// request lanes, applied through the trusted submit-ids route — the
+/// scheduler resolves each id's subgraph from its node store and
+/// reports the ids it does not hold as `unknown` (stow#588).
+async fn submit_ids_plan(
+    edge: &Edge,
+    entries: Vec<stow_types::api::SubmitTaskIdEntry>,
+    yes: bool,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    render::mutation(
+        output,
+        yes,
+        entries,
+        move |envelope: &render::Planned<
+            Vec<stow_types::api::SubmitTaskIdEntry>,
+            crate::projects::SubmitIdsOutcome,
+        >| {
+            let mut out = format!(
+                "{} task id(s)
+",
+                envelope.plan.len()
+            );
+            if let Some(result) = &envelope.result {
+                let _ = write!(
+                    out,
+                    "submitted {}, inserted {}, unknown {} in {} batch(es)",
+                    result.submitted,
+                    result.inserted,
+                    result.unknown.len(),
+                    result.batches
+                );
+                for id in &result.unknown {
+                    let _ = write!(out, "\n  unknown: {id}");
+                }
+            }
+            let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
+            out
+        },
+        async move |entries: &Vec<stow_types::api::SubmitTaskIdEntry>| {
+            crate::projects::submit_ids_chunked(edge, entries).await
+        },
+    )
+    .await
 }
 
 /// `preheat plan` — the dry run of a crate request's closure expansion
 /// and coverage pruning, computed in-process on the same resolver the
-/// submit lanes use. The coverage pruning reads the public artifact
-/// catalog per node — the edge's old plan also filtered on unit shapes
-/// and dep-chain closure, which the catalog rows do not expose, so a
-/// node published on only one side can read as covered. The wave itself
-/// is unaffected: the scheduler dedupes every task by identity.
+/// submit lanes use. Coverage comes from verified signed slices and
+/// requires the exact dependency context and complete unit shapes.
 #[allow(clippy::too_many_lines)] // one lane end to end: fetch → resolve → coverage → enqueue
 async fn plan(
-    edge: &Edge,
+    _edge: &Edge,
     crates_io: &mut crates_io::CratesIo,
     args: PlanArgs,
     output: Output,
@@ -1035,32 +1067,30 @@ async fn plan(
     .expect("resolve pool panicked")?;
 
     let mut parts = Vec::with_capacity(outputs.len());
-    let mut all_nodes = std::collections::BTreeSet::new();
     for (target, output) in &outputs {
-        let target_parts = stow_resolver::request_plan_parts(
-            &output.units,
-            &output.roots,
-            crate_name.as_str(),
-            &version,
-            target,
-        )
-        .map_err(|error| stow_error!("plan {crate_name} {version} for {target}: {error:#}"))?;
-        all_nodes.extend(target_parts.nodes.iter().cloned());
+        let target_parts =
+            stow_resolver::request_plan_parts(&output.units, &output.roots, target, &rustc_version)
+                .map_err(|error| {
+                    stow_error!("plan {crate_name} {version} for {target}: {error:#}")
+                })?;
         parts.push((target, target_parts));
     }
-    let covered = covered_nodes(edge, &all_nodes, &rustc_version).await?;
+    let target_triples = outputs
+        .iter()
+        .map(|(target, _)| TargetTriple::parse(target.clone()).map_err(Into::into))
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    let covered = crate::manual::contextual_coverage(&target_triples, &rustc_version).await?;
     let mut planned = Vec::with_capacity(parts.len());
     for (target, target_parts) in parts {
         let (tasks, _uncovered) = stow_resolver::enqueue_requests_inner(
-            &target_parts.nodes,
-            &target_parts.edges,
+            &target_parts.graph,
             &covered,
-            &rustc_version,
             EnqueueSource::HumanRequest,
             0,
-        );
+        )
+        .map_err(|error| stow_error!("plan {target} requests: {error:#}"))?;
         let root_cached = target_parts
-            .root_key
+            .root_task_id
             .as_ref()
             .is_some_and(|key| covered.contains(key));
         planned.push(PreheatPlanTarget {
@@ -1099,7 +1129,10 @@ async fn plan(
                     task.crate_name.as_str().to_owned(),
                     task.version.to_string(),
                     task.features_json.raw(),
-                    task.depends_on.len().to_string(),
+                    task.depends_on()
+                        .expect("planned task subgraph resolves")
+                        .len()
+                        .to_string(),
                     if task.preserve_lockfile {
                         "source".to_owned()
                     } else {
@@ -1113,65 +1146,6 @@ async fn plan(
         }
         out.trim_end().to_owned()
     })
-}
-
-/// How many coverage lookups `plan` runs at once — each is one row of a
-/// node's catalog answer; a plan's node set is large, the reads cheap.
-const COVERAGE_CONCURRENCY: usize = 8;
-
-/// The nodes of a plan's task graph that the public artifact catalog
-/// already serves — `GET /api/v1/admin/coverage/{crate}` once per
-/// distinct crate name, matched on the full identity a row carries:
-/// version, features, target, rustc. `host_side` is not on the wire
-/// (artifact rows collapse it), so a crate published on only one side
-/// reads as covered for both — the edge's old plan filtered shapes too;
-/// see `plan`'s doc comment.
-async fn covered_nodes(
-    edge: &Edge,
-    nodes: &std::collections::BTreeSet<stow_resolver::TaskNode>,
-    rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<std::collections::BTreeSet<stow_resolver::TaskNode>> {
-    let names: std::collections::BTreeSet<String> = nodes
-        .iter()
-        .map(|node| node.crate_name.as_str().to_owned())
-        .collect();
-    let coverages = futures_util::stream::iter(names.into_iter().map(|name| async move {
-        let coverage: CrateCoverage = edge
-            .get_json(&format!("/api/v1/admin/coverage/{name}"))
-            .await?;
-        Ok::<_, stow_types::error::Error>(coverage)
-    }))
-    .buffer_unordered(COVERAGE_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await;
-    let mut rows = std::collections::BTreeSet::new();
-    for coverage in coverages {
-        let coverage = coverage?;
-        for target in &coverage.targets {
-            for artifact in &target.artifacts {
-                rows.insert((
-                    coverage.crate_name.as_str().to_owned(),
-                    artifact.version.clone(),
-                    artifact.features_json.raw(),
-                    target.target.as_str().to_owned(),
-                    artifact.rustc_version.clone(),
-                ));
-            }
-        }
-    }
-    Ok(nodes
-        .iter()
-        .filter(|node| {
-            rows.contains(&(
-                node.crate_name.as_str().to_owned(),
-                node.version.clone(),
-                node.features_json.clone(),
-                node.target.clone(),
-                rustc_version.clone(),
-            ))
-        })
-        .cloned()
-        .collect())
 }
 
 /// How many semver-compatible lines of one crate a wave preheats.
@@ -1245,7 +1219,7 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{ci_targets, missed_enqueue_request, top_missed_query};
+    use super::{ci_targets, missed_task_id_entry, top_missed_query};
 
     #[test]
     fn analytics_sql_base_override_is_loopback_only() {
@@ -1263,7 +1237,6 @@ mod tests {
             super::loopback_sql_base(remote).expect_err(remote);
         }
     }
-    use stow_types::api::EnqueueSource;
     use stow_types::identity::WireRustcVersion;
 
     fn version(num: &str, downloads: u64) -> super::CrateVersion {
@@ -1353,15 +1326,20 @@ mod tests {
             "x86_64-unknown-linux-gnu".to_owned(),
             "aarch64-apple-darwin".to_owned(),
         ];
-        let sql = top_missed_query(50, 7, &targets);
+        let rustc_version = WireRustcVersion::parse("1.91.1").expect("rustc");
+        let sql = top_missed_query(50, 7, &targets, &rustc_version);
         let expected = include_str!("../sql/top_missed.sql")
             .replace("__LIMIT__", "50")
             .replace("__SINCE_DAYS__", "7")
+            .replace("__RUSTC_VERSION__", "1.91.1")
             .replace(
                 "__TARGETS__",
                 "'x86_64-unknown-linux-gnu', 'aarch64-apple-darwin'",
             );
         assert_eq!(sql, expected);
+        assert!(sql.contains("AND blob6 = '1.91.1'"));
+        assert!(sql.contains("AND blob12 <> ''"));
+        assert!(sql.contains("GROUP BY\n        target,\n        task_id"));
     }
 
     /// A triple outside `CI_TARGET_TRIPLES` is rejected before it can
@@ -1378,68 +1356,33 @@ mod tests {
         );
     }
 
-    /// A `top_missed` element maps to the task the scheduler expects:
-    /// miss-sourced, miss count as the priority signal, no lockfile pin,
-    /// and the recorded dep edges back in `depends_on` (stow#317).
+    /// A `top_missed` element maps to the promote-by-id entry the
+    /// submit-ids lane posts; a malformed element fails loudly rather
+    /// than submitting a half-parsed id (stow#588).
     #[test]
-    fn missed_entry_maps_to_enqueue_request() {
-        let rustc_version = WireRustcVersion::parse("1.91.1").expect("rustc version");
-        let depends_on_json = concat!(
-            "[{\"crate_name\":\"syn\",\"version\":\"3.0.6\",",
-            "\"features_json\":\"[\\\"derive\\\"]\",",
-            "\"target\":\"x86_64-unknown-linux-gnu\",\"rustc_version\":\"1.91.1\"}]"
-        );
-        let request = missed_enqueue_request(
-            "x86_64-unknown-linux-gnu",
-            &format!("serde;1.2.3;[\"derive\",\"std\"];{depends_on_json};42"),
-            &rustc_version,
+    fn missed_entry_maps_to_task_id_entry() {
+        let entry = missed_task_id_entry(
+            "serde-1.0.228--x86_64-unknown-linux-gnu-r1.91.1-d4bc91f87c0a1f0e;42",
         )
-        .expect("entry maps to a request");
-        assert_eq!(request.crate_name.as_str(), "serde");
-        assert_eq!(request.version.to_string(), "1.2.3");
-        assert_eq!(request.features_json.raw(), "[\"derive\",\"std\"]");
-        assert_eq!(request.target.as_str(), "x86_64-unknown-linux-gnu");
-        assert_eq!(request.rustc_version.as_str(), "1.91.1");
-        assert_eq!(request.downloads, 42);
-        assert_eq!(request.source, EnqueueSource::CacheMiss);
-        assert!(!request.preserve_lockfile);
-        assert_eq!(request.depends_on.len(), 1);
-        assert_eq!(request.depends_on[0].crate_name.as_str(), "syn");
+        .expect("entry");
         assert_eq!(
-            request.depends_on[0].target.as_str(),
-            "x86_64-unknown-linux-gnu"
+            entry.task_id,
+            "serde-1.0.228--x86_64-unknown-linux-gnu-r1.91.1-d4bc91f87c0a1f0e"
         );
-
-        // Points recorded before the edges blob existed carry an empty
-        // slot and re-mint edge-less.
-        let request = missed_enqueue_request(
-            "x86_64-unknown-linux-gnu",
-            "serde;1.2.3;[\"derive\"];[];42",
-            &rustc_version,
-        )
-        .expect("edge-less entry maps");
-        assert_eq!(
-            request.depends_on,
-            [] as [stow_types::api::EnqueueDependency; 0]
-        );
+        assert_eq!(entry.downloads, 42);
     }
 
     /// A malformed element fails loudly rather than submitting a
     /// half-parsed identity.
     #[test]
     fn missed_entry_rejects_bad_shape() {
-        let rustc_version = WireRustcVersion::parse("1.91.1").expect("rustc version");
         assert!(
-            missed_enqueue_request("x86_64-unknown-linux-gnu", "serde;1.2.3", &rustc_version)
-                .is_err()
+            missed_task_id_entry("serde;1.2.3").is_err(),
+            "three-field entry must fail"
         );
         assert!(
-            missed_enqueue_request(
-                "x86_64-unknown-linux-gnu",
-                "serde;1.2.3;[\"derive\"];[];not-a-number",
-                &rustc_version,
-            )
-            .is_err()
+            missed_task_id_entry("some-task-id;not-a-count").is_err(),
+            "non-numeric misses must fail"
         );
     }
 }

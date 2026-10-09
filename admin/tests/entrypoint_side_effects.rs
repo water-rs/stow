@@ -80,26 +80,35 @@ async fn analytics(
     Json(response)
 }
 
-async fn submit(
+async fn submit_ids(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    let n = u32::try_from(
-        serde_json::from_str::<Vec<Value>>(&body)
-            .expect("submit body is a JSON array")
-            .len(),
-    )
-    .expect("submit body fits u32");
+    let tasks =
+        serde_json::from_str::<Value>(&body).expect("submit-ids body is a JSON object")["tasks"]
+            .as_array()
+            .expect("tasks is a JSON array")
+            .clone();
+    let n = u32::try_from(tasks.len()).expect("submit body fits u32");
     app.requests.lock().expect("requests").push(Recorded {
-        path: "/api/v1/scheduler/tasks/submit".to_owned(),
+        path: "/api/v1/scheduler/tasks/submit-ids".to_owned(),
         auth: headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
         body,
     });
-    Json(json!({"submitted": n, "inserted": n, "dropped": 0}))
+    // The DO reports ids its node store does not hold — the fixture
+    // marks them with a `nomatch` tag — never re-minting them.
+    let unknown: Vec<&str> = tasks
+        .iter()
+        .filter_map(|task| task["task_id"].as_str())
+        .filter(|id| id.contains("nomatch"))
+        .collect();
+    Json(
+        json!({"submitted": n, "inserted": n - u32::try_from(unknown.len()).unwrap(), "unknown": unknown}),
+    )
 }
 
 async fn oidc(
@@ -142,7 +151,7 @@ impl Server {
         });
         let router = Router::new()
             .route("/accounts/{account}/analytics_engine/sql", post(analytics))
-            .route("/api/v1/scheduler/tasks/submit", post(submit))
+            .route("/api/v1/scheduler/tasks/submit-ids", post(submit_ids))
             .route("/oidc", get(oidc))
             .with_state(app.clone());
         let std_listener = StdListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -220,21 +229,24 @@ fn run(mut cmd: Command) -> Output {
     cmd.output().expect("spawn stow-admin")
 }
 
-/// `crate;version;features_json;depends_on_json;misses` — the Analytics
-/// Engine element shape `missed_enqueue_request` parses.
-fn entry(name: &str, version: &str, misses: u64) -> String {
-    format!("{name};{version};[\"default\"];[];{misses}")
+/// `task_id;misses` — the Analytics Engine element shape
+/// `missed_task_id_entry` parses (stow#588). The lane promotes by the
+/// id alone; the scheduler re-derives the subgraph from its node store.
+fn entry(task_id: &str, misses: u64) -> String {
+    format!("{task_id};{misses}")
 }
 
 #[test]
 fn missed_lane_end_to_end() {
     // 1001 entries → SUBMIT_CHUNK=1000 splits the submit into exactly
     // two edge POSTs, which is what proves the OIDC mint is per request.
+    // The id one slot carries a `nomatch` tag — the mock edge reports it
+    // as unknown, exercising the report-never-remint path (stow#588).
     let entries: Vec<String> = (0..1001)
         .map(|i| {
+            let tag = if i == 500 { "-nomatch" } else { "" };
             entry(
-                "serde",
-                "1.0.228",
+                &format!("serde-1.0.228--x86_64-unknown-linux-gnu-r1.98.1-d{i:016x}{tag}"),
                 40 + u64::try_from(i % 3).expect("small i"),
             )
         })
@@ -302,7 +314,7 @@ fn missed_lane_end_to_end() {
 
     // Two submit chunks of 1000+1 — and each POST minted its own OIDC
     // token rather than reusing the first.
-    let submits = server.requests_on("/api/v1/scheduler/tasks/submit");
+    let submits = server.requests_on("/api/v1/scheduler/tasks/submit-ids");
     assert_eq!(submits.len(), 2, "{submits:?}");
     assert_eq!(submits[0].auth.as_deref(), Some("Bearer jwt-first"));
     assert_eq!(submits[1].auth.as_deref(), Some("Bearer jwt-second"));
@@ -313,21 +325,37 @@ fn missed_lane_end_to_end() {
         assert_eq!(m.auth.as_deref(), Some("bearer test-request-token"));
     }
 
-    // The submitted payloads are the fixture identities, promoted to
-    // cache-miss tasks at the requested rustc/target.
+    // The submitted payloads are the fixture task ids verbatim — the
+    // lane promotes by id and never re-mints or reshapes them.
     let mut seen = 0usize;
     for s in &submits {
-        let tasks: Vec<Value> = serde_json::from_str(&s.body).expect("submit body");
-        for t in &tasks {
-            assert_eq!(t["crate_name"], "serde", "{t}");
-            assert_eq!(t["version"], "1.0.228", "{t}");
-            assert_eq!(t["target"], "x86_64-unknown-linux-gnu", "{t}");
-            assert_eq!(t["rustc_version"], "1.98.1", "{t}");
-            assert_eq!(t["source"], "CacheMiss", "{t}");
+        let body: Value = serde_json::from_str(&s.body).expect("submit-ids body");
+        let tasks = body["tasks"].as_array().expect("tasks array");
+        for t in tasks {
+            let task_id = t["task_id"].as_str().expect("task_id");
+            assert!(
+                task_id.starts_with("serde-1.0.228--x86_64-unknown-linux-gnu-r1.98.1-d"),
+                "{t}"
+            );
+            assert!(t["downloads"].as_u64().expect("downloads") >= 40, "{t}");
             seen += 1;
         }
     }
     assert_eq!(seen, 1001);
+
+    // The unknown id the edge reported surfaces in the lane's output —
+    // reported, never re-minted.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("unknown 1"),
+        "stdout:
+{stdout}"
+    );
+    assert!(
+        stdout.contains("nomatch"),
+        "the unknown id is named:
+{stdout}"
+    );
 }
 
 #[test]
@@ -350,7 +378,7 @@ fn missed_malformed_entry_fails_before_submit() {
     assert!(stderr.contains("malformed top_missed"), "stderr:\n{stderr}");
     assert!(
         server
-            .requests_on("/api/v1/scheduler/tasks/submit")
+            .requests_on("/api/v1/scheduler/tasks/submit-ids")
             .is_empty(),
         "submit ran after a malformed entry: {:?}",
         server.requests()

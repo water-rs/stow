@@ -411,6 +411,7 @@ mod tests {
         side: Option<UnitSide>,
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
+            dependency_identity: None,
             crate_name: CrateName::parse(name).unwrap(),
             version: CrateVersion::new(semver::Version::parse(version).unwrap()),
             features_json: FeaturesJson::canonicalize(

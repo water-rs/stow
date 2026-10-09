@@ -4151,6 +4151,7 @@ mod tests {
                 oci_reference: "ghcr.io/water-rs/stow-cache:demo.test".to_owned(),
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
+                    dependency_identity: None,
                     compile_key: "compile-key".to_owned(),
                     crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
                     crate_version: stow_types::identity::CrateVersion::new(

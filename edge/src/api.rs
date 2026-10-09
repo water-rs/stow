@@ -212,14 +212,9 @@ fn mint_admissions(
     let minute = now_minute();
     let mut admissions = Vec::with_capacity(requests.len());
     for request in requests {
-        let task_id = scheduler::queue::task_id(
-            request.crate_name.as_str(),
-            &request.version.to_string(),
-            request.features_json.raw().as_str(),
-            request.target.as_str(),
-            request.rustc_version.as_str(),
-            request.host_side,
-        );
+        let task_id = request.task_id().map_err(|error| {
+            GetArtifactError::BadRequestWithMessage(format!("enqueue task id: {error}"))
+        })?;
         let request_json = serde_json::to_vec(&request)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
         let challenge = admission::issue_challenge(
@@ -893,6 +888,25 @@ pub async fn submit_scheduler_tasks(
         // shape the submitters already parse.
         dropped: 0,
     }))
+}
+
+/// POST /api/v1/scheduler/tasks/submit-ids — the missed lane's trusted
+/// promote path (stow#588): forwards the task ids to the DO's
+/// submit-by-id route; the scheduler resolves each subgraph from its
+/// node store and reports ids it does not hold as `unknown`.
+pub async fn submit_task_ids(
+    SchedulerCaller(caller): SchedulerCaller,
+    Json(request): Json<stow_types::api::SubmitTaskIdsRequest>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::SubmitTaskIdsResponse>, GetArtifactError> {
+    let response = scheduler_client::send_task_ids(&scheduler, &request).await?;
+    tracing::info!(
+        tasks = request.tasks.len(),
+        unknown = response.unknown.len(),
+        %caller,
+        "submitted scheduler task ids"
+    );
+    Ok(Json(response))
 }
 
 /// GET /api/v1/scheduler/status
@@ -1646,13 +1660,22 @@ pub async fn mint_miss_admissions(
 async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
     const DRAIN_MISS_BATCH: usize = 64;
 
-    let drained = match db::take_dependency_graph_misses(db, DRAIN_MISS_BATCH).await {
-        Ok(drained) => drained,
+    let drain = match db::take_dependency_graph_misses(db, DRAIN_MISS_BATCH).await {
+        Ok(drain) => drain,
         Err(error) => {
             tracing::error!(%error, "failed to drain admitted dependency-graph misses");
             return;
         }
     };
+    // Historical rows carry no stored subgraph — they drained as an
+    // explicit skip, counted here, never re-minted (stow#588).
+    if drain.skipped > 0 {
+        tracing::info!(
+            skipped = drain.skipped,
+            "miss drain skipped rows with no stored context"
+        );
+    }
+    let drained = drain.requests;
     if drained.is_empty() {
         return;
     }
@@ -1697,14 +1720,9 @@ pub async fn enqueue_admitted_task(
     }
     // The challenge binds task_id to the request's canonical identity;
     // recompute it so a verified ticket always forwards what it minted.
-    let derived_task_id = scheduler::queue::task_id(
-        ticket.request.crate_name.as_str(),
-        &ticket.request.version.to_string(),
-        ticket.request.features_json.raw().as_str(),
-        ticket.request.target.as_str(),
-        ticket.request.rustc_version.as_str(),
-        ticket.request.host_side,
-    );
+    let derived_task_id = ticket.request.task_id().map_err(|error| {
+        GetArtifactError::BadRequestWithMessage(format!("enqueue task id: {error}"))
+    })?;
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
         return Err(GetArtifactError::Unauthorized);

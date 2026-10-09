@@ -388,7 +388,10 @@ fn submit_task(rustc: &str, counter: u64) -> Result<EnqueueRequest, String> {
             .map_err(|error| format!("rustc: {error}"))?,
         downloads: 0,
         source: EnqueueSource::CrateUpdate,
-        depends_on: Vec::new(),
+        dependency_subgraph: stow_types::api::TaskSubgraph {
+            root_deps: Vec::new(),
+            nodes: Vec::new(),
+        },
         host_side: false,
         preserve_lockfile: false,
     })
@@ -430,6 +433,7 @@ fn admission_body(target: &str, rustc: &str, counter: u64) -> Result<serde_json:
             features,
             host_side: false,
             dependencies: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         }],
     })
     .map_err(|error| error.to_string())
@@ -454,14 +458,7 @@ fn mint_ticket(
     min_bits: u32,
     request: &EnqueueRequest,
 ) -> Result<EnqueueTicket, String> {
-    let task_id = stow_types::api::task_id(
-        request.crate_name.as_str(),
-        &request.version.to_string(),
-        request.features_json.raw().as_str(),
-        request.target.as_str(),
-        request.rustc_version.as_str(),
-        request.host_side,
-    );
+    let task_id = request.task_id().map_err(|error| error.to_string())?;
     let request_json = serde_json::to_vec(request).map_err(|error| error.to_string())?;
     let challenge = issue_challenge(secret, &task_id, &request_json, now_minute());
     let required = difficulty(min_bits);

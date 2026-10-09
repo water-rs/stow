@@ -7,6 +7,7 @@ use crate::errors::SchedulerClientError;
 const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
+const SCHEDULER_SUBMIT_IDS_URL: &str = "https://scheduler.internal/tasks/submit/ids";
 const SCHEDULER_RUN_COMPLETE_URL: &str = "https://scheduler.internal/tasks/complete-run";
 const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
@@ -46,6 +47,16 @@ pub async fn send_enqueue_trusted(
     let response: InsertedResponse =
         post_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, requests).await?;
     Ok(response.inserted)
+}
+
+/// The trusted submit-by-id channel: `/tasks/submit/ids` promotes
+/// misses by exact task id — the DO rebuilds each subgraph from its
+/// node store and reports the ids it does not hold (stow#588).
+pub async fn send_task_ids(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::SubmitTaskIdsRequest,
+) -> Result<stow_types::api::SubmitTaskIdsResponse, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_SUBMIT_IDS_URL, request).await
 }
 
 /// The GitHub `workflow_run` webhook's completion channel (stow#455):
