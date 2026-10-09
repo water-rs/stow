@@ -8810,3 +8810,466 @@ async fn migration_adds_claim_stamp_and_cost_tables() {
         assert!(!columns.is_empty(), "{table} exists");
     }
 }
+
+// ==================== stow#588: identity rebuild + node-store dispatch walk ====================
+
+/// The version-14 `queue` table: every column the identity copy carries,
+/// minus `dependency_identity`, under the six-field UNIQUE that could
+/// merge two contexts sharing an identity tuple.
+const V14_QUEUE_DDL: &str = "CREATE TABLE queue (
+    task_id TEXT PRIMARY KEY,
+    crate_name TEXT NOT NULL, version TEXT NOT NULL, features_json TEXT NOT NULL,
+    target TEXT NOT NULL, rustc_version TEXT NOT NULL,
+    downloads INTEGER NOT NULL DEFAULT 0, miss_count INTEGER NOT NULL DEFAULT 0,
+    request_count INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending', error_msg TEXT,
+    preserve_lockfile INTEGER NOT NULL DEFAULT 0,
+    lane TEXT NOT NULL DEFAULT 'miss',
+    dispatch_attempts INTEGER NOT NULL DEFAULT 0, attempt INTEGER NOT NULL DEFAULT 1,
+    generation_id TEXT NOT NULL DEFAULT '',
+    not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
+    first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    github_run_id TEXT, host_side INTEGER NOT NULL DEFAULT 0,
+    shape_requeue INTEGER NOT NULL DEFAULT 0, unpublished_deps INTEGER NOT NULL DEFAULT 0,
+    deps_met INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0,
+    wake_at TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
+    dispatch_family TEXT NOT NULL DEFAULT '', value INTEGER NOT NULL DEFAULT 0,
+    demand INTEGER NOT NULL DEFAULT 0, dispatch_key TEXT NOT NULL DEFAULT '',
+    claimed_at TEXT, dispatch_eligible INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
+)";
+
+/// The version-14 edge table — every current column minus
+/// `dep_dependency_identity`, which only the rebuild's ALTER adds.
+const V14_DEPS_DDL: &str = "CREATE TABLE queue_dependencies (
+    task_id TEXT NOT NULL, depends_on_task_id TEXT NOT NULL,
+    dep_crate_name TEXT NOT NULL DEFAULT '', dep_version TEXT NOT NULL DEFAULT '',
+    dep_features_json TEXT NOT NULL DEFAULT '', dep_target TEXT NOT NULL DEFAULT '',
+    dep_rustc_version TEXT NOT NULL DEFAULT '',
+    dep_host_side INTEGER NOT NULL DEFAULT 0,
+    dep_invocations INTEGER NOT NULL DEFAULT 0, dep_shapes INTEGER NOT NULL DEFAULT 0,
+    dep_met INTEGER NOT NULL DEFAULT 0, dep_side_known INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, depends_on_task_id)
+)";
+
+/// The version-14 slice-membership table — the nine immutable membership
+/// columns, primary key carrying no `dependency_identity`.
+const V14_SLICE_ROWS_DDL: &str = "CREATE TABLE published_slice_rows (
+    target TEXT NOT NULL, rustc_version TEXT NOT NULL, generation INTEGER NOT NULL,
+    crate_name TEXT NOT NULL, version TEXT NOT NULL, features_json TEXT NOT NULL,
+    unit_side INTEGER NOT NULL DEFAULT -1, unit_invocation INTEGER NOT NULL DEFAULT -1,
+    unit_linked INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json,
+                 unit_side, unit_invocation, unit_linked)
+)";
+
+/// Build a version-14 database: current schema for the untouched tables,
+/// the three rebuilt tables in their legacy shapes, the version stamp
+/// at 14.
+async fn seed_v14_db() -> DurableDb {
+    let db = memory_db_raw().await.expect("raw memory db");
+    for statement in [
+        include_str!("schema.sql"),
+        "DROP TABLE queue",
+        "DROP TABLE queue_dependencies",
+        "DROP TABLE published_slice_rows",
+        V14_QUEUE_DDL,
+        V14_DEPS_DDL,
+        V14_SLICE_ROWS_DDL,
+        "INSERT INTO scheduler_schema_version (id, version) VALUES (1, 14)",
+    ] {
+        db.query(statement)
+            .execute()
+            .await
+            .unwrap_or_else(|error| panic!("v14 seed step failed: {error}\n{statement}"));
+    }
+    db
+}
+
+/// Insert one legacy queue row of the given status carrying a value in
+/// every preserved column; `seq` keeps task ids distinct and ordered.
+async fn seed_v14_row(db: &DurableDb, seq: i64, status: &str, extra: &str) {
+    db.query(&format!(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, downloads, miss_count, request_count, priority, status,
+            error_msg, preserve_lockfile, lane, dispatch_attempts, attempt,
+            generation_id, not_before, first_requested_at, created_at, updated_at,
+            github_run_id, host_side, shape_requeue, unpublished_deps, deps_met,
+            blocked, wake_at, dispatch_family, value, demand, dispatch_key,
+            claimed_at, dispatch_eligible)
+         VALUES ('v14-task-{seq:05}', 'crate{seq}', '1.0.0', '[\"default\"]',
+            'x86_64-unknown-linux-gnu', '1.85.0', 10 + {seq}, {seq}, 2, {seq},
+            '{status}', {extra}, 0, 'miss', 1, 3, 'gen-{seq}',
+            '2024-01-01 00:00:00', '2024-01-02 00:00:00', '2024-01-03 00:00:00',
+            '2024-01-04 00:00:00', 'run-{seq}', 0, 1, 2, 0, 1,
+            '2024-01-05 00:00:00', 'linux', 100 + {seq}, 5, 'key-{seq}',
+            '2024-01-06 00:00:00', 0)"
+    ))
+    .execute()
+    .await
+    .expect("seed v14 row");
+}
+
+/// Rows of every queue status, one dependency edge and one slice row —
+/// the preservation matrix the rebuild must carry verbatim.
+#[derive(skyzen::FromRow)]
+struct Migrated {
+    status: String,
+    downloads: i64,
+    miss_count: i64,
+    request_count: i64,
+    priority: i64,
+    attempt: i64,
+    generation_id: String,
+    github_run_id: Option<String>,
+    lane: String,
+    demand: i64,
+    claimed_at: Option<String>,
+    not_before: String,
+    dependency_identity: Option<String>,
+    error_msg: Option<String>,
+}
+
+/// Every immutable column the copy must carry, asserted per seeded row.
+/// `demand` is the demand association; the derived rank columns (`value`,
+/// `dispatch_key`, `wake_at`, …) are legitimately recomputed by the gate
+/// backfill, never carried — they are not asserted.
+fn assert_v14_row(row: &Migrated, seq: i64) {
+    assert_eq!(row.downloads, 10 + seq, "downloads preserved");
+    assert_eq!(row.miss_count, seq, "miss_count preserved");
+    assert_eq!(row.request_count, 2);
+    assert_eq!(row.priority, seq);
+    assert_eq!(row.attempt, 3, "attempt preserved");
+    assert_eq!(row.generation_id, format!("gen-{seq}"));
+    let run_id = format!("run-{seq}");
+    assert_eq!(row.github_run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(row.lane, "miss");
+    assert_eq!(row.demand, 5, "demand association preserved");
+    assert_eq!(row.claimed_at.as_deref(), Some("2024-01-06 00:00:00"));
+    assert_eq!(row.not_before, "2024-01-01 00:00:00");
+    assert_eq!(
+        row.dependency_identity, None,
+        "historical context stays NULL, never guessed"
+    );
+    assert_eq!(row.error_msg.as_deref(), Some("seeded-error"));
+}
+
+#[tokio::test]
+async fn migration_from_a_v14_database_preserves_every_row_edge_and_null_context() {
+    let db = seed_v14_db().await;
+    for (seq, status) in ["pending", "dispatched", "running", "completed", "failed"]
+        .iter()
+        .enumerate()
+    {
+        seed_v14_row(
+            &db,
+            i64::try_from(seq).expect("seq") + 1,
+            status,
+            "'seeded-error'",
+        )
+        .await;
+    }
+    db.query(
+        "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_crate_name)
+         VALUES ('v14-task-00001', 'v14-task-00002', 'crate2')",
+    )
+    .execute()
+    .await
+    .expect("seed v14 edge");
+    db.query(
+        "INSERT INTO published_slice_rows
+            (target, rustc_version, generation, crate_name, version, features_json,
+             unit_side, unit_invocation, unit_linked)
+         VALUES ('x86_64-unknown-linux-gnu', '1.85.0', 7, 'crate2', '1.0.0',
+             '[\"default\"]', 1, 2, 0)",
+    )
+    .execute()
+    .await
+    .expect("seed v14 slice row");
+
+    let report = super::migrate(&db, &settings()).await.expect("migrate");
+    assert_eq!(
+        (report.before, report.after),
+        (14, super::SCHEMA_VERSION),
+        "v14 → SCHEMA_VERSION in one pass under the small fixture"
+    );
+
+    // Every status row landed with every immutable column verbatim and
+    // context NULL — never guessed.
+    let rows = db
+        .query(
+            "SELECT status, downloads, miss_count, request_count, priority, attempt,
+                generation_id, github_run_id, lane, demand,
+                claimed_at, not_before, dependency_identity, error_msg FROM queue ORDER BY task_id",
+        )
+        .fetch_all::<Migrated>()
+        .await
+        .expect("read migrated rows");
+    assert_eq!(rows.len(), 5, "every legacy row survived the copy");
+    let mut statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        ["completed", "dispatched", "failed", "pending", "running"]
+    );
+    for (index, row) in rows.iter().enumerate() {
+        assert_v14_row(row, i64::try_from(index + 1).expect("seq"));
+    }
+    // The edge row and slice row carried through unchanged.
+    let edge = db
+        .query("SELECT COUNT(*) FROM queue_dependencies WHERE task_id = 'v14-task-00001' AND depends_on_task_id = 'v14-task-00002' AND dep_dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("edge row");
+    assert_eq!(edge, 1, "dependency edge preserved, context NULL");
+    let slice = db
+        .query("SELECT COUNT(*) FROM published_slice_rows WHERE crate_name = 'crate2' AND dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("slice row");
+    assert_eq!(slice, 1, "slice membership preserved, context NULL");
+    // Status counters repopulated by the copy's inserts.
+    let pending = db
+        .query("SELECT n FROM queue_status_counts WHERE status = 'pending'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("pending count");
+    assert_eq!(pending, 1);
+}
+
+/// A migrate call's bounded copy leaves the rest for the next call: the
+/// interrupted run keeps the legacy table and cursor, the retry finishes
+/// — `after` answers `SCHEMA_VERSION` only once the copy verified.
+#[tokio::test]
+async fn migration_identity_copy_resumes_after_an_interrupted_batch_run() {
+    let db = seed_v14_db().await;
+    // One call moves at most IDENTITY_COPY_BATCHES_PER_CALL × 1000 rows;
+    // seed one row over that so the first call cannot finish.
+    let rows = super::IDENTITY_COPY_BATCH_ROWS
+        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
+        + 1;
+    db.query(&format!(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
+            '[\"default\"]', 'x86_64-unknown-linux-gnu', '1.85.0',
+            CASE x % 5 WHEN 0 THEN 'pending' WHEN 1 THEN 'completed'
+             WHEN 2 THEN 'failed' WHEN 3 THEN 'dispatched' ELSE 'running' END,
+            'miss'
+         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
+               SELECT x FROM n) AS g"
+    ))
+    .execute()
+    .await
+    .expect("seed bulk v14 rows");
+
+    let first = super::migrate(&db, &settings())
+        .await
+        .expect("first migrate");
+    assert_eq!(
+        (first.before, first.after),
+        (14, 14),
+        "an incomplete copy must not report SCHEMA_VERSION: {first:?}"
+    );
+    let legacy_present = db
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'queue_identity_legacy'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("legacy probe");
+    assert_eq!(legacy_present, 1, "the copy's source survives interruption");
+
+    // Retry finishes the copy.
+    let second = super::migrate(&db, &settings())
+        .await
+        .expect("migrate retry");
+    assert_eq!((second.before, second.after), (14, super::SCHEMA_VERSION));
+    let total = db
+        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("count migrated rows");
+    assert_eq!(total, rows, "every bulk row copied with NULL context");
+    let legacy_gone = db
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'queue_identity_legacy'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("legacy probe");
+    assert_eq!(legacy_gone, 0, "verified copy drops the legacy table");
+
+    // Already migrated: a third pass is a pure no-op.
+    let third = super::migrate(&db, &settings())
+        .await
+        .expect("idempotent migrate");
+    assert_eq!(
+        (third.before, third.after),
+        (super::SCHEMA_VERSION, super::SCHEMA_VERSION)
+    );
+}
+
+/// Two tasks whose dependency closures meet at a shared grandchild
+/// produce two distinct dispatch subgraphs — each rebuilding to exactly
+/// its own task id under the payload's verify (stow#588 node store).
+#[tokio::test]
+async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
+    let db = memory_db().await.expect("memory db");
+    let shared = dependency("shared-gc");
+    let aunt = request("aunt-a", std::slice::from_ref(&shared));
+    let uncle = request("uncle-b", std::slice::from_ref(&shared));
+    let first = request("ctx-a", std::slice::from_ref(&aunt));
+    let second = request("ctx-b", std::slice::from_ref(&uncle));
+    enqueue(
+        &db,
+        &[
+            shared.clone(),
+            aunt.clone(),
+            uncle.clone(),
+            first.clone(),
+            second.clone(),
+        ],
+    )
+    .await
+    .expect("enqueue chain");
+
+    // Publish every dependency so both contexts release — `shared-gc`
+    // first so `aunt`'s and `uncle`'s own edges meet before they publish.
+    for dep_request in [&shared, &aunt, &uncle] {
+        db.query("UPDATE queue SET status = 'completed' WHERE task_id = ?")
+            .bind(dep_request.task_id().expect("dep task id"))
+            .execute()
+            .await
+            .expect("complete dep");
+    }
+    // A slice report replaces the generation's rows wholesale, so all
+    // published rows land in one call. Every invocation spelling and
+    // kind is covered: an edge asks for the shapes its own context
+    // spells.
+    let slice_rows = [&shared, &aunt, &uncle]
+        .iter()
+        .flat_map(|dep_request| {
+            let crate_name = dep_request.crate_name.as_str().to_owned();
+            let identity = dep_request.dependency_identity().ok();
+            [UnitInvocation::Native, UnitInvocation::Target]
+                .iter()
+                .flat_map(|invocation| {
+                    [UnitKind::Linked, UnitKind::Unlinked]
+                        .iter()
+                        .map(|kind| stow_types::api::PublishedSliceRow {
+                            dependency_identity: identity.clone(),
+                            crate_name: crate_name.parse().expect("crate name"),
+                            version: VERSION.parse().expect("semver"),
+                            features_json: FeaturesJson::default(),
+                            unit_shape: Some(shape(UnitSide::Target, *invocation, *kind)),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    super::record_published_slice(&db, TARGET, RUSTC, None, None, &slice_rows, &[])
+        .await
+        .expect("publish dep slice");
+
+    let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let mut verified = Vec::new();
+    for task in &claimed {
+        if !task.task_id.starts_with("ctx-") {
+            continue;
+        }
+        // The payload path: subgraph + the task's own identity re-derive
+        // the claimed task id.
+        let payload = stow_types::api::BuildTaskPayload {
+            task_id: task.task_id.clone(),
+            attempt: task.attempt,
+            crate_name: task.crate_name.parse().expect("crate name"),
+            version: stow_types::identity::CrateVersion::new(
+                task.version.parse().expect("version"),
+            ),
+            features_json: FeaturesJson::from_sorted(
+                serde_json::from_str::<Vec<String>>(&task.features_json).expect("features"),
+            )
+            .expect("canonical features"),
+            target: task.target.parse().expect("target"),
+            rustc_version: task.rustc_version.parse().expect("rustc"),
+            preserve_lockfile: false,
+            host_side: task.host_side,
+            dependency_subgraph: task.dependency_subgraph.clone(),
+        };
+        let graph = payload.verified_dependency_graph().expect("verify");
+        assert_eq!(
+            graph.task_id(0),
+            Some(task.task_id.as_str()),
+            "walked subgraph re-derives the claimed task id"
+        );
+        verified.push(task.dependency_subgraph.clone());
+    }
+    assert_eq!(verified.len(), 2, "both contexts claimed");
+    assert_ne!(
+        verified[0], verified[1],
+        "shared grandchildren do not collapse the two contexts"
+    );
+}
+
+/// A node the store lost fails the claim hard, naming the missing id —
+/// never a leaf substitute (stow#588).
+#[tokio::test]
+async fn dispatch_fails_on_a_missing_node_naming_it() {
+    let db = memory_db().await.expect("memory db");
+    let leaf = dependency("lost-leaf");
+    let owner = request("walk-owner", std::slice::from_ref(&leaf));
+    let missing_id = leaf.task_id().expect("leaf task id");
+    enqueue(&db, &[leaf.clone(), owner.clone()])
+        .await
+        .expect("enqueue");
+    // Publish the leaf so the gate releases the owner — the walk, not
+    // the gate, is what must fail.
+    let leaf_name = leaf.crate_name.as_str().to_owned();
+    db.query("UPDATE queue SET status = 'completed' WHERE task_id = ?")
+        .bind(missing_id.clone())
+        .execute()
+        .await
+        .expect("complete leaf");
+    let rows = [UnitKind::Linked, UnitKind::Unlinked]
+        .iter()
+        .map(|kind| stow_types::api::PublishedSliceRow {
+            dependency_identity: leaf.dependency_identity().ok(),
+            crate_name: leaf_name.parse().expect("crate name"),
+            version: VERSION.parse().expect("semver"),
+            features_json: FeaturesJson::default(),
+            unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+        })
+        .collect::<Vec<_>>();
+    super::record_published_slice(&db, TARGET, RUSTC, None, None, &rows, &[])
+        .await
+        .expect("publish leaf slice");
+
+    // Delete the leaf's node row: the store can no longer serve it.
+    db.query("DELETE FROM task_nodes WHERE task_id = ?")
+        .bind(missing_id.clone())
+        .execute()
+        .await
+        .expect("drop node row");
+
+    let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let owner_id = owner.task_id().expect("owner task id");
+    assert!(
+        !claimed.iter().any(|task| task.task_id == owner_id),
+        "the broken task must not dispatch"
+    );
+    let error: String = db
+        .query("SELECT status || '|' || COALESCE(error_msg, '') FROM queue WHERE task_id = ?")
+        .bind(owner_id)
+        .fetch_scalar::<String>()
+        .await
+        .expect("owner row");
+    assert!(
+        error.starts_with("failed|") && error.contains(&missing_id),
+        "the hard dispatch error names the missing node id: {error}"
+    );
+}

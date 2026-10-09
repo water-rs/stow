@@ -6959,22 +6959,23 @@ async fn set_identity_copy_cursor(
 /// `dependency_identity` — unknown context, never guessed.
 async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
     const CURSOR_KEY: &str = "migrate_queue_identity_cursor";
-    if table_columns(db, "queue")
+    let queue_has_identity = table_columns(db, "queue")
         .await?
-        .contains("dependency_identity")
-    {
-        // Already the new shape; a stranded legacy table means a call
-        // died between verify and drop — finish it.
-        if !table_columns(db, "queue_identity_legacy").await?.is_empty() {
-            verify_queue_identity_copy(db).await?;
-            db.query("DROP TABLE queue_identity_legacy")
-                .execute()
-                .await
-                .map_err(|error| format!("drop queue_identity_legacy: {error}"))?;
-        }
+        .contains("dependency_identity");
+    let legacy_exists = !table_columns(db, "queue_identity_legacy").await?.is_empty();
+    if queue_has_identity && !legacy_exists {
         return Ok(true);
     }
-    if table_columns(db, "queue_identity_legacy").await?.is_empty() {
+    if !queue_has_identity && legacy_exists {
+        return Err(QueueError::Invariant(
+            "queue identity rebuild: old-shape queue alongside queue_identity_legacy".to_owned(),
+        ));
+    }
+    // Legacy still present — whether the new queue is fresh or partly
+    // filled — means the copy is unfinished: a call that died between
+    // batches resumes here, and only an exhausted cursor reaches
+    // verify+drop. Never verify ahead of the tail.
+    if !legacy_exists {
         // Contract step of the rename: the live table aside, the new
         // one (plus its indexes and triggers) arrives through the
         // schema file itself so the copy writes the same shape fresh
@@ -7009,7 +7010,7 @@ async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, Queue
             )
             .bind(cursor.clone())
             .bind(IDENTITY_COPY_BATCH_ROWS)
-            .fetch_scalar_optional::<String>()
+            .fetch_scalar::<Option<String>>()
             .await
             .map_err(|error| format!("probe identity copy bound: {error}"))?
         else {
@@ -7063,26 +7064,24 @@ async fn verify_queue_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
 /// historical row — pre-identity reports never carried context.
 async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
     const CURSOR_KEY: &str = "migrate_slice_identity_cursor";
-    if table_columns(db, "published_slice_rows")
+    let rows_have_identity = table_columns(db, "published_slice_rows")
         .await?
-        .contains("dependency_identity")
-    {
-        if !table_columns(db, "published_slice_rows_identity_legacy")
-            .await?
-            .is_empty()
-        {
-            verify_slice_identity_copy(db).await?;
-            db.query("DROP TABLE published_slice_rows_identity_legacy")
-                .execute()
-                .await
-                .map_err(|error| format!("drop published_slice_rows_identity_legacy: {error}"))?;
-        }
+        .contains("dependency_identity");
+    let legacy_exists = !table_columns(db, "published_slice_rows_identity_legacy")
+        .await?
+        .is_empty();
+    if rows_have_identity && !legacy_exists {
         return Ok(true);
     }
-    if table_columns(db, "published_slice_rows_identity_legacy")
-        .await?
-        .is_empty()
-    {
+    if !rows_have_identity && legacy_exists {
+        return Err(QueueError::Invariant(
+            "slice identity rebuild: old-shape rows alongside published_slice_rows_identity_legacy"
+                .to_owned(),
+        ));
+    }
+    // Same resume rule as the queue copy: a stranded legacy table is an
+    // unfinished copy, never a verified one — fall through to the loop.
+    if !legacy_exists {
         db.query("ALTER TABLE published_slice_rows RENAME TO published_slice_rows_identity_legacy")
             .execute()
             .await
@@ -7094,7 +7093,10 @@ async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, Queue
     }
     // `rowid` is the cursor: the legacy table kept its storage-order
     // rowids through the rename.
-    let mut cursor = identity_copy_cursor(db, CURSOR_KEY).await?;
+    let mut cursor: i64 = identity_copy_cursor(db, CURSOR_KEY)
+        .await?
+        .parse()
+        .unwrap_or(0);
     for _ in 0..IDENTITY_COPY_BATCHES_PER_CALL {
         let Some(bound) = db
             .query(
@@ -7102,9 +7104,9 @@ async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, Queue
                      SELECT rowid FROM published_slice_rows_identity_legacy \
                      WHERE rowid > ? ORDER BY rowid LIMIT ?)",
             )
-            .bind(cursor.clone())
+            .bind(cursor)
             .bind(IDENTITY_COPY_BATCH_ROWS)
-            .fetch_scalar_optional::<i64>()
+            .fetch_scalar::<Option<i64>>()
             .await
             .map_err(|error| format!("probe slice identity copy bound: {error}"))?
         else {
@@ -7121,13 +7123,13 @@ async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, Queue
             return Ok(true);
         };
         db.query(include_str!("copy_slice_dependency_identity.sql"))
-            .bind(cursor.clone())
+            .bind(cursor)
             .bind(IDENTITY_COPY_BATCH_ROWS)
             .execute()
             .await
             .map_err(|error| format!("copy slice rows for identity rebuild: {error}"))?;
         set_identity_copy_cursor(db, CURSOR_KEY, &bound.to_string()).await?;
-        cursor = bound.to_string();
+        cursor = bound;
     }
     Ok(false)
 }
