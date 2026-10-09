@@ -540,7 +540,11 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
-    dependency_identity TEXT,
+    -- The Merkle dependency digest the row was built under (stow#588).
+    -- NOT NULL since v15: a row without it satisfies no coverage clause,
+    -- so the rebuild drops context-free rows and reports that carry
+    -- none are refused — the column is `=` everywhere, never `IS`.
+    dependency_identity TEXT NOT NULL,
     -- The unit shape the row serves — the builder-recorded side, cargo
     -- invocation spelling, and link kind the dependency gate compares an
     -- edge's required shapes against. -1 on all three legs marks a row

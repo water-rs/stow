@@ -3036,7 +3036,7 @@ fn full_slice_report() -> Vec<PublishedSliceRow> {
             node_shapes(false, target)
                 .into_iter()
                 .map(move |shape| PublishedSliceRow {
-                    dependency_identity: None,
+                    dependency_identity: format!("{i:064x}").parse().ok(),
                     crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
                     version: "1.0.0".parse().expect("full version"),
                     features_json: FeaturesJson::default(),
@@ -3066,7 +3066,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
         let n = first + (live - 1 - i) * 9;
         let (crate_name, version) = crate_identity(n);
         retired.push(PublishedSliceRow {
-            dependency_identity: None,
+            dependency_identity: format!("{n:064x}").parse().ok(),
             crate_name: crate_name.parse().expect("retire crate"),
             version: version.parse().expect("retire version"),
             features_json: FeaturesJson::default(),
@@ -3078,7 +3078,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
             node_shapes(false, target)
                 .into_iter()
                 .map(|shape| PublishedSliceRow {
-                    dependency_identity: None,
+                    dependency_identity: format!("{i:064x}").parse().ok(),
                     crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
                     version: "9.9.9".parse().expect("delta version"),
                     features_json: FeaturesJson::default(),

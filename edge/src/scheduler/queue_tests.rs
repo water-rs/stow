@@ -4986,8 +4986,8 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
     // above the committed one, then the writer dies before the flip.
     db.query(
         "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json) \
-             VALUES (?, ?, 2, 'stale', '1.0.0', '[]')",
+             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity) \
+             VALUES (?, ?, 2, 'stale', '1.0.0', '[]', 'd0deadbeef')",
     )
     .bind(TARGET.to_owned())
     .bind(RUSTC.to_owned())
@@ -9018,7 +9018,9 @@ async fn migration_from_a_v14_database_preserves_every_row_edge_and_null_context
     for (index, row) in rows.iter().enumerate() {
         assert_v14_row(row, i64::try_from(index + 1).expect("seq"));
     }
-    // The edge row and slice row carried through unchanged.
+    // The edge row carried through unchanged; the slice row dropped at
+    // the swap — `published_slice_rows.dependency_identity` is NOT NULL
+    // post-v15, and a context-free row satisfies no coverage clause.
     let edge = db
         .query("SELECT COUNT(*) FROM queue_dependencies WHERE task_id = 'v14-task-00001' AND depends_on_task_id = 'v14-task-00002' AND dep_dependency_identity IS NULL")
         .fetch_scalar::<i64>()
@@ -9026,11 +9028,11 @@ async fn migration_from_a_v14_database_preserves_every_row_edge_and_null_context
         .expect("edge row");
     assert_eq!(edge, 1, "dependency edge preserved, context NULL");
     let slice = db
-        .query("SELECT COUNT(*) FROM published_slice_rows WHERE crate_name = 'crate2' AND dependency_identity IS NULL")
+        .query("SELECT COUNT(*) FROM published_slice_rows")
         .fetch_scalar::<i64>()
         .await
-        .expect("slice row");
-    assert_eq!(slice, 1, "slice membership preserved, context NULL");
+        .expect("slice rows");
+    assert_eq!(slice, 0, "context-free slice rows drop at the swap");
     // Status counters repopulated by the copy's inserts.
     let pending = db
         .query("SELECT n FROM queue_status_counts WHERE status = 'pending'")

@@ -6167,8 +6167,8 @@ pub async fn record_published_slice(
                 target,
                 rustc_version,
                 live_generation,
-                &to_slice_rows(added),
-                &to_slice_rows(retired),
+                &to_slice_rows(added)?,
+                &to_slice_rows(retired)?,
             )
             .await?;
             let changed = directional
@@ -6204,7 +6204,7 @@ pub async fn record_published_slice(
                 target,
                 rustc_version,
                 live_generation,
-                &to_slice_rows(added),
+                &to_slice_rows(added)?,
             )
             .await?;
             (changed, None, true)
@@ -6261,18 +6261,31 @@ struct LiveSliceRow {
 
 /// Map report rows onto the stored 6-column identity — `rowid` zeroes
 /// out (only live-read rows carry one) and a missing unit shape writes
-/// the `-1` legs that satisfy no coverage clause.
-fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
+/// the `-1` legs that satisfy no coverage clause. A row without a
+/// `dependency_identity` is refused, not stored: post-v15 the column
+/// is NOT NULL and every report carries the digest — a context-free
+/// row would satisfy no coverage clause anyway (stow#588).
+fn to_slice_rows(rows: &[PublishedSliceRow]) -> Result<Vec<SliceRowJson>, QueueError> {
     rows.iter()
-        .map(|row| SliceRowJson {
-            crate_name: row.crate_name.to_string(),
-            version: row.version.to_string(),
-            features_json: row.features_json.raw(),
-            dependency_identity: row.dependency_identity.as_ref().map(ToString::to_string),
-            unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
-            unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
-            unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
-            rowid: 0,
+        .map(|row| {
+            let Some(dependency_identity) = row.dependency_identity.as_ref() else {
+                return Err(QueueError::Sql(format!(
+                    "published slice row {} {} carries no dependency_identity",
+                    row.crate_name, row.version
+                )));
+            };
+            Ok(SliceRowJson {
+                crate_name: row.crate_name.to_string(),
+                version: row.version.to_string(),
+                features_json: row.features_json.raw(),
+                dependency_identity: Some(dependency_identity.to_string()),
+                unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
+                unit_invocation: row
+                    .unit_shape
+                    .map_or(-1, |shape| shape.invocation.to_int()),
+                unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
+                rowid: 0,
+            })
         })
         .collect()
 }
@@ -6294,19 +6307,23 @@ async fn apply_slice_delta(
     if !retired.is_empty() {
         let retired_json = serde_json::to_string(retired)
             .map_err(|error| QueueError::Sql(format!("encode slice retire json: {error}")))?;
-        // NULL-safe identity match: a retired row's `dependency_identity`
-        // can be NULL (unknown historical context) and `=` never binds
-        // NULL — `IS` is the only comparator that retires it.
+        // `json_each` drives: each retired row probes the table's own
+        // primary key (the leading (target, rustc_version, generation)
+        // bound constants, the remaining seven equality terms off the
+        // JSON row), so the delete costs one PK lookup per retired row
+        // — proportional to the delta, never a slice scan. `=` on
+        // `dependency_identity` is total post-v15: the column is
+        // NOT NULL (stow#588).
         db.query(
             "DELETE FROM published_slice_rows \
              WHERE rowid IN ( \
-                 SELECT p.rowid FROM published_slice_rows p \
-                 JOIN (SELECT value AS e FROM json_each(?)) j \
+                 SELECT p.rowid FROM (SELECT value AS e FROM json_each(?)) j \
+                 CROSS JOIN published_slice_rows p \
                    ON p.target = ? AND p.rustc_version = ? AND p.generation = ? \
                   AND p.crate_name = j.e ->> 'crate_name' \
                   AND p.version = j.e ->> 'version' \
                   AND p.features_json = j.e ->> 'features_json' \
-                  AND p.dependency_identity IS j.e ->> 'dependency_identity' \
+                  AND p.dependency_identity = j.e ->> 'dependency_identity' \
                   AND p.unit_side = j.e ->> 'unit_side' \
                   AND p.unit_invocation = j.e ->> 'unit_invocation' \
                   AND p.unit_linked = j.e ->> 'unit_linked')",
@@ -6852,17 +6869,19 @@ pub async fn migrate(
     }
     migrate_schema(db).await?;
     // The dependency-identity rebuilds run ahead of every other step
-    // (stow#588): `queue` and `published_slice_rows` are rebuilt as
-    // shadow copies — the live tables keep their names and keep serving
-    // every read and write of the old code while bounded batches copy
-    // across repeated migrate calls — because the uniqueness/identity
-    // columns must come up through a table rebuild, not an ALTER. While
-    // either copy is in flight the remaining steps stay off and the
-    // version stamp holds at its stored value — the report's `after`
-    // answers SCHEMA_VERSION only once both shadows verified and swapped
-    // in, so the deploy gate keeps calling until the rebuild completes.
-    // Reads and writes keep working throughout against the real tables:
-    // mirror triggers follow every live write into the shadow.
+    // (stow#588): `queue` is rebuilt as a shadow copy — the live table
+    // keeps its name and keeps serving every read and write of the old
+    // code while bounded batches copy across repeated migrate calls —
+    // and `published_slice_rows` swaps in one tick (its identity column
+    // is NOT NULL, so every context-free historical row drops and the
+    // shadow's only valid content is empty). While the queue copy is
+    // in flight the remaining steps stay off and the version stamp
+    // holds at its stored value — the report's `after` answers
+    // SCHEMA_VERSION only once both shadows verified and swapped in,
+    // so the deploy gate keeps calling until the rebuild completes.
+    // Reads and writes keep working throughout against the real
+    // tables: mirror triggers follow every live queue write into the
+    // shadow.
     if !migrate_dependency_identity_rebuilds(db).await? {
         return Ok(SchemaMigrationReport {
             before,
@@ -7158,15 +7177,15 @@ async fn verify_queue_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
     Ok(())
 }
 
-/// The `published_slice_rows` half of the version-15 identity rebuild:
-/// the same shadow-copy design as [`migrate_queue_dependency_identity`]
-/// — live table untouched, `published_slice_rows_v15` shadow beside it,
-/// mirror triggers following every live write, bounded `rowid`-ordered
-/// batches — keyed on `rowid` because the table's primary key includes
-/// the column being added (and its NULLs never dedup under UNIQUE, so
-/// both the copy batch and the mirror insert guard on the nine
-/// membership columns explicitly). `dependency_identity` lands NULL on
-/// every historical row — pre-identity reports never carried context.
+/// The `published_slice_rows` half of the version-15 identity rebuild.
+/// Unlike `queue`, the slice's `dependency_identity` is NOT NULL: a
+/// context-free row satisfies no coverage clause, so historical rows —
+/// all of which predate the column — drop at the swap rather than
+/// carry NULL. The copy therefore degenerates: every row a v14 table
+/// can hold dies by design, the shadow's only valid content is empty,
+/// and the whole rebuild is one atomic tick — shadow create, empty-
+/// shadow audit, drop, rename — so no mirror triggers or cursor
+/// batches are needed (the window they guard does not exist).
 async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
     const CURSOR_KEY: &str = "migrate_slice_identity_cursor";
     let rows = table_columns(db, "published_slice_rows").await?;
@@ -7178,31 +7197,18 @@ async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, Queue
         // Same crash recovery as the queue half: `migrate_schema`
         // recreated `published_slice_rows` new-shape after the swap's
         // drop committed and the call died before the rename. The
-        // verified shadow is authoritative — retarget its rows at any
-        // straggler writes (the 9-column match, identity preserved from
-        // the live row) then absorb every live row and finish the tail.
+        // verified shadow is authoritative — absorb any straggler
+        // writes (new-code rows carry real digests, preserved by the
+        // primary-key replace) and finish the tail.
         db.query(
-            "DELETE FROM published_slice_rows_v15 WHERE EXISTS ( \
-                 SELECT 1 FROM published_slice_rows live \
-                 WHERE live.target = published_slice_rows_v15.target \
-                   AND live.rustc_version = published_slice_rows_v15.rustc_version \
-                   AND live.generation = published_slice_rows_v15.generation \
-                   AND live.crate_name = published_slice_rows_v15.crate_name \
-                   AND live.version = published_slice_rows_v15.version \
-                   AND live.features_json = published_slice_rows_v15.features_json \
-                   AND live.unit_side = published_slice_rows_v15.unit_side \
-                   AND live.unit_invocation = published_slice_rows_v15.unit_invocation \
-                   AND live.unit_linked = published_slice_rows_v15.unit_linked)",
-        )
-        .execute()
-        .await
-        .map_err(|error| format!("retarget slice shadow rows for straggler merge: {error}"))?;
-        db.query(
-            "INSERT INTO published_slice_rows_v15 \
+            "INSERT OR REPLACE INTO published_slice_rows_v15 \
+             (target, rustc_version, generation, crate_name, version, features_json, \
+              dependency_identity, unit_side, unit_invocation, unit_linked) \
              SELECT target, rustc_version, generation, crate_name, version, \
-                    features_json, unit_side, unit_invocation, unit_linked, \
-                    dependency_identity \
-             FROM published_slice_rows",
+                    features_json, dependency_identity, unit_side, \
+                    unit_invocation, unit_linked \
+             FROM published_slice_rows \
+             WHERE dependency_identity IS NOT NULL",
         )
         .execute()
         .await
@@ -7230,45 +7236,15 @@ async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, Queue
         .await
         .map_err(|error| format!("create published_slice_rows_v15 shadow: {error}"))?;
     }
-    db.query(include_str!("mirror_slice_identity_triggers.sql"))
+    // The audit before the drop: nothing may occupy the shadow — a
+    // v14 live table holds no digests to copy and no mirror or merge
+    // could have written here. A non-empty shadow is corruption.
+    verify_slice_identity_copy(db).await?;
+    db.query("DROP TABLE published_slice_rows")
         .execute()
         .await
-        .map_err(|error| format!("install slice identity mirror triggers: {error}"))?;
-    // `rowid` is the cursor over the live table's storage order.
-    let mut cursor: i64 = identity_copy_cursor(db, CURSOR_KEY)
-        .await?
-        .parse()
-        .unwrap_or(0);
-    for _ in 0..IDENTITY_COPY_BATCHES_PER_CALL {
-        let Some(bound) = db
-            .query(
-                "SELECT MAX(rowid) FROM ( \
-                     SELECT rowid FROM published_slice_rows \
-                     WHERE rowid > ? ORDER BY rowid LIMIT ?)",
-            )
-            .bind(cursor)
-            .bind(IDENTITY_COPY_BATCH_ROWS)
-            .fetch_scalar::<Option<i64>>()
-            .await
-            .map_err(|error| format!("probe slice identity copy bound: {error}"))?
-        else {
-            verify_slice_identity_copy(db).await?;
-            db.query("DROP TABLE published_slice_rows")
-                .execute()
-                .await
-                .map_err(|error| format!("drop live slice rows for identity swap: {error}"))?;
-            return finish_slice_identity_swap(db, CURSOR_KEY).await;
-        };
-        db.query(include_str!("copy_slice_dependency_identity.sql"))
-            .bind(cursor)
-            .bind(IDENTITY_COPY_BATCH_ROWS)
-            .execute()
-            .await
-            .map_err(|error| format!("copy slice rows for identity rebuild: {error}"))?;
-        set_identity_copy_cursor(db, CURSOR_KEY, &bound.to_string()).await?;
-        cursor = bound;
-    }
-    Ok(false)
+        .map_err(|error| format!("drop live slice rows for identity swap: {error}"))?;
+    finish_slice_identity_swap(db, CURSOR_KEY).await
 }
 
 /// The slice swap's mutating tail — same crash-resume contract as
@@ -7294,39 +7270,23 @@ async fn finish_slice_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<
     Ok(true)
 }
 
-/// The slice copy's verify: the shadow's nine membership columns must
-/// equal the live table's in both directions and no shadow row may
-/// carry a digest — all nine are immutable (a slice row is only ever
-/// inserted or retired), so the comparison cannot drift.
+/// The slice rebuild's audit before the live table drops: the shadow
+/// must be empty. A v14 `published_slice_rows` carries no
+/// `dependency_identity` column, so every historical row is
+/// context-free — it satisfies no coverage clause and dies at the
+/// swap rather than violate the NOT NULL shadow. Nothing else can
+/// write the shadow (no mirror triggers exist on this path — the
+/// rebuild is one atomic tick), so a non-empty shadow is corruption.
 async fn verify_slice_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
     let differs = db
-        .query(
-            "SELECT EXISTS ( \
-                 SELECT target, rustc_version, generation, crate_name, version, \
-                        features_json, unit_side, unit_invocation, unit_linked \
-                 FROM published_slice_rows \
-                 EXCEPT \
-                 SELECT target, rustc_version, generation, crate_name, version, \
-                        features_json, unit_side, unit_invocation, unit_linked \
-                 FROM published_slice_rows_v15) \
-             OR EXISTS ( \
-                 SELECT target, rustc_version, generation, crate_name, version, \
-                        features_json, unit_side, unit_invocation, unit_linked \
-                 FROM published_slice_rows_v15 \
-                 EXCEPT \
-                 SELECT target, rustc_version, generation, crate_name, version, \
-                        features_json, unit_side, unit_invocation, unit_linked \
-                 FROM published_slice_rows) \
-             OR EXISTS ( \
-                 SELECT 1 FROM published_slice_rows_v15 \
-                 WHERE dependency_identity IS NOT NULL) AS differs",
-        )
+        .query("SELECT EXISTS (SELECT 1 FROM published_slice_rows_v15) AS differs")
         .fetch_scalar::<i64>()
         .await
         .map_err(|error| format!("verify slice identity copy: {error}"))?;
     if differs != 0 {
         return Err(QueueError::Invariant(
-            "slice identity rebuild: shadow diverges from live published_slice_rows".to_owned(),
+            "slice identity rebuild: shadow holds rows a context-free live set cannot produce"
+                .to_owned(),
         ));
     }
     Ok(())
