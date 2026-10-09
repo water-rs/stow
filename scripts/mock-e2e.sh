@@ -1187,7 +1187,10 @@ echo "[mock-e2e] digest byte path: 404 miss, 400 malformed, old route gone (expe
 # just built it — so its expanded graph must return empty. `entries`
 # carries the manifest's seed features (`["default"]`);
 # `expanded_entries` carries the resolved feature set, which for
-# itoa 1.0 is empty — its `default` feature declares nothing.
+# itoa 1.0 is empty — its `default` feature declares nothing — plus
+# `dependency_subgraph`, the node's #588 dependency context: itoa is
+# a leaf, so its subgraph is `{n: []}` — the same leaf shape the CLI
+# projects from `cargo --unit-graph`.
 admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
     -H 'content-type: application/json' \
     --data "$(jq -nc \
@@ -1203,7 +1206,8 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 crate_name: $crate,
                 version: $version,
                 features: [],
-                dependencies: []
+                dependencies: [],
+                dependency_subgraph: {n: []}
             }]
         }')")"
 [ "$(jq -r 'length' <<<"$admissions")" = "0" ] \
@@ -1225,7 +1229,8 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 crate_name: "libc",
                 version: "0.2.177",
                 features: ["default"],
-                dependencies: []
+                dependencies: [],
+                dependency_subgraph: {n: []}
             }]
         }')")"
 [ "$(jq -r 'length' <<<"$admissions")" = "1" ] \
