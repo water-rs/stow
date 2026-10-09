@@ -281,11 +281,18 @@ pub fn spawn_drain(target_dir: &Path) {
     if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > DRAIN_LOG_MAX_BYTES) {
         let _ = std::fs::rename(&log, target_dir.join(format!("{DRAIN_LOG}.1")));
     }
-    let stderr = std::fs::OpenOptions::new()
+    // Keep the file: a spawn failure is invisible otherwise — the
+    // parent's `tracing::warn` lands on the build's own stderr, not in
+    // the log the drain never started (stow#588).
+    let mut log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log)
-        .map_or_else(|_| Stdio::null(), Stdio::from);
+        .ok();
+    let stderr = log_file
+        .as_ref()
+        .and_then(|file| file.try_clone().ok())
+        .map_or_else(Stdio::null, Stdio::from);
     let mut command = std::process::Command::new(&exe);
     command
         .arg("__drain-misses")
@@ -324,6 +331,9 @@ pub fn spawn_drain(target_dir: &Path) {
     }
     if let Err(error) = command.spawn() {
         tracing::warn!(error = %error, "could not spawn the miss drain");
+        if let Some(file) = log_file.as_mut() {
+            let _ = writeln!(file, "stow: could not spawn the miss drain: {error}");
+        }
     }
 }
 
@@ -464,7 +474,16 @@ pub fn drain_finished_builds(out_dir: &Path) {
 /// only them.
 pub async fn drain(target_dir: &Path) -> stow_types::error::Result<()> {
     let config = StowConfig::load_local()?;
-    for journal in finished_journals(target_dir) {
+    let journals = finished_journals(target_dir);
+    // The drain runs detached with stderr in `stow-drain.log`: one line
+    // naming how many journals it found is what separates "the drain
+    // never spawned" from "every keep-path was silent" in that file.
+    tracing::info!(
+        target_dir = %target_dir.display(),
+        journals = journals.len(),
+        "miss drain starting"
+    );
+    for journal in journals {
         drain_journal(&config, &journal).await;
     }
     Ok(())
@@ -882,7 +901,10 @@ async fn drain_group(
     }
     let units: Vec<ObservedUnit> = group.iter().map(|entry| entry.unit.clone()).collect();
     let posted = match &expanded {
-        Some(graph) => crate::cargo_cmd::admit_observed_misses(
+        // The one keep-path that must name its cause: every other way
+        // entries stay journaled already warns, and a silent failure
+        // leaves the drain's own log saying nothing at all (stow#588).
+        Some(graph) => match crate::cargo_cmd::admit_observed_misses(
             config,
             consumer_target,
             rustc_version,
@@ -892,7 +914,17 @@ async fn drain_group(
             graph,
         )
         .await
-        .is_ok(),
+        {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    journal = %journal.display(),
+                    "could not admit the miss journal's units; keeping them"
+                );
+                false
+            }
+        },
         None => false,
     };
     if posted {

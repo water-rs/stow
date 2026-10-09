@@ -901,6 +901,10 @@ pub async fn build(
     task: &BuildTaskPayload,
     output_dir: &Path,
 ) -> stow_types::error::Result<BuiltWorkspace> {
+    // Resolve and verify the run toolchain once per task — a name whose
+    // rustc reports a different release than the pinned `rustc_version`
+    // is refused here, before any phase runs cargo.
+    verified_run_toolchain(task)?;
     let mirror_key = workspace_mirror::MirrorTaskKey {
         target: task.target.as_str().to_owned(),
         rustc_version: task.rustc_version.as_str().to_owned(),
@@ -1009,8 +1013,47 @@ pub async fn build(
 /// production's no-export env still resolves (`rustup toolchain
 /// install 1.99.0` answers to `1.99.0`). It never asks `rustup show`:
 /// a runner's *default* toolchain is not the task's.
-pub(crate) fn run_toolchain(task: &BuildTaskPayload) -> String {
+pub fn run_toolchain(task: &BuildTaskPayload) -> String {
     std::env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| task.rustc_version.as_str().to_owned())
+}
+
+/// `run_toolchain`'s name, verified once per task against the release
+/// its `rustc` actually reports — the same check `Resolver::setup`
+/// makes. The ambient name is still just a name: a misconfigured
+/// workflow step (or a runner whose `stable` moved past the dispatch's
+/// pin) would otherwise compile the whole task under the wrong release
+/// and only surface at `validate`, which rejects the scanned artifacts
+/// after the build already burned. This refuses before any cargo
+/// invocation, naming the toolchain, its reported release, and the
+/// task's `rustc_version`. `RUSTUP_AUTO_INSTALL=0` keeps a missing name
+/// a refusal instead of a network install.
+pub fn verified_run_toolchain(task: &BuildTaskPayload) -> stow_types::error::Result<String> {
+    let toolchain = run_toolchain(task);
+    let output = std::process::Command::new("rustc")
+        .arg("-vV")
+        .env("RUSTUP_TOOLCHAIN", &toolchain)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .map_err(|error| stow_types::stow_error!("probe run toolchain {toolchain}: {error}"))?;
+    if !output.status.success() {
+        return Err(stow_types::stow_error!(
+            "run toolchain {toolchain}: rustc -vV failed with {}",
+            output.status
+        ));
+    }
+    let verbose = String::from_utf8_lossy(&output.stdout);
+    let release = verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .unwrap_or("<unparsable rustc -vV output>");
+    if release != task.rustc_version.as_str() {
+        return Err(stow_types::stow_error!(
+            "run toolchain {toolchain} reports rustc {release}, \
+             not the task's pinned {}",
+            task.rustc_version.as_str()
+        ));
+    }
+    Ok(toolchain)
 }
 
 /// Phase 0 runs on the host: `cargo fetch` resolves the dependency graph
@@ -2273,6 +2316,58 @@ mod tests {
         }
     }
 
+    /// The release the ambient run toolchain's `rustc` reports — parsed
+    /// from the same `rustc -vV` probe `verified_run_toolchain` runs.
+    fn active_release() -> WireRustcVersion {
+        let output = std::process::Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .expect("run rustc -vV");
+        let verbose = String::from_utf8_lossy(&output.stdout);
+        let release = verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("release: "))
+            .expect("rustc -vV reports a release");
+        WireRustcVersion::parse(release).expect("active release parses")
+    }
+
+    /// A run toolchain whose `rustc -vV` release differs from the task's
+    /// pinned `rustc_version` is refused by the once-per-task check —
+    /// which both `build` and `closure::resolve` run before their first
+    /// cargo invocation — naming the toolchain, its release, and the
+    /// pinned version.
+    #[test]
+    fn a_mismatched_run_toolchain_is_refused_before_any_cargo() {
+        let mut task = task_with_features(&[]);
+        task.rustc_version = WireRustcVersion::parse("0.0.0").expect("mismatched version parses");
+        let error = super::verified_run_toolchain(&task)
+            .expect_err("a toolchain reporting a different release must be refused");
+        let message = format!("{error}");
+        assert!(
+            message.contains(&super::run_toolchain(&task)),
+            "the refusal must name the run toolchain: {message}"
+        );
+        assert!(
+            message.contains("0.0.0"),
+            "the refusal must name the pinned version: {message}"
+        );
+        assert!(
+            message.contains(&format!("rustc {}", active_release().as_str())),
+            "the refusal must name the reported release: {message}"
+        );
+    }
+
+    /// The same check passes when the toolchain's release equals the
+    /// task's pin, returning the name the phases put on `RUSTUP_TOOLCHAIN`.
+    #[test]
+    fn a_matching_run_toolchain_verifies_and_returns_its_name() {
+        let mut task = task_with_features(&[]);
+        task.rustc_version = active_release();
+        let toolchain = super::verified_run_toolchain(&task)
+            .expect("a toolchain reporting the pinned release verifies");
+        assert_eq!(toolchain, super::run_toolchain(&task));
+    }
+
     /// A subgraph carrying only the task's direct deps as leaves —
     /// enough to exercise the wrapper manifest's pin section/alias
     /// rules; the build-stage checks a full subgraph against the
@@ -2789,11 +2884,12 @@ checksum = "33"
                 capture_dir,
                 bundled_lockfile: None,
             };
+            let exe = std::env::consts::EXE_SUFFIX;
             let wrappers = stow_shim::WrapperShimPaths {
-                rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),
-                cc_launcher: tools_dir.path().join("stow-cc-launcher"),
-                cc_compiler: tools_dir.path().join("stow-cc"),
-                cxx_compiler: tools_dir.path().join("stow-cxx"),
+                rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
+                cc_launcher: tools_dir.path().join(format!("stow-cc-launcher{exe}")),
+                cc_compiler: tools_dir.path().join(format!("stow-cc{exe}")),
+                cxx_compiler: tools_dir.path().join(format!("stow-cxx{exe}")),
             };
             let wrapper = std::env::current_exe().expect("current exe");
             let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
@@ -2872,11 +2968,12 @@ checksum = "33"
                 capture_dir,
                 bundled_lockfile: None,
             };
+            let exe = std::env::consts::EXE_SUFFIX;
             let wrappers = stow_shim::WrapperShimPaths {
-                rustc_wrapper: tools_dir.path().join("stow-rustc-wrapper"),
-                cc_launcher: tools_dir.path().join("stow-cc-launcher"),
-                cc_compiler: tools_dir.path().join("stow-cc"),
-                cxx_compiler: tools_dir.path().join("stow-cxx"),
+                rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
+                cc_launcher: tools_dir.path().join(format!("stow-cc-launcher{exe}")),
+                cc_compiler: tools_dir.path().join(format!("stow-cc{exe}")),
+                cxx_compiler: tools_dir.path().join(format!("stow-cxx{exe}")),
             };
             let wrapper = std::env::current_exe().expect("current exe");
 

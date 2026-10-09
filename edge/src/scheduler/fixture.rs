@@ -597,7 +597,12 @@ pub async fn seed_edges_chunk(
     let pending_end = shape.pending_end();
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
-    let completed_dep = shape.pending_end() + 1;
+    // `completed_row(2)`: the pinned leaf must stay clear of the purge
+    // drive's `completed_row(0)`/`completed_row(1)` deletes — purging a
+    // row walks its dependents, and a leaf holding the claimable set's
+    // ~80 inbound edges turns `POST /tasks/purge` into a hub walk no
+    // production purge carries (stow#588).
+    let completed_dep = shape.pending_end() + 3;
     let eligible_start = human_end;
     let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
     let thirds_where =

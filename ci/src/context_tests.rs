@@ -42,6 +42,24 @@ fn toml_document(value: &Value) -> String {
 /// sparse-index line — the same shape `resolver/tests/offline.rs`
 /// publishes.
 fn publish(reg: &Path, fixture: &Fixture) -> String {
+    publish_targeted(reg, fixture, &[])
+}
+
+/// `publish` plus `[target.'<platform>'.dependencies]` entries —
+/// `(platform, name, req, features)`: the manifest gains one
+/// `[target.'platform'.dependencies]` table per platform and the index
+/// line carries `"target": platform` — the shape cargo's unit graph
+/// filters per target and the resolver must match (stow#588).
+fn publish_targeted(
+    reg: &Path,
+    fixture: &Fixture,
+    target_deps: &[(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+    )],
+) -> String {
     let features: serde_json::Map<String, Value> = fixture
         .features
         .iter()
@@ -66,6 +84,10 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
                 .map(dep_spec)
                 .collect::<serde_json::Map<_, _>>()
         );
+    }
+    for (platform, name, req, feats) in target_deps {
+        manifest["target"][platform]["dependencies"][name] =
+            json!({ "version": req, "features": feats });
     }
     let mut lib = String::new();
     if fixture.proc_macro {
@@ -92,6 +114,17 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     let deps = dep_line(&fixture.deps, "normal")
         .into_iter()
         .chain(dep_line(&fixture.build_deps, "build"))
+        .chain(target_deps.iter().map(|(platform, name, req, feats)| {
+            json!({
+                "name": name,
+                "req": format!("^{req}"),
+                "features": feats,
+                "optional": false,
+                "default_features": true,
+                "target": platform,
+                "kind": "normal",
+            })
+        }))
         .collect::<Vec<_>>();
     let mut line = serde_json::to_string(&json!({
         "name": fixture.name,
@@ -272,6 +305,21 @@ fn resolver_at(cargo_home: &Path) -> stow_resolver::Resolver {
     .expect("resolver")
 }
 
+/// `context_tests`' own cargo target dir. These tests run the binaries
+/// they build, and a `cargo build` that relinks the shared
+/// `target/debug` copies unlinks the path out from under a test binary
+/// executing it concurrently — under nextest that left a running
+/// `stow-cli` whose `current_exe` read `stow-cli (deleted)`, and its
+/// drain re-exec failed ENOENT (stow#588). A private
+/// `CARGO_TARGET_DIR` still gets sccache and the warm registry but
+/// never touches `target/debug`.
+fn context_target_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate dir has a parent")
+        .join("target/context-tests")
+}
+
 fn shim_binary() -> PathBuf {
     static SHIM: OnceLock<PathBuf> = OnceLock::new();
     SHIM.get_or_init(|| {
@@ -279,10 +327,12 @@ fn shim_binary() -> PathBuf {
             .parent()
             .expect("crate dir has a parent")
             .to_path_buf();
+        let target_dir = context_target_dir();
         let mut build = std::process::Command::new("cargo");
         build
             .args(["build", "-p", "stow-resolver", "--bin", "stow-rustc-shim"])
-            .current_dir(&workspace);
+            .current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", &target_dir);
         if let Some(home) = original_cargo_home() {
             build.env("CARGO_HOME", home);
         } else {
@@ -290,8 +340,8 @@ fn shim_binary() -> PathBuf {
         }
         let status = build.status().expect("build the resolve shim");
         assert!(status.success(), "cargo build stow-rustc-shim failed");
-        workspace.join(format!(
-            "target/debug/stow-rustc-shim{}",
+        target_dir.join(format!(
+            "debug/stow-rustc-shim{}",
             std::env::consts::EXE_SUFFIX
         ))
     })
@@ -310,10 +360,12 @@ fn build_binaries() -> (PathBuf, PathBuf) {
             .parent()
             .expect("crate dir has a parent")
             .to_path_buf();
+        let target_dir = context_target_dir();
         let mut build = std::process::Command::new("cargo");
         build
             .args(["build", "-p", "stow-build", "-p", "stow-cli"])
-            .current_dir(&workspace);
+            .current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", &target_dir);
         if let Some(home) = original_cargo_home() {
             build.env("CARGO_HOME", home);
         } else {
@@ -322,11 +374,54 @@ fn build_binaries() -> (PathBuf, PathBuf) {
         let status = build.status().expect("build stow-build and stow-cli");
         assert!(status.success(), "cargo build stow-build failed");
         (
-            workspace.join("target/debug/stow-cli"),
-            workspace.join("target/debug/stow-build"),
+            target_dir.join(format!("debug/stow-cli{}", std::env::consts::EXE_SUFFIX)),
+            target_dir.join(format!("debug/stow-build{}", std::env::consts::EXE_SUFFIX)),
         )
     })
     .clone()
+}
+
+/// The harness must never rebuild or replace a binary another test may
+/// be executing: every binary `context_tests` builds lands in its own
+/// cargo target dir, so the shared `target/debug` set nextest runs is
+/// untouched (stow#588 — a relink mid-suite unlinked `stow-cli` out
+/// from under a concurrent test and its drain re-exec failed ENOENT).
+#[test]
+fn context_builds_leave_the_shared_debug_binaries_untouched() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate dir has a parent")
+        .to_path_buf();
+    let exe = std::env::consts::EXE_SUFFIX;
+    let shared: Vec<(PathBuf, std::time::SystemTime, u64)> =
+        ["stow-cli", "stow-build", "stow-rustc-shim"]
+            .iter()
+            .filter_map(|name| {
+                let path = workspace.join(format!("target/debug/{name}{exe}"));
+                std::fs::metadata(&path)
+                    .ok()
+                    .map(|meta| (path, meta.modified().expect("mtime"), meta.len()))
+            })
+            .collect();
+
+    let (runtime, capture) = build_binaries();
+    let shim = shim_binary();
+    for built in [&runtime, &capture, &shim] {
+        assert!(
+            built.starts_with(context_target_dir().join("debug")),
+            "context_tests binaries come from its own target dir"
+        );
+    }
+
+    for (path, mtime, len) in &shared {
+        let meta = std::fs::metadata(path).expect("shared binary still present");
+        assert_eq!(
+            (meta.modified().expect("mtime"), meta.len()),
+            (*mtime, *len),
+            "context_tests' builds replaced {}",
+            path.display()
+        );
+    }
 }
 
 /// A consumer project manifest: `deps` under `[dependencies]`,
@@ -1096,4 +1191,136 @@ async fn capture_build_dep_keys(
         .find(|record| record.crate_name == "bd")
         .expect("bd rustc invocation recorded");
     (build_script.compile_key.clone(), bd.c_metadata.clone())
+}
+
+/// `parent`'s target-side child crate names and node index in one task
+/// graph — the comparison the resolver side and the `cargo
+/// --unit-graph` side each mint for one target.
+fn target_side_children(graph: &stow_types::task_graph::ResolvedTaskGraph) -> (Vec<String>, usize) {
+    let nodes = graph.nodes();
+    let parent = nodes
+        .iter()
+        .position(|node| node.identity.crate_name.as_str() == "parent" && !node.identity.host_side)
+        .expect("graph mints target-side parent");
+    let mut names: Vec<String> = nodes[parent]
+        .dependencies
+        .iter()
+        .map(|&child| nodes[child].identity.crate_name.to_string())
+        .collect();
+    names.sort_unstable();
+    (names, parent)
+}
+
+/// Item 1's proof, both directions: `parent`'s
+/// `[target.'cfg(windows)'.dependencies]` `winleaf` is a child only
+/// when the requested target satisfies the gate — cargo's unit graph
+/// omits it on the host triple and keeps it on
+/// `x86_64-pc-windows-msvc`, and the resolver's projection must mint
+/// the same children and the same task id as `cargo --unit-graph` in
+/// both (stow#588 — the pre-#588 port let `ignore_inactive_targets`
+/// skip the platform gate, so a V1 resolve carried winapi-util's
+/// windows-sys dep into a Linux task's children).
+#[test]
+fn platform_gated_dependencies_match_the_cargo_unit_graph() {
+    let _env = env_guard();
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "winleaf",
+            version: "1.0.0",
+            deps: vec![],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: false,
+        },
+    );
+    publish_targeted(
+        &reg,
+        &Fixture {
+            name: "parent",
+            version: "1.0.0",
+            deps: vec![],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: false,
+        },
+        &[("cfg(windows)", "winleaf", "1", &[])],
+    );
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "parent": "1" }),
+        &json!({}),
+    );
+    let host = host_triple();
+    let windows = "x86_64-pc-windows-msvc";
+    // `resolver_at` builds `stow-rustc-shim` — before CARGO_HOME points
+    // at the fixture registry, which cannot serve its real crates.
+    let resolver = resolver_at(cargo_home.path());
+    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
+    let rustc = pinned_rustc_version();
+    let outputs = resolver
+        .resolve(
+            &manifest,
+            &stow_resolver::ResolveOptions::default(),
+            &[host.clone(), windows.to_owned()],
+        )
+        .expect("resolve consumer project");
+    smol::block_on(async {
+        // `cargo fetch` without --target fetches every platform's deps,
+        // which is what the --unit-graph spellings below read.
+        let status = async_process::Command::new("cargo")
+            .args(["fetch", "--manifest-path"])
+            .arg(&manifest)
+            .env("RUSTUP_TOOLCHAIN", active_toolchain())
+            .status()
+            .await
+            .expect("cargo fetch");
+        assert!(status.success(), "cargo fetch on the consumer failed");
+        for (target, leaf_expected) in [(host.as_str(), false), (windows, true)] {
+            let (_, out) = outputs
+                .iter()
+                .find(|(t, _)| t == target)
+                .unwrap_or_else(|| panic!("resolver emits {target}"));
+            let resolver_graph = stow_resolver::resolved_task_graph(&out.units, rustc)
+                .unwrap_or_else(|error| panic!("{target} resolver graph: {error}"));
+            let graph = stow_cli::resolve_exact_dependency_graph(
+                &manifest,
+                "check",
+                &[
+                    std::ffi::OsString::from("--target"),
+                    std::ffi::OsString::from(target),
+                ],
+                Some(target),
+                manifest.parent().unwrap(),
+                host.as_str(),
+                rustc,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{target} cargo --unit-graph: {error}"));
+            let units = graph
+                .task_units(Some(target), &host)
+                .unwrap_or_else(|error| panic!("{target} unit graph converts: {error}"));
+            let cargo_graph = stow_types::unit_graph::resolved_task_graph(&units, rustc)
+                .unwrap_or_else(|error| panic!("{target} unit graph resolves: {error}"));
+
+            let (resolver_children, resolver_parent) = target_side_children(&resolver_graph);
+            let (cargo_children, cargo_parent) = target_side_children(&cargo_graph);
+            assert_eq!(
+                leaf_expected,
+                resolver_children.iter().any(|name| name == "winleaf"),
+                "{target}: resolver children {resolver_children:?}"
+            );
+            assert_eq!(
+                resolver_children, cargo_children,
+                "{target}: resolver projects a different child set than cargo --unit-graph"
+            );
+            assert_eq!(
+                resolver_graph.task_id(resolver_parent),
+                cargo_graph.task_id(cargo_parent),
+                "{target}: resolver mints a different task id than cargo --unit-graph"
+            );
+        }
+    });
 }
