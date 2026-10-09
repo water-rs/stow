@@ -1432,10 +1432,6 @@ mod tests {
         ))
     }
 
-    /// The `.prev` rule is exact: generation 1 is the slice's first
-    /// publish — the only state with no sidecar — so the report takes
-    /// the explicit full path; a missing sidecar at any later
-    /// generation is broken wiring and errors naming the file.
     /// An archive row registered before stow#588 carries no dependency
     /// digest: it satisfies no coverage clause, so it is not slice
     /// membership — `semantic_rows` filters it, and a delta between two
@@ -1495,6 +1491,10 @@ mod tests {
         assert_eq!(added[0].dependency_identity, new_digest);
     }
 
+    /// The `.prev` rule is exact: generation 1 is the slice's first
+    /// publish — the only state with no sidecar — so the report takes
+    /// the explicit full path; a missing sidecar at any later
+    /// generation is broken wiring and errors naming the file.
     #[test]
     fn a_first_publish_without_a_prev_sends_the_full_report() {
         let file = no_sidecar_file();
