@@ -42,6 +42,24 @@ fn toml_document(value: &Value) -> String {
 /// sparse-index line — the same shape `resolver/tests/offline.rs`
 /// publishes.
 fn publish(reg: &Path, fixture: &Fixture) -> String {
+    publish_targeted(reg, fixture, &[])
+}
+
+/// `publish` plus `[target.'<platform>'.dependencies]` entries —
+/// `(platform, name, req, features)`: the manifest gains one
+/// `[target.'platform'.dependencies]` table per platform and the index
+/// line carries `"target": platform` — the shape cargo's unit graph
+/// filters per target and the resolver must match (stow#588).
+fn publish_targeted(
+    reg: &Path,
+    fixture: &Fixture,
+    target_deps: &[(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+    )],
+) -> String {
     let features: serde_json::Map<String, Value> = fixture
         .features
         .iter()
@@ -66,6 +84,10 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
                 .map(dep_spec)
                 .collect::<serde_json::Map<_, _>>()
         );
+    }
+    for (platform, name, req, feats) in target_deps {
+        manifest["target"][platform]["dependencies"][name] =
+            json!({ "version": req, "features": feats });
     }
     let mut lib = String::new();
     if fixture.proc_macro {
@@ -92,6 +114,17 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     let deps = dep_line(&fixture.deps, "normal")
         .into_iter()
         .chain(dep_line(&fixture.build_deps, "build"))
+        .chain(target_deps.iter().map(|(platform, name, req, feats)| {
+            json!({
+                "name": name,
+                "req": format!("^{req}"),
+                "features": feats,
+                "optional": false,
+                "default_features": true,
+                "target": platform,
+                "kind": "normal",
+            })
+        }))
         .collect::<Vec<_>>();
     let mut line = serde_json::to_string(&json!({
         "name": fixture.name,
@@ -1102,4 +1135,136 @@ async fn capture_build_dep_keys(
         .find(|record| record.crate_name == "bd")
         .expect("bd rustc invocation recorded");
     (build_script.compile_key.clone(), bd.c_metadata.clone())
+}
+
+/// `parent`'s target-side child crate names and node index in one task
+/// graph — the comparison the resolver side and the `cargo
+/// --unit-graph` side each mint for one target.
+fn target_side_children(graph: &stow_types::task_graph::ResolvedTaskGraph) -> (Vec<String>, usize) {
+    let nodes = graph.nodes();
+    let parent = nodes
+        .iter()
+        .position(|node| node.identity.crate_name.as_str() == "parent" && !node.identity.host_side)
+        .expect("graph mints target-side parent");
+    let mut names: Vec<String> = nodes[parent]
+        .dependencies
+        .iter()
+        .map(|&child| nodes[child].identity.crate_name.to_string())
+        .collect();
+    names.sort_unstable();
+    (names, parent)
+}
+
+/// Item 1's proof, both directions: `parent`'s
+/// `[target.'cfg(windows)'.dependencies]` `winleaf` is a child only
+/// when the requested target satisfies the gate — cargo's unit graph
+/// omits it on the host triple and keeps it on
+/// `x86_64-pc-windows-msvc`, and the resolver's projection must mint
+/// the same children and the same task id as `cargo --unit-graph` in
+/// both (stow#588 — the pre-#588 port let `ignore_inactive_targets`
+/// skip the platform gate, so a V1 resolve carried winapi-util's
+/// windows-sys dep into a Linux task's children).
+#[test]
+fn platform_gated_dependencies_match_the_cargo_unit_graph() {
+    let _env = env_guard();
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "winleaf",
+            version: "1.0.0",
+            deps: vec![],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: false,
+        },
+    );
+    publish_targeted(
+        &reg,
+        &Fixture {
+            name: "parent",
+            version: "1.0.0",
+            deps: vec![],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: false,
+        },
+        &[("cfg(windows)", "winleaf", "1", &[])],
+    );
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "parent": "1" }),
+        &json!({}),
+    );
+    let host = host_triple();
+    let windows = "x86_64-pc-windows-msvc";
+    // `resolver_at` builds `stow-rustc-shim` — before CARGO_HOME points
+    // at the fixture registry, which cannot serve its real crates.
+    let resolver = resolver_at(cargo_home.path());
+    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
+    let rustc = pinned_rustc_version();
+    let outputs = resolver
+        .resolve(
+            &manifest,
+            &stow_resolver::ResolveOptions::default(),
+            &[host.clone(), windows.to_owned()],
+        )
+        .expect("resolve consumer project");
+    smol::block_on(async {
+        // `cargo fetch` without --target fetches every platform's deps,
+        // which is what the --unit-graph spellings below read.
+        let status = async_process::Command::new("cargo")
+            .args(["fetch", "--manifest-path"])
+            .arg(&manifest)
+            .env("RUSTUP_TOOLCHAIN", active_toolchain())
+            .status()
+            .await
+            .expect("cargo fetch");
+        assert!(status.success(), "cargo fetch on the consumer failed");
+        for (target, leaf_expected) in [(host.as_str(), false), (windows, true)] {
+            let (_, out) = outputs
+                .iter()
+                .find(|(t, _)| t == target)
+                .unwrap_or_else(|| panic!("resolver emits {target}"));
+            let resolver_graph = stow_resolver::resolved_task_graph(&out.units, rustc)
+                .unwrap_or_else(|error| panic!("{target} resolver graph: {error}"));
+            let graph = stow_cli::resolve_exact_dependency_graph(
+                &manifest,
+                "check",
+                &[
+                    std::ffi::OsString::from("--target"),
+                    std::ffi::OsString::from(target),
+                ],
+                Some(target),
+                manifest.parent().unwrap(),
+                host.as_str(),
+                rustc,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{target} cargo --unit-graph: {error}"));
+            let units = graph
+                .task_units(Some(target), &host)
+                .unwrap_or_else(|error| panic!("{target} unit graph converts: {error}"));
+            let cargo_graph = stow_types::unit_graph::resolved_task_graph(&units, rustc)
+                .unwrap_or_else(|error| panic!("{target} unit graph resolves: {error}"));
+
+            let (resolver_children, resolver_parent) = target_side_children(&resolver_graph);
+            let (cargo_children, cargo_parent) = target_side_children(&cargo_graph);
+            assert_eq!(
+                leaf_expected,
+                resolver_children.iter().any(|name| name == "winleaf"),
+                "{target}: resolver children {resolver_children:?}"
+            );
+            assert_eq!(
+                resolver_children, cargo_children,
+                "{target}: resolver projects a different child set than cargo --unit-graph"
+            );
+            assert_eq!(
+                resolver_graph.task_id(resolver_parent),
+                cargo_graph.task_id(cargo_parent),
+                "{target}: resolver mints a different task id than cargo --unit-graph"
+            );
+        }
+    });
 }

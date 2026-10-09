@@ -208,8 +208,10 @@ fn artifact_features_for(
 /// `FeaturesFor` sides it compiles under.
 type DepEdgeList<'a> = Vec<(PackageId, Vec<(&'a Dependency, FeaturesFor)>)>;
 
-/// The dependencies of one `(package, side)` node — verbatim from
-/// `FeatureResolver::deps`, filtering out inactive targets.
+/// The dependencies of one `(package, side)` node — `FeatureResolver::deps`
+/// verbatim except the platform gate, which `unit_dependencies` applies
+/// unconditionally (the `opts.ignore_inactive_targets` arm upstream is
+/// the feature resolver's own).
 ///
 /// `track_for_host` is `decouple_host_deps || ignore_inactive_targets` of
 /// the same [`EdgeOpts`].
@@ -231,8 +233,17 @@ fn deps<'a>(
         let mut deps: Vec<&'a Dependency> = deps
             .iter()
             .filter(|dep| {
+                // The compile-time edge set is `unit_dependencies`'s,
+                // not the feature resolver's: upstream it evaluates
+                // `dep_platform_activated` per unit kind
+                // unconditionally, while `FeatureResolver::deps` gates
+                // the same check on `ignore_inactive_targets` — a flag
+                // a V1 workspace or a ForceAllTargets::Yes lane never
+                // sets. Edges must spell what cargo builds, so the
+                // platform gate applies always (stow#588 — a
+                // cfg(windows) dep of a registry crate reached a Linux
+                // task's children through the unfiltered lane).
                 if dep.platform().is_some()
-                    && opts.ignore_inactive_targets
                     && !platform_activated(dep, fk, target_data, requested_targets)
                 {
                     return false;
