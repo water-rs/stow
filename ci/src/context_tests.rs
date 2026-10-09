@@ -305,6 +305,21 @@ fn resolver_at(cargo_home: &Path) -> stow_resolver::Resolver {
     .expect("resolver")
 }
 
+/// `context_tests`' own cargo target dir. These tests run the binaries
+/// they build, and a `cargo build` that relinks the shared
+/// `target/debug` copies unlinks the path out from under a test binary
+/// executing it concurrently — under nextest that left a running
+/// `stow-cli` whose `current_exe` read `stow-cli (deleted)`, and its
+/// drain re-exec failed ENOENT (stow#588). A private
+/// `CARGO_TARGET_DIR` still gets sccache and the warm registry but
+/// never touches `target/debug`.
+fn context_target_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate dir has a parent")
+        .join("target/context-tests")
+}
+
 fn shim_binary() -> PathBuf {
     static SHIM: OnceLock<PathBuf> = OnceLock::new();
     SHIM.get_or_init(|| {
@@ -312,10 +327,12 @@ fn shim_binary() -> PathBuf {
             .parent()
             .expect("crate dir has a parent")
             .to_path_buf();
+        let target_dir = context_target_dir();
         let mut build = std::process::Command::new("cargo");
         build
             .args(["build", "-p", "stow-resolver", "--bin", "stow-rustc-shim"])
-            .current_dir(&workspace);
+            .current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", &target_dir);
         if let Some(home) = original_cargo_home() {
             build.env("CARGO_HOME", home);
         } else {
@@ -323,8 +340,8 @@ fn shim_binary() -> PathBuf {
         }
         let status = build.status().expect("build the resolve shim");
         assert!(status.success(), "cargo build stow-rustc-shim failed");
-        workspace.join(format!(
-            "target/debug/stow-rustc-shim{}",
+        target_dir.join(format!(
+            "debug/stow-rustc-shim{}",
             std::env::consts::EXE_SUFFIX
         ))
     })
@@ -343,10 +360,12 @@ fn build_binaries() -> (PathBuf, PathBuf) {
             .parent()
             .expect("crate dir has a parent")
             .to_path_buf();
+        let target_dir = context_target_dir();
         let mut build = std::process::Command::new("cargo");
         build
             .args(["build", "-p", "stow-build", "-p", "stow-cli"])
-            .current_dir(&workspace);
+            .current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", &target_dir);
         if let Some(home) = original_cargo_home() {
             build.env("CARGO_HOME", home);
         } else {
@@ -355,17 +374,54 @@ fn build_binaries() -> (PathBuf, PathBuf) {
         let status = build.status().expect("build stow-build and stow-cli");
         assert!(status.success(), "cargo build stow-build failed");
         (
-            workspace.join(format!(
-                "target/debug/stow-cli{}",
-                std::env::consts::EXE_SUFFIX
-            )),
-            workspace.join(format!(
-                "target/debug/stow-build{}",
-                std::env::consts::EXE_SUFFIX
-            )),
+            target_dir.join(format!("debug/stow-cli{}", std::env::consts::EXE_SUFFIX)),
+            target_dir.join(format!("debug/stow-build{}", std::env::consts::EXE_SUFFIX)),
         )
     })
     .clone()
+}
+
+/// The harness must never rebuild or replace a binary another test may
+/// be executing: every binary `context_tests` builds lands in its own
+/// cargo target dir, so the shared `target/debug` set nextest runs is
+/// untouched (stow#588 — a relink mid-suite unlinked `stow-cli` out
+/// from under a concurrent test and its drain re-exec failed ENOENT).
+#[test]
+fn context_builds_leave_the_shared_debug_binaries_untouched() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate dir has a parent")
+        .to_path_buf();
+    let exe = std::env::consts::EXE_SUFFIX;
+    let shared: Vec<(PathBuf, std::time::SystemTime, u64)> =
+        ["stow-cli", "stow-build", "stow-rustc-shim"]
+            .iter()
+            .filter_map(|name| {
+                let path = workspace.join(format!("target/debug/{name}{exe}"));
+                std::fs::metadata(&path)
+                    .ok()
+                    .map(|meta| (path, meta.modified().expect("mtime"), meta.len()))
+            })
+            .collect();
+
+    let (runtime, capture) = build_binaries();
+    let shim = shim_binary();
+    for built in [&runtime, &capture, &shim] {
+        assert!(
+            built.starts_with(context_target_dir().join("debug")),
+            "context_tests binaries come from its own target dir"
+        );
+    }
+
+    for (path, mtime, len) in &shared {
+        let meta = std::fs::metadata(path).expect("shared binary still present");
+        assert_eq!(
+            (meta.modified().expect("mtime"), meta.len()),
+            (*mtime, *len),
+            "context_tests' builds replaced {}",
+            path.display()
+        );
+    }
 }
 
 /// A consumer project manifest: `deps` under `[dependencies]`,
