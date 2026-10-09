@@ -777,7 +777,8 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
             &[],
             None,
             manifest.parent().unwrap(),
-            rustc.as_str(),
+            host.as_str(),
+            rustc,
         )
         .await
         .expect("native unit graph");
@@ -795,7 +796,8 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
             ],
             Some(host.as_str()),
             manifest.parent().unwrap(),
-            rustc.as_str(),
+            host.as_str(),
+            rustc,
         )
         .await
         .expect("explicit-target unit graph");

@@ -1295,6 +1295,7 @@ mod tests {
                         version: libm_key.version.clone(),
                         host_side: false,
                     }],
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
@@ -1302,6 +1303,7 @@ mod tests {
                     features: Vec::new(),
                     host_side: false,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
             ],
         )
@@ -1621,6 +1623,7 @@ mod tests {
                     version: dep_b.version.clone(),
                     host_side: false,
                 }],
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
@@ -1628,6 +1631,7 @@ mod tests {
                 features: Vec::new(),
                 host_side: false,
                 dependencies: Vec::new(),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             },
             ResolvedDependencyGraphEntry {
                 crate_name: missing.crate_name.clone(),
@@ -1635,6 +1639,7 @@ mod tests {
                 features: Vec::new(),
                 host_side: false,
                 dependencies: Vec::new(),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             },
         ];
         let analysis =
@@ -1808,6 +1813,7 @@ mod tests {
                     version: dep_b.version.clone(),
                     host_side: false,
                 }],
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
@@ -1815,6 +1821,7 @@ mod tests {
                 features: Vec::new(),
                 host_side: false,
                 dependencies: Vec::new(),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             },
         ];
         let host = Some(GlibcVersion {

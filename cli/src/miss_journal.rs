@@ -50,6 +50,13 @@ struct JournalEntry {
     /// target ones (stow#367).
     #[serde(default)]
     consumer_spelled_target: bool,
+    /// The `lockfile_graph_cache` key naming the build's persisted
+    /// expanded graph — the drain mints each miss's dependency subgraph
+    /// from its unit graph (stow#588). Empty on wrapper-journaled
+    /// lines, whose builds carry no expanded graph — their units
+    /// cannot mint a real subgraph and stay journaled until one can.
+    #[serde(default)]
+    expanded_cache_key: String,
     /// The compile observation itself.
     unit: ObservedUnit,
 }
@@ -354,6 +361,10 @@ pub fn record_observation(
         rustc_version: build.rustc_version.clone(),
         build_host: build_host.to_owned(),
         consumer_spelled_target: unit.explicit_target.is_some(),
+        // The rustc wrapper has no project context — it cannot name
+        // the build's expanded graph; the build's context sidecar does
+        // (stow#588).
+        expanded_cache_key: String::new(),
         unit,
     };
     let journal = journal_path(&target_dir, &cargo_build());
@@ -383,6 +394,7 @@ pub fn journal_supervised(
     observations: &[ObservedUnit],
     target_dir: &Path,
     consumer_spelled_target: bool,
+    expanded_cache_key: &str,
 ) {
     if observations.is_empty() {
         return;
@@ -402,6 +414,7 @@ pub fn journal_supervised(
             rustc_version: rustc_version.to_owned(),
             build_host: build_host.clone(),
             consumer_spelled_target,
+            expanded_cache_key: expanded_cache_key.to_owned(),
             unit: unit.clone(),
         })
         .collect();
@@ -516,36 +529,209 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
     let consumer_spelled_target = entries
         .iter()
         .any(|entry| entry.consumer_spelled_target || entry.unit.explicit_target.is_some());
-    let mut groups: BTreeMap<String, Vec<ObservedUnit>> = BTreeMap::new();
+    // A standalone build's context sidecar names the consumer manifest
+    // the drain re-derives its unit graph from (stow#588).
+    let context_manifest = context_manifest(&work);
+    let mut groups: BTreeMap<DrainGroupKey, Vec<JournalEntry>> = BTreeMap::new();
     for entry in entries {
         groups
-            .entry(entry.rustc_version)
+            .entry(DrainGroupKey {
+                rustc_version: entry.rustc_version.clone(),
+                expanded_cache_key: entry.expanded_cache_key.clone(),
+            })
             .or_default()
-            .push(entry.unit);
+            .push(entry);
     }
     let mut unposted = Vec::new();
-    for (rustc_version, units) in groups {
-        if let Err(error) = crate::cargo_cmd::admit_observed_misses(
-            config,
-            &consumer_target,
-            &rustc_version,
-            &build_host,
-            consumer_spelled_target,
-            &units,
-        )
-        .await
-        {
-            tracing::warn!(error = %error, journal = %journal.display(), "could not admit a journal's misses");
-            unposted.extend(units.into_iter().map(|unit| JournalEntry {
-                rustc: String::new(),
-                rustc_version: rustc_version.clone(),
-                build_host: build_host.clone(),
-                consumer_spelled_target,
-                unit,
-            }));
-        }
+    for (key, group) in groups {
+        unposted.extend(
+            drain_group(
+                config,
+                &journal,
+                DrainContext {
+                    consumer_target: &consumer_target,
+                    build_host: &build_host,
+                    spelled: consumer_spelled_target,
+                },
+                &key,
+                context_manifest.as_deref(),
+                group,
+            )
+            .await,
+        );
     }
     restore(&work, &journal, &unposted);
+    if unposted.is_empty() {
+        let _ = std::fs::remove_file(context_path(&work));
+    }
+}
+
+/// What names one journal group: the rustc its build ran, plus the
+/// supervised lane's persisted expanded graph (by cache key). Empty key
+/// groups drain through the journal's context sidecar instead (stow#588).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DrainGroupKey {
+    rustc_version: String,
+    expanded_cache_key: String,
+}
+
+/// The context sidecar one standalone `cargo build` drops next to its
+/// journal: the consumer package's manifest dir, so the drain can
+/// re-derive the build's unit graph after the build exits (stow#588).
+const CONTEXT_PREFIX: &str = "stow-context.";
+
+/// Every wrapper invocation under the build's root package lands here:
+/// cargo marks it `CARGO_PRIMARY_PACKAGE`, and `CARGO_MANIFEST_DIR` then
+/// names the manifest the user is building — a path dep's or registry
+/// crate's units never qualify (stow#588).
+pub fn note_consumer_context(out_dir: &Path) {
+    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() {
+        return;
+    }
+    let (Some(manifest_dir), Some(target_dir)) = (
+        std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
+        target_dir_for(out_dir),
+    ) else {
+        return;
+    };
+    let context = context_path(&journal_path(&target_dir, &cargo_build()));
+    let body = serde_json::json!({ "consumer_manifest_dir": manifest_dir });
+    if let Err(error) = std::fs::write(&context, body.to_string()) {
+        tracing::warn!(error = %error, context = %context.display(), "could not write the build's context sidecar");
+    }
+}
+
+/// The context sidecar one journal name maps to: `stow-misses.<id>.jsonl`
+/// (or its `.draining-*` claim) pairs with `stow-context.<id>`.
+fn context_path(journal: &Path) -> PathBuf {
+    let name = journal
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    let base = name.split_once(DRAIN_CLAIM).map_or(name, |(base, _)| base);
+    let id = base
+        .trim_start_matches(JOURNAL_PREFIX)
+        .trim_end_matches(JOURNAL_SUFFIX);
+    journal.with_file_name(format!("{CONTEXT_PREFIX}{id}"))
+}
+
+/// The consumer manifest dir a journal's sidecar recorded, if any.
+fn context_manifest(journal: &Path) -> Option<PathBuf> {
+    let path = context_path(journal);
+    let body = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()?
+        .get("consumer_manifest_dir")?
+        .as_str()
+        .map(PathBuf::from)
+}
+
+/// The build-level facts every journal group drains under.
+struct DrainContext<'a> {
+    consumer_target: &'a str,
+    build_host: &'a str,
+    spelled: bool,
+}
+
+/// Drains one `(rustc_version, expanded_cache_key)` group, returning the
+/// entries that stay journaled. The misses' subgraphs mint off the
+/// build's own expanded graph — a journal line whose build recorded none
+/// (a wrapper-written line, or a key the cache no longer holds) cannot
+/// mint a real context, so its units stay journaled (stow#588).
+async fn drain_group(
+    config: &StowConfig,
+    journal: &Path,
+    ctx: DrainContext<'_>,
+    key: &DrainGroupKey,
+    context_manifest: Option<&Path>,
+    group: Vec<JournalEntry>,
+) -> Vec<JournalEntry> {
+    let DrainContext {
+        consumer_target,
+        build_host,
+        spelled: consumer_spelled_target,
+    } = ctx;
+    let DrainGroupKey {
+        rustc_version,
+        expanded_cache_key,
+    } = key;
+    let expanded = if !expanded_cache_key.is_empty() {
+        match crate::lockfile_graph_cache::load(config, expanded_cache_key).await {
+            Ok(None) => {
+                tracing::warn!(
+                    journal = %journal.display(),
+                    cache_key = %expanded_cache_key,
+                    "miss journal's expanded graph is not in the lockfile graph cache; keeping its units"
+                );
+                None
+            }
+            Ok(graph) => graph,
+            Err(error) => {
+                tracing::warn!(error = %error, journal = %journal.display(), "could not load the miss journal's expanded graph; keeping its units");
+                None
+            }
+        }
+    } else if let Some(manifest_dir) = context_manifest {
+        // A standalone `cargo build` journals no expanded graph — the
+        // drain re-derives the same projection from the recorded
+        // consumer manifest (stow#588).
+        match stow_types::identity::WireRustcVersion::parse(rustc_version) {
+            Err(error) => {
+                tracing::warn!(error = %error, journal = %journal.display(), "miss journal's rustc version does not parse; keeping its units");
+                None
+            }
+            Ok(rustc) => match crate::workspace_deps::resolve_exact_dependency_graph(
+                &manifest_dir.join("Cargo.toml"),
+                "build",
+                &[],
+                consumer_spelled_target.then_some(consumer_target),
+                manifest_dir,
+                stow_types::api::runner_family(consumer_target)
+                    .map_or(consumer_target, |family| family.host_triple()),
+                &rustc,
+            )
+            .await
+            {
+                Ok(graph) => Some(graph),
+                Err(error) => {
+                    tracing::warn!(error = %error, journal = %journal.display(), manifest = %manifest_dir.display(), "could not re-derive the miss journal's unit graph; keeping its units");
+                    None
+                }
+            },
+        }
+    } else {
+        None
+    };
+    let units: Vec<ObservedUnit> = group.iter().map(|entry| entry.unit.clone()).collect();
+    let posted = match &expanded {
+        Some(graph) => crate::cargo_cmd::admit_observed_misses(
+            config,
+            consumer_target,
+            rustc_version,
+            build_host,
+            consumer_spelled_target,
+            &units,
+            graph,
+        )
+        .await
+        .is_ok(),
+        None => false,
+    };
+    if posted {
+        Vec::new()
+    } else {
+        group
+            .into_iter()
+            .map(|entry| JournalEntry {
+                rustc: String::new(),
+                rustc_version: rustc_version.to_owned(),
+                build_host: build_host.to_owned(),
+                consumer_spelled_target,
+                expanded_cache_key: expanded_cache_key.to_owned(),
+                unit: entry.unit,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +760,7 @@ mod tests {
             rustc_version: rustc_version.to_owned(),
             build_host: "x86_64-unknown-linux-gnu".to_owned(),
             consumer_spelled_target: unit.explicit_target.is_some(),
+            expanded_cache_key: String::new(),
             unit,
         }
     }
@@ -777,8 +964,25 @@ mod tests {
         // Group A's units carry a name no CrateName parses, so its
         // graph mints no roots and the group "posts" empty; group B's
         // unit mints a real miss whose POST fails against the dead
-        // edge, so only it goes back.
-        let broken = entry("not a crate", "1.85.0");
+        // edge, so only it goes back. Group A needs a loadable expanded
+        // graph for its group key — an empty one mints zero roots and
+        // "posts" immediately (stow#588).
+        crate::lockfile_graph_cache::store(
+            &config,
+            "key-a",
+            &crate::workspace_deps::ExpandedDependencyGraph {
+                entries: Vec::new(),
+                direct_dependencies: Vec::new(),
+                local_manifests: Vec::new(),
+                raw_unit_graph: br#"{"version":1,"units":[],"roots":[]}"#.to_vec(),
+            },
+        )
+        .await
+        .expect("store expanded graph");
+        let broken = JournalEntry {
+            expanded_cache_key: "key-a".to_owned(),
+            ..entry("not a crate", "1.85.0")
+        };
         let postable = JournalEntry {
             unit: ObservedUnit {
                 crate_name: "serde".to_owned(),

@@ -690,7 +690,9 @@ pub async fn phase_unit_graphs(
                     .collect::<Vec<_>>(),
                 passes_target.then(|| task.target.as_str()),
                 workspace.workspace_root(),
-                task.rustc_version.as_str(),
+                stow_types::api::runner_family(task.target.as_str())
+                    .map_or(task.target.as_str(), |family| family.host_triple()),
+                &task.rustc_version,
             )
             .await?;
             graphs.push(PhaseUnitGraph {

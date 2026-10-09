@@ -2281,8 +2281,13 @@ mod tests {
             graph_json["units"][index]["pkg_id"] = serde_json::Value::String(wrapper_pkg.clone());
         }
         let graph_json = serde_json::to_vec(&graph_json).expect("serialize fixture");
-        let graph = stow_cli::expanded_dependency_graph(&graph_json, None, "1.99.0")
-            .expect("unit graph parses");
+        let graph = stow_cli::expanded_dependency_graph(
+            &graph_json,
+            None,
+            "x86_64-unknown-linux-gnu",
+            &stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
+        )
+        .expect("unit graph parses");
 
         let task = BuildTaskPayload {
             task_id: "task-crate-1.2.3".to_owned(),

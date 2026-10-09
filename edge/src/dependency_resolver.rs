@@ -243,6 +243,28 @@ pub async fn expand_scheduler_requests(
     let rustc_version_typed =
         WireRustcVersion::parse(rustc_version).map_err(|error| error.to_string())?;
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
+    // Every entry's dependency subgraph is client-supplied — minted
+    // off the build's own `cargo --unit-graph` — so a dep the coverage
+    // prune drops still carries its real context (stow#588).
+    let mut subgraph_by_key = BTreeMap::<ExpandedNodeKey, stow_types::api::TaskSubgraph>::new();
+    for entry in expanded_entries {
+        let key = ExpandedNodeKey {
+            package: PackageKey {
+                crate_name: entry.crate_name.clone(),
+                version: entry.version.clone(),
+            },
+            host_side: entry.host_side,
+        };
+        if subgraph_by_key
+            .insert(key, entry.dependency_subgraph.clone())
+            .is_some()
+        {
+            return Err(ResolverError::Invariant(format!(
+                "duplicate expanded dependency graph entry for {} {}",
+                entry.crate_name, entry.version
+            )));
+        }
+    }
     // A consumer target outside `CI_TARGET_TRIPLES` has no runner
     // family, so its host units have no host triple to mint on —
     // refuse rather than mint nodes that block their dependents.
@@ -262,6 +284,7 @@ pub async fn expand_scheduler_requests(
     let requests = build_enqueue_requests(
         &exact_graph.feature_json_by_key,
         &exact_graph.dependency_keys_by_key,
+        &subgraph_by_key,
         &semantic_keys,
         &target_typed,
         &rustc_version_typed,
@@ -287,89 +310,6 @@ fn node_target(node_key: &ExpandedNodeKey, target_typed: &TargetTriple) -> Targe
     TargetTriple::parse(triple).expect("triples come from the runner family")
 }
 
-/// The compact dependency subgraph a dispatch payload carries: the
-/// node's transitive closure over the expanded graph, each member's
-/// children wired as indexes (stow#588). A dep the expanded graph does
-/// not list — a covered leaf the coverage prune removed — contributes
-/// its identity only.
-fn expanded_subgraph(
-    node_key: &ExpandedNodeKey,
-    feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
-    dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
-) -> Result<stow_types::api::TaskSubgraph, ResolverError> {
-    let mut closure = BTreeSet::new();
-    let mut frontier = dependency_keys_by_key
-        .get(node_key)
-        .map(|children| children.iter().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    while let Some(next) = frontier.pop() {
-        if closure.insert(next.clone())
-            && let Some(children) = dependency_keys_by_key.get(&next)
-        {
-            frontier.extend(children.iter().cloned());
-        }
-    }
-    let wire_index = |dep_key: &ExpandedNodeKey| -> Result<u32, ResolverError> {
-        closure
-            .iter()
-            .position(|key| key == dep_key)
-            .ok_or_else(|| {
-                ResolverError::from(format!(
-                    "dep {} {} escapes {} {}'s dependency closure",
-                    dep_key.package.crate_name,
-                    dep_key.package.version,
-                    node_key.package.crate_name,
-                    node_key.package.version,
-                ))
-            })
-            .and_then(|rank| {
-                u32::try_from(rank).map_err(|_| {
-                    ResolverError::from(format!(
-                        "dependency closure of {} {} exceeds the u32 wire index space",
-                        node_key.package.crate_name, node_key.package.version
-                    ))
-                })
-            })
-    };
-    let mut nodes = Vec::with_capacity(closure.len());
-    for member in &closure {
-        let features_json = feature_json_by_key.get(member).ok_or_else(|| {
-            ResolverError::from(format!(
-                "missing serialized feature set for {} {}",
-                member.package.crate_name, member.package.version
-            ))
-        })?;
-        let deps = dependency_keys_by_key
-            .get(member)
-            .map(|children| {
-                children
-                    .iter()
-                    .map(wire_index)
-                    .collect::<Result<Vec<u32>, ResolverError>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
-        nodes.push(stow_types::api::SubgraphNode {
-            crate_name: member.package.crate_name.clone(),
-            version: CrateVersion::new(member.package.version.clone()),
-            features_json: parse_canonical_features_json(features_json)?,
-            host_side: member.host_side,
-            deps,
-        });
-    }
-    let root_deps = dependency_keys_by_key
-        .get(node_key)
-        .map(|children| {
-            children
-                .iter()
-                .map(wire_index)
-                .collect::<Result<Vec<u32>, ResolverError>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    Ok(stow_types::api::TaskSubgraph { root_deps, nodes })
-}
-
 /// Turn an exact graph (`feature_json_by_key` + `dependency_keys_by_key`)
 /// into one [`EnqueueRequest`] per node the cache does not already cover.
 /// `source` decides the scheduler lane the tasks land in: the miss path
@@ -378,6 +318,7 @@ fn expanded_subgraph(
 fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
     dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+    subgraph_by_key: &BTreeMap<ExpandedNodeKey, stow_types::api::TaskSubgraph>,
     cached_semantic_keys: &BTreeSet<(ExpandedNodeKey, String)>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
@@ -395,7 +336,7 @@ fn build_enqueue_requests(
             continue;
         }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
-        requests.push(EnqueueRequest {
+        let request = EnqueueRequest {
             crate_name: node_key.package.crate_name.clone(),
             version: CrateVersion::new(node_key.package.version.clone()),
             features_json: features_json_typed,
@@ -403,14 +344,26 @@ fn build_enqueue_requests(
             rustc_version: rustc_version_typed.clone(),
             downloads: 0,
             source,
-            dependency_subgraph: expanded_subgraph(
-                node_key,
-                feature_json_by_key,
-                dependency_keys_by_key,
-            )?,
+            dependency_subgraph: subgraph_by_key.get(node_key).cloned().ok_or_else(|| {
+                format!(
+                    "missing dependency subgraph for {} {}",
+                    node_key.package.crate_name, node_key.package.version
+                )
+            })?,
             preserve_lockfile: false,
             host_side: node_key.host_side,
-        });
+        };
+        // Re-derive every id the subgraph yields: a wire that does not
+        // resolve is refused rather than minted (stow#588). The
+        // declared-id check rides the ticket path — `/api/v1/enqueue`
+        // already refuses `ticket.task_id != request.task_id()`.
+        request.resolved_dependency_graph().map_err(|error| {
+            ResolverError::BadRequest(format!(
+                "dependency subgraph for {} {} does not resolve: {error}",
+                node_key.package.crate_name, node_key.package.version
+            ))
+        })?;
+        requests.push(request);
     }
     Ok(requests)
 }
@@ -1333,6 +1286,7 @@ mod tests {
                         version: libm_key.version.clone(),
                         host_side: false,
                     }],
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
@@ -1340,6 +1294,7 @@ mod tests {
                     features: Vec::new(),
                     host_side: false,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
             ],
         )
@@ -1404,6 +1359,7 @@ mod tests {
                             host_side: true,
                         },
                     ],
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: syn_key.crate_name.clone(),
@@ -1411,6 +1367,7 @@ mod tests {
                     features: vec!["parsing".to_owned()],
                     host_side: false,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: syn_key.crate_name.clone(),
@@ -1418,6 +1375,7 @@ mod tests {
                     features: vec!["full".to_owned(), "parsing".to_owned()],
                     host_side: true,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
             ],
         )
@@ -1750,6 +1708,70 @@ mod tests {
         }
     }
 
+    /// Subgraphs minted off the exact graph the same way the wire
+    /// carries them — each node's closure, covered nodes with their own
+    /// feature set (stow#588).
+    fn subgraphs(
+        graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+        features: &BTreeMap<ExpandedNodeKey, String>,
+    ) -> BTreeMap<ExpandedNodeKey, stow_types::api::TaskSubgraph> {
+        graph
+            .keys()
+            .map(|key| (key.clone(), subgraph_for(key, graph, features)))
+            .collect()
+    }
+
+    fn subgraph_for(
+        node_key: &ExpandedNodeKey,
+        graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+        features: &BTreeMap<ExpandedNodeKey, String>,
+    ) -> stow_types::api::TaskSubgraph {
+        let mut closure = BTreeSet::new();
+        let mut frontier: Vec<ExpandedNodeKey> =
+            graph.get(node_key).into_iter().flatten().cloned().collect();
+        while let Some(next) = frontier.pop() {
+            if closure.insert(next.clone()) {
+                frontier.extend(graph.get(&next).into_iter().flatten().cloned());
+            }
+        }
+        let wire_index = |dep: &ExpandedNodeKey| {
+            u32::try_from(
+                closure
+                    .iter()
+                    .position(|key| key == dep)
+                    .expect("dep in closure"),
+            )
+            .expect("wire index")
+        };
+        let nodes = closure
+            .iter()
+            .map(|member| stow_types::api::SubgraphNode {
+                crate_name: member.package.crate_name.clone(),
+                version: stow_types::identity::CrateVersion::new(member.package.version.clone()),
+                features_json: features
+                    .get(member)
+                    .map(|raw| super::parse_canonical_features_json(raw).expect("features parse"))
+                    .unwrap_or_default(),
+                host_side: member.host_side,
+                deps: graph
+                    .get(member)
+                    .into_iter()
+                    .flatten()
+                    .map(wire_index)
+                    .collect(),
+            })
+            .collect();
+        stow_types::api::TaskSubgraph {
+            root_deps: graph
+                .get(node_key)
+                .into_iter()
+                .flatten()
+                .map(wire_index)
+                .collect(),
+            nodes,
+        }
+    }
+
     fn node(name: &str, host_side: bool) -> ExpandedNodeKey {
         ExpandedNodeKey {
             package: key(name, "1.0.0"),
@@ -1804,6 +1826,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features(&graph),
             &graph,
+            &subgraphs(&graph, &features(&graph)),
             &covered(&["b"]),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1847,6 +1870,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
+            &subgraphs(&graph, &features),
             &BTreeSet::new(),
             &"wasm32-unknown-unknown".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1895,6 +1919,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
+            &subgraphs(&graph, &features),
             &BTreeSet::new(),
             &"aarch64-apple-ios".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -2242,6 +2267,7 @@ mod sqlite_tests {
                 features: Vec::new(),
                 host_side: false,
                 dependencies: Vec::new(),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             })
             .collect::<Vec<_>>();
 
@@ -2289,6 +2315,7 @@ mod sqlite_tests {
                 features: Vec::new(),
                 host_side: false,
                 dependencies: Vec::new(),
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             })
             .collect::<Vec<_>>();
 

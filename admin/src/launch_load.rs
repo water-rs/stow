@@ -433,6 +433,7 @@ fn admission_body(target: &str, rustc: &str, counter: u64) -> Result<serde_json:
             features,
             host_side: false,
             dependencies: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         }],
     })
     .map_err(|error| error.to_string())

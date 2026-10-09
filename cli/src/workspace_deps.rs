@@ -275,7 +275,8 @@ pub async fn resolve_exact_dependency_graph(
     cargo_args: &[OsString],
     target: Option<&str>,
     current_dir: &Path,
-    toolchain: &str,
+    host_triple: &str,
+    rustc_version: &stow_types::identity::WireRustcVersion,
 ) -> stow_types::error::Result<ExpandedDependencyGraph> {
     let subcommand = unit_graph_subcommand(action)?;
     let mut unit_graph = Command::new("cargo");
@@ -316,18 +317,24 @@ pub async fn resolve_exact_dependency_graph(
     }
     unit_graph.args(cargo_args);
 
-    let unit_graph = unit_graph
+    let unit_graph_output = unit_graph
         .output()
         .await
         .wrap_err("spawn cargo --unit-graph")?;
-    if !unit_graph.status.success() {
+    if !unit_graph_output.status.success() {
         return Err(stow_types::stow_error!(
-            "cargo {subcommand} --unit-graph failed on toolchain {toolchain}: {}",
-            String::from_utf8_lossy(&unit_graph.stderr).trim()
+            "cargo {subcommand} --unit-graph failed on toolchain {}: {}",
+            rustc_version.as_str(),
+            String::from_utf8_lossy(&unit_graph_output.stderr).trim()
         ));
     }
-    let mut graph = expanded_dependency_graph(&unit_graph.stdout, target, toolchain)?;
-    graph.raw_unit_graph = unit_graph.stdout;
+    let mut graph = expanded_dependency_graph(
+        &unit_graph_output.stdout,
+        target,
+        host_triple,
+        rustc_version,
+    )?;
+    graph.raw_unit_graph = unit_graph_output.stdout;
     Ok(graph)
 }
 
@@ -348,17 +355,20 @@ pub async fn resolve_exact_dependency_graph(
 pub fn expanded_dependency_graph(
     unit_graph_json: &[u8],
     target: Option<&str>,
-    toolchain: &str,
+    host_triple: &str,
+    rustc_version: &stow_types::identity::WireRustcVersion,
 ) -> stow_types::error::Result<ExpandedDependencyGraph> {
     let graph: UnitGraph<'_> =
         serde_json::from_slice(unit_graph_json).wrap_err("parse cargo --unit-graph JSON")?;
     if graph.version != 1 {
         return Err(stow_types::stow_error!(
-            "cargo --unit-graph reported version {} (toolchain {toolchain}); only version 1 is understood",
-            graph.version
+            "cargo --unit-graph reported version {} (toolchain {}); only version 1 is understood",
+            graph.version,
+            rustc_version.as_str()
         ));
     }
-    let (entries, direct_dependencies, local_manifests) = emit_expanded_graph(&graph, target)?;
+    let (entries, direct_dependencies, local_manifests) =
+        emit_expanded_graph(&graph, target, host_triple, rustc_version)?;
     Ok(ExpandedDependencyGraph {
         entries,
         direct_dependencies,
@@ -930,12 +940,25 @@ fn direct_dependencies(
         .collect())
 }
 
+/// The wire rustc the unit-graph projection fixtures mint under
+/// (tests only).
+#[cfg(test)]
+fn rustc_test() -> &'static stow_types::identity::WireRustcVersion {
+    static RUSTC: std::sync::OnceLock<stow_types::identity::WireRustcVersion> =
+        std::sync::OnceLock::new();
+    RUSTC.get_or_init(|| {
+        stow_types::identity::WireRustcVersion::parse("1.91.1").expect("rustc parses")
+    })
+}
+
 /// The unit graph as `ResolvedDependencyGraphEntry` rows + root direct
 /// deps + the local manifests cargo read. `target` is cargo's given
 /// target triple; `None` is a native build.
 fn emit_expanded_graph(
     graph: &UnitGraph<'_>,
     target: Option<&str>,
+    host_triple: &str,
+    rustc_version: &stow_types::identity::WireRustcVersion,
 ) -> stow_types::error::Result<(
     Vec<ResolvedDependencyGraphEntry>,
     Vec<SelectedRegistryDependency>,
@@ -995,6 +1018,7 @@ fn emit_expanded_graph(
                     features: Vec::new(),
                     host_side: side == HOST,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 });
             entry
                 .features
@@ -1018,11 +1042,50 @@ fn emit_expanded_graph(
         entry.dependencies.sort();
         entry.dependencies.dedup();
     }
+    // Each entry's dependency subgraph comes from the resolved task
+    // graph over this same unit graph — a covered dep still has its
+    // own real context there, so nothing is minted leaf-shaped
+    // (stow#588).
+    let task_units = unit_graph_task_units(graph, target, host_triple)?;
+    let resolved = stow_types::unit_graph::resolved_task_graph(&task_units, rustc_version)?;
+    for entry in entries.values_mut() {
+        entry.dependency_subgraph = node_subgraph(&resolved, entry)?;
+    }
     Ok((
         entries.into_values().collect(),
         direct_dependencies(graph, &infos, &sides)?,
         local_manifest_hashes(graph)?,
     ))
+}
+
+/// The wire subgraph for one expanded-graph entry: the entry's own
+/// node inside the resolved task graph, located by its identity
+/// `(name, version, feature set, side)` — exact package identity, not
+/// a name association (stow#588). Two resolved nodes sharing the
+/// entry's `(name, version, side)` but differing in features cannot
+/// both back one merged entry, so any ambiguity or absence is an
+/// error, never a guess.
+fn node_subgraph(
+    resolved: &stow_types::task_graph::ResolvedTaskGraph,
+    entry: &ResolvedDependencyGraphEntry,
+) -> stow_types::error::Result<stow_types::api::TaskSubgraph> {
+    let mut matched = resolved.nodes().iter().enumerate().filter(|(_, node)| {
+        node.identity.crate_name.as_str() == entry.crate_name.as_str()
+            && node.identity.version.as_semver() == &entry.version
+            && node.identity.host_side == entry.host_side
+            && node.identity.features_json.features() == entry.features.as_slice()
+    });
+    let Some((index, _)) = matched.next() else {
+        return Err(stow_types::stow_error!(
+            "cargo --unit-graph has no task node for {} {} (host_side={}) at features {:?} — cannot mint its dependency subgraph",
+            entry.crate_name,
+            entry.version,
+            entry.host_side,
+            entry.features,
+        ));
+    };
+    stow_types::api::TaskSubgraph::from_resolved(resolved, index)
+        .map_err(|e| stow_types::stow_error!("{e}"))
 }
 
 /// Every local package manifest cargo read for this answer —
@@ -1092,12 +1155,17 @@ pub struct ObservedMissGraph {
 }
 
 /// Build the miss graph from the build's compile observations and the
-/// dependency identities recorded in the artifact cache.
+/// dependency identities recorded in the artifact cache. `resolved` is
+/// the shared projection of the build's own `cargo --unit-graph` —
+/// every minted entry's dependency subgraph comes out of it, so an
+/// entry whose node the unit graph does not hold fails the call rather
+/// than carrying a synthesized context (stow#588).
 pub fn observed_miss_graph(
     observations: &[crate::artifact_cache::ObservedUnit],
     dep_identities: &BTreeMap<String, crate::artifact_cache::ObservedDepIdentity>,
     consumer_spelled_target: bool,
-) -> ObservedMissGraph {
+    resolved: &stow_types::task_graph::ResolvedTaskGraph,
+) -> stow_types::error::Result<ObservedMissGraph> {
     let mut entries = BTreeMap::<(String, String, bool), ResolvedDependencyGraphEntry>::new();
     let mut roots = Vec::new();
     // `(dep key, side)` pairs an observed edge needs a node for —
@@ -1162,6 +1230,7 @@ pub fn observed_miss_graph(
                 features,
                 host_side,
                 dependencies,
+                dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             },
         );
     }
@@ -1183,14 +1252,19 @@ pub fn observed_miss_graph(
                         .unwrap_or_default(),
                     host_side: side,
                     dependencies: Vec::new(),
+                    dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 }
             });
     }
 
-    ObservedMissGraph {
+    for entry in entries.values_mut() {
+        entry.dependency_subgraph = node_subgraph(resolved, entry)?;
+    }
+
+    Ok(ObservedMissGraph {
         roots,
         expanded: entries.into_values().collect(),
-    }
+    })
 }
 
 /// The `(name, version, host_side)` key a referenced dep mints its leaf
@@ -2082,6 +2156,67 @@ mod observed_miss_tests {
     /// the artifact's recorded kind.
     type DepIdentityFixture<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], Option<bool>, bool);
 
+    /// A resolved task graph covering every node an observed miss
+    /// graph could mint from these inputs — one leaf node per
+    /// `(name, version, features, side)` an observation or dep identity
+    /// names, on both sides for dep rows whose side the edge decides
+    /// downstream (stow#588).
+    fn resolved_fixture(
+        observations: &[crate::artifact_cache::ObservedUnit],
+        deps: &BTreeMap<String, ObservedDepIdentity>,
+        consumer_spelled_target: bool,
+    ) -> stow_types::task_graph::ResolvedTaskGraph {
+        use stow_types::identity::{
+            CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+        };
+        use stow_types::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
+        let mut keys = std::collections::BTreeSet::new();
+        for observation in observations {
+            let host_side = observation.explicit_target.is_none()
+                && (consumer_spelled_target || observation.build_override);
+            let mut features = observation.features.clone();
+            features.sort();
+            features.dedup();
+            keys.insert((
+                observation.crate_name.clone(),
+                observation.crate_version.clone(),
+                features,
+                host_side,
+            ));
+        }
+        for dep in deps.values() {
+            let mut features = dep.features.clone();
+            features.sort();
+            features.dedup();
+            for side in [false, true] {
+                keys.insert((
+                    dep.crate_name.clone(),
+                    dep.crate_version.clone(),
+                    features.clone(),
+                    side,
+                ));
+            }
+        }
+        let nodes = keys
+            .into_iter()
+            .map(|(name, version, features, host_side)| ResolvedTaskNode {
+                identity: TaskNodeIdentity {
+                    crate_name: CrateName::parse(name).expect("crate name parses"),
+                    version: CrateVersion::new(
+                        semver::Version::parse(&version).expect("version parses"),
+                    ),
+                    features_json: FeaturesJson::canonicalize(features)
+                        .expect("features canonicalize"),
+                    target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target parses"),
+                    rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc parses"),
+                    host_side,
+                },
+                dependencies: Vec::new(),
+            })
+            .collect();
+        ResolvedTaskGraph::resolve(nodes).expect("fixture resolves")
+    }
+
     fn dep_identities(deps: &[DepIdentityFixture<'_>]) -> BTreeMap<String, ObservedDepIdentity> {
         deps.iter()
             .map(
@@ -2147,7 +2282,13 @@ mod observed_miss_tests {
             None,
             false,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, false);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            false,
+            &resolved_fixture(&observations, &dep_identities, false),
+        )
+        .expect("miss graph mints");
 
         let app = node(&graph, "app", false);
         assert_eq!(app.features, vec!["full"]);
@@ -2184,7 +2325,13 @@ mod observed_miss_tests {
             None,
             true,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, false);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            false,
+            &resolved_fixture(&observations, &dep_identities, false),
+        )
+        .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2229,7 +2376,13 @@ mod observed_miss_tests {
             None,
             true,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, true);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            true,
+            &resolved_fixture(&observations, &dep_identities, true),
+        )
+        .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2263,7 +2416,13 @@ mod observed_miss_tests {
             Some(true),
             false,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, true);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            true,
+            &resolved_fixture(&observations, &dep_identities, true),
+        )
+        .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2291,7 +2450,13 @@ mod observed_miss_tests {
             None,
             false,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, false);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            false,
+            &resolved_fixture(&observations, &dep_identities, false),
+        )
+        .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.features, vec!["std"]);
@@ -2325,7 +2490,13 @@ mod observed_miss_tests {
             None,
             false,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, false);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            false,
+            &resolved_fixture(&observations, &dep_identities, false),
+        )
+        .expect("miss graph mints");
 
         assert_eq!(
             graph.roots,
@@ -2346,7 +2517,13 @@ mod observed_miss_tests {
             observation("serde", "1.0.228", HOST, &["derive"], &[]),
         ];
         let dep_identities = dep_identities(&[]);
-        let graph = observed_miss_graph(&observations, &dep_identities, false);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            false,
+            &resolved_fixture(&observations, &dep_identities, false),
+        )
+        .expect("miss graph mints");
 
         assert_eq!(graph.expanded.len(), 1);
         assert_eq!(graph.expanded[0].crate_name.as_str(), "serde");
@@ -2385,7 +2562,13 @@ mod observed_miss_tests {
             None,
             true,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, true);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            true,
+            &resolved_fixture(&observations, &dep_identities, true),
+        )
+        .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2420,7 +2603,13 @@ mod observed_miss_tests {
             Some(true),
             false,
         )]);
-        let graph = observed_miss_graph(&observations, &dep_identities, true);
+        let graph = observed_miss_graph(
+            &observations,
+            &dep_identities,
+            true,
+            &resolved_fixture(&observations, &dep_identities, true),
+        )
+        .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert!(serde.dependencies[0].host_side);
@@ -2438,8 +2627,8 @@ mod unit_graph_tests {
 
     use super::{
         CARGO_CHANNEL_OVERRIDE, SelectedRegistryDependency, UnitGraph, emit_expanded_graph,
-        parse_pkg_id, path_pkg_root, resolve_exact_dependency_graph, unit_graph_channel_env,
-        unit_graph_subcommand, unstable_feature_gate,
+        parse_pkg_id, path_pkg_root, resolve_exact_dependency_graph, rustc_test,
+        unit_graph_channel_env, unit_graph_subcommand, unstable_feature_gate,
     };
     use stow_types::api::ResolvedDependencyGraphEntry;
 
@@ -2563,7 +2752,8 @@ mod unit_graph_tests {
             &cargo_args,
             spelled_target.as_deref(),
             root,
-            "rustc",
+            "x86_64-unknown-linux-gnu",
+            rustc_test(),
         ))
         .expect("resolve exact dependency graph")
     }
@@ -2884,7 +3074,9 @@ mod unit_graph_tests {
             }]
         }"#;
         let graph: UnitGraph<'_> = serde_json::from_str(out_of_bounds).expect("parse");
-        assert!(emit_expanded_graph(&graph, None).is_err());
+        assert!(
+            emit_expanded_graph(&graph, None, "x86_64-unknown-linux-gnu", rustc_test()).is_err()
+        );
     }
 
     /// Members `a` and `b` depending on one crate under two extern
@@ -3041,8 +3233,13 @@ mod unit_graph_tests {
             ]
         }"#;
         let graph: UnitGraph<'_> = serde_json::from_str(json).expect("parse");
-        let (entries, _, _) = emit_expanded_graph(&graph, Some("x86_64-unknown-linux-gnu"))
-            .expect("resolved target is present");
+        let (entries, _, _) = emit_expanded_graph(
+            &graph,
+            Some("x86_64-unknown-linux-gnu"),
+            "x86_64-unknown-linux-gnu",
+            rustc_test(),
+        )
+        .expect("resolved target is present");
         assert_eq!(
             entries
                 .iter()

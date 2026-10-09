@@ -1465,17 +1465,18 @@ pub async fn admit_observed_misses(
     build_host: &str,
     consumer_spelled_target: bool,
     observations: &[crate::artifact_cache::ObservedUnit],
+    expanded: &ExpandedDependencyGraph,
 ) -> stow_types::error::Result<()> {
     if observations.is_empty() {
         return Ok(());
     }
-    if stow_types::api::runner_family(consumer_target).is_none() {
+    let Some(family) = stow_types::api::runner_family(consumer_target) else {
         tracing::info!(
             target = %consumer_target,
             "consumer target is not a CI target; not minting misses"
         );
         return Ok(());
-    }
+    };
     // A `--target` anywhere in the observations proves the consumer
     // spelled one, whatever the journal's flag says.
     let consumer_spelled_target = consumer_spelled_target
@@ -1533,8 +1534,23 @@ pub async fn admit_observed_misses(
     // Host units classify against the build's probed host — the
     // triple cargo never passes `--target` for — not the family's
     // host; the family's host stays where host nodes mint (stow#317).
-    let graph =
-        workspace_deps::observed_miss_graph(observations, &dep_identities, consumer_spelled_target);
+    // The misses' subgraphs project off the build's own unit graph
+    // (stow#588) — the persisted expanded graph the drain recorded.
+    let task_units = expanded.task_units(
+        consumer_spelled_target.then_some(consumer_target),
+        family.host_triple(),
+    )?;
+    let resolved = stow_types::unit_graph::resolved_task_graph(
+        &task_units,
+        &stow_types::identity::WireRustcVersion::parse(rustc_version)
+            .wrap_err("parse rustc_version")?,
+    )?;
+    let graph = workspace_deps::observed_miss_graph(
+        observations,
+        &dep_identities,
+        consumer_spelled_target,
+        &resolved,
+    )?;
     if graph.roots.is_empty() {
         return Ok(());
     }
@@ -1609,13 +1625,19 @@ async fn expanded_graph(
             tracing::warn!(%error, "lockfile_graph_cache load failed; falling back to live resolve");
         }
     }
+    // Host-side units mint at the runner family's host triple — the
+    // same platform the host slice and the scheduler key on (stow#588).
+    let host_triple = stow_types::api::runner_family(&project.target)
+        .map_or(project.target.as_str(), |family| family.host_triple());
     let graph = workspace_deps::resolve_exact_dependency_graph(
         manifest_path,
         &project.action,
         &project.cargo_args,
         project.target_given.then_some(project.target.as_str()),
         &project.current_dir,
-        &project.rustc_version,
+        host_triple,
+        &stow_types::identity::WireRustcVersion::parse(project.rustc_version.as_str())
+            .wrap_err("parse rustc_version")?,
     )
     .await?;
     if let Err(error) =
@@ -4162,6 +4184,15 @@ fn journal_and_drain_misses(
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map_or_else(|| cargo_target_dir(project, cargo_args), PathBuf::from);
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    // The drain mints each miss's dependency subgraph off the build's
+    // persisted expanded graph — a cache-key failure journals the units
+    // with an empty key, and they stay until a supervised resolve
+    // writes the graph (stow#588).
+    let expanded_cache_key =
+        crate::lockfile_graph_cache::cache_key(project).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "could not key the expanded graph for the miss journal");
+            String::new()
+        });
     crate::miss_journal::journal_supervised(
         &rustc,
         &project.target,
@@ -4169,6 +4200,7 @@ fn journal_and_drain_misses(
         observations,
         &target_dir,
         project.target_given,
+        &expanded_cache_key,
     );
     crate::miss_journal::spawn_drain(&target_dir);
 }

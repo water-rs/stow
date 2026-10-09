@@ -949,6 +949,7 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
         && let Some(out_dir) = parsed.out_dir.as_deref()
     {
         miss_journal::drain_finished_builds(out_dir);
+        miss_journal::note_consumer_context(out_dir);
     }
     let env_cache = WrapperEnvCache::default();
     let ctx = match BuildContext::from_env() {

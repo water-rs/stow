@@ -198,7 +198,7 @@ pub const DISPATCH_INPUT_LIMIT: usize = 65_535;
 /// `platform` at `CompileKind::Host` mapped to the runner family's host
 /// triple (`resolver/src/emit.rs`), and `EnqueueDependency::target`,
 /// which carries the dep node's platform verbatim.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TaskSubgraph {
     /// The indexes into `nodes` of the task node's direct dependencies.
     /// Field renames keep the wire small: the payload rides one
@@ -873,6 +873,11 @@ pub struct ResolvedDependencyGraphEntry {
     pub host_side: bool,
     /// Direct dependencies of this package.
     pub dependencies: Vec<ResolvedDependencyGraphDependency>,
+    /// This node's dependency subgraph, projected from the build's own
+    /// `cargo --unit-graph` — the wire `resolve` re-derives the node's
+    /// task id from, so a forged or leaf-shaped context is refused
+    /// (stow#588).
+    pub dependency_subgraph: TaskSubgraph,
 }
 
 /// The dispatch freeze — the scheduler's "builds are failing

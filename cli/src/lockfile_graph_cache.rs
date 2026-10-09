@@ -327,7 +327,8 @@ mod tests {
             &[],
             Some("x86_64-unknown-linux-gnu"),
             &zed,
-            "rustc",
+            "x86_64-unknown-linux-gnu",
+            &stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
         ))
         .expect("resolve zed");
         let json = serde_json::to_string(&graph).expect("encode");
