@@ -691,7 +691,15 @@ pub async fn phase_unit_graphs(
                 passes_target.then(|| task.target.as_str()),
                 workspace.workspace_root(),
                 stow_types::api::runner_family(task.target.as_str())
-                    .map_or(task.target.as_str(), |family| family.host_triple()),
+                    .ok_or_else(|| {
+                        stow_types::stow_error!(
+                            "task {} {} targets {} — no runner family names its host triple",
+                            task.crate_name.as_str(),
+                            task.version,
+                            task.target
+                        )
+                    })?
+                    .host_triple(),
                 &task.rustc_version,
             )
             .await?;
