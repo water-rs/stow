@@ -14,9 +14,14 @@
 //! * the next ~35% are `completed`, ~2.5% `failed`, and exactly thirty
 //!   `dispatched`/`running` rows — fewer than the default 45-slot
 //!   dispatch limit so the alarm's claim walk actually runs;
-//! * a fixed [`FixtureShape::HUMAN_LANE_ROWS`] ride the human lane,
-//!   ~5% carry a future `not_before`, `first_requested_at` spreads over
-//!   the trailing two days, and exactly
+//! * the human lane inside the pending range is the pin window alone —
+//!   the claimable pending span is the planted window, and every other
+//!   pending row parks `dispatch_eligible = 0` below the admission
+//!   floor (a below-floor stored flag is only a stable state for a
+//!   miss-lane row — humans are exempt under every floor), ~5% of
+//!   non-pending rows carry a future
+//!   `not_before`, `first_requested_at` spreads over the trailing two
+//!   days, and exactly
 //!   [`FixtureShape::LAST_24H_ROWS`] sit `updated_at` inside the last
 //!   24 h — the quantities a route may legitimately be bounded by, held
 //!   constant across fixture sizes so the scale check sees only the
@@ -392,24 +397,43 @@ fn queue_seed_insert_sql(
     let in_flight_end = failed_end + FixtureShape::IN_FLIGHT_ROWS;
     let target_case = target_case_sql("n");
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
-    let lane_case = &format!("CASE WHEN n <= {human_end} THEN 'human' ELSE 'miss' END");
-    let first_at = "datetime('now', '-' || (n % 2880) || ' minutes')";
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
+    // The human lane inside the pending range is the pin window alone:
+    // a pending row parked `dispatch_eligible = 0` must be miss-lane,
+    // because the lane exemption (`lane = 'human' OR value >= floor`)
+    // recomputes a human row to eligible under EVERY admission floor —
+    // a below-floor stored flag is only a stable state for a miss row.
+    // Keeping the parked bulk miss-lane also keeps the pin window the
+    // first rows the claim walks at any floor: humans order ahead of
+    // every miss row in `dispatch_key`, so the claimed set is the pin
+    // — and its pooled closure — even after a floor change flips some
+    // parked rows back to eligible. Rows outside the pending range
+    // keep the upstream lane split (their lane never prices a claim).
+    let lane_case = &format!(
+        "CASE WHEN n <= {pending_end} \
+              THEN CASE WHEN n > {human_pin} AND n <= {human_end} \
+                        THEN 'human' ELSE 'miss' END \
+              ELSE CASE WHEN n <= {human_end} THEN 'human' ELSE 'miss' END END"
+    );
+    let first_at = "datetime('now', '-' || (n % 2880) || ' minutes')";
     let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
     // The claimable set is exactly the planted window (the human-lane
     // pin + `DISPATCH_ELIGIBLE_ROWS`) at every size (stow#588): a
-    // pending row outside it carries a future `not_before`, which the
-    // claim's `not_before <= now` leg and — through `wake_at_sql`'s
-    // `MAX(first_at + age, not_before)` — the eligibility probes'
-    // `wake_at <= now` leg both refuse. Gating here instead of by
-    // unmet deps keeps the dev edge distribution: the demand walk and
-    // the probes' index scans see the same mixed met/unmet bulk every
-    // other drive's budget was measured on. Inside the window the
-    // ~5% `n % 20 = 1` pin still applies, as before.
+    // pending row outside it is parked `dispatch_eligible = 0` — the
+    // below-the-admission-floor state production persists — so
+    // `idx_queue_claim`'s `dispatch_eligible = 1` equality drops it
+    // from the claim's walk range before the `dispatch_key` ordering
+    // reads a row. A future `not_before` parks a row inside the walk
+    // range instead — the claim examines it and refuses it, stow#597's
+    // read-past — and gating by unmet deps turns the queue into chains
+    // the demand walk follows. `dispatch_eligible = 0` is the only
+    // unclaimable state the index excludes by equality. The bulk edge
+    // distribution stays dev's: the demand walk and the probes' scans
+    // see the same mixed met/unmet rows every other drive's budget was
+    // measured on. Inside the window the ~5% `n % 20 = 1` pin still
+    // applies, as before.
     let not_before = &format!(
-        "CASE WHEN n <= {pending_end} AND (n <= {human_pin} OR n > {eligible_end}) \
-              THEN datetime('now', '+30 minutes') \
-              WHEN (n <= {failed_end} OR n > {in_flight_end}) AND n % 20 = 1 \
+        "CASE WHEN (n <= {failed_end} OR n > {in_flight_end}) AND n % 20 = 1 \
               THEN datetime('now', '+30 minutes') \
               ELSE '1970-01-01 00:00:00' END"
     );
@@ -437,6 +461,24 @@ fn queue_seed_insert_sql(
     let key = format!(
         "({prefix}) || '|' || ({first_at}) || '|' || ({first_at}) || '|' || ({task_id})",
         prefix = rank_prefix_case_sql(&bands_expr),
+    );
+    // Non-window pending rows park `dispatch_eligible = 0` — the stored
+    // production state a row below the admission floor carries — so the
+    // claim page's `dispatch_eligible = 1` index equality excludes them
+    // before the walk instead of reading past them per row. Window rows
+    // carry the recomputed flag the production formula gives.
+    let eligible = format!(
+        "CASE WHEN n <= {pending_end} AND (n <= {human_pin} OR n > {eligible_end}) \
+              THEN 0 ELSE ({}) END",
+        crate::scheduler::queue::dispatch_eligible_sql(
+            &format!("({lane_case})"),
+            &crate::scheduler::queue::value_sql(
+                &format!("({lane_case})"),
+                &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
+                "(n % 7)",
+                "0",
+            ),
+        ),
     );
     format!(
         "WITH RECURSIVE seq(n) AS ({seq_source}) \
@@ -485,15 +527,7 @@ fn queue_seed_insert_sql(
             "0",
         ),
         key = key,
-        eligible = crate::scheduler::queue::dispatch_eligible_sql(
-            &format!("({lane_case})"),
-            &crate::scheduler::queue::value_sql(
-                &format!("({lane_case})"),
-                &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
-                "(n % 7)",
-                "0",
-            ),
-        ),
+        eligible = eligible,
     )
 }
 
@@ -640,9 +674,9 @@ pub async fn seed_edges_chunk(
     // and the other drives' budgets were measured on. A spread pick
     // landing in the completed range leaves its owner `deps_met = 1`,
     // but that stray stays unclaimable through the claim's
-    // `not_before` leg (`queue_seed_insert_sql` puts every non-window
-    // pending row behind a future `not_before`), so it never enters a
-    // claimed set's walk.
+    // `dispatch_eligible` equality (`queue_seed_insert_sql` parks every
+    // non-window pending row below the admission floor), so it never
+    // enters a claimed set's walk.
     let (dep_expr, extra) = match phase {
         SeedPhase::EdgesEvery => (
             format!(

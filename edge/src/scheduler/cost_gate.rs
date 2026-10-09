@@ -1366,6 +1366,28 @@ async fn explain_details(db: &DurableDb, statement: &LoggedStatement) -> Vec<Str
         .collect()
 }
 
+/// The seeded claimable span is the planted window — the human-lane
+/// pin plus `DISPATCH_ELIGIBLE_ROWS`; every pending row outside it is
+/// parked below the admission floor, so the claim's equality seek can
+/// only ever examine this many rows.
+async fn assert_seeded_claimable_span_is_the_window(db: &DurableDb) {
+    let eligible: u64 = db
+        .query(
+            "SELECT COUNT(*) FROM queue WHERE status = 'pending' \
+             AND dispatch_eligible = 1",
+        )
+        .fetch_scalar()
+        .await
+        .expect("eligible pending count");
+    assert_eq!(
+        eligible,
+        u64::from(
+            fixture::FixtureShape::HUMAN_PROBE_ROWS + fixture::FixtureShape::DISPATCH_ELIGIBLE_ROWS
+        ),
+        "the fixture's claimable span must be the planted window"
+    );
+}
+
 /// stow#588's sixth queue run priced each wake probe at ~16k reads on
 /// the 100k queue: `dispatch_family != 'macos'` could not bound
 /// `idx_queue_wake`'s trailing `wake_at` range, so every alarm pass and
@@ -1373,12 +1395,13 @@ async fn explain_details(db: &DurableDb, statement: &LoggedStatement) -> Vec<Str
 /// exclusion is now equality — `dispatch_family IN (…)` over
 /// `RunnerFamily::ALL` minus the saturated family — which SQLite
 /// expands into one seek per remaining family: this seeds the gate
-/// fixture's production shape (thousands of eligible rows behind a
-/// future `wake_at`, the miss burst), runs `next_alarm` and the
-/// dispatchable frontier under a saturated macOS family, and asserts
-/// both probes' plans bind `dispatch_family=?` inside the
-/// `idx_queue_wake` seek — reads bounded by the family count, never
-/// the eligible set.
+/// fixture's production shape, checks the claimable span is the
+/// planted window (the bulk parks `dispatch_eligible = 0`, so the
+/// claim page's `dispatch_eligible=?` equality seeks into the window
+/// instead of reading past parked rows — stow#597's read-past), then
+/// plants a burst of eligible future-wake misses and asserts both
+/// probes' plans bind `dispatch_family=?` inside the `idx_queue_wake`
+/// seek — reads bounded by the family count, never the eligible set.
 #[tokio::test]
 async fn wake_probes_seek_each_remaining_familys_wake_range() {
     let (db, log) = counting_memory_db().await.expect("counting db");
@@ -1391,14 +1414,18 @@ async fn wake_probes_seek_each_remaining_familys_wake_range() {
     fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
         .await
         .expect("seed fixture");
-    // Push every pending row's persisted wake into the future — the
-    // miss-burst shape the defect billed on — so the ready probe
-    // returns nothing and the deferred probe runs: both statements
-    // land in the log.
-    db.query("UPDATE queue SET wake_at = '2999-01-01 00:00:00' WHERE status = 'pending'")
-        .execute()
-        .await
-        .expect("defer all wakes");
+    assert_seeded_claimable_span_is_the_window(&db).await;
+    // Push every pending row's persisted wake into the future and mark
+    // the bulk eligible — the miss-burst shape the defect billed on —
+    // so the ready probe returns nothing and the deferred probe runs:
+    // both statements land in the log.
+    db.query(
+        "UPDATE queue SET wake_at = '2999-01-01 00:00:00', dispatch_eligible = 1 \
+         WHERE status = 'pending'",
+    )
+    .execute()
+    .await
+    .expect("defer all wakes");
     let deferred: u64 = db
         .query(
             "SELECT COUNT(*) FROM queue WHERE status = 'pending' \
@@ -1453,9 +1480,15 @@ async fn wake_probes_seek_each_remaining_familys_wake_range() {
             );
         } else if statement.sql.contains("q.dispatch_key > ?") {
             frontier = true;
+            // The claim page's seek: `dispatch_eligible=?` equality
+            // bounds the walk before the `dispatch_key` range — the
+            // parked bulk is outside the index span, not read-past
+            // inside it (stow#597).
             assert!(
-                detail.contains("idx_queue_claim"),
-                "dispatchable frontier plan changed shape:\n{detail}"
+                detail.contains("idx_queue_claim")
+                    && detail.contains("dispatch_eligible=?")
+                    && detail.contains("dispatch_key>?"),
+                "claim page lost the eligible equality seek:\n{detail}"
             );
         }
     }
