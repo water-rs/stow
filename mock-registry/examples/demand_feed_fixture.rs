@@ -152,15 +152,29 @@ fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
         rustc_version: rustc(version_rustc),
         downloads: 1_000_000 - u64::try_from(n).expect("consumer index fits u64"),
         source: EnqueueSource::CacheMiss,
+        // The subgraph must carry the base's real subtree: the edge's
+        // `depends_on_task_id` commits to the dep's digest, and the
+        // base row's own id digests {anchor} — an empty `deps` here
+        // would mint a different dep id, miss the queue join, and the
+        // demand walk would never reach the base row (stow#588).
         dependency_subgraph: stow_types::api::TaskSubgraph {
             root_deps: vec![0],
-            nodes: vec![stow_types::api::SubgraphNode {
-                crate_name: crate_name(&base_name(dep_index)),
-                version: crate_version("1.0.0"),
-                features_json: FeaturesJson::default(),
-                host_side,
-                deps: Vec::new(),
-            }],
+            nodes: vec![
+                stow_types::api::SubgraphNode {
+                    crate_name: crate_name(&base_name(dep_index)),
+                    version: crate_version("1.0.0"),
+                    features_json: FeaturesJson::default(),
+                    host_side,
+                    deps: vec![1],
+                },
+                stow_types::api::SubgraphNode {
+                    crate_name: crate_name(&anchor_name(dep_index)),
+                    version: crate_version("1.0.0"),
+                    features_json: FeaturesJson::default(),
+                    host_side,
+                    deps: Vec::new(),
+                },
+            ],
         },
         host_side,
         preserve_lockfile: false,
