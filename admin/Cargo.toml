@@ -28,7 +28,7 @@ humantime = "2"
 serde_html_form = "0.4"
 semver.workspace = true
 blake3.workspace = true
-askama = "0.14"
+askama = "0.16"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1"
 url = "2"
