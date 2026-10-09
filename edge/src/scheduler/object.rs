@@ -22,9 +22,9 @@ use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
-use crate::scheduler::budget;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
+use crate::scheduler::{budget, fixture};
 use crate::scheduler::{dispatch, feed, queue};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
@@ -252,7 +252,7 @@ async fn scheduler_budget_seed(
         );
     }
     Ok(Json(
-        budget::seed(&db, &request, &scheduler_settings(&env)?)
+        fixture::seed(&db, &request, &scheduler_settings(&env)?)
             .await
             .map_err(to_error)?,
     ))
