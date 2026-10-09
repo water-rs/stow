@@ -49,6 +49,15 @@ impl FixtureShape {
     /// throughput, which the scale check must not let grow with the
     /// stored bulk.
     pub const LAST_24H_ROWS: u32 = 3_000;
+    /// The pending rows the fixture plants as dispatch-eligible — a
+    /// fixed window just above the human lane, each with its edges met,
+    /// so the dispatch claim has claimable rows to pick at any fixture
+    /// size. Held constant because the claimable population itself is a
+    /// fixture input: an eligible set that grows with the queue would
+    /// make the claimed set's dependency closure — and the dependents a
+    /// purge or a dep expansion walks — a function of stored bulk
+    /// instead of the claim's own bound (stow#588).
+    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 64;
 
     /// Rows `1..=pending_end` are `pending` — 60% of the queue.
     #[must_use]

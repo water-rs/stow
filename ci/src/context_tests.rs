@@ -290,7 +290,10 @@ fn shim_binary() -> PathBuf {
         }
         let status = build.status().expect("build the resolve shim");
         assert!(status.success(), "cargo build stow-rustc-shim failed");
-        workspace.join("target/debug/stow-rustc-shim")
+        workspace.join(format!(
+            "target/debug/stow-rustc-shim{}",
+            std::env::consts::EXE_SUFFIX
+        ))
     })
     .clone()
 }
@@ -794,7 +797,7 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
         let status = async_process::Command::new("cargo")
             .args(["fetch", "--manifest-path"])
             .arg(&manifest)
-            .env("RUSTUP_TOOLCHAIN", rustc.as_str())
+            .env("RUSTUP_TOOLCHAIN", active_toolchain())
             .status()
             .await
             .expect("cargo fetch");

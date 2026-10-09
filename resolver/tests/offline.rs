@@ -435,6 +435,42 @@ fn newer_release_beats_the_pin() {
     assert_eq!(units_named(&out, "dep")[0].version, "1.0.1");
 }
 
+/// `default` in the feature list is the lanes' spelling of the
+/// default feature set, not a literal `-F` name: a package that
+/// declares no features still resolves (cargo accepts `default` for a
+/// feature-less root — `TASK_FEATURES='["default"]'` over itoa,
+/// stow#588).
+#[test]
+fn the_default_sentinel_resolves_a_featureless_package() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "dep",
+            version: "1.0.0",
+            deps: vec![],
+            features: &[],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let manifest = project(&work.path().join("root"), &json!({ "dep": "1" }));
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve(
+            &manifest,
+            &ResolveOptions {
+                features: vec!["default".to_owned()],
+                ..ResolveOptions::default()
+            },
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+    assert_eq!(units_named(&out, "dep")[0].version, "1.0.0");
+}
+
 /// The crate lane drops the tarball's bundled `Cargo.lock` like every
 /// other lane — the `dep` pin is admission, never preference, so the
 /// resolve lands on the index's newest compatible `1.0.1`, not the

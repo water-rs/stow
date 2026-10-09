@@ -263,7 +263,8 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for the drained /api/v1/enqueue post"
+            "timed out waiting for the drained /api/v1/enqueue post{}",
+            drain_diagnostics(&dir.path().join("target"))
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -294,6 +295,51 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         Some("cfg-if"),
         "the ticket must carry the admission's canonical request: {body}"
     );
+}
+
+/// Forensics for a drain that never posted: the detached child's
+/// stderr log tail plus every journal/claim/context file left under
+/// `target_dir`, so a timeout panic names what the drain saw.
+fn drain_diagnostics(target_dir: &Path) -> String {
+    use std::fmt::Write as _;
+    let mut report = String::new();
+    let log = target_dir.join("stow-drain.log");
+    match std::fs::read(&log) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(4096)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let _ = write!(
+                report,
+                "\nstow-drain.log (last {} bytes):\n{tail}",
+                text.len().min(4096)
+            );
+        }
+        Err(error) => {
+            let _ = write!(report, "\nstow-drain.log: unreadable ({error})");
+        }
+    }
+    report.push_str("\njournal dir:");
+    if let Ok(entries) = std::fs::read_dir(target_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("stow-misses.")
+                || name.starts_with(".draining-")
+                || name.starts_with("stow-context.")
+            {
+                let size = entry.metadata().map_or(0, |meta| meta.len());
+                let _ = write!(report, "\n  {name} ({size} bytes)");
+            }
+        }
+    }
+    report
 }
 
 /// The tools dir `stow setup` produces for the wrapper: the
@@ -411,7 +457,8 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for the drained /api/v1/enqueue post"
+            "timed out waiting for the drained /api/v1/enqueue post{}",
+            drain_diagnostics(&target_dir)
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
