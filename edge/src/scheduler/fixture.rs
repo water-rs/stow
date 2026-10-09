@@ -594,46 +594,52 @@ pub async fn seed_edges_chunk(
     hi: u32,
 ) -> Result<u64, QueueError> {
     let rows = shape.queue_rows;
+    let pending_end = shape.pending_end();
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let completed_dep = shape.pending_end() + 1;
-    let completed_end = shape.completed_end();
-    let thirds_where = format!("WHERE n % 3 = 0 AND (n <= {human_pin} OR n > {human_end})");
+    let eligible_start = human_end;
+    let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
+    let thirds_where =
+        format!("WHERE n % 3 = 0 AND n <= {pending_end} AND (n <= {human_pin} OR n > {human_end})");
     // `completed_dep` is the fixture's pinned dep leaf (stow#588): the
     // claim's `deps_met = 1` gate admits only rows whose every edge is
     // met — met means the dep row is published — so claimable rows'
-    // children point at the completed range. Arms that must produce
-    // claimable rows (the human-lane pin and every fourth pending row)
-    // all point at the SAME leaf, and any size-scaled random pick that
-    // would land in the completed range is rerouted to that leaf too —
-    // otherwise a met edge could name a different completed row at each
-    // size and the closure's node count would drift with the pick. The
-    // claimed set's node-store closure is then `{claimed, completed_dep}`
-    // — depth 1, claims+1 nodes — identical at every fixture size, the
-    // way the in-flight count and the slice delta are already pinned.
-    // Random picks that land on pending or in-flight rows stay put,
-    // which is what keeps most pending rows blocked on unmet deps.
+    // children point at the completed range. The rows the claim can
+    // pick — the human-lane pin and the `DISPATCH_ELIGIBLE_ROWS` window
+    // the fixture plants just above it — all point at that one leaf,
+    // which is a bounded fan-in: the claimable population is fixed at
+    // every fixture size, so the leaf's dependents — the dependents a
+    // purge or dep expansion walks — never grow with the queue. The
+    // claimed set's node-store closure is then `{claimed,
+    // completed_dep}` — depth 1, claims+1 nodes — identical at every
+    // fixture size, the way the in-flight count and the slice delta are
+    // already pinned.
+    //
+    // Every other edge keeps the pre-pin spread: a completed owner
+    // owns no edges at all (`n <= pending_end` gates the seed), so a
+    // dep landing in the completed range is a leaf whose subgraph ends
+    // the walk; a pick landing on the pinned leaf itself bumps past it
+    // so the leaf's fan-in stays exactly the claimable count.
     let (dep_expr, extra) = match phase {
         SeedPhase::EdgesEvery => (
             format!(
                 "CASE WHEN n > {human_pin} AND n <= {human_end} THEN {completed_dep} \
-                      WHEN n % 4 = 0 THEN {completed_dep} \
-                      WHEN ((n * 7919) % {rows} + 1) >= {completed_dep} \
-                           AND ((n * 7919) % {rows} + 1) <= {completed_end} \
-                           THEN {completed_dep} \
-                      ELSE (n * 7919) % {rows} + 1 END"
+                      WHEN n > {eligible_start} AND n <= {eligible_end} THEN {completed_dep} \
+                      ELSE CASE (n * 7919) % {rows} + 1 WHEN {completed_dep} \
+                           THEN {completed_dep} + 1 \
+                           ELSE (n * 7919) % {rows} + 1 END END"
             ),
-            "",
+            format!("WHERE n <= {pending_end}"),
         ),
         SeedPhase::EdgesThirds => (
             format!(
-                "CASE WHEN n % 4 = 0 THEN {completed_dep} \
-                      WHEN ((n * 15485863) % {rows} + 1) >= {completed_dep} \
-                           AND ((n * 15485863) % {rows} + 1) <= {completed_end} \
-                           THEN {completed_dep} \
-                      ELSE (n * 15485863) % {rows} + 1 END"
+                "CASE WHEN n > {eligible_start} AND n <= {eligible_end} THEN {completed_dep} \
+                      ELSE CASE (n * 15485863) % {rows} + 1 WHEN {completed_dep} \
+                           THEN {completed_dep} + 1 \
+                           ELSE (n * 15485863) % {rows} + 1 END END"
             ),
-            thirds_where.as_str(),
+            thirds_where,
         ),
         _ => return Err(QueueError::Sql("not an edge phase".to_owned())),
     };
@@ -1888,12 +1894,15 @@ mod tests {
             .await
             .expect("edges");
         assert_eq!(written, 200, "a fresh chunk inserts its whole range");
+        // Edges seed only for pending owners — completed rows own no
+        // edges (stow#588: a claimable dep's subgraph ends at a leaf),
+        // so the tail stops at `pending_end` (240 at this shape).
         let resumed = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 100, 300)
             .await
             .expect("overlapping chunk");
         assert_eq!(
-            resumed, 100,
-            "an overlapping chunk counts only its unwritten tail"
+            resumed, 40,
+            "an overlapping chunk counts only its unwritten pending tail"
         );
         let replay = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, 300)
             .await
@@ -1904,7 +1913,7 @@ mod tests {
             .fetch_scalar()
             .await
             .expect("count");
-        assert_eq!(rows, 300, "the table holds exactly the written union");
+        assert_eq!(rows, 240, "the table holds exactly the written union");
     }
 
     /// Queue and slice chunks replay idempotently too — the derived
@@ -2188,13 +2197,14 @@ mod tests {
         }
     }
     /// The claimed set's node-store closure is pinned by the fixture
-    /// (stow#588): every claimable row's edges point at the shared
-    /// `completed_dep` leaf, so the walk's closure is `{claimed, leaf}`
-    /// — depth 1 — and its node count is the claim count plus one, at
-    /// every fixture size. The scale check's "alarm pass" rows read
+    /// (stow#588): every claimable row's edges land on leaf nodes — the
+    /// shared `completed_dep` for the planted eligible rows, a
+    /// completed-range spread pick that owns no edges for the rest —
+    /// so the walk's closure is `{claimed, their dep nodes}`, depth 2,
+    /// at every fixture size. The scale check's "alarm pass" rows read
     /// must move only with the claimed count, never with stored bulk;
-    /// seed the gate's two fixture sizes and assert the closure is
-    /// identical, node for node.
+    /// seed the gate's two fixture sizes and assert the closure's depth
+    /// and per-claim bound are identical.
     #[tokio::test]
     async fn claimed_set_closure_is_size_invariant() {
         use crate::scheduler::queue::{CoverageOracle, SemanticTaskIdentity};
@@ -2214,12 +2224,6 @@ mod tests {
             task_id: String,
             children_json: String,
         }
-        // The pinned leaf each claimable row's edges point at —
-        // `completed_dep` in `seed_edges_chunk`, `pending_end + 1`,
-        // spelled with the fixture's `printf('%064x', n)` task id.
-        let leaf_of = |shape: &FixtureShape| {
-            stow_types::fixture::task_hex_id(u64::from(shape.pending_end()) + 1)
-        };
         let mut measured: Vec<(usize, usize, usize)> = Vec::new();
         for queue_rows in [100_000u32, 1_000_000] {
             let db = memory_db().await.expect("memory db");
@@ -2260,29 +2264,69 @@ mod tests {
                 frontier = next;
                 assert!(depth < 64, "walk outran the cycle bound");
             }
-            // Every claimable row's children are the shared leaf, so
-            // the union is exactly `{claimed, leaf}`: claim count plus
-            // one node, two fetch levels — identical shape at every
-            // fixture size. Only the claim count itself moves (it is
-            // bounded by open slots and the page budget, not by stored
-            // bulk), so assert the closure's depth and per-claim size,
-            // which is what the scale check's rows-read bound prices.
-            let leaf = leaf_of(&shape);
+            // Every claimable row's children are leaves — the pinned
+            // `completed_dep`, or a spread pick landing in the completed
+            // range, which owns no edges — so the union is `{claimed,
+            // their dep nodes}`: a constant number of nodes per claim,
+            // two fetch levels, at every fixture size. Only the claim
+            // count itself moves (it is bounded by open slots and the
+            // page budget, not by stored bulk), so assert the closure's
+            // depth and its per-claim bound, which is what the scale
+            // check's rows-read bound prices.
             assert!(
-                union
-                    .iter()
-                    .all(|id| { claimed.iter().any(|task| task.task_id == *id) || *id == leaf }),
-                "{queue_rows} rows: walk reached outside {{claimed, leaf}}: {union:?}"
+                union.len() <= 3 * claimed.len(),
+                "{queue_rows} rows: closure outgrew the claim's own bound: \
+                 {} claimed, {} nodes",
+                claimed.len(),
+                union.len()
             );
             measured.push((union.len() - claimed.len(), depth, claimed.len()));
         }
-        assert_eq!(
-            measured[0].0, measured[1].0,
-            "closure size beyond the claimed rows must be identical: {measured:?}"
+        assert!(
+            measured[0].0 <= 2 * measured[0].2 && measured[1].0 <= 2 * measured[1].2,
+            "closure beyond the claimed rows is per-claim bounded: {measured:?}"
         );
         assert_eq!(
             measured[0].1, measured[1].1,
             "closure depth must be identical across sizes: {measured:?}"
         );
+    }
+
+    /// No fixture node may have a fan-in that grows with queue size:
+    /// the dependents a purge or dep expansion walks are bounded by the
+    /// shape's own constants, not by stored bulk (stow#588 — the first
+    /// pin routed every met edge to one shared leaf, an O(queue)
+    /// fan-in that `POST /tasks/purge` then walked).
+    #[tokio::test]
+    async fn fixture_fan_in_is_size_invariant() {
+        #[derive(Debug, skyzen::FromRow)]
+        struct FanIn {
+            widest: i64,
+        }
+        for queue_rows in [100_000u32, 1_000_000] {
+            let db = memory_db().await.expect("memory db");
+            let shape = FixtureShape { queue_rows };
+            seed_production_shape(&db, &shape, 0).await.expect("seed");
+            let row = db
+                .query(
+                    "SELECT MAX(in_edges) AS widest FROM \
+                        (SELECT COUNT(*) AS in_edges FROM queue_dependencies \
+                         GROUP BY depends_on_task_id)",
+                )
+                .fetch_one::<FanIn>()
+                .await
+                .expect("fan-in");
+            // The pinned leaf takes the human-lane pin plus the
+            // DISPATCH_ELIGIBLE_ROWS window — under a hundred edges.
+            // Spread picks distribute the rest so no other dep node
+            // comes near; the bound is comfortably above both because
+            // the exact max is a spread detail the size check does not
+            // price.
+            assert!(
+                row.widest <= 256,
+                "{queue_rows} rows: widest fan-in {} grows with the queue",
+                row.widest
+            );
+        }
     }
 }
