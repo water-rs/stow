@@ -1175,16 +1175,6 @@ pub fn observed_miss_graph(
     let mut referenced_features = BTreeMap::<(String, String, bool), Vec<String>>::new();
 
     for observation in observations {
-        // A host unit is the one cargo never passes `--target`. When
-        // the consumer's own cargo invocation spelled `--target` —
-        // even when it spelled the host triple — that alone decides
-        // it, because cargo then compiles host units with the mapped
-        // codegen flags a target dep also carries, leaving no profile
-        // signal to split them by. Under a native build the split
-        // falls to the profile the unit's argv carried — host units
-        // compile under the build-override profile (stow#349).
-        let host_side = observation.explicit_target.is_none()
-            && (consumer_spelled_target || observation.build_override);
         let (Ok(crate_name), Ok(version)) = (
             stow_types::identity::CrateName::parse(&observation.crate_name),
             Version::parse(&observation.crate_version),
@@ -1195,6 +1185,31 @@ pub fn observed_miss_graph(
                 "observed unit's identity does not parse; not minting it as a miss"
             );
             continue;
+        };
+        let mut features = observation.features.clone();
+        features.sort();
+        features.dedup();
+        // A host unit is the one cargo never passes `--target`. When
+        // the consumer's own cargo invocation spelled `--target` —
+        // even when it spelled the host triple — that alone decides
+        // it, because cargo then compiles host units with the mapped
+        // codegen flags a target dep also carries, leaving no profile
+        // signal to split them by. Under a native build the resolved
+        // unit graph arbitrates: it holds the unit on exactly one side
+        // unless the dep compiles once for both halves, so a node it
+        // carries only target-side is a target compile however the
+        // argv reads. Only a genuine twin falls to the profile signal
+        // — cargo spells explicit codegen flags for target units but
+        // not for the build-override units on the host half (stow#349),
+        // which is also why flag absence alone cannot decide: a profile
+        // like `debug = 0` strips the same flags from every unit's argv
+        // and would misread every dep as host-side (stow#588).
+        let host_side = if consumer_spelled_target {
+            observation.explicit_target.is_none()
+        } else {
+            only_side(resolved, &observation.crate_name, &version, &features).unwrap_or_else(|| {
+                observation.explicit_target.is_none() && observation.build_override
+            })
         };
         let Some((mut dependencies, dep_nodes)) =
             observed_dep_edges(observation, dep_identities, host_side)
@@ -1209,9 +1224,6 @@ pub fn observed_miss_graph(
         }
         dependencies.sort();
         dependencies.dedup();
-        let mut features = observation.features.clone();
-        features.sort();
-        features.dedup();
         let key = (
             observation.crate_name.clone(),
             observation.crate_version.clone(),
@@ -1270,6 +1282,33 @@ pub fn observed_miss_graph(
 /// The `(name, version, host_side)` key a referenced dep mints its leaf
 /// node under, plus the recorded feature set it carries there.
 type DepNodeRef = ((String, String, bool), Vec<String>);
+
+/// The one side `resolved` holds `(crate, version, features)` on —
+/// `None` when the graph carries no node for the unit or carries it on
+/// both halves (the twin a shared dep's single native compile serves).
+fn only_side(
+    resolved: &stow_types::task_graph::ResolvedTaskGraph,
+    crate_name: &str,
+    version: &Version,
+    features: &[String],
+) -> Option<bool> {
+    let mut side = None;
+    for node in resolved.nodes() {
+        let identity = &node.identity;
+        if identity.crate_name.as_str() != crate_name
+            || identity.version.as_semver() != version
+            || identity.features_json.features() != features
+        {
+            continue;
+        }
+        match side {
+            None => side = Some(identity.host_side),
+            Some(known) if known == identity.host_side => {}
+            Some(_) => return None,
+        }
+    }
+    side
+}
 
 /// Resolve one observed unit's `--extern` deps into graph edges at each
 /// dep's own recorded identity, returning the (name, version, side) keys
@@ -2341,6 +2380,82 @@ mod observed_miss_tests {
         );
         node(&graph, "serde_derive", true);
         assert_eq!(graph.roots.len(), 2);
+    }
+
+    /// A one-node resolved graph at an explicitly chosen side — the
+    /// projection's own answer, independent of the observation's argv.
+    fn resolved_at(
+        crate_name: &str,
+        version: &str,
+        features: &[&str],
+        host_side: bool,
+    ) -> stow_types::task_graph::ResolvedTaskGraph {
+        use stow_types::identity::{
+            CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+        };
+        use stow_types::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
+        ResolvedTaskGraph::resolve(vec![ResolvedTaskNode {
+            identity: TaskNodeIdentity {
+                crate_name: CrateName::parse(crate_name).expect("crate name parses"),
+                version: CrateVersion::new(
+                    semver::Version::parse(version).expect("version parses"),
+                ),
+                features_json: FeaturesJson::canonicalize(
+                    features
+                        .iter()
+                        .map(|feature| (*feature).to_owned())
+                        .collect(),
+                )
+                .expect("features canonicalize"),
+                target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target parses"),
+                rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc parses"),
+                host_side,
+            },
+            dependencies: Vec::new(),
+        }])
+        .expect("fixture resolves")
+    }
+
+    /// The `debug = 0` shape CI runs: cargo strips the codegen flags
+    /// the build-override heuristic reads from EVERY unit's argv, so a
+    /// plain dep's compile is indistinguishable from a host unit's
+    /// (stow#588). The unit graph arbitrates — cfg-if is a normal dep,
+    /// so the unit is target-side however its argv read.
+    #[test]
+    fn a_flagless_native_compile_takes_the_unit_graphs_side() {
+        let mut cfg_if = observation("cfg-if", "1.0.5", HOST, &[], &[]);
+        cfg_if.build_override = true; // the flagless-argv false positive
+        let observations = vec![cfg_if];
+        let graph = observed_miss_graph(
+            &observations,
+            &BTreeMap::new(),
+            false,
+            &resolved_at("cfg-if", "1.0.5", &[], false),
+        )
+        .expect("miss graph mints");
+
+        node(&graph, "cfg-if", false);
+        assert_eq!(graph.roots.len(), 1);
+    }
+
+    /// The same flagless argv on a unit the graph carries host-side
+    /// only: the arbitration keeps it host — a real build-override
+    /// compile is not re-sided to target.
+    #[test]
+    fn a_flagless_native_compile_on_a_host_only_unit_stays_host() {
+        let mut anyhow = observation("anyhow", "1.0.104", HOST, &["std"], &[]);
+        anyhow.build_override = true;
+        let observations = vec![anyhow];
+        let graph = observed_miss_graph(
+            &observations,
+            &BTreeMap::new(),
+            false,
+            &resolved_at("anyhow", "1.0.104", &["std"], true),
+        )
+        .expect("miss graph mints");
+
+        node(&graph, "anyhow", true);
+        assert_eq!(graph.roots.len(), 1);
     }
 
     /// A `--target wasm32` cross build: a unit recorded at the build
