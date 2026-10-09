@@ -55,7 +55,7 @@ pub async fn send_enqueue_trusted(
 pub async fn send_task_ids(
     namespace: &CfDurableNamespace,
     request: &stow_types::api::SubmitTaskIdsRequest,
-) -> Result<stow_types::api::SubmitTaskIdsResponse, GetArtifactError> {
+) -> Result<stow_types::api::SubmitTaskIdsResponse, SchedulerClientError> {
     post_json(namespace, SCHEDULER_SUBMIT_IDS_URL, request).await
 }
 

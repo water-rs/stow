@@ -470,7 +470,8 @@ async fn submit_tasks_by_id(
             "submit-by-id: node store misses"
         );
     }
-    arm_dispatch(&env, &db, &alarm).await?;
+    // Same hand-off as submit: the alarm pass owns dispatch.
+    schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(stow_types::api::SubmitTaskIdsResponse {
         submitted: u32::try_from(body.tasks.len()).map_err(|_| {
             to_error("submit-ids task count exceeds u32").set_status(StatusCode::PAYLOAD_TOO_LARGE)

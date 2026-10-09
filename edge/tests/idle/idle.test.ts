@@ -45,7 +45,11 @@ const STALE_LEASE_MS = 10 * 60 * 1000; // STOW_STALE_DISPATCH_MINUTES="10"
 
 type Env2 = typeof env & Record<string, string>;
 
-function enqueue(name: string, depends_on: unknown[] = [], downloads = 100) {
+// The subgraph wire (`{r: root-dep indexes, n: [{n,v,f,h,d}]}`) — the
+// request's single context source; the DO re-derives the task id from
+// it and upserts every node into its node store (stow#588). `deps` are
+// leaf nodes here: a leaf's own id needs no transitive context.
+function enqueue(name: string, deps: unknown[] = [], downloads = 100) {
 	return {
 		crate_name: name,
 		version: "1.0.0",
@@ -54,7 +58,10 @@ function enqueue(name: string, depends_on: unknown[] = [], downloads = 100) {
 		rustc_version: RUSTC,
 		downloads,
 		source: "CacheMiss",
-		depends_on,
+		dependency_subgraph: {
+			r: deps.map((_, i) => i),
+			n: deps,
+		},
 		host_side: false,
 		preserve_lockfile: false,
 	};
@@ -64,16 +71,13 @@ function depOn(task: {
 	crate_name: string;
 	version: string;
 	features_json: string;
-	target: string;
-	rustc_version: string;
 }) {
 	return {
-		crate_name: task.crate_name,
-		version: task.version,
-		features_json: task.features_json,
-		target: task.target,
-		rustc_version: task.rustc_version,
-		host_side: false,
+		n: task.crate_name,
+		v: task.version,
+		f: task.features_json,
+		h: false,
+		d: [],
 	};
 }
 
