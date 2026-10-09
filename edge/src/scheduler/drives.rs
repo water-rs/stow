@@ -960,6 +960,54 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
+        // `POST /tasks/submit/ids` — the missed lane's promote-by-id
+        // route (stow#588): per id, a node-store root lookup, the BFS
+        // subgraph rebuild bounded by the id's own subgraph, and the
+        // trusted enqueue. The drive submits the batch setup landed,
+        // so the walk is the full cost and the enqueue half is the
+        // resync path (inserted = 0); an unknown id adds only its
+        // failed root lookup.
+        name: "POST /admin/enqueue (submit-ids)",
+        setup: Some(|db, shape, settings, _ctx| {
+            Box::pin(async move {
+                // Guarantee the node store holds the batch's subgraphs —
+                // the count is whatever an earlier drive left behind.
+                queue::enqueue_trusted(db, &submit_batch(shape), settings)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        }),
+        run: |db, shape, settings, _ctx| {
+            Box::pin(async move {
+                let entries: Vec<stow_types::api::SubmitTaskIdEntry> = submit_batch(shape)
+                    .iter()
+                    .map(|request| {
+                        Ok(stow_types::api::SubmitTaskIdEntry {
+                            task_id: request
+                                .task_id()
+                                .map_err(|error| format!("drive task id: {error}"))?,
+                            downloads: 1,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?;
+                let outcome = queue::submit_task_ids(db, &entries, settings)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                (outcome.inserted == 0 && outcome.unknown.is_empty())
+                    .then_some(())
+                    .ok_or_else(|| {
+                        format!(
+                            "submit-ids inserted {}, unknown {}",
+                            outcome.inserted,
+                            outcome.unknown.len()
+                        )
+                    })
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
         name: "POST /admin/enqueue (resubmit)",
         setup: None,
         run: |db, shape, settings, _ctx| {

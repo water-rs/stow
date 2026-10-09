@@ -2696,6 +2696,40 @@ pub struct SchedulerSubmitResponse {
     pub dropped: u32,
 }
 
+/// One task the submit-by-id lane promotes: a task id whose nodes are
+/// already in the scheduler's node store, with the miss demand the
+/// promoted row keeps for ranking (stow#588).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmitTaskIdEntry {
+    /// The full contextual task id the node store holds.
+    pub task_id: String,
+    /// The demand the queue row records (`downloads` on the minted
+    /// request).
+    pub downloads: u64,
+}
+
+/// Body of `POST /api/v1/scheduler/tasks/submit-ids`.
+///
+/// The scheduler resolves each id's subgraph from its node store; an id
+/// the store does not hold is reported as unknown and never re-minted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmitTaskIdsRequest {
+    /// The task ids to promote, in submit order.
+    pub tasks: Vec<SubmitTaskIdEntry>,
+}
+
+/// Response of `POST /api/v1/scheduler/tasks/submit-ids`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmitTaskIdsResponse {
+    /// Ids accepted for submission.
+    pub submitted: u32,
+    /// Brand-new queue rows inserted; the rest of `submitted` updated or
+    /// merged into existing rows.
+    pub inserted: u32,
+    /// Ids the node store does not hold — reported, never re-minted.
+    pub unknown: Vec<String>,
+}
+
 /// Response of `GET /api/v1/admin/coverage/{crate}` — per-CI-target
 /// servable identities for one crate (one version when `version` was given).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

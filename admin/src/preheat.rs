@@ -5,12 +5,11 @@ use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
-    CI_TARGET_TRIPLES, EnqueueDependency, EnqueueRequest, EnqueueSource, PreheatPlanResponse,
-    PreheatPlanTarget, is_ci_target,
+    CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PreheatPlanResponse, PreheatPlanTarget,
+    is_ci_target,
 };
 use stow_types::identity::{
-    CrateName, CrateVersion as TypedCrateVersion, DependencyIdentity, FeaturesJson, TargetTriple,
-    WireRustcVersion,
+    CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
 use stow_types::stow_error;
 use zenwave::{Client, ResponseExt};
@@ -843,6 +842,9 @@ pub fn ci_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec
 /// for it.
 #[derive(Debug, serde::Deserialize)]
 struct TopMissedRow {
+    /// The row's target — carried in the query answer but unused here:
+    /// the task id embeds it (stow#588).
+    #[expect(dead_code)]
     target: String,
     top_missed: Vec<String>,
 }
@@ -898,100 +900,37 @@ async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMisse
     Ok(envelope.data)
 }
 
-/// Map one contextual seven-field element
-/// of a [`TopMissedRow::top_missed`] array to the task it promotes. Every
-/// field came from a validated `EnqueueRequest` on the write path, so a
-/// parse failure here means the dataset diverged from `miss_logger`'s
-/// layout — a bug to fail on, not a row to skip.
-fn missed_enqueue_request(
-    target: &str,
+/// Map one `task_id;misses` element of a [`TopMissedRow::top_missed`]
+/// array to the promote-by-id entry it submits (stow#588). The miss
+/// row's task id is the whole identity — the scheduler re-derives the
+/// subgraph from its node store, so nothing more travels on this lane;
+/// an id the store does not hold comes back as `unknown`, never
+/// re-minted. A parse failure means the dataset diverged from
+/// `miss_logger`'s layout — a bug to fail on, not a row to skip.
+fn missed_task_id_entry(
     entry: &str,
-    rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<EnqueueRequest> {
-    let [
-        crate_name,
-        version,
-        features_json,
-        depends_on_json,
-        dependency_identity,
-        host_side,
-        misses,
-    ]: [&str; 7] = entry
-        .split(';')
-        .collect::<Vec<_>>()
-        .try_into()
-        .map_err(|_| {
-            stow_error!(
-                "malformed top_missed entry {entry:?} - expected a seven-field contextual task"
-            )
-        })?;
-    let features: Vec<String> = serde_json::from_str(features_json)
-        .map_err(|error| stow_error!("top_missed features_json {features_json:?}: {error}"))?;
-    let depends_on: Vec<EnqueueDependency> = serde_json::from_str(depends_on_json)
-        .map_err(|error| stow_error!("top_missed depends_on_json {depends_on_json:?}: {error}"))?;
-    // stow#588: the miss row records each direct dep's own resolved
-    // digest — the identity the dep's task id commits to — but no
-    // transitive closure, so the subgraph this request can carry is the
-    // direct-deps shape (each dep as a leaf). A dep whose stored digest
-    // is non-leaf cannot be re-derived here; the recorded digest is the
-    // only evidence and `validate_dependency_identity` still binds it.
-    let dependency_subgraph = stow_types::api::TaskSubgraph {
-        root_deps: (0..u32::try_from(depends_on.len())
-            .map_err(|_| stow_error!("top_missed depends_on_json too long"))?)
-            .collect(),
-        nodes: depends_on
-            .iter()
-            .map(|dep| stow_types::api::SubgraphNode {
-                crate_name: dep.crate_name.clone(),
-                version: dep.version.clone(),
-                features_json: dep.features_json.clone(),
-                host_side: dep.host_side,
-                deps: Vec::new(),
-            })
-            .collect(),
-    };
-    let request = EnqueueRequest {
-        crate_name: CrateName::parse(crate_name)
-            .map_err(|error| stow_error!("top_missed crate_name: {error}"))?,
-        version: TypedCrateVersion::new(semver::Version::parse(version)?),
-        features_json: FeaturesJson::canonicalize(features)
-            .map_err(|error| stow_error!("top_missed features_json: {error}"))?,
-        target: TargetTriple::parse(target)
-            .map_err(|error| stow_error!("top_missed target: {error}"))?,
-        rustc_version: rustc_version.clone(),
+) -> stow_types::error::Result<stow_types::api::SubmitTaskIdEntry> {
+    let [task_id, misses]: [&str; 2] =
+        entry
+            .split(';')
+            .collect::<Vec<_>>()
+            .try_into()
+            .map_err(|_| {
+                stow_error!(
+                    "malformed top_missed entry {entry:?} - expected a `task_id;misses` pair"
+                )
+            })?;
+    Ok(stow_types::api::SubmitTaskIdEntry {
+        task_id: task_id.to_owned(),
         downloads: misses
             .parse()
             .map_err(|error| stow_error!("top_missed misses `{misses}`: {error}"))?,
-        source: EnqueueSource::CacheMiss,
-        dependency_subgraph,
-        preserve_lockfile: false,
-        host_side: host_side
-            .parse::<bool>()
-            .map_err(|error| stow_error!("top_missed host_side: {error}"))?,
-    };
-    // The row's stored digest stays bound where it can be checked: a
-    // dep-free request derives the leaf digest, so anything else is a
-    // corrupt row. A dep-carrying row's subgraph records each dep as a
-    // leaf — the real transitive context the miss row cannot carry — so
-    // the recorded digest is the only evidence there and is parsed for
-    // format. Edge-placeholder (stow#588): the scheduler-storage task
-    // owns a faithful miss-row subgraph.
-    let recorded = DependencyIdentity::parse(dependency_identity)
-        .map_err(|error| stow_error!("top_missed dependency_identity: {error}"))?;
-    if depends_on.is_empty() {
-        let derived = request.dependency_identity()?;
-        if derived != recorded {
-            return Err(stow_error!(
-                "top_missed dependency_identity {recorded} does not match the derived identity {derived}"
-            ));
-        }
-    }
-    Ok(request)
+    })
 }
 
 async fn missed(
     edge: &Edge,
-    crates_io: &crates_io::CratesIo,
+    _crates_io: &crates_io::CratesIo,
     args: MissedArgs,
     output: Output,
 ) -> stow_types::error::Result<()> {
@@ -1007,16 +946,62 @@ async fn missed(
     let query = top_missed_query(args.limit, args.since_days, &targets, &rustc_version);
     let rows = fetch_top_missed(&query).await?;
 
-    let mut requests = Vec::new();
+    let mut entries = Vec::new();
     for row in &rows {
         for entry in &row.top_missed {
-            requests.push(missed_enqueue_request(&row.target, entry, &rustc_version)?);
+            entries.push(missed_task_id_entry(entry)?);
         }
     }
-    if requests.is_empty() {
-        tracing::info!("no missed identities in the window; nothing to submit");
+    if entries.is_empty() {
+        tracing::info!("no missed task ids in the window; nothing to submit");
     }
-    submit_plan(edge, crates_io, requests, args.yes, output).await
+    submit_ids_plan(edge, entries, args.yes, output).await
+}
+
+/// The promote-by-id submit: same dry-run/`--yes` envelope as the
+/// request lanes, applied through the trusted submit-ids route — the
+/// scheduler resolves each id's subgraph from its node store and
+/// reports the ids it does not hold as `unknown` (stow#588).
+async fn submit_ids_plan(
+    edge: &Edge,
+    entries: Vec<stow_types::api::SubmitTaskIdEntry>,
+    yes: bool,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    render::mutation(
+        output,
+        yes,
+        entries,
+        move |envelope: &render::Planned<
+            Vec<stow_types::api::SubmitTaskIdEntry>,
+            crate::projects::SubmitIdsOutcome,
+        >| {
+            let mut out = format!(
+                "{} task id(s)
+",
+                envelope.plan.len()
+            );
+            if let Some(result) = &envelope.result {
+                let _ = write!(
+                    out,
+                    "submitted {}, inserted {}, unknown {} in {} batch(es)",
+                    result.submitted,
+                    result.inserted,
+                    result.unknown.len(),
+                    result.batches
+                );
+                for id in &result.unknown {
+                    let _ = write!(out, "\n  unknown: {id}");
+                }
+            }
+            let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
+            out
+        },
+        async move |entries: &Vec<stow_types::api::SubmitTaskIdEntry>| {
+            crate::projects::submit_ids_chunked(edge, entries).await
+        },
+    )
+    .await
 }
 
 /// `preheat plan` — the dry run of a crate request's closure expansion
@@ -1234,7 +1219,7 @@ fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{ci_targets, missed_enqueue_request, top_missed_query};
+    use super::{ci_targets, missed_task_id_entry, top_missed_query};
 
     #[test]
     fn analytics_sql_base_override_is_loopback_only() {
@@ -1252,7 +1237,6 @@ mod tests {
             super::loopback_sql_base(remote).expect_err(remote);
         }
     }
-    use stow_types::api::EnqueueSource;
     use stow_types::identity::WireRustcVersion;
 
     fn version(num: &str, downloads: u64) -> super::CrateVersion {
@@ -1354,8 +1338,8 @@ mod tests {
             );
         assert_eq!(sql, expected);
         assert!(sql.contains("AND blob6 = '1.91.1'"));
-        assert!(sql.contains("AND blob10 <> ''"));
-        assert!(!sql.contains("max(blob9)"));
+        assert!(sql.contains("AND blob12 <> ''"));
+        assert!(sql.contains("GROUP BY\n        target,\n        task_id"));
     }
 
     /// A triple outside `CI_TARGET_TRIPLES` is rejected before it can
@@ -1372,90 +1356,33 @@ mod tests {
         );
     }
 
-    /// A `top_missed` element maps to the task the scheduler expects:
-    /// miss-sourced, miss count as the priority signal, no lockfile pin,
-    /// and the recorded dep edges back in `depends_on` (stow#317).
+    /// A `top_missed` element maps to the promote-by-id entry the
+    /// submit-ids lane posts; a malformed element fails loudly rather
+    /// than submitting a half-parsed id (stow#588).
     #[test]
-    fn missed_entry_maps_to_enqueue_request() {
-        let rustc_version = WireRustcVersion::parse("1.91.1").expect("rustc version");
-        let dep = stow_types::api::EnqueueDependency {
-            crate_name: "syn".parse().expect("crate"),
-            version: "3.0.6".parse().expect("version"),
-            features_json: stow_types::identity::FeaturesJson::canonicalize(vec![
-                "derive".to_owned(),
-            ])
-            .expect("features"),
-            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
-            rustc_version: rustc_version.clone(),
-            host_side: false,
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf().expect("leaf"),
-        };
-        let dep_id = dep.task_id();
-        let digest = stow_types::identity::DependencyIdentity::from_task_ids([dep_id.as_str()])
-            .expect("digest");
-        let depends_on_json = serde_json::to_string(&[dep]).expect("deps serialize");
-        let request = missed_enqueue_request(
-            "x86_64-unknown-linux-gnu",
-            &format!("serde;1.2.3;[\"derive\",\"std\"];{depends_on_json};{digest};false;42"),
-            &rustc_version,
+    fn missed_entry_maps_to_task_id_entry() {
+        let entry = missed_task_id_entry(
+            "serde-1.0.228--x86_64-unknown-linux-gnu-r1.91.1-d4bc91f87c0a1f0e;42",
         )
-        .expect("entry maps to a request");
-        assert_eq!(request.crate_name.as_str(), "serde");
-        assert_eq!(request.version.to_string(), "1.2.3");
-        assert_eq!(request.features_json.raw(), "[\"derive\",\"std\"]");
-        assert_eq!(request.target.as_str(), "x86_64-unknown-linux-gnu");
-        assert_eq!(request.rustc_version.as_str(), "1.91.1");
-        assert_eq!(request.downloads, 42);
-        assert_eq!(request.source, EnqueueSource::CacheMiss);
-        assert!(!request.preserve_lockfile);
-        let depends_on = request.depends_on().expect("derived deps");
-        assert_eq!(depends_on.len(), 1);
-        assert_eq!(depends_on[0].crate_name.as_str(), "syn");
-        assert_eq!(depends_on[0].target.as_str(), "x86_64-unknown-linux-gnu");
-
-        let leaf = stow_types::identity::DependencyIdentity::leaf().expect("leaf");
-        let request = missed_enqueue_request(
-            "x86_64-unknown-linux-gnu",
-            &format!("serde;1.2.3;[\"derive\"];[];{leaf};true;42"),
-            &rustc_version,
-        )
-        .expect("edge-less entry maps");
+        .expect("entry");
         assert_eq!(
-            request.depends_on().expect("derived deps"),
-            [] as [stow_types::api::EnqueueDependency; 0]
+            entry.task_id,
+            "serde-1.0.228--x86_64-unknown-linux-gnu-r1.91.1-d4bc91f87c0a1f0e"
         );
-        assert!(request.host_side);
-        assert_eq!(request.dependency_identity().expect("digest"), leaf);
+        assert_eq!(entry.downloads, 42);
     }
 
     /// A malformed element fails loudly rather than submitting a
     /// half-parsed identity.
     #[test]
     fn missed_entry_rejects_bad_shape() {
-        let rustc_version = WireRustcVersion::parse("1.91.1").expect("rustc version");
         assert!(
-            missed_enqueue_request("x86_64-unknown-linux-gnu", "serde;1.2.3", &rustc_version)
-                .is_err()
+            missed_task_id_entry("serde;1.2.3").is_err(),
+            "three-field entry must fail"
         );
-        let leaf = stow_types::identity::DependencyIdentity::leaf().expect("leaf");
-        for entry in [
-            "serde;1.2.3;[\"derive\"];[];42".to_owned(),
-            format!("serde;1.2.3;[\"derive\"];[];{leaf};false;not-a-number"),
-            format!("serde;1.2.3;[\"derive\"];[];{};false;42", "0".repeat(64)),
-            format!("serde;1.2.3;[\"derive\"];[];{leaf};invalid-side;42"),
-        ] {
-            assert!(
-                missed_enqueue_request("x86_64-unknown-linux-gnu", &entry, &rustc_version).is_err(),
-                "{entry}"
-            );
-        }
         assert!(
-            missed_enqueue_request(
-                "x86_64-unknown-linux-gnu",
-                "serde;1.2.3;[\"derive\"];[];not-a-number",
-                &rustc_version,
-            )
-            .is_err()
+            missed_task_id_entry("some-task-id;not-a-count").is_err(),
+            "non-numeric misses must fail"
         );
     }
 }

@@ -1072,6 +1072,99 @@ async fn enqueue_inner(
     u64_to_u32(inserted, "inserted task count")
 }
 
+/// What `submit_task_ids` reports: new queue rows inserted, plus the
+/// submitted ids the node store does not hold — reported as unknown,
+/// never re-minted (stow#588).
+#[derive(Debug, Default)]
+pub struct SubmitTaskIdsOutcome {
+    pub inserted: u32,
+    pub unknown: Vec<String>,
+}
+
+/// `POST /tasks/submit/ids` — the missed lane's promote path (stow#588):
+/// each entry names an exact task id whose nodes a verified admission's
+/// submit already upserted into `task_nodes`. The store is the only
+/// context source — every known id's subgraph is rebuilt by the same
+/// BFS walk dispatch uses and minted into a cache-miss `EnqueueRequest`
+/// with the entry's recorded demand, then enqueued on the trusted lane.
+/// An id the store does not hold is reported as `unknown` — never
+/// re-minted, never a leaf substitute; a store chain that breaks
+/// mid-walk is likewise reported rather than guessed at.
+pub async fn submit_task_ids(
+    db: &DurableDb,
+    entries: &[stow_types::api::SubmitTaskIdEntry],
+    settings: &SchedulerSettings,
+) -> Result<SubmitTaskIdsOutcome, QueueError> {
+    let ids: Vec<String> = entries.iter().map(|entry| entry.task_id.clone()).collect();
+    let (walks, found, failed) = walk_task_ids(db, &ids).await?;
+    let mut broken: std::collections::HashSet<usize> =
+        failed.iter().map(|(index, _)| *index).collect();
+    for (index, slot) in walks.iter().enumerate() {
+        if slot.is_none() && !broken.contains(&index) {
+            broken.insert(index);
+        }
+    }
+    let mut requests = Vec::with_capacity(entries.len());
+    let mut unknown = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(walk) = walks.get(index).and_then(Option::as_ref) else {
+            unknown.push(entry.task_id.clone());
+            continue;
+        };
+        let Some(root) = found.get(&entry.task_id) else {
+            unknown.push(entry.task_id.clone());
+            continue;
+        };
+        let dependency_subgraph = build_task_subgraph(&entry.task_id, walk, &found)
+            .map_err(|error| QueueError::Invariant(format!("submit task ids: {error}")))?;
+        let request = EnqueueRequest {
+            crate_name: CrateName::parse(root.crate_name.as_str()).map_err(|error| {
+                QueueError::Invariant(format!("node {}: {error}", root.task_id))
+            })?,
+            version: CrateVersion::new(semver::Version::parse(&root.version).map_err(|error| {
+                QueueError::Invariant(format!("node {}: {error}", root.task_id))
+            })?),
+            features_json: FeaturesJson::from_sorted(
+                serde_json::from_str(&root.features_json).map_err(|error| {
+                    QueueError::Invariant(format!("node {}: {error}", root.task_id))
+                })?,
+            )
+            .map_err(|error| QueueError::Invariant(format!("node {}: {error}", root.task_id)))?,
+            target: stow_types::identity::TargetTriple::parse(root.target.as_str()).map_err(
+                |error| QueueError::Invariant(format!("node {}: {error}", root.task_id)),
+            )?,
+            rustc_version: stow_types::identity::WireRustcVersion::parse(
+                root.rustc_version.as_str(),
+            )
+            .map_err(|error| QueueError::Invariant(format!("node {}: {error}", root.task_id)))?,
+            downloads: entry.downloads,
+            source: stow_types::api::EnqueueSource::CacheMiss,
+            dependency_subgraph,
+            preserve_lockfile: false,
+            host_side: root.host_side != 0,
+        };
+        // The rebuilt context must re-derive the submitted id exactly —
+        // a store that produces anything else is corrupt, never
+        // re-minted under a fresh id.
+        let derived = request
+            .task_id()
+            .map_err(|error| QueueError::Invariant(format!("derive task id: {error}")))?;
+        if derived != entry.task_id {
+            return Err(QueueError::Invariant(format!(
+                "node store re-derived task id {derived} for submitted {} — refusing to re-mint",
+                entry.task_id
+            )));
+        }
+        requests.push(request);
+    }
+    let inserted = if requests.is_empty() {
+        0
+    } else {
+        enqueue_inner(db, &requests, settings, false).await?
+    };
+    Ok(SubmitTaskIdsOutcome { inserted, unknown })
+}
+
 /// One request precomputed for the batched enqueue: queue identity,
 /// its deterministic task id, the resolved deps of its carried
 /// subgraph, and the node-store rows the submit upserts (stow#588).
@@ -4106,6 +4199,8 @@ struct TaskNodeRow {
     crate_name: String,
     version: String,
     features_json: String,
+    target: String,
+    rustc_version: String,
     host_side: i64,
     children_json: String,
 }
@@ -4153,7 +4248,8 @@ async fn load_claimed_subgraphs(
     if claimed.is_empty() {
         return Ok(());
     }
-    let (mut walks, found, failed) = walk_claimed_subgraphs(db, claimed).await?;
+    let ids: Vec<String> = claimed.iter().map(|task| task.task_id.clone()).collect();
+    let (mut walks, found, failed) = walk_task_ids(db, &ids).await?;
     // Fail the unbuildable tasks, naming the missing/unreached node id.
     for (index, missing) in &failed {
         let task = &claimed[*index];
@@ -4179,7 +4275,7 @@ async fn load_claimed_subgraphs(
     let mut build_failed: Vec<usize> = Vec::new();
     for (index, task) in claimed.iter_mut().enumerate() {
         let walk = walks[index].take().expect("surviving walk exists");
-        match build_task_subgraph(task, &walk, &found) {
+        match build_task_subgraph(&task.task_id, &walk, &found) {
             Ok(subgraph) => task.dependency_subgraph = subgraph,
             Err(error) => {
                 tracing::error!(task_id = %task.task_id, error = %error, "dispatch subgraph build failed");
@@ -4203,9 +4299,9 @@ async fn load_claimed_subgraphs(
 /// `IN` query, then the union-of-frontiers expansion bounded per level,
 /// returning every task's `SubgraphWalk` (None where the walk broke),
 /// the fetched row set, and the (claimed index, missing id) pairs.
-async fn walk_claimed_subgraphs(
+async fn walk_task_ids(
     db: &DurableDb,
-    claimed: &[QueuedTask],
+    task_ids: &[String],
 ) -> Result<
     (
         Vec<Option<SubgraphWalk>>,
@@ -4216,28 +4312,23 @@ async fn walk_claimed_subgraphs(
 > {
     let mut found: std::collections::HashMap<String, TaskNodeRow> =
         std::collections::HashMap::new();
-    for chunk in claimed
-        .iter()
-        .map(|task| task.task_id.clone())
-        .collect::<Vec<_>>()
-        .chunks(SUBGRAPH_WALK_LEVEL_ROWS)
-    {
+    for chunk in task_ids.chunks(SUBGRAPH_WALK_LEVEL_ROWS) {
         for row in fetch_task_nodes(db, chunk).await? {
             found.insert(row.task_id.clone(), row);
         }
     }
     let mut failed: Vec<(usize, String)> = Vec::new();
-    let mut walks: Vec<Option<SubgraphWalk>> = Vec::with_capacity(claimed.len());
-    for (index, task) in claimed.iter().enumerate() {
-        let Some(row) = found.get(&task.task_id) else {
+    let mut walks: Vec<Option<SubgraphWalk>> = Vec::with_capacity(task_ids.len());
+    for (index, task_id) in task_ids.iter().enumerate() {
+        let Some(row) = found.get(task_id) else {
             walks.push(None);
-            failed.push((index, task.task_id.clone()));
+            failed.push((index, task_id.clone()));
             continue;
         };
-        let children = parse_node_children(&task.task_id, &row.children_json)?;
+        let children = parse_node_children(task_id, &row.children_json)?;
         walks.push(Some(SubgraphWalk {
             node_ids: Vec::new(),
-            seen: std::collections::HashSet::from([task.task_id.clone()]),
+            seen: std::collections::HashSet::from([task_id.clone()]),
             root_children: children.clone(),
             frontier: children,
         }));
@@ -4300,7 +4391,7 @@ async fn walk_claimed_subgraphs(
 /// `nodes` in discovery order, `root_deps` mapped through the same
 /// positions. Any unbuildable store row is reported, never defaulted.
 fn build_task_subgraph(
-    task: &QueuedTask,
+    task_id: &str,
     walk: &SubgraphWalk,
     found: &std::collections::HashMap<String, TaskNodeRow>,
 ) -> Result<stow_types::api::TaskSubgraph, String> {
@@ -4320,10 +4411,7 @@ fn build_task_subgraph(
         .filter_map(|id| position.get(id.as_str()).copied())
         .collect();
     if root_deps.len() != walk.root_children.len() {
-        return Err(format!(
-            "root child missing from walked set for {}",
-            task.task_id
-        ));
+        return Err(format!("root child missing from walked set for {task_id}"));
     }
     Ok(stow_types::api::TaskSubgraph { root_deps, nodes })
 }
@@ -4351,7 +4439,7 @@ async fn fetch_task_nodes(
     task_ids: &[String],
 ) -> Result<Vec<TaskNodeRow>, QueueError> {
     db.query(
-        "SELECT task_id, crate_name, version, features_json, host_side, children_json \
+        "SELECT task_id, crate_name, version, features_json, target, rustc_version, host_side, children_json \
          FROM task_nodes \
          WHERE task_id IN (SELECT value FROM json_each(?))",
     )

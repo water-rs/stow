@@ -890,6 +890,25 @@ pub async fn submit_scheduler_tasks(
     }))
 }
 
+/// POST /api/v1/scheduler/tasks/submit-ids — the missed lane's trusted
+/// promote path (stow#588): forwards the task ids to the DO's
+/// submit-by-id route; the scheduler resolves each subgraph from its
+/// node store and reports ids it does not hold as `unknown`.
+pub async fn submit_task_ids(
+    SchedulerCaller(caller): SchedulerCaller,
+    Json(request): Json<stow_types::api::SubmitTaskIdsRequest>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::SubmitTaskIdsResponse>, GetArtifactError> {
+    let response = scheduler_client::send_task_ids(&scheduler, &request).await?;
+    tracing::info!(
+        tasks = request.tasks.len(),
+        unknown = response.unknown.len(),
+        %caller,
+        "submitted scheduler task ids"
+    );
+    Ok(Json(response))
+}
+
 /// GET /api/v1/scheduler/status
 pub async fn scheduler_status(
     State(scheduler): State<CfDurableNamespace>,

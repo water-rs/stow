@@ -254,6 +254,15 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // submit-by-id (stow#588): resync-path writes; the walk reads
+        // scale with the submitted ids' stored subgraphs.
+        name: "POST /admin/enqueue (submit-ids)",
+        statements: 24,
+        rows_read: 2_000,
+        rows_written: 110,
+        wall_ms: 500,
+    },
+    DriveBudget {
         name: "POST /admin/enqueue (resubmit)",
         statements: 16,
         rows_read: 1_600,

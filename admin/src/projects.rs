@@ -245,6 +245,20 @@ pub struct SubmitOutcome {
     pub dropped: u32,
 }
 
+/// The aggregated answer of the chunked submit-by-id posts.
+#[derive(Debug, serde::Serialize)]
+pub struct SubmitIdsOutcome {
+    /// How many batches were posted to the scheduler.
+    pub batches: usize,
+    /// Total ids accepted across batches.
+    pub submitted: u32,
+    /// Total new tasks inserted across batches.
+    pub inserted: u32,
+    /// Ids the scheduler's node store did not hold — reported, never
+    /// re-minted (stow#588).
+    pub unknown: Vec<String>,
+}
+
 /// GitHub search pages return at most 100 entries.
 const SEARCH_PER_PAGE: usize = 100;
 /// The search API refuses to page beyond result 1000.
@@ -936,6 +950,36 @@ pub async fn submit_chunked(
         outcome.submitted += response.submitted;
         outcome.inserted += response.inserted;
         outcome.dropped += response.dropped;
+    }
+    Ok(outcome)
+}
+
+/// POST the task-id batch in [`SUBMIT_CHUNK`]-sized pieces to the
+/// trusted submit-ids route and fold the responses — the promote lane
+/// submits ids, never requests (stow#588).
+pub async fn submit_ids_chunked(
+    edge: &Edge,
+    entries: &[stow_types::api::SubmitTaskIdEntry],
+) -> stow_types::error::Result<SubmitIdsOutcome> {
+    let mut outcome = SubmitIdsOutcome {
+        batches: 0,
+        submitted: 0,
+        inserted: 0,
+        unknown: Vec::new(),
+    };
+    for chunk in entries.chunks(SUBMIT_CHUNK) {
+        let response: stow_types::api::SubmitTaskIdsResponse = edge
+            .post_json(
+                "/api/v1/scheduler/tasks/submit-ids",
+                &stow_types::api::SubmitTaskIdsRequest {
+                    tasks: chunk.to_vec(),
+                },
+            )
+            .await?;
+        outcome.batches += 1;
+        outcome.submitted += response.submitted;
+        outcome.inserted += response.inserted;
+        outcome.unknown.extend(response.unknown);
     }
     Ok(outcome)
 }

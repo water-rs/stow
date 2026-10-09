@@ -292,6 +292,18 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
         ddl_permitted: false,
     },
+    // The submit-by-id promote lane (stow#588): the trusted enqueue's
+    // resync path plus the node-store walk — one root lookup per id and
+    // one bounded query per BFS level (the drive's test subgraphs are
+    // one level deep).
+    RouteBudget {
+        name: "POST /admin/enqueue (submit-ids)",
+        statements: 24,
+        rows_read: 200,
+        rows_written: 20,
+        scan_allowlist: &[],
+        ddl_permitted: false,
+    },
     // The same batch submitted again: writes collapse to the task
     // upserts and the budget charge — the edge set is identical, so
     // the delta sync deletes nothing and the insert conflicts out.

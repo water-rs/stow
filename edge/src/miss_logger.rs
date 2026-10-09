@@ -37,7 +37,7 @@ impl MissPath {
 ///
 /// The blob tuple is fixed-width — `(event, crate_name, version,
 /// features_json, target, rustc_version, kind, path, depends_on_json,
-/// dependency_identity, host_side)`
+/// dependency_identity, host_side, task_id)`
 /// — and a slot a surface cannot observe stays empty rather than
 /// shifting positions.
 #[derive(Debug)]
@@ -56,6 +56,10 @@ pub struct Miss {
     depends_on_json: String,
     dependency_identity: String,
     host_side: bool,
+    /// The missed unit's full contextual task id — `preheat missed`
+    /// promotes by id through the submit-by-id route (stow#588). Empty
+    /// when the lookup surface never re-derived one.
+    task_id: String,
 }
 
 impl Miss {
@@ -78,13 +82,15 @@ impl Miss {
                 .expect("derived digest")
                 .to_string(),
             host_side: request.host_side,
+            task_id: request.task_id().expect("derived task id"),
         }
     }
 
     /// The data point's blob tuple, in the dataset's column order:
     /// `(event, crate_name, version, features_json, target,
-    /// rustc_version, kind, path, depends_on_json, dependency_identity, host_side)`.
-    pub fn blobs(&self) -> [&str; 11] {
+    /// rustc_version, kind, path, depends_on_json, dependency_identity,
+    /// host_side, task_id)`.
+    pub fn blobs(&self) -> [&str; 12] {
         [
             MISS_EVENT,
             &self.crate_name,
@@ -97,6 +103,7 @@ impl Miss {
             &self.depends_on_json,
             &self.dependency_identity,
             if self.host_side { "true" } else { "false" },
+            &self.task_id,
         ]
     }
 
@@ -152,7 +159,7 @@ impl MissLog for skyzen_cloudflare::worker::AnalyticsEngineDataset {
 #[derive(Debug, Default)]
 pub struct RecordingMissLog {
     /// One rendered blob tuple per `write_miss` call.
-    pub points: std::sync::Mutex<Vec<[String; 11]>>,
+    pub points: std::sync::Mutex<Vec<[String; 12]>>,
 }
 
 #[cfg(test)]
@@ -217,6 +224,7 @@ mod tests {
                 "[]",
                 request.dependency_identity().expect("digest").as_str(),
                 "false",
+                request.task_id().expect("task id").as_str(),
             ]
         );
     }
