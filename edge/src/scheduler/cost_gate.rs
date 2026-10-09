@@ -1347,3 +1347,140 @@ async fn cleanup_still_runs_after_a_failing_drive() {
          cleanup also failed: probe-double-failure cleanup failed: injected cleanup failure"
     );
 }
+
+/// Every `detail` line of a logged statement's `EXPLAIN QUERY PLAN`
+/// replay — the seek columns a probe's plan must name, not just the
+/// scans the route gate watches.
+async fn explain_details(db: &DurableDb, statement: &LoggedStatement) -> Vec<String> {
+    let explain_sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+    let mut explain = db.query(&explain_sql);
+    for param in &statement.params {
+        explain = explain.bind(param.clone());
+    }
+    explain
+        .fetch_all::<PlanRow>()
+        .await
+        .expect("EXPLAIN QUERY PLAN replay")
+        .iter()
+        .map(|row| row.detail.clone())
+        .collect()
+}
+
+/// stow#588's sixth queue run priced each wake probe at ~16k reads on
+/// the 100k queue: `dispatch_family != 'macos'` could not bound
+/// `idx_queue_wake`'s trailing `wake_at` range, so every alarm pass and
+/// every deliver read the whole dispatch-eligible pending set. The
+/// exclusion is now equality — `dispatch_family IN (…)` over
+/// `RunnerFamily::ALL` minus the saturated family — which SQLite
+/// expands into one seek per remaining family: this seeds the gate
+/// fixture's production shape (thousands of eligible rows behind a
+/// future `wake_at`, the miss burst), runs `next_alarm` and the
+/// dispatchable frontier under a saturated macOS family, and asserts
+/// both probes' plans bind `dispatch_family=?` inside the
+/// `idx_queue_wake` seek — reads bounded by the family count, never
+/// the eligible set.
+#[tokio::test]
+async fn wake_probes_seek_each_remaining_familys_wake_range() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let settings = SchedulerSettings {
+        // The live `full_family` a macOS backlog produces — the family
+        // the exclusion must remove from the probes' seeks.
+        max_concurrent_macos_jobs: 0,
+        ..SchedulerSettings::default()
+    };
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+    // Push every pending row's persisted wake into the future — the
+    // miss-burst shape the defect billed on — so the ready probe
+    // returns nothing and the deferred probe runs: both statements
+    // land in the log.
+    db.query("UPDATE queue SET wake_at = '2999-01-01 00:00:00' WHERE status = 'pending'")
+        .execute()
+        .await
+        .expect("defer all wakes");
+    let deferred: u64 = db
+        .query(
+            "SELECT COUNT(*) FROM queue WHERE status = 'pending' \
+             AND deps_met = 1 AND dispatch_eligible = 1 \
+             AND wake_at > datetime('now')",
+        )
+        .fetch_scalar()
+        .await
+        .expect("deferred eligible count");
+    assert!(
+        deferred >= 1_000,
+        "the gate fixture must plant the miss-burst shape — {deferred} eligible future-wake rows"
+    );
+
+    let base = log.lock().expect("log").len();
+    queue::next_alarm(&db, 0, &settings)
+        .await
+        .expect("next alarm");
+    queue::select_dispatchable_frontier(&db, &settings)
+        .await
+        .expect("dispatchable frontier");
+    let statements = log.lock().expect("log")[base..].to_vec();
+
+    let mut ready_probe = false;
+    let mut deferred_probe = false;
+    let mut frontier = false;
+    for statement in &statements {
+        if !statement.sql.contains("dispatch_family IN") {
+            continue;
+        }
+        let detail = explain_details(&db, statement).await.join("\n");
+        assert!(
+            !detail.contains("SCAN queue"),
+            "family-excluded statement scanned the queue:\n{}\nplan:\n{detail}",
+            statement.sql
+        );
+        if statement.sql.contains("wake_at <= ?") {
+            ready_probe = true;
+            assert!(
+                detail.contains("SEARCH queue USING")
+                    && detail.contains("idx_queue_wake")
+                    && detail.contains("dispatch_family=?"),
+                "ready probe lost the family equality seek:\n{detail}"
+            );
+        } else if statement.sql.contains("wake_at > ?") {
+            deferred_probe = true;
+            assert!(
+                detail.contains("SEARCH queue USING")
+                    && detail.contains("idx_queue_wake")
+                    && detail.contains("dispatch_family=?"),
+                "deferred probe lost the family equality seek:\n{detail}"
+            );
+        } else if statement.sql.contains("q.dispatch_key > ?") {
+            frontier = true;
+            assert!(
+                detail.contains("idx_queue_claim"),
+                "dispatchable frontier plan changed shape:\n{detail}"
+            );
+        }
+    }
+    assert!(
+        ready_probe && deferred_probe && frontier,
+        "both wake probes and the frontier must carry the family exclusion"
+    );
+    // The exclusion names exactly the remaining families — the bound is
+    // the family count, derived from `RunnerFamily::ALL`, not a list
+    // that can drift from it.
+    for statement in &statements {
+        if !statement.sql.contains("dispatch_family IN") {
+            continue;
+        }
+        let column = if statement.sql.contains("q.dispatch_family") {
+            "q.dispatch_family"
+        } else {
+            "dispatch_family"
+        };
+        assert!(
+            statement
+                .sql
+                .contains(&format!("{column} IN ('linux', 'windows')")),
+            "exclusion must be RunnerFamily::ALL minus macos: {}",
+            statement.sql
+        );
+    }
+}
