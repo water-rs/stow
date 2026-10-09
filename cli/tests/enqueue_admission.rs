@@ -19,13 +19,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const RUSTC_VERSION: &str = "1.85.0";
-const ADMISSION_TASK_ID: &str = "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0";
+const ADMISSION_TASK_ID: &str = "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0-d9f3a7c1";
 const ADMISSION_CHALLENGE: &str = "0123456789abcdef";
 
 /// The admissions payload the edge mints for this analysis's misses —
 /// one zero-difficulty admission the CLI must redeem.
 const ADMISSIONS_RESPONSE: &str = r#"[{
-    "task_id": "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0",
+    "task_id": "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0-d9f3a7c1",
     "challenge": "0123456789abcdef",
     "difficulty": 0,
     "request": {

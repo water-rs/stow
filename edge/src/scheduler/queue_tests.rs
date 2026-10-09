@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 
-use stow_types::api::{EnqueueRequest, EnqueueSource, task_id};
+use stow_types::api::{EnqueueRequest, EnqueueSource};
 use stow_types::identity::FeaturesJson;
 
 use super::{
@@ -6717,8 +6717,8 @@ async fn migrate_derives_dev_era_edge_sides_from_triples() {
     for (index, (owner_target, dep_target)) in cases.iter().enumerate() {
         let owner = format!("owner{index}");
         let dep = format!("dep{index}");
-        let owner_id = task_id(&owner, VERSION, FEATURES, owner_target, RUSTC, false);
-        let dep_id = task_id(&dep, VERSION, FEATURES, dep_target, RUSTC, false);
+        let owner_id = task_id_on(&owner, owner_target);
+        let dep_id = task_id_on(&dep, dep_target);
         db.query(
                 "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version) \
                  VALUES (?, ?, '1.0.0', '[]', ?, '1.85.0'), (?, ?, '1.0.0', '[]', ?, '1.85.0')",

@@ -751,38 +751,10 @@ pub struct AdmissionRequest {
     pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
 }
 
-/// Canonical scheduler task identity — the blake3-derived id `enqueue`
-/// deduplicates on and `build-crate.yml`'s `run-name` carries.
-///
-/// The workflow-run webhook maps a finished run back to the task by this
-/// id. It lives in this crate so `stow-admin`'s manual driver mints
-/// exactly the ids the scheduler queue assigns.
-///
-/// `host_side` carries the unit's compile side: the same crate
-/// legitimately exists as both a target-side node and a host-side node at
-/// the host triple — a `-host` suffix distinguishes them while leaving
-/// every pre-existing target-side id spelled exactly as before.
-#[must_use]
-pub fn task_id(
-    crate_name: &str,
-    version: &str,
-    features_json: &str,
-    target: &str,
-    rustc_version: &str,
-    host_side: bool,
-) -> String {
-    let base = task_id_prefix(crate_name, version, features_json, target, rustc_version);
-    if host_side {
-        format!("{base}-host")
-    } else {
-        base
-    }
-}
-
 /// The `<crate>-<version>-<features hash>-<target>-<rustc>` prefix every
-/// task id shares — [`task_id`] appends `-host`,
-/// [`crate::task_graph::TaskNodeIdentity::task_id`] inserts the
-/// dependency digest before it.
+/// task id shares — [`crate::task_graph::TaskNodeIdentity::task_id`]
+/// inserts the `-d<dependency digest>` segment and appends `-host` —
+/// there is no digest-less spelling of a task id (stow#588).
 pub(crate) fn task_id_prefix(
     crate_name: &str,
     version: &str,

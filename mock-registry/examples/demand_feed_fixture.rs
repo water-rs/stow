@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use stow_types::api::{
     DEMAND_FEED_BATCH_PREFIX, DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageBuilder,
     DemandFeedPageRequest, EnqueueRequest, EnqueueSource, QueueSelector, SchedulerDemandEntry,
-    SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash, task_id,
+    SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -118,31 +118,21 @@ fn anchor_name(combo_index: usize) -> String {
     format!("fixture-anchor-{combo_index:02}")
 }
 
-/// One consumer's queue task key, from its own identity — the single
-/// task_id computation every expectation/readback file shares.
-fn consumer_task_id(n: usize) -> String {
-    let (name, version, feats, triple, version_rustc, host_side) = identity(n);
-    task_id(
-        &name,
-        &version,
-        &FeaturesJson::canonicalize(feats).expect("features").raw(),
-        triple,
-        version_rustc,
-        host_side,
-    )
+/// One consumer's queue task key — the id its own `EnqueueRequest`
+/// derives from the subgraph it carries, the single task_id
+/// computation every expectation/readback file shares (stow#588: the
+/// id commits to the dependency digest).
+fn consumer_task_id(n: usize, combos: &[DepCombo]) -> String {
+    enqueue_request(n, combos)
+        .task_id()
+        .expect("consumer task id")
 }
 
-/// One base row's queue task key, from its combo position.
+/// One base row's queue task key — the id its own request derives.
 fn base_task_id(combo_index: usize, combo: DepCombo) -> String {
-    let (triple, version_rustc, host_side) = combo;
-    task_id(
-        &base_name(combo_index),
-        "1.0.0",
-        "[]",
-        triple,
-        version_rustc,
-        host_side,
-    )
+    base_dep_request(combo_index, combo)
+        .task_id()
+        .expect("base task id")
 }
 
 fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
@@ -355,7 +345,7 @@ fn expectations_json(
     for (n, delta) in consumer_delta.iter().enumerate() {
         let (name, ..) = identity(n);
         expectations.push(serde_json::json!({
-            "task_id": consumer_task_id(n),
+            "task_id": consumer_task_id(n, combos),
             "crate_name": name,
             "expected_delta": delta,
         }));
@@ -560,7 +550,7 @@ fn main() {
         .iter()
         .enumerate()
         .map(|(index, combo)| base_task_id(index, *combo))
-        .chain((0..CONSUMERS).map(consumer_task_id))
+        .chain((0..CONSUMERS).map(|n| consumer_task_id(n, &combos)))
         .collect();
     let queries: Vec<String> = task_ids
         .chunks(SELECTOR_CHUNK)

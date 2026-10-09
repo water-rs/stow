@@ -416,7 +416,10 @@ mod tests {
 
     #[test]
     fn solver_finds_nonce_at_difficulty_eight() {
-        let admission = test_admission("serde-1.0.0-deadbeef-x86_64_unknown_linux_gnu-1_92_0", 8);
+        let admission = test_admission(
+            "serde-1.0.0-deadbeef-x86_64_unknown_linux_gnu-1_92_0-d0123ab5",
+            8,
+        );
         let budget = full_budget();
         let nonce = solve_nonce(&admission, &budget, &running()).expect("nonce found within bound");
         assert!(
