@@ -9271,6 +9271,81 @@ async fn assert_interleaved_writes_survived(db: &DurableDb, rows: i64) {
     assert_eq!(completed_count, rows / 5, "counts recomputed post-swap");
 }
 
+/// A live write that lands inside a range a copy batch has already
+/// verified stays invisible to the swap: the mirror triggers keep the
+/// verified range equal on both sides, so the final tick's tail-only
+/// verify still sees no difference and the swap completes.
+#[tokio::test]
+async fn migration_swap_tolerates_writes_into_an_already_verified_range() {
+    let db = seed_v14_db().await;
+    let rows = super::IDENTITY_COPY_BATCH_ROWS
+        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
+        + 1;
+    db.query(&format!(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
+            '[]', 'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss'
+         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
+               SELECT x FROM n) AS g"
+    ))
+    .execute()
+    .await
+    .expect("seed v14 rows");
+
+    // The first call copies and verifies every range up to
+    // 'bulk-008000' and leaves the copy in flight.
+    let first = super::migrate(&db, &settings())
+        .await
+        .expect("first migrate");
+    assert_eq!((first.before, first.after), (14, 14), "copy in flight");
+
+    // Writes land inside the first batch's range — verified ticks ago:
+    // an update, a fresh insert that sorts below the cursor, and a
+    // delete. The mirror, not a re-verify, keeps the range equal.
+    db.query("UPDATE queue SET status = 'failed', attempt = 4 WHERE task_id = 'bulk-000500'")
+        .execute()
+        .await
+        .expect("update inside verified range");
+    db.query(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         VALUES ('bulk-000500a', 'latecrate', '3.0.0', '[]',
+            'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss')",
+    )
+    .execute()
+    .await
+    .expect("insert inside verified range");
+    db.query("DELETE FROM queue WHERE task_id = 'bulk-000501'")
+        .execute()
+        .await
+        .expect("delete inside verified range");
+
+    // The swap sees no difference and completes.
+    let second = super::migrate(&db, &settings())
+        .await
+        .expect("swap migrate");
+    assert_eq!((second.before, second.after), (14, super::SCHEMA_VERSION));
+    let status = db
+        .query("SELECT status || '/' || attempt FROM queue WHERE task_id = 'bulk-000500'")
+        .fetch_scalar::<String>()
+        .await
+        .expect("updated row");
+    assert_eq!(status, "failed/4");
+    let inserted = db
+        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000500a' AND status = 'pending'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("inserted row");
+    assert_eq!(inserted, 1, "insert mirrored into the verified range");
+    let deleted = db
+        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000501'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("deleted row");
+    assert_eq!(deleted, 0, "delete mirrored out of the verified range");
+}
+
 /// Drive the queue copy's remaining batches to exhaustion with the same
 /// bound probe, copy statement and cursor write the migrate loop runs —
 /// the state a crash leaves when it dies after its last batch commit
@@ -9298,11 +9373,25 @@ async fn drain_queue_identity_copy(db: &DurableDb) {
             break;
         };
         db.query(include_str!("copy_queue_dependency_identity.sql"))
-            .bind(cursor)
+            .bind(cursor.clone())
             .bind(super::IDENTITY_COPY_BATCH_ROWS)
             .execute()
             .await
             .expect("drain batch");
+        // The drain replays what the migrate loop ran before the
+        // crash: the copied range verified in the same step.
+        let mut verify = db.query(include_str!("verify_queue_dependency_identity.sql"));
+        for _ in 0..5 {
+            verify = verify
+                .bind(cursor.clone())
+                .bind(bound.clone())
+                .bind(bound.clone());
+        }
+        assert_eq!(
+            verify.fetch_scalar::<i64>().await.expect("drain verify"),
+            0,
+            "drained range verifies equal"
+        );
         db.query(
             "INSERT INTO settings (key, value) \
              VALUES ('migrate_queue_identity_cursor', ?) \

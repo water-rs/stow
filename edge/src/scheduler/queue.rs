@@ -6920,28 +6920,41 @@ async fn set_identity_copy_cursor(
 /// REPLACE`/`DELETE` keyed on `task_id`), and historical rows copy
 /// across in bounded `task_id`-ordered `INSERT OR IGNORE` batches over
 /// repeated migrate calls — a mirrored row is newer than the copy's
-/// stale read and wins the IGNORE. **Transient cost:** while the copy
-/// runs, every live `queue` write pays one extra `queue_v15` statement
-/// (a second row written per insert or update, one shadow row deleted
-/// per delete) — the mirror doubles `queue` rowsWritten until the
-/// triggers drop at swap.
+/// stale read and wins the IGNORE. The shadow also carries
+/// `schema.sql`'s queue indexes from birth, under `v15sh_` build
+/// names: created empty, the copy maintains them incrementally — a
+/// 1M-row `CREATE INDEX` inside the swap tick would cost more than the
+/// rest of the swap combined. **Transient cost:** while the copy runs,
+/// every live `queue` write pays one extra `queue_v15` statement (a
+/// second row written per insert or update, one shadow row deleted
+/// per delete) plus that row's shadow-index maintenance — the mirror
+/// roughly doubles `queue` rowsWritten until the triggers drop at
+/// swap.
 ///
-/// When the cursor is exhausted the swap commits in one storage tick —
-/// verify shadow == live over every live column in both directions,
-/// drop the live table (its mirror triggers die with it), rename the
-/// shadow to `queue`, replay `schema.sql` to recreate its indexes and
-/// triggers, recompute `queue_status_counts` from the swapped table —
-/// the same unbroken-statement atomicity the enqueue write phase relies
-/// on, so the swap lands whole or not at all. Returns `false` while
-/// the copy is incomplete. Historical rows get `NULL`
-/// `dependency_identity` — unknown context, never guessed.
+/// Each copy batch also verifies its own task-id range inside the
+/// batch's tick (both directions, plus the NULL-identity audit): a
+/// verified range stays equal because the mirror triggers write every
+/// later change to both sides. So when the cursor is exhausted the
+/// swap's storage tick makes no table-wide comparison and builds no
+/// index — it verifies only the open tail, drops the live table (its
+/// mirror triggers die with it), renames the shadow to `queue`,
+/// strips the `v15sh_` build names off the shadow's already-indexed
+/// indexes via `writable_schema` (SQLite has no ALTER INDEX RENAME; a
+/// `sqlite_master` UPDATE is the metadata-only equivalent), replays
+/// `schema.sql` for the triggers, and recomputes `queue_status_counts`
+/// from the swapped table — the same unbroken-statement atomicity the
+/// enqueue write phase relies on, so the swap lands whole or not at
+/// all. Returns `false` while the copy is incomplete. Historical rows
+/// get `NULL` `dependency_identity` — unknown context, never guessed.
 async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
     const CURSOR_KEY: &str = "migrate_queue_identity_cursor";
     let queue = table_columns(db, "queue").await?;
     let shadow = table_columns(db, "queue_v15").await?;
     if queue.contains("dependency_identity") {
         if shadow.is_empty() {
-            // The swapped (or fresh) table — rebuild done.
+            // The swapped (or fresh) table — rebuild done. The
+            // shadow's indexes already carry their `schema.sql`
+            // names, so a crash after the rename needs no tail work.
             return Ok(true);
         }
         // Crash recovery: the swap's `DROP TABLE queue` committed on an
@@ -6995,6 +7008,8 @@ async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, Queue
             .await
             .map_err(|error| format!("create queue_v15 shadow: {error}"))?;
     }
+    // The index handoff — one index per call (see the function).
+    handoff_one_queue_index(db).await?;
     // The mirror triggers re-assert every call while the copy runs:
     // idempotent, and it closes the crash window between shadow
     // creation and trigger creation — an unmirrored write gap would
@@ -7020,10 +7035,13 @@ async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, Queue
             .await
             .map_err(|error| format!("probe identity copy bound: {error}"))?
         else {
-            // Copy exhausted: verify shadow == live both directions and
-            // swap — the same storage tick, so verified and swapped are
-            // one decision, never two.
-            verify_queue_identity_copy(db).await?;
+            // Copy exhausted: verify the open tail `(cursor, +inf)` —
+            // every bounded range already verified in its own copy
+            // tick, and the mirror triggers keep a verified range
+            // equal, so nothing table-wide runs here — then swap, the
+            // same storage tick, so verified and swapped are one
+            // decision, never two.
+            verify_queue_identity_range(db, &cursor, None).await?;
             db.query("DROP TABLE queue")
                 .execute()
                 .await
@@ -7036,6 +7054,12 @@ async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, Queue
             .execute()
             .await
             .map_err(|error| format!("copy queue rows for identity rebuild: {error}"))?;
+        // Verify this batch's range `(cursor, bound]` in the same
+        // tick: copied and verified are one decision. A verified range
+        // stays equal — later live writes land in both sides via the
+        // mirror — so a failed verify fails the call and the next call
+        // retries this same range from the unchanged cursor.
+        verify_queue_identity_range(db, &cursor, Some(&bound)).await?;
         set_identity_copy_cursor(db, CURSOR_KEY, &bound).await?;
         cursor = bound;
     }
@@ -7058,15 +7082,142 @@ fn shadow_create_ddl(live: &str, shadow: &str) -> String {
     tail[..end + 3].replacen(&format!("{live} ("), &format!("{shadow} ("), 1)
 }
 
+/// One step of the index handoff, run every migrate call while the
+/// copy is in flight. The shadow builds `schema.sql`'s queue indexes
+/// from birth so the copy maintains them incrementally — building any
+/// of them over the copied 1M-row table inside the swap tick costs
+/// more than the rest of the swap combined. Index names are
+/// schema-global and SQLite has no ALTER INDEX RENAME (and Durable
+/// Objects SQLite has no `writable_schema`), so the live table's
+/// index gives the name up by drop-and-recreate under a `v15live_`
+/// stand-in — one index per call keeps each call's rebuild bounded,
+/// and inside a storage tick the serving table never loses the index.
+/// Once the name is free the shadow's copy goes up under the real
+/// name — which is also what makes the `schema.sql` replay's
+/// `IF NOT EXISTS` skip it for the rest of the migration. The stand-
+/// ins die with the live table at the swap.
+async fn handoff_one_queue_index(db: &DurableDb) -> Result<(), QueueError> {
+    for ddl in queue_index_ddls() {
+        let name = index_name(&ddl);
+        if shadow_has_index(db, &name).await? {
+            continue;
+        }
+        // The live index holding `name` drops first — freeing it —
+        // then its `v15live_` stand-in goes up on `queue`, then the
+        // shadow's copy under the real name. Each is IF EXISTS /
+        // IF NOT EXISTS, so a crash anywhere inside the triple resumes
+        // into the same step; on a Durable Object the whole call is
+        // one tick anyway.
+        db.query(&format!("DROP INDEX IF EXISTS {name}"))
+            .execute()
+            .await
+            .map_err(|error| format!("drop live index {name} for handoff: {error}"))?;
+        db.query(&standin_index_ddl(&ddl, &name))
+            .execute()
+            .await
+            .map_err(|error| format!("stand-in live index for {name}: {error}"))?;
+        db.query(&shadow_index_ddl(&ddl))
+            .execute()
+            .await
+            .map_err(|error| format!("create shadow index {name}: {error}"))?;
+        break;
+    }
+    Ok(())
+}
+
+/// Every `CREATE INDEX` statement `schema.sql` declares `ON queue` —
+/// the secondary set the handoff moves onto the shadow. Statements
+/// are harvested line by line because a later edit could spread one
+/// over several.
+fn queue_index_ddls() -> Vec<String> {
+    let mut ddls = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in include_str!("schema.sql").lines() {
+        match &mut pending {
+            None => {
+                if line.trim_start().starts_with("CREATE INDEX") {
+                    if line.trim_end().ends_with(';') {
+                        if line.contains("ON queue ") || line.contains("ON queue\n") {
+                            ddls.push(line.to_owned());
+                        }
+                    } else {
+                        pending = Some(format!("{line}\n"));
+                    }
+                }
+            }
+            Some(buf) => {
+                buf.push_str(line);
+                buf.push('\n');
+                if line.trim_end().ends_with(';') {
+                    let ddl = pending.take().expect("pending index ddl");
+                    if ddl.contains("ON queue ") || ddl.contains("ON queue\n") {
+                        ddls.push(ddl);
+                    }
+                }
+            }
+        }
+    }
+    ddls
+}
+
+/// The index name a `CREATE INDEX IF NOT EXISTS <name> ...`
+/// `schema.sql` statement declares — everything between the keyword
+/// and the next whitespace.
+fn index_name(ddl: &str) -> String {
+    let head = "CREATE INDEX IF NOT EXISTS ";
+    let name_at = ddl
+        .find(head)
+        .unwrap_or_else(|| panic!("{head} not in index ddl"))
+        + head.len();
+    ddl[name_at..]
+        .split_whitespace()
+        .next()
+        .expect("index name in index ddl")
+        .to_owned()
+}
+
+/// True when the shadow already carries an index named `name` — the
+/// handoff's done-state for that index (`IF NOT EXISTS` would also
+/// match the live table's holder of the same name, so it cannot be
+/// the probe).
+async fn shadow_has_index(db: &DurableDb, name: &str) -> Result<bool, QueueError> {
+    Ok(db
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = ? AND tbl_name = 'queue_v15'",
+        )
+        .bind(name)
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("probe shadow index {name}: {error}"))?
+        != 0)
+}
+
+/// A `schema.sql` queue index statement rewritten onto the shadow:
+/// `ON queue_v15`, name unchanged — the name was freed by the live
+/// index's drop in the same handoff step.
+fn shadow_index_ddl(ddl: &str) -> String {
+    ddl.replacen("ON queue", "ON queue_v15", 1)
+}
+
+/// A `schema.sql` queue index statement renamed to `v15live_<name>`,
+/// still on the live `queue` — the stand-in that keeps the serving
+/// table indexed while its real name is given to the shadow.
+fn standin_index_ddl(ddl: &str, name: &str) -> String {
+    ddl.replacen(name, &format!("v15live_{name}"), 1)
+}
+
 /// The swap's mutating tail, ordered for crash recovery: the live
-/// `queue` drops first — taking the mirror triggers and its counts
-/// triggers with it — so the only mid-swap crash state is `queue`
-/// absent with `queue_v15` present, which always means "rename
-/// pending". `schema.sql` then recreates the queue's indexes and
-/// triggers (everything else in the file is `IF NOT EXISTS`, a no-op),
+/// `queue` drops first — taking the mirror triggers, its counts
+/// triggers and the `v15live_` stand-in indexes with it — so the only
+/// mid-swap crash state is `queue` absent with `queue_v15` present,
+/// which always means "rename pending". The shadow's indexes already
+/// carry their `schema.sql` names — the handoff gave them up during
+/// the copy — so `schema.sql`'s replay only has the queue's triggers
+/// left to recreate (everything else is `IF NOT EXISTS`, a no-op),
 /// and `queue_status_counts` is recomputed wholesale from the swapped
-/// table — the live counters were already consistent, the recompute is
-/// the swap's own audit. Called either right after the drop in the
+/// table — the live counters were already consistent, the recompute
+/// is the swap's own audit. Called either right after the drop in the
 /// same statement sequence, or alone from the crash-resume path.
 async fn finish_queue_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<bool, QueueError> {
     db.query("ALTER TABLE queue_v15 RENAME TO queue")
@@ -7097,16 +7248,25 @@ async fn finish_queue_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<
     Ok(true)
 }
 
-/// The verify half of the queue copy: the shadow's live-column content
-/// must equal the live table's in both directions and no shadow row
-/// may carry a digest. Runs inside the swap's own storage tick; a
-/// divergence fails the migrate call and the next call re-verifies.
-async fn verify_queue_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
-    let differs = db
-        .query(include_str!("verify_queue_dependency_identity.sql"))
+/// The verify half of one copy range `(lower, upper]` (a NULL `upper`
+/// is the open tail): the shadow's live-column content must equal the
+/// live table's in both directions and no shadow row may carry a
+/// digest. Runs inside the same storage tick as the copy batch it
+/// gates; a divergence fails the migrate call, and since the cursor
+/// was not yet advanced the next call retries this same range.
+async fn verify_queue_identity_range(
+    db: &DurableDb,
+    lower: &str,
+    upper: Option<&str>,
+) -> Result<(), QueueError> {
+    let mut query = db.query(include_str!("verify_queue_dependency_identity.sql"));
+    for _ in 0..5 {
+        query = query.bind(lower).bind(upper).bind(upper);
+    }
+    let differs = query
         .fetch_scalar::<i64>()
         .await
-        .map_err(|error| format!("verify queue identity copy: {error}"))?;
+        .map_err(|error| format!("verify queue identity copy range: {error}"))?;
     if differs != 0 {
         return Err(QueueError::Invariant(
             "queue identity rebuild: queue_v15 shadow diverges from live queue".to_owned(),

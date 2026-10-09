@@ -1,10 +1,17 @@
--- The swap gate for the version-15 identity rebuild (stow#588): the
--- `queue_v15` shadow must equal the live `queue` over every column the
--- live schema carries, in BOTH directions — a live write that beat the
--- copy cursor is present exactly once (mirrored), a live delete is
--- absent, and no shadow row may hold a fabricated context. Runs inside
--- the same storage tick as the swap itself: verified and swapped are
--- one decision, never two.
+-- One range of the version-15 identity rebuild's verify (stow#588):
+-- the `queue_v15` shadow must equal the live `queue` over every column
+-- the live schema carries, in BOTH directions, inside the task-id
+-- range `(?, ?]` — a NULL second bound asks for the open tail
+-- `(?, +inf)`, which is all that is left once the copy cursor is
+-- exhausted. A live write that beat the copy cursor is present exactly
+-- once (mirrored), a live delete is absent, and no shadow row may hold
+-- a fabricated context.
+--
+-- This runs inside the same storage tick as the batch it verifies:
+-- copied and verified are one decision, never two. A range that has
+-- passed stays equal — the mirror triggers write every later live
+-- change into the shadow identically — so the swap's final tick makes
+-- no table-wide comparison.
 SELECT EXISTS (
     SELECT task_id, crate_name, version, features_json, target, rustc_version,
            downloads, miss_count, request_count, priority, status, error_msg,
@@ -14,6 +21,7 @@ SELECT EXISTS (
            wake_at, dispatch_family, value, demand, dispatch_key, claimed_at,
            dispatch_eligible
     FROM queue
+    WHERE task_id > ? AND (? IS NULL OR task_id <= ?)
     EXCEPT
     SELECT task_id, crate_name, version, features_json, target, rustc_version,
            downloads, miss_count, request_count, priority, status, error_msg,
@@ -23,6 +31,7 @@ SELECT EXISTS (
            wake_at, dispatch_family, value, demand, dispatch_key, claimed_at,
            dispatch_eligible
     FROM queue_v15
+    WHERE task_id > ? AND (? IS NULL OR task_id <= ?)
 ) OR EXISTS (
     SELECT task_id, crate_name, version, features_json, target, rustc_version,
            downloads, miss_count, request_count, priority, status, error_msg,
@@ -32,6 +41,7 @@ SELECT EXISTS (
            wake_at, dispatch_family, value, demand, dispatch_key, claimed_at,
            dispatch_eligible
     FROM queue_v15
+    WHERE task_id > ? AND (? IS NULL OR task_id <= ?)
     EXCEPT
     SELECT task_id, crate_name, version, features_json, target, rustc_version,
            downloads, miss_count, request_count, priority, status, error_msg,
@@ -41,6 +51,9 @@ SELECT EXISTS (
            wake_at, dispatch_family, value, demand, dispatch_key, claimed_at,
            dispatch_eligible
     FROM queue
+    WHERE task_id > ? AND (? IS NULL OR task_id <= ?)
 ) OR EXISTS (
-    SELECT 1 FROM queue_v15 WHERE dependency_identity IS NOT NULL
+    SELECT 1 FROM queue_v15
+    WHERE task_id > ? AND (? IS NULL OR task_id <= ?)
+          AND dependency_identity IS NOT NULL
 ) AS differs;
