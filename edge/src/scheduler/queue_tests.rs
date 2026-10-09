@@ -7023,12 +7023,23 @@ async fn a_small_slot_pass_reads_one_page_not_the_frontier() {
 #[tokio::test]
 async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
     let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", &[])])
+    // Owner on iOS, dep on the macOS family's host triple — the
+    // unambiguous case `derive_edge_side` resolves to a host unit.
+    let dep = host_dependency_on("aarch64-apple-ios", "dep");
+    let host_target = dep.target.as_str().to_owned();
+    enqueue(&db, std::slice::from_ref(&dep))
         .await
         .expect("enqueue dep");
-    enqueue(&db, &[request("parent", &[dependency("dep")])])
-        .await
-        .expect("enqueue parent");
+    enqueue(
+        &db,
+        &[request_on(
+            "parent",
+            "aarch64-apple-ios",
+            std::slice::from_ref(&dep),
+        )],
+    )
+    .await
+    .expect("enqueue parent");
     // The spelling the migration writes on an edge whose required
     // side it could not derive.
     db.query("UPDATE queue_dependencies SET dep_host_side = -1")
@@ -7054,25 +7065,61 @@ async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
     )
     .await
     .expect("complete dep");
-    publish(&db, "dep").await;
+    publish_shapes(
+        &db,
+        "dep",
+        &host_target,
+        &[
+            shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+            shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
+            shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
+            shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
+        ],
+    )
+    .await;
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim with unestablished edge");
     assert!(claimed.is_empty(), "a -1 edge satisfies no published row");
 
-    enqueue(&db, &[request("parent", &[dependency("dep")])])
+    // The request path never rewrites edges: a task id's edge set is a
+    // function of the id (stow#588), so a resubmit of the same id
+    // carries nothing new — the failing-closed row is the migration's
+    // job, and it stamps `dep_side_known = 0` to mark that.
+    db.query("UPDATE queue_dependencies SET dep_side_known = 0")
+        .execute()
         .await
-        .expect("re-request parent resyncs the edge");
+        .expect("stamp edge side unknown");
+    enqueue(
+        &db,
+        &[request_on(
+            "parent",
+            "aarch64-apple-ios",
+            std::slice::from_ref(&dep),
+        )],
+    )
+    .await
+    .expect("re-request parent leaves the edge alone");
     let side = db
         .query("SELECT dep_host_side FROM queue_dependencies")
         .fetch_scalar::<i64>()
         .await
         .expect("edge side");
-    assert_eq!(side, 0);
+    assert_eq!(side, -1, "the request path does not repair edges");
+
+    super::derive_dev_era_edge_sides(&db)
+        .await
+        .expect("migration derives the edge side");
+    let side = db
+        .query("SELECT dep_host_side FROM queue_dependencies")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("edge side");
+    assert_eq!(side, 1);
 
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
         .await
-        .expect("claim after resync");
+        .expect("claim after migration resync");
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].crate_name, "parent");
 }

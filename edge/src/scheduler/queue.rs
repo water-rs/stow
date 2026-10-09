@@ -721,63 +721,15 @@ async fn apply_batched_inserts(
     Ok(inserted)
 }
 
-/// Sync the dependency edges of every task the chunk resynced as a
-/// delta, not a rewrite: the DELETE drops only edges the task's new
-/// report no longer carries — a reported edge whose stored columns
-/// already match survives untouched, so a resubmit with an unchanged
-/// dependency set writes nothing. Rewriting wholesale (delete all +
-/// reinsert) billed `2 × edges` rows per resubmit; at ~20k submits a
-/// day with production-size dep lists that was the dominant rows-written
-/// source. A content-changed edge counts as dropped and the INSERT
-/// re-adds it with the new columns; a legacy `dep_side_known = 0` row
-/// never matches a resolver-written report, so it is deleted and
-/// reinserted as known rather than left failing closed.
-async fn apply_batched_dependency_sync(
-    db: &DurableDb,
-    resync_ids: &[String],
-    edges: &[BatchedDepEdge],
-) -> Result<(), QueueError> {
-    for chunk in resync_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
-        // The reported edge set is scoped to the tasks in this chunk so
-        // a keep-check never consults another chunk's report.
-        let chunk_ids: std::collections::HashSet<&str> = chunk.iter().map(String::as_str).collect();
-        let chunk_edges: Vec<&BatchedDepEdge> = edges
-            .iter()
-            .filter(|edge| chunk_ids.contains(edge.task_id.as_str()))
-            .collect();
-        db.query(
-            "DELETE FROM queue_dependencies \
-             WHERE task_id IN (SELECT value FROM json_each(?)) \
-               AND (dep_side_known != 1 OR NOT EXISTS ( \
-                   SELECT 1 FROM (SELECT value AS e FROM json_each(?)) AS j \
-                   WHERE j.e ->> 'task_id' = queue_dependencies.task_id \
-                     AND j.e ->> 'depends_on_task_id' = queue_dependencies.depends_on_task_id \
-                     AND j.e ->> 'dep_crate_name' = queue_dependencies.dep_crate_name \
-                     AND j.e ->> 'dep_version' = queue_dependencies.dep_version \
-                     AND j.e ->> 'dep_features_json' = queue_dependencies.dep_features_json \
-                     AND j.e ->> 'dep_target' = queue_dependencies.dep_target \
-                     AND j.e ->> 'dep_rustc_version' = queue_dependencies.dep_rustc_version \
-                     AND j.e ->> 'dep_host_side' = queue_dependencies.dep_host_side \
-                     AND j.e ->> 'dep_dependency_identity' = queue_dependencies.dep_dependency_identity \
-                     AND j.e ->> 'dep_invocations' = queue_dependencies.dep_invocations \
-                     AND j.e ->> 'dep_shapes' = queue_dependencies.dep_shapes \
-               ))",
-        )
-        .bind(enqueue_json(chunk)?)
-        .bind(enqueue_json(&chunk_edges)?)
-        .execute()
-        .await
-        .map_err(|error| format!("clear dropped task dependencies: {error}"))?;
-    }
-    insert_dep_edges(db, edges).await?;
-    Ok(())
-}
-
-/// Insert the resync's surviving edges, each carrying its `dep_met` —
-/// the slice answer at insert time, the same EXISTS the gate used to
-/// evaluate — so the owner's `unpublished_deps` count and every later
-/// slice-delta flip read a stored flag instead of re-joining the
-/// published rows per edge.
+/// Insert the edges of the tasks this request inserts, each carrying
+/// its `dep_met` — the slice answer at insert time, the same EXISTS
+/// the gate used to evaluate — so the owner's `unpublished_deps`
+/// count and every later slice-delta flip read a stored flag instead
+/// of re-joining the published rows per edge. `ON CONFLICT` tolerates
+/// a stale edge row outliving its queue row (edges are a function of
+/// the owner task id, so the row is identical by construction), and
+/// the slice deltas' `dep_met` maintenance keeps it current while the
+/// owner is gone.
 async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<(), QueueError> {
     for chunk in edges.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(&format!(
@@ -1057,17 +1009,18 @@ async fn enqueue_inner(
             budget: u64::from(settings.human_daily_task_budget),
         });
     }
-    let resync_ids: Vec<String> = plan.resync.keys().cloned().collect();
-    let edges: Vec<BatchedDepEdge> = plan.resync.into_values().flatten().collect();
-    apply_batched_dependency_sync(db, &resync_ids, &edges).await?;
+    let edge_owner_ids: Vec<String> = plan.edge_inserts.keys().cloned().collect();
+    let edges: Vec<BatchedDepEdge> = plan.edge_inserts.into_values().flatten().collect();
+    insert_dep_edges(db, &edges).await?;
     let inserted = apply_batched_inserts(db, settings, &plan.inserts).await?;
     apply_batched_updates(db, settings, &plan.updates).await?;
 
-    // The batch's edge set is settled — refresh the gate answer on
-    // pre-existing tasks whose edges the sync rewrote. Fresh inserts
-    // computed theirs inside the INSERT; an empty resync set issues
-    // no statement at all.
-    refresh_deps_met_tasks(db, &resync_ids).await?;
+    // The batch's edge set is settled — recount the gate answer on the
+    // tasks the request inserted. Their INSERT already folded the
+    // edges just written, so this only moves a row whose insert hit a
+    // conflict (a stale edge set from a deleted queue row, maintained
+    // by slice deltas in between); an empty set issues no statement.
+    refresh_deps_met_tasks(db, &edge_owner_ids).await?;
 
     u64_to_u32(inserted, "inserted task count")
 }
@@ -1239,9 +1192,11 @@ fn node_store_rows(
 struct EnqueuePlan {
     updates: Vec<BatchedUpdate>,
     inserts: Vec<BatchedInsert>,
-    /// Task ids whose edge set is rewritten this chunk — the key set
-    /// feeds the bulk DELETE, the rows the bulk INSERT.
-    resync: BTreeMap<String, Vec<BatchedDepEdge>>,
+    /// Edge sets of the tasks this chunk inserts — keyed by owner task
+    /// id. Only fresh rows get edges: a task id commits to its whole
+    /// dependency subgraph, so an existing id's stored edges are already
+    /// exactly these (stow#588).
+    edge_inserts: BTreeMap<String, Vec<BatchedDepEdge>>,
 }
 
 /// One existence probe for the chunk, over every task id it can
@@ -1274,8 +1229,7 @@ async fn probe_task_statuses(
 }
 
 /// One request's edge rows, fully resolved: the dep's required unit
-/// shapes for the gate and a self-edge rejection — the checks
-/// `sync_task_dependencies` ran per dep before each edge INSERT.
+/// shapes for the gate and a self-edge rejection.
 fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
     let mut edges = Vec::with_capacity(entry.deps.len());
     for (dependency, dep_task_id) in entry.deps.iter().zip(entry.dep_task_ids.iter()) {
@@ -1318,11 +1272,11 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
 /// order: each request's own insert/update, then its dep sync. A task
 /// appearing twice in one chunk sees what its earlier occurrence left
 /// (a fresh insert reads as 'pending', a resurrected row as 'pending'),
-/// so duplicates land identically to the row-at-a-time loop. `resync`
-/// keeps the last occurrence's dependency list per task — the old
-/// loop's per-occurrence DELETE+INSERT made the last sync the
-/// surviving one. `statuses` carries the existence probe in and is
-/// advanced to the row each occurrence leaves.
+/// so duplicates land identically to the row-at-a-time loop.
+/// `edge_inserts` holds the first occurrence's dependency list per
+/// task — only a task the chunk inserts can carry new edges. `statuses`
+/// carries the existence probe in and is advanced to the row each
+/// occurrence leaves.
 fn plan_enqueue(
     prepared: &[Prepared<'_>],
     statuses: &mut BTreeMap<String, String>,
@@ -1331,7 +1285,7 @@ fn plan_enqueue(
     let mut plan = EnqueuePlan {
         updates: Vec::new(),
         inserts: Vec::new(),
-        resync: BTreeMap::new(),
+        edge_inserts: BTreeMap::new(),
     };
     for entry in prepared {
         let lane = request_lane(entry.request.source);
@@ -1370,15 +1324,17 @@ fn plan_enqueue(
                 lane: lane.as_str(),
             });
             statuses.insert(entry.task_id.clone(), "pending".to_owned());
+            // A task id commits to its whole dependency subgraph, so a
+            // task's edge set is a function of the id (stow#588): edges
+            // are written only for the row this request inserts — a
+            // re-enqueue of an existing id can carry nothing new, and
+            // pre-v15 `dep_side_known != 1` rows are the migration's
+            // job, never the request path's.
+            if !entry.deps.is_empty() {
+                let edges = dep_edges(entry)?;
+                plan.edge_inserts.insert(entry.task_id.clone(), edges);
+            }
         }
-        // A re-request without dependency info (exact/semantic miss
-        // paths always send an empty list) must not erase ordering
-        // edges a graph-analysis enqueue established.
-        if entry.deps.is_empty() {
-            continue;
-        }
-        let edges = dep_edges(entry)?;
-        plan.resync.insert(entry.task_id.clone(), edges);
     }
     plan.updates = updates.into_values().collect();
     Ok(plan)
@@ -6280,9 +6236,7 @@ fn to_slice_rows(rows: &[PublishedSliceRow]) -> Result<Vec<SliceRowJson>, QueueE
                 features_json: row.features_json.raw(),
                 dependency_identity: Some(dependency_identity.to_string()),
                 unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
-                unit_invocation: row
-                    .unit_shape
-                    .map_or(-1, |shape| shape.invocation.to_int()),
+                unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
                 unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
                 rowid: 0,
             })
@@ -7915,7 +7869,7 @@ async fn derive_dev_era_edge_sides(db: &DurableDb) -> Result<(), QueueError> {
         .fetch_all::<UnmaskedEdge>()
         .await
         .map_err(|error| format!("load unestablished dependency edges: {error}"))?;
-    for edge in side_edges {
+    for edge in &side_edges {
         let owner_target = edge.owner_target.as_deref().unwrap_or("");
         let owner_host_side = edge.owner_host_side.unwrap_or(0) != 0;
         let side = derive_edge_side(owner_target, owner_host_side, &edge.dep_target);
@@ -7932,12 +7886,33 @@ async fn derive_dev_era_edge_sides(db: &DurableDb) -> Result<(), QueueError> {
         .bind(side)
         .bind(mask)
         .bind(shapes)
-        .bind(edge.task_id)
-        .bind(edge.depends_on_task_id)
+        .bind(edge.task_id.clone())
+        .bind(edge.depends_on_task_id.clone())
         .execute()
         .await
         .map_err(|error| format!("derive dependency edge side: {error}"))?;
+        // `dep_met` is a stored answer the request path only writes at
+        // edge insert — nothing else re-evaluates a derived edge until
+        // a slice delta happens to touch it, so recount it here with
+        // the same EXISTS the insert evaluates (a second statement:
+        // a SET expression sees the row's old values).
+        db.query(&format!(
+            "UPDATE queue_dependencies \
+             SET dep_met = CASE WHEN {unpub} THEN 0 ELSE 1 END \
+             WHERE task_id = ? AND depends_on_task_id = ?",
+            unpub = dep_edge_unpublished_sql("queue_dependencies"),
+        ))
+        .bind(edge.task_id.clone())
+        .bind(edge.depends_on_task_id.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("recount derived edge coverage: {error}"))?;
     }
+    // The owners' stored counters (`unpublished_deps`/`deps_met`/
+    // `blocked`) follow from the edges just rewritten — recount them
+    // on exactly those rows.
+    let owner_ids: Vec<String> = side_edges.iter().map(|edge| edge.task_id.clone()).collect();
+    refresh_deps_met_tasks(db, &owner_ids).await?;
     Ok(())
 }
 
