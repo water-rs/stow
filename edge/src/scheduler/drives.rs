@@ -569,12 +569,12 @@ pub const DRIVES: &[Drive] = &[
                         task_ids: vec![
                             hex_id(u64::from(FixtureShape::pending_row(600))),
                             hex_id(u64::from(shape.failed_row(0))),
-                            // Human rows 2 and 3 sit on non-Windows
-                            // targets, so their seeded values are
-                            // `2 * VALUE_BAND + n % 7`: the adjacent
-                            // pair 36893574046765006/…65007.
-                            hex_id(2),
-                            hex_id(3),
+                            // Human rows 1993 and 1994 sit in the pin
+                            // window on non-Windows targets, so their
+                            // seeded values are `2 * VALUE_BAND + n % 7`:
+                            // the adjacent pair 36893574046765009/…65010.
+                            hex_id(1993),
+                            hex_id(1994),
                         ],
                         ..QueueSelector::default()
                     },
@@ -587,7 +587,7 @@ pub const DRIVES: &[Drive] = &[
                         .find(|task| task.task_id == hex_id(n))
                         .map(|task| task.value.clone())
                 };
-                for (n, expected) in [(2, "36893574046765006"), (3, "36893574046765007")] {
+                for (n, expected) in [(1993, "36893574046765009"), (1994, "36893574046765010")] {
                     let actual =
                         value_of(n).ok_or_else(|| format!("task {n} missing from the listing"))?;
                     if actual != expected {
