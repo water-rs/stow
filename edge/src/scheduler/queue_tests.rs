@@ -245,6 +245,13 @@ fn dependency(crate_name: &str) -> EnqueueRequest {
     request(crate_name, &[])
 }
 
+/// The dependency-context identity a leaf dep's own subgraph resolves
+/// to — what its `queue_dependencies` edge records and what a slice
+/// row must carry for the gate to release on it (stow#588).
+fn dep_identity(crate_name: &str) -> Option<stow_types::identity::DependencyIdentity> {
+    dependency(crate_name).dependency_identity().ok()
+}
+
 /// A host-side leaf dep as its own request — minted at the consumer
 /// family's host triple with `host_side`, the same identity its node
 /// resolves to inside the consumer's subgraph (stow#588).
@@ -2986,14 +2993,14 @@ fn gate_pub_rows() -> Vec<stow_types::api::PublishedSliceRow> {
         .iter()
         .flat_map(|name| full().iter().map(|s| (name, *s)).collect::<Vec<_>>())
         .map(|(name, s)| stow_types::api::PublishedSliceRow {
-            dependency_identity: None,
+            dependency_identity: dep_identity(name),
             crate_name: name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
             unit_shape: Some(s),
         })
         .chain(std::iter::once(stow_types::api::PublishedSliceRow {
-            dependency_identity: None,
+            dependency_identity: dep_identity("dep-short"),
             crate_name: "dep-short".parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -3059,14 +3066,19 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
             "INSERT INTO queue_dependencies \
                  (task_id, depends_on_task_id, dep_crate_name, dep_version, \
                   dep_features_json, dep_target, dep_rustc_version, \
-                  dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
-                 VALUES (?, ?, ?, '1.0.0', '[]', ?, ?, 0, ?, ?, ?)",
+                  dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_side_known) \
+                 VALUES (?, ?, ?, '1.0.0', '[]', ?, ?, 0, ?, ?, ?, ?)",
         )
         .bind(task_id_on("pair", TARGET))
         .bind(task_id_on(dep, TARGET))
         .bind(dep.to_owned())
         .bind(TARGET.to_owned())
         .bind(RUSTC.to_owned())
+        .bind(
+            dep_identity(dep)
+                .expect("leaf dep identity")
+                .to_string(),
+        )
         .bind(invocations)
         .bind(shapes)
         .bind(side_known)
@@ -3992,7 +4004,7 @@ async fn publish(db: &DurableDb, crate_name: &str) {
     let rows = [UnitKind::Linked, UnitKind::Unlinked]
         .iter()
         .map(|kind| stow_types::api::PublishedSliceRow {
-            dependency_identity: None,
+            dependency_identity: dep_identity(crate_name),
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -4011,7 +4023,7 @@ async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: 
     let rows = shapes
         .iter()
         .map(|shape| stow_types::api::PublishedSliceRow {
-            dependency_identity: None,
+            dependency_identity: dep_identity(crate_name),
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -4264,7 +4276,7 @@ fn dep_slice_rows(crate_name: &str) -> Vec<stow_types::api::PublishedSliceRow> {
     [UnitKind::Linked, UnitKind::Unlinked]
         .iter()
         .map(|kind| stow_types::api::PublishedSliceRow {
-            dependency_identity: None,
+            dependency_identity: dep_identity(crate_name),
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
@@ -4936,7 +4948,7 @@ async fn a_larger_slice_reports_whole() {
     let rows = (0..REPORT_ROWS)
         .flat_map(|index| {
             [UnitKind::Linked, UnitKind::Unlinked].map(|kind| stow_types::api::PublishedSliceRow {
-                dependency_identity: None,
+                dependency_identity: dep_identity(&format!("crate-{index}")),
                 crate_name: format!("crate-{index}").parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
@@ -7283,14 +7295,16 @@ async fn a_submit_chunk_issues_a_constant_statement_count() {
         .expect("enqueue chunk");
 
     let issued = log.lock().expect("log").len() - base;
-    // Eight: edge delete + edge insert + edge-flag probe + task
-    // insert + task update + dep-requeue + `deps_met` refresh +
-    // `dispatch_key` refresh, each a single statement over the
-    // whole chunk regardless of request count.
+    // Ten: node-store upsert (two bounded json_each batches over the
+    // chunk's ~3000-node batch) + edge delete + edge insert +
+    // edge-flag probe + task insert + task update + dep-requeue +
+    // `deps_met` refresh + `dispatch_key` refresh, each a bounded
+    // statement count over the whole chunk regardless of request
+    // count.
     assert!(
-        issued <= 8,
+        issued <= 10,
         "a 1000-request chunk must stay a constant statement count \
-             (measured 8), got {issued}"
+             (measured 10), got {issued}"
     );
 }
 

@@ -256,6 +256,10 @@ pub enum SeedPhase {
     /// The every-third-owner edge (`dep_n = n * 15485863`) — `n` runs
     /// `1..=pending_end`.
     EdgesThirds,
+    /// `task_nodes` for every queue row — `n` runs `1..=queue_rows`.
+    /// Runs after the edge phases so `children_json` can read the
+    /// seeded `queue_dependencies`.
+    Nodes,
     /// `published_slice_rows` for the completed identities — `n` runs
     /// `pending_end < n <= completed_end`. The caller inserts the
     /// `published_slices` header rows once this phase completes.
@@ -279,7 +283,7 @@ impl SeedPhase {
     /// counters (an ended phase reports its range end).
     pub fn range_end(self, shape: FixtureShape) -> u32 {
         match self {
-            Self::Queue => shape.queue_rows,
+            Self::Queue | Self::Nodes => shape.queue_rows,
             Self::EdgesEvery | Self::EdgesThirds | Self::DepsMet => shape.pending_end(),
             Self::Slices => shape.completed_end(),
             Self::FeedHeaders => feed_hist_hours(shape),
@@ -302,7 +306,8 @@ impl SeedPhase {
         match self {
             Self::Queue => Some(Self::EdgesEvery),
             Self::EdgesEvery => Some(Self::EdgesThirds),
-            Self::EdgesThirds => Some(Self::Slices),
+            Self::EdgesThirds => Some(Self::Nodes),
+            Self::Nodes => Some(Self::Slices),
             Self::Slices => Some(Self::DepsMet),
             Self::DepsMet => Some(Self::FeedHeaders),
             Self::FeedHeaders => Some(Self::FeedPages),
@@ -632,8 +637,8 @@ pub async fn seed_edges_chunk(
         "WITH RECURSIVE seq(n) AS ({seq}) \
          INSERT OR IGNORE INTO queue_dependencies \
              (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, \
-              dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, \
-              dep_side_known) \
+              dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, \
+              dep_invocations, dep_shapes, dep_side_known) \
          SELECT printf('%064x', n), \
                 printf('%064x', {dep}), \
                 'crate' || ({dep} / {CRATE_NAME_ROWS}), \
@@ -642,6 +647,7 @@ pub async fn seed_edges_chunk(
                 {dep_target_case}, \
                 CASE WHEN {dep} % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
                 CASE WHEN {dep} % 10 = 0 THEN 1 ELSE 0 END, \
+                printf('%064x', {dep}), \
                 CASE WHEN {dep} % 10 = 0 THEN ({owner_mask}) ELSE ({dep_mask}) END, \
                 CASE WHEN {dep} % 10 = 0 THEN CASE WHEN n % 10 = 0 THEN 2 ELSE 1 END ELSE 2 END, \
                 1 \
@@ -657,6 +663,41 @@ pub async fn seed_edges_chunk(
     crate::scheduler::queue::changes(db).await
 }
 
+/// Seed `task_nodes` for queue rows `(lo, hi]` (stow#588): each row's
+/// node carries the same identity columns as its `queue` row, its own
+/// task id as the `dependency_identity` (the fixture's synthetic digest —
+/// edges and slice rows agree by the same formula), and a
+/// `children_json` built from the seeded `queue_dependencies`, so the
+/// dispatch walk can expand every claimable row's subgraph.
+async fn seed_nodes_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), QueueError> {
+    let target_case = target_case_sql("n");
+    db.query(&format!(
+        "WITH RECURSIVE seq(n) AS ({seq}) \
+         INSERT OR IGNORE INTO task_nodes \
+             (task_id, crate_name, version, features_json, target, rustc_version, \
+              host_side, dependency_identity, children_json) \
+         SELECT printf('%064x', n), \
+                'crate' || (n / {CRATE_NAME_ROWS}), \
+                '1.' || (n / 20000) || '.' || (n % 500), \
+                '[]', \
+                {target_case}, \
+                CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
+                CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
+                printf('%064x', n), \
+                COALESCE( \
+                    (SELECT json_group_array(d.depends_on_task_id) \
+                     FROM queue_dependencies d \
+                     WHERE d.task_id = printf('%064x', n)), \
+                    '[]') \
+         FROM seq",
+        seq = seq_sql(lo, hi),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("seed task nodes: {error}"))?;
+    Ok(())
+}
+
 /// Seed the published-slice membership of completed rows `(lo, hi]` —
 /// two rows per node, the pair `required_unit_shapes` publishes for
 /// it: a host-side node (`n % 10 = 0`, the fixture's host arm)
@@ -670,26 +711,27 @@ pub async fn seed_slice_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), Qu
     db.query(&format!(
         "WITH RECURSIVE seq(n) AS ({seq}), \
          rows(target, rustc_version, generation, crate_name, version, features_json, \
-              unit_side, unit_invocation, unit_linked) AS ( \
+              dependency_identity, unit_side, unit_invocation, unit_linked) AS ( \
             SELECT {target_case}, \
                    CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
                    1, 'crate' || (n / {CRATE_NAME_ROWS}), '1.' || (n / 20000) || '.' || (n % 500), '[]', \
+                   printf('%064x', n), \
                    CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
                    CASE WHEN n % 10 = 0 THEN part ELSE {node_invocation} END, \
                    CASE WHEN n % 10 = 0 THEN 1 ELSE part END \
             FROM seq, (SELECT 0 AS part UNION ALL SELECT 1 AS part)) \
          INSERT OR IGNORE INTO published_slice_rows \
              (target, rustc_version, generation, crate_name, version, features_json, \
-              unit_side, unit_invocation, unit_linked) \
+              dependency_identity, unit_side, unit_invocation, unit_linked) \
          SELECT target, rustc_version, generation, crate_name, version, features_json, \
-                unit_side, unit_invocation, unit_linked \
+                dependency_identity, unit_side, unit_invocation, unit_linked \
          FROM rows \
          WHERE NOT EXISTS ( \
             SELECT 1 FROM published_slice_rows p \
             WHERE p.target = rows.target AND p.rustc_version = rows.rustc_version \
               AND p.generation = rows.generation AND p.crate_name = rows.crate_name \
               AND p.version = rows.version AND p.features_json = rows.features_json \
-              AND p.dependency_identity IS NULL \
+              AND p.dependency_identity = rows.dependency_identity \
               AND p.unit_side = rows.unit_side AND p.unit_invocation = rows.unit_invocation \
               AND p.unit_linked = rows.unit_linked)",
         seq = seq_sql(lo, hi),
@@ -1138,7 +1180,8 @@ pub const fn counted_table(phase: SeedPhase) -> Option<CountedTable> {
         SeedPhase::Slices => Some(CountedTable::Slices),
         // The feed phases write internal bulk the seed report does
         // not count — the three-counter codec stays untouched.
-        SeedPhase::DepsMet
+        SeedPhase::Nodes
+        | SeedPhase::DepsMet
         | SeedPhase::FeedHeaders
         | SeedPhase::FeedPages
         | SeedPhase::FeedStaged => None,
@@ -1195,6 +1238,7 @@ pub async fn seed_batch(
                     seed_slice_headers(db).await?;
                 }
             }
+            SeedPhase::Nodes => seed_nodes_chunk(db, n, hi).await?,
             SeedPhase::DepsMet => seed_deps_met_chunk(db, n, hi).await?,
             SeedPhase::FeedHeaders => seed_feed_headers_chunk(db, n, hi).await?,
             SeedPhase::FeedPages => {

@@ -1506,6 +1506,12 @@ pub const DRIVES: &[Drive] = &[
         // peak-wall bound exists to measure. On host the claim runs the
         // same queue code against the empty-catalog oracle — the host
         // gate checks statements and counters only.
+        // The claimed tasks' subgraph rebuild (stow#588) is priced in
+        // the same pass: `load_claimed_subgraphs` pays one bounded
+        // `task_id IN (…)` read per shared BFS level — at most
+        // `SUBGRAPH_WALK_MAX_LEVELS` (64) statements and `O(Σ reachable
+        // nodes)` rows read, bounded by the dispatched tasks' own
+        // subgraphs, never the queue bulk.
         name: "alarm pass",
         setup: None,
         run: |db, _shape, settings, ctx| {

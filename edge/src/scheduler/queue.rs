@@ -304,10 +304,27 @@ struct BatchedInsert {
     target: String,
     rustc_version: String,
     host_side: u8,
+    dependency_identity: String,
     downloads: i64,
     priority: i64,
     preserve_lockfile: u8,
     lane: &'static str,
+}
+
+/// One node-store row for the bulk `INSERT OR IGNORE INTO task_nodes`:
+/// the node's canonical identity plus its dependency digest and the
+/// JSON-encoded list of its direct-dependency task ids (stow#588).
+#[derive(Clone, serde::Serialize)]
+struct BatchedNodeRow {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    target: String,
+    rustc_version: String,
+    host_side: u8,
+    dependency_identity: String,
+    children_json: String,
 }
 
 /// One stored edge's readiness as probed for an insert chunk: whether
@@ -441,6 +458,7 @@ struct BatchedDepEdge {
     dep_target: String,
     dep_rustc_version: String,
     dep_host_side: u8,
+    dep_dependency_identity: String,
     dep_invocations: i64,
     dep_shapes: i64,
 }
@@ -660,9 +678,9 @@ async fn apply_batched_inserts(
         let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, dependency_identity, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
-                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'downloads', \
+                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'dependency_identity', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
                         1, lower(hex(randomblob(16))), e ->> 'first_requested_at', \
                         e ->> 'created_at', \
@@ -740,6 +758,7 @@ async fn apply_batched_dependency_sync(
                      AND j.e ->> 'dep_target' = queue_dependencies.dep_target \
                      AND j.e ->> 'dep_rustc_version' = queue_dependencies.dep_rustc_version \
                      AND j.e ->> 'dep_host_side' = queue_dependencies.dep_host_side \
+                     AND j.e ->> 'dep_dependency_identity' = queue_dependencies.dep_dependency_identity \
                      AND j.e ->> 'dep_invocations' = queue_dependencies.dep_invocations \
                      AND j.e ->> 'dep_shapes' = queue_dependencies.dep_shapes \
                ))",
@@ -763,10 +782,11 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
     for chunk in edges.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(&format!(
             "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_met, dep_side_known) \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_met, dep_side_known) \
              SELECT d.task_id, d.depends_on_task_id, d.dep_crate_name, \
                     d.dep_version, d.dep_features_json, d.dep_target, \
-                    d.dep_rustc_version, d.dep_host_side, d.dep_invocations, \
+                    d.dep_rustc_version, d.dep_host_side, d.dep_dependency_identity, \
+                    d.dep_invocations, \
                     d.dep_shapes, CASE WHEN {unpub} THEN 0 ELSE 1 END, 1 \
              FROM (SELECT e ->> 'task_id' AS task_id, \
                          e ->> 'depends_on_task_id' AS depends_on_task_id, \
@@ -776,6 +796,7 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
                          e ->> 'dep_target' AS dep_target, \
                          e ->> 'dep_rustc_version' AS dep_rustc_version, \
                          e ->> 'dep_host_side' AS dep_host_side, \
+                         e ->> 'dep_dependency_identity' AS dep_dependency_identity, \
                          e ->> 'dep_invocations' AS dep_invocations, \
                          e ->> 'dep_shapes' AS dep_shapes \
                    FROM (SELECT value AS e FROM json_each(?))) AS d \
@@ -787,6 +808,31 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
         .execute()
         .await
         .map_err(|error| format!("insert task dependencies: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Upsert every resolved-subgraph node into `task_nodes` — the
+/// submit-side half of the node store (stow#588). `INSERT OR IGNORE`:
+/// a task id is a content address, so a node another request already
+/// wrote is identical by construction and skipped. Batched by JSON
+/// like every enqueue write; the per-node payload is fixed-width plus
+/// one `children_json` array.
+async fn upsert_task_nodes(db: &DurableDb, rows: &[BatchedNodeRow]) -> Result<(), QueueError> {
+    for chunk in rows.chunks(ENQUEUE_JSON_BATCH_ROWS) {
+        db.query(
+            "INSERT OR IGNORE INTO task_nodes \
+             (task_id, crate_name, version, features_json, target, rustc_version, host_side, dependency_identity, children_json) \
+             SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', \
+                    e ->> 'features_json', e ->> 'target', e ->> 'rustc_version', \
+                    e ->> 'host_side', e ->> 'dependency_identity', \
+                    e ->> 'children_json' \
+             FROM (SELECT value AS e FROM json_each(?)) e",
+        )
+        .bind(enqueue_json(chunk)?)
+        .execute()
+        .await
+        .map_err(|error| format!("upsert task nodes: {error}"))?;
     }
     Ok(())
 }
@@ -916,9 +962,14 @@ async fn enqueue_inner(
             );
             continue;
         }
-        // Each named dep's task id resolves here once — the edge rows
-        // `dep_edges` builds key on them. The request derives its dep
-        // edges from the carried subgraph (stow#588).
+        // The request's subgraph resolves once: the task id, dep edges
+        // and node-store rows all derive from that one resolution — the
+        // validation `resolve` runs (indexes, self-edges, cycles) is the
+        // refusal for a request whose declared context cannot re-derive
+        // its ids (stow#588).
+        let graph = request.resolved_dependency_graph().map_err(|error| {
+            QueueError::Invariant(format!("resolve dependency subgraph: {error}"))
+        })?;
         let deps = request
             .depends_on()
             .map_err(|error| QueueError::Invariant(format!("derive dep edges: {error}")))?;
@@ -926,13 +977,21 @@ async fn enqueue_inner(
             .iter()
             .map(stow_types::api::EnqueueDependency::task_id)
             .collect();
+        let nodes = node_store_rows(&graph)?;
+        let root_dependency_identity = graph
+            .dependency_identity(0)
+            .ok_or_else(|| QueueError::Invariant("root node yields no digest".into()))?
+            .to_string();
         prepared.push(Prepared {
             request,
             task_id: request
                 .task_id()
                 .map_err(|error| QueueError::Invariant(format!("derive task id: {error}")))?,
             identity,
+            deps,
             dep_task_ids,
+            root_dependency_identity,
+            nodes,
         });
     }
     if prepared.is_empty() {
@@ -964,6 +1023,16 @@ async fn enqueue_inner(
     // priority that cannot exceed `compute_priority`'s own bound, so
     // only the update set needs the probe.
     check_update_band_bound(db, &plan.updates).await?;
+    // The content-addressed node store: every submit upserts every
+    // node of each request's resolved subgraph, root included, so a
+    // claimed task's `dependency_subgraph` can later be rebuilt by
+    // walking task ids alone (stow#588). Insert-or-ignore — dedup is
+    // by task id; storage grows with distinct nodes, not requests.
+    let node_rows: Vec<BatchedNodeRow> = prepared
+        .iter()
+        .flat_map(|entry| entry.nodes.iter().cloned())
+        .collect();
+    upsert_task_nodes(db, &node_rows).await?;
     // The human lane spends from a per-UTC-day budget — a mutating
     // charge, so it runs only after every read-only preflight above
     // has passed; a refused resubmit must not consume budget.
@@ -1004,13 +1073,72 @@ async fn enqueue_inner(
 }
 
 /// One request precomputed for the batched enqueue: queue identity,
-/// its deterministic task id, and the resolved task ids of its deps.
+/// its deterministic task id, the resolved deps of its carried
+/// subgraph, and the node-store rows the submit upserts (stow#588).
 struct Prepared<'r> {
     request: &'r EnqueueRequest,
     task_id: String,
     identity: TaskIdentity,
-    /// `task_id` of each `request.depends_on` entry, in the same order.
+    /// The request's direct dependencies, resolved from its carried
+    /// subgraph once.
+    deps: Vec<stow_types::api::EnqueueDependency>,
+    /// `task_id` of each `deps` entry, in the same order.
     dep_task_ids: Vec<String>,
+    /// The root node's dependency digest — what `task_id`'s `-d`
+    /// segment commits to; written to `queue.dependency_identity`.
+    root_dependency_identity: String,
+    /// Every node of the request's resolved subgraph, root included —
+    /// upserted into `task_nodes` by the write phase.
+    nodes: Vec<BatchedNodeRow>,
+}
+
+/// The node-store rows one request's resolved subgraph contributes:
+/// every node of the graph, root included, with its children's task
+/// ids encoded as JSON — the upsert set `enqueue` writes so dispatch
+/// can later walk the closure by task id alone (stow#588).
+fn node_store_rows(
+    graph: &stow_types::task_graph::ResolvedTaskGraph,
+) -> Result<Vec<BatchedNodeRow>, QueueError> {
+    let nodes = graph.nodes();
+    let mut rows = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let task_id = graph
+            .task_id(index)
+            .ok_or_else(|| {
+                QueueError::Invariant(format!("resolved node {index} yields no task id"))
+            })?
+            .to_owned();
+        let dependency_identity = graph
+            .dependency_identity(index)
+            .ok_or_else(|| {
+                QueueError::Invariant(format!("resolved node {index} yields no digest"))
+            })?
+            .to_string();
+        let children = node
+            .dependencies
+            .iter()
+            .map(|&dep| {
+                graph.task_id(dep).map(str::to_owned).ok_or_else(|| {
+                    QueueError::Invariant(format!(
+                        "resolved node {index} dep {dep} yields no task id"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<String>, QueueError>>()?;
+        rows.push(BatchedNodeRow {
+            task_id,
+            crate_name: node.identity.crate_name.as_str().to_owned(),
+            version: node.identity.version.to_string(),
+            features_json: node.identity.features_json.raw(),
+            target: node.identity.target.as_str().to_owned(),
+            rustc_version: node.identity.rustc_version.as_str().to_owned(),
+            host_side: u8::from(node.identity.host_side),
+            dependency_identity,
+            children_json: serde_json::to_string(&children)
+                .map_err(|error| QueueError::Sql(format!("encode node children json: {error}")))?,
+        });
+    }
+    Ok(rows)
 }
 
 /// Everything the write phase emits for one chunk, with the per-request
@@ -1056,12 +1184,8 @@ async fn probe_task_statuses(
 /// shapes for the gate and a self-edge rejection — the checks
 /// `sync_task_dependencies` ran per dep before each edge INSERT.
 fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
-    let request_deps = entry
-        .request
-        .depends_on()
-        .map_err(|error| QueueError::Invariant(format!("derive dep edges: {error}")))?;
-    let mut edges = Vec::with_capacity(request_deps.len());
-    for (dependency, dep_task_id) in request_deps.iter().zip(entry.dep_task_ids.iter()) {
+    let mut edges = Vec::with_capacity(entry.deps.len());
+    for (dependency, dep_task_id) in entry.deps.iter().zip(entry.dep_task_ids.iter()) {
         let dep_features = dependency.features_json.raw();
         let dep_version = dependency.version.to_string();
         // The gate needs every required unit shape of the dep's
@@ -1089,6 +1213,7 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
             dep_target: dependency.target.as_str().to_owned(),
             dep_rustc_version: dependency.rustc_version.as_str().to_owned(),
             dep_host_side: u8::from(dependency.host_side),
+            dep_dependency_identity: dependency.dependency_identity.to_string(),
             dep_invocations,
             dep_shapes,
         });
@@ -1145,6 +1270,7 @@ fn plan_enqueue(
                 target: entry.identity.target.clone(),
                 rustc_version: entry.identity.rustc_version.clone(),
                 host_side: u8::from(entry.identity.host_side),
+                dependency_identity: entry.root_dependency_identity.clone(),
                 downloads,
                 priority: compute_priority(entry.request.downloads, 0)?,
                 preserve_lockfile: u8::from(entry.request.preserve_lockfile),
@@ -1155,12 +1281,7 @@ fn plan_enqueue(
         // A re-request without dependency info (exact/semantic miss
         // paths always send an empty list) must not erase ordering
         // edges a graph-analysis enqueue established.
-        if entry
-            .request
-            .depends_on()
-            .map_err(|error| QueueError::Invariant(format!("derive dep edges: {error}")))?
-            .is_empty()
-        {
+        if entry.deps.is_empty() {
             continue;
         }
         let edges = dep_edges(entry)?;
@@ -2672,6 +2793,7 @@ fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
                AND p.crate_name = {dep}.dep_crate_name \
                AND p.version = {dep}.dep_version \
                AND p.features_json = {dep}.dep_features_json \
+               AND p.dependency_identity = {dep}.dep_dependency_identity \
                AND p.unit_side = {dep}.dep_host_side \
                AND p.unit_invocation BETWEEN 0 AND 1 \
                AND p.unit_linked BETWEEN 0 AND 1 \
@@ -3972,90 +4094,315 @@ pub async fn claim_dispatchable_tasks(
     }
     tracing::info!(selected, "scheduler claim_dispatchable_tasks selected rows");
 
-    load_claimed_dep_pins(db, &mut claimed).await?;
+    load_claimed_subgraphs(db, &mut claimed).await?;
 
     Ok(claimed)
 }
 
-/// Fill each claimed task's `dependency_subgraph` from its
-/// `queue_dependencies` rows: the (name, version, unified features, side)
-/// the dep's own task was published at — exactly what the dependent's
-/// wrapper manifest pins so its resolve lands on the published unit
-/// (stow#431). The rows carry direct-dep edges only, so each node is a
-/// leaf here (stow#588; scheduler storage rework is a follow-up).
-async fn load_claimed_dep_pins(
+/// One `task_nodes` row as the dispatch walk reads it.
+#[derive(Debug, skyzen::FromRow)]
+struct TaskNodeRow {
+    task_id: String,
+    crate_name: String,
+    version: String,
+    features_json: String,
+    host_side: i64,
+    children_json: String,
+}
+
+/// The deepest BFS level the node-store walk expands before declaring
+/// the stored graph cyclic — a resolved task graph is acyclic by
+/// construction, so a store that keeps growing past this bound is
+/// corrupt and the walk fails rather than looping.
+const SUBGRAPH_WALK_MAX_LEVELS: usize = 64;
+
+/// The per-level fetch bound: `json_each` over every claimed task's
+/// current frontier in a single statement. A level wider than this —
+/// impossible under real graphs, which stay far narrower — splits into
+/// successive bounded statements of the same shape.
+const SUBGRAPH_WALK_LEVEL_ROWS: usize = 512;
+
+/// Rebuild every claimed task's `BuildTaskPayload.dependency_subgraph`
+/// by walking the `task_nodes` store breadth-first from the task id
+/// (stow#588).
+///
+/// Cost shape: one bounded `task_id IN (…)` SELECT per BFS level shared
+/// by the whole claimed batch — never one query per node — so a pass
+/// costs `O(max depth over the claimed subgraphs)` statements and reads
+/// `O(Σ reachable nodes)` rows. A claimed task whose store chain is
+/// broken (its own node or any reachable node absent) cannot produce a
+/// payload whose `verified_dependency_graph` would hold, so it fails
+/// dispatch with the missing task id named — never a leaf substitute —
+/// and the rest of the batch still dispatches.
+/// Per-task walk state for [`load_claimed_subgraphs`]: the ordered
+/// list of discovered dependency node ids (the future `nodes` array —
+/// the root itself is implicit in the wire), the set for dedup, the
+/// level frontier, and the root node's own children (the future
+/// `root_deps`).
+struct SubgraphWalk {
+    node_ids: Vec<String>,
+    seen: std::collections::HashSet<String>,
+    frontier: Vec<String>,
+    root_children: Vec<String>,
+}
+
+async fn load_claimed_subgraphs(
     db: &DurableDb,
-    claimed: &mut [QueuedTask],
+    claimed: &mut Vec<QueuedTask>,
 ) -> Result<(), QueueError> {
     if claimed.is_empty() {
         return Ok(());
     }
-    let task_ids = claimed
-        .iter()
-        .map(|task| task.task_id.clone())
-        .collect::<Vec<_>>();
-    let rows = db
-        .query(
-            "SELECT task_id, dep_crate_name, dep_version, dep_features_json, dep_host_side \
-             FROM queue_dependencies \
-             WHERE task_id IN (SELECT value FROM json_each(?))",
-        )
-        .bind(enqueue_json(&task_ids)?)
-        .fetch_all::<DepPinRow>()
-        .await
-        .map_err(|error| format!("load claimed task dep pins: {error}"))?;
-    let mut by_task: std::collections::HashMap<String, Vec<stow_types::api::SubgraphNode>> =
-        std::collections::HashMap::new();
-    for row in rows {
-        // queue_dependencies stores the task's direct-dep edges only:
-        // each row is a subgraph node whose own `deps` stay empty — the
-        // dep's children are not in the table (see `QueuedTask::
-        // dependency_subgraph`).
-        let node = stow_types::api::SubgraphNode {
-            crate_name: CrateName::parse(row.dep_crate_name).map_err(|error| {
-                QueueError::Invariant(format!(
-                    "dep pin for {}: invalid crate name: {error}",
-                    row.task_id
-                ))
-            })?,
-            version: CrateVersion::new(semver::Version::parse(&row.dep_version).map_err(
-                |error| {
-                    QueueError::Invariant(format!(
-                        "dep pin for {}: invalid version: {error}",
-                        row.task_id
-                    ))
-                },
-            )?),
-            features_json: FeaturesJson::from_sorted(
-                serde_json::from_str(&row.dep_features_json).map_err(|error| {
-                    QueueError::Invariant(format!(
-                        "dep pin for {}: invalid features: {error}",
-                        row.task_id
-                    ))
-                })?,
-            )
-            .map_err(|error| {
-                QueueError::Invariant(format!(
-                    "dep pin for {}: invalid features: {error}",
-                    row.task_id
-                ))
-            })?,
-            host_side: row.dep_host_side != 0,
-            deps: Vec::new(),
-        };
-        by_task.entry(row.task_id).or_default().push(node);
+    let (mut walks, found, failed) = walk_claimed_subgraphs(db, claimed).await?;
+    // Fail the unbuildable tasks, naming the missing/unreached node id.
+    for (index, missing) in &failed {
+        let task = &claimed[*index];
+        let error = format!(
+            "node store cannot serve task {}: node {missing} absent ({} nodes walked)",
+            task.task_id,
+            walks[*index].as_ref().map_or(0, |w| w.node_ids.len())
+        );
+        fail_claimed_task(db, &task.task_id, &error).await?;
     }
-    for task in claimed.iter_mut() {
-        if let Some(nodes) = by_task.remove(&task.task_id) {
-            task.dependency_subgraph = stow_types::api::TaskSubgraph {
-                root_deps: (0..nodes.len())
-                    .map(|index| u32::try_from(index).expect("dep rows fit u32"))
-                    .collect(),
-                nodes,
-            };
+    // Drop failures from the claimed set (descending order keeps
+    // earlier indexes valid); `walks` entries for dropped tasks stay
+    // None and line up with `claimed` afterward.
+    for (index, _) in failed.iter().rev() {
+        claimed.remove(*index);
+        walks.remove(*index);
+    }
+
+    // Build each survivor's wire subgraph: `nodes` in discovery order,
+    // `root_deps` = the root row's children as node indexes. A store
+    // row whose own fields fail to parse is the same class of
+    // corruption as an absent node — fail that task too.
+    let mut build_failed: Vec<usize> = Vec::new();
+    for (index, task) in claimed.iter_mut().enumerate() {
+        let walk = walks[index].take().expect("surviving walk exists");
+        match build_task_subgraph(task, &walk, &found) {
+            Ok(subgraph) => task.dependency_subgraph = subgraph,
+            Err(error) => {
+                tracing::error!(task_id = %task.task_id, error = %error, "dispatch subgraph build failed");
+                fail_claimed_task(
+                    db,
+                    &task.task_id,
+                    &format!("node store row invalid for {}: {error}", task.task_id),
+                )
+                .await?;
+                build_failed.push(index);
+            }
         }
     }
+    for index in build_failed.into_iter().rev() {
+        claimed.remove(index);
+    }
     Ok(())
+}
+
+/// The walk half of [`load_claimed_subgraphs`]: level-0 roots in one
+/// `IN` query, then the union-of-frontiers expansion bounded per level,
+/// returning every task's `SubgraphWalk` (None where the walk broke),
+/// the fetched row set, and the (claimed index, missing id) pairs.
+async fn walk_claimed_subgraphs(
+    db: &DurableDb,
+    claimed: &[QueuedTask],
+) -> Result<
+    (
+        Vec<Option<SubgraphWalk>>,
+        std::collections::HashMap<String, TaskNodeRow>,
+        Vec<(usize, String)>,
+    ),
+    QueueError,
+> {
+    let mut found: std::collections::HashMap<String, TaskNodeRow> =
+        std::collections::HashMap::new();
+    for chunk in claimed
+        .iter()
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>()
+        .chunks(SUBGRAPH_WALK_LEVEL_ROWS)
+    {
+        for row in fetch_task_nodes(db, chunk).await? {
+            found.insert(row.task_id.clone(), row);
+        }
+    }
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    let mut walks: Vec<Option<SubgraphWalk>> = Vec::with_capacity(claimed.len());
+    for (index, task) in claimed.iter().enumerate() {
+        let Some(row) = found.get(&task.task_id) else {
+            walks.push(None);
+            failed.push((index, task.task_id.clone()));
+            continue;
+        };
+        let children = parse_node_children(&task.task_id, &row.children_json)?;
+        walks.push(Some(SubgraphWalk {
+            node_ids: Vec::new(),
+            seen: std::collections::HashSet::from([task.task_id.clone()]),
+            root_children: children.clone(),
+            frontier: children,
+        }));
+    }
+
+    // BFS levels: the union of every live walk's frontier goes out as
+    // one `IN` query; each walk then consumes its own slice.
+    for _level in 0..SUBGRAPH_WALK_MAX_LEVELS {
+        let union: Vec<String> = walks
+            .iter()
+            .filter_map(|walk| walk.as_ref())
+            .flat_map(|walk| walk.frontier.iter().cloned())
+            .collect();
+        if union.is_empty() {
+            break;
+        }
+        for chunk in union.chunks(SUBGRAPH_WALK_LEVEL_ROWS) {
+            for row in fetch_task_nodes(db, chunk).await? {
+                found.entry(row.task_id.clone()).or_insert(row);
+            }
+        }
+        for (index, slot) in walks.iter_mut().enumerate() {
+            let Some(walk) = slot else { continue };
+            let mut next: Vec<String> = Vec::new();
+            let mut missing: Option<String> = None;
+            for id in walk.frontier.drain(..) {
+                let Some(row) = found.get(&id) else {
+                    missing = Some(id);
+                    break;
+                };
+                if walk.seen.insert(id.clone()) {
+                    let children = parse_node_children(&id, &row.children_json)?;
+                    next.extend(children.into_iter().filter(|c| !walk.seen.contains(c)));
+                    walk.node_ids.push(id);
+                }
+            }
+            if let Some(id) = missing {
+                failed.push((index, id));
+                *slot = None;
+            } else {
+                walk.frontier = next;
+            }
+        }
+    }
+    // Any walk still holding a frontier grew past the level cap — the
+    // stored graph under it is cyclic/corrupt; fail it naming where.
+    for (index, slot) in walks.iter_mut().enumerate() {
+        if let Some(walk) = slot.take() {
+            if walk.frontier.is_empty() {
+                *slot = Some(walk);
+            } else {
+                failed.push((index, walk.frontier[0].clone()));
+            }
+        }
+    }
+    Ok((walks, found, failed))
+}
+
+/// Assemble one claimed task's `TaskSubgraph` from its finished walk —
+/// `nodes` in discovery order, `root_deps` mapped through the same
+/// positions. Any unbuildable store row is reported, never defaulted.
+fn build_task_subgraph(
+    task: &QueuedTask,
+    walk: &SubgraphWalk,
+    found: &std::collections::HashMap<String, TaskNodeRow>,
+) -> Result<stow_types::api::TaskSubgraph, String> {
+    let position: std::collections::HashMap<&str, u32> = walk
+        .node_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), u32::try_from(i).expect("node count fits u32")))
+        .collect();
+    let mut nodes = Vec::with_capacity(walk.node_ids.len());
+    for id in &walk.node_ids {
+        nodes.push(subgraph_node_from_store(&found[id], &position)?);
+    }
+    let root_deps: Vec<u32> = walk
+        .root_children
+        .iter()
+        .filter_map(|id| position.get(id.as_str()).copied())
+        .collect();
+    if root_deps.len() != walk.root_children.len() {
+        return Err(format!(
+            "root child missing from walked set for {}",
+            task.task_id
+        ));
+    }
+    Ok(stow_types::api::TaskSubgraph { root_deps, nodes })
+}
+
+/// Persist the hard dispatch failure for one claimed task — the node
+/// store could not serve its subgraph, so it can never verify a
+/// payload; the error message names the offending id.
+async fn fail_claimed_task(db: &DurableDb, task_id: &str, error: &str) -> Result<(), QueueError> {
+    tracing::error!(task_id = %task_id, error = %error, "dispatch subgraph walk failed");
+    db.query(
+        "UPDATE queue SET status = 'failed', error_msg = ?, updated_at = datetime('now')          WHERE task_id = ?",
+    )
+    .bind(error.to_owned())
+    .bind(task_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("mark undispatchable task failed: {error}"))?;
+    Ok(())
+}
+
+/// One bounded `task_id IN (…)` SELECT against the node store — the
+/// only read shape the dispatch walk uses (stow#588).
+async fn fetch_task_nodes(
+    db: &DurableDb,
+    task_ids: &[String],
+) -> Result<Vec<TaskNodeRow>, QueueError> {
+    db.query(
+        "SELECT task_id, crate_name, version, features_json, host_side, children_json \
+         FROM task_nodes \
+         WHERE task_id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(enqueue_json(task_ids)?)
+    .fetch_all::<TaskNodeRow>()
+    .await
+    .map_err(|error| format!("fetch task nodes: {error}").into())
+}
+
+/// Decode a node row's `children_json` — the task ids of its direct
+/// dependencies, in stored edge order. A malformed array is a corrupt
+/// store row, an invariant error naming the node.
+fn parse_node_children(task_id: &str, children_json: &str) -> Result<Vec<String>, QueueError> {
+    serde_json::from_str::<Vec<String>>(children_json).map_err(|error| {
+        QueueError::Invariant(format!(
+            "task node {task_id}: invalid children_json: {error}"
+        ))
+    })
+}
+
+/// Project a `task_nodes` row into the wire's `SubgraphNode`, mapping
+/// its children's task ids to positions in this task's node list.
+fn subgraph_node_from_store(
+    row: &TaskNodeRow,
+    position: &std::collections::HashMap<&str, u32>,
+) -> Result<stow_types::api::SubgraphNode, String> {
+    let children =
+        parse_node_children(&row.task_id, &row.children_json).map_err(|error| error.to_string())?;
+    Ok(stow_types::api::SubgraphNode {
+        crate_name: CrateName::parse(row.crate_name.as_str())
+            .map_err(|error| format!("node {}: invalid crate name: {error}", row.task_id))?,
+        version: CrateVersion::new(
+            semver::Version::parse(&row.version)
+                .map_err(|error| format!("node {}: invalid version: {error}", row.task_id))?,
+        ),
+        features_json: FeaturesJson::from_sorted(
+            serde_json::from_str(&row.features_json)
+                .map_err(|error| format!("node {}: invalid features: {error}", row.task_id))?,
+        )
+        .map_err(|error| format!("node {}: invalid features: {error}", row.task_id))?,
+        host_side: row.host_side != 0,
+        deps: children
+            .iter()
+            .map(|id| {
+                position
+                    .get(id.as_str())
+                    .copied()
+                    .ok_or_else(|| format!("node {}: child {id} not in walked set", row.task_id))
+            })
+            .collect::<Result<Vec<u32>, String>>()?,
+    })
 }
 
 /// Retire every candidate row whose semantic identity the artifact
@@ -5545,6 +5892,9 @@ struct SliceRowJson {
     crate_name: String,
     version: String,
     features_json: String,
+    /// The published row's contextual digest (stow#588): `None` means
+    /// unknown historical context — it satisfies no gate clause.
+    dependency_identity: Option<String>,
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
@@ -5571,6 +5921,7 @@ struct GateIdentity {
     crate_name: String,
     version: String,
     features_json: String,
+    dependency_identity: Option<String>,
     unit_side: i64,
     kind: Option<SliceChangeKind>,
 }
@@ -5580,6 +5931,9 @@ struct NormalizedGateRow {
     crate_name: String,
     version: String,
     features_json: String,
+    /// `None` serializes as JSON null — the match join's `=` never
+    /// binds it, so a context-free row flips no edge (stow#588).
+    dependency_identity: Option<String>,
     unit_side: i64,
     invocations: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5613,11 +5967,12 @@ struct OwnerDelta {
     cleared_blocker: i64,
 }
 
-fn slice_row_key(row: &SliceRowJson) -> (String, String, String, i64, i64, i64) {
+fn slice_row_key(row: &SliceRowJson) -> (String, String, String, Option<String>, i64, i64, i64) {
     (
         row.crate_name.clone(),
         row.version.clone(),
         row.features_json.clone(),
+        row.dependency_identity.clone(),
         row.unit_side,
         row.unit_invocation,
         row.unit_linked,
@@ -5649,6 +6004,7 @@ fn normalize_gate_rows(
             crate_name: row.crate_name,
             version: row.version,
             features_json: row.features_json,
+            dependency_identity: row.dependency_identity,
             unit_side: side.to_int(),
             kind,
         };
@@ -5661,6 +6017,7 @@ fn normalize_gate_rows(
             crate_name: identity.crate_name,
             version: identity.version,
             features_json: identity.features_json,
+            dependency_identity: identity.dependency_identity,
             unit_side: identity.unit_side,
             invocations,
             kind: identity.kind,
@@ -5823,6 +6180,7 @@ fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
             crate_name: row.crate_name.to_string(),
             version: row.version.to_string(),
             features_json: row.features_json.raw(),
+            dependency_identity: row.dependency_identity.as_ref().map(ToString::to_string),
             unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
             unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
             unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
@@ -5848,19 +6206,27 @@ async fn apply_slice_delta(
     if !retired.is_empty() {
         let retired_json = serde_json::to_string(retired)
             .map_err(|error| QueueError::Sql(format!("encode slice retire json: {error}")))?;
+        // NULL-safe identity match: a retired row's `dependency_identity`
+        // can be NULL (unknown historical context) and `=` never binds
+        // NULL — `IS` is the only comparator that retires it.
         db.query(
             "DELETE FROM published_slice_rows \
-             WHERE (target, rustc_version, generation, crate_name, version, features_json, \
-                    unit_side, unit_invocation, unit_linked) IN ( \
-                 SELECT ?, ?, ?, value ->> 'crate_name', value ->> 'version', \
-                        value ->> 'features_json', value ->> 'unit_side', \
-                        value ->> 'unit_invocation', value ->> 'unit_linked' \
-                 FROM json_each(?))",
+             WHERE rowid IN ( \
+                 SELECT p.rowid FROM published_slice_rows p \
+                 JOIN (SELECT value AS e FROM json_each(?)) j \
+                   ON p.target = ? AND p.rustc_version = ? AND p.generation = ? \
+                  AND p.crate_name = j.e ->> 'crate_name' \
+                  AND p.version = j.e ->> 'version' \
+                  AND p.features_json = j.e ->> 'features_json' \
+                  AND p.dependency_identity IS j.e ->> 'dependency_identity' \
+                  AND p.unit_side = j.e ->> 'unit_side' \
+                  AND p.unit_invocation = j.e ->> 'unit_invocation' \
+                  AND p.unit_linked = j.e ->> 'unit_linked')",
         )
+        .bind(retired_json)
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
         .bind(live_generation)
-        .bind(retired_json)
         .execute()
         .await
         .map_err(|error| format!("drop retired slice rows {target}/{rustc_version}: {error}"))?;
@@ -5878,9 +6244,10 @@ async fn apply_slice_delta(
             .map_err(|error| QueueError::Sql(format!("encode slice insert json: {error}")))?;
         db.query(
             "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked) \
+             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked) \
              SELECT ?, ?, ?, e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
-                    e ->> 'unit_side', e ->> 'unit_invocation', e ->> 'unit_linked' \
+                    e ->> 'dependency_identity', e ->> 'unit_side', \
+                    e ->> 'unit_invocation', e ->> 'unit_linked' \
              FROM (SELECT value AS e FROM json_each(?)) \
              WHERE TRUE \
              ON CONFLICT DO NOTHING",
@@ -5917,7 +6284,7 @@ async fn apply_slice_row_delta(
 ) -> Result<Vec<SliceRowJson>, QueueError> {
     let live_rows = db
         .query(
-            "SELECT rowid, crate_name, version, features_json, unit_side, unit_invocation, unit_linked \
+            "SELECT rowid, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked \
              FROM published_slice_rows \
              WHERE target = ? AND rustc_version = ? AND generation = ?",
         )
@@ -5967,9 +6334,10 @@ async fn apply_slice_row_delta(
             .map_err(|error| QueueError::Sql(format!("encode slice insert json: {error}")))?;
         db.query(
             "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json, unit_side, unit_invocation, unit_linked) \
+             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked) \
              SELECT ?, ?, ?, e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
-                    e ->> 'unit_side', e ->> 'unit_invocation', e ->> 'unit_linked' \
+                    e ->> 'dependency_identity', e ->> 'unit_side', \
+                    e ->> 'unit_invocation', e ->> 'unit_linked' \
              FROM (SELECT value AS e FROM json_each(?)) \
              WHERE TRUE \
              ON CONFLICT DO NOTHING",
@@ -6093,6 +6461,7 @@ fn matched_edges_sql(directional_delta: bool) -> String {
           AND d.dep_version = j.c ->> 'version' \
           AND d.dep_features_json = j.c ->> 'features_json' \
           AND d.dep_host_side = j.c ->> 'unit_side' \
+          AND d.dep_dependency_identity = j.c ->> 'dependency_identity' \
           AND (d.dep_invocations & (j.c ->> 'invocations')) != 0 \
           {direction_filter}",
     )
@@ -6238,7 +6607,7 @@ async fn apply_slice_gate_delta(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -6394,6 +6763,23 @@ pub async fn migrate(
         )));
     }
     migrate_schema(db).await?;
+    // The dependency-identity rebuilds run ahead of every other step
+    // (stow#588): `queue` and `published_slice_rows` are renamed aside
+    // and repopulated in bounded batches across repeated migrate calls,
+    // because the uniqueness/identity columns must come up through a
+    // table rebuild, not an ALTER. While either copy is in flight the
+    // remaining steps stay off and the version stamp holds at its
+    // stored value — the report's `after` answers SCHEMA_VERSION only
+    // once both copies verified and the legacy tables dropped, so the
+    // deploy gate keeps calling until the rebuild completes. Reads keep
+    // working throughout: the renamed-aside row set stays queryable as
+    // `*_identity_legacy` and the new table's column list is a superset.
+    if !migrate_dependency_identity_rebuilds(db).await? {
+        return Ok(SchemaMigrationReport {
+            before,
+            after: stored_schema_version(db).await?,
+        });
+    }
     migrate_queue_dependencies_columns(db).await?;
     migrate_published_slice_row_shape(db).await?;
     migrate_published_slice_columns(db).await?;
@@ -6420,6 +6806,282 @@ pub async fn migrate(
         before,
         after: SCHEMA_VERSION,
     })
+}
+
+/// Rows one copy statement moves and statements one migrate call makes
+/// during the identity rebuilds — bounded so a call stays well inside
+/// the Durable Object's CPU budget; the operator's repeated migrate
+/// calls (the deploy gate retries until `after` matches) drive the
+/// cursors forward.
+const IDENTITY_COPY_BATCH_ROWS: i64 = 1_000;
+const IDENTITY_COPY_BATCHES_PER_CALL: usize = 8;
+
+/// A table's column names — the probe the rebuild uses to tell whether
+/// the live table carries the identity column yet.
+async fn table_columns(
+    db: &DurableDb,
+    table: &str,
+) -> Result<std::collections::BTreeSet<String>, QueueError> {
+    Ok(db
+        .query(&format!("PRAGMA table_info({table})"))
+        .fetch_all::<QueueTableInfoRow>()
+        .await
+        .map_err(|error| format!("load {table} table_info: {error}"))?
+        .into_iter()
+        .map(|row| row.name)
+        .collect())
+}
+
+/// One stored rebuild cursor from `settings` (`NULL`/`0` means the copy
+/// has not started).
+async fn identity_copy_cursor(db: &DurableDb, key: &str) -> Result<String, QueueError> {
+    Ok(db
+        .query("SELECT value FROM settings WHERE key = ?")
+        .bind(key.to_owned())
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("read identity copy cursor {key}: {error}"))?
+        .unwrap_or_default())
+}
+
+async fn set_identity_copy_cursor(
+    db: &DurableDb,
+    key: &str,
+    value: &str,
+) -> Result<(), QueueError> {
+    db.query(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key.to_owned())
+    .bind(value.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("write identity copy cursor {key}: {error}"))?;
+    Ok(())
+}
+
+/// The `queue` half of the version-15 identity rebuild (stow#588): the
+/// task-id uniqueness change is a table rebuild — the old table moves
+/// to `queue_identity_legacy` and a fresh `queue` (the schema.sql
+/// shape, `dependency_identity` included) receives the rows in bounded
+/// `task_id`-ordered batches across repeated migrate calls. Returns
+/// `false` while the copy is incomplete; `true` once the copy verified
+/// and the legacy table dropped. Historical rows get `NULL`
+/// `dependency_identity` — unknown context, never guessed.
+async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
+    const CURSOR_KEY: &str = "migrate_queue_identity_cursor";
+    if table_columns(db, "queue")
+        .await?
+        .contains("dependency_identity")
+    {
+        // Already the new shape; a stranded legacy table means a call
+        // died between verify and drop — finish it.
+        if !table_columns(db, "queue_identity_legacy").await?.is_empty() {
+            verify_queue_identity_copy(db).await?;
+            db.query("DROP TABLE queue_identity_legacy")
+                .execute()
+                .await
+                .map_err(|error| format!("drop queue_identity_legacy: {error}"))?;
+        }
+        return Ok(true);
+    }
+    if table_columns(db, "queue_identity_legacy").await?.is_empty() {
+        // Contract step of the rename: the live table aside, the new
+        // one (plus its indexes and triggers) arrives through the
+        // schema file itself so the copy writes the same shape fresh
+        // databases get.
+        db.query("ALTER TABLE queue RENAME TO queue_identity_legacy")
+            .execute()
+            .await
+            .map_err(|error| format!("rename queue for identity rebuild: {error}"))?;
+        db.query(include_str!("schema.sql"))
+            .execute()
+            .await
+            .map_err(|error| format!("recreate queue after identity rename: {error}"))?;
+        // The status counters are trigger-maintained: the fresh table
+        // starts empty and the copy's inserts re-populate them row by
+        // row — `queue_status_counts` must reset with it.
+        db.query("DELETE FROM queue_status_counts")
+            .execute()
+            .await
+            .map_err(|error| format!("reset status counts for identity rebuild: {error}"))?;
+    }
+    let mut cursor = identity_copy_cursor(db, CURSOR_KEY).await?;
+    for _ in 0..IDENTITY_COPY_BATCHES_PER_CALL {
+        // The batch's upper bound is a separate probe: `INSERT OR
+        // IGNORE` may write fewer rows than it scanned (a live submit
+        // mid-migration already carries that task id), so the cursor
+        // cannot ride on an insert count.
+        let Some(bound) = db
+            .query(
+                "SELECT MAX(task_id) FROM ( \
+                     SELECT task_id FROM queue_identity_legacy \
+                     WHERE task_id > ? ORDER BY task_id LIMIT ?)",
+            )
+            .bind(cursor.clone())
+            .bind(IDENTITY_COPY_BATCH_ROWS)
+            .fetch_scalar_optional::<String>()
+            .await
+            .map_err(|error| format!("probe identity copy bound: {error}"))?
+        else {
+            // Copy exhausted: verify the full set landed, then contract.
+            verify_queue_identity_copy(db).await?;
+            db.query("DROP TABLE queue_identity_legacy")
+                .execute()
+                .await
+                .map_err(|error| format!("drop queue_identity_legacy: {error}"))?;
+            db.query("DELETE FROM settings WHERE key = ?")
+                .bind(CURSOR_KEY)
+                .execute()
+                .await
+                .map_err(|error| format!("clear identity copy cursor: {error}"))?;
+            return Ok(true);
+        };
+        db.query(include_str!("copy_queue_dependency_identity.sql"))
+            .bind(cursor.clone())
+            .bind(IDENTITY_COPY_BATCH_ROWS)
+            .execute()
+            .await
+            .map_err(|error| format!("copy queue rows for identity rebuild: {error}"))?;
+        set_identity_copy_cursor(db, CURSOR_KEY, &bound).await?;
+        cursor = bound;
+    }
+    Ok(false)
+}
+
+/// The verify half of the queue copy: every legacy row's immutable
+/// columns must appear in the rebuilt table and no copied row may
+/// carry a digest. Fails the migrate call — the next call re-verifies
+/// rather than trusting a claimed completion.
+async fn verify_queue_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
+    let differs = db
+        .query(include_str!("verify_queue_dependency_identity.sql"))
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("verify queue identity copy: {error}"))?;
+    if differs != 0 {
+        return Err(QueueError::Invariant(
+            "queue identity rebuild: copied rows diverge from queue_identity_legacy".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The `published_slice_rows` half of the version-15 identity rebuild:
+/// same rename/copy/verify/drop shape as [`migrate_queue_dependency_identity`],
+/// keyed on `rowid` because the table's primary key includes the
+/// column being added. `dependency_identity` lands NULL on every
+/// historical row — pre-identity reports never carried context.
+async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
+    const CURSOR_KEY: &str = "migrate_slice_identity_cursor";
+    if table_columns(db, "published_slice_rows")
+        .await?
+        .contains("dependency_identity")
+    {
+        if !table_columns(db, "published_slice_rows_identity_legacy")
+            .await?
+            .is_empty()
+        {
+            verify_slice_identity_copy(db).await?;
+            db.query("DROP TABLE published_slice_rows_identity_legacy")
+                .execute()
+                .await
+                .map_err(|error| format!("drop published_slice_rows_identity_legacy: {error}"))?;
+        }
+        return Ok(true);
+    }
+    if table_columns(db, "published_slice_rows_identity_legacy")
+        .await?
+        .is_empty()
+    {
+        db.query("ALTER TABLE published_slice_rows RENAME TO published_slice_rows_identity_legacy")
+            .execute()
+            .await
+            .map_err(|error| format!("rename slice rows for identity rebuild: {error}"))?;
+        db.query(include_str!("schema.sql"))
+            .execute()
+            .await
+            .map_err(|error| format!("recreate slice rows after identity rename: {error}"))?;
+    }
+    // `rowid` is the cursor: the legacy table kept its storage-order
+    // rowids through the rename.
+    let mut cursor = identity_copy_cursor(db, CURSOR_KEY).await?;
+    for _ in 0..IDENTITY_COPY_BATCHES_PER_CALL {
+        let Some(bound) = db
+            .query(
+                "SELECT MAX(rowid) FROM ( \
+                     SELECT rowid FROM published_slice_rows_identity_legacy \
+                     WHERE rowid > ? ORDER BY rowid LIMIT ?)",
+            )
+            .bind(cursor.clone())
+            .bind(IDENTITY_COPY_BATCH_ROWS)
+            .fetch_scalar_optional::<i64>()
+            .await
+            .map_err(|error| format!("probe slice identity copy bound: {error}"))?
+        else {
+            verify_slice_identity_copy(db).await?;
+            db.query("DROP TABLE published_slice_rows_identity_legacy")
+                .execute()
+                .await
+                .map_err(|error| format!("drop published_slice_rows_identity_legacy: {error}"))?;
+            db.query("DELETE FROM settings WHERE key = ?")
+                .bind(CURSOR_KEY)
+                .execute()
+                .await
+                .map_err(|error| format!("clear slice identity copy cursor: {error}"))?;
+            return Ok(true);
+        };
+        db.query(include_str!("copy_slice_dependency_identity.sql"))
+            .bind(cursor.clone())
+            .bind(IDENTITY_COPY_BATCH_ROWS)
+            .execute()
+            .await
+            .map_err(|error| format!("copy slice rows for identity rebuild: {error}"))?;
+        set_identity_copy_cursor(db, CURSOR_KEY, &bound.to_string()).await?;
+        cursor = bound.to_string();
+    }
+    Ok(false)
+}
+
+/// The slice copy's verify: every legacy membership tuple must be
+/// present in the rebuilt table (all nine membership columns are
+/// immutable — a slice row is only ever inserted or retired, so the
+/// comparison cannot drift).
+async fn verify_slice_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
+    let differs = db
+        .query(
+            "SELECT EXISTS ( \
+                 SELECT target, rustc_version, generation, crate_name, version, \
+                        features_json, unit_side, unit_invocation, unit_linked \
+                 FROM published_slice_rows_identity_legacy \
+                 EXCEPT \
+                 SELECT target, rustc_version, generation, crate_name, version, \
+                        features_json, unit_side, unit_invocation, unit_linked \
+                 FROM published_slice_rows) AS differs",
+        )
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("verify slice identity copy: {error}"))?;
+    if differs != 0 {
+        return Err(QueueError::Invariant(
+            "slice identity rebuild: copied rows diverge from published_slice_rows_identity_legacy"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Both identity rebuilds; `false` while either copy is still in
+/// flight so the caller holds the version stamp. `task_nodes` itself
+/// needs no copy: it is created fresh by `schema.sql` and populated
+/// only by new-code submits — historical rows carry no nodes by
+/// design (unknown context is never re-minted).
+async fn migrate_dependency_identity_rebuilds(db: &DurableDb) -> Result<bool, QueueError> {
+    if !migrate_queue_dependency_identity(db).await? {
+        return Ok(false);
+    }
+    migrate_slice_dependency_identity(db).await
 }
 
 /// The stored schema version, or 0 on a queue that predates the marker
@@ -6893,6 +7555,17 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
                 .await
                 .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
         }
+    }
+    // The dep's contextual digest (stow#588): nullable on purpose —
+    // edges written before the identity model carry NULL, and NULL
+    // satisfies no coverage clause.
+    if !columns.contains("dep_dependency_identity") {
+        db.query("ALTER TABLE queue_dependencies ADD COLUMN dep_dependency_identity TEXT")
+            .execute()
+            .await
+            .map_err(|error| {
+                format!("add queue_dependencies.dep_dependency_identity column: {error}")
+            })?;
     }
     if !columns.contains("dep_side_known") {
         db.query(
@@ -7405,16 +8078,6 @@ struct TaskIdRow {
     status: String,
 }
 
-/// One `queue_dependencies` row reduced to a [`QueuedTask`]'s dep pin.
-#[derive(Debug, skyzen::FromRow)]
-struct DepPinRow {
-    task_id: String,
-    dep_crate_name: String,
-    dep_version: String,
-    dep_features_json: String,
-    dep_host_side: i64,
-}
-
 /// One `GROUP BY status, lane, blocked` aggregate row from [`status`].
 #[derive(Debug, skyzen::FromRow)]
 struct StatusLaneCountRow {
@@ -7533,6 +8196,7 @@ mod tests {
             crate_name: "crate".to_owned(),
             version: "1.0.0".to_owned(),
             features_json: "[]".to_owned(),
+            dependency_identity: Some("dep".to_owned()),
             unit_side,
             unit_invocation,
             unit_linked,

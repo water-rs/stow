@@ -189,6 +189,34 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     PRIMARY KEY (task_id, depends_on_task_id)
 );
 
+-- The content-addressed dependency node store (stow#588): one row per
+-- distinct task-subgraph node any accepted enqueue request carried,
+-- keyed by the node's canonical task id. `children_json` is the JSON
+-- array of the node's direct-dependency task ids — an encoded column,
+-- not an edge table, because the only read is the dispatch walk's
+-- level-by-level expansion: one json_each-bounded SELECT per BFS level
+-- returns identities and children together, where an edge table would
+-- pay a second same-shape lookup per level for no extra reach (the
+-- queue_dependencies table already serves the gate's edge traversal).
+-- Inserted with insert-or-ignore semantics at submit: dedup is by task
+-- id, so storage grows with distinct nodes, not with requests.
+CREATE TABLE IF NOT EXISTS task_nodes (
+    task_id TEXT PRIMARY KEY,
+    crate_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    target TEXT NOT NULL,
+    rustc_version TEXT NOT NULL,
+    host_side INTEGER NOT NULL DEFAULT 0,
+    -- The Merkle dependency digest this node's task id commits to —
+    -- every node in the store carries it; NULL belongs to tables whose
+    -- context is historical, never here.
+    dependency_identity TEXT NOT NULL,
+    -- JSON array of this node's direct-dependency task ids, in the
+    -- resolved graph's edge order. `[]` for a leaf.
+    children_json TEXT NOT NULL DEFAULT '[]'
+);
+
 -- One demand batch's durable record (stow#522): the batch/window
 -- identity and payload contract the hourly demand feed (#523) replays
 -- against. `input_hash` is the blake3 fingerprint of the canonical
