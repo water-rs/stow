@@ -102,6 +102,9 @@ impl DependencyClosure {
 /// toolchain, same feature set, same lockfile policy — but from a pristine
 /// source tree.
 pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<DependencyClosure> {
+    // Same once-per-task check the build makes: the closure must resolve
+    // under the task's pinned release — refuse before the first cargo.
+    task::verified_run_toolchain(task)?;
     let root = TempDir::new().wrap_err("create closure resolution workspace")?;
     // The task resolves as a dependency of the generated wrapper package,
     // exactly as the build job compiled it — the wrapper decides which
