@@ -6252,31 +6252,24 @@ async fn apply_slice_delta(
     if !retired.is_empty() {
         let retired_json = serde_json::to_string(retired)
             .map_err(|error| QueueError::Sql(format!("encode slice retire json: {error}")))?;
-        // `json_each` drives: each retired row probes the table's own
-        // primary key (the leading (target, rustc_version, generation)
-        // bound constants, the remaining seven equality terms off the
-        // JSON row), so the delete costs one PK lookup per retired row
-        // — proportional to the delta, never a slice scan. `=` on
-        // `dependency_identity` is total post-v15: the column is
-        // NOT NULL (stow#588).
+        // `json_each` drives: each retired row is one row-value probe
+        // of the table's primary key — the ten-column tuple in PK order,
+        // `dependency_identity` included (NOT NULL post-v15, so row-value
+        // equality is exact; stow#588). One PK lookup per retired row,
+        // proportional to the delta, never a slice scan — and no rowid
+        // second seek.
         db.query(
             "DELETE FROM published_slice_rows \
-             WHERE rowid IN ( \
-                 SELECT p.rowid FROM (SELECT value AS e FROM json_each(?)) j \
-                 CROSS JOIN published_slice_rows p \
-                   ON p.target = ? AND p.rustc_version = ? AND p.generation = ? \
-                  AND p.crate_name = j.e ->> 'crate_name' \
-                  AND p.version = j.e ->> 'version' \
-                  AND p.features_json = j.e ->> 'features_json' \
-                  AND p.dependency_identity = j.e ->> 'dependency_identity' \
-                  AND p.unit_side = j.e ->> 'unit_side' \
-                  AND p.unit_invocation = j.e ->> 'unit_invocation' \
-                  AND p.unit_linked = j.e ->> 'unit_linked')",
+             WHERE (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked) IN ( \
+                 SELECT ?, ?, ?, e ->> 'crate_name', e ->> 'version', \
+                        e ->> 'features_json', e ->> 'dependency_identity', \
+                        e ->> 'unit_side', e ->> 'unit_invocation', e ->> 'unit_linked' \
+                 FROM (SELECT value AS e FROM json_each(?)))",
         )
-        .bind(retired_json)
         .bind(target.to_owned())
         .bind(rustc_version.to_owned())
         .bind(live_generation)
+        .bind(retired_json)
         .execute()
         .await
         .map_err(|error| format!("drop retired slice rows {target}/{rustc_version}: {error}"))?;
