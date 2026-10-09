@@ -390,8 +390,22 @@ impl Resolver {
         opts: &ResolveOptions,
         targets: &[String],
     ) -> CargoResult<Vec<(String, StowResolveOutput)>> {
+        // `default` inside the feature list is the lanes' spelling of
+        // "the package's default feature set", which
+        // `uses_default_features` already carries — the callers derive
+        // `no_default_features` from its absence. Cargo's `-F` grammar
+        // has no implicit `default` to activate: it accepts the name
+        // only when the manifest declares it, so passing the literal
+        // through rejects a feature-less package that cargo itself
+        // accepts (`TASK_FEATURES='["default"]'` over `itoa`).
+        let features: Vec<String> = opts
+            .features
+            .iter()
+            .filter(|feature| feature.as_str() != "default")
+            .cloned()
+            .collect();
         let cli_features = CliFeatures::from_command_line(
-            &opts.features,
+            &features,
             opts.all_features,
             !opts.no_default_features,
         )?;
