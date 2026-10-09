@@ -226,15 +226,46 @@ fn registry_home() -> (TempDir, PathBuf) {
     (home, reg)
 }
 
+/// The rustup name of the toolchain running this test binary —
+/// `RUSTUP_TOOLCHAIN` when the cargo proxy set it (`cargo +stable
+/// test`), else `rustup show active-toolchain`'s answer. The resolver
+/// is asked for this toolchain *by name*; `pinned_rustc_version` is the
+/// release that toolchain's rustc reports, so the probe's
+/// release-equals-pin check still holds when the name is a channel —
+/// CI runs only `stable`, where no toolchain literally named `1.99.0`
+/// exists.
+fn active_toolchain() -> &'static str {
+    static ACTIVE: OnceLock<String> = OnceLock::new();
+    ACTIVE.get_or_init(|| {
+        if let Ok(name) = std::env::var("RUSTUP_TOOLCHAIN") {
+            return name;
+        }
+        String::from_utf8(
+            std::process::Command::new("rustup")
+                .args(["show", "active-toolchain"])
+                .output()
+                .expect("rustup show active-toolchain")
+                .stdout,
+        )
+        .expect("active-toolchain is utf8")
+        .split_whitespace()
+        .next()
+        .expect("rustup reports a toolchain name")
+        .to_owned()
+    })
+}
+
 /// `Resolver` over the local registry, rustc pinned to the test
-/// toolchain. `stow-rustc-shim` is a `stow-resolver` binary — a test in
+/// toolchain's release, probed under [`active_toolchain`]'s rustup
+/// name. `stow-rustc-shim` is a `stow-resolver` binary — a test in
 /// this package gets no `CARGO_BIN_EXE_` for it, so build it once.
 /// `Resolver` over the same cargo home `fetch` and the sandbox use —
 /// its `local-registry` source names the registry under the home, the
 /// only registry path the phase grants cover.
 fn resolver_at(cargo_home: &Path) -> stow_resolver::Resolver {
-    stow_resolver::Resolver::with_cargo_home(
+    stow_resolver::Resolver::with_cargo_home_and_toolchain(
         cargo_home.to_path_buf(),
+        active_toolchain(),
         pinned_rustc_version(),
         shim_binary(),
     )

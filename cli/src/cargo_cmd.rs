@@ -4185,21 +4185,35 @@ fn journal_and_drain_misses(
         .map_or_else(|| cargo_target_dir(project, cargo_args), PathBuf::from);
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     // The drain mints each miss's dependency subgraph off the build's
-    // persisted expanded graph — a cache-key failure journals the units
-    // with an empty key, and they stay until a supervised resolve
-    // writes the graph (stow#588).
+    // persisted expanded graph when it can load it, and off the
+    // journal's context sidecar when it cannot (stow#588).
     let expanded_cache_key =
         crate::lockfile_graph_cache::cache_key(project).unwrap_or_else(|error| {
             tracing::warn!(error = %error, "could not key the expanded graph for the miss journal");
             String::new()
         });
+    let key_inputs = crate::lockfile_graph_cache::KeyInputs {
+        action: &project.action,
+        cargo_args: &project.cargo_args,
+        current_dir: &project.current_dir,
+        manifest_path: &project.manifest_path,
+        workspace_root: &project.workspace_root,
+        target: &project.target,
+        target_given: project.target_given,
+        rustc_version: &project.rustc_version,
+    };
+    let consumer = crate::miss_journal::JournalConsumer {
+        manifest_dir: project
+            .manifest_path
+            .parent()
+            .unwrap_or(project.current_dir.as_path()),
+        key: &key_inputs,
+    };
     crate::miss_journal::journal_supervised(
         &rustc,
-        &project.target,
-        &project.rustc_version,
+        &consumer,
         observations,
         &target_dir,
-        project.target_given,
         &expanded_cache_key,
     );
     crate::miss_journal::spawn_drain(&target_dir);

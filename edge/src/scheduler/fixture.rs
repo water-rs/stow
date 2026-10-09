@@ -597,17 +597,42 @@ pub async fn seed_edges_chunk(
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let completed_dep = shape.pending_end() + 1;
+    let completed_end = shape.completed_end();
     let thirds_where = format!("WHERE n % 3 = 0 AND (n <= {human_pin} OR n > {human_end})");
+    // `completed_dep` is the fixture's pinned dep leaf (stow#588): the
+    // claim's `deps_met = 1` gate admits only rows whose every edge is
+    // met — met means the dep row is published — so claimable rows'
+    // children point at the completed range. Arms that must produce
+    // claimable rows (the human-lane pin and every fourth pending row)
+    // all point at the SAME leaf, and any size-scaled random pick that
+    // would land in the completed range is rerouted to that leaf too —
+    // otherwise a met edge could name a different completed row at each
+    // size and the closure's node count would drift with the pick. The
+    // claimed set's node-store closure is then `{claimed, completed_dep}`
+    // — depth 1, claims+1 nodes — identical at every fixture size, the
+    // way the in-flight count and the slice delta are already pinned.
+    // Random picks that land on pending or in-flight rows stay put,
+    // which is what keeps most pending rows blocked on unmet deps.
     let (dep_expr, extra) = match phase {
         SeedPhase::EdgesEvery => (
             format!(
-                "CASE WHEN n > {human_pin} AND n <= {human_end} \
-                 THEN {completed_dep} + (n % 64) ELSE (n * 7919) % {rows} + 1 END"
+                "CASE WHEN n > {human_pin} AND n <= {human_end} THEN {completed_dep} \
+                      WHEN n % 4 = 0 THEN {completed_dep} \
+                      WHEN ((n * 7919) % {rows} + 1) >= {completed_dep} \
+                           AND ((n * 7919) % {rows} + 1) <= {completed_end} \
+                           THEN {completed_dep} \
+                      ELSE (n * 7919) % {rows} + 1 END"
             ),
             "",
         ),
         SeedPhase::EdgesThirds => (
-            format!("(n * 15485863) % {rows} + 1"),
+            format!(
+                "CASE WHEN n % 4 = 0 THEN {completed_dep} \
+                      WHEN ((n * 15485863) % {rows} + 1) >= {completed_dep} \
+                           AND ((n * 15485863) % {rows} + 1) <= {completed_end} \
+                           THEN {completed_dep} \
+                      ELSE (n * 15485863) % {rows} + 1 END"
+            ),
             thirds_where.as_str(),
         ),
         _ => return Err(QueueError::Sql("not an edge phase".to_owned())),
@@ -2161,5 +2186,103 @@ mod tests {
                 "crate lookup scans at {queue_rows} rows: {plan:?}"
             );
         }
+    }
+    /// The claimed set's node-store closure is pinned by the fixture
+    /// (stow#588): every claimable row's edges point at the shared
+    /// `completed_dep` leaf, so the walk's closure is `{claimed, leaf}`
+    /// — depth 1 — and its node count is the claim count plus one, at
+    /// every fixture size. The scale check's "alarm pass" rows read
+    /// must move only with the claimed count, never with stored bulk;
+    /// seed the gate's two fixture sizes and assert the closure is
+    /// identical, node for node.
+    #[tokio::test]
+    async fn claimed_set_closure_is_size_invariant() {
+        use crate::scheduler::queue::{CoverageOracle, SemanticTaskIdentity};
+        struct NoCoverage;
+        impl CoverageOracle for NoCoverage {
+            fn covered(
+                &self,
+                _identities: &[SemanticTaskIdentity],
+            ) -> impl std::future::Future<
+                Output = Result<std::collections::BTreeSet<SemanticTaskIdentity>, QueueError>,
+            > + Send {
+                std::future::ready(Ok(std::collections::BTreeSet::new()))
+            }
+        }
+        #[derive(Debug, skyzen::FromRow)]
+        struct NodeRow {
+            task_id: String,
+            children_json: String,
+        }
+        // The pinned leaf each claimable row's edges point at —
+        // `completed_dep` in `seed_edges_chunk`, `pending_end + 1`,
+        // spelled with the fixture's `printf('%064x', n)` task id.
+        let leaf_of = |shape: &FixtureShape| {
+            stow_types::fixture::task_hex_id(u64::from(shape.pending_end()) + 1)
+        };
+        let mut measured: Vec<(usize, usize, usize)> = Vec::new();
+        for queue_rows in [100_000u32, 1_000_000] {
+            let db = memory_db().await.expect("memory db");
+            let shape = FixtureShape { queue_rows };
+            seed_production_shape(&db, &shape, 0).await.expect("seed");
+            let settings = crate::scheduler::queue::SchedulerSettings {
+                dispatch_min_age_minutes: 0,
+                ..Default::default()
+            };
+            let claimed =
+                crate::scheduler::queue::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+                    .await
+                    .expect("claim");
+            assert!(!claimed.is_empty(), "{queue_rows} rows claimed nothing");
+            // The real walk's BFS: union the claimed ids' `children_json`
+            // level by level until the frontier empties.
+            let mut union: std::collections::HashSet<String> =
+                claimed.iter().map(|task| task.task_id.clone()).collect();
+            let mut frontier = union.iter().cloned().collect::<Vec<_>>();
+            let mut depth = 0usize;
+            while !frontier.is_empty() {
+                let json = serde_json::to_string(&frontier).expect("ids json");
+                let rows = db
+                    .query(
+                        "SELECT task_id, children_json FROM task_nodes                          WHERE task_id IN (SELECT value FROM json_each(?))",
+                    )
+                    .bind(json)
+                    .fetch_all::<NodeRow>()
+                    .await
+                    .expect("nodes");
+                let mut next = Vec::new();
+                for row in rows {
+                    let children: Vec<String> =
+                        serde_json::from_str(&row.children_json).expect("children");
+                    next.extend(children.into_iter().filter(|id| union.insert(id.clone())));
+                }
+                depth += 1;
+                frontier = next;
+                assert!(depth < 64, "walk outran the cycle bound");
+            }
+            // Every claimable row's children are the shared leaf, so
+            // the union is exactly `{claimed, leaf}`: claim count plus
+            // one node, two fetch levels — identical shape at every
+            // fixture size. Only the claim count itself moves (it is
+            // bounded by open slots and the page budget, not by stored
+            // bulk), so assert the closure's depth and per-claim size,
+            // which is what the scale check's rows-read bound prices.
+            let leaf = leaf_of(&shape);
+            assert!(
+                union
+                    .iter()
+                    .all(|id| { claimed.iter().any(|task| task.task_id == *id) || *id == leaf }),
+                "{queue_rows} rows: walk reached outside {{claimed, leaf}}: {union:?}"
+            );
+            measured.push((union.len() - claimed.len(), depth, claimed.len()));
+        }
+        assert_eq!(
+            measured[0].0, measured[1].0,
+            "closure size beyond the claimed rows must be identical: {measured:?}"
+        );
+        assert_eq!(
+            measured[0].1, measured[1].1,
+            "closure depth must be identical across sizes: {measured:?}"
+        );
     }
 }
