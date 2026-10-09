@@ -8,8 +8,8 @@ This repository builds a public Rust artifact cache pipeline around a trusted Gi
 ## The model
 
 stow is a graph whose nodes are library and macro crates, each at one identity:
-crate, version, feature set, target, rustc, profile, side. Nothing else is a
-node. A binary is not a node, a project is not a node, a workspace is not a
+crate, version, feature set, target, rustc, profile, side, and the digest of
+its resolved dependency subgraph. Nothing else is a node. A binary is not a node, a project is not a node, a workspace is not a
 node. The side is which half of a target's unit graph the node is: a crate
 a consumer links (`--extern`, the target side) and the same crate a
 consumer's proc-macro or build script links (the host side) compile as
@@ -96,8 +96,9 @@ each one as an ordinary crate task. The project is not cloned, its own code is n
 compiled, and whether it builds on any of our targets is irrelevant.
 
 Deduplication is a consequence of the unit being minimal, not a mechanism added on
-top. `task_id` is the blake3 of the identity tuple, so two projects that need the same
-crate at the same identity land on the same task and it is built once — nobody
+top. `task_id` spells the identity tuple plus a Merkle digest of the unit's resolved
+dependency subgraph, so two projects that need the same crate at the same identity
+land on the same task and it is built once — nobody
 arranged that. Make the unit coarser and no key design recovers it: ripgrep and fd
 overlap across nearly their whole dependency trees and overlap in nothing as tasks,
 because a task that means "ripgrep" is equal to no other task in the system. Every
