@@ -394,10 +394,24 @@ fn queue_seed_insert_sql(
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let lane_case = &format!("CASE WHEN n <= {human_end} THEN 'human' ELSE 'miss' END");
     let first_at = "datetime('now', '-' || (n % 2880) || ' minutes')";
+    let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
+    let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
+    // The claimable set is exactly the planted window (the human-lane
+    // pin + `DISPATCH_ELIGIBLE_ROWS`) at every size (stow#588): a
+    // pending row outside it carries a future `not_before`, which the
+    // claim's `not_before <= now` leg and — through `wake_at_sql`'s
+    // `MAX(first_at + age, not_before)` — the eligibility probes'
+    // `wake_at <= now` leg both refuse. Gating here instead of by
+    // unmet deps keeps the dev edge distribution: the demand walk and
+    // the probes' index scans see the same mixed met/unmet bulk every
+    // other drive's budget was measured on. Inside the window the
+    // ~5% `n % 20 = 1` pin still applies, as before.
     let not_before = &format!(
-        "CASE WHEN (n <= {failed_end} OR n > {in_flight_end}) AND n % 20 = 1 \
-         THEN datetime('now', '+30 minutes') \
-         ELSE '1970-01-01 00:00:00' END"
+        "CASE WHEN n <= {pending_end} AND (n <= {human_pin} OR n > {eligible_end}) \
+              THEN datetime('now', '+30 minutes') \
+              WHEN (n <= {failed_end} OR n > {in_flight_end}) AND n % 20 = 1 \
+              THEN datetime('now', '+30 minutes') \
+              ELSE '1970-01-01 00:00:00' END"
     );
     let last_24h = FixtureShape::LAST_24H_ROWS;
     // In-flight rows model attempts with a live heartbeat: stamped ahead
@@ -593,54 +607,52 @@ pub async fn seed_edges_chunk(
     lo: u32,
     hi: u32,
 ) -> Result<u64, QueueError> {
-    let pending_end = shape.pending_end();
+    let rows = shape.queue_rows;
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
-    // `completed_row(2)`: the pinned leaf must stay clear of the purge
-    // drive's `completed_row(0)`/`completed_row(1)` deletes — purging a
-    // row walks its dependents, and a leaf holding the claimable set's
-    // ~80 inbound edges turns `POST /tasks/purge` into a hub walk no
-    // production purge carries (stow#588).
+    // The window's dep pool starts at `completed_row(2)` —
+    // `pending_end + 3` — clear of the purge drive's
+    // `completed_row(0)`/`completed_row(1)` deletes: purging a row
+    // walks its dependents, and pool leaves carrying the claimable
+    // set's inbound edges would turn `POST /tasks/purge` into a hub
+    // walk no production purge carries (stow#588). The `+ (n % 64)`
+    // pool — origin/dev's shape for the human pin — spreads the
+    // window's edges across 64 completed leaves so no leaf accrues
+    // fan-in that grows with the window.
     let completed_dep = shape.pending_end() + 3;
-    let eligible_start = human_end;
     let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
-    let thirds_where =
-        format!("WHERE n % 3 = 0 AND n <= {pending_end} AND (n <= {human_pin} OR n > {human_end})");
-    // `completed_dep` is the fixture's pinned dep leaf (stow#588): the
-    // claim's `deps_met = 1` gate admits only rows whose every edge is
-    // met — met means the dep row is published — so claimable rows'
-    // children point at the completed range. The rows the claim can
-    // pick — the human-lane pin and the `DISPATCH_ELIGIBLE_ROWS` window
-    // the fixture plants just above it — all point at that one leaf.
-    // The claimable population is then fixed at every fixture size —
-    // the leaf's dependents are exactly the planted window — and the
-    // claimed set's node-store closure is `{claimed, completed_dep}`:
-    // depth 2, claims+1 nodes, identical at every fixture size, the
-    // way the in-flight count and the slice delta are already pinned.
+    let thirds_where = format!("WHERE n % 3 = 0 AND (n <= {human_pin} OR n > {eligible_end})");
+    // `completed_dep .. +64` is the fixture's pinned dep pool
+    // (stow#588): the claim's `deps_met = 1` gate admits only rows
+    // whose every edge is met — met means the dep row is published —
+    // so claimable rows' children point at the completed range. The
+    // rows the claim can pick — the human-lane pin and the
+    // `DISPATCH_ELIGIBLE_ROWS` window the fixture plants just above
+    // it — all point at that pool. The claimable population is then
+    // fixed at every fixture size — pool dependents are exactly the
+    // planted window — and the claimed set's node-store closure is
+    // `{claimed, their pool nodes}`: depth 2, identical at every
+    // fixture size, the way the in-flight count and the slice delta
+    // are already pinned.
     //
-    // Every other edge spreads over the PENDING range: the claim takes
-    // the top of the eligible frontier by `dispatch_key`, and a
-    // completed-range dep would make its owner a stray claimable row
-    // whose spread children differ across fixture sizes — the walk's
-    // node reads would move with stored bulk. A pending dep is always
-    // unmet, so a row outside the planted window can never claim and
-    // the frontier's top is the window itself at every size.
+    // Every other edge spreads over the WHOLE queue — origin/dev's
+    // distribution: mixed met/unmet, the bulk shape the demand walk
+    // and the other drives' budgets were measured on. A spread pick
+    // landing in the completed range leaves its owner `deps_met = 1`,
+    // but that stray stays unclaimable through the claim's
+    // `not_before` leg (`queue_seed_insert_sql` puts every non-window
+    // pending row behind a future `not_before`), so it never enters a
+    // claimed set's walk.
     let (dep_expr, extra) = match phase {
         SeedPhase::EdgesEvery => (
             format!(
-                "CASE WHEN n > {human_pin} AND n <= {human_end} THEN {completed_dep} \
-                      WHEN n > {eligible_start} AND n <= {eligible_end} THEN {completed_dep} \
-                      ELSE (n * 7919) % {pending_end} + 1 END"
+                "CASE WHEN n > {human_pin} AND n <= {eligible_end} \
+                      THEN {completed_dep} + (n % 64) \
+                      ELSE (n * 7919) % {rows} + 1 END"
             ),
-            format!("WHERE n <= {pending_end}"),
+            String::new(),
         ),
-        SeedPhase::EdgesThirds => (
-            format!(
-                "CASE WHEN n > {eligible_start} AND n <= {eligible_end} THEN {completed_dep} \
-                      ELSE (n * 15485863) % {pending_end} + 1 END"
-            ),
-            thirds_where,
-        ),
+        SeedPhase::EdgesThirds => (format!("(n * 15485863) % {rows} + 1"), thirds_where),
         _ => return Err(QueueError::Sql("not an edge phase".to_owned())),
     };
     // `dep` is the dep row's `n` as one parenthesized unit — spliced
@@ -1901,17 +1913,19 @@ mod tests {
             .await
             .expect("edges");
         assert_eq!(written, 200, "a fresh chunk inserts its whole range");
-        // Edges seed only for pending owners — completed rows own no
-        // edges (stow#588: a claimable dep's subgraph ends at a leaf),
-        // so the tail stops at `pending_end` (240 at this shape).
-        let resumed = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 100, 300)
+        // Edge chunks cover the pending domain — the phase's range_end
+        // is `pending_end` (240 at this shape), the only owners the
+        // seed ever writes edges for.
+        let pending_end = shape.pending_end();
+        let resumed = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 100, pending_end)
             .await
             .expect("overlapping chunk");
         assert_eq!(
-            resumed, 40,
-            "an overlapping chunk counts only its unwritten pending tail"
+            resumed,
+            u64::from(pending_end) - 200,
+            "an overlapping chunk counts only its unwritten tail"
         );
-        let replay = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, 300)
+        let replay = seed_edges_chunk(&db, shape, SeedPhase::EdgesEvery, 0, pending_end)
             .await
             .expect("replay");
         assert_eq!(replay, 0, "a replay inserts nothing");
@@ -1920,7 +1934,11 @@ mod tests {
             .fetch_scalar()
             .await
             .expect("count");
-        assert_eq!(rows, 240, "the table holds exactly the written union");
+        assert_eq!(
+            rows,
+            i64::from(pending_end),
+            "the table holds exactly the written union"
+        );
     }
 
     /// Queue and slice chunks replay idempotently too — the derived
