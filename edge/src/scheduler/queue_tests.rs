@@ -9040,9 +9040,15 @@ async fn migration_from_a_v14_database_preserves_every_row_edge_and_null_context
     assert_eq!(pending, 1);
 }
 
-/// A migrate call's bounded copy leaves the rest for the next call: the
-/// interrupted run keeps the legacy table and cursor, the retry finishes
-/// — `after` answers `SCHEMA_VERSION` only once the copy verified.
+/// A migrate call's bounded copy leaves the rest for the next call: an
+/// interrupted run keeps the live `queue` untouched (old code keeps
+/// reading and writing the real table at every moment — the shadow
+/// `queue_v15` is a mirror, never a serving table), the cursor resumes,
+/// and `after` answers `SCHEMA_VERSION` only once the shadow verified
+/// and swapped in. Writes that land between batches — a fresh submit,
+/// status updates on rows both sides of the cursor, a completion, a
+/// delete — are mirrored by the copy's triggers and survive the swap
+/// with their latest values.
 #[tokio::test]
 async fn migration_identity_copy_resumes_after_an_interrupted_batch_run() {
     let db = seed_v14_db().await;
@@ -9074,14 +9080,61 @@ async fn migration_identity_copy_resumes_after_an_interrupted_batch_run() {
         (14, 14),
         "an incomplete copy must not report SCHEMA_VERSION: {first:?}"
     );
-    let legacy_present = db
-        .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'queue_identity_legacy'")
+    // The live table keeps its name and full row count mid-copy —
+    // nothing was renamed aside — and the shadow holds the copied
+    // prefix beside it.
+    let live_rows = db
+        .query("SELECT COUNT(*) FROM queue")
         .fetch_scalar::<i64>()
         .await
-        .expect("legacy probe");
-    assert_eq!(legacy_present, 1, "the copy's source survives interruption");
+        .expect("live count");
+    assert_eq!(live_rows, rows, "live queue untouched during the copy");
+    let shadow_rows = db
+        .query("SELECT COUNT(*) FROM queue_v15")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("shadow count");
+    assert!(
+        0 < shadow_rows && shadow_rows < rows,
+        "partial copy in the shadow"
+    );
 
-    // Retry finishes the copy.
+    // Live writes land between the batches — the mirror triggers make
+    // each shadow row the newest write.
+    // A fresh submit whose id sorts below the cursor: only the mirror
+    // can carry it across (the cursor never walks back).
+    db.query(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         VALUES ('aaa-live-insert', 'livecrate', '2.0.0', '[]',
+            'aarch64-apple-darwin', '1.85.0', 'pending', 'miss')",
+    )
+    .execute()
+    .await
+    .expect("live insert mid-copy");
+    // A status update on an already-copied row must overwrite the
+    // shadow's stale copy (`failed`: a terminal status no migrate step
+    // rewrites).
+    db.query("UPDATE queue SET status = 'failed', attempt = 9 WHERE task_id = 'bulk-000001'")
+        .execute()
+        .await
+        .expect("update copied row");
+    // A completion touching a task the cursor has not reached: the
+    // mirror writes it before the copy's IGNORE can see it.
+    db.query(
+        "UPDATE queue SET status = 'completed', github_run_id = 'run-late', \
+            miss_count = 77 WHERE task_id = 'bulk-008001'",
+    )
+    .execute()
+    .await
+    .expect("complete uncopied row");
+    // A delete on an already-copied row must retire its shadow row too.
+    db.query("DELETE FROM queue WHERE task_id = 'bulk-000002'")
+        .execute()
+        .await
+        .expect("delete copied row");
+
+    // Retry finishes the copy and swaps the shadow in.
     let second = super::migrate(&db, &settings())
         .await
         .expect("migrate retry");
@@ -9091,13 +9144,23 @@ async fn migration_identity_copy_resumes_after_an_interrupted_batch_run() {
         .fetch_scalar::<i64>()
         .await
         .expect("count migrated rows");
-    assert_eq!(total, rows, "every bulk row copied with NULL context");
-    let legacy_gone = db
-        .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'queue_identity_legacy'")
+    assert_eq!(
+        total, rows,
+        "insert+delete cancel, every row has NULL context"
+    );
+    let shadow_gone = db
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v15'")
         .fetch_scalar::<i64>()
         .await
-        .expect("legacy probe");
-    assert_eq!(legacy_gone, 0, "verified copy drops the legacy table");
+        .expect("shadow probe");
+    assert_eq!(shadow_gone, 0, "swap drops the shadow tables");
+    let mirror_gone = db
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'v15_%_mirror_%'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("mirror probe");
+    assert_eq!(mirror_gone, 0, "swap drops the mirror triggers");
+    assert_interleaved_writes_survived(&db, rows).await;
 
     // Already migrated: a third pass is a pure no-op.
     let third = super::migrate(&db, &settings())
@@ -9107,6 +9170,275 @@ async fn migration_identity_copy_resumes_after_an_interrupted_batch_run() {
         (third.before, third.after),
         (super::SCHEMA_VERSION, super::SCHEMA_VERSION)
     );
+}
+
+/// Every interleaved write survived the swap with its latest value:
+/// mirrored rows always beat the copy's stale reads.
+async fn assert_interleaved_writes_survived(db: &DurableDb, rows: i64) {
+    let fresh = db
+        .query(
+            "SELECT COUNT(*) FROM queue WHERE task_id = 'aaa-live-insert' AND status = 'pending'",
+        )
+        .fetch_scalar::<i64>()
+        .await
+        .expect("mirrored insert");
+    assert_eq!(fresh, 1, "live insert below the cursor mirrored in");
+    let updated = db
+        .query("SELECT status || ':' || attempt FROM queue WHERE task_id = 'bulk-000001'")
+        .fetch_scalar::<String>()
+        .await
+        .expect("updated row");
+    assert_eq!(
+        updated, "failed:9",
+        "update on a copied row beats the stale copy"
+    );
+    let completed = db
+        .query(
+            "SELECT status || ':' || miss_count || ':' || github_run_id \
+                FROM queue WHERE task_id = 'bulk-008001'",
+        )
+        .fetch_scalar::<String>()
+        .await
+        .expect("completed row");
+    assert_eq!(
+        completed, "completed:77:run-late",
+        "completion on a not-yet-copied row survives the swap"
+    );
+    let deleted = db
+        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000002'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("deleted row");
+    assert_eq!(deleted, 0, "delete on a copied row retires its shadow");
+    // Status counters recomputed on the swapped table: 1601 seeded
+    // `completed` rows (x % 5 == 1 over x = 1..8001) minus the one the
+    // update moved to `failed`; the not-yet-copied completion stays
+    // `completed`, and the delete hit another `failed` row.
+    let completed_count = db
+        .query("SELECT n FROM queue_status_counts WHERE status = 'completed'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("completed count");
+    assert_eq!(completed_count, rows / 5, "counts recomputed post-swap");
+}
+
+/// Drive the queue copy's remaining batches to exhaustion with the same
+/// bound probe, copy statement and cursor write the migrate loop runs —
+/// the state a crash leaves when it dies after its last batch commit
+/// but before the verify+swap tick: copy complete, live `queue` intact.
+async fn drain_queue_identity_copy(db: &DurableDb) {
+    loop {
+        let cursor = db
+            .query("SELECT value FROM settings WHERE key = 'migrate_queue_identity_cursor'")
+            .fetch_scalar_optional::<String>()
+            .await
+            .expect("read cursor")
+            .unwrap_or_default();
+        let bound: Option<String> = db
+            .query(
+                "SELECT MAX(task_id) FROM ( \
+                     SELECT task_id FROM queue \
+                     WHERE task_id > ? ORDER BY task_id LIMIT ?)",
+            )
+            .bind(cursor.clone())
+            .bind(super::IDENTITY_COPY_BATCH_ROWS)
+            .fetch_scalar::<Option<String>>()
+            .await
+            .expect("bound probe");
+        let Some(bound) = bound else {
+            break;
+        };
+        db.query(include_str!("copy_queue_dependency_identity.sql"))
+            .bind(cursor)
+            .bind(super::IDENTITY_COPY_BATCH_ROWS)
+            .execute()
+            .await
+            .expect("drain batch");
+        db.query(
+            "INSERT INTO settings (key, value) \
+             VALUES ('migrate_queue_identity_cursor', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(bound)
+        .execute()
+        .await
+        .expect("advance cursor");
+    }
+}
+
+/// Seed enough v14 rows that one migrate call leaves the copy in
+/// flight, then drain the rest so the next migrate call owns the
+/// verify+swap tail alone.
+async fn seed_and_drain_queue_copy(db: &DurableDb) -> i64 {
+    let rows = super::IDENTITY_COPY_BATCH_ROWS
+        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
+        + 1;
+    db.query(&format!(
+        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
+            rustc_version, status, lane)
+         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
+            '[]', 'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss'
+         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
+               SELECT x FROM n) AS g"
+    ))
+    .execute()
+    .await
+    .expect("seed v14 rows");
+    let report = super::migrate(db, &settings())
+        .await
+        .expect("first migrate");
+    assert_eq!((report.before, report.after), (14, 14), "copy in flight");
+    drain_queue_identity_copy(db).await;
+    rows
+}
+
+/// A call that dies after the copy's last batch but inside the
+/// verify+swap tick commits nothing on the Durable Object (the tick is
+/// the atomic unit): the live `queue` stays intact and serving, and the
+/// next migrate call re-verifies and completes the swap.
+#[tokio::test]
+async fn migration_swap_crash_after_copy_leaves_live_and_recovers() {
+    let db = seed_v14_db().await;
+    let rows = seed_and_drain_queue_copy(&db).await;
+
+    // "Between verify and swap" is the uncommitted crash: nothing wrote,
+    // so the live table is still the serving table.
+    let live = db
+        .query("SELECT COUNT(*) FROM queue")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("live intact");
+    assert_eq!(live, rows, "live queue still serving every row");
+
+    let report = super::migrate(&db, &settings())
+        .await
+        .expect("migrate completes");
+    assert_eq!((report.before, report.after), (14, super::SCHEMA_VERSION));
+    let migrated = db
+        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("count post-swap");
+    assert_eq!(migrated, rows);
+}
+
+/// The deeper crash: the swap's `DROP TABLE queue` committed (eager
+/// backend) and the call died before the rename. `queue` absent with
+/// `queue_v15` present is the one resumable state — the next migrate
+/// call finishes the tail rather than wedging.
+#[tokio::test]
+async fn migration_swap_crash_between_drop_and_rename_resumes() {
+    let db = seed_v14_db().await;
+    let rows = seed_and_drain_queue_copy(&db).await;
+
+    // Simulate the committed prefix of the swap tick.
+    db.query("DROP TABLE queue")
+        .execute()
+        .await
+        .expect("crash prefix: drop live queue");
+
+    let report = super::migrate(&db, &settings())
+        .await
+        .expect("migrate resumes the swap tail");
+    assert_eq!((report.before, report.after), (14, super::SCHEMA_VERSION));
+    let migrated = db
+        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("count post-resume");
+    assert_eq!(migrated, rows, "swap tail restores every copied row");
+    let shadow_gone = db
+        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v15'")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("shadow probe");
+    assert_eq!(shadow_gone, 0);
+}
+
+/// One `sqlite_master` row for the schema-parity assertion.
+#[derive(skyzen::FromRow)]
+struct SchemaObject {
+    kind: String,
+    name: String,
+    tbl_name: String,
+    sql: Option<String>,
+}
+
+/// The database's full `sqlite_master` listing, minus SQLite internals.
+async fn schema_objects(db: &DurableDb) -> Vec<SchemaObject> {
+    db.query(
+        "SELECT type AS kind, name, tbl_name, sql FROM sqlite_master \
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    )
+    .fetch_all::<SchemaObject>()
+    .await
+    .expect("schema dump")
+}
+
+/// The swapped database's schema must equal what `schema.sql` builds on
+/// a fresh database: same tables, indexes and triggers, same column
+/// lists — and for the two swapped tables byte-equal `sqlite_master`
+/// definitions once name and quoting normalize.
+#[tokio::test]
+async fn migration_swapped_schema_matches_a_fresh_database() {
+    let db = seed_v14_db().await;
+    seed_v14_row(&db, 1, "pending", "NULL").await;
+    super::migrate(&db, &settings()).await.expect("migrate");
+    let fresh = memory_db_raw().await.expect("fresh db");
+    super::migrate(&fresh, &settings())
+        .await
+        .expect("fresh migrate");
+
+    let migrated = schema_objects(&db).await;
+    let reference = schema_objects(&fresh).await;
+    let shape = |rows: &[SchemaObject]| {
+        rows.iter()
+            .map(|row| (row.kind.clone(), row.name.clone(), row.tbl_name.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shape(&migrated),
+        shape(&reference),
+        "same tables, indexes and triggers as a fresh database"
+    );
+    // `ALTER`-appended columns (e.g. queue_dependencies' identity
+    // column) legitimately sit at different positions in the stored
+    // DDL; compare column sets instead of text for non-swapped tables.
+    for table in ["queue", "published_slice_rows", "queue_dependencies"] {
+        assert_eq!(
+            super::table_columns(&db, table).await.expect("table_info"),
+            super::table_columns(&fresh, table)
+                .await
+                .expect("table_info"),
+            "{table} column set equals a fresh database's"
+        );
+    }
+    // The swapped tables' stored DDL is byte-equal modulo the shadow
+    // rename's quoting: same column order, same constraints.
+    let normalize = |sql: &str| {
+        sql.replace('"', "")
+            .replace("IF NOT EXISTS", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for table in ["queue", "published_slice_rows"] {
+        let got = migrated
+            .iter()
+            .find(|row| row.kind == "table" && row.name == table)
+            .and_then(|row| row.sql.as_deref())
+            .expect("migrated table ddl");
+        let want = reference
+            .iter()
+            .find(|row| row.kind == "table" && row.name == table)
+            .and_then(|row| row.sql.as_deref())
+            .expect("fresh table ddl");
+        assert_eq!(
+            normalize(got),
+            normalize(want),
+            "{table} stored DDL matches schema.sql"
+        );
+    }
 }
 
 /// Two tasks whose dependency closures meet at a shared grandchild

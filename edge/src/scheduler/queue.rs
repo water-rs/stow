@@ -6852,16 +6852,17 @@ pub async fn migrate(
     }
     migrate_schema(db).await?;
     // The dependency-identity rebuilds run ahead of every other step
-    // (stow#588): `queue` and `published_slice_rows` are renamed aside
-    // and repopulated in bounded batches across repeated migrate calls,
-    // because the uniqueness/identity columns must come up through a
-    // table rebuild, not an ALTER. While either copy is in flight the
-    // remaining steps stay off and the version stamp holds at its
-    // stored value — the report's `after` answers SCHEMA_VERSION only
-    // once both copies verified and the legacy tables dropped, so the
-    // deploy gate keeps calling until the rebuild completes. Reads keep
-    // working throughout: the renamed-aside row set stays queryable as
-    // `*_identity_legacy` and the new table's column list is a superset.
+    // (stow#588): `queue` and `published_slice_rows` are rebuilt as
+    // shadow copies — the live tables keep their names and keep serving
+    // every read and write of the old code while bounded batches copy
+    // across repeated migrate calls — because the uniqueness/identity
+    // columns must come up through a table rebuild, not an ALTER. While
+    // either copy is in flight the remaining steps stay off and the
+    // version stamp holds at its stored value — the report's `after`
+    // answers SCHEMA_VERSION only once both shadows verified and swapped
+    // in, so the deploy gate keeps calling until the rebuild completes.
+    // Reads and writes keep working throughout against the real tables:
+    // mirror triggers follow every live write into the shadow.
     if !migrate_dependency_identity_rebuilds(db).await? {
         return Ok(SchemaMigrationReport {
             before,
@@ -6950,62 +6951,110 @@ async fn set_identity_copy_cursor(
 }
 
 /// The `queue` half of the version-15 identity rebuild (stow#588): the
-/// task-id uniqueness change is a table rebuild — the old table moves
-/// to `queue_identity_legacy` and a fresh `queue` (the schema.sql
-/// shape, `dependency_identity` included) receives the rows in bounded
-/// `task_id`-ordered batches across repeated migrate calls. Returns
-/// `false` while the copy is incomplete; `true` once the copy verified
-/// and the legacy table dropped. Historical rows get `NULL`
+/// task-id uniqueness change is a table rebuild, done as a shadow copy
+/// so the live `queue` keeps its name and keeps serving every read and
+/// write of the running (baseline) code for the whole migration — a
+/// mid-copy `queue` is never a partially populated table.
+///
+/// `queue_v15` — its CREATE TABLE extracted from `schema.sql` itself, so
+/// the shadow's shape cannot drift from a fresh database's — grows
+/// beside the live table. AFTER INSERT/UPDATE/DELETE mirror triggers on
+/// `queue` write every live change into the shadow (`INSERT OR
+/// REPLACE`/`DELETE` keyed on `task_id`), and historical rows copy
+/// across in bounded `task_id`-ordered `INSERT OR IGNORE` batches over
+/// repeated migrate calls — a mirrored row is newer than the copy's
+/// stale read and wins the IGNORE. **Transient cost:** while the copy
+/// runs, every live `queue` write pays one extra `queue_v15` statement
+/// (a second row written per insert or update, one shadow row deleted
+/// per delete) — the mirror doubles `queue` rowsWritten until the
+/// triggers drop at swap.
+///
+/// When the cursor is exhausted the swap commits in one storage tick —
+/// verify shadow == live over every live column in both directions,
+/// drop the live table (its mirror triggers die with it), rename the
+/// shadow to `queue`, replay `schema.sql` to recreate its indexes and
+/// triggers, recompute `queue_status_counts` from the swapped table —
+/// the same unbroken-statement atomicity the enqueue write phase relies
+/// on, so the swap lands whole or not at all. Returns `false` while
+/// the copy is incomplete. Historical rows get `NULL`
 /// `dependency_identity` — unknown context, never guessed.
 async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
     const CURSOR_KEY: &str = "migrate_queue_identity_cursor";
-    let queue_has_identity = table_columns(db, "queue")
-        .await?
-        .contains("dependency_identity");
-    let legacy_exists = !table_columns(db, "queue_identity_legacy").await?.is_empty();
-    if queue_has_identity && !legacy_exists {
-        return Ok(true);
+    let queue = table_columns(db, "queue").await?;
+    let shadow = table_columns(db, "queue_v15").await?;
+    if queue.contains("dependency_identity") {
+        if shadow.is_empty() {
+            // The swapped (or fresh) table — rebuild done.
+            return Ok(true);
+        }
+        // Crash recovery: the swap's `DROP TABLE queue` committed on an
+        // eager-commit backend and the call died before the rename;
+        // `migrate_schema` has already recreated `queue` new-shape
+        // (empty — or holding straggler writes that slipped the gap).
+        // The shadow verified before the drop, so it is authoritative:
+        // merge whatever the gap wrote — a straggler insert or update
+        // replaces its shadow copy and keeps its own real digest — then
+        // finish the tail. A straggler *delete* is unmirrored and its
+        // row resurrects; on the Durable Object the swap is one storage
+        // tick and this state can never commit partway, so the gap only
+        // exists on eager-commit backends.
+        db.query(
+            "INSERT OR REPLACE INTO queue_v15 ( \
+                 task_id, crate_name, version, features_json, target, rustc_version, \
+                 downloads, miss_count, request_count, priority, status, error_msg, \
+                 preserve_lockfile, lane, dispatch_attempts, attempt, generation_id, \
+                 not_before, first_requested_at, created_at, updated_at, github_run_id, \
+                 host_side, shape_requeue, unpublished_deps, deps_met, blocked, \
+                 wake_at, dispatch_family, value, demand, dispatch_key, claimed_at, \
+                 dispatch_eligible, dependency_identity \
+             ) SELECT \
+                 task_id, crate_name, version, features_json, target, rustc_version, \
+                 downloads, miss_count, request_count, priority, status, error_msg, \
+                 preserve_lockfile, lane, dispatch_attempts, attempt, generation_id, \
+                 not_before, first_requested_at, created_at, updated_at, github_run_id, \
+                 host_side, shape_requeue, unpublished_deps, deps_met, blocked, \
+                 wake_at, dispatch_family, value, demand, dispatch_key, claimed_at, \
+                 dispatch_eligible, dependency_identity \
+             FROM queue",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("merge straggler queue rows into shadow: {error}"))?;
+        db.query("DROP TABLE queue")
+            .execute()
+            .await
+            .map_err(|error| format!("drop recreated queue for identity swap: {error}"))?;
+        return finish_queue_identity_swap(db, CURSOR_KEY).await;
     }
-    if !queue_has_identity && legacy_exists {
+    if queue.is_empty() {
         return Err(QueueError::Invariant(
-            "queue identity rebuild: old-shape queue alongside queue_identity_legacy".to_owned(),
+            "queue identity rebuild: no queue and no queue_v15".to_owned(),
         ));
     }
-    // Legacy still present — whether the new queue is fresh or partly
-    // filled — means the copy is unfinished: a call that died between
-    // batches resumes here, and only an exhausted cursor reaches
-    // verify+drop. Never verify ahead of the tail.
-    if !legacy_exists {
-        // Contract step of the rename: the live table aside, the new
-        // one (plus its indexes and triggers) arrives through the
-        // schema file itself so the copy writes the same shape fresh
-        // databases get.
-        db.query("ALTER TABLE queue RENAME TO queue_identity_legacy")
+    // Live old-shape queue: grow the shadow beside it.
+    if shadow.is_empty() {
+        db.query(&shadow_create_ddl("queue", "queue_v15"))
             .execute()
             .await
-            .map_err(|error| format!("rename queue for identity rebuild: {error}"))?;
-        db.query(include_str!("schema.sql"))
-            .execute()
-            .await
-            .map_err(|error| format!("recreate queue after identity rename: {error}"))?;
-        // The status counters are trigger-maintained: the fresh table
-        // starts empty and the copy's inserts re-populate them row by
-        // row — `queue_status_counts` must reset with it.
-        db.query("DELETE FROM queue_status_counts")
-            .execute()
-            .await
-            .map_err(|error| format!("reset status counts for identity rebuild: {error}"))?;
+            .map_err(|error| format!("create queue_v15 shadow: {error}"))?;
     }
+    // The mirror triggers re-assert every call while the copy runs:
+    // idempotent, and it closes the crash window between shadow
+    // creation and trigger creation — an unmirrored write gap would
+    // wedge the swap's verify.
+    db.query(include_str!("mirror_queue_identity_triggers.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("install queue identity mirror triggers: {error}"))?;
     let mut cursor = identity_copy_cursor(db, CURSOR_KEY).await?;
     for _ in 0..IDENTITY_COPY_BATCHES_PER_CALL {
-        // The batch's upper bound is a separate probe: `INSERT OR
-        // IGNORE` may write fewer rows than it scanned (a live submit
-        // mid-migration already carries that task id), so the cursor
-        // cannot ride on an insert count.
+        // The batch's upper bound is a separate probe: a mirrored row
+        // already standing in the shadow makes `INSERT OR IGNORE` skip
+        // its stale copy, so the cursor cannot ride on an insert count.
         let Some(bound) = db
             .query(
                 "SELECT MAX(task_id) FROM ( \
-                     SELECT task_id FROM queue_identity_legacy \
+                     SELECT task_id FROM queue \
                      WHERE task_id > ? ORDER BY task_id LIMIT ?)",
             )
             .bind(cursor.clone())
@@ -7014,18 +7063,15 @@ async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, Queue
             .await
             .map_err(|error| format!("probe identity copy bound: {error}"))?
         else {
-            // Copy exhausted: verify the full set landed, then contract.
+            // Copy exhausted: verify shadow == live both directions and
+            // swap — the same storage tick, so verified and swapped are
+            // one decision, never two.
             verify_queue_identity_copy(db).await?;
-            db.query("DROP TABLE queue_identity_legacy")
+            db.query("DROP TABLE queue")
                 .execute()
                 .await
-                .map_err(|error| format!("drop queue_identity_legacy: {error}"))?;
-            db.query("DELETE FROM settings WHERE key = ?")
-                .bind(CURSOR_KEY)
-                .execute()
-                .await
-                .map_err(|error| format!("clear identity copy cursor: {error}"))?;
-            return Ok(true);
+                .map_err(|error| format!("drop live queue for identity swap: {error}"))?;
+            return finish_queue_identity_swap(db, CURSOR_KEY).await;
         };
         db.query(include_str!("copy_queue_dependency_identity.sql"))
             .bind(cursor.clone())
@@ -7039,10 +7085,65 @@ async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, Queue
     Ok(false)
 }
 
-/// The verify half of the queue copy: every legacy row's immutable
-/// columns must appear in the rebuilt table and no copied row may
-/// carry a digest. Fails the migrate call — the next call re-verifies
-/// rather than trusting a claimed completion.
+/// A table's `CREATE TABLE` statement pulled out of `schema.sql` and
+/// renamed to its shadow — single source of truth, so the swapped
+/// table's `sqlite_master` entry equals what a fresh database gets.
+fn shadow_create_ddl(live: &str, shadow: &str) -> String {
+    let schema = include_str!("schema.sql");
+    let needle = format!("CREATE TABLE IF NOT EXISTS {live} (");
+    let start = schema
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{needle} not in schema.sql"));
+    let tail = &schema[start..];
+    let end = tail
+        .find("\n);")
+        .unwrap_or_else(|| panic!("{live} create table unterminated in schema.sql"));
+    tail[..end + 3].replacen(&format!("{live} ("), &format!("{shadow} ("), 1)
+}
+
+/// The swap's mutating tail, ordered for crash recovery: the live
+/// `queue` drops first — taking the mirror triggers and its counts
+/// triggers with it — so the only mid-swap crash state is `queue`
+/// absent with `queue_v15` present, which always means "rename
+/// pending". `schema.sql` then recreates the queue's indexes and
+/// triggers (everything else in the file is `IF NOT EXISTS`, a no-op),
+/// and `queue_status_counts` is recomputed wholesale from the swapped
+/// table — the live counters were already consistent, the recompute is
+/// the swap's own audit. Called either right after the drop in the
+/// same statement sequence, or alone from the crash-resume path.
+async fn finish_queue_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<bool, QueueError> {
+    db.query("ALTER TABLE queue_v15 RENAME TO queue")
+        .execute()
+        .await
+        .map_err(|error| format!("rename queue_v15 for identity swap: {error}"))?;
+    db.query(include_str!("schema.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("recreate queue schema after identity swap: {error}"))?;
+    db.query("DELETE FROM queue_status_counts")
+        .execute()
+        .await
+        .map_err(|error| format!("reset status counts for identity swap: {error}"))?;
+    db.query(
+        "INSERT INTO queue_status_counts (status, lane, blocked, n) \
+         SELECT status, lane, blocked, COUNT(*) FROM queue \
+         GROUP BY status, lane, blocked",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("recompute status counts for identity swap: {error}"))?;
+    db.query("DELETE FROM settings WHERE key = ?")
+        .bind(cursor_key)
+        .execute()
+        .await
+        .map_err(|error| format!("clear identity copy cursor: {error}"))?;
+    Ok(true)
+}
+
+/// The verify half of the queue copy: the shadow's live-column content
+/// must equal the live table's in both directions and no shadow row
+/// may carry a digest. Runs inside the swap's own storage tick; a
+/// divergence fails the migrate call and the next call re-verifies.
 async fn verify_queue_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
     let differs = db
         .query(include_str!("verify_queue_dependency_identity.sql"))
@@ -7051,48 +7152,89 @@ async fn verify_queue_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
         .map_err(|error| format!("verify queue identity copy: {error}"))?;
     if differs != 0 {
         return Err(QueueError::Invariant(
-            "queue identity rebuild: copied rows diverge from queue_identity_legacy".to_owned(),
+            "queue identity rebuild: queue_v15 shadow diverges from live queue".to_owned(),
         ));
     }
     Ok(())
 }
 
 /// The `published_slice_rows` half of the version-15 identity rebuild:
-/// same rename/copy/verify/drop shape as [`migrate_queue_dependency_identity`],
-/// keyed on `rowid` because the table's primary key includes the
-/// column being added. `dependency_identity` lands NULL on every
-/// historical row — pre-identity reports never carried context.
+/// the same shadow-copy design as [`migrate_queue_dependency_identity`]
+/// — live table untouched, `published_slice_rows_v15` shadow beside it,
+/// mirror triggers following every live write, bounded `rowid`-ordered
+/// batches — keyed on `rowid` because the table's primary key includes
+/// the column being added (and its NULLs never dedup under UNIQUE, so
+/// both the copy batch and the mirror insert guard on the nine
+/// membership columns explicitly). `dependency_identity` lands NULL on
+/// every historical row — pre-identity reports never carried context.
 async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
     const CURSOR_KEY: &str = "migrate_slice_identity_cursor";
-    let rows_have_identity = table_columns(db, "published_slice_rows")
-        .await?
-        .contains("dependency_identity");
-    let legacy_exists = !table_columns(db, "published_slice_rows_identity_legacy")
-        .await?
-        .is_empty();
-    if rows_have_identity && !legacy_exists {
-        return Ok(true);
-    }
-    if !rows_have_identity && legacy_exists {
-        return Err(QueueError::Invariant(
-            "slice identity rebuild: old-shape rows alongside published_slice_rows_identity_legacy"
-                .to_owned(),
-        ));
-    }
-    // Same resume rule as the queue copy: a stranded legacy table is an
-    // unfinished copy, never a verified one — fall through to the loop.
-    if !legacy_exists {
-        db.query("ALTER TABLE published_slice_rows RENAME TO published_slice_rows_identity_legacy")
+    let rows = table_columns(db, "published_slice_rows").await?;
+    let shadow = table_columns(db, "published_slice_rows_v15").await?;
+    if rows.contains("dependency_identity") {
+        if shadow.is_empty() {
+            return Ok(true);
+        }
+        // Same crash recovery as the queue half: `migrate_schema`
+        // recreated `published_slice_rows` new-shape after the swap's
+        // drop committed and the call died before the rename. The
+        // verified shadow is authoritative — retarget its rows at any
+        // straggler writes (the 9-column match, identity preserved from
+        // the live row) then absorb every live row and finish the tail.
+        db.query(
+            "DELETE FROM published_slice_rows_v15 WHERE EXISTS ( \
+                 SELECT 1 FROM published_slice_rows live \
+                 WHERE live.target = published_slice_rows_v15.target \
+                   AND live.rustc_version = published_slice_rows_v15.rustc_version \
+                   AND live.generation = published_slice_rows_v15.generation \
+                   AND live.crate_name = published_slice_rows_v15.crate_name \
+                   AND live.version = published_slice_rows_v15.version \
+                   AND live.features_json = published_slice_rows_v15.features_json \
+                   AND live.unit_side = published_slice_rows_v15.unit_side \
+                   AND live.unit_invocation = published_slice_rows_v15.unit_invocation \
+                   AND live.unit_linked = published_slice_rows_v15.unit_linked)",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("retarget slice shadow rows for straggler merge: {error}"))?;
+        db.query(
+            "INSERT INTO published_slice_rows_v15 \
+             SELECT target, rustc_version, generation, crate_name, version, \
+                    features_json, unit_side, unit_invocation, unit_linked, \
+                    dependency_identity \
+             FROM published_slice_rows",
+        )
+        .execute()
+        .await
+        .map_err(|error| format!("merge straggler slice rows into shadow: {error}"))?;
+        db.query("DROP TABLE published_slice_rows")
             .execute()
             .await
-            .map_err(|error| format!("rename slice rows for identity rebuild: {error}"))?;
-        db.query(include_str!("schema.sql"))
-            .execute()
-            .await
-            .map_err(|error| format!("recreate slice rows after identity rename: {error}"))?;
+            .map_err(|error| format!("drop recreated slice rows for identity swap: {error}"))?;
+        return finish_slice_identity_swap(db, CURSOR_KEY).await;
     }
-    // `rowid` is the cursor: the legacy table kept its storage-order
-    // rowids through the rename.
+    if rows.is_empty() {
+        if shadow.is_empty() {
+            return Err(QueueError::Invariant(
+                "slice identity rebuild: no published_slice_rows and no shadow".to_owned(),
+            ));
+        }
+        return finish_slice_identity_swap(db, CURSOR_KEY).await;
+    }
+    if shadow.is_empty() {
+        db.query(&shadow_create_ddl(
+            "published_slice_rows",
+            "published_slice_rows_v15",
+        ))
+        .execute()
+        .await
+        .map_err(|error| format!("create published_slice_rows_v15 shadow: {error}"))?;
+    }
+    db.query(include_str!("mirror_slice_identity_triggers.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("install slice identity mirror triggers: {error}"))?;
+    // `rowid` is the cursor over the live table's storage order.
     let mut cursor: i64 = identity_copy_cursor(db, CURSOR_KEY)
         .await?
         .parse()
@@ -7101,7 +7243,7 @@ async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, Queue
         let Some(bound) = db
             .query(
                 "SELECT MAX(rowid) FROM ( \
-                     SELECT rowid FROM published_slice_rows_identity_legacy \
+                     SELECT rowid FROM published_slice_rows \
                      WHERE rowid > ? ORDER BY rowid LIMIT ?)",
             )
             .bind(cursor)
@@ -7111,16 +7253,11 @@ async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, Queue
             .map_err(|error| format!("probe slice identity copy bound: {error}"))?
         else {
             verify_slice_identity_copy(db).await?;
-            db.query("DROP TABLE published_slice_rows_identity_legacy")
+            db.query("DROP TABLE published_slice_rows")
                 .execute()
                 .await
-                .map_err(|error| format!("drop published_slice_rows_identity_legacy: {error}"))?;
-            db.query("DELETE FROM settings WHERE key = ?")
-                .bind(CURSOR_KEY)
-                .execute()
-                .await
-                .map_err(|error| format!("clear slice identity copy cursor: {error}"))?;
-            return Ok(true);
+                .map_err(|error| format!("drop live slice rows for identity swap: {error}"))?;
+            return finish_slice_identity_swap(db, CURSOR_KEY).await;
         };
         db.query(include_str!("copy_slice_dependency_identity.sql"))
             .bind(cursor)
@@ -7134,29 +7271,62 @@ async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, Queue
     Ok(false)
 }
 
-/// The slice copy's verify: every legacy membership tuple must be
-/// present in the rebuilt table (all nine membership columns are
-/// immutable — a slice row is only ever inserted or retired, so the
-/// comparison cannot drift).
+/// The slice swap's mutating tail — same crash-resume contract as
+/// [`finish_queue_identity_swap`]: rename the shadow in, replay
+/// `schema.sql`, clear the cursor. (`published_slice_rows` has no
+/// indexes or counters of its own; the schema replay is a no-op past
+/// the rename and stays in the sequence for symmetry with any future
+/// table additions.)
+async fn finish_slice_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<bool, QueueError> {
+    db.query("ALTER TABLE published_slice_rows_v15 RENAME TO published_slice_rows")
+        .execute()
+        .await
+        .map_err(|error| format!("rename slice-rows shadow for identity swap: {error}"))?;
+    db.query(include_str!("schema.sql"))
+        .execute()
+        .await
+        .map_err(|error| format!("recreate slice schema after identity swap: {error}"))?;
+    db.query("DELETE FROM settings WHERE key = ?")
+        .bind(cursor_key)
+        .execute()
+        .await
+        .map_err(|error| format!("clear slice identity copy cursor: {error}"))?;
+    Ok(true)
+}
+
+/// The slice copy's verify: the shadow's nine membership columns must
+/// equal the live table's in both directions and no shadow row may
+/// carry a digest — all nine are immutable (a slice row is only ever
+/// inserted or retired), so the comparison cannot drift.
 async fn verify_slice_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
     let differs = db
         .query(
             "SELECT EXISTS ( \
                  SELECT target, rustc_version, generation, crate_name, version, \
                         features_json, unit_side, unit_invocation, unit_linked \
-                 FROM published_slice_rows_identity_legacy \
+                 FROM published_slice_rows \
                  EXCEPT \
                  SELECT target, rustc_version, generation, crate_name, version, \
                         features_json, unit_side, unit_invocation, unit_linked \
-                 FROM published_slice_rows) AS differs",
+                 FROM published_slice_rows_v15) \
+             OR EXISTS ( \
+                 SELECT target, rustc_version, generation, crate_name, version, \
+                        features_json, unit_side, unit_invocation, unit_linked \
+                 FROM published_slice_rows_v15 \
+                 EXCEPT \
+                 SELECT target, rustc_version, generation, crate_name, version, \
+                        features_json, unit_side, unit_invocation, unit_linked \
+                 FROM published_slice_rows) \
+             OR EXISTS ( \
+                 SELECT 1 FROM published_slice_rows_v15 \
+                 WHERE dependency_identity IS NOT NULL) AS differs",
         )
         .fetch_scalar::<i64>()
         .await
         .map_err(|error| format!("verify slice identity copy: {error}"))?;
     if differs != 0 {
         return Err(QueueError::Invariant(
-            "slice identity rebuild: copied rows diverge from published_slice_rows_identity_legacy"
-                .to_owned(),
+            "slice identity rebuild: shadow diverges from live published_slice_rows".to_owned(),
         ));
     }
     Ok(())
