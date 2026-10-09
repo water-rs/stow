@@ -1812,8 +1812,8 @@ pub struct SchedulerSeedRequest {
 
 /// What the seed reports back. A request carries one chunk of work, so
 /// the caller loops until `done` — `seeded` says whether this call
-/// wrote fixture rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// wrote fixture rows, and `(phase, n)` is its progress witness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerSeedReport {
     /// Rows `queue` holds now.
     pub queue_rows: u64,
@@ -1826,6 +1826,13 @@ pub struct SchedulerSeedReport {
     pub seeded: bool,
     /// Whether the fixture is fully seeded (or was already populated).
     pub done: bool,
+    /// The seed cursor's phase after this call (`queue`, `edges_*`,
+    /// `nodes`, `slices`, `deps`, `feed_*`, `reset`, `done`) — with
+    /// `n`, the caller's progress witness: a call that returns the same
+    /// `(phase, n)` twice advanced nothing.
+    pub phase: String,
+    /// The phase's position after this call.
+    pub n: u64,
 }
 
 /// One statement's real Durable Object cursor counters — the units

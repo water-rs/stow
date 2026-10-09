@@ -322,12 +322,22 @@ pub async fn seed(
     if next != cursor {
         set_seed_cursor(db, &next).await?;
     }
+    // The cursor's `tag:n:shape:counts` head is the caller's progress
+    // witness — our own format, so the split cannot fail.
+    let mut head = next.split(':');
+    let phase = head.next().expect("cursor tag").to_owned();
+    let n = head
+        .next()
+        .and_then(|position| position.parse::<u64>().ok())
+        .expect("cursor position");
     Ok(SchedulerSeedReport {
         queue_rows: counts.queue,
         dependency_rows: counts.dependencies,
         slice_rows: counts.slices,
         seeded,
         done: next.starts_with("done:"),
+        phase,
+        n,
     })
 }
 
