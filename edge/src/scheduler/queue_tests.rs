@@ -248,8 +248,10 @@ fn dependency(crate_name: &str) -> EnqueueRequest {
 /// The dependency-context identity a leaf dep's own subgraph resolves
 /// to — what its `queue_dependencies` edge records and what a slice
 /// row must carry for the gate to release on it (stow#588).
-fn dep_identity(crate_name: &str) -> Option<stow_types::identity::DependencyIdentity> {
-    dependency(crate_name).dependency_identity().ok()
+fn dep_identity(crate_name: &str) -> stow_types::identity::DependencyIdentity {
+    dependency(crate_name)
+        .dependency_identity()
+        .expect("dep identity")
 }
 
 /// A host-side leaf dep as its own request — minted at the consumer
@@ -3075,9 +3077,7 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
         .bind(TARGET.to_owned())
         .bind(RUSTC.to_owned())
         .bind(
-            dep_identity(dep)
-                .expect("leaf dep identity")
-                .to_string(),
+            dep_identity(dep).to_string(),
         )
         .bind(invocations)
         .bind(shapes)
@@ -9531,7 +9531,7 @@ async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
         .iter()
         .flat_map(|dep_request| {
             let crate_name = dep_request.crate_name.as_str().to_owned();
-            let identity = dep_request.dependency_identity().ok();
+            let identity = dep_request.dependency_identity().expect("dep identity");
             [UnitInvocation::Native, UnitInvocation::Target]
                 .iter()
                 .flat_map(|invocation| {
@@ -9617,7 +9617,7 @@ async fn dispatch_fails_on_a_missing_node_naming_it() {
     let rows = [UnitKind::Linked, UnitKind::Unlinked]
         .iter()
         .map(|kind| stow_types::api::PublishedSliceRow {
-            dependency_identity: leaf.dependency_identity().ok(),
+            dependency_identity: leaf.dependency_identity().expect("leaf identity"),
             crate_name: leaf_name.parse().expect("crate name"),
             version: VERSION.parse().expect("semver"),
             features_json: FeaturesJson::default(),

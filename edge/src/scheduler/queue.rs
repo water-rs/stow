@@ -5936,9 +5936,9 @@ struct SliceRowJson {
     crate_name: String,
     version: String,
     features_json: String,
-    /// The published row's contextual digest (stow#588): `None` means
-    /// unknown historical context — it satisfies no gate clause.
-    dependency_identity: Option<String>,
+    /// The published row's contextual digest (stow#588) — the column
+    /// is NOT NULL, so a stored or reported row always carries one.
+    dependency_identity: String,
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
@@ -6011,7 +6011,7 @@ struct OwnerDelta {
     cleared_blocker: i64,
 }
 
-fn slice_row_key(row: &SliceRowJson) -> (String, String, String, Option<String>, i64, i64, i64) {
+fn slice_row_key(row: &SliceRowJson) -> (String, String, String, String, i64, i64, i64) {
     (
         row.crate_name.clone(),
         row.version.clone(),
@@ -6048,7 +6048,7 @@ fn normalize_gate_rows(
             crate_name: row.crate_name,
             version: row.version,
             features_json: row.features_json,
-            dependency_identity: row.dependency_identity,
+            dependency_identity: Some(row.dependency_identity),
             unit_side: side.to_int(),
             kind,
         };
@@ -6123,8 +6123,8 @@ pub async fn record_published_slice(
                 target,
                 rustc_version,
                 live_generation,
-                &to_slice_rows(added)?,
-                &to_slice_rows(retired)?,
+                &to_slice_rows(added),
+                &to_slice_rows(retired),
             )
             .await?;
             let changed = directional
@@ -6160,7 +6160,7 @@ pub async fn record_published_slice(
                 target,
                 rustc_version,
                 live_generation,
-                &to_slice_rows(added)?,
+                &to_slice_rows(added),
             )
             .await?;
             (changed, None, true)
@@ -6217,29 +6217,20 @@ struct LiveSliceRow {
 
 /// Map report rows onto the stored 6-column identity — `rowid` zeroes
 /// out (only live-read rows carry one) and a missing unit shape writes
-/// the `-1` legs that satisfy no coverage clause. A row without a
-/// `dependency_identity` is refused, not stored: post-v15 the column
-/// is NOT NULL and every report carries the digest — a context-free
-/// row would satisfy no coverage clause anyway (stow#588).
-fn to_slice_rows(rows: &[PublishedSliceRow]) -> Result<Vec<SliceRowJson>, QueueError> {
+/// the `-1` legs that satisfy no coverage clause. Every report row
+/// carries a digest: `PublishedSliceRow.dependency_identity` is
+/// required on the wire, so this map cannot fail on identity.
+fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
     rows.iter()
-        .map(|row| {
-            let Some(dependency_identity) = row.dependency_identity.as_ref() else {
-                return Err(QueueError::Sql(format!(
-                    "published slice row {} {} carries no dependency_identity",
-                    row.crate_name, row.version
-                )));
-            };
-            Ok(SliceRowJson {
-                crate_name: row.crate_name.to_string(),
-                version: row.version.to_string(),
-                features_json: row.features_json.raw(),
-                dependency_identity: Some(dependency_identity.to_string()),
-                unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
-                unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
-                unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
-                rowid: 0,
-            })
+        .map(|row| SliceRowJson {
+            crate_name: row.crate_name.to_string(),
+            version: row.version.to_string(),
+            features_json: row.features_json.raw(),
+            dependency_identity: row.dependency_identity.to_string(),
+            unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
+            unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
+            unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
+            rowid: 0,
         })
         .collect()
 }
@@ -8391,7 +8382,7 @@ mod tests {
             crate_name: "crate".to_owned(),
             version: "1.0.0".to_owned(),
             features_json: "[]".to_owned(),
-            dependency_identity: Some("dep".to_owned()),
+            dependency_identity: "dep".to_owned(),
             unit_side,
             unit_invocation,
             unit_linked,

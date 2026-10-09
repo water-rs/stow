@@ -1686,11 +1686,10 @@ pub struct PublishedSliceRow {
     /// `None` only on reports serialized before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_shape: Option<crate::public_cache::UnitShape>,
-    /// The Merkle dependency digest the row was built under (stow#588).
-    /// `None` on reports serialized before the field existed — such
-    /// rows satisfy no contextual coverage clause.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dependency_identity: Option<DependencyIdentity>,
+    /// The Merkle dependency digest the row was built under (stow#588) —
+    /// required: an index row without one is filtered before it ever
+    /// reaches this wire, so a stored or reported row always carries it.
+    pub dependency_identity: DependencyIdentity,
 }
 
 /// Body the edge forwards to the scheduler's `/index/published` — one
