@@ -296,7 +296,7 @@ fn cargo_for_task(task: &BuildTaskPayload, manifest_path: &Path, subcommand: &st
         .arg(subcommand)
         .arg("--manifest-path")
         .arg(manifest_path)
-        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str());
+        .env("RUSTUP_TOOLCHAIN", crate::task::run_toolchain(task));
     command
 }
 

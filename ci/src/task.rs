@@ -1000,6 +1000,19 @@ pub async fn build(
     })
 }
 
+/// The rustup *name* the phases run `cargo` under — a different fact
+/// from `task.rustc_version`, which records the release the task's
+/// identity pins, not a toolchain name. `RUSTUP_TOOLCHAIN` already
+/// carries a name when the caller set one — the build workflow's
+/// toolchain step exports it, and a test run inherits the name of the
+/// toolchain executing the suite — and the pinned release is the name
+/// production's no-export env still resolves (`rustup toolchain
+/// install 1.99.0` answers to `1.99.0`). It never asks `rustup show`:
+/// a runner's *default* toolchain is not the task's.
+pub(crate) fn run_toolchain(task: &BuildTaskPayload) -> String {
+    std::env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| task.rustc_version.as_str().to_owned())
+}
+
 /// Phase 0 runs on the host: `cargo fetch` resolves the dependency graph
 /// and populates the registry cache, so the sandboxed phases can run
 /// `--frozen` — no lockfile writes, no index access — with every outbound
@@ -1021,7 +1034,7 @@ pub async fn fetch_workspace_dependencies(
     // `preserve_lockfile` the lock's fidelity is proven by the diff check
     // below instead of by the flag.
     let status = fetch
-        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
+        .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
         .status()
         .await
         .map_err(|error| stow_types::stow_error!("run cargo fetch: {error}"))?;
@@ -1118,7 +1131,7 @@ pub async fn run_sandboxed_phase(
         .sandbox
         .command("cargo")
         .args(args)
-        .env("RUSTUP_TOOLCHAIN", task.rustc_version.as_str())
+        .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
         .env("RUSTFLAGS", rustflags)
         .env("RUSTC_WRAPPER", path_arg(&setup.wrappers.rustc_wrapper)?)
         .env("CARGO_TARGET_DIR", path_arg(target_dir)?)
