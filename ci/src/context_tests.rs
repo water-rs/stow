@@ -1278,7 +1278,12 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
             .await
             .expect("cargo fetch");
         assert!(status.success(), "cargo fetch on the consumer failed");
-        for (target, leaf_expected) in [(host.as_str(), false), (windows, true)] {
+        // The host leg's expectation is the host's own cfg answer:
+        // `cfg(windows)` fails on a unix host but holds on a Windows
+        // host, where host and the explicit windows target coincide —
+        // cargo's unit graph includes `winleaf` there, so the resolver
+        // must too.
+        for (target, leaf_expected) in [(host.as_str(), cfg!(windows)), (windows, true)] {
             let (_, out) = outputs
                 .iter()
                 .find(|(t, _)| t == target)
