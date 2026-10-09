@@ -5346,32 +5346,6 @@ dependencies = [
 
 [[package]]
 name = "oci-client"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b7f8deaffcd3b0e3baf93dddcab3d18b91d46dc37d38a8b170089b234de5bb3"
-dependencies = [
- "bytes",
- "chrono",
- "futures-util",
- "http",
- "http-auth",
- "jsonwebtoken",
- "lazy_static",
- "oci-spec 0.9.0",
- "olpc-cjson",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "unicase",
-]
-
-[[package]]
-name = "oci-client"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5261a7fb43d9c53b8e63e6d5e86860719dad253d015d022066c72d585125aed8"
@@ -7239,7 +7213,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hex-literal",
- "oci-client 0.17.0",
+ "oci-client",
  "openidconnect",
  "pem 3.0.6",
  "pkcs8",
@@ -7820,7 +7794,7 @@ dependencies = [
  "humantime",
  "hyper",
  "hyper-util",
- "oci-client 0.16.1",
+ "oci-client",
  "rustls",
  "semver",
  "serde",
@@ -7909,7 +7883,7 @@ dependencies = [
  "glob",
  "hex",
  "libc",
- "oci-client 0.16.1",
+ "oci-client",
  "oci-spec 0.10.0",
  "olpc-cjson",
  "pathdiff",
@@ -8032,7 +8006,7 @@ dependencies = [
  "const-oid 0.10.2",
  "fastrand",
  "hex",
- "oci-client 0.16.1",
+ "oci-client",
  "olpc-cjson",
  "rcgen",
  "reqwest",
@@ -8287,7 +8261,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
