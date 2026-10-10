@@ -28,7 +28,6 @@ mod context_tests;
 mod dep_scan;
 mod local_server;
 mod plan;
-mod retry;
 mod stage;
 mod task;
 mod validate;

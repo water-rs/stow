@@ -12,6 +12,11 @@ use std::time::Duration;
 /// next attempt, so `initial_delay = 1s` yields 1s, 2s, 4s, 8s, … The final
 /// error is returned to the caller, which owns wrapping it in the context a
 /// generic loop cannot know (the URL, the operation subject).
+///
+/// # Errors
+///
+/// Returns the last attempt's error once `max_attempts` is reached or
+/// `should_retry` rejects it.
 pub async fn retry_with_backoff<F, Fut, T, E>(
     operation: &'static str,
     max_attempts: u32,
