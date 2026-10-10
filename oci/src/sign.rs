@@ -1,9 +1,12 @@
+use std::time::Duration;
+
 use async_process::Command;
 use oci_client::Reference;
 use stow_types::registry::sha256_digest;
 
 use crate::client::RegistrySession;
 use crate::registry::RegistryCredentials;
+use crate::retry::retry_with_backoff;
 
 /// Push `manifest` so that `reference`'s tag never names an unsigned
 /// manifest: the bytes go up by digest first, `sign` signs that digest
@@ -50,32 +53,57 @@ where
     Ok(digest)
 }
 
+/// How many times one artifact's `cosign sign` runs before its failure is
+/// final.
+const SIGN_MAX_ATTEMPTS: u32 = 4;
+/// The first retry's delay; later retries double it (2s, 4s, 8s).
+const SIGN_INITIAL_DELAY: Duration = Duration::from_secs(2);
+
 /// Sign one pushed artifact with cosign (keyless, the job's OIDC identity).
 ///
 /// The signature is pushed to the same registry as the artifact, so cosign
 /// gets the registry credentials on its command line rather than from a
 /// Docker config file that not every runner can produce.
 ///
+/// cosign reaches Fulcio, Rekor and the registry, and any of them can drop
+/// a connection; its failure is opaque to us (an exit status), so every
+/// failed attempt is retried within `SIGN_MAX_ATTEMPTS`. A retry after a
+/// sign that wrote its signature and still failed adds a second signature
+/// layer, which verification tolerates: it picks the layer that binds the
+/// expected reference.
+///
 /// # Errors
 ///
-/// Returns an error when `cosign` cannot be spawned or exits non-zero.
+/// Returns an error when `cosign` cannot be spawned or exits non-zero on
+/// every attempt.
 pub async fn sign_artifact(
     reference: &str,
     digest: &str,
     credentials: &RegistryCredentials,
 ) -> stow_types::error::Result<()> {
     let image = format!("{reference}@{digest}");
-    let status = Command::new("cosign")
-        .args(sign_args(reference, &image, credentials))
-        .status()
-        .await?;
+    let args = sign_args(reference, &image, credentials);
+    retry_with_backoff(
+        "cosign sign",
+        SIGN_MAX_ATTEMPTS,
+        SIGN_INITIAL_DELAY,
+        || sign_once(&args, &image),
+        |_| true,
+    )
+    .await?;
+
+    tracing::info!(image = %image, "signed OCI artifact with cosign");
+    Ok(())
+}
+
+/// One `cosign sign` run.
+async fn sign_once(args: &[String], image: &str) -> stow_types::error::Result<()> {
+    let status = Command::new("cosign").args(args).status().await?;
     if !status.success() {
         return Err(stow_types::stow_error!(
             "cosign sign failed for {image} with status {status}"
         ));
     }
-
-    tracing::info!(image = %image, "signed OCI artifact with cosign");
     Ok(())
 }
 

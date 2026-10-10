@@ -19,8 +19,8 @@ use crate::capture::{
 };
 use crate::consume;
 use crate::dep_scan;
-use crate::retry::retry_with_backoff;
 use crate::workspace_mirror;
+use stow_oci::retry::retry_with_backoff;
 use stow_shim as wrapper_shim;
 
 const STOW_BUILD_WORKSPACE_ROOT_ENV: &str = "STOW_BUILD_WORKSPACE_ROOT";
