@@ -840,7 +840,11 @@ fn stow_startup_floor(dir: &Path, cargo_home: &Path, edge_url: &str) -> std::tim
             .env("CARGO_HOME", cargo_home)
             .env("CARGO_TARGET_DIR", cargo_target.path())
             .env("CARGO_INCREMENTAL", "0")
-            .env_remove("RUSTC_WRAPPER")
+            // An empty RUSTC_WRAPPER is no wrapper to cargo, and it
+            // overrides the `build.rustc-wrapper` stow setup wrote into
+            // the shared cargo home — so the baseline is plain cargo
+            // (stow#608).
+            .env("RUSTC_WRAPPER", "")
             .env_remove("RUST_LOG");
         let (output, _, window) = timed_build(&mut command);
         assert!(
@@ -1087,7 +1091,11 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
             .env("CARGO_HOME", cargo_home.path())
             .env("CARGO_TARGET_DIR", cargo_target.path())
             .env("CARGO_INCREMENTAL", "0")
-            .env_remove("RUSTC_WRAPPER")
+            // An empty RUSTC_WRAPPER is no wrapper to cargo, and it
+            // overrides the `build.rustc-wrapper` stow setup wrote into
+            // the shared cargo home — so the baseline is plain cargo
+            // (stow#608).
+            .env("RUSTC_WRAPPER", "")
             .env_remove("RUST_LOG");
         let (output, wall, window) = timed_build(&mut command);
         assert!(
