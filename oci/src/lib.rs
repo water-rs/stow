@@ -10,6 +10,7 @@ mod client;
 mod index;
 mod records;
 mod registry;
+pub mod retry;
 mod sign;
 pub mod verify;
 
