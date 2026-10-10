@@ -376,7 +376,7 @@ fn finish_report(
             "  RERUN {} {} attempt {}: {} / {}",
             rerun.task_id,
             rerun.url,
-            rerun.attempt,
+            rerun.run_attempt,
             rerun.job,
             rerun.step.as_deref().unwrap_or("-")
         );
@@ -1161,7 +1161,7 @@ struct RerunRecord {
     url: String,
     job: String,
     step: Option<String>,
-    attempt: u64,
+    run_attempt: u64,
 }
 
 /// Bind a node to the rerun just requested on `state`'s run: the node
@@ -1223,7 +1223,7 @@ async fn classify_and_fold(
     // for the rerun's own state rather than classifying it again.
     if reruns
         .iter()
-        .any(|rerun| rerun.task_id == state.task_id && rerun.attempt > state.run_attempt)
+        .any(|rerun| rerun.task_id == state.task_id && rerun.run_attempt > state.run_attempt)
     {
         return Ok(());
     }
@@ -1664,7 +1664,7 @@ impl Dispatch {
             url: state.url.clone(),
             job,
             step,
-            attempt: state.run_attempt + 1,
+            run_attempt: state.run_attempt + 1,
         }))
     }
 
@@ -2773,7 +2773,7 @@ mod tests {
                 url: "https://github.com/water-rs/stow/actions/runs/77".to_owned(),
                 job: "build".to_owned(),
                 step: Some("Run dtolnay/rust-toolchain".to_owned()),
-                attempt: 2,
+                run_attempt: 2,
             }),
             &mut nodes,
             &mut open,
@@ -2785,7 +2785,7 @@ mod tests {
         assert_eq!(node.workflow_run_id, Some(77));
         assert!(node.dispatched && node.run_etag.is_none() && node.latest.is_none());
         assert_eq!(reruns.len(), 1);
-        assert_eq!(reruns[0].attempt, 2);
+        assert_eq!(reruns[0].run_attempt, 2);
     }
 
     /// Adoption folds through the same classifier: a failed adopted run
@@ -2808,7 +2808,7 @@ mod tests {
                 url: "https://github.com/water-rs/stow/actions/runs/88".to_owned(),
                 job: "-".to_owned(),
                 step: None,
-                attempt: 2,
+                run_attempt: 2,
             }),
             &mut nodes,
             &mut open,
