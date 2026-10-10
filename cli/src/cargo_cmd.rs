@@ -104,7 +104,9 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     let project_span = tracing::debug_span!("stow.precargo.project_context");
     let pending = project_span.in_scope(|| ProjectContext::begin(&invocation))?;
     let mold = spawn_mold_provision(&pending);
+    let env_base = spawn_env_base(config.as_ref(), &pending.invocation_dir);
     let mut project = pending.finish().instrument(project_span).await?;
+    project.env_base = env_base;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -577,6 +579,7 @@ fn build_mirror_project_context(
         target_given: project.target_given,
         rustc_version: project.rustc_version.clone(),
         mold_config_args: project.mold_config_args.clone(),
+        env_base: project.env_base.clone(),
     })
 }
 
@@ -677,12 +680,55 @@ pub struct ProjectContext {
     /// selection — and therefore the compile keys — is identical
     /// whether it came from `--config` or from a written config file.
     pub(crate) mold_config_args: Vec<String>,
+    /// The supervisor's wrapper base, still computing while the driver's
+    /// other work proceeds — `Shared` so every `run_cargo` the context
+    /// reaches awaits the one task rather than letting the first
+    /// facade's `compiled` re-probe on cargo's critical path (stow#608).
+    /// `None` on the paths that never had a `StowConfig` to build it
+    /// from; the lazy load then behaves exactly as before.
+    pub(crate) env_base: Option<SharedEnvBase>,
 }
 
 /// The build's target triple while rustc is still answering: `Shared` so
 /// the project context and the mold provisioning task can both await the
 /// one probe (stow#517).
 type SharedTargetProbe = Shared<BoxFuture<'static, Result<String, String>>>;
+
+/// The wrapper environment base the driver's supervisor seeds, still
+/// computing — `Shared` so a cloned `ProjectContext` (a mirrored
+/// upgrade build) awaits the same task rather than a second one.
+type SharedEnvBase = Shared<BoxFuture<'static, Option<std::sync::Arc<crate::WrapperEnvBase>>>>;
+
+/// Spawn the supervisor's base build on the driver's own timeline —
+/// its probes and `prepare_local_cache` overlap the context's
+/// remaining work and mold's provisioning, so `run_cargo` finds them
+/// already answered (stow#608). No `StowConfig` means nothing to build
+/// and no task to await.
+fn spawn_env_base(config: Option<&StowConfig>, invocation_dir: &Path) -> Option<SharedEnvBase> {
+    let config = config.cloned()?;
+    let dir = invocation_dir.to_path_buf();
+    let task = tokio::spawn(
+        async move {
+            crate::supervisor_env_base(&config, &dir)
+                .await
+                .map(std::sync::Arc::new)
+        }
+        .instrument(tracing::debug_span!("stow.precargo.env_base")),
+    );
+    Some(
+        async move {
+            match task.await {
+                Ok(base) => base,
+                Err(error) => {
+                    tracing::warn!(error = %error, "join supervisor env base task");
+                    None
+                }
+            }
+        }
+        .boxed()
+        .shared(),
+    )
+}
 
 /// The half of a [`ProjectContext`] that never waits on rustc: the
 /// invocation's workspace layout, and the rustc probes themselves,
@@ -703,6 +749,10 @@ struct PendingProjectContext {
     /// `None` for a native (host-triple) build.
     resolved_target: Option<String>,
     rustc_version: tokio::task::JoinHandle<Result<String, String>>,
+    /// The directory cargo answers its config chain for — where the
+    /// invocation ran, which `supervisor_env_base` resolves
+    /// `build.rustc` against (stow#608).
+    invocation_dir: PathBuf,
 }
 
 impl ProjectContext {
@@ -760,7 +810,7 @@ impl ProjectContext {
         })?;
         let workspace_root = layout.workspace_root;
         let current_dir = if invocation_dir.starts_with(&workspace_root) {
-            invocation_dir
+            invocation_dir.clone()
         } else {
             workspace_root.clone()
         };
@@ -778,6 +828,7 @@ impl ProjectContext {
             target,
             resolved_target,
             rustc_version,
+            invocation_dir,
         })
     }
 
@@ -815,6 +866,7 @@ impl PendingProjectContext {
             target_given: self.resolved_target.is_some(),
             rustc_version,
             mold_config_args: Vec::new(),
+            env_base: None,
         })
     }
 }
@@ -3879,13 +3931,24 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
                  writer when the analysis is not deferred",
             );
     }
-    let handler = std::sync::Arc::new(crate::BuildSupervisor::new(crate::BuildContext {
-        policy_dir: cache_policy_path.map(Path::to_path_buf),
-        public_cache_target: Some(project.target.clone()),
-        public_cache_disabled: public_cache_mode.disable_reason().is_some(),
-        analysis: std::sync::Arc::clone(&analysis_cell),
-        serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
-    }));
+    // The driver-built wrapper base lands here, still inside the
+    // driver's own timeline: the task spawned in `run_inner` has been
+    // running beside mold's provisioning and the workspace analysis, so
+    // this await is almost always an immediate take (stow#608).
+    let env_base = match &project.env_base {
+        Some(shared) => shared.clone().await,
+        None => None,
+    };
+    let handler = std::sync::Arc::new(crate::BuildSupervisor::new(
+        crate::BuildContext {
+            policy_dir: cache_policy_path.map(Path::to_path_buf),
+            public_cache_target: Some(project.target.clone()),
+            public_cache_disabled: public_cache_mode.disable_reason().is_some(),
+            analysis: std::sync::Arc::clone(&analysis_cell),
+            serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
+        },
+        env_base,
+    ));
     let supervisor = tracing::debug_span!("stow.precargo.supervisor_start")
         .in_scope(|| crate::supervisor::server::start(handler.clone()))
         .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
@@ -4656,6 +4719,7 @@ mod tests {
             target_given: false,
             rustc_version: "1.91.1".to_owned(),
             mold_config_args: Vec::new(),
+            env_base: None,
         }
     }
 
@@ -4925,6 +4989,7 @@ mod tests {
             target_given: false,
             rustc_version: "1.91.1".to_owned(),
             mold_config_args: Vec::new(),
+            env_base: None,
         };
         let mirror = create_workspace_mirror(&project, &project.workspace_root)
             .await
