@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/water-rs/stow/compare/stow-cli-v0.6.0...stow-cli-v0.7.0) - 2026-10-10
+
+### Added
+
+- *(cli)* read cargo's unit graph instead of hand-walking cargo metadata ([#551](https://github.com/water-rs/stow/pull/551)) ([#566](https://github.com/water-rs/stow/pull/566))
+- *(edge)* serve cacheable GETs through Workers Cache; adopt native platform features ([#454](https://github.com/water-rs/stow/pull/454)) ([#498](https://github.com/water-rs/stow/pull/498))
+- [**breaking**] preheat the cache from GHCR, with records as the only record source ([#477](https://github.com/water-rs/stow/pull/477))
+- *(admin)* [**breaking**] resolve graphs natively with the cargo library in stow-admin ([#468](https://github.com/water-rs/stow/pull/468))
+
+### Fixed
+
+- carry resolved dependency identity through the cache graph ([#594](https://github.com/water-rs/stow/pull/594))
+- *(ci)* stage consumption from the build's own cargo unit graph ([#590](https://github.com/water-rs/stow/pull/590))
+- serve and publish crates whose [lib] name differs from the package name ([#583](https://github.com/water-rs/stow/pull/583))
+- *(admin,cli)* classify HTTP statuses zenwave returns as errors, starting with the watchdog incident label ([#569](https://github.com/water-rs/stow/pull/569))
+- *(cli)* take the rustc and mold probes off the pre-cargo critical path ([#515](https://github.com/water-rs/stow/pull/515))
+- *(cli)* retry transient failures when downloading mold ([#514](https://github.com/water-rs/stow/pull/514))
+- satisfy the lints Rust 1.99 adds ([#513](https://github.com/water-rs/stow/pull/513))
+- *(oci)* sign a manifest before its tag points at it ([#483](https://github.com/water-rs/stow/pull/483))
+- *(edge)* [**breaking**] drop the CI completion route and the probes of retired routes ([#479](https://github.com/water-rs/stow/pull/479))
+- *(cli)* carry the invocation's OUT_DIR across the supervisor socket ([#476](https://github.com/water-rs/stow/pull/476))
+- *(scheduler)* [**breaking**] bound every scheduler request and alarm pass to its event, gated by workerd's billed counters ([#472](https://github.com/water-rs/stow/pull/472))
+- *(ci)* [**breaking**] cut build-wave latency and the failures behind it ([#462](https://github.com/water-rs/stow/pull/462))
+- [**breaking**] a served unit is one its slice vouches for, and a dependency side the resolver never wrote is not trusted ([#374](https://github.com/water-rs/stow/pull/374))
+- [**breaking**] host-side units are nodes of their own, built at the keys consumers compute ([#368](https://github.com/water-rs/stow/pull/368))
+
+### Other
+
+- *(cli)* take the state DB open, rustc probes and Windows shim compare off cargo's critical path ([#518](https://github.com/water-rs/stow/pull/518))
+- *(cli)* decide serves from a once-per-build map, not a per-invocation round trip ([#509](https://github.com/water-rs/stow/pull/509))
+- *(deps)* bump sigstore from 0.13.0 to 0.14.0 ([#503](https://github.com/water-rs/stow/pull/503))
+- *(edge)* [**breaking**] serve bundles by digest without the D1 catalog lookup ([#467](https://github.com/water-rs/stow/pull/467))
+
 ## [0.6.0](https://github.com/water-rs/stow/compare/stow-cli-v0.5.0...stow-cli-v0.6.0) - 2026-09-24
 
 ### Added
