@@ -90,7 +90,11 @@ in-process for every CI target, layers it so each layer's deps sit in
 the published index, dispatches `build-crate.yml` through GitHub's
 `workflow_dispatch` API under the operator token, dispatches
 `index-publish.yml` between layers, and resumes by re-reading the
-published index — no edge, no local state. A `--projects` repository
+published index — no edge, no local state. A run that fails outside
+the build and publish steps — runner setup, toolchain install,
+artifact transfer — is infrastructure rather than the crate's verdict:
+its failed jobs are rerun in place, up to three attempts, and the
+report lists each rerun. A `--projects` repository
 that fails to resolve is reported while the wave dispatches the rest,
 and the run exits non-zero naming it; a `--crates` or `--dirs` failure
 still aborts before dispatch. `--dispatch-url` points the
