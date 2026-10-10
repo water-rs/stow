@@ -81,65 +81,27 @@ pub async fn provision(
     if !cfg!(target_os = "linux") || explicit_target.is_some_and(|target| !linux_target(target)) {
         return Ok(Vec::new());
     }
-    // The availability probe is a process spawn, and it is independent
-    // of the target triple unless a `cfg()` target table changes the
-    // probe's inputs: launch the probe the config asks for under a
-    // target-blind read while rustc's own host probe is still running.
-    // When the real target leaves the probe inputs untouched the
-    // speculative answer stands; when they change it the probe reruns
-    // on the real inputs. `cargo-config2` answers the cfg question
-    // lazily on first resolution, so this read costs a rustc probe
-    // only when a `cfg()` table exists (stow#517).
-    let config = cargo_config(cargo_dir, None)
+    // Loading the config files does not evaluate `target.<cfg>` tables —
+    // `cargo-config2` answers the cfg question lazily on first resolution
+    // — so the read overlaps rustc's host probe; only the evaluation
+    // waits for the real triple (stow#608).
+    let config = cargo_config_for_link_eval(cargo_dir, None)
         .map_err(|error| stow_types::stow_error!("load cargo config: {error}"))?;
-    let candidate = resolve_link_from(&config, explicit_target.unwrap_or_default(), &process_env);
-    let speculative = match (candidate.selects_mold, candidate.probe()) {
-        (true, probe @ MoldProbe::Driver { .. }) => {
-            let task = tokio::spawn({
-                let probe = probe.clone();
-                async move {
-                    probe_unavailable_reason(&probe)
-                        .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
-                        .await
-                }
-            });
-            Some((probe, task))
-        }
-        _ => None,
-    };
     let target = target
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     if !linux_target(&target) {
-        if let Some((_, task)) = speculative {
-            task.abort();
-        }
         return Ok(Vec::new());
     }
     let link = resolve_link_from(&config, &target, &process_env);
-    if link.selects_mold {
-        let real = link.probe();
-        let reason = match speculative {
-            Some((probe, task)) if probe == real => task
-                .await
-                .map_err(|error| stow_types::stow_error!("join mold probe task: {error}"))?,
-            Some((_, task)) => {
-                task.abort();
-                probe_unavailable_reason(&real)
-                    .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
-                    .await
-            }
-            None => {
-                probe_unavailable_reason(&real)
-                    .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
-                    .await
-            }
-        };
-        if reason.is_none() {
-            return Ok(Vec::new());
-        }
-    } else if let Some((_, task)) = speculative {
-        task.abort();
+    if link.selects_mold
+        && link
+            .unavailable_reason()
+            .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
+            .await
+            .is_none()
+    {
+        return Ok(Vec::new());
     }
     let bin_dir = ensure_mold_install()
         .instrument(tracing::debug_span!("stow.precargo.mold_install"))
@@ -624,6 +586,37 @@ pub fn cargo_config(
     cargo_config2::Config::load_with_options(cargo_dir, options)
 }
 
+/// The cargo configuration for `target.<cfg>`/rustflags/linker
+/// evaluation, with stow's own rustc wrapper taken out of the probe: the
+/// shim passes `--print` through unchanged so the answers are identical,
+/// while evaluating through it would boot the whole standalone wrapper —
+/// its own rustc probes and state-DB open — once per `cfg()` table read
+/// (stow#608). The wrapper is removed the way cargo removes it —
+/// `RUSTC_WRAPPER` set to the empty string overrides `build.rustc-wrapper`
+/// — so a user-configured wrapper is left in place, because it can
+/// legitimately change rustc's answers.
+fn cargo_config_for_link_eval(
+    cargo_dir: &Path,
+    cargo_home: Option<&Path>,
+) -> Result<cargo_config2::Config, cargo_config2::Error> {
+    let config = cargo_config(cargo_dir, cargo_home)?;
+    let stow_wrapped = config
+        .build
+        .rustc_wrapper
+        .as_deref()
+        .and_then(Path::to_str)
+        .is_some_and(crate::commands::is_stow_owned_value);
+    if !stow_wrapped {
+        return Ok(config);
+    }
+    let env = std::env::vars_os().chain([(OsString::from("RUSTC_WRAPPER"), OsString::new())]);
+    let mut options = cargo_config2::ResolveOptions::default().env(env);
+    if let Some(home) = cargo_home {
+        options = options.cargo_home(Some(home.to_path_buf()));
+    }
+    cargo_config2::Config::load_with_options(cargo_dir, options)
+}
+
 /// Only the global end of the chain — the read `stow setup` makes,
 /// where project-level files must not answer: ancestors of
 /// `cargo_home`, which reach `$CARGO_HOME/config.toml` and any
@@ -632,9 +625,28 @@ fn global_cargo_config(
     cargo_home: Option<&Path>,
 ) -> Result<cargo_config2::Config, cargo_config2::Error> {
     let cargo_home = cargo_home.map(Path::to_path_buf);
+    let config = cargo_config2::Config::load_with_options(
+        cargo_home.clone().unwrap_or_default(),
+        cargo_config2::ResolveOptions::default().cargo_home(cargo_home.clone()),
+    )?;
+    // Same rule as `cargo_config_for_link_eval`: stow's own wrapper must
+    // not answer the `target.<cfg>` probes setup's re-run makes once its
+    // own `rustc-wrapper` entry is on disk.
+    let stow_wrapped = config
+        .build
+        .rustc_wrapper
+        .as_deref()
+        .and_then(Path::to_str)
+        .is_some_and(crate::commands::is_stow_owned_value);
+    if !stow_wrapped {
+        return Ok(config);
+    }
+    let env = std::env::vars_os().chain([(OsString::from("RUSTC_WRAPPER"), OsString::new())]);
     cargo_config2::Config::load_with_options(
         cargo_home.clone().unwrap_or_default(),
-        cargo_config2::ResolveOptions::default().cargo_home(cargo_home),
+        cargo_config2::ResolveOptions::default()
+            .cargo_home(cargo_home)
+            .env(env),
     )
 }
 

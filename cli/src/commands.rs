@@ -985,7 +985,7 @@ fn clean_stow_owned_entries(document: &mut DocumentMut) -> bool {
 /// inside a stow tools dir — the shims' home (`<data>/stow/tools`) and the
 /// tools dir older releases used (`/tmp/stow-tools`). The key holding a
 /// value never decides, so a user's own `CC` or `COMPILER_PATH` survives.
-fn is_stow_owned_value(value: &str) -> bool {
+pub fn is_stow_owned_value(value: &str) -> bool {
     const SHIM_STEMS: &[&str] = &[
         "stow-rustc-wrapper",
         "stow-cc",
