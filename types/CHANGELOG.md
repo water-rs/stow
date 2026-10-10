@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/water-rs/stow/compare/stow-types-v0.6.0...stow-types-v0.7.0) - 2026-10-10
+
+### Added
+
+- *(cli)* read cargo's unit graph instead of hand-walking cargo metadata ([#551](https://github.com/water-rs/stow/pull/551)) ([#566](https://github.com/water-rs/stow/pull/566))
+- *(scheduler)* deliver hourly sampled demand through a durable feed ([#563](https://github.com/water-rs/stow/pull/563))
+- *(scheduler)* rank demand by build cost and enforce admission floor ([#534](https://github.com/water-rs/stow/pull/534))
+- [**breaking**] the edge resolves nothing; delete stow-resolve and the Worker resolver ([#519](https://github.com/water-rs/stow/pull/519))
+- resolve human requests in an Actions job; the edge resolves nothing on the request lane ([#516](https://github.com/water-rs/stow/pull/516))
+- gate every change on its projected cost at launch traffic ([#505](https://github.com/water-rs/stow/pull/505))
+- [**breaking**] preheat the cache from GHCR, with records as the only record source ([#477](https://github.com/water-rs/stow/pull/477))
+- *(edge)* [**breaking**] dispatch freeze on systematic failure + self-metered cost trip ([#279](https://github.com/water-rs/stow/pull/279)) ([#470](https://github.com/water-rs/stow/pull/470))
+- *(admin)* [**breaking**] resolve graphs natively with the cargo library in stow-admin ([#468](https://github.com/water-rs/stow/pull/468))
+- *(edge,admin)* replace the panic switch with zone WAF maintenance rules ([#453](https://github.com/water-rs/stow/pull/453)) ([#469](https://github.com/water-rs/stow/pull/469))
+
+### Fixed
+
+- carry resolved dependency identity through the cache graph ([#594](https://github.com/water-rs/stow/pull/594))
+- serve and publish crates whose [lib] name differs from the package name ([#583](https://github.com/water-rs/stow/pull/583))
+- *(ci)* label published artifacts with the feature set rustc compiled ([#581](https://github.com/water-rs/stow/pull/581))
+- *(edge)* report the scheduler budget's wall time instead of gating on it ([#580](https://github.com/water-rs/stow/pull/580))
+- fence bounded build retries by execution generation ([#532](https://github.com/water-rs/stow/pull/532))
+- *(cli)* retry transient failures when downloading mold ([#514](https://github.com/water-rs/stow/pull/514))
+- *(resolver)* tasks resolve the deduped dependency identity a consumer's build computes ([#507](https://github.com/water-rs/stow/pull/507))
+- decode Analytics Engine's quoted 64-bit integers with the column's type ([#497](https://github.com/water-rs/stow/pull/497))
+- retry transient failures in the GitHub client and the registry session ([#490](https://github.com/water-rs/stow/pull/490))
+- *(resolver)* [**breaking**] drop a crate's bundled lockfile like every other lane ([#484](https://github.com/water-rs/stow/pull/484))
+- *(edge)* [**breaking**] drop the CI completion route and the probes of retired routes ([#479](https://github.com/water-rs/stow/pull/479))
+- *(scheduler)* [**breaking**] bound every scheduler request and alarm pass to its event, gated by workerd's billed counters ([#472](https://github.com/water-rs/stow/pull/472))
+- *(scheduler)* [**breaking**] move schema migrations off request code onto an operator route ([#459](https://github.com/water-rs/stow/pull/459))
+- *(ci)* [**breaking**] cut build-wave latency and the failures behind it ([#462](https://github.com/water-rs/stow/pull/462))
+- [**breaking**] host-side units are nodes of their own, built at the keys consumers compute ([#368](https://github.com/water-rs/stow/pull/368))
+
+### Other
+
+- *(edge)* maintain each queue node's unpublished-deps counter ([#529](https://github.com/water-rs/stow/pull/529))
+- Bound scheduler dispatch and idle alarms; keep workerd gates event-scoped ([#528](https://github.com/water-rs/stow/pull/528))
+- *(edge)* [**breaking**] serve bundles by digest without the D1 catalog lookup ([#467](https://github.com/water-rs/stow/pull/467))
+
 ## [0.6.0](https://github.com/water-rs/stow/compare/stow-types-v0.5.0...stow-types-v0.6.0) - 2026-09-24
 
 ### Added
