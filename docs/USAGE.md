@@ -379,7 +379,11 @@ acting unless `--yes` is given.
   published index, dispatch `build-crate.yml` straight through GitHub's
   `workflow_dispatch`, and publish each index slice as its layer lands.
   Works while Cloudflare is down. Resumable by index, exits non-zero
-  with the failed runs' URLs. A `--projects` repository that fails to
+  with the failed runs' URLs. A run whose failed step is outside the
+  build and publish stages — runner setup, toolchain install, artifact
+  transfer — is infrastructure, not the crate's verdict: its failed
+  jobs are rerun in place (up to three attempts) and the report lists
+  every rerun. A `--projects` repository that fails to
   resolve is reported and the wave dispatches the rest, exiting
   non-zero naming it; a `--crates` or `--dirs` failure still aborts
   before dispatch. `--dispatch-url` aims it at the mock's

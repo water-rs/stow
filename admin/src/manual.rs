@@ -12,7 +12,10 @@
 //! work. Runs a previous invocation dispatched are adopted by
 //! `display_title` rather than re-dispatched — except a failure that ran
 //! code `main` no longer carries, which says nothing about the code a
-//! dispatch runs now and is dispatched again.
+//! dispatch runs now and is dispatched again. A failure outside the
+//! steps that run the crate is runner infrastructure, not the node's
+//! verdict: the run's failed jobs are rerun in place (bounded by
+//! `MAX_RUN_ATTEMPTS`) and the node stays open.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -54,6 +57,21 @@ const SLICE_PULL_CONCURRENCY: usize = 8;
 /// How far back `workflow_run` adoption looks when `--adopt-since`
 /// is not given.
 const ADOPT_SINCE_DEFAULT_HOURS: i64 = 24;
+/// How many attempts one run gets before a failure is final —
+/// `rerun-failed-jobs` bumps the run's `run_attempt`, so a failure
+/// observed at this count is the node's verdict even when its step
+/// is infrastructure.
+const MAX_RUN_ATTEMPTS: u64 = 3;
+/// The `build-crate.yml` step names whose failure is the crate's
+/// verdict — the steps that run the crate or judge its outputs; every
+/// other step is runner setup, toolchain install or artifact transfer.
+/// Step names are the contract: keep them in sync with
+/// `.github/workflows/build-crate.yml`.
+const VERDICT_STEPS: &[&str] = &[
+    "Run the untrusted build stage",
+    "Report the built outputs' glibc floor",
+    "Run the trusted publish stage",
+];
 
 /// `stow-admin preheat manual` arguments.
 #[derive(Debug, Args)]
@@ -180,6 +198,11 @@ struct RunState {
     /// `main` moves. The local CI server always runs the checkout it
     /// serves, so its rows carry an empty sha that is never stale.
     head_sha: String,
+    /// GitHub's attempt counter — `rerun-failed-jobs` bumps it, so a
+    /// failure observed at `MAX_RUN_ATTEMPTS` is final. The local
+    /// server's rows carry a constant 1: it has no runner setup and
+    /// never reruns, so the attempt is never consulted there.
+    run_attempt: u64,
 }
 
 impl RunState {
@@ -275,6 +298,7 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
 
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut blocked_report: Vec<(String, String)> = Vec::new();
+    let mut reruns: Vec<RerunRecord> = Vec::new();
     for (index, layer) in layers.iter().enumerate() {
         if layer.is_empty() {
             continue;
@@ -290,6 +314,7 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
             &dispatch,
             layer,
             &mut nodes,
+            &mut reruns,
             args.in_flight,
             adopt_since,
             &rustc_version,
@@ -311,6 +336,7 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
         &nodes,
         &failures,
         &blocked_report,
+        &reruns,
         &resolved.unresolved_projects,
     )
 }
@@ -318,12 +344,14 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
 /// The wave's outcome line plus its failure list — a node still undone
 /// failed, or was skipped behind a failed ancestor, a `--projects`
 /// repository that never resolved is named too, and the report names
-/// all three. The run exits non-zero unless every node is done and
-/// every project resolved.
+/// all three. Infrastructure reruns are listed as well: runner flakes
+/// are reported, not hidden. The run exits non-zero unless every node
+/// is done and every project resolved.
 fn finish_report(
     nodes: &BTreeMap<String, NodeRun>,
     failures: &[(String, String)],
     blocked_report: &[(String, String)],
+    reruns: &[RerunRecord],
     unresolved_projects: &[String],
 ) -> stow_types::error::Result<()> {
     let total = nodes.len();
@@ -342,11 +370,23 @@ fn finish_report(
     for project in unresolved_projects {
         let _ = writeln!(report, "  UNRESOLVED {project}");
     }
+    for rerun in reruns {
+        let _ = writeln!(
+            report,
+            "  RERUN {} {} attempt {}: {} / {}",
+            rerun.task_id,
+            rerun.url,
+            rerun.run_attempt,
+            rerun.job,
+            rerun.step.as_deref().unwrap_or("-")
+        );
+    }
     let _ = writeln!(
         report,
-        "manual preheat: {done}/{total} built, {} failed, {skipped} skipped, {} unresolved",
+        "manual preheat: {done}/{total} built, {} failed, {skipped} skipped, {} unresolved, {} rerun",
         failures.len(),
-        unresolved_projects.len()
+        unresolved_projects.len(),
+        reruns.len()
     );
     render::emit_line(&report);
     if failures.is_empty() && done == total && unresolved_projects.is_empty() {
@@ -1061,6 +1101,137 @@ fn fold_run(
     node.latest = Some(state);
 }
 
+/// A completed run's non-success conclusion, classified by which step
+/// failed: `Verdict` is the crate's own outcome and the node fails as
+/// always; `Infrastructure` names the failed job and step — runner
+/// setup, toolchain install or artifact transfer — and earns a rerun
+/// of the run's failed jobs instead of the node's verdict.
+enum FailureClass {
+    Verdict,
+    Infrastructure {
+        /// The failed job's name — for the warn log and the report.
+        job: String,
+        /// Its first failed step — `None` when the runner was lost
+        /// before any step ran (a cancelled setup, a dropped runner).
+        step: Option<String>,
+    },
+}
+
+/// Classify a completed failed run by its jobs: the first failed job's
+/// first failed step decides — a `VERDICT_STEPS` step is the crate's
+/// verdict and anything else is infrastructure. A failed job with no
+/// failed step (the runner died mid-job) and a failed run with no
+/// failed job at all (`startup_failure` — no runner ever took it) are
+/// infrastructure too.
+fn classify_failure(jobs: &[RunJobRow]) -> FailureClass {
+    let Some(job) = jobs
+        .iter()
+        .find(|job| job.conclusion.as_deref() == Some("failure"))
+    else {
+        return FailureClass::Infrastructure {
+            job: "-".to_owned(),
+            step: None,
+        };
+    };
+    let Some(step) = job
+        .steps
+        .iter()
+        .find(|step| step.conclusion.as_deref() == Some("failure"))
+    else {
+        return FailureClass::Infrastructure {
+            job: job.name.clone(),
+            step: None,
+        };
+    };
+    if VERDICT_STEPS.contains(&step.name.as_str()) {
+        FailureClass::Verdict
+    } else {
+        FailureClass::Infrastructure {
+            job: job.name.clone(),
+            step: Some(step.name.clone()),
+        }
+    }
+}
+
+/// One infrastructure rerun for the finish report: the run, the job
+/// and step it failed in, and the attempt the rerun runs as — the
+/// failed attempt's `run_attempt` + 1.
+struct RerunRecord {
+    task_id: String,
+    url: String,
+    job: String,
+    step: Option<String>,
+    run_attempt: u64,
+}
+
+/// Bind a node to the rerun just requested on `state`'s run: the node
+/// stays open under the same `workflow_run_id` — only its cached row
+/// and validator drop, so the next poll reads the rerun's fresh state
+/// rather than answering a 304 with the failed attempt's.
+fn bind_rerun(state: &RunState, nodes: &mut BTreeMap<String, NodeRun>) {
+    let Some(node) = nodes.get_mut(&state.task_id) else {
+        return;
+    };
+    node.run_url = Some(state.url.clone());
+    node.workflow_run_id = Some(state.workflow_run_id);
+    node.dispatched = true;
+    node.run_etag = None;
+    node.latest = None;
+}
+
+/// Fold one already-classified run state: a `Some` record means the
+/// failure was infrastructure and its rerun was just requested — bind
+/// the node to it and record it; `None` folds the state exactly as
+/// `fold_run` always did.
+fn fold_classified(
+    state: RunState,
+    record: Option<RerunRecord>,
+    nodes: &mut BTreeMap<String, NodeRun>,
+    open: &mut BTreeSet<String>,
+    main_head: &str,
+    reruns: &mut Vec<RerunRecord>,
+) {
+    match record {
+        Some(record) => {
+            bind_rerun(&state, nodes);
+            reruns.push(record);
+        }
+        None => fold_run(state, nodes, open, main_head),
+    }
+}
+
+/// The async half `fold_run` cannot do: a completed non-success run on
+/// current `main` is classified through the backend first — an
+/// infrastructure failure gets its failed jobs rerun and never reaches
+/// the fold as a failure. Everything else — in-flight runs, successes,
+/// stale failures and runs of other tasks — folds untouched.
+async fn classify_and_fold(
+    dispatch: &Dispatch,
+    state: RunState,
+    nodes: &mut BTreeMap<String, NodeRun>,
+    open: &mut BTreeSet<String>,
+    main_head: &str,
+    reruns: &mut Vec<RerunRecord>,
+) -> stow_types::error::Result<()> {
+    let failed = state.status == "completed" && state.conclusion.as_deref() != Some("success");
+    if !failed || state.stale_failure(main_head) || !nodes.contains_key(&state.task_id) {
+        fold_run(state, nodes, open, main_head);
+        return Ok(());
+    }
+    // The run row lags a rerun request by a beat: a failure row for an
+    // attempt a rerun already superseded is not a new verdict — wait
+    // for the rerun's own state rather than classifying it again.
+    if reruns
+        .iter()
+        .any(|rerun| rerun.task_id == state.task_id && rerun.run_attempt > state.run_attempt)
+    {
+        return Ok(());
+    }
+    let record = dispatch.classify_failed_run(&state).await?;
+    fold_classified(state, record, nodes, open, main_head, reruns);
+    Ok(())
+}
+
 /// Drive one layer to completion: adopt once — every run in the closed
 /// `[adopt_since, now]` window whose title names an open node — dispatch
 /// the rest bounded by `in_flight`, then poll only the run ids the wave
@@ -1071,6 +1242,7 @@ async fn drive_layer(
     dispatch: &Dispatch,
     layer: &[String],
     nodes: &mut BTreeMap<String, NodeRun>,
+    reruns: &mut Vec<RerunRecord>,
     in_flight: usize,
     adopt_since: time::OffsetDateTime,
     rustc_version: &WireRustcVersion,
@@ -1108,7 +1280,7 @@ async fn drive_layer(
             retain_latest_run(&mut latest, state, node.workflow_run_id);
         }
         for state in latest.into_values() {
-            fold_run(state, nodes, &mut open, &main_head);
+            classify_and_fold(dispatch, state, nodes, &mut open, &main_head, reruns).await?;
         }
     }
     loop {
@@ -1125,14 +1297,16 @@ async fn drive_layer(
                     if let Some(node) = nodes.get_mut(&task_id) {
                         node.run_etag = etag;
                     }
-                    fold_run(state, nodes, &mut open, &main_head);
+                    classify_and_fold(dispatch, state, nodes, &mut open, &main_head, reruns)
+                        .await?;
                 }
                 BoundPoll::Unmodified(task_id) => {
                     // The cached row stands; refold it — a `main` head
                     // that moved this poll can still stale it.
                     let cached = nodes.get(&task_id).and_then(|node| node.latest.clone());
                     if let Some(state) = cached {
-                        fold_run(state, nodes, &mut open, &main_head);
+                        classify_and_fold(dispatch, state, nodes, &mut open, &main_head, reruns)
+                            .await?;
                     }
                 }
                 BoundPoll::Pending => {}
@@ -1445,6 +1619,55 @@ impl Dispatch {
         }
     }
 
+    /// Classify one bound run's completed non-success conclusion:
+    /// `Ok(Some)` when a rerun of the run's failed jobs was requested,
+    /// `Ok(None)` when the failure is the node's verdict. GitHub reads
+    /// the run's jobs — a `VERDICT_STEPS` step is the crate's verdict
+    /// and anything else is infrastructure — then asks for the rerun.
+    /// The local server has no runner setup, so every failure is final.
+    /// A failure observed at `MAX_RUN_ATTEMPTS` is final either way,
+    /// without spending the jobs read.
+    async fn classify_failed_run(
+        &self,
+        state: &RunState,
+    ) -> stow_types::error::Result<Option<RerunRecord>> {
+        let Self::GitHub { token } = self else {
+            return Ok(None);
+        };
+        if state.run_attempt >= MAX_RUN_ATTEMPTS {
+            return Ok(None);
+        }
+        let page: RunJobsPage = crate::github::get(
+            token,
+            &format!("actions/runs/{}/jobs", state.workflow_run_id),
+        )
+        .await?;
+        let FailureClass::Infrastructure { job, step } = classify_failure(&page.jobs) else {
+            return Ok(None);
+        };
+        crate::github::post_empty(
+            token,
+            &format!("actions/runs/{}/rerun-failed-jobs", state.workflow_run_id),
+            &serde_json::json!({}),
+        )
+        .await?;
+        tracing::warn!(
+            run = state.workflow_run_id,
+            task = %state.task_id,
+            %job,
+            step = step.as_deref().unwrap_or("-"),
+            attempt = state.run_attempt + 1,
+            "infrastructure failure; rerunning the run's failed jobs"
+        );
+        Ok(Some(RerunRecord {
+            task_id: state.task_id.clone(),
+            url: state.url.clone(),
+            job,
+            step,
+            run_attempt: state.run_attempt + 1,
+        }))
+    }
+
     /// The layer's one-time adoption sweep: every run in the closed
     /// `[since, until]` window whose `<rustc>-<task_id>` title names an
     /// open node — GitHub range-enumerates `created` so the whole window
@@ -1485,6 +1708,7 @@ impl Dispatch {
                                 conclusion: run.conclusion,
                                 url: run.html_url,
                                 head_sha: run.head_sha,
+                                run_attempt: run.run_attempt,
                             }
                         })
                     })
@@ -1646,6 +1870,7 @@ fn bound_run_state(
         conclusion: row.conclusion,
         url: row.html_url,
         head_sha: row.head_sha,
+        run_attempt: row.run_attempt,
     })
 }
 
@@ -1673,6 +1898,7 @@ async fn local_run_states(
                 conclusion: run.conclusion,
                 url: run.html_url,
                 head_sha: String::new(),
+                run_attempt: 1,
             })
         })
         .collect())
@@ -1688,6 +1914,30 @@ struct WorkflowRunRow {
     status: String,
     conclusion: Option<String>,
     html_url: String,
+    /// GitHub's attempt counter — `rerun-failed-jobs` bumps it.
+    run_attempt: u64,
+}
+
+/// `GET actions/runs/{id}/jobs` — the fields failure classification
+/// needs: each job's conclusion and its steps'. The endpoint serves the
+/// latest attempt's jobs by default, exactly the attempt the run's
+/// `run_attempt` names.
+#[derive(serde::Deserialize)]
+struct RunJobsPage {
+    jobs: Vec<RunJobRow>,
+}
+
+#[derive(serde::Deserialize)]
+struct RunJobRow {
+    name: String,
+    conclusion: Option<String>,
+    steps: Vec<RunStepRow>,
+}
+
+#[derive(serde::Deserialize)]
+struct RunStepRow {
+    name: String,
+    conclusion: Option<String>,
 }
 
 impl crate::github::RunRow for WorkflowRunRow {
@@ -1827,6 +2077,7 @@ mod tests {
             } else {
                 "2222222222222222222222222222222222222222".to_owned()
             },
+            run_attempt: 1,
         }
     }
 
@@ -2216,6 +2467,7 @@ mod tests {
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
             html_url: format!("https://github.com/water-rs/stow/actions/runs/{workflow_run_id}"),
+            run_attempt: 1,
         }
     }
 
@@ -2386,6 +2638,213 @@ mod tests {
         assert_eq!(latest["task"].workflow_run_id, 50);
     }
 
+    /// One jobs row for the classifier — the job's name, its conclusion
+    /// and its `(name, conclusion)` steps.
+    fn job_row(name: &str, conclusion: Option<&str>, steps: &[(&str, Option<&str>)]) -> RunJobRow {
+        RunJobRow {
+            name: name.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+            steps: steps
+                .iter()
+                .map(|&(name, conclusion)| RunStepRow {
+                    name: name.to_owned(),
+                    conclusion: conclusion.map(str::to_owned),
+                })
+                .collect(),
+        }
+    }
+
+    /// A failed step named by `VERDICT_STEPS` is the crate's verdict —
+    /// the build stage, the glibc-floor report and the publish stage.
+    #[test]
+    fn a_verdict_step_is_final() {
+        for step in VERDICT_STEPS {
+            let jobs = [job_row(
+                "build",
+                Some("failure"),
+                &[(*step, Some("failure"))],
+            )];
+            assert!(
+                matches!(classify_failure(&jobs), FailureClass::Verdict),
+                "{step} is the crate's verdict"
+            );
+        }
+    }
+
+    /// The step run 38019734143 died in — the toolchain install — is
+    /// runner infrastructure, not the crate's verdict.
+    #[test]
+    fn a_setup_step_failure_is_infrastructure() {
+        const TOOLCHAIN_STEP: &str =
+            "Run dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de";
+        let jobs = [job_row(
+            "build adler2 2.0.1 (aarch64-linux-android)",
+            Some("failure"),
+            &[(TOOLCHAIN_STEP, Some("failure"))],
+        )];
+        let FailureClass::Infrastructure { job, step } = classify_failure(&jobs) else {
+            panic!("a toolchain-install failure is infrastructure");
+        };
+        assert_eq!(step.as_deref(), Some(TOOLCHAIN_STEP));
+        assert!(job.contains("adler2"));
+    }
+
+    /// A failed job with no failed step — the runner was lost before a
+    /// step could fail — is infrastructure; so is a failed run with no
+    /// failed job at all (`startup_failure`).
+    #[test]
+    fn a_failed_job_with_no_failed_step_is_infrastructure() {
+        let jobs = [job_row(
+            "build",
+            Some("failure"),
+            &[("Check out the repository", Some("success"))],
+        )];
+        assert!(matches!(
+            classify_failure(&jobs),
+            FailureClass::Infrastructure { step: None, .. }
+        ));
+        assert!(matches!(
+            classify_failure(&[]),
+            FailureClass::Infrastructure { step: None, .. }
+        ));
+    }
+
+    /// At `MAX_RUN_ATTEMPTS` an infrastructure failure is final — the
+    /// bound returns before the jobs read, so the dummy token never
+    /// reaches the network.
+    #[tokio::test]
+    async fn infrastructure_at_max_attempts_is_final() {
+        let dispatch = Dispatch::GitHub {
+            token: "unused".to_owned(),
+        };
+        let mut state = run_state("completed", Some("failure"), true);
+        state.run_attempt = MAX_RUN_ATTEMPTS;
+        assert!(
+            dispatch
+                .classify_failed_run(&state)
+                .await
+                .expect("classified")
+                .is_none()
+        );
+    }
+
+    /// The local CI server has no runner setup: a failure is always
+    /// the verdict, at any attempt.
+    #[tokio::test]
+    async fn the_local_lane_takes_every_failure_as_final() {
+        let dispatch = Dispatch::Local {
+            base: "http://localhost".to_owned(),
+        };
+        let state = run_state("completed", Some("failure"), true);
+        assert!(
+            dispatch
+                .classify_failed_run(&state)
+                .await
+                .expect("classified")
+                .is_none()
+        );
+    }
+
+    /// A rerun keeps the node open and bound to the same run — the
+    /// failed attempt's cached row and validator drop so the next poll
+    /// reads the rerun's own state.
+    #[test]
+    fn a_rerun_stays_open_bound_to_the_same_run() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) =
+            build_graph(vec![request("flake", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("flake", &nodes)).expect("task id");
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        let mut state = run_state_with_id(77, "completed", Some("failure"), true);
+        state.task_id = task.clone();
+        // The node was bound to the failed attempt before it completed.
+        {
+            let node = nodes.get_mut(&task).expect("node");
+            node.workflow_run_id = Some(77);
+            node.run_etag = Some("etag".to_owned());
+            node.latest = Some(state.clone());
+            node.dispatched = true;
+        }
+        let mut reruns = Vec::new();
+        fold_classified(
+            state,
+            Some(RerunRecord {
+                task_id: task.clone(),
+                url: "https://github.com/water-rs/stow/actions/runs/77".to_owned(),
+                job: "build".to_owned(),
+                step: Some("Run dtolnay/rust-toolchain".to_owned()),
+                run_attempt: 2,
+            }),
+            &mut nodes,
+            &mut open,
+            MAIN_HEAD,
+            &mut reruns,
+        );
+        let node = &nodes[&task];
+        assert!(open.contains(&task) && !node.failed && !node.done);
+        assert_eq!(node.workflow_run_id, Some(77));
+        assert!(node.dispatched && node.run_etag.is_none() && node.latest.is_none());
+        assert_eq!(reruns.len(), 1);
+        assert_eq!(reruns[0].run_attempt, 2);
+    }
+
+    /// Adoption folds through the same classifier: a failed adopted run
+    /// whose step is infrastructure binds the node to the rerun and
+    /// keeps it open rather than failing it.
+    #[test]
+    fn adopting_an_infrastructure_failure_keeps_the_node_open() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) =
+            build_graph(vec![request("adopted", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("adopted", &nodes)).expect("task id");
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        let mut state = run_state_with_id(88, "completed", Some("failure"), true);
+        state.task_id = task.clone();
+        let mut reruns = Vec::new();
+        fold_classified(
+            state,
+            Some(RerunRecord {
+                task_id: task.clone(),
+                url: "https://github.com/water-rs/stow/actions/runs/88".to_owned(),
+                job: "-".to_owned(),
+                step: None,
+                run_attempt: 2,
+            }),
+            &mut nodes,
+            &mut open,
+            MAIN_HEAD,
+            &mut reruns,
+        );
+        let node = &nodes[&task];
+        assert!(open.contains(&task) && !node.failed && node.dispatched);
+        assert_eq!(node.workflow_run_id, Some(88));
+        assert_eq!(
+            node.run_url.as_deref(),
+            Some("https://github.com/water-rs/stow/actions/runs/88")
+        );
+    }
+
+    /// A verdict stays final: the fold marks the node failed and the
+    /// dependent layer is skipped behind it — unchanged from before
+    /// the rerun rule.
+    #[test]
+    fn a_final_failure_fails_the_node_and_blocks_dependents() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let mid = request("mid", T, false, &[("leaf", T, false)]);
+        let (mut nodes, edges) =
+            build_graph(vec![request("leaf", T, false, &[]), mid]).expect("valid graph");
+        let ids = |name: &str| node_task_id(request_by_name(name, &nodes)).expect("task id");
+        let (leaf, mid) = (ids("leaf"), ids("mid"));
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        let mut state = run_state_with_id(90, "completed", Some("failure"), true);
+        state.task_id = leaf.clone();
+        let mut reruns = Vec::new();
+        fold_classified(state, None, &mut nodes, &mut open, MAIN_HEAD, &mut reruns);
+        assert!(nodes[&leaf].failed && !open.contains(&leaf));
+        let blocked = mark_blocked(std::slice::from_ref(&mid), &mut nodes, &edges);
+        assert_eq!(blocked, vec![(mid.clone(), leaf)]);
+    }
+
     /// A 404 on an id whose row was already observed is GitHub dropping
     /// a materialized run — an error. Only a fresh id that never
     /// materialized waits its grace as `Pending`.
@@ -2455,7 +2914,7 @@ mod tests {
             "https://github.com/a/one: fetch failed".to_owned(),
             "https://github.com/b/two: no rust manifest".to_owned(),
         ];
-        let message = finish_report(&nodes, &[], &[], &unresolved)
+        let message = finish_report(&nodes, &[], &[], &[], &unresolved)
             .expect_err("unresolved projects fail the wave")
             .to_string();
         for entry in &unresolved {
@@ -2467,7 +2926,7 @@ mod tests {
     #[test]
     fn finish_report_ok_when_all_done_and_resolved() {
         let nodes = all_done(&["built"]);
-        finish_report(&nodes, &[], &[], &[]).expect("a clean wave");
+        finish_report(&nodes, &[], &[], &[], &[]).expect("a clean wave");
     }
 
     /// An undone node and an unresolved project both land in the error.
@@ -2485,6 +2944,7 @@ mod tests {
         let message = finish_report(
             &nodes,
             &[(id.clone(), "http://localhost/run/1".to_owned())],
+            &[],
             &[],
             &unresolved,
         )
