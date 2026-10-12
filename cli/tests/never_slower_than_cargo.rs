@@ -1171,6 +1171,18 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
             "stow build failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // stow's in-build `--unit-graph` query must never take the
+        // package-cache lock ahead of the real cargo — when it wins the
+        // race, cargo's own resolve prints this on the user's stderr
+        // (stow#608).
+        assert!(
+            !String::from_utf8_lossy(&output.stderr)
+                .contains("Blocking waiting for file lock on package cache"),
+            "stow's unit-graph query held the package-cache lock ahead of \
+             the real cargo, which printed `Blocking waiting for file \
+             lock`:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         stow_walls.push(wall);
         stow_windows.push(window);
     }

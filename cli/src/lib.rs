@@ -631,6 +631,76 @@ pub(crate) struct BuildContext {
     pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
 }
 
+/// The build's "cargo's resolution is over" signal — a
+/// [`crate::facade::ServeMapSignal`]-shaped `watch` one-shot.
+///
+/// The supervisor completes it on the first facade frame that
+/// describes a real compile unit — by then cargo holds only the shared
+/// package-cache lock, so the in-build enrichment's own `--unit-graph`
+/// cargo may take the exclusive one without queuing the user's build
+/// behind it. A build whose cargo compiles nothing never fires it; the
+/// waiter then ends with the process, as it already does when cargo
+/// exits first — no second trigger on cargo's exit (stow#608).
+#[derive(Debug, Clone)]
+pub struct ResolutionDone {
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl ResolutionDone {
+    /// A signal cargo has not yet left resolution.
+    #[must_use]
+    pub fn pending() -> Self {
+        Self {
+            done: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    /// Cargo's resolution is over: release every waiter. Idempotent —
+    /// the second compile unit's frame states the same truth.
+    /// `send_replace`, not `send`: the state must flip even while no
+    /// waiter is subscribed yet.
+    pub fn complete(&self) {
+        self.done.send_replace(true);
+    }
+
+    /// Whether cargo has left resolution yet.
+    #[must_use]
+    pub fn has_completed(&self) -> bool {
+        *self.done.borrow()
+    }
+
+    /// Wait for [`Self::complete`], or for the signal's own end: a
+    /// sender that is gone resolves the same wait a completed one does.
+    pub async fn wait(&self) {
+        let mut receiver = self.done.subscribe();
+        if !*receiver.borrow() {
+            let _ = receiver.changed().await;
+        }
+    }
+}
+
+impl Default for ResolutionDone {
+    /// A supervisor nobody armed has seen no compile unit.
+    fn default() -> Self {
+        Self::pending()
+    }
+}
+
+/// Whether a facade's frame describes a real compile unit — the moment
+/// cargo's resolution is over. Cargo's own probes pass through the
+/// wrapper before resolution (`rustc -vV`, the `--crate-name ___
+/// --print=file-names` target-info query): the classifier's probe set
+/// and the `___` probe crate are not units. An invocation the parser
+/// rejects is a compile headed to rustc all the same — cargo does not
+/// spawn unparseable probes (stow#608).
+fn describes_compile_unit(args: &[OsString], build_script_out_dir: Option<PathBuf>) -> bool {
+    match classify_invocation(args, build_script_out_dir) {
+        Ok(parsed) => parsed.crate_name != "___",
+        Err(UnparseableInvocation::Passthrough(_)) => true,
+        Err(UnparseableInvocation::Probe(_)) => false,
+    }
+}
+
 /// What the graph analysis adds to the plan path when it commits: the
 /// resolved per-package feature sets the identity derivation consults,
 /// the prefetch ledger, and whether semantic fallback applies.
@@ -748,6 +818,11 @@ pub(crate) struct BuildSupervisor {
     /// policy dir, the expanded graph, the prefetch candidates — which
     /// this process's environment never carried.
     ctx: BuildContext,
+    /// Completed by the first facade frame that describes a real
+    /// compile unit — the boundary after which the enrichment's own
+    /// cargo may take the package-cache lock without holding the real
+    /// cargo back (stow#608).
+    resolution_done: ResolutionDone,
     observations: std::sync::Mutex<Vec<artifact_cache::ObservedUnit>>,
 }
 
@@ -758,9 +833,14 @@ impl BuildSupervisor {
     /// loader would have probed on the first facade's critical path —
     /// seeded into the env cache so `compiled` answers immediately
     /// (stow#608).
-    pub(crate) fn new(ctx: BuildContext, base: Option<std::sync::Arc<WrapperEnvBase>>) -> Self {
+    pub(crate) fn new(
+        ctx: BuildContext,
+        base: Option<std::sync::Arc<WrapperEnvBase>>,
+        resolution_done: ResolutionDone,
+    ) -> Self {
         let supervisor = Self {
             ctx,
+            resolution_done,
             ..Self::default()
         };
         if let Some(base) = base {
@@ -809,14 +889,11 @@ impl supervisor::server::Handler for BuildSupervisor {
         args: Vec<OsString>,
         build_script_out_dir: Option<OsString>,
     ) -> supervisor::server::Decision<Self::Pending> {
-        match decide_rustc_invocation(
-            &executable,
-            &args,
-            &self.env_cache,
-            build_script_out_dir.map(PathBuf::from),
-            &self.ctx,
-        )
-        .await
+        let out_dir = build_script_out_dir.map(PathBuf::from);
+        if !self.resolution_done.has_completed() && describes_compile_unit(&args, out_dir.clone()) {
+            self.resolution_done.complete();
+        }
+        match decide_rustc_invocation(&executable, &args, &self.env_cache, out_dir, &self.ctx).await
         {
             Outcome::Served => supervisor::server::Decision::Served,
             Outcome::Compile(post) => supervisor::server::Decision::Compile(post),
@@ -843,6 +920,9 @@ impl supervisor::server::Handler for BuildSupervisor {
             tracing::warn!("supervisor observation carried an unparseable invocation; dropped");
             return;
         };
+        if parsed.crate_name != "___" {
+            self.resolution_done.complete();
+        }
         let Some(local_base) = self.env_cache.local_base(&observation.executable).await else {
             return;
         };
@@ -4084,6 +4164,116 @@ mod tests {
                 .as_deref(),
             Some(std::path::Path::new("/tmp/build/demo-aaa/out")),
         );
+    }
+
+    /// Cargo's probes reach the supervisor as `Plan` frames — `rustc -vV`
+    /// and the `--crate-name ___ --print=file-names` target-info query —
+    /// but they run before resolution and must not complete
+    /// `ResolutionDone`; only a real compile unit's frame may (stow#608).
+    #[tokio::test]
+    async fn resolution_done_fires_only_on_a_compile_unit_plan() {
+        let resolution_done = super::ResolutionDone::pending();
+        let handler = std::sync::Arc::new(super::BuildSupervisor::new(
+            super::BuildContext::default(),
+            None,
+            resolution_done.clone(),
+        ));
+
+        let _ = crate::supervisor::server::Handler::plan(
+            &handler,
+            OsString::from("rustc"),
+            args(&["-vV"]),
+            None,
+        )
+        .await;
+        assert!(!resolution_done.has_completed());
+
+        let _ = crate::supervisor::server::Handler::plan(
+            &handler,
+            OsString::from("rustc"),
+            args(&[
+                "--crate-name",
+                "___",
+                "--crate-type",
+                "lib",
+                "--print",
+                "file-names",
+            ]),
+            None,
+        )
+        .await;
+        assert!(!resolution_done.has_completed());
+
+        let _ = crate::supervisor::server::Handler::plan(
+            &handler,
+            OsString::from("rustc"),
+            args(&[
+                "--crate-name",
+                "demo",
+                "--crate-type",
+                "lib",
+                "--out-dir",
+                "/tmp/out",
+                "--emit",
+                "metadata",
+                "-C",
+                "metadata=abc123",
+            ]),
+            None,
+        )
+        .await;
+        assert!(resolution_done.has_completed());
+        // A waiter armed after completion resolves at once.
+        resolution_done.wait().await;
+    }
+
+    /// The uncovered fast path's `Observed` frames describe real compile
+    /// units by construction — the same signal fires on them, while a
+    /// probe that somehow arrived is dropped by the classifier before it
+    /// can complete the signal (stow#608).
+    #[tokio::test]
+    async fn resolution_done_fires_on_a_compile_unit_observed() {
+        let resolution_done = super::ResolutionDone::pending();
+        let handler = std::sync::Arc::new(super::BuildSupervisor::new(
+            super::BuildContext::default(),
+            None,
+            resolution_done.clone(),
+        ));
+
+        crate::supervisor::server::Handler::observed(
+            &handler,
+            crate::supervisor::server::Observation {
+                executable: OsString::from("rustc"),
+                args: args(&["-vV"]),
+                build_script_out_dir: None,
+                success: None,
+            },
+        )
+        .await;
+        assert!(!resolution_done.has_completed());
+
+        crate::supervisor::server::Handler::observed(
+            &handler,
+            crate::supervisor::server::Observation {
+                executable: OsString::from("rustc"),
+                args: args(&[
+                    "--crate-name",
+                    "demo",
+                    "--crate-type",
+                    "lib",
+                    "--out-dir",
+                    "/tmp/out",
+                    "--emit",
+                    "metadata",
+                    "-C",
+                    "metadata=abc123",
+                ]),
+                build_script_out_dir: None,
+                success: None,
+            },
+        )
+        .await;
+        assert!(resolution_done.has_completed());
     }
 
     #[test]
