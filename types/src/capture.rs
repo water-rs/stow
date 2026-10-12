@@ -38,14 +38,17 @@ pub struct CapturedRustcArtifact {
     /// The `--emit` list rustc was invoked with.
     pub emit: Vec<String>,
     /// The `--cfg feature="…"` set the invocation compiled — cargo's
-    /// activated features for this unit's side. This is the identity the
-    /// consumer's unit graph reproduces and the published row must be
-    /// labelled with; cargo metadata's `resolve.features` is
-    /// platform-agnostic and side-unified, so it records implicit
-    /// features of optional deps a target never compiles (stow#579).
-    /// Required, not defaulted: the record only ever travels
-    /// wrapper → collector inside one build, so every reader sees the
-    /// same shape the writer built.
+    /// activated features for this unit's side, plus any
+    /// `cargo:rustc-cfg=feature="…"` lines the crate's build script
+    /// printed, which cargo passes to rustc exactly like resolved
+    /// features. This is what rustc was told, so it feeds the compile
+    /// key; it is *not* the published row's label, which is the unit's
+    /// feature set in the build's cargo unit graph (stow#611). Cargo
+    /// metadata's `resolve.features` is neither: platform-agnostic and
+    /// side-unified, it records implicit features of optional deps a
+    /// target never compiles (stow#579). Required, not defaulted: the
+    /// record only ever travels wrapper → collector inside one build, so
+    /// every reader sees the same shape the writer built.
     pub features: BTreeSet<String>,
     /// The `--target` triple rustc was invoked with, when cargo passed one.
     pub target: Option<String>,
