@@ -367,22 +367,21 @@ async fn run_original_workspace_build(
     analysis: Option<WorkspacePrediction>,
     budget: &CacheBudget,
 ) -> stow_types::error::Result<()> {
-    let expanded_graph = analysis
+    let unit_nodes = analysis
         .as_ref()
-        .map(|analysis| analysis.expanded_entries.clone());
+        .and_then(|analysis| analysis.unit_nodes.clone());
     let prefetch_artifacts = analysis
         .as_ref()
         .map(|analysis| analysis.prefetch_artifacts.clone());
-    let semantic_fallback_enabled = expanded_graph
+    let semantic_fallback_enabled = unit_nodes
         .as_ref()
-        .is_some_and(|entries| !entries.is_empty());
+        .is_some_and(|table| !table.nodes.is_empty());
     let servable_units = analysis
         .as_ref()
         .and_then(|analysis| analysis.servable_units.clone());
     let cache_policy_path = create_build_policy_dir(config, public_cache_mode, analysis.as_ref())
         .instrument(tracing::debug_span!("stow.precargo.policy_dir"))
         .await?;
-    let expanded_entries = expanded_graph.as_deref();
     let prefetch_artifacts = prefetch_artifacts.as_deref();
     let covered_units = prefetch_artifacts.map_or(0, <[PrefetchArtifact]>::len);
     // The top-crate fast path pays its own graph resolve plus a
@@ -427,7 +426,7 @@ async fn run_original_workspace_build(
         current_dir: project.current_dir(),
         cache_policy_path: cache_policy_path.as_deref(),
         public_cache_mode,
-        expanded_entries,
+        unit_nodes: unit_nodes.as_ref(),
         prefetch_artifacts,
         servable_units: servable_units.as_ref(),
         semantic_fallback_enabled,
@@ -480,15 +479,15 @@ async fn run_mirrored_upgrade_build(
         },
         None => None,
     };
-    let mirror_expanded = mirror_analysis
+    let mirror_unit_nodes = mirror_analysis
         .as_ref()
-        .map(|analysis| analysis.expanded_entries.clone());
+        .and_then(|analysis| analysis.unit_nodes.clone());
     let mirror_prefetch = mirror_analysis
         .as_ref()
         .map(|analysis| analysis.prefetch_artifacts.clone());
-    let mirror_semantic_fallback = mirror_expanded
+    let mirror_semantic_fallback = mirror_unit_nodes
         .as_ref()
-        .is_some_and(|entries| !entries.is_empty());
+        .is_some_and(|table| !table.nodes.is_empty());
     let mirror_servable = mirror_analysis
         .as_ref()
         .and_then(|analysis| analysis.servable_units.clone());
@@ -539,7 +538,7 @@ async fn run_mirrored_upgrade_build(
         current_dir: &mirror_current_dir,
         cache_policy_path: cache_policy_path.as_deref(),
         public_cache_mode,
-        expanded_entries: mirror_expanded.as_deref(),
+        unit_nodes: mirror_unit_nodes.as_ref(),
         prefetch_artifacts: mirror_prefetch.as_deref(),
         servable_units: mirror_servable.as_ref(),
         semantic_fallback_enabled: mirror_semantic_fallback,
@@ -906,7 +905,11 @@ struct WorkspacePrediction {
     current_total: usize,
     expanded_cached: usize,
     expanded_total: usize,
-    expanded_entries: Vec<DependencyGraphEntry>,
+    /// The build's unit graph as a per-side node table — what the
+    /// wrapper's decision path resolves each compiled unit's cargo
+    /// feature set and side from (stow#615). `None` when the lite pass
+    /// ran with no expanded graph.
+    unit_nodes: Option<crate::unit_node::UnitNodeTable>,
     candidates: Vec<CompatibleUpgrade>,
     missing_current: Vec<ResolvedDependency>,
     prefetch_artifacts: Vec<PrefetchArtifact>,
@@ -1103,7 +1106,7 @@ async fn analyze_workspace_prediction_from(
             current_total: dependencies.len(),
             expanded_cached: 0,
             expanded_total: 0,
-            expanded_entries: Vec::new(),
+            unit_nodes: None,
             candidates: Vec::new(),
             missing_current: dependencies,
             prefetch_artifacts: Vec::new(),
@@ -1135,7 +1138,12 @@ async fn analyze_workspace_prediction_from(
         .wrap_err("join dependency-graph resolver")??
     };
 
-    let expanded_entries = analysis.expanded_entries.clone();
+    // The wrapper's decision path resolves each compiled unit against
+    // the per-side node table — the entries' cargo-resolved feature sets
+    // plus whether the graph's invocation spelled `--target` (stow#615).
+    let unit_nodes = expanded.as_ref().map(|graph| {
+        crate::unit_node::UnitNodeTable::from_expanded(&graph.entries, project.target_given)
+    });
     let mut analysis_by_key = index_analysis_entries(analysis.entries)?;
     let (current_cached, missing_current, mut candidates) =
         apply_dependency_analyses(dependencies, &mut analysis_by_key)?;
@@ -1160,7 +1168,7 @@ async fn analyze_workspace_prediction_from(
         current_total: entries.len(),
         expanded_cached: analysis.expanded_cached,
         expanded_total: analysis.expanded_total,
-        expanded_entries,
+        unit_nodes,
         candidates,
         missing_current,
         prefetch_artifacts,
@@ -2073,10 +2081,12 @@ async fn run_pinned_mirror_build(
     public_cache_mode: &PublicCacheMode,
     mirror_analysis: WorkspacePrediction,
 ) -> stow_types::error::Result<bool> {
-    let mirror_expanded = mirror_analysis.expanded_entries.clone();
+    let mirror_unit_nodes = mirror_analysis.unit_nodes.clone();
     let mirror_prefetch = mirror_analysis.prefetch_artifacts.clone();
     let mirror_servable = mirror_analysis.servable_units.clone();
-    let mirror_semantic_fallback = !mirror_expanded.is_empty();
+    let mirror_semantic_fallback = mirror_unit_nodes
+        .as_ref()
+        .is_some_and(|table| !table.nodes.is_empty());
 
     // The resolver path builds its own graph analysis for the pinned mirror,
     // so it sizes its own allowance from that.
@@ -2128,7 +2138,7 @@ async fn run_pinned_mirror_build(
         current_dir: &mirror_current_dir,
         cache_policy_path: cache_policy_path.as_deref(),
         public_cache_mode,
-        expanded_entries: Some(&mirror_expanded),
+        unit_nodes: mirror_unit_nodes.as_ref(),
         prefetch_artifacts: Some(&mirror_prefetch),
         servable_units: mirror_servable.as_ref(),
         semantic_fallback_enabled: mirror_semantic_fallback,
@@ -2513,7 +2523,7 @@ async fn try_run_top_crate_with_cached_dependencies(
         current_dir: &mirror_current_dir,
         cache_policy_path,
         public_cache_mode: &PublicCacheMode::for_rustc(&project.rustc_version),
-        expanded_entries: None,
+        unit_nodes: None,
         prefetch_artifacts: None,
         servable_units: None,
         semantic_fallback_enabled: false,
@@ -3798,7 +3808,11 @@ struct CargoRunPlan<'a> {
     current_dir: &'a Path,
     cache_policy_path: Option<&'a Path>,
     public_cache_mode: &'a PublicCacheMode,
-    expanded_entries: Option<&'a [DependencyGraphEntry]>,
+    /// The build's per-side unit node table — the lib nodes' `(crate,
+    /// version, side, cargo-resolved feature set)` plus the spelled
+    /// `--target` fact — for the wrapper's semantic identity and miss
+    /// path (stow#615). `None` carries no graph.
+    unit_nodes: Option<&'a crate::unit_node::UnitNodeTable>,
     prefetch_artifacts: Option<&'a [PrefetchArtifact]>,
     /// The serve map the facades answer their uncovered checks from —
     /// `None` exports no map file and every invocation plans.
@@ -3825,7 +3839,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         current_dir,
         cache_policy_path,
         public_cache_mode,
-        expanded_entries,
+        unit_nodes,
         prefetch_artifacts,
         semantic_fallback_enabled,
         covered_units,
@@ -3865,7 +3879,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         analysis_cell
             .set(crate::AnalysisFacts {
                 semantic_fallback_enabled,
-                expanded_entries: expanded_entries.map(<[DependencyGraphEntry]>::to_vec),
+                unit_nodes: unit_nodes.cloned(),
                 prefetch_candidates: prefetch_artifacts.map_or_else(BTreeMap::new, |artifacts| {
                     crate::prefetch_candidate_c_metadatas(
                         artifacts.iter().map(|artifact| {
@@ -3958,7 +3972,7 @@ fn export_wrapper_env(
         source_root,
         cache_policy_path,
         public_cache_mode,
-        expanded_entries,
+        unit_nodes,
         prefetch_artifacts,
         semantic_fallback_enabled,
         extra_rustflags,
@@ -3998,8 +4012,11 @@ fn export_wrapper_env(
         STOW_ENABLE_SEMANTIC_FALLBACK_ENV,
         if semantic_fallback_enabled { "1" } else { "0" },
     );
-    if let Some(expanded_entries) = expanded_entries {
-        let expanded_graph_json = serde_json::to_string(expanded_entries)
+    // The per-side node table every wrapper invocation resolves its
+    // unit's cargo feature set and side against — the argv scan is
+    // compile-key evidence, never the semantic label (stow#615).
+    if let Some(unit_nodes) = unit_nodes {
+        let expanded_graph_json = serde_json::to_string(unit_nodes)
             .wrap_err("serialize expanded dependency graph for rustc wrapper")?;
         command.env(STOW_EXPANDED_GRAPH_ENV, expanded_graph_json);
     }
@@ -4145,8 +4162,11 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     }
     work.cell
         .set(crate::AnalysisFacts {
-            semantic_fallback_enabled: !analysis.expanded_entries.is_empty(),
-            expanded_entries: Some(analysis.expanded_entries.clone()),
+            semantic_fallback_enabled: analysis
+                .unit_nodes
+                .as_ref()
+                .is_some_and(|table| !table.nodes.is_empty()),
+            unit_nodes: analysis.unit_nodes.clone(),
             prefetch_candidates: crate::prefetch_candidate_c_metadatas(
                 analysis
                     .prefetch_artifacts

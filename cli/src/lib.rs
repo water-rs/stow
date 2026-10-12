@@ -47,6 +47,7 @@ mod rustc_args;
 mod state_db;
 mod stats;
 mod supervisor;
+mod unit_node;
 mod verify;
 mod workspace_deps;
 
@@ -89,7 +90,6 @@ use crate::artifact_cache::{
 use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
-use stow_types::api::DependencyGraphEntry;
 
 const STOW_EXPANDED_GRAPH_ENV: &str = "STOW_EXPANDED_GRAPH_JSON";
 pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JSON";
@@ -471,7 +471,7 @@ async fn finish_rustc_compile(
     let mut artifact = None;
     if success {
         if let Some(base) = local_base {
-            match resolve_local_build_artifact(base, parsed, ctx.expanded_entries()).await {
+            match resolve_local_build_artifact(base, parsed, ctx.unit_nodes()).await {
                 Ok(Some(build)) => {
                     log_nonfatal_result(
                         "failed to materialize stable local build aliases after successful rustc build",
@@ -632,18 +632,20 @@ pub(crate) struct BuildContext {
 }
 
 /// What the graph analysis adds to the plan path when it commits: the
-/// resolved per-package feature sets the identity derivation consults,
+/// build's unit node table the semantic identity derivation consults,
 /// the prefetch ledger, and whether semantic fallback applies.
 #[derive(Debug)]
 pub(crate) struct AnalysisFacts {
     /// Whether the expanded graph found a semver-upgrade the plan path
     /// may serve for — the `STOW_ENABLE_SEMANTIC_FALLBACK` fact.
     pub(crate) semantic_fallback_enabled: bool,
-    /// `STOW_EXPANDED_GRAPH_JSON` parsed: the resolved per-package
-    /// feature sets. `None` means the environment carried no graph at
-    /// all — the distinction a semantic gate needs between "unset" and
-    /// "empty".
-    pub(crate) expanded_entries: Option<Vec<DependencyGraphEntry>>,
+    /// `STOW_EXPANDED_GRAPH_JSON` parsed: the build's unit graph as a
+    /// per-side node table — each lib node's `(crate, version, side,
+    /// cargo-resolved feature set)` plus whether the graph's cargo
+    /// invocation spelled `--target`. `None` means the environment
+    /// carried no graph at all — the distinction a semantic gate needs
+    /// between "unset" and "empty".
+    pub(crate) unit_nodes: Option<unit_node::UnitNodeTable>,
     /// `STOW_PREFETCH_ARTIFACTS_JSON` parsed and indexed: canonical
     /// crate name to the `c_metadata` values the driver already fetched.
     pub(crate) prefetch_candidates: BTreeMap<String, BTreeSet<String>>,
@@ -659,9 +661,9 @@ impl BuildContext {
     /// A present-but-malformed graph payload is a wiring bug and fails
     /// loudly, as it did when the readers parsed it per invocation.
     fn from_env() -> stow_types::error::Result<Self> {
-        let expanded_entries = match std::env::var(STOW_EXPANDED_GRAPH_ENV) {
+        let unit_nodes = match std::env::var(STOW_EXPANDED_GRAPH_ENV) {
             Ok(raw) => Some(
-                serde_json::from_str::<Vec<DependencyGraphEntry>>(&raw)
+                serde_json::from_str::<unit_node::UnitNodeTable>(&raw)
                     .wrap_err_with(|| format!("parse {STOW_EXPANDED_GRAPH_ENV}"))?,
             ),
             Err(_) => None,
@@ -684,19 +686,19 @@ impl BuildContext {
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                 semantic_fallback_enabled: std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV)
                     .is_some_and(|value| value != "0"),
-                expanded_entries,
+                unit_nodes,
                 prefetch_candidates,
             })),
             serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
         })
     }
 
-    /// The resolved per-package feature sets, once analysis committed
-    /// them.
-    pub(crate) fn expanded_entries(&self) -> Option<&[DependencyGraphEntry]> {
+    /// The build's per-side unit node table, once analysis committed
+    /// it.
+    pub(crate) fn unit_nodes(&self) -> Option<&unit_node::UnitNodeTable> {
         self.analysis
             .get()
-            .and_then(|facts| facts.expanded_entries.as_deref())
+            .and_then(|facts| facts.unit_nodes.as_ref())
     }
 
     /// Whether semantic fallback may serve an upgrade for this build.
@@ -1176,11 +1178,6 @@ struct WrapperEnvironment<'a> {
     /// The build-scoped memo the slice lookup and the circuit recorders
     /// share — a state this build loads once, refreshed by its own writes.
     env_cache: &'a WrapperEnvCache,
-    /// The build's resolved context — the policy dir, the expanded graph,
-    /// the prefetch candidates — carried rather than re-read from an
-    /// environment that may not carry them (the supervisor's own does
-    /// not).
-    ctx: &'a BuildContext,
     /// The breaker guards the *network*: remote fetches stop while tripped,
     /// but a local entry still serves — a self-produced hit never touches
     /// the edge, so it keeps paying off through the very outage that tripped
@@ -1492,7 +1489,6 @@ async fn prepare_wrapper_environment<'a>(
         parsed,
         &target,
         &rustc_version,
-        ctx.expanded_entries(),
     )
     .await
     {
@@ -1512,7 +1508,7 @@ async fn prepare_wrapper_environment<'a>(
             parsed,
             &target,
             &rustc_version,
-            ctx.expanded_entries(),
+            ctx.unit_nodes(),
         )
         .await
         {
@@ -1528,7 +1524,6 @@ async fn prepare_wrapper_environment<'a>(
     Some(WrapperEnvironment {
         env_base,
         env_cache,
-        ctx,
         circuit_tripped,
         target,
         rustc_version,
@@ -1881,7 +1876,6 @@ async fn decide_local_only(
         parsed,
         &target,
         &local_base.rustc_version,
-        ctx.expanded_entries(),
     )
     .await
     {
@@ -2122,21 +2116,16 @@ async fn try_serve_local_prefetched_graph_bundle(
     let Some((crate_name, version)) = registry_unit_identity(parsed) else {
         return false;
     };
-    let expected_features_json =
-        match resolve_semantic_features_json(&crate_name, &version, parsed, ctx.expanded_entries())
-        {
-            Ok(features_json) => features_json,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = %parsed.crate_name,
-                    target,
-                    rustc_version,
-                    "failed to resolve semantic features for prefetched graph bundle lookup"
-                );
-                return false;
-            }
-        };
+    // The bundle's features are the unit's cargo feature set — the unit
+    // graph's node — never the argv scan (stow#615).
+    let Some(table) = ctx.unit_nodes() else {
+        return false;
+    };
+    let Some(expected_features_json) =
+        resolved_unit_features_json(table, &crate_name, &version, parsed, target, rustc_version)
+    else {
+        return false;
+    };
     let expected_dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await {
             Ok(Some(value)) => value,
@@ -2913,18 +2902,6 @@ async fn try_serve_semantic_downloaded_bundle(
         );
         return false;
     }
-    if !semantic_request_allowed_by_expanded_graph(semantic_request, env.ctx.expanded_entries()) {
-        tracing::warn!(
-            crate_name = %parsed.crate_name,
-            semantic_crate_name = %semantic_request.crate_name,
-            semantic_version = %semantic_request.version,
-            target = %semantic_request.target,
-            rustc_version = %semantic_request.rustc_version,
-            semantic_c_metadata = %bundle.manifest.config.c_metadata,
-            "rejecting semantic bundle outside expanded dependency graph"
-        );
-        return false;
-    }
 
     let request = FetchRequest {
         target: bundle.manifest.config.target.as_str(),
@@ -3095,9 +3072,23 @@ async fn build_semantic_fetch_request(
     parsed: &rustc_args::ParsedRustcArgs,
     target: &str,
     rustc_version: &str,
-    expanded_entries: Option<&[DependencyGraphEntry]>,
+    unit_nodes: Option<&unit_node::UnitNodeTable>,
 ) -> stow_types::error::Result<Option<fetch::SemanticFetchRequest>> {
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
+        return Ok(None);
+    };
+    // The request's feature set is the unit's cargo feature set — the
+    // build's own unit graph's node — never the argv `--cfg feature="…"`
+    // scan, which a build script's `cargo:rustc-cfg=feature="…"` lines
+    // inflate. No table (the analysis has not landed, or a standalone
+    // wrapper with no graph) means no semantic request; a table that
+    // does not hold the unit warns and compiles (stow#615).
+    let Some(table) = unit_nodes else {
+        return Ok(None);
+    };
+    let Some(features_json) =
+        resolved_unit_features_json(table, &crate_name, &version, parsed, target, rustc_version)
+    else {
         return Ok(None);
     };
     let dependency_c_metadata_json =
@@ -3110,8 +3101,6 @@ async fn build_semantic_fetch_request(
     let profile = semantic_request_profile(parsed)?;
     let kind = parsed_artifact_kind(parsed)?;
     let crate_types = parsed_crate_types(parsed)?;
-    let features_json =
-        resolve_semantic_features_json(&crate_name, &version, parsed, expanded_entries)?;
     tracing::debug!(
         crate_name = %crate_name,
         version = %version,
@@ -3144,7 +3133,6 @@ async fn build_stable_exact_identity(
     parsed: &rustc_args::ParsedRustcArgs,
     target: &str,
     rustc_version: &str,
-    expanded_entries: Option<&[DependencyGraphEntry]>,
 ) -> stow_types::error::Result<Option<stow_types::public_cache::StableRegistryArtifactIdentity>> {
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
         trace_identity_inputs(
@@ -3175,8 +3163,13 @@ async fn build_stable_exact_identity(
                 return Ok(None);
             }
         };
-    let features_json =
-        resolve_semantic_features_json(&crate_name, &version, parsed, expanded_entries)?;
+    // The compile key is the command line's: the feature cfgs are the
+    // argv scan exactly as the builder's capture serializes them
+    // (`ci/src/capture.rs` feeds `stable_registry_artifact_identity_for_package`
+    // the same bytes) — a build script's `cargo:rustc-cfg=feature="…"`
+    // output is part of the invocation's identity, and the graph's
+    // resolved set never enters the key (stow#615).
+    let features_json = command_line_features_json(parsed)?;
     let identity = stable_registry_artifact_identity(
         parsed,
         target,
@@ -3274,7 +3267,7 @@ async fn trace_identity_inputs(
 async fn resolve_local_build_artifact(
     base: &WrapperEnvBase,
     parsed: &rustc_args::ParsedRustcArgs,
-    expanded_entries: Option<&[DependencyGraphEntry]>,
+    unit_nodes: Option<&unit_node::UnitNodeTable>,
 ) -> stow_types::error::Result<Option<artifact_cache::LocalBuildArtifact>> {
     let config = &base.config;
     // The unit's own platform — the compiling rustc's real host triple
@@ -3294,18 +3287,41 @@ async fn resolve_local_build_artifact(
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
         return Ok(None);
     };
-    let features_json =
-        resolve_semantic_features_json(&crate_name, &version, parsed, expanded_entries)?;
+    // The compile key is the command line's scan, always — a build
+    // script's `cargo:rustc-cfg=feature="…"` output is part of the
+    // invocation's identity (stow#615).
+    let scan_features_json = command_line_features_json(parsed)?;
     let Some(identity) = stable_registry_artifact_identity(
         parsed,
         &target,
         &rustc_version,
-        &features_json,
+        &scan_features_json,
         &dependency_c_metadata_json,
     )?
     else {
         return Ok(None);
     };
+    // The stored row's label is the unit's cargo feature set when the
+    // build's unit graph names the unit, the scan otherwise — a unit
+    // that finished before the analysis landed, or a standalone wrapper
+    // with no graph, has no other answer. Both are sound labels for a
+    // local row: two units of one crate whose scans agree compiled with
+    // the same feature cfgs, so a scan-labelled row still serves exact
+    // lookups. The scan only costs semantic matches for a crate whose
+    // build script adds feature cfgs when its unit finished before the
+    // analysis landed.
+    let features_json = unit_nodes
+        .and_then(|table| {
+            resolved_unit_features_json(
+                table,
+                &crate_name,
+                &version,
+                parsed,
+                &target,
+                &rustc_version,
+            )
+        })
+        .unwrap_or(scan_features_json);
     Ok(Some(artifact_cache::LocalBuildArtifact {
         target,
         rustc_version,
@@ -3322,80 +3338,62 @@ fn semantic_request_profile(
     normalized_requested_profile(parsed)
 }
 
-fn resolve_semantic_features_json(
+/// The argv `--cfg feature="…"` scan serialized for the compile key —
+/// exactly the bytes the builder's capture serializes
+/// (`ci/src/capture.rs` hands `stable_registry_artifact_identity_for_package`
+/// the same string). The scan is a fact about the command line: it may
+/// carry a build script's `cargo:rustc-cfg=feature="…"` additions, which
+/// is why it is a compile-key input and never a semantic label (stow#615).
+fn command_line_features_json(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<String> {
+    serde_json::to_string(&parsed.features.iter().cloned().collect::<Vec<_>>())
+        .wrap_err("serialize the command line's feature cfgs")
+}
+
+/// The unit's cargo feature set serialized, resolved against the build's
+/// unit node table — the label published rows and miss nodes carry
+/// (stow#615). `None` — with a warning naming the crate — when the table
+/// does not hold the unit; the caller compiles on without a semantic
+/// request or graph label for it.
+fn resolved_unit_features_json(
+    table: &unit_node::UnitNodeTable,
     crate_name: &str,
     version: &str,
     parsed: &rustc_args::ParsedRustcArgs,
-    expanded_entries: Option<&[DependencyGraphEntry]>,
-) -> stow_types::error::Result<String> {
-    if let Some(features_json) = lookup_expanded_graph_features_json(
-        crate_name,
-        version,
-        &parsed.features,
-        expanded_entries,
-    )? {
-        return Ok(features_json);
-    }
-    serde_json::to_string(&parsed.features.iter().cloned().collect::<Vec<_>>())
-        .wrap_err("serialize semantic rustc features")
-}
-
-/// The resolved feature set for `(crate, version)` out of the expanded
-/// graph the driver computed before cargo started — `Some` only when it
-/// names exactly one set. `None` (no entries, or no match) means the
-/// graph does not pin this crate, and the caller falls back to what argv
-/// spelled.
-fn lookup_expanded_graph_features_json(
-    crate_name: &str,
-    version: &str,
-    parsed_features: &std::collections::BTreeSet<String>,
-    expanded_entries: Option<&[DependencyGraphEntry]>,
-) -> stow_types::error::Result<Option<String>> {
-    let Some(entries) = expanded_entries else {
-        return Ok(None);
-    };
-    let requested_version = semver::Version::parse(version)
-        .wrap_err_with(|| format!("parse semantic request version `{version}`"))?;
-    let canonical_name = canonical_crate_name(crate_name);
-    let mut matches = entries
-        .iter()
-        .filter(|entry| {
-            if canonical_crate_name(entry.crate_name.as_str()) != canonical_name
-                || entry.version != requested_version
-            {
-                return false;
+    target: &str,
+    rustc_version: &str,
+) -> Option<String> {
+    match crate::unit_node::resolve_unit_node(
+        table.coordinates(),
+        table.consumer_spelled_target,
+        &crate::unit_node::UnitEvidence::from_invocation(crate_name, version, parsed),
+    ) {
+        Ok(node) => match serde_json::to_string(node.features) {
+            Ok(features_json) => Some(features_json),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %crate_name,
+                    version = %version,
+                    target,
+                    rustc_version,
+                    "failed to serialize the unit's resolved feature set"
+                );
+                None
             }
-            let expanded_features = entry
-                .features
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
-            parsed_features
-                .iter()
-                .all(|feature| expanded_features.contains(feature))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by(|left, right| {
-        left.features
-            .len()
-            .cmp(&right.features.len())
-            .then(left.features.cmp(&right.features))
-    });
-    if let Some(best) = matches.first() {
-        let best_len = best.features.len();
-        matches.retain(|entry| entry.features.len() == best_len);
-    }
-    matches.dedup_by(|left, right| left.features == right.features);
-    match matches.as_slice() {
-        [] => Ok(None),
-        [entry] => serde_json::to_string(&entry.features)
-            .wrap_err("serialize expanded graph semantic features")
-            .map(Some),
-        _ => Err(stow_types::stow_error!(
-            "{STOW_EXPANDED_GRAPH_ENV} contains duplicate exact feature sets for {} {}",
-            crate_name,
-            version
-        )),
+        },
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %crate_name,
+                version = %version,
+                target,
+                rustc_version,
+                "compiled unit does not resolve against the build's unit graph"
+            );
+            None
+        }
     }
 }
 
@@ -3520,27 +3518,6 @@ fn normalized_requested_profile(
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<stow_types::platform::Profile> {
     normalized_cache_profile(parsed)
-}
-
-/// A semantic request is gated by the expanded graph the driver
-/// resolved before cargo started: unset means the gate stays open, set
-/// means a bundle the graph never names is refused — the driver's own
-/// expansion is the boundary inside which a semantic match may stand in
-/// for a unit.
-fn semantic_request_allowed_by_expanded_graph(
-    semantic_request: &fetch::SemanticFetchRequest,
-    expanded_entries: Option<&[DependencyGraphEntry]>,
-) -> bool {
-    let Some(entries) = expanded_entries else {
-        return true;
-    };
-    entries.iter().any(|entry| {
-        canonical_crate_name(entry.crate_name.as_str())
-            == canonical_crate_name(&semantic_request.crate_name)
-            && entry.version.to_string() == semantic_request.version
-            && serde_json::to_string(&entry.features)
-                .is_ok_and(|features_json| features_json == semantic_request.features_json)
-    })
 }
 
 pub(crate) fn parsed_artifact_kind(
@@ -4052,5 +4029,85 @@ mod tests {
         ]))
         .expect("parse rustc args");
         assert_eq!(super::expected_bundle_crate_name(&parsed), None);
+    }
+
+    /// stow#615: the consumer's compile key is computed over the command
+    /// line's `--cfg feature="…"` scan — the same bytes the builder's
+    /// capture hands
+    /// `stable_registry_artifact_identity_for_package` — whatever the
+    /// unit graph's resolved set says. A build script's
+    /// `cargo:rustc-cfg=feature="…"` output rides the scan and lands in
+    /// the key; the graph never enters the identity at all.
+    #[tokio::test]
+    async fn the_compile_key_is_the_command_lines_scan() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = crate::config::StowConfig {
+            edge_url: "http://127.0.0.1:9".to_owned(),
+            registry_base_url: "http://127.0.0.1:9/v2/stow".to_owned(),
+            cache_dir: tempdir.path().to_path_buf(),
+            request_timeout: std::time::Duration::from_millis(200),
+            negative_cache_ttl: std::time::Duration::ZERO,
+            circuit_reset_after: std::time::Duration::ZERO,
+            circuit_trip_threshold: 1,
+            artifact_cache_max_bytes: 0,
+            index_refresh_interval: std::time::Duration::ZERO,
+            verify_mode: crate::config::VerifyMode::GithubCi,
+            state_db_pool: std::sync::Arc::default(),
+            trust_material: std::sync::Arc::default(),
+        };
+        // A scan shaped like a build-script crate's: `default` resolved
+        // plus `probe_from_build_script` the script printed itself.
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "lexicon",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "--cfg",
+            "feature=\"default\"",
+            "--cfg",
+            "feature=\"probe_from_build_script\"",
+            "-C",
+            "metadata=abc123",
+            "-C",
+            "extra-filename=-xyz789",
+            "/root/.cargo/registry/src/index.crates.io-0123abcd/lexicon-0.9.6/src/lib.rs",
+        ]))
+        .expect("parse rustc args");
+
+        let identity = super::build_stable_exact_identity(
+            &config,
+            &parsed,
+            "x86_64-unknown-linux-gnu",
+            "1.99.0",
+        )
+        .await
+        .expect("identity resolves")
+        .expect("registry unit");
+
+        // The builder's key for the same command line: the capture path
+        // serializes the scan and hashes it into the compile key
+        // verbatim.
+        let scan_features_json =
+            serde_json::to_string(&parsed.features.iter().cloned().collect::<Vec<_>>())
+                .expect("serialize the scan");
+        let builder_identity =
+            stow_types::public_cache::stable_registry_artifact_identity_for_package(
+                &parsed,
+                "lexicon",
+                "0.9.6",
+                "x86_64-unknown-linux-gnu",
+                "1.99.0",
+                &scan_features_json,
+                "[]",
+            )
+            .expect("builder identity");
+        assert_eq!(identity.compile_key, builder_identity.compile_key);
+        assert_eq!(identity.c_metadata, builder_identity.c_metadata);
+        assert_eq!(
+            scan_features_json, "[\"default\",\"probe_from_build_script\"]",
+            "the scan, not the resolved set, is what the key covers"
+        );
     }
 }

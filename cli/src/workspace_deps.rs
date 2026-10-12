@@ -1010,19 +1010,39 @@ fn emit_expanded_graph(
                 continue;
             }
             let (crate_name, version) = info.parsed();
+            let mut unit_features = unit
+                .features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect::<Vec<_>>();
+            unit_features.sort();
+            unit_features.dedup();
             let entry = entries
                 .entry((info.name.to_owned(), version.clone(), side == HOST))
                 .or_insert_with(|| ResolvedDependencyGraphEntry {
                     crate_name: crate_name.clone(),
                     version: version.clone(),
-                    features: Vec::new(),
+                    features: unit_features.clone(),
                     host_side: side == HOST,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 });
-            entry
-                .features
-                .extend(unit.features.iter().map(|feature| (*feature).to_owned()));
+            // One `(crate, version, side)` key is one node, and cargo's
+            // resolver assigns it one feature set — a second, different
+            // set landing on the same key is a unit-graph shape this
+            // projection cannot represent, not something to union away
+            // (the builder's `phase_feature_sets` holds the same rule,
+            // stow#615).
+            if entry.features != unit_features {
+                return Err(stow_types::stow_error!(
+                    "cargo --unit-graph holds two feature sets for the {} lib unit of {} {}: {:?} and {:?}",
+                    if side == HOST { "host" } else { "target" },
+                    info.name,
+                    version,
+                    entry.features,
+                    unit_features,
+                ));
+            }
             entry.dependencies.extend(
                 unit_edges[index][usize::from(side == TARGET)]
                     .iter()
@@ -1143,7 +1163,7 @@ fn path_pkg_root(pkg_id: &str) -> stow_types::error::Result<PathBuf> {
 /// exists only to tell a host compile from a target one (stow#317).
 /// A unit's `dependencies` are its invocation's `--extern` deps
 /// named at each dep's own recorded identity; a dep the build served
-/// rather than compiled joins as a leaf node at the artifact's recorded
+/// rather than compiled joins as a leaf node at the unit graph node's
 /// feature set so every edge resolves to a node. A unit whose externs
 /// do not all resolve to a recorded identity is not minted — a miss
 /// whose deps cannot be named is a miss stow does not post.
@@ -1152,6 +1172,47 @@ pub struct ObservedMissGraph {
     pub roots: Vec<stow_types::api::DependencyGraphEntry>,
     /// The expanded graph their `depends_on` edges resolve against.
     pub expanded: Vec<ResolvedDependencyGraphEntry>,
+}
+
+/// One pass over the build's unit graph: `(name, version, side)` → the
+/// node's cargo-resolved feature set — the answer every extern lookup and
+/// leaf mint in [`observed_miss_graph`] shares. The graph holds one set
+/// per key for one build (the `emit_expanded_graph` rule); a second,
+/// different set is a shape this projection cannot represent — an error
+/// naming both, never a pick (stow#615).
+fn node_feature_index(
+    resolved: &stow_types::task_graph::ResolvedTaskGraph,
+) -> stow_types::error::Result<NodeFeatureIndex<'_>> {
+    let mut node_features = NodeFeatureIndex::new();
+    for node in resolved.nodes() {
+        let key = (
+            node.identity.crate_name.as_str(),
+            node.identity.version.as_semver(),
+            node.identity.host_side,
+        );
+        match node_features.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(node.identity.features_json.features());
+            }
+            std::collections::btree_map::Entry::Occupied(slot)
+                if *slot.get() == node.identity.features_json.features() => {}
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                return Err(stow_types::stow_error!(
+                    "the build's unit graph holds two feature sets for the {} node of {} {}: {:?} and {:?}",
+                    if node.identity.host_side {
+                        "host"
+                    } else {
+                        "target"
+                    },
+                    node.identity.crate_name,
+                    node.identity.version,
+                    slot.get(),
+                    node.identity.features_json.features(),
+                ));
+            }
+        }
+    }
+    Ok(node_features)
 }
 
 /// Build the miss graph from the build's compile observations and the
@@ -1166,13 +1227,14 @@ pub fn observed_miss_graph(
     consumer_spelled_target: bool,
     resolved: &stow_types::task_graph::ResolvedTaskGraph,
 ) -> stow_types::error::Result<ObservedMissGraph> {
+    let node_features = node_feature_index(resolved)?;
+
     let mut entries = BTreeMap::<(String, String, bool), ResolvedDependencyGraphEntry>::new();
     let mut roots = Vec::new();
-    // `(dep key, side)` pairs an observed edge needs a node for —
-    // synthesized after the observed units so an observed node always
-    // wins over a leaf.
-    let mut referenced = BTreeSet::<(String, String, bool)>::new();
-    let mut referenced_features = BTreeMap::<(String, String, bool), Vec<String>>::new();
+    // `(dep key, side, features)` triples an observed edge needs a node
+    // for — synthesized after the observed units so an observed node
+    // always wins over a leaf.
+    let mut referenced = BTreeSet::<DepNodeRef>::new();
 
     for observation in observations {
         let (Ok(crate_name), Ok(version)) = (
@@ -1186,42 +1248,25 @@ pub fn observed_miss_graph(
             );
             continue;
         };
-        let mut features = observation.features.clone();
-        features.sort();
-        features.dedup();
-        // A host unit is the one cargo never passes `--target`. When
-        // the consumer's own cargo invocation spelled `--target` —
-        // even when it spelled the host triple — that alone decides
-        // it, because cargo then compiles host units with the mapped
-        // codegen flags a target dep also carries, leaving no profile
-        // signal to split them by. Under a native build the resolved
-        // unit graph arbitrates: it holds the unit on exactly one side
-        // unless the dep compiles once for both halves, so a node it
-        // carries only target-side is a target compile however the
-        // argv reads. Only a genuine twin falls to the profile signal
-        // — cargo spells explicit codegen flags for target units but
-        // not for the build-override units on the host half (stow#349),
-        // which is also why flag absence alone cannot decide: a profile
-        // like `debug = 0` strips the same flags from every unit's argv
-        // and would misread every dep as host-side (stow#588).
-        let host_side = if consumer_spelled_target {
-            observation.explicit_target.is_none()
-        } else {
-            only_side(resolved, &observation.crate_name, &version, &features).unwrap_or_else(|| {
-                observation.explicit_target.is_none() && observation.build_override
-            })
+        // The unit's node is the build's own unit graph's answer: the
+        // node's side and the feature set cargo resolved it at. The
+        // observation's `features` — the argv `--cfg feature="…"` scan —
+        // is evidence for the resolution, never the node's set: a build
+        // script's `cargo:rustc-cfg=feature="…"` lines ride it (stow#615).
+        let Some(node) = resolve_observed_unit(observation, consumer_spelled_target, resolved)
+        else {
+            continue;
         };
+        let features = node.features.to_vec();
+        let host_side = node.host_side;
         let Some((mut dependencies, dep_nodes)) =
-            observed_dep_edges(observation, dep_identities, host_side)
+            observed_dep_edges(observation, dep_identities, host_side, &node_features)
         else {
             continue;
         };
         // A skipped unit's deps must not mint orphan leaf nodes —
         // record the keys only once the unit's edges all resolved.
-        for (dep_key, dep_features) in dep_nodes {
-            referenced.insert(dep_key.clone());
-            referenced_features.insert(dep_key, dep_features);
-        }
+        referenced.extend(dep_nodes);
         dependencies.sort();
         dependencies.dedup();
         let key = (
@@ -1250,18 +1295,17 @@ pub fn observed_miss_graph(
     roots.sort();
     roots.dedup();
 
-    for (name, version, side) in referenced {
+    for (name, version, side, features) in referenced {
         entries
             .entry((name.clone(), version.clone(), side))
             .or_insert_with(|| {
-                let crate_name = stow_types::identity::CrateName::parse(&name)
-                    .expect("referenced dep name parses");
+                // A served dep's leaf carries the graph node's feature
+                // set — it rode along on the edge's node ref (stow#615).
                 ResolvedDependencyGraphEntry {
-                    crate_name,
+                    crate_name: stow_types::identity::CrateName::parse(&name)
+                        .expect("referenced dep name parses"),
                     version: Version::parse(&version).expect("referenced dep version parses"),
-                    features: referenced_features
-                        .remove(&(name, version, side))
-                        .unwrap_or_default(),
+                    features,
                     host_side: side,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
@@ -1279,46 +1323,65 @@ pub fn observed_miss_graph(
     })
 }
 
-/// The `(name, version, host_side)` key a referenced dep mints its leaf
-/// node under, plus the recorded feature set it carries there.
-type DepNodeRef = ((String, String, bool), Vec<String>);
-
-/// The one side `resolved` holds `(crate, version, features)` on —
-/// `None` when the graph carries no node for the unit or carries it on
-/// both halves (the twin a shared dep's single native compile serves).
-fn only_side(
-    resolved: &stow_types::task_graph::ResolvedTaskGraph,
-    crate_name: &str,
-    version: &Version,
-    features: &[String],
-) -> Option<bool> {
-    let mut side = None;
-    for node in resolved.nodes() {
-        let identity = &node.identity;
-        if identity.crate_name.as_str() != crate_name
-            || identity.version.as_semver() != version
-            || identity.features_json.features() != features
-        {
-            continue;
-        }
-        match side {
-            None => side = Some(identity.host_side),
-            Some(known) if known == identity.host_side => {}
-            Some(_) => return None,
+/// The graph node one observed unit compiled as — `None` when the
+/// build's unit graph does not carry it, skipped with a warning like an
+/// unresolvable extern (stow#615).
+fn resolve_observed_unit<'r>(
+    observation: &crate::artifact_cache::ObservedUnit,
+    consumer_spelled_target: bool,
+    resolved: &'r stow_types::task_graph::ResolvedTaskGraph,
+) -> Option<crate::unit_node::NodeCoordinates<'r>> {
+    let feature_scan = observation
+        .features
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    match crate::unit_node::resolve_unit_node(
+        resolved
+            .nodes()
+            .iter()
+            .map(crate::unit_node::NodeCoordinates::from),
+        consumer_spelled_target,
+        &crate::unit_node::UnitEvidence {
+            crate_name: observation.crate_name.as_str(),
+            version: observation.crate_version.as_str(),
+            spelled_target: observation.explicit_target.is_some(),
+            feature_scan: &feature_scan,
+            build_override: observation.build_override,
+        },
+    ) {
+        Ok(node) => Some(node),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %observation.crate_name,
+                crate_version = %observation.crate_version,
+                "observed unit does not resolve against the build's unit graph; not minting it as a miss"
+            );
+            None
         }
     }
-    side
 }
 
+/// A referenced dep's leaf slot: the `(name, version, host_side)` key
+/// it mints under and the feature set the graph node carries (stow#615).
+type DepNodeRef = (String, String, bool, Vec<String>);
+
+/// `(crate name, version, host_side)` → the node's cargo-resolved
+/// feature set, borrowed from the build's unit graph (stow#615).
+type NodeFeatureIndex<'r> = BTreeMap<(&'r str, &'r Version, bool), &'r [String]>;
+
 /// Resolve one observed unit's `--extern` deps into graph edges at each
-/// dep's own recorded identity, returning the (name, version, side) keys
-/// the graph must carry a node for alongside the edges. `None` — and
-/// the unit is not minted — when any extern has no recorded identity:
-/// a miss whose deps cannot be named is a miss stow does not post.
+/// dep's own recorded identity, returning the (name, version, side)
+/// node refs — each carrying the graph node's feature set — alongside
+/// the edges. `None` — and the unit is not minted — when any extern has
+/// no recorded identity or names no node of the build's unit graph: a
+/// miss whose deps cannot be named is a miss stow does not post.
 fn observed_dep_edges(
     observation: &crate::artifact_cache::ObservedUnit,
     dep_identities: &BTreeMap<String, crate::artifact_cache::ObservedDepIdentity>,
     observation_host_side: bool,
+    node_features: &NodeFeatureIndex<'_>,
 ) -> Option<(Vec<ResolvedDependencyGraphDependency>, Vec<DepNodeRef>)> {
     let mut dependencies = Vec::new();
     let mut dep_nodes = Vec::new();
@@ -1327,12 +1390,11 @@ fn observed_dep_edges(
             Some((
                 stow_types::identity::CrateName::parse(&dep.crate_name).ok()?,
                 Version::parse(&dep.crate_version).ok()?,
-                dep.features.clone(),
                 dep.unit_shape,
                 dep.proc_macro,
             ))
         });
-        let Some((dep_name, dep_version, dep_features, dep_shape, dep_proc_macro)) = dep else {
+        let Some((dep_name, dep_version, dep_shape, dep_proc_macro)) = dep else {
             tracing::warn!(
                 crate_name = %observation.crate_name,
                 c_metadata = %extern_dep.c_metadata,
@@ -1348,13 +1410,29 @@ fn observed_dep_edges(
         let dep_side = dep_shape.map_or(observation_host_side || dep_proc_macro, |shape| {
             shape.side == UnitSide::Host
         });
-        dep_nodes.push((
-            (
-                dep_name.as_str().to_owned(),
-                dep_version.to_string(),
+        // The dep node a leaf mints under is the build's own graph's —
+        // its feature set comes from that node, not the artifact row's
+        // recorded label, and travels with the node ref (stow#615). A
+        // dep the graph does not carry is treated like an extern with
+        // no recorded identity.
+        let Some(dep_features) = node_features
+            .get(&(dep_name.as_str(), &dep_version, dep_side))
+            .copied()
+        else {
+            tracing::warn!(
+                crate_name = %observation.crate_name,
+                dep_name = %dep_name,
+                dep_version = %dep_version,
                 dep_side,
-            ),
-            dep_features,
+                "observed unit's --extern dep names no node in the build's unit graph; not minting it as a miss"
+            );
+            return None;
+        };
+        dep_nodes.push((
+            dep_name.as_str().to_owned(),
+            dep_version.to_string(),
+            dep_side,
+            dep_features.to_vec(),
         ));
         dependencies.push(ResolvedDependencyGraphDependency {
             crate_name: dep_name,
@@ -2195,6 +2273,43 @@ mod observed_miss_tests {
     /// the artifact's recorded kind.
     type DepIdentityFixture<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], Option<bool>, bool);
 
+    fn task_node(
+        crate_name: &str,
+        version: &str,
+        features: &[&str],
+        host_side: bool,
+    ) -> stow_types::task_graph::ResolvedTaskNode {
+        use stow_types::identity::{
+            CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+        };
+        use stow_types::task_graph::TaskNodeIdentity;
+        stow_types::task_graph::ResolvedTaskNode {
+            identity: TaskNodeIdentity {
+                crate_name: CrateName::parse(crate_name).expect("crate name parses"),
+                version: CrateVersion::new(
+                    semver::Version::parse(version).expect("version parses"),
+                ),
+                features_json: FeaturesJson::canonicalize(
+                    features
+                        .iter()
+                        .map(|feature| (*feature).to_owned())
+                        .collect(),
+                )
+                .expect("features canonicalize"),
+                target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target parses"),
+                rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc parses"),
+                host_side,
+            },
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn resolved_graph(
+        nodes: Vec<stow_types::task_graph::ResolvedTaskNode>,
+    ) -> stow_types::task_graph::ResolvedTaskGraph {
+        stow_types::task_graph::ResolvedTaskGraph::resolve(nodes).expect("fixture resolves")
+    }
+
     /// A resolved task graph covering every node an observed miss
     /// graph could mint from these inputs — one leaf node per
     /// `(name, version, features, side)` an observation or dep identity
@@ -2205,55 +2320,49 @@ mod observed_miss_tests {
         deps: &BTreeMap<String, ObservedDepIdentity>,
         consumer_spelled_target: bool,
     ) -> stow_types::task_graph::ResolvedTaskGraph {
-        use stow_types::identity::{
-            CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
-        };
-        use stow_types::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
-        let mut keys = std::collections::BTreeSet::new();
+        let mut nodes = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
         for observation in observations {
             let host_side = observation.explicit_target.is_none()
                 && (consumer_spelled_target || observation.build_override);
-            let mut features = observation.features.clone();
-            features.sort();
+            let mut features: Vec<&str> = observation.features.iter().map(String::as_str).collect();
+            features.sort_unstable();
             features.dedup();
-            keys.insert((
+            if seen.insert((
                 observation.crate_name.clone(),
                 observation.crate_version.clone(),
-                features,
+                features.clone(),
                 host_side,
-            ));
+            )) {
+                nodes.push(task_node(
+                    &observation.crate_name,
+                    &observation.crate_version,
+                    &features,
+                    host_side,
+                ));
+            }
         }
         for dep in deps.values() {
-            let mut features = dep.features.clone();
-            features.sort();
-            features.dedup();
             for side in [false, true] {
-                keys.insert((
+                let mut features: Vec<&str> = dep.features.iter().map(String::as_str).collect();
+                features.sort_unstable();
+                features.dedup();
+                if seen.insert((
                     dep.crate_name.clone(),
                     dep.crate_version.clone(),
                     features.clone(),
                     side,
-                ));
+                )) {
+                    nodes.push(task_node(
+                        &dep.crate_name,
+                        &dep.crate_version,
+                        &features,
+                        side,
+                    ));
+                }
             }
         }
-        let nodes = keys
-            .into_iter()
-            .map(|(name, version, features, host_side)| ResolvedTaskNode {
-                identity: TaskNodeIdentity {
-                    crate_name: CrateName::parse(name).expect("crate name parses"),
-                    version: CrateVersion::new(
-                        semver::Version::parse(&version).expect("version parses"),
-                    ),
-                    features_json: FeaturesJson::canonicalize(features)
-                        .expect("features canonicalize"),
-                    target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target parses"),
-                    rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc parses"),
-                    host_side,
-                },
-                dependencies: Vec::new(),
-            })
-            .collect();
-        ResolvedTaskGraph::resolve(nodes).expect("fixture resolves")
+        resolved_graph(nodes)
     }
 
     fn dep_identities(deps: &[DepIdentityFixture<'_>]) -> BTreeMap<String, ObservedDepIdentity> {
@@ -2695,6 +2804,147 @@ mod observed_miss_tests {
         assert_eq!(graph.roots.len(), 2);
     }
 
+    /// stow#615: the observation's `features` are the argv scan — a
+    /// build script's `cargo:rustc-cfg=feature="…"` output inflates it
+    /// past cargo's resolved set. The minted node carries the unit
+    /// graph node's set and resolves against the build's own task
+    /// graph, so one such crate can no longer fail the whole call.
+    #[test]
+    fn a_build_script_inflated_scan_mints_at_the_resolved_set() {
+        let observation = observation(
+            "scripted",
+            "1.0.0",
+            HOST,
+            &["declared", "probe_from_build_script"],
+            &[],
+        );
+        let dep_identities = dep_identities(&[]);
+        // The build's unit graph carries cargo's resolved set alone.
+        let resolved = resolved_graph(vec![task_node("scripted", "1.0.0", &["declared"], false)]);
+        let graph = observed_miss_graph(&[observation], &dep_identities, false, &resolved)
+            .expect("miss graph mints");
+
+        let entry = node(&graph, "scripted", false);
+        assert_eq!(entry.features, vec!["declared"]);
+        assert_eq!(graph.roots.len(), 1);
+        assert_eq!(graph.roots[0].features, vec!["declared"]);
+        assert!(
+            super::node_subgraph(&resolved, entry).is_ok(),
+            "the minted node resolves inside the build's unit graph"
+        );
+    }
+
+    /// stow#615: an observation the build's unit graph does not carry is
+    /// skipped like an unresolvable extern — it costs that unit's mint,
+    /// not the build's other misses.
+    #[test]
+    fn an_observation_absent_from_the_graph_is_skipped() {
+        let observations = vec![
+            observation("absent", "1.0.0", HOST, &["derive"], &[]),
+            observation("present", "1.0.0", HOST, &[], &[]),
+        ];
+        let dep_identities = dep_identities(&[]);
+        let resolved = resolved_graph(vec![task_node("present", "1.0.0", &[], false)]);
+        let graph = observed_miss_graph(&observations, &dep_identities, false, &resolved)
+            .expect("miss graph mints");
+
+        assert_eq!(graph.expanded.len(), 1);
+        assert_eq!(graph.expanded[0].crate_name.as_str(), "present");
+        assert_eq!(graph.roots.len(), 1);
+        assert_eq!(graph.roots[0].crate_name.as_str(), "present");
+    }
+
+    /// stow#615: a served dep that joins as a leaf carries the graph
+    /// node's feature set, not the published row's recorded label —
+    /// the label is the row's own consumer's answer.
+    #[test]
+    fn a_served_dep_leaf_carries_the_graph_nodes_feature_set() {
+        let observations = vec![observation(
+            "app",
+            "1.0.0",
+            HOST,
+            &[],
+            &[("serde", "aaaa0000aaaa0000")],
+        )];
+        // The artifact row was labelled under another consumer's
+        // resolution; this build's unit graph resolved the dep at a
+        // different set.
+        let dep_identities = dep_identities(&[(
+            "aaaa0000aaaa0000",
+            "serde",
+            "1.0.228",
+            &["row-label"],
+            None,
+            false,
+        )]);
+        let resolved = resolved_graph(vec![
+            task_node("app", "1.0.0", &[], false),
+            task_node("serde", "1.0.228", &["resolved"], false),
+            task_node("serde", "1.0.228", &["resolved"], true),
+        ]);
+        let graph = observed_miss_graph(&observations, &dep_identities, false, &resolved)
+            .expect("miss graph mints");
+
+        let leaf = node(&graph, "serde", false);
+        assert_eq!(leaf.features, vec!["resolved"]);
+    }
+
+    /// stow#615: a served dep the build's unit graph does not carry
+    /// cannot mint a leaf — the referencing unit is not minted either,
+    /// like an extern the identity map lacks.
+    #[test]
+    fn a_served_dep_absent_from_the_graph_skips_its_unit() {
+        let observations = vec![observation(
+            "app",
+            "1.0.0",
+            HOST,
+            &[],
+            &[("serde", "aaaa0000aaaa0000")],
+        )];
+        let dep_identities = dep_identities(&[(
+            "aaaa0000aaaa0000",
+            "serde",
+            "1.0.228",
+            &["derive"],
+            None,
+            false,
+        )]);
+        // No serde node in this build's unit graph.
+        let resolved = resolved_graph(vec![task_node("app", "1.0.0", &[], false)]);
+        let graph = observed_miss_graph(&observations, &dep_identities, false, &resolved)
+            .expect("miss graph mints");
+
+        assert_eq!(
+            graph.roots,
+            [] as [stow_types::api::DependencyGraphEntry; 0]
+        );
+        assert_eq!(
+            graph.expanded,
+            [] as [stow_types::api::ResolvedDependencyGraphEntry; 0]
+        );
+    }
+
+    /// stow#615: the node index is one answer per `(name, version,
+    /// side)` — two nodes on one side carrying different feature sets is
+    /// a graph shape the miss graph cannot project: a hard error naming
+    /// the crate, the side and both sets, never a pick.
+    #[test]
+    fn a_conflicting_node_set_fails_the_index() {
+        let resolved = resolved_graph(vec![
+            task_node("dep", "1.0.0", &["a"], false),
+            task_node("dep", "1.0.0", &["a", "b"], false),
+        ]);
+        let error = observed_miss_graph(&[], &BTreeMap::new(), false, &resolved)
+            .err()
+            .expect("conflicting feature sets fail the graph");
+        let message = error.to_string();
+        assert!(message.contains("dep"), "{message}");
+        assert!(message.contains("1.0.0"), "{message}");
+        assert!(message.contains("target"), "{message}");
+        assert!(message.contains("[\"a\"]"), "{message}");
+        assert!(message.contains("[\"a\", \"b\"]"), "{message}");
+    }
+
     /// A dep's own published `unit_shape` decides its edge's side when
     /// the index carries one — a non-proc-macro host dep (a build
     /// script's ordinary dependency) resolves host-side without leaning
@@ -2813,7 +3063,8 @@ mod unit_graph_tests {
         vendored(
             &root,
             "leaf",
-            "[package]\nname = \"leaf\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"leaf\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nprobe-dep = { version = \"1\", features = [\"declared\"] }\n",
         );
         vendored(
             &root,
@@ -2841,6 +3092,21 @@ mod unit_graph_tests {
             &root,
             "dev-dep",
             "[package]\nname = \"dev-dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+        );
+        vendored(
+            &root,
+            "probe-dep",
+            "[package]\nname = \"probe-dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\
+             build = \"build.rs\"\n\n\
+             [features]\ndefault = [\"declared\"]\ndeclared = []\n",
+        );
+        // The build script adds a feature cfg cargo never resolved:
+        // rustc sees it on the unit's argv; the unit graph does not
+        // (stow#615).
+        write(
+            &root,
+            "vendor/probe-dep/build.rs",
+            "fn main() {\n    println!(\"cargo:rustc-cfg=feature=\\\"probe_from_build_script\\\"\");\n}\n",
         );
 
         dir
@@ -2904,6 +3170,47 @@ mod unit_graph_tests {
         let host_side = entries[&("feat-a", true)];
         assert_eq!(target_side.features, [] as [String; 0]);
         assert_eq!(host_side.features, vec!["default", "f1"]);
+    }
+
+    /// stow#615: a build script's `cargo:rustc-cfg=feature="…"` prints
+    /// into the unit's argv `--cfg` scan, never into cargo's resolved
+    /// feature set — the unit graph's node carries the cargo set alone,
+    /// and an observed unit whose scan additionally names the
+    /// build-script cfg resolves back to that node.
+    #[test]
+    fn a_build_script_feature_cfg_stays_out_of_the_resolved_set() {
+        let root = fixture();
+        let graph = resolve(root.path(), "build", &[]);
+        let entries = index(&graph.entries);
+
+        // `probe-dep` reaches both sides through `leaf`; the two nodes
+        // carry the same cargo-resolved set.
+        let node = entries[&("probe-dep", false)];
+        assert_eq!(node.features, vec!["declared", "default"]);
+        assert_eq!(node.features, entries[&("probe-dep", true)].features,);
+
+        // The scan the wrapper journals for that unit additionally
+        // carries the cfg the build script printed.
+        let scan = node
+            .features
+            .iter()
+            .cloned()
+            .chain(std::iter::once("probe_from_build_script".to_owned()))
+            .collect::<BTreeSet<_>>();
+        let table = crate::unit_node::UnitNodeTable::from_expanded(&graph.entries, false);
+        let resolved_node = crate::unit_node::resolve_unit_node(
+            table.coordinates(),
+            table.consumer_spelled_target,
+            &crate::unit_node::UnitEvidence {
+                crate_name: "probe-dep",
+                version: "1.0.0",
+                spelled_target: false,
+                feature_scan: &scan,
+                build_override: false,
+            },
+        )
+        .expect("the inflated scan resolves to the graph's node");
+        assert_eq!(resolved_node.features, node.features.as_slice());
     }
 
     /// Defect 2: an optional dependency reachable only through a weak
