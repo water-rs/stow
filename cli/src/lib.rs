@@ -91,8 +91,8 @@ use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
 use crate::supervisor::protocol::ArtifactNotifications;
 
-const STOW_EXPANDED_GRAPH_ENV: &str = "STOW_EXPANDED_GRAPH_JSON";
-pub(crate) const STOW_PREFETCH_ARTIFACTS_ENV: &str = "STOW_PREFETCH_ARTIFACTS_JSON";
+const STOW_EXPANDED_GRAPH_PATH_ENV: &str = "STOW_EXPANDED_GRAPH_PATH";
+pub(crate) const STOW_PREFETCH_ARTIFACTS_PATH_ENV: &str = "STOW_PREFETCH_ARTIFACTS_PATH";
 pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC_FALLBACK";
 pub(crate) const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
 /// When set to a path, stow writes a Chrome-trace JSON to that file describing
@@ -474,18 +474,8 @@ async fn finish_rustc_compile(
     let mut artifact = None;
     if success {
         if let Some(base) = local_base {
-            // The identity resolution reads each `--extern` dependency's
-            // `materialized_outputs` row, which that dependency's own
-            // post-compile writes on another connection. A dependency
-            // still in flight — rustc running or bookkeeping unfinished
-            // — has not written its rows yet, so wait for it rather than
-            // misread a pending write as a missing one (stow#618). The
-            // waits follow dependency edges, and those form a DAG: a
-            // unit can only block on units it was compiled against, which
-            // can never transitively be waiting on it, so no cycle can
-            // form.
-            ctx.in_flight.wait_for_externs(parsed).await;
-            match resolve_local_build_artifact(base, parsed, ctx.unit_nodes()).await {
+            match resolve_local_build_artifact(base, parsed, &ctx.in_flight, ctx.unit_nodes()).await
+            {
                 Ok(LocalBuildResolution::Resolved(build)) => {
                     let build = *build;
                     log_nonfatal_result(
@@ -672,15 +662,16 @@ pub(crate) struct AnalysisFacts {
     /// Whether the expanded graph found a semver-upgrade the plan path
     /// may serve for — the `STOW_ENABLE_SEMANTIC_FALLBACK` fact.
     pub(crate) semantic_fallback_enabled: bool,
-    /// `STOW_EXPANDED_GRAPH_JSON` parsed: the build's unit graph as a
-    /// per-side node table — each lib node's `(crate, version, side,
-    /// cargo-resolved feature set)` plus whether the graph's cargo
-    /// invocation spelled `--target`. `None` means the environment
-    /// carried no graph at all — the distinction a semantic gate needs
-    /// between "unset" and "empty".
+    /// The `STOW_EXPANDED_GRAPH_PATH` file parsed: the build's unit
+    /// graph as a per-side node table — each lib node's `(crate,
+    /// version, side, cargo-resolved feature set)` plus whether the
+    /// graph's cargo invocation spelled `--target`. `None` means the
+    /// environment carried no graph at all — the distinction a semantic
+    /// gate needs between "unset" and "empty".
     pub(crate) unit_nodes: Option<unit_node::UnitNodeTable>,
-    /// `STOW_PREFETCH_ARTIFACTS_JSON` parsed and indexed: canonical
-    /// crate name to the `c_metadata` values the driver already fetched.
+    /// The `STOW_PREFETCH_ARTIFACTS_PATH` file parsed and indexed:
+    /// canonical crate name to the `c_metadata` values the driver
+    /// already fetched.
     pub(crate) prefetch_candidates: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -691,25 +682,20 @@ impl BuildContext {
     ///
     /// # Errors
     ///
-    /// A present-but-malformed graph payload is a wiring bug and fails
-    /// loudly, as it did when the readers parsed it per invocation.
+    /// A set-but-unreadable or malformed table file is a wiring bug and
+    /// fails loudly, as a malformed inline payload did.
     fn from_env() -> stow_types::error::Result<Self> {
-        let unit_nodes = match std::env::var(STOW_EXPANDED_GRAPH_ENV) {
-            Ok(raw) => Some(
-                serde_json::from_str::<unit_node::UnitNodeTable>(&raw)
-                    .wrap_err_with(|| format!("parse {STOW_EXPANDED_GRAPH_ENV}"))?,
-            ),
-            Err(_) => None,
-        };
-        let prefetch_candidates = match std::env::var(STOW_PREFETCH_ARTIFACTS_ENV) {
-            Ok(raw) => prefetch_candidate_c_metadatas(
-                serde_json::from_str::<Vec<resolve::PrefetchArtifactRow>>(&raw)
-                    .wrap_err_with(|| format!("parse {STOW_PREFETCH_ARTIFACTS_ENV}"))?
-                    .into_iter()
+        let unit_nodes =
+            read_build_json_table_env::<unit_node::UnitNodeTable>(STOW_EXPANDED_GRAPH_PATH_ENV)?;
+        let prefetch_candidates = read_build_json_table_env::<Vec<resolve::PrefetchArtifactRow>>(
+            STOW_PREFETCH_ARTIFACTS_PATH_ENV,
+        )?
+        .map_or_else(BTreeMap::new, |rows| {
+            prefetch_candidate_c_metadatas(
+                rows.into_iter()
                     .map(|row| (row.crate_name.into_inner(), row.c_metadata.into_inner())),
-            ),
-            Err(_) => BTreeMap::new(),
-        };
+            )
+        });
         Ok(Self {
             policy_dir: cache_policy::policy_dir(),
             public_cache_target: std::env::var(rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV)
@@ -750,9 +736,41 @@ impl BuildContext {
     }
 }
 
-/// `STOW_PREFETCH_ARTIFACTS_JSON`, indexed once for the per-invocation
-/// candidate lookups: canonical crate name to the `c_metadata` values the
-/// driver prefetched.
+/// One build-scoped JSON table the driver left behind `env` — a file
+/// path since stow#625, when the payloads outgrew what one environment
+/// string can carry past `execve` (Linux fails it at `MAX_ARG_STRLEN`,
+/// which a workspace-sized table clears). Unset reads as no table, as
+/// the inline payload did.
+///
+/// # Errors
+///
+/// A set variable whose file is missing or malformed is a wiring bug —
+/// the same loud failure a malformed inline payload was — naming the
+/// path.
+fn read_build_json_table_env<T: serde::de::DeserializeOwned>(
+    env: &str,
+) -> stow_types::error::Result<Option<T>> {
+    let Some(path) = std::env::var_os(env) else {
+        return Ok(None);
+    };
+    read_build_json_table(Path::new(&path), env).map(Some)
+}
+
+/// Read `path` as the JSON table `env` named; the variable names the
+/// wiring in the error.
+fn read_build_json_table<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    env: &str,
+) -> stow_types::error::Result<T> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| stow_types::stow_error!("read {env} {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| stow_types::stow_error!("parse {env} {}: {error}", path.display()))
+}
+
+/// The `STOW_PREFETCH_ARTIFACTS_PATH` ledger, indexed once for the
+/// per-invocation candidate lookups: canonical crate name to the
+/// `c_metadata` values the driver prefetched.
 pub(crate) fn prefetch_candidate_c_metadatas(
     rows: impl IntoIterator<Item = (String, String)>,
 ) -> BTreeMap<String, BTreeSet<String>> {
@@ -924,16 +942,9 @@ async fn run_rustc_wrapper(mut command: WrapperCommandArgs) -> stow_types::error
     // The supervising run's extra rustc arguments (workspace path remap and
     // any flags it selected) arrive appended to the argv so the user's own
     // rustflags sources — env or config — keep their cargo semantics.
-    if let Some(encoded) = std::env::var_os(rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV)
-        && let Ok(encoded) = encoded.into_string()
-    {
-        command.wrapped_args.extend(
-            encoded
-                .split('\x1f')
-                .filter(|arg| !arg.is_empty())
-                .map(std::ffi::OsString::from),
-        );
-    }
+    command
+        .wrapped_args
+        .extend(rustc_args::extra_args_from_env()?);
     // An endpoint that is set but unusable fails the build. A wrapper that
     // quietly compiled everything itself would leave a build that is
     // merely slow, which is the failure mode that hides.
@@ -3300,8 +3311,9 @@ enum LocalBuildResolution {
     /// The unit's stable identity and the inputs `store_local_build_outputs`
     /// persists.
     Resolved(Box<artifact_cache::LocalBuildArtifact>),
-    /// The invocation is not a registry crate or carries no stable
-    /// identity — nothing was owed.
+    /// The invocation is not a unit the cache can hold — no restorable
+    /// artifact shape, not a registry crate, or no stable identity —
+    /// nothing was owed (stow#619).
     NotAnArtifactUnit,
     /// An `--extern` dependency's `materialized_outputs` row is absent
     /// after every in-flight unit completed: a dependency whose
@@ -3319,8 +3331,29 @@ enum LocalBuildResolution {
 async fn resolve_local_build_artifact(
     base: &WrapperEnvBase,
     parsed: &rustc_args::ParsedRustcArgs,
+    in_flight: &crate::supervisor::server::InFlightUnits,
     unit_nodes: Option<&unit_node::UnitNodeTable>,
 ) -> stow_types::error::Result<LocalBuildResolution> {
+    // Whether the cache can hold this unit at all — the same predicate
+    // `artifact_cache::materialized_output_paths` gates on — comes first:
+    // a `bin` unit like `build_script_build` is never a cache unit, so it
+    // never waits on another unit's bookkeeping, never reads
+    // `materialized_outputs`, and never reaches an identity function,
+    // which would only fail on its crate type (stow#619).
+    if !parsed.is_restorable_artifact() {
+        return Ok(LocalBuildResolution::NotAnArtifactUnit);
+    }
+    // The identity resolution reads each `--extern` dependency's
+    // `materialized_outputs` row, which that dependency's own
+    // post-compile writes on another connection. A dependency
+    // still in flight — rustc running or bookkeeping unfinished
+    // — has not written its rows yet, so wait for it rather than
+    // misread a pending write as a missing one (stow#618). The
+    // waits follow dependency edges, and those form a DAG: a
+    // unit can only block on units it was compiled against, which
+    // can never transitively be waiting on it, so no cycle can
+    // form.
+    in_flight.wait_for_externs(parsed).await;
     let config = &base.config;
     // The unit's own platform — the compiling rustc's real host triple
     // when cargo passed no `--target`, never the
@@ -4202,6 +4235,85 @@ mod tests {
         );
     }
 
+    /// The process environment is global and the harness runs tests on
+    /// several threads, so every test that touches the table variables
+    /// holds this for its whole body — one test's `set_var` must never
+    /// land inside another's assertion.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// stow#625: unset table variables read as no table, exactly as the
+    /// inline payloads did.
+    #[test]
+    fn unset_table_variables_carry_no_table() {
+        let _guard = env_guard();
+        unsafe {
+            std::env::remove_var(super::STOW_EXPANDED_GRAPH_PATH_ENV);
+            std::env::remove_var(super::STOW_PREFETCH_ARTIFACTS_PATH_ENV);
+        }
+        let ctx = super::BuildContext::from_env().expect("unset reads as no table");
+        assert!(ctx.unit_nodes().is_none());
+        assert!(
+            ctx.prefetch_candidates()
+                .expect("the facts cell is filled")
+                .is_empty()
+        );
+    }
+
+    /// stow#625: a set variable whose file is missing is a wiring bug —
+    /// the same loud failure a malformed inline payload was — naming the
+    /// path.
+    #[test]
+    fn a_missing_table_file_fails_loudly_naming_the_path() {
+        let _guard = env_guard();
+        let missing = PathBuf::from("/definitely/missing/table.json");
+        let missing_display = missing.display().to_string();
+        for env in [
+            super::STOW_EXPANDED_GRAPH_PATH_ENV,
+            super::STOW_PREFETCH_ARTIFACTS_PATH_ENV,
+        ] {
+            unsafe { std::env::set_var(env, &missing) };
+            let error = super::BuildContext::from_env()
+                .expect_err("a set variable whose file is missing fails loudly");
+            unsafe { std::env::remove_var(env) };
+            let message = error.to_string();
+            assert!(
+                message.contains(env) && message.contains(&missing_display),
+                "the error names the variable and the path: {message}"
+            );
+        }
+    }
+
+    /// stow#625: a set variable whose file is not the table's JSON is the
+    /// same wiring bug, naming the path.
+    #[test]
+    fn a_malformed_table_file_fails_loudly_naming_the_path() {
+        let _guard = env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let malformed = dir.path().join("malformed.json");
+        let malformed_display = malformed.display().to_string();
+        std::fs::write(&malformed, "not a json table").expect("write malformed file");
+        for env in [
+            super::STOW_EXPANDED_GRAPH_PATH_ENV,
+            super::STOW_PREFETCH_ARTIFACTS_PATH_ENV,
+        ] {
+            unsafe { std::env::set_var(env, &malformed) };
+            let error =
+                super::BuildContext::from_env().expect_err("a malformed table file fails loudly");
+            unsafe { std::env::remove_var(env) };
+            let message = error.to_string();
+            assert!(
+                message.contains(env) && message.contains(&malformed_display),
+                "the error names the variable and the path: {message}"
+            );
+        }
+    }
+
     /// stow#618: a dependent's post-compile bookkeeping must wait for the
     /// bookkeeping of the dependencies it was built against — an
     /// `--extern` whose rows are still being written is a pending write,
@@ -4217,6 +4329,21 @@ mod tests {
         use crate::supervisor::protocol::{Observed, Request, write_frame};
         use crate::supervisor::{Endpoint, server};
         use crate::{AnalysisFacts, BuildContext, BuildSupervisor, WrapperEnvBase};
+
+        /// A `tracing` writer whose buffer the test can inspect — the
+        /// assertions on what the post-compile logged read it back.
+        #[derive(Clone)]
+        struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
 
         /// The shared `--out-dir` both fixture units compile into, cargo's
         /// deps-dir shape.
@@ -4495,17 +4622,6 @@ mod tests {
         /// debug line says which extern was never recorded (stow#618).
         #[tokio::test]
         async fn a_dead_connection_releases_the_dependent() {
-            #[derive(Clone)]
-            struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
-            impl std::io::Write for SharedLog {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().expect("log buffer").extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
             let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
             let writer = log.clone();
             let subscriber = tracing_subscriber::fmt()
@@ -4571,6 +4687,100 @@ mod tests {
             assert!(
                 stored_crates(&config).await.is_empty(),
                 "a dependent whose dependency never recorded is not stored"
+            );
+        }
+
+        /// stow#619: a build script's `bin` unit is never an artifact
+        /// unit — its post-compile owes no wait on an in-flight extern,
+        /// no `materialized_outputs` read, no identity resolution, and
+        /// therefore no store and no warn. The dependency's flight stays
+        /// open for the whole test: a post-compile that waited on it
+        /// would never let the flush answer.
+        #[tokio::test]
+        async fn a_build_script_units_post_compile_owes_nothing() {
+            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _default = tracing::subscriber::set_default(subscriber);
+
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+
+            let (config, in_flight, handler) = fixture(tempdir.path()).await;
+            let supervisor = server::start(handler, in_flight).expect("start supervisor");
+            let [(_, endpoint), (_, token)] = supervisor.env();
+            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
+
+            // The extern the build-script unit was compiled against is
+            // in flight for the whole test: its mark lands — the flush
+            // proves the registration — and its report never does.
+            let dep_args = unit_args(&registry_src, &out_dir, "dep3", "1.0.0", "dep3meta", &[]);
+            write_outputs(&out_dir, "dep3", "dep3meta");
+            let mut dep_conn = connect_raw(&endpoint).await;
+            send_observed(&mut dep_conn, &token, &dep_args, None).await;
+            flush_frames(&mut dep_conn, &token).await;
+
+            // The invocation cargo runs for a registry crate's build
+            // script: `--crate-type bin`, the `build.rs` source, the
+            // deps dir, and the build-dependencies as `--extern`s.
+            let build_script_args = vec![
+                OsString::from("--crate-name"),
+                OsString::from("build_script_build"),
+                OsString::from("--crate-type"),
+                OsString::from("bin"),
+                OsString::from("--emit"),
+                OsString::from("link"),
+                OsString::from("--out-dir"),
+                out_dir.as_os_str().to_os_string(),
+                OsString::from("-C"),
+                OsString::from("metadata=bsmeta"),
+                OsString::from("-C"),
+                OsString::from("extra-filename=-bsmeta"),
+                OsString::from("--target"),
+                OsString::from(HOST_TARGET),
+                OsString::from(format!(
+                    "--extern=dep3={}",
+                    out_dir.join("libdep3-dep3meta.rlib").display()
+                )),
+                registry_src
+                    .join("index.crates.io-0123abcd/proc-macro2-1.0.0/build.rs")
+                    .into_os_string(),
+            ];
+            // rustc succeeded: its binary is where the post-compile's
+            // build-script check looks for it.
+            std::fs::write(out_dir.join("build_script_build-bsmeta"), b"bin-bytes")
+                .expect("write build script binary");
+
+            let mut script_conn = connect_raw(&endpoint).await;
+            send_observed(&mut script_conn, &token, &build_script_args, None).await;
+            send_observed(&mut script_conn, &token, &build_script_args, Some(true)).await;
+            // The flush answers only once the report's bookkeeping has
+            // run to its end — a post-compile that waited on the
+            // in-flight extern would hold it forever.
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                flush_frames(&mut script_conn, &token),
+            )
+            .await
+            .expect("the build-script unit's post-compile returned while its extern was in flight");
+
+            assert!(
+                stored_crates(&config).await.is_empty(),
+                "a unit the cache cannot hold stores nothing"
+            );
+            let captured = {
+                let captured = log.0.lock().expect("log buffer");
+                String::from_utf8_lossy(&captured).into_owned()
+            };
+            assert!(
+                captured.is_empty(),
+                "a never-cacheable unit logs no warn:\n{captured}"
             );
         }
     }
