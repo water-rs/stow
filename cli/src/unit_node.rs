@@ -51,9 +51,9 @@ impl UnitNode {
 
 /// The per-side node table of one build's unit graph — what the
 /// wrapper's decision path and the miss graph's minter resolve a
-/// compiled unit against. `STOW_EXPANDED_GRAPH_JSON` carries this for a
-/// nested or unsupervised wrapper; a supervised build's `AnalysisFacts`
-/// cell holds it directly (stow#615).
+/// compiled unit against. The file `STOW_EXPANDED_GRAPH_PATH` names
+/// carries this for a nested or unsupervised wrapper; a supervised
+/// build's `AnalysisFacts` cell holds it directly (stow#615).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UnitNodeTable {
     /// Whether the graph's cargo invocation was given a target —

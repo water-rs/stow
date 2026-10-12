@@ -189,7 +189,8 @@ async fn plan_request(
     // the queue's dependency gate serves — so a `cached` root or a
     // pruned dep is one the serving path can actually hand out.
     let base = crate::index_cmd::registry_base()?;
-    let session = base.session();
+    let http = stow_oci::RegistryHttp::new().await?;
+    let session = base.session(&http);
     let trust = crate::index_cmd::records_trust().await?;
     let catalog = crate::manual::Index {
         session: &session,

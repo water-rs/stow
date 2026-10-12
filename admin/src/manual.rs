@@ -394,7 +394,8 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
     };
 
     let base = crate::index_cmd::registry_base()?;
-    let session = base.session();
+    let http = stow_oci::RegistryHttp::new().await?;
+    let session = base.session(&http);
     let trust = crate::index_cmd::records_trust().await?;
     let catalog = Index {
         session: &session,
@@ -994,7 +995,8 @@ pub async fn contextual_coverage(
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let base = crate::index_cmd::registry_base()?;
-    let session = base.session();
+    let http = stow_oci::RegistryHttp::new().await?;
+    let session = base.session(&http);
     let trust = crate::index_cmd::records_trust().await?;
     covered_nodes(
         &Index {

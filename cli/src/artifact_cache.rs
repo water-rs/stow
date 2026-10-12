@@ -199,10 +199,6 @@ impl CachedArtifactBundle {
     pub fn output_source_path(&self, file: &ArtifactBundleFile) -> PathBuf {
         self.entry_dir.join(bundle_file_path(&file.file_name))
     }
-
-    pub fn native_output_source_path(&self, relative_path: &str) -> PathBuf {
-        self.entry_dir.join(NATIVE_OUT_DIR).join(relative_path)
-    }
 }
 
 #[tracing::instrument(name = "stow.cache.prepare_local", skip_all)]
@@ -2937,13 +2933,21 @@ pub async fn filter_locally_cached_keys(
         for cache_key in chunk {
             query = query.bind(cache_key);
         }
-        for (cache_key, relative_dir) in query.fetch_all(&connection).await? {
-            // A row whose bundle directory was pruned underneath us is a miss,
-            // not an error: the caller simply re-fetches it.
-            if version_dir.join(&relative_dir).exists() {
-                present.insert(cache_key);
-            }
-        }
+        let rows = query.fetch_all(&connection).await?;
+        // A row whose bundle directory was pruned underneath us is a miss,
+        // not an error: the caller simply re-fetches it. One stat per row
+        // of the build's graph, so the chunk's stats run on a blocking
+        // thread (stow#624).
+        let version_dir = version_dir.clone();
+        present.extend(
+            smol::unblock(move || {
+                rows.into_iter()
+                    .filter(|(_, relative_dir)| version_dir.join(relative_dir).exists())
+                    .map(|(cache_key, _)| cache_key)
+                    .collect::<Vec<_>>()
+            })
+            .await,
+        );
     }
 
     if !present.is_empty() {
@@ -2991,7 +2995,6 @@ mod tests {
     };
     use stow_types::public_cache::StableRegistryArtifactIdentity;
 
-    use crate::inject::{OutputDirWriters, write_artifacts};
     use stow_types::rustc::ParsedExternCrate;
 
     use super::{
@@ -3730,7 +3733,7 @@ mod tests {
     }
 
     #[test]
-    fn store_local_build_outputs_captures_and_restores_native_out_dir() {
+    fn store_local_build_outputs_captures_native_out_dir() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         let out_dir = tempdir.path().join("deps");
@@ -3821,22 +3824,6 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["gen/bindings.rs", "libdemo.a"]
             );
-
-            // Restore into a fresh target dir: cargo exports the new OUT_DIR
-            // to the rustc invocation, which is where the files land.
-            let fresh_deps = tempdir.path().join("fresh/debug/deps");
-            let fresh_native_out = tempdir.path().join("fresh/debug/build/demo-bbbb2222/out");
-            let mut restore_parsed = local_build_parsed(
-                "demo",
-                "cargo-meta-restore",
-                fresh_deps,
-                &["dep-info", "metadata", "link"],
-            );
-            restore_parsed.build_script_out_dir = Some(fresh_native_out.clone());
-            write_artifacts(&restore_parsed, &bundle, OutputDirWriters::StowOnly)
-                .await
-                .expect("restore local entry");
-            assert_restored_native_out_dir(&fresh_native_out);
         });
     }
 
@@ -3862,29 +3849,6 @@ mod tests {
         )
         .expect("write build script output");
         out_dir
-    }
-
-    fn assert_restored_native_out_dir(out_dir: &Path) {
-        assert_eq!(
-            std::fs::read(out_dir.join("libdemo.a")).expect("read restored lib"),
-            b"archive-bytes"
-        );
-        assert_eq!(
-            std::fs::read(out_dir.join("gen/bindings.rs")).expect("read restored generated file"),
-            b"pub fn demo() {}"
-        );
-        let output =
-            std::fs::read_to_string(out_dir.parent().expect("native build dir").join("output"))
-                .expect("read restored build script output");
-        // The link-search path is rewritten to the new OUT_DIR.
-        assert!(
-            output.contains(&format!(
-                "cargo:rustc-link-search=native={}",
-                out_dir.display()
-            )),
-            "rewritten directives: {output}"
-        );
-        assert!(output.contains("cargo:rustc-link-lib=static=demo"));
     }
 
     #[test]
@@ -4251,6 +4215,7 @@ mod tests {
             verify_mode: VerifyMode::GithubCi,
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
         }
     }
 

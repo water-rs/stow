@@ -684,7 +684,8 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
     let base = registry_base()?;
-    let session = base.session();
+    let http = stow_oci::RegistryHttp::new().await?;
+    let session = base.session(&http);
     let trust = records_trust().await?;
     let mut tags = session
         .list_tags()
@@ -911,36 +912,44 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
     let tag = index_tag(&target, &rustc_version);
     let ftag = folded_tag(&target, &rustc_version);
 
-    let (manifest_digest, outcome) = if let Ok(private_key_path) =
-        std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV)
-    {
-        publish_index_mock(&args.file, &args.folded, &private_key_path).await?
-    } else {
-        let credentials = stow_oci::RegistryCredentials::from_env()?;
-        let outcome =
-            stow_oci::publish_index(&credentials, &bytes, &target, &rustc_version, &sha256).await?;
-        // The folded set publishes under the same identity in the
-        // same step — the export that follows only ever sees pairs
-        // this command pushed.
-        stow_oci::publish_folded(
-            &credentials,
-            &serde_json::to_vec(&folded)?,
-            &target,
-            &rustc_version,
-        )
-        .await?;
-        match outcome {
-            stow_oci::IndexPublishOutcome::Published { manifest_digest } => {
-                (manifest_digest, "published")
+    let (manifest_digest, outcome) =
+        if let Ok(private_key_path) = std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV) {
+            publish_index_mock(&args.file, &args.folded, &private_key_path).await?
+        } else {
+            let credentials = stow_oci::RegistryCredentials::from_env()?;
+            let http = stow_oci::RegistryHttp::new().await?;
+            let outcome = stow_oci::publish_index(
+                &credentials,
+                &http,
+                &bytes,
+                &target,
+                &rustc_version,
+                &sha256,
+            )
+            .await?;
+            // The folded set publishes under the same identity in the
+            // same step — the export that follows only ever sees pairs
+            // this command pushed.
+            stow_oci::publish_folded(
+                &credentials,
+                &http,
+                &serde_json::to_vec(&folded)?,
+                &target,
+                &rustc_version,
+            )
+            .await?;
+            match outcome {
+                stow_oci::IndexPublishOutcome::Published { manifest_digest } => {
+                    (manifest_digest, "published")
+                }
+                stow_oci::IndexPublishOutcome::Unchanged { manifest_digest } => {
+                    (manifest_digest, "unchanged")
+                }
+                stow_oci::IndexPublishOutcome::Resigned { manifest_digest } => {
+                    (manifest_digest, "resigned")
+                }
             }
-            stow_oci::IndexPublishOutcome::Unchanged { manifest_digest } => {
-                (manifest_digest, "unchanged")
-            }
-            stow_oci::IndexPublishOutcome::Resigned { manifest_digest } => {
-                (manifest_digest, "resigned")
-            }
-        }
-    };
+        };
     tracing::info!(%tag, %ftag, %manifest_digest, outcome, "published artifact index slice");
     let line = serde_json::to_string(&IndexPublishSummary {
         tag,

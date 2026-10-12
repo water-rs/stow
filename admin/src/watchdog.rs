@@ -899,7 +899,8 @@ impl Watcher<'_> {
     /// not the D1 mirror.
     async fn pick_bundle_digest(&self) -> stow_types::error::Result<Option<String>> {
         let base = crate::index_cmd::registry_base()?;
-        let session = base.session();
+        let http = stow_oci::RegistryHttp::new().await?;
+        let session = base.session(&http);
         let trust = crate::index_cmd::records_trust().await?;
         let mut tags = session
             .list_tags()

@@ -92,7 +92,7 @@ pub struct AnalysisEntry {
 
 /// One exact artifact the driver should prefetch: its identity plus the
 /// content digest the bundle blob lives under in the registry. Serialized
-/// into `STOW_PREFETCH_ARTIFACTS` for the wrapper.
+/// into the `STOW_PREFETCH_ARTIFACTS_PATH` file for the wrapper.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PrefetchArtifactRow {
     /// Crate name as published.

@@ -189,16 +189,7 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
         return Ok(FastPath::Defer);
     }
     let mut wrapped_args = args.get(3..).map(<[_]>::to_vec).unwrap_or_default();
-    if let Some(encoded) = std::env::var_os(rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV)
-        .and_then(|value| value.into_string().ok())
-    {
-        wrapped_args.extend(
-            encoded
-                .split('\x1f')
-                .filter(|arg| !arg.is_empty())
-                .map(OsString::from),
-        );
-    }
+    wrapped_args.extend(rustc_args::extra_args_from_env()?);
     let Ok(parsed) = ParsedRustcArgs::parse(&wrapped_args) else {
         return Ok(FastPath::Defer);
     };
@@ -377,9 +368,12 @@ impl ServeMapSignal {
         }
     }
 
-    /// The final map has landed: release every waiter.
+    /// The final map has landed: release every waiter, the ones already
+    /// parked and the ones that have not asked yet. `send_replace`, not
+    /// `send`: the final write can land before the first facade asks,
+    /// and `send` stores nothing when nobody is subscribed.
     pub fn complete(&self) {
-        let _ = self.ready.send(true);
+        self.ready.send_replace(true);
     }
 
     /// Wait for [`Self::complete`], or for the signal's own end: a
@@ -555,6 +549,18 @@ mod tests {
 
     use super::{ServeMap, WILDCARD};
     use crate::supervisor::Endpoint;
+
+    /// The final write can land before any facade has asked: a facade
+    /// that asks afterwards must hear it at once, not wait out its
+    /// timeout on a signal handed to no subscriber.
+    #[tokio::test]
+    async fn a_signal_completed_before_its_first_waiter_still_releases_it() {
+        let signal = super::ServeMapSignal::pending();
+        signal.complete();
+        tokio::time::timeout(std::time::Duration::from_secs(5), signal.wait())
+            .await
+            .expect("a completed signal answers a late waiter at once");
+    }
 
     fn map(target: &[(&str, &str)], host: &[(&str, &str)]) -> ServeMap {
         ServeMap {
