@@ -471,18 +471,8 @@ async fn finish_rustc_compile(
     let mut artifact = None;
     if success {
         if let Some(base) = local_base {
-            // The identity resolution reads each `--extern` dependency's
-            // `materialized_outputs` row, which that dependency's own
-            // post-compile writes on another connection. A dependency
-            // still in flight — rustc running or bookkeeping unfinished
-            // — has not written its rows yet, so wait for it rather than
-            // misread a pending write as a missing one (stow#618). The
-            // waits follow dependency edges, and those form a DAG: a
-            // unit can only block on units it was compiled against, which
-            // can never transitively be waiting on it, so no cycle can
-            // form.
-            ctx.in_flight.wait_for_externs(parsed).await;
-            match resolve_local_build_artifact(base, parsed, ctx.unit_nodes()).await {
+            match resolve_local_build_artifact(base, parsed, &ctx.in_flight, ctx.unit_nodes()).await
+            {
                 Ok(LocalBuildResolution::Resolved(build)) => {
                     let build = *build;
                     log_nonfatal_result(
@@ -3297,8 +3287,9 @@ enum LocalBuildResolution {
     /// The unit's stable identity and the inputs `store_local_build_outputs`
     /// persists.
     Resolved(Box<artifact_cache::LocalBuildArtifact>),
-    /// The invocation is not a registry crate or carries no stable
-    /// identity — nothing was owed.
+    /// The invocation is not a unit the cache can hold — no restorable
+    /// artifact shape, not a registry crate, or no stable identity —
+    /// nothing was owed (stow#619).
     NotAnArtifactUnit,
     /// An `--extern` dependency's `materialized_outputs` row is absent
     /// after every in-flight unit completed: a dependency whose
@@ -3316,8 +3307,29 @@ enum LocalBuildResolution {
 async fn resolve_local_build_artifact(
     base: &WrapperEnvBase,
     parsed: &rustc_args::ParsedRustcArgs,
+    in_flight: &crate::supervisor::server::InFlightUnits,
     unit_nodes: Option<&unit_node::UnitNodeTable>,
 ) -> stow_types::error::Result<LocalBuildResolution> {
+    // Whether the cache can hold this unit at all — the same predicate
+    // `artifact_cache::materialized_output_paths` gates on — comes first:
+    // a `bin` unit like `build_script_build` is never a cache unit, so it
+    // never waits on another unit's bookkeeping, never reads
+    // `materialized_outputs`, and never reaches an identity function,
+    // which would only fail on its crate type (stow#619).
+    if !parsed.is_restorable_artifact() {
+        return Ok(LocalBuildResolution::NotAnArtifactUnit);
+    }
+    // The identity resolution reads each `--extern` dependency's
+    // `materialized_outputs` row, which that dependency's own
+    // post-compile writes on another connection. A dependency
+    // still in flight — rustc running or bookkeeping unfinished
+    // — has not written its rows yet, so wait for it rather than
+    // misread a pending write as a missing one (stow#618). The
+    // waits follow dependency edges, and those form a DAG: a
+    // unit can only block on units it was compiled against, which
+    // can never transitively be waiting on it, so no cycle can
+    // form.
+    in_flight.wait_for_externs(parsed).await;
     let config = &base.config;
     // The unit's own platform — the compiling rustc's real host triple
     // when cargo passed no `--target`, never the
@@ -4179,6 +4191,21 @@ mod tests {
         use crate::supervisor::{Endpoint, server};
         use crate::{AnalysisFacts, BuildContext, BuildSupervisor, WrapperEnvBase};
 
+        /// A `tracing` writer whose buffer the test can inspect — the
+        /// assertions on what the post-compile logged read it back.
+        #[derive(Clone)]
+        struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         /// The shared `--out-dir` both fixture units compile into, cargo's
         /// deps-dir shape.
         const HOST_TARGET: &str = "aarch64-apple-darwin";
@@ -4456,17 +4483,6 @@ mod tests {
         /// debug line says which extern was never recorded (stow#618).
         #[tokio::test]
         async fn a_dead_connection_releases_the_dependent() {
-            #[derive(Clone)]
-            struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
-            impl std::io::Write for SharedLog {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().expect("log buffer").extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
             let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
             let writer = log.clone();
             let subscriber = tracing_subscriber::fmt()
@@ -4532,6 +4548,100 @@ mod tests {
             assert!(
                 stored_crates(&config).await.is_empty(),
                 "a dependent whose dependency never recorded is not stored"
+            );
+        }
+
+        /// stow#619: a build script's `bin` unit is never an artifact
+        /// unit — its post-compile owes no wait on an in-flight extern,
+        /// no `materialized_outputs` read, no identity resolution, and
+        /// therefore no store and no warn. The dependency's flight stays
+        /// open for the whole test: a post-compile that waited on it
+        /// would never let the flush answer.
+        #[tokio::test]
+        async fn a_build_script_units_post_compile_owes_nothing() {
+            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _default = tracing::subscriber::set_default(subscriber);
+
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+
+            let (config, in_flight, handler) = fixture(tempdir.path()).await;
+            let supervisor = server::start(handler, in_flight).expect("start supervisor");
+            let [(_, endpoint), (_, token)] = supervisor.env();
+            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
+
+            // The extern the build-script unit was compiled against is
+            // in flight for the whole test: its mark lands — the flush
+            // proves the registration — and its report never does.
+            let dep_args = unit_args(&registry_src, &out_dir, "dep3", "1.0.0", "dep3meta", &[]);
+            write_outputs(&out_dir, "dep3", "dep3meta");
+            let mut dep_conn = connect_raw(&endpoint).await;
+            send_observed(&mut dep_conn, &token, &dep_args, None).await;
+            flush_frames(&mut dep_conn, &token).await;
+
+            // The invocation cargo runs for a registry crate's build
+            // script: `--crate-type bin`, the `build.rs` source, the
+            // deps dir, and the build-dependencies as `--extern`s.
+            let build_script_args = vec![
+                OsString::from("--crate-name"),
+                OsString::from("build_script_build"),
+                OsString::from("--crate-type"),
+                OsString::from("bin"),
+                OsString::from("--emit"),
+                OsString::from("link"),
+                OsString::from("--out-dir"),
+                out_dir.as_os_str().to_os_string(),
+                OsString::from("-C"),
+                OsString::from("metadata=bsmeta"),
+                OsString::from("-C"),
+                OsString::from("extra-filename=-bsmeta"),
+                OsString::from("--target"),
+                OsString::from(HOST_TARGET),
+                OsString::from(format!(
+                    "--extern=dep3={}",
+                    out_dir.join("libdep3-dep3meta.rlib").display()
+                )),
+                registry_src
+                    .join("index.crates.io-0123abcd/proc-macro2-1.0.0/build.rs")
+                    .into_os_string(),
+            ];
+            // rustc succeeded: its binary is where the post-compile's
+            // build-script check looks for it.
+            std::fs::write(out_dir.join("build_script_build-bsmeta"), b"bin-bytes")
+                .expect("write build script binary");
+
+            let mut script_conn = connect_raw(&endpoint).await;
+            send_observed(&mut script_conn, &token, &build_script_args, None).await;
+            send_observed(&mut script_conn, &token, &build_script_args, Some(true)).await;
+            // The flush answers only once the report's bookkeeping has
+            // run to its end — a post-compile that waited on the
+            // in-flight extern would hold it forever.
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                flush_frames(&mut script_conn, &token),
+            )
+            .await
+            .expect("the build-script unit's post-compile returned while its extern was in flight");
+
+            assert!(
+                stored_crates(&config).await.is_empty(),
+                "a unit the cache cannot hold stores nothing"
+            );
+            let captured = {
+                let captured = log.0.lock().expect("log buffer");
+                String::from_utf8_lossy(&captured).into_owned()
+            };
+            assert!(
+                captured.is_empty(),
+                "a never-cacheable unit logs no warn:\n{captured}"
             );
         }
     }
