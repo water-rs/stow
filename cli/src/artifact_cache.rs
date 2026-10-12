@@ -2933,13 +2933,21 @@ pub async fn filter_locally_cached_keys(
         for cache_key in chunk {
             query = query.bind(cache_key);
         }
-        for (cache_key, relative_dir) in query.fetch_all(&connection).await? {
-            // A row whose bundle directory was pruned underneath us is a miss,
-            // not an error: the caller simply re-fetches it.
-            if version_dir.join(&relative_dir).exists() {
-                present.insert(cache_key);
-            }
-        }
+        let rows = query.fetch_all(&connection).await?;
+        // A row whose bundle directory was pruned underneath us is a miss,
+        // not an error: the caller simply re-fetches it. One stat per row
+        // of the build's graph, so the chunk's stats run on a blocking
+        // thread (stow#624).
+        let version_dir = version_dir.clone();
+        present.extend(
+            smol::unblock(move || {
+                rows.into_iter()
+                    .filter(|(_, relative_dir)| version_dir.join(relative_dir).exists())
+                    .map(|(cache_key, _)| cache_key)
+                    .collect::<Vec<_>>()
+            })
+            .await,
+        );
     }
 
     if !present.is_empty() {
@@ -4207,6 +4215,7 @@ mod tests {
             verify_mode: VerifyMode::GithubCi,
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
         }
     }
 

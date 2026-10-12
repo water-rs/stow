@@ -41,12 +41,19 @@ x509-cert = "0.2.5"
 const-oid = { version = "0.10", features = ["db"] }
 webpki = { package = "rustls-webpki", version = "0.103.8" }
 async-fs = "2"
+# `RegistryHttp` builds the reqwest client on a blocking thread: the
+# trust-store load is synchronous and must not run on an async worker.
+tokio = { version = "1", features = ["rt"] }
 
 [features]
 mock-verify = []
 
 [dev-dependencies]
 time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["macros", "rt"] }
+# The registry client resolves its TLS provider from the process default;
+# a test that builds one installs `ring` the way the binaries do.
+rustls.workspace = true
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [lints]

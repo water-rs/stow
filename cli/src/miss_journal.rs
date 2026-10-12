@@ -453,11 +453,10 @@ pub fn journal_supervised(
     if let Err(error) = append_lines(&journal, &entries) {
         tracing::warn!(error = %error, journal = %journal.display(), "could not journal the build's compile observations");
     }
-    // The expanded graph's store lands only when the detached
-    // build-analysis enrichment finishes — a fast build's drain can
-    // run before it (or after the process has already killed it), so
-    // the journal also carries the context the drain re-derives the
-    // same graph from (stow#588).
+    // The expanded graph's store lands only when the in-build analysis
+    // reaches it — a build aborts that analysis when cargo exits, and a
+    // fast build's cargo exits first — so the journal also carries the
+    // context the drain re-derives the same graph from (stow#588).
     write_consumer_context(&journal, consumer.manifest_dir, Some(consumer.key));
 }
 
@@ -1009,6 +1008,7 @@ mod tests {
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db_pool: std::sync::Arc::default(),
             trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
         }
     }
 

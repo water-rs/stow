@@ -2599,14 +2599,14 @@ mod tests {
     }
 
     /// A credentialed `pull,push` session on the served mock.
-    fn push_session(listen: &str) -> stow_oci::RegistrySession {
+    fn push_session(listen: &str, http: &stow_oci::RegistryHttp) -> stow_oci::RegistrySession {
         let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{}", GHCR_REPOSITORY))
             .expect("registry base");
         let credentials = stow_oci::RegistryCredentials {
             username: "mock".to_owned(),
             password: "mock".to_owned(),
         };
-        base.push_session(&credentials)
+        base.push_session(&credentials, http)
     }
 
     /// The in-process signer the push tests inject: writes the signature
@@ -2646,7 +2646,8 @@ mod tests {
         let plan = test_plan(root.path());
         let (listen, probe) = serve_probe_registry(root.path()).await;
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds");
@@ -2722,7 +2723,8 @@ mod tests {
         let manifests = root.path().join("manifests");
         let sign = mock_sign(root.path());
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(
             &session,
             &[plan],
@@ -2758,7 +2760,8 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.rate_limit(Method::POST, "/blobs/uploads", 3);
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds after retries");
@@ -2784,7 +2787,8 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.refuse_single_post();
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds through commit PUTs");
@@ -2824,7 +2828,8 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.omit_manifest_digest_header();
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push verifies manifests by read-back");
@@ -2861,7 +2866,8 @@ mod tests {
 
         let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
             .expect("registry base");
-        let session = base.session();
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = base.session(&http);
 
         let tag_reference = base.reference("forged-tag").expect("tag reference");
         let error = session
@@ -2920,7 +2926,8 @@ mod tests {
         let (listen, _probe) = serve_probe_registry(root.path()).await;
         let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
             .expect("registry base");
-        let session = base.session();
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = base.session(&http);
         let reference = base.reference(tag_a).expect("reference");
         let materials = stow_oci::pull_signature_materials(&session, &reference, digest)
             .await

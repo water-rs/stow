@@ -148,7 +148,8 @@ async fn stage_candidates(
     // anonymous session mints one bearer for the whole batch.
     let registry =
         stow_oci::RegistryBase::parse(config.registry_base_url()).map_err(unavailable)?;
-    let session = registry.session();
+    let http = config.registry_http().await.map_err(unavailable)?;
+    let session = registry.session(&http);
 
     let mut staged = 0usize;
     let mut seen_compile_keys = BTreeSet::new();

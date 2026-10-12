@@ -15,7 +15,7 @@ use stow_types::records::{
 };
 use stow_types::registry::sha256_digest;
 
-use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::client::{RegistryHttp, RegistrySession, canonical_manifest_bytes};
 use crate::registry::{
     RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest,
 };
@@ -58,12 +58,13 @@ pub struct PulledRecords {
 /// signing does.
 pub async fn push_records(
     credentials: &RegistryCredentials,
+    http: &RegistryHttp,
     rustc_version: &str,
     task_id: &str,
     records: &[ArtifactRecord],
 ) -> stow_types::error::Result<RecordsPublishOutcome> {
     let base = RegistryBase::production()?;
-    let session = base.push_session(credentials);
+    let session = base.push_session(credentials, http);
     push_records_with(&session, &base, rustc_version, task_id, records, |reference, digest| async move {
         sign::sign_artifact(&reference, &digest, credentials).await
     })
