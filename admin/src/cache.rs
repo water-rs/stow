@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
 use stow_types::stow_error;
+use stow_types::transient::Backoff;
 
 use crate::github;
 use crate::render::{self, Output, Table};
@@ -96,7 +97,7 @@ pub async fn run(token: &str, args: CacheArgs, output: Output) -> stow_types::er
 }
 
 async fn stats(token: &str, output: Output) -> stow_types::error::Result<()> {
-    let usage: CacheUsage = github::get(token, "actions/cache/usage").await?;
+    let usage: CacheUsage = github::get(token, "actions/cache/usage", Backoff::new()).await?;
     let stats = CacheStats {
         repo: usage.full_name,
         active_caches: usage.active_caches_count,
@@ -129,6 +130,7 @@ async fn caches_with_prefix(
             &format!(
                 "actions/caches?key={prefix}&sort=created_at&direction=asc&per_page=100&page={page}"
             ),
+            Backoff::new(),
         )
         .await?;
         let count = page_body.actions_caches.len();
