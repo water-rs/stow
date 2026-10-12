@@ -411,7 +411,11 @@ impl InFlightUnits {
                 }
             }
         }
-        let _ = unit.done.send(true);
+        // `send_replace`, not `send`: a dependent waits on its
+        // dependencies one at a time, so this flight can end before the
+        // dependent has subscribed to it, and `send` stores nothing when
+        // nobody is subscribed.
+        unit.done.send_replace(true);
     }
 }
 
@@ -424,7 +428,9 @@ struct InFlightUnit {
     /// `materialized_outputs` rows and the extern lookup use.
     paths: Vec<String>,
     /// `true` once the flight ends. `watch` so a waiter that arrives late
-    /// reads `true` instead of blocking on a signal already sent.
+    /// reads `true` instead of blocking on a signal already sent — which
+    /// holds only because the end is stored whether or not anyone is
+    /// subscribed at that moment.
     done: watch::Sender<bool>,
 }
 
@@ -1213,5 +1219,47 @@ mod tests {
             .await;
         assert_eq!(abandoned, 1);
         assert_eq!(handler.finished.load(Ordering::SeqCst), 0);
+    }
+
+    /// A dependent waits on its in-flight dependencies one at a time, so
+    /// a dependency can finish before the dependent has subscribed to
+    /// it. That completion has to be there when the dependent gets to
+    /// it: a signal handed to no subscriber was dropped, and the
+    /// dependent's post-compile — and the build behind it — waited
+    /// forever.
+    #[tokio::test]
+    async fn a_flight_ending_before_its_waiter_subscribes_still_releases_it() {
+        let in_flight = super::InFlightUnits::default();
+        let first = in_flight.register(vec!["/deps/libfirst.rlib".to_owned()]);
+        let second = in_flight.register(vec!["/deps/libsecond.rlib".to_owned()]);
+        let dependent = crate::rustc_args::ParsedRustcArgs::parse(
+            &[
+                "--crate-name",
+                "dependent",
+                "--crate-type",
+                "lib",
+                "--extern",
+                "first=/deps/libfirst.rlib",
+                "--extern",
+                "second=/deps/libsecond.rlib",
+                "src/lib.rs",
+            ]
+            .map(OsString::from),
+        )
+        .expect("parse the dependent's invocation");
+        let waiter = tokio::spawn({
+            let in_flight = in_flight.clone();
+            async move { in_flight.wait_for_externs(&dependent).await }
+        });
+        // The waiter parks on `first`, the flight it reaches first; it
+        // has not subscribed to `second` yet.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(second);
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the dependent is released once both flights have ended")
+            .expect("join the waiter");
     }
 }
