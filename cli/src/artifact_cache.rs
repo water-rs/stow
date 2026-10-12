@@ -1001,56 +1001,60 @@ pub async fn record_materialized_bundle_outputs(
     Ok(())
 }
 
-pub async fn record_materialized_local_build_outputs(
-    config: &StowConfig,
+/// The output paths a locally-compiled unit records in
+/// `materialized_outputs` — the paths a dependent's `--extern` arguments
+/// name — derived by the parsed invocation's own `output_*_path`
+/// methods, never by naming files by hand (stow#618). Empty for a unit
+/// that records nothing: no `-C metadata`, or no restorable artifact
+/// shape at all.
+pub fn materialized_output_paths(
     parsed: &ParsedRustcArgs,
-    identity: &StableRegistryArtifactIdentity,
-) -> stow_types::error::Result<()> {
-    if parsed.c_metadata.is_none() {
-        return Ok(());
+) -> stow_types::error::Result<Vec<PathBuf>> {
+    if parsed.c_metadata.is_none() || !parsed.is_restorable_artifact() {
+        return Ok(Vec::new());
     }
-    if !parsed.is_restorable_artifact() {
-        return Ok(());
-    }
-
-    let connection = config.state_db_pool().await?;
-    let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
-    let dependency_identity = identity.c_metadata.as_str();
-    let stable_parsed = parsed_with_stable_identity(parsed, identity);
-
+    let mut paths = Vec::new();
     if let Some(path) = parsed.output_rlib_path() {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
-    }
-    if let Some(path) = stable_parsed.output_rlib_path() {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+        paths.push(path);
     }
     if let Some(path) = parsed.output_rmeta_path() {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
-    }
-    if let Some(path) = stable_parsed.output_rmeta_path() {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
+        paths.push(path);
     }
     if let Some(path) = parsed
         .output_dynamic_library_path()
         .map_err(stow_types::error::Error::msg)?
     {
-        record_materialized_output(&connection, &path, dependency_identity, updated_at_ms).await?;
-        let stable_path = stable_parsed
-            .output_dynamic_library_path()
-            .map_err(stow_types::error::Error::msg)?
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "stable parsed rustc args are missing dynamic library path for crate {}",
-                    stable_parsed.crate_name
-                )
-            })?;
-        record_materialized_output(
-            &connection,
-            &stable_path,
-            dependency_identity,
-            updated_at_ms,
-        )
-        .await?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+pub async fn record_materialized_local_build_outputs(
+    config: &StowConfig,
+    parsed: &ParsedRustcArgs,
+    identity: &StableRegistryArtifactIdentity,
+) -> stow_types::error::Result<()> {
+    let connection = config.state_db_pool().await?;
+    let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
+    let dependency_identity = identity.c_metadata.as_str();
+    let stable_parsed = parsed_with_stable_identity(parsed, identity);
+
+    // The stable-named invocation is the same unit under another file
+    // name, so it names the same outputs: a shape present under one name
+    // and absent under the other is a broken rewrite, not a unit with
+    // fewer rows.
+    let cargo_named = materialized_output_paths(parsed)?;
+    let stable_named = materialized_output_paths(&stable_parsed)?;
+    if cargo_named.len() != stable_named.len() {
+        return Err(stow_types::stow_error!(
+            "stable parsed rustc args name {} outputs for crate {}, the invocation names {}",
+            stable_named.len(),
+            stable_parsed.crate_name,
+            cargo_named.len()
+        ));
+    }
+    for path in cargo_named.iter().chain(&stable_named) {
+        record_materialized_output(&connection, path, dependency_identity, updated_at_ms).await?;
     }
 
     Ok(())
@@ -1134,11 +1138,14 @@ pub async fn locally_covered_units(
     .wrap_err("read locally covered crate units")
 }
 
-pub async fn resolve_dependency_c_metadata_json(
-    config: &StowConfig,
+/// The `(crate_name, output_path)` pairs a unit's `--extern` arguments
+/// name, in the order the dependency-identity JSON serializes them —
+/// sorted by crate name then path. The `output_path`s are the
+/// `materialized_outputs` rows' keys: the same normalization the records
+/// use on the write side (stow#618).
+pub fn extern_output_paths(
     parsed: &ParsedRustcArgs,
-) -> stow_types::error::Result<Option<String>> {
-    let connection = config.state_db_pool().await?;
+) -> stow_types::error::Result<Vec<(String, String)>> {
     let mut identities = parsed
         .extern_crates
         .iter()
@@ -1148,8 +1155,30 @@ pub async fn resolve_dependency_c_metadata_json(
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
     identities.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    Ok(identities)
+}
+
+/// What resolving a unit's `--extern` set against `materialized_outputs`
+/// found (stow#618).
+pub enum DependencyCMetadataResolution {
+    /// Every extern resolved; the serialized dependency-identity JSON the
+    /// compile key and the miss journal consume.
+    Resolved(String),
+    /// The first extern path — in `extern_output_paths` order — with no
+    /// recorded row. The dependency's bookkeeping genuinely never landed:
+    /// a path or git dependency, or a dependency whose own store was
+    /// skipped.
+    Unrecorded(String),
+}
+
+pub async fn resolve_dependency_c_metadata_json(
+    config: &StowConfig,
+    parsed: &ParsedRustcArgs,
+) -> stow_types::error::Result<DependencyCMetadataResolution> {
+    let connection = config.state_db_pool().await?;
+    let identities = extern_output_paths(parsed)?;
     if identities.is_empty() {
-        return Ok(Some("[]".to_owned()));
+        return Ok(DependencyCMetadataResolution::Resolved("[]".to_owned()));
     }
 
     // One round trip for the whole extern set — this runs inside every
@@ -1172,7 +1201,7 @@ pub async fn resolve_dependency_c_metadata_json(
     let mut resolved = Vec::with_capacity(identities.len());
     for (crate_name, output_path) in identities {
         let Some(c_metadata) = metadata_by_path.get(&output_path) else {
-            return Ok(None);
+            return Ok(DependencyCMetadataResolution::Unrecorded(output_path));
         };
         resolved.push(DependencyCMetadataIdentity {
             crate_name,
@@ -1180,7 +1209,9 @@ pub async fn resolve_dependency_c_metadata_json(
         });
     }
 
-    Ok(Some(serde_json::to_string(&resolved)?))
+    Ok(DependencyCMetadataResolution::Resolved(
+        serde_json::to_string(&resolved)?,
+    ))
 }
 
 async fn record_materialized_output(
@@ -1908,7 +1939,7 @@ fn entry_relative_dir_owned(request: &OwnedFetchRequest) -> PathBuf {
         .join(&request.c_metadata)
 }
 
-fn path_to_string(path: &Path) -> stow_types::error::Result<String> {
+pub fn path_to_string(path: &Path) -> stow_types::error::Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| stow_types::stow_error!("path {} is not UTF-8", path.display()))
@@ -3558,8 +3589,10 @@ mod tests {
 
             let resolved = super::resolve_dependency_c_metadata_json(&config, &consumer)
                 .await
-                .expect("resolve dependency metadata")
-                .expect("dependency metadata json");
+                .expect("resolve dependency metadata");
+            let super::DependencyCMetadataResolution::Resolved(resolved) = resolved else {
+                panic!("the dependency's bookkeeping resolved");
+            };
             assert_eq!(
                 resolved,
                 r#"[{"crate_name":"colorchoice","c_metadata":"stable-colorchoice"}]"#
@@ -3602,8 +3635,10 @@ mod tests {
 
             let resolved = super::resolve_dependency_c_metadata_json(&config, &consumer)
                 .await
-                .expect("resolve dependency metadata")
-                .expect("dependency metadata json");
+                .expect("resolve dependency metadata");
+            let super::DependencyCMetadataResolution::Resolved(resolved) = resolved else {
+                panic!("the dependency's bookkeeping resolved");
+            };
             assert_eq!(
                 resolved,
                 r#"[{"crate_name":"colorchoice","c_metadata":"0123456789abcdef"}]"#
