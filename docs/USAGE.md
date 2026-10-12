@@ -135,8 +135,9 @@ cargo configuration of its own builds warm from its first `stow build`.
 The record is keyed on the toolchain (`rustc -vV`), the target, the
 existing cargo config documents, the environment inputs the resolution
 reads (`PATH` included), and the witnessed driver and `ld.mold` files —
-changing any of them, or letting a row age past 24 hours, re-resolves
-instead of serving a stale answer. To reset it, rerun `stow setup`, or
+changing any of them re-resolves instead of serving a stale answer, and
+rows under keys that stopped being asked are pruned after 30 days. To
+reset it, rerun `stow setup`, or
 remove the state database with the rest of the local cache (`stow
 clean`).
 

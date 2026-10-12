@@ -68,7 +68,7 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
         // failure of the resolution itself is an error.
         match StowConfig::load() {
             Ok(stow_config) => {
-                mold::warm_global_link_cache(&cargo_home, &host_target, &stow_config).await?;
+                mold::warm_global_link_cache(&cargo_home, &stow_config).await?;
             }
             Err(error) => {
                 tracing::warn!(error = %error, "stow config unavailable, setup leaves the link cache cold");

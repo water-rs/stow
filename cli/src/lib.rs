@@ -576,6 +576,34 @@ fn classify_invocation(
     }
 }
 
+/// The parsed invocation, or `None` after logging what the rejected
+/// argv was: a cargo probe at debug — expected, not a defect — and a
+/// unit whose arguments failed to parse at warn, with the crate name
+/// when `--crate-name` is still readable. `None` means run rustc and
+/// take its answer; each caller supplies its own way to do that.
+fn classify_or_log(
+    classified: Result<rustc_args::ParsedRustcArgs, UnparseableInvocation>,
+    args: &[OsString],
+) -> Option<rustc_args::ParsedRustcArgs> {
+    match classified {
+        Ok(parsed) => Some(parsed),
+        Err(UnparseableInvocation::Probe(error)) => {
+            tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
+            None
+        }
+        Err(UnparseableInvocation::Passthrough(error)) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = wrapped_crate_name(args)
+                    .as_deref()
+                    .unwrap_or("<unknown>"),
+                "rustc arguments failed to parse; passing the invocation through to rustc"
+            );
+            None
+        }
+    }
+}
+
 /// Best-effort `--crate-name` scrape for the warn emitted on an invocation
 /// the parser rejected — the name is usually present even when some other
 /// argument failed.
@@ -912,26 +940,8 @@ impl supervisor::server::Handler for BuildSupervisor {
         if !self.resolution_done.has_completed() && describes_compile_unit(&classified) {
             self.resolution_done.complete();
         }
-        let parsed = match classified {
-            Ok(parsed) => parsed,
-            Err(UnparseableInvocation::Probe(error)) => {
-                tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
-                return supervisor::server::Decision::Compile(Box::new(PostCompile::raw(
-                    &executable,
-                )));
-            }
-            Err(UnparseableInvocation::Passthrough(error)) => {
-                tracing::warn!(
-                    error = %error,
-                    crate_name = wrapped_crate_name(&args)
-                        .as_deref()
-                        .unwrap_or("<unknown>"),
-                    "rustc arguments failed to parse; passing the invocation through to rustc"
-                );
-                return supervisor::server::Decision::Compile(Box::new(PostCompile::raw(
-                    &executable,
-                )));
-            }
+        let Some(parsed) = classify_or_log(classified, &args) else {
+            return supervisor::server::Decision::Compile(Box::new(PostCompile::raw(&executable)));
         };
         match decide_rustc_invocation(&executable, parsed, &self.env_cache, &self.ctx).await {
             Outcome::Served => supervisor::server::Decision::Served,
@@ -1068,17 +1078,11 @@ async fn delegate_to_supervisor(
 /// Decide and execute in this process: the configuration that has no
 /// supervisor to ask.
 async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error::Result<()> {
-    // A non-compile invocation has nothing for the cache to decide and
-    // nothing to record — the classifier's probe set covers `-vV`, `-V`,
-    // `--version` and every `--print` query (none carry a `--crate-name`),
-    // and cargo's `___` probe crate is no real unit: run rustc and return
-    // its result rather than loading the wrapper base and opening the
-    // state DB for an answer that is never used (stow#608).
-    // Parse the argv once: the probe gate, the journal and the
-    // decision all read the one `ParsedRustcArgs` (stow#608). A
-    // non-compile invocation has nothing for the cache to decide and
-    // nothing to record — the classifier's probe set covers `-vV`,
-    // `-V`, `--version` and every `--print` query (none carry a
+    // Parse the argv once: the probe gate, the journal and the decision
+    // all read the one `ParsedRustcArgs` (stow#608). A non-compile
+    // invocation has nothing for the cache to decide and nothing to
+    // record — the classifier's probe set covers `-vV`, `-V`,
+    // `--version` and every `--print` query (none carry a
     // `--crate-name`), and cargo's `___` probe crate is no real unit:
     // run rustc and return its result rather than loading the wrapper
     // base and opening the state DB for an answer that is never used.
@@ -1086,21 +1090,9 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
         &command.wrapped_args,
         std::env::var_os("OUT_DIR").map(PathBuf::from),
     );
-    let parsed = match classified {
-        Ok(parsed) if is_compile_unit(&parsed) => parsed,
-        Ok(_) | Err(UnparseableInvocation::Probe(_)) => {
-            let status =
-                run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
-            std::process::exit(status.code().unwrap_or(1));
-        }
-        Err(UnparseableInvocation::Passthrough(error)) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = wrapped_crate_name(&command.wrapped_args)
-                    .as_deref()
-                    .unwrap_or("<unknown>"),
-                "rustc arguments failed to parse; passing the invocation through to rustc"
-            );
+    let parsed = match classify_or_log(classified, &command.wrapped_args) {
+        Some(parsed) if is_compile_unit(&parsed) => parsed,
+        _ => {
             let status =
                 run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
             std::process::exit(status.code().unwrap_or(1));
@@ -1454,31 +1446,21 @@ impl Default for WrapperEnvCache {
     }
 }
 
-/// The file a spelling names the way the OS resolves it: a spelling with
-/// a path separator is itself; a bare name is looked up on `path` — the
-/// wrapper's inherited `PATH`, the one cargo resolved the wrapper
-/// through (stow#608).
-fn resolve_rustc_spelling(spelling: &OsStr, path: &OsStr) -> Option<PathBuf> {
-    let spelled = Path::new(spelling);
-    if spelled.components().count() > 1 {
-        return Some(spelled.to_path_buf());
-    }
-    std::env::split_paths(path)
-        .map(|dir| dir.join(spelling))
-        .find(|candidate| candidate.is_file())
-}
-
 /// Whether the facade's `spelling` and the seeded base's `target` rustc
-/// are the same file — bare names resolved through `path`, both sides
-/// canonicalized (stow#608). Runs off the runtime workers: canonicalize
-/// stats the file chain.
+/// are the same file — bare names resolved through `path`, the
+/// wrapper's inherited `PATH`, with the platform's own rules for
+/// separators and executable suffixes (`PATHEXT` on Windows), and the
+/// two files compared by identity rather than by canonicalized string
+/// (stow#608). Runs off the runtime workers: the `PATH` walk and the
+/// comparison both stat the file system.
 async fn resolves_to_same_file(spelling: &OsStr, target: &OsStr, path: &OsStr) -> bool {
     let spelling = spelling.to_os_string();
     let target = PathBuf::from(target);
     let path = path.to_os_string();
     tokio::task::spawn_blocking(move || {
-        let resolved = resolve_rustc_spelling(&spelling, &path)?;
-        Some(std::fs::canonicalize(resolved).ok()? == std::fs::canonicalize(&target).ok()?)
+        let cwd = std::env::current_dir().ok()?;
+        let resolved = which::which_in(&spelling, Some(&path), &cwd).ok()?;
+        same_file::is_same_file(&resolved, &target).ok()
     })
     .await
     .ok()
@@ -1659,32 +1641,6 @@ async fn load_wrapper_env_base(rustc: &OsStr, config: StowConfig) -> Option<Wrap
     })
 }
 
-/// The toolchain's own `rustc`, `<sysroot>/bin/rustc` — the string cargo
-/// hands the build's rustc wrapper when neither `RUSTC` nor `build.rustc`
-/// is set: cargo asks the rustup shim for its real rustc rather than
-/// passing the bare name, and `rustc --print sysroot` answers the same
-/// directory.
-async fn sysroot_rustc_executable() -> Result<OsString, String> {
-    let output = Command::new("rustc")
-        .arg("--print")
-        .arg("sysroot")
-        .output()
-        .await
-        .map_err(|error| format!("spawn rustc --print sysroot: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rustc --print sysroot failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let sysroot = String::from_utf8(output.stdout)
-        .map_err(|error| format!("rustc --print sysroot output is not UTF-8: {error}"))?;
-    Ok(Path::new(sysroot.trim())
-        .join("bin")
-        .join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
-        .into_os_string())
-}
-
 /// The wrapper environment base the supervisor seeds from, built on the
 /// driver's own timeline before cargo spawns rather than inside the
 /// first facade's `compiled` (stow#608). The facts are the ones the lazy
@@ -1703,23 +1659,15 @@ async fn sysroot_rustc_executable() -> Result<OsString, String> {
 pub(crate) async fn supervisor_env_base(
     config: &StowConfig,
     shared_vv: &rustc_args::SharedRustcVv,
-    build_rustc: &OsStr,
+    build_rustc: &rustc_args::BuildRustc,
 ) -> stow_types::error::Result<Option<WrapperEnvBase>> {
     // The executable as the facades will report it — the configured
     // `RUSTC`/`build.rustc` spelling verbatim when one names the build's
     // compiler, else the toolchain's own `rustc` — so the seeded cell
     // matches the spelling the first facade carries.
-    let configured = build_rustc != OsStr::new("rustc");
-    let (executable, vv) = tokio::join!(
-        async {
-            if configured {
-                Ok(build_rustc.to_os_string())
-            } else {
-                sysroot_rustc_executable().await
-            }
-        },
-        async { shared_vv.clone().await.map(|vv| (*vv).clone()) },
-    );
+    let (executable, vv) = tokio::join!(build_rustc.facade_spelling(), async {
+        shared_vv.clone().await.map(|vv| (*vv).clone())
+    },);
     let rustc = executable.map_err(|error| {
         stow_types::stow_error!("probe the rustc executable for the supervisor base: {error}")
     })?;
@@ -4478,11 +4426,6 @@ mod tests {
         assert_eq!(super::expected_bundle_crate_name(&parsed), None);
     }
 
-    /// stow#608 identity check: the seeded base must carry exactly the
-    /// facts the lazy path computes — the same executable spelling the
-    /// `base.rustc == rustc` check compares, the machine's own host
-    /// triple (never the consumer target a `--target` build compiles
-    /// for) and the same release string.
     /// A `StowConfig` whose every path and endpoint is a throwaway — the
     /// env-base tests' shared fixture.
     fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
@@ -4507,13 +4450,11 @@ mod tests {
         crate::rustc_args::shared_rustc_vv(std::ffi::OsString::from("rustc"))
     }
 
-    /// The real rustc's path — `PATH` order, as the OS resolves cargo's
-    /// bare spelling — used as the seeded base's executable.
+    /// The real rustc's path — `PATH` order and the platform's own
+    /// executable rules, as the OS resolves cargo's bare spelling —
+    /// used as the seeded base's executable.
     fn real_rustc_path() -> std::path::PathBuf {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join("rustc"))
-            .find(|candidate| candidate.is_file())
-            .expect("the test machine has rustc on PATH")
+        which::which("rustc").expect("the test machine has rustc on PATH")
     }
 
     /// A `WrapperEnvCache` whose `PATH` is the test's injected value.
@@ -4529,20 +4470,25 @@ mod tests {
     }
 
     /// stow#608 A1: a seeded base computed from the driver's rustc and a
-    /// lazily resolved one for the same spelling are the same base.
+    /// lazily resolved one for the same spelling are the same base. The
+    /// seeded base must carry exactly the facts the lazy path computes —
+    /// the same executable spelling, the machine's own host triple
+    /// (never the consumer target a `--target` build compiles for) and
+    /// the same release string.
     #[tokio::test]
     async fn the_seeded_env_base_matches_the_lazy_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = env_base_test_config(&dir);
         let shared_vv = test_shared_vv();
-        let rustc = real_rustc_path().into_os_string();
-        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &rustc)
+        let rustc = real_rustc_path();
+        let build_rustc = crate::rustc_args::BuildRustc::Configured(rustc.clone().into_os_string());
+        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &build_rustc)
             .await
             .expect("the seeded env base must build on a machine with rustc")
         else {
             panic!("the seeded env base must exist on a machine with rustc");
         };
-        let Some(lazy) = super::load_wrapper_env_base(&rustc, config).await else {
+        let Some(lazy) = super::load_wrapper_env_base(rustc.as_os_str(), config).await else {
             panic!("the lazy env base must build on the same rustc");
         };
         assert_eq!(seeded.rustc, lazy.rustc);
@@ -4552,13 +4498,15 @@ mod tests {
 
     /// A spelling that does not resolve to the seeded file is probed —
     /// but exactly once, however many frames carry it (stow#608 A1).
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_unseeded_spelling_loads_its_base_exactly_once() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = env_base_test_config(&dir);
         let shared_vv = test_shared_vv();
         let rustc = real_rustc_path();
-        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, rustc.as_os_str())
+        let build_rustc = crate::rustc_args::BuildRustc::Configured(rustc.clone().into_os_string());
+        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &build_rustc)
             .await
             .expect("seeded env base")
         else {
@@ -4569,7 +4517,6 @@ mod tests {
         let tools = tempfile::tempdir().expect("tools");
         let fake = tools.path().join("other-rustc");
         std::fs::write(&fake, "#!/bin/sh\nexec rustc \"$@\"\n").expect("write fake rustc");
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
@@ -4605,13 +4552,15 @@ mod tests {
 
     /// A spelling that reaches the seed's file through a symlinked
     /// directory adopts the seed — zero loads (stow#608 A1).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_spelling_through_a_symlinked_dir_adopts_the_seed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = env_base_test_config(&dir);
         let shared_vv = test_shared_vv();
         let rustc = real_rustc_path();
-        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, rustc.as_os_str())
+        let build_rustc = crate::rustc_args::BuildRustc::Configured(rustc.clone().into_os_string());
+        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &build_rustc)
             .await
             .expect("seeded env base")
         else {
@@ -4620,7 +4569,6 @@ mod tests {
         let seeded = std::sync::Arc::new(seeded);
 
         let link_dir = tempfile::tempdir().expect("link dir");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(
             rustc.parent().expect("rustc has a parent"),
             link_dir.path().join("bin"),
@@ -4657,7 +4605,8 @@ mod tests {
         let config = env_base_test_config(&dir);
         let shared_vv = test_shared_vv();
         let rustc = real_rustc_path();
-        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, rustc.as_os_str())
+        let build_rustc = crate::rustc_args::BuildRustc::Configured(rustc.clone().into_os_string());
+        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &build_rustc)
             .await
             .expect("seeded env base")
         else {

@@ -1,3 +1,6 @@
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+
 use async_process::Command;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
@@ -99,6 +102,84 @@ pub fn vv_release(vv: &str) -> Result<String, String> {
     vv.lines()
         .find_map(|line| line.strip_prefix("release: ").map(str::to_owned))
         .ok_or_else(|| "rustc -vV output missing release".to_owned())
+}
+
+/// The rustc a build compiles with, as cargo resolves it: the
+/// configured `RUSTC`/`build.rustc` when one is set — cargo hands its
+/// rustc wrapper that spelling verbatim — else the toolchain's own
+/// `rustc` (stow#608).
+#[derive(Debug, Clone)]
+pub enum BuildRustc {
+    /// No `RUSTC`/`build.rustc` configured: the toolchain's own `rustc`
+    /// — the bare name cargo resolves, through the rustup shim when one
+    /// proxies it.
+    ToolchainDefault,
+    /// `RUSTC`/`build.rustc` set: the spelling cargo hands its rustc
+    /// wrapper and the toolchain probes verbatim.
+    Configured(OsString),
+}
+
+impl BuildRustc {
+    /// The build's rustc as a loaded cargo config chain resolves it —
+    /// `build.rustc` covers the `RUSTC`/`CARGO_BUILD_RUSTC` environment
+    /// and the config files alike.
+    pub fn from_cargo_config(config: &cargo_config2::Config) -> Self {
+        config
+            .build
+            .rustc
+            .clone()
+            .map_or(Self::ToolchainDefault, |rustc| {
+                Self::Configured(rustc.into_os_string())
+            })
+    }
+
+    /// The executable to spawn when this rustc is asked anything — a
+    /// `-vV`, a `--print` query: the configured spelling, or the bare
+    /// name the toolchain resolves.
+    pub fn executable(&self) -> &OsStr {
+        match self {
+            Self::ToolchainDefault => OsStr::new("rustc"),
+            Self::Configured(rustc) => rustc,
+        }
+    }
+
+    /// The spelling the build's facades report for this rustc: the
+    /// configured one verbatim, or the toolchain's
+    /// `<sysroot>/bin/rustc` — the path cargo hands its wrapper when it
+    /// asks the rustup shim for the real rustc.
+    pub async fn facade_spelling(&self) -> Result<OsString, String> {
+        match self {
+            Self::Configured(rustc) => Ok(rustc.clone()),
+            Self::ToolchainDefault => sysroot_rustc_executable(self.executable()).await,
+        }
+    }
+}
+
+/// The toolchain's own `rustc`, `<sysroot>/bin/rustc` — the string cargo
+/// hands the build's rustc wrapper when neither `RUSTC` nor `build.rustc`
+/// is set: cargo asks the rustup shim for its real rustc rather than
+/// passing the bare name, and `rustc --print sysroot` answers the same
+/// directory. `rustc` is the executable the probe runs — the build
+/// rustc's [`BuildRustc::executable`].
+async fn sysroot_rustc_executable(rustc: &OsStr) -> Result<OsString, String> {
+    let output = Command::new(rustc)
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .await
+        .map_err(|error| format!("spawn rustc --print sysroot: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustc --print sysroot failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let sysroot = String::from_utf8(output.stdout)
+        .map_err(|error| format!("rustc --print sysroot output is not UTF-8: {error}"))?;
+    Ok(Path::new(sysroot.trim())
+        .join("bin")
+        .join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
+        .into_os_string())
 }
 
 /// One `rustc -vV` shared by every consumer — the project context's
