@@ -2085,6 +2085,16 @@ fn is_lock_contended(error: &std::io::Error) -> bool {
     error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
+/// Whether opening or removing a staging lock failed because another
+/// sweeper has removed it. On unix the file is simply gone. On Windows a file
+/// removed while a handle to it is still open — the sweeper holds its
+/// lock through the removal — stays listed in delete-pending state and
+/// refuses every open with access denied until that handle closes.
+fn is_being_reclaimed(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || (cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
 /// Reclaim staging directories their owning process abandoned. A live
 /// store holds `<name>.lock` exclusively for the process's whole life, so
 /// an exclusive try-lock that succeeds names a dead process: its sibling
@@ -2095,8 +2105,9 @@ fn is_lock_contended(error: &std::io::Error) -> bool {
 ///
 /// Every stow process of a build sweeps, so several reach the same dead
 /// lock at once. The lock serializes them: the first removes the
-/// directory and the lock file, and a later one either finds the file
-/// gone or locks the unlinked file and has nothing left to remove.
+/// directory and the lock file, and a later one either cannot open the
+/// file any more or locks the unlinked file and has nothing left to
+/// remove.
 fn sweep_staging_locks(staging_root: &Path) -> stow_types::error::Result<()> {
     for entry in std::fs::read_dir(staging_root)
         .wrap_err_with(|| format!("read staging root {}", staging_root.display()))?
@@ -2107,7 +2118,7 @@ fn sweep_staging_locks(staging_root: &Path) -> stow_types::error::Result<()> {
         }
         let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if is_being_reclaimed(&error) => continue,
             Err(error) => {
                 return Err(stow_types::stow_error!(
                     "open staging lock {}: {error}",
@@ -2133,7 +2144,7 @@ fn sweep_staging_locks(staging_root: &Path) -> stow_types::error::Result<()> {
         }
         match std::fs::remove_file(&lock_path) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if is_being_reclaimed(&error) => {}
             Err(error) => {
                 return Err(stow_types::stow_error!(
                     "remove staging lock {}: {error}",
