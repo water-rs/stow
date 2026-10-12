@@ -88,6 +88,8 @@ pub fn stow_build_in(
         // supervisor runs in this process, so the warnings it logs are on
         // this stderr, where a test can assert on them (stow#619).
         .env_remove("RUST_LOG")
+        // Level markers and messages are asserted on as plain text.
+        .env("NO_COLOR", "1")
         .output()
         .expect("run stow-cli build")
 }

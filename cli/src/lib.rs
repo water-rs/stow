@@ -3831,6 +3831,7 @@ fn install_tracing() -> TracingGuard {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     use super::{
         UnparseableInvocation, cached_rustc_artifact_notifications, classify_invocation,
