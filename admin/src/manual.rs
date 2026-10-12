@@ -405,13 +405,66 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
         time::OffsetDateTime::now_utc() - time::Duration::hours(ADOPT_SINCE_DEFAULT_HOURS)
     });
     let covered = covered_nodes(&catalog, &targets, &rustc_version).await?;
-    tracing::info!(covered = covered.len(), "published index coverage");
+    let wave_covered = mark_covered_done(&mut nodes, &covered);
+    tracing::info!(
+        covered = covered.len(),
+        wave_covered,
+        "published index coverage"
+    );
 
     let layers = layer_graph(&nodes, &edges, &covered)?;
 
-    let mut failures: Vec<(String, String)> = Vec::new();
-    let mut blocked_report: Vec<(String, String)> = Vec::new();
-    let mut reruns: Vec<RerunRecord> = Vec::new();
+    let drive = Drive {
+        dispatch: &dispatch,
+        args: &args,
+        catalog: &catalog,
+        rustc_version: &rustc_version,
+        adopt_since,
+    };
+    let report = drive_layers(&drive, &layers, &mut nodes, &edges).await?;
+
+    finish_report(
+        &nodes,
+        wave_covered,
+        &report.failures,
+        &report.blocked,
+        &report.reruns,
+        &resolved.unresolved_projects,
+    )
+}
+
+/// The per-wave context every layer drive shares — the dispatch
+/// backend, the invocation's args, the index handle and the adoption
+/// window.
+struct Drive<'a> {
+    dispatch: &'a Dispatch,
+    args: &'a ManualArgs,
+    catalog: &'a Index<'a>,
+    rustc_version: &'a WireRustcVersion,
+    adopt_since: time::OffsetDateTime,
+}
+
+/// Every layer's outcome folded for the finish report: failures as
+/// `(task, run url)`, skips as `(task, failed ancestor)`, and the
+/// confirmed infrastructure reruns.
+#[derive(Default)]
+struct WaveReport {
+    failures: Vec<(String, String)>,
+    blocked: Vec<(String, String)>,
+    reruns: Vec<RerunRecord>,
+}
+
+/// Drive each non-empty layer in order: mark newly-blocked nodes, run
+/// the layer to completion, then publish the index slices its newly
+/// done nodes earned. A layer that drove nothing to done — every node
+/// failed or was skipped behind a failure — publishes nothing.
+async fn drive_layers(
+    drive: &Drive<'_>,
+    layers: &[Vec<String>],
+    nodes: &mut BTreeMap<String, NodeRun>,
+    edges: &BTreeMap<String, BTreeSet<String>>,
+) -> stow_types::error::Result<WaveReport> {
+    let mut report = WaveReport::default();
     for (index, layer) in layers.iter().enumerate() {
         if layer.is_empty() {
             continue;
@@ -422,36 +475,48 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
             tasks = layer.len(),
             "manual preheat layer"
         );
-        blocked_report.extend(mark_blocked(layer, &mut nodes, &edges));
+        report.blocked.extend(mark_blocked(layer, nodes, edges));
+        let done_before = layer
+            .iter()
+            .filter(|id| nodes.get(*id).expect("layer node").done)
+            .count();
         drive_layer(
-            &dispatch,
+            drive.dispatch,
             layer,
-            &mut nodes,
-            &mut reruns,
-            args.in_flight,
-            adopt_since,
-            &rustc_version,
+            nodes,
+            &mut report.reruns,
+            drive.args.in_flight,
+            drive.adopt_since,
+            drive.rustc_version,
         )
         .await?;
+        let built = layer
+            .iter()
+            .filter(|id| nodes.get(*id).expect("layer node").done)
+            .count()
+            - done_before;
         for id in layer {
             let node = nodes.get(id).expect("layer node");
             if node.failed {
-                failures.push((
+                report.failures.push((
                     id.clone(),
                     node.run_url.clone().unwrap_or_else(|| "-".to_owned()),
                 ));
             }
         }
-        publish_and_wait(&dispatch, &args, &nodes, layer, &catalog, &rustc_version).await?;
+        if built > 0 {
+            publish_and_wait(
+                drive.dispatch,
+                drive.args,
+                nodes,
+                layer,
+                drive.catalog,
+                drive.rustc_version,
+            )
+            .await?;
+        }
     }
-
-    finish_report(
-        &nodes,
-        &failures,
-        &blocked_report,
-        &reruns,
-        &resolved.unresolved_projects,
-    )
+    Ok(report)
 }
 
 /// The wave's outcome line plus its failure list — a node still undone
@@ -460,8 +525,13 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
 /// all three. Infrastructure reruns are listed as well: runner flakes
 /// are reported, not hidden. The run exits non-zero unless every node
 /// is done and every project resolved.
+///
+/// `served` is how many of the wave's nodes the published index already
+/// covered — they are `done` without this wave building anything, so the
+/// report breaks `done` into built and already-served counts.
 fn finish_report(
     nodes: &BTreeMap<String, NodeRun>,
+    served: usize,
     failures: &[(String, String)],
     blocked_report: &[(String, String)],
     reruns: &[RerunRecord],
@@ -469,6 +539,7 @@ fn finish_report(
 ) -> stow_types::error::Result<()> {
     let total = nodes.len();
     let done = nodes.values().filter(|node| node.done).count();
+    let built = done - served;
     let skipped = nodes
         .values()
         .filter(|node| node.blocked_by.is_some())
@@ -496,7 +567,8 @@ fn finish_report(
     }
     let _ = writeln!(
         report,
-        "manual preheat: {done}/{total} built, {} failed, {skipped} skipped, {} unresolved, {} rerun",
+        "manual preheat: {done}/{total} done ({built} built, {served} already served), \
+         {} failed, {skipped} skipped, {} unresolved, {} rerun",
         failures.len(),
         unresolved_projects.len(),
         reruns.len()
@@ -551,6 +623,21 @@ fn build_graph(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<Manua
     Ok((nodes, edges))
 }
 
+/// Mark every node the published index already serves done before the
+/// first layer is driven: a covered node is never dispatched, never
+/// adopted and never lands in a layer — the wave owes it nothing.
+/// Returns how many of the wave's own nodes that is.
+fn mark_covered_done(nodes: &mut BTreeMap<String, NodeRun>, covered: &BTreeSet<String>) -> usize {
+    let mut served = 0;
+    for (id, node) in nodes {
+        if covered.contains(id) {
+            node.done = true;
+            served += 1;
+        }
+    }
+    served
+}
+
 /// Layer the uncovered graph: depth 0 is a node whose deps the index
 /// already serves (or that has none); every other layer waits on the
 /// publish the previous layer earned.
@@ -562,6 +649,9 @@ fn layer_graph(
     let mut layers: Vec<Vec<String>> = Vec::new();
     let mut depth_cache: HashMap<String, usize> = HashMap::new();
     for id in nodes.keys() {
+        if covered.contains(id) {
+            continue;
+        }
         let depth = node_depth(id, edges, covered, &mut depth_cache, &mut BTreeSet::new())?;
         if depth + 1 > layers.len() {
             layers.resize_with(depth + 1, Vec::new);
@@ -3424,7 +3514,7 @@ mod tests {
             "https://github.com/a/one: fetch failed".to_owned(),
             "https://github.com/b/two: no rust manifest".to_owned(),
         ];
-        let message = finish_report(&nodes, &[], &[], &[], &unresolved)
+        let message = finish_report(&nodes, 0, &[], &[], &[], &unresolved)
             .expect_err("unresolved projects fail the wave")
             .to_string();
         for entry in &unresolved {
@@ -3436,7 +3526,7 @@ mod tests {
     #[test]
     fn finish_report_ok_when_all_done_and_resolved() {
         let nodes = all_done(&["built"]);
-        finish_report(&nodes, &[], &[], &[], &[]).expect("a clean wave");
+        finish_report(&nodes, 0, &[], &[], &[], &[]).expect("a clean wave");
     }
 
     /// A wall-clock timestamp for the resolution tests.
@@ -3942,6 +4032,92 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// stow#656: a node the published index already serves lands in no
+    /// layer at all, and a dependent of a covered node owes no layer
+    /// for it — it sits in layer 0.
+    #[test]
+    fn a_covered_node_lands_in_no_layer() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let covered_leaf = request("served", T, false, &[]);
+        let dependent = request("dependent", T, false, &[("served", T, false)]);
+        let covered_id = covered_leaf.task_id().expect("served id");
+        let dependent_id = dependent.task_id().expect("dependent id");
+        let (nodes, edges) = build_graph(vec![covered_leaf, dependent]).expect("valid graph");
+        let covered = BTreeSet::from([covered_id.clone()]);
+        let layers = layer_graph(&nodes, &edges, &covered).expect("layers");
+        assert!(
+            layers.iter().all(|layer| !layer.contains(&covered_id)),
+            "the covered node is in no layer"
+        );
+        assert_eq!(layers, vec![vec![dependent_id]]);
+    }
+
+    /// stow#656 end to end through `Dispatch::Local`: a wave whose
+    /// graph mixes covered and uncovered nodes marks the covered done
+    /// through the same `mark_covered_done` the driver runs, keeps them
+    /// out of every layer, and the CI server never sees a dispatch for
+    /// them — each uncovered node dispatches exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn a_wave_never_dispatches_a_covered_node() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let covered_leaf = request("served", T, false, &[]);
+        let fresh = request("fresh", T, false, &[]);
+        let dependent = request("dependent", T, false, &[("served", T, false)]);
+        let covered_id = covered_leaf.task_id().expect("served id");
+        let (mut nodes, edges) =
+            build_graph(vec![covered_leaf, fresh, dependent]).expect("valid graph");
+        let ids = |name: &str| node_task_id(request_by_name(name, &nodes)).expect("task id");
+        let (fresh, dependent) = (ids("fresh"), ids("dependent"));
+        let covered = BTreeSet::from([covered_id.clone()]);
+        assert_eq!(mark_covered_done(&mut nodes, &covered), 1);
+        let layers = layer_graph(&nodes, &edges, &covered).expect("layers");
+        let server = MockCi::start(&[], &[], "1.99.0").await;
+        let dispatch = Dispatch::Local {
+            base: server.url.clone(),
+        };
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
+        let mut reruns = Vec::new();
+        {
+            let drive = async {
+                for layer in &layers {
+                    if layer.is_empty() {
+                        continue;
+                    }
+                    mark_blocked(layer, &mut nodes, &edges);
+                    drive_layer(&dispatch, layer, &mut nodes, &mut reruns, 8, at(0), &rustc)
+                        .await?;
+                }
+                Ok::<(), stow_types::error::Error>(())
+            };
+            tokio::pin!(drive);
+            let (bound_tx, bound) = tokio::sync::oneshot::channel::<()>();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                let _ = bound_tx.send(());
+            });
+            tokio::select! {
+                result = &mut drive => result.expect("every uncovered node built"),
+                _ = bound => panic!("the wave did not finish inside its real bound"),
+            }
+        }
+        assert!(nodes.values().all(|node| node.done));
+        {
+            let state = server.state.lock().expect("mock state");
+            assert!(
+                !state.seen.contains(&covered_id),
+                "the covered leaf was never dispatched"
+            );
+            for id in [&fresh, &dependent] {
+                assert_eq!(
+                    state.seen.iter().filter(|task_id| *task_id == id).count(),
+                    1,
+                    "{id} dispatched exactly once"
+                );
+            }
+        }
+        server.shutdown().await;
+    }
+
     /// An undone node and an unresolved project both land in the error.
     #[test]
     fn finish_report_names_undone_and_unresolved() {
@@ -3956,6 +4132,7 @@ mod tests {
         let unresolved = vec!["https://github.com/a/one: fetch failed".to_owned()];
         let message = finish_report(
             &nodes,
+            0,
             &[(id.clone(), "http://localhost/run/1".to_owned())],
             &[],
             &[],
