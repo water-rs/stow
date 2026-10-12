@@ -119,7 +119,14 @@ pub async fn download_bundle_bytes(
         .await
         .map_err(|error| FetchError::Other(format!("read artifact response body: {error}")))?
         .to_vec();
-    let actual = sha256_prefixed(&bytes);
+    // One pass over the whole bundle — megabytes for a large crate — so
+    // the hash runs on a blocking thread like the parse behind it
+    // (stow#624).
+    let (bytes, actual) = smol::unblock(move || {
+        let actual = sha256_prefixed(&bytes);
+        (bytes, actual)
+    })
+    .await;
     if actual != bundle.bundle_digest {
         return Err(FetchError::Digest {
             expected: bundle.bundle_digest.to_owned(),
@@ -719,6 +726,7 @@ mod tests {
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db_pool: crate::config::StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
         }
     }
 
