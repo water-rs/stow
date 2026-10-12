@@ -111,10 +111,26 @@ fn read_request_body(reader: &mut impl std::io::BufRead) -> Vec<u8> {
 const EMPTY_ADMISSIONS: &str = "[]";
 
 fn write_crate(dir: &Path, cargo_home: &Path) {
+    write_probe_crate(dir, cargo_home, "cfg-if = \"1\"\n");
+}
+
+/// Four leaf dependencies — four cacheable units, no dependency-identity
+/// chains, so every build-1 store and every build-2 serve keys exactly.
+fn write_leaf_dep_crate(dir: &Path, cargo_home: &Path) {
+    write_probe_crate(
+        dir,
+        cargo_home,
+        "cfg-if = \"1\"\nitoa = \"1\"\nryu = \"1\"\nunicode-ident = \"1\"\n",
+    );
+}
+
+fn write_probe_crate(dir: &Path, cargo_home: &Path, dependencies: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
-        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-         [dependencies]\ncfg-if = \"1\"\n",
+        format!(
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\n{dependencies}"
+        ),
     )
     .expect("write manifest");
     std::fs::create_dir_all(dir.join("src")).expect("create src");
@@ -183,6 +199,10 @@ fn stow_build_command(
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home)
         .env("STOW_EDGE_URL", edge_url)
+        .env(
+            "STOW_REGISTRY_BASE_URL",
+            format!("{edge_url}/water-rs/stow"),
+        )
         .env("STOW_CACHE_DIR", cache_dir)
         // Isolate from the developer's ambient stow config: a user-level
         // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
@@ -804,6 +824,64 @@ fn a_disabled_public_cache_still_serves_local_entries() {
             "SELECT hits FROM crate_stats WHERE crate_name = 'cfg_if'"
         ),
         1
+    );
+}
+
+/// stow#617: a unit the local cache holds must serve whether or not a
+/// graph or an index slice is cached. Build 2 runs the same cache
+/// against a fresh target dir — before the fix the graph cache key
+/// hashed `CARGO_TARGET_DIR`, so the lite pass saw no graph, admitted
+/// no local units into the serve map, and every facade compiled over a
+/// populated cache.
+#[test]
+fn a_fresh_target_dir_serves_everything_the_local_cache_holds() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let target_a = tempfile::tempdir().expect("target dir a");
+    let target_b = tempfile::tempdir().expect("target dir b");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_leaf_dep_crate(dir.path(), cargo_home.path());
+    stow_setup_in(dir.path(), cargo_home.path());
+
+    // Nothing listens on this port: the edge and the index registry
+    // both refuse every connection, so build 2 can only serve from the
+    // local artifact cache.
+    let edge_url = unreachable_edge_url();
+
+    let output = stow_build_command(
+        dir.path(),
+        &edge_url,
+        cache.path(),
+        cargo_home.path(),
+        target_a.path(),
+    );
+    assert!(
+        output.status.success(),
+        "first stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = stow_build_command(
+        dir.path(),
+        &edge_url,
+        cache.path(),
+        cargo_home.path(),
+        target_b.path(),
+    );
+    assert!(
+        output.status.success(),
+        "second stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let summary = stdout
+        .lines()
+        .find(|line| line.contains("stow: served"))
+        .expect("the coverage summary line");
+    assert_eq!(
+        summary.trim(),
+        "stow: served 4 of 4 cacheable dependencies",
+        "every locally stored dependency must serve on a fresh target dir"
     );
 }
 

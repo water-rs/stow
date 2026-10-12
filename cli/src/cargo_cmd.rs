@@ -1056,6 +1056,30 @@ struct AnalysisInputs {
     slice_pending: bool,
 }
 
+/// The lockfile's own graph, resolved only for the no-expanded-graph
+/// branch: its registry packages are that pass's unit set and its
+/// manifest-view direct deps are that pass's missing answer. With a
+/// cached graph nothing about the unit set changes and no lockfile
+/// walk runs (stow#617).
+fn lockfile_graph_without_expanded(
+    project: &ProjectContext,
+    manifest_path: &Path,
+    expanded_in: &[ResolvedDependencyGraphEntry],
+) -> stow_types::error::Result<Option<workspace_deps::LockfileGraph>> {
+    expanded_in
+        .is_empty()
+        .then(|| {
+            tracing::debug_span!("stow.precargo.lockfile_graph").in_scope(|| {
+                workspace_deps::resolve_lockfile_graph(
+                    &project.workspace_root,
+                    manifest_path,
+                    &project.metadata_args,
+                )
+            })
+        })
+        .transpose()
+}
+
 async fn analyze_workspace_prediction_from(
     project: &ProjectContext,
     manifest_path: &Path,
@@ -1072,6 +1096,11 @@ async fn analyze_workspace_prediction_from(
     let expanded_in = expanded
         .as_ref()
         .map_or_else(Vec::new, |expanded| expanded.entries.clone());
+    // The lockfile walk only exists for the no-graph branch, and it
+    // runs ahead of the map build now: the map's local half admits a
+    // unit only when the lockfile's own registry packages name it, so
+    // the two read one parse (stow#617).
+    let lockfile_graph = lockfile_graph_without_expanded(project, manifest_path, &expanded_in)?;
     let rows = slice.map(|slice| slice.index.rows).unwrap_or_default();
     let mut map = tracing::debug_span!("stow.precargo.serve_map_build").in_scope(|| {
         build_serve_map(
@@ -1080,26 +1109,21 @@ async fn analyze_workspace_prediction_from(
             host_slice.as_ref(),
             &expanded_in,
             local_units.as_deref().unwrap_or(&[]),
+            lockfile_graph
+                .as_ref()
+                .map_or(&BTreeSet::new(), |graph| &graph.registry_packages),
         )
     });
     map.pending = slice_pending;
     let servable_units = Some(map);
-    if expanded_in.is_empty() {
+    if let Some(lockfile_graph) = lockfile_graph {
         // No expanded graph on disk — a cold cache cannot have one — so
         // the lite pass cannot rank semantic upgrades; it answers with
         // the serve map alone, which needs no expanded entries, and the
         // in-build enrichment resolves the full analysis (stow#347).
-        // The lockfile walk only exists for this branch: with no
-        // expanded graph the unit graph's parents map is empty anyway,
-        // and its manifest-view direct deps are the lite answer.
-        let lockfile_graph =
-            tracing::debug_span!("stow.precargo.lockfile_graph").in_scope(|| {
-                workspace_deps::resolve_lockfile_graph(
-                    &project.workspace_root,
-                    manifest_path,
-                    &project.metadata_args,
-                )
-            })?;
+        // With no expanded graph the unit graph's parents map is empty
+        // anyway, and the lockfile's manifest-view direct deps are the
+        // lite answer.
         let dependencies = direct_resolved_dependencies(&lockfile_graph);
         return Ok(WorkspacePrediction {
             current_cached: 0,
@@ -1188,12 +1212,28 @@ async fn analyze_workspace_prediction_from(
 /// The pair set errs on covering: a unit the map wrongly includes costs a
 /// plan round trip, while a unit it wrongly excludes compiles despite an
 /// artifact being available.
+///
+/// The two halves admit against different sets. Index rows still
+/// intersect the expanded graph's own per-side units — index coverage
+/// claims a feature set and a side only the graph proves — so with no
+/// cached graph they contribute nothing. The local half asks for less:
+/// the exact-key local lookup the plan path runs needs neither a graph
+/// nor a slice, so a locally stored unit is admitted whenever the
+/// build's units name it *as far as known* — the graph's per-side sets
+/// when a graph is cached, `lockfile_packages` on both sides when it is
+/// not (stow#617). Without the graph the side is unknowable, and a
+/// wrong side costs the round trip the map already tolerates; the
+/// unit's side itself still comes from its row's platform. When the
+/// lockfile is absent — cargo writes this build's during the run — the
+/// caller's resolve fails instead, so such a build carries no local
+/// half and the in-build enrichment covers it as today.
 fn build_serve_map(
     project: &ProjectContext,
     consumer_rows: &[stow_types::index::ArtifactIndexRow],
     host: Option<&index::IndexSlice>,
     expanded_entries: &[ResolvedDependencyGraphEntry],
     local_units: &[(String, String, String)],
+    lockfile_packages: &BTreeSet<(String, semver::Version)>,
 ) -> crate::facade::ServeMap {
     let host_glibc = resolve::host_glibc();
     let unit_pairs = |host_side: bool| -> BTreeSet<(String, String)> {
@@ -1244,6 +1284,16 @@ fn build_serve_map(
         host_index_pairs.iter().map(|(name, _)| name).collect();
     let consumer_units = unit_pairs(false);
     let host_units = unit_pairs(true);
+    // The units this build compiles as far as the map can prove: the
+    // expanded graph's own sets when one is cached — the index half
+    // reads them alone — and the lockfile's registry packages on both
+    // sides when it is not (stow#617).
+    let lockfile_units = canonical_lockfile_packages(lockfile_packages);
+    let (consumer_known, host_known) = if expanded_entries.is_empty() {
+        (&lockfile_units, &lockfile_units)
+    } else {
+        (&consumer_units, &host_units)
+    };
     let consumer_servable: BTreeSet<(String, String)> = consumer_units
         .intersection(&consumer_index_pairs)
         .cloned()
@@ -1265,14 +1315,14 @@ fn build_serve_map(
             crate::canonical_crate_name(crate_name),
             crate_version.clone(),
         );
-        if unit_target == &project.target && consumer_units.contains(&pair) {
+        if unit_target == &project.target && consumer_known.contains(&pair) {
             if consumer_spelled {
                 target.insert(pair.clone());
             } else {
                 host.insert(pair.clone());
             }
         }
-        if Some(unit_target.as_str()) == host_target.as_deref() && host_units.contains(&pair) {
+        if Some(unit_target.as_str()) == host_target.as_deref() && host_known.contains(&pair) {
             host.insert(pair.clone());
         }
     }
@@ -1286,8 +1336,8 @@ fn build_serve_map(
         host_target.as_deref(),
         &consumer_index_names,
         &host_index_names,
-        &consumer_units,
-        &host_units,
+        consumer_known,
+        host_known,
     );
     crate::facade::ServeMap {
         target: target.into_iter().collect(),
@@ -1296,10 +1346,32 @@ fn build_serve_map(
     }
 }
 
+/// The lockfile's registry packages as the serve map's canonical
+/// `(name, version)` pairs — the local half's unit set when no
+/// expanded graph is cached (stow#617).
+fn canonical_lockfile_packages(
+    lockfile_packages: &BTreeSet<(String, semver::Version)>,
+) -> BTreeSet<(String, String)> {
+    lockfile_packages
+        .iter()
+        .map(|(name, version)| {
+            (
+                crate::canonical_crate_name(name.as_str()),
+                version.to_string(),
+            )
+        })
+        .collect()
+}
+
 /// The wildcard half of the serve map: a `("name", "*")` entry says this
 /// crate may serve under another version, so the facade still asks the
 /// plan path. Covers the units an exact pair cannot name — semantic
 /// fallback candidates and name-scoped local hits.
+///
+/// `consumer_known`/`host_known` are the build's units as far as the
+/// map can prove them — the expanded graph's sets when one is cached,
+/// the lockfile's registry packages on both sides when it is not
+/// (stow#617).
 #[allow(clippy::too_many_arguments)]
 fn serve_map_wildcards(
     target: &mut BTreeSet<(String, String)>,
@@ -1311,8 +1383,8 @@ fn serve_map_wildcards(
     host_target: Option<&str>,
     consumer_index_names: &BTreeSet<&String>,
     host_index_names: &BTreeSet<&String>,
-    consumer_units: &BTreeSet<(String, String)>,
-    host_units: &BTreeSet<(String, String)>,
+    consumer_known: &BTreeSet<(String, String)>,
+    host_known: &BTreeSet<(String, String)>,
 ) {
     // The side a unit's invocation arrives on: spelled `--target` units
     // read `target`, every unspelled unit reads `host` — which is all of
@@ -1340,14 +1412,14 @@ fn serve_map_wildcards(
         }
     }
     // A local serve answers by name — the store's version key is not
-    // one a facade can reproduce — so every graph unit the local cache
+    // one a facade can reproduce — so every known unit the local cache
     // holds at all wildcards the side it would run on.
     for (crate_name, _, unit_target) in local_units {
         let name = crate::canonical_crate_name(crate_name);
-        if unit_target == project_target && consumer_units.iter().any(|(n, _)| *n == name) {
+        if unit_target == project_target && consumer_known.iter().any(|(n, _)| *n == name) {
             wildcard(false, name.clone());
         }
-        if Some(unit_target.as_str()) == host_target && host_units.iter().any(|(n, _)| *n == name) {
+        if Some(unit_target.as_str()) == host_target && host_known.iter().any(|(n, _)| *n == name) {
             wildcard(true, name);
         }
     }
@@ -4212,6 +4284,7 @@ fn journal_and_drain_misses(
             tracing::warn!(error = %error, "could not key the expanded graph for the miss journal");
             String::new()
         });
+    let env = std::env::vars_os().collect::<Vec<_>>();
     let key_inputs = crate::lockfile_graph_cache::KeyInputs {
         action: &project.action,
         cargo_args: &project.cargo_args,
@@ -4221,6 +4294,7 @@ fn journal_and_drain_misses(
         target: &project.target,
         target_given: project.target_given,
         rustc_version: &project.rustc_version,
+        env: &env,
     };
     let consumer = crate::miss_journal::JournalConsumer {
         manifest_dir: project
@@ -4649,6 +4723,7 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::build_serve_map;
     use super::{
         CachedDependencyPlan, MetadataArgs, ProjectContext, WorkspaceMirror,
         cached_dependency_profile, feature_references_dependency, native_requires_link_replay,
@@ -4979,6 +5054,153 @@ mod tests {
         assert!(
             !stripped.contains("serde"),
             "mirror manifest lost its dependency table: {stripped}"
+        );
+    }
+
+    /// A `(crate, version)` unit-graph entry for `build_serve_map`'s
+    /// expanded-graph input.
+    fn graph_entry(
+        name: &str,
+        version: &str,
+        host_side: bool,
+    ) -> stow_types::api::ResolvedDependencyGraphEntry {
+        stow_types::api::ResolvedDependencyGraphEntry {
+            crate_name: stow_types::identity::CrateName::parse(name).expect("crate name"),
+            version: semver::Version::parse(version).expect("version"),
+            features: Vec::new(),
+            host_side,
+            dependencies: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+        }
+    }
+
+    /// The map `build_serve_map` produces with no index rows — these
+    /// tests exercise the local half's unit set alone.
+    fn local_only_map(
+        project: &ProjectContext,
+        expanded_entries: &[stow_types::api::ResolvedDependencyGraphEntry],
+        local_units: &[(&str, &str, &str)],
+        lockfile_packages: &[(&str, &str)],
+    ) -> crate::facade::ServeMap {
+        let local_units = local_units
+            .iter()
+            .map(|(name, version, target)| {
+                (name.to_string(), version.to_string(), target.to_string())
+            })
+            .collect::<Vec<_>>();
+        let lockfile_packages = lockfile_packages
+            .iter()
+            .map(|(name, version)| {
+                (
+                    (*name).to_owned(),
+                    semver::Version::parse(version).expect("version"),
+                )
+            })
+            .collect();
+        build_serve_map(
+            project,
+            &[],
+            None,
+            expanded_entries,
+            &local_units,
+            &lockfile_packages,
+        )
+    }
+
+    /// stow#617: with no expanded graph on disk the lockfile's registry
+    /// packages name the build's units — a locally stored one of them
+    /// serves whether the graph was ever resolved, and one the lockfile
+    /// does not name stays out.
+    #[test]
+    fn a_local_unit_serves_without_an_expanded_graph() {
+        let project = project_context();
+        let map = local_only_map(
+            &project,
+            &[],
+            &[
+                ("a", "1.0.0", "aarch64-apple-darwin"),
+                ("c", "3.0.0", "aarch64-apple-darwin"),
+            ],
+            &[("a", "1.0.0"), ("b", "2.0.0")],
+        );
+        // A native build spells no `--target`: every unit arrives
+        // unspelled, so the covered pair and the name wildcard both
+        // land on the host list.
+        assert_eq!(map.target, Vec::<(String, String)>::new());
+        assert_eq!(
+            map.host,
+            vec![
+                ("a".to_owned(), "*".to_owned()),
+                ("a".to_owned(), "1.0.0".to_owned())
+            ]
+        );
+    }
+
+    /// The same admission under a spelled `--target`: a row whose
+    /// platform is the build's host triple lands on the host list, and
+    /// a consumer-platform row lands on the target list (stow#617).
+    #[test]
+    fn a_host_platform_row_lands_on_the_host_list() {
+        let project = ProjectContext {
+            target: "aarch64-apple-ios".to_owned(),
+            target_given: true,
+            ..project_context()
+        };
+        let map = local_only_map(
+            &project,
+            &[],
+            &[
+                ("a", "1.0.0", "aarch64-apple-darwin"),
+                ("b", "2.0.0", "aarch64-apple-ios"),
+                ("c", "3.0.0", "aarch64-apple-ios"),
+            ],
+            &[("a", "1.0.0"), ("b", "2.0.0")],
+        );
+        assert_eq!(
+            map.host,
+            vec![
+                ("a".to_owned(), "*".to_owned()),
+                ("a".to_owned(), "1.0.0".to_owned())
+            ]
+        );
+        assert_eq!(
+            map.target,
+            vec![
+                ("b".to_owned(), "*".to_owned()),
+                ("b".to_owned(), "2.0.0".to_owned())
+            ]
+        );
+    }
+
+    /// With a cached expanded graph nothing changes: the local half is
+    /// still gated on the graph's own per-side unit sets, and a locally
+    /// stored crate the graph does not name stays out.
+    #[test]
+    fn a_cached_graph_still_gates_the_local_half() {
+        let project = project_context();
+        let entries = [
+            graph_entry("a", "1.0.0", false),
+            graph_entry("d", "4.0.0", true),
+        ];
+        let map = local_only_map(
+            &project,
+            &entries,
+            &[
+                ("a", "1.0.0", "aarch64-apple-darwin"),
+                ("d", "4.0.0", "aarch64-apple-darwin"),
+                ("b", "2.0.0", "aarch64-apple-darwin"),
+            ],
+            &[],
+        );
+        assert_eq!(map.target, Vec::<(String, String)>::new());
+        assert_eq!(
+            map.host,
+            vec![
+                ("a".to_owned(), "*".to_owned()),
+                ("a".to_owned(), "1.0.0".to_owned()),
+                ("d".to_owned(), "*".to_owned()),
+                ("d".to_owned(), "4.0.0".to_owned()),
+            ]
         );
     }
 }
