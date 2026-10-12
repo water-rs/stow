@@ -17,6 +17,37 @@ use crate::verify;
 use crate::config::StowConfig;
 
 pub use crate::index::IndexSlice;
+pub use crate::supervisor::protocol::ArtifactNotifications;
+
+/// The `--json=…artifacts…` notification lines a served unit owes cargo.
+///
+/// `parsed` is the invocation exactly as cargo spelled it; the result is
+/// empty when it did not ask for artifact notifications. The CLI's
+/// served decisions carry the same lines (stow#633).
+///
+/// # Errors
+///
+/// Returns an error when an emit kind the invocation requested has no
+/// output path to name.
+pub fn artifact_notifications(
+    parsed: &ParsedRustcArgs,
+) -> stow_types::error::Result<ArtifactNotifications> {
+    crate::cached_rustc_artifact_notifications(parsed)
+}
+
+/// Write notification `lines` to this process's stderr, each
+/// `\n`-terminated and flushed. The caller must be the process cargo
+/// spawned — cargo reads the notifications from its child (stow#633).
+///
+/// # Errors
+///
+/// A write or flush failure is an error, not a warning: exiting without
+/// the lines leaves cargo blind to artifacts it was told were emitted.
+pub fn write_artifact_notifications(
+    lines: &ArtifactNotifications,
+) -> stow_types::error::Result<()> {
+    crate::write_served_artifact_notifications(lines)
+}
 
 /// The edge/registry/verify-mode configuration the consumption path loads
 /// the same way the CLI does — opaque so the builder goes through the same

@@ -160,12 +160,35 @@ pub struct AwaitServeMap {
     pub token: String,
 }
 
+/// The rustc artifact-notification lines a served invocation owes cargo.
+///
+/// Each entry is one complete `{"$message_type":"artifact",…}` line —
+/// the JSON message rustc itself would have printed under
+/// `--json=…artifacts…`. The supervisor computes them because it holds
+/// the serve decision, but only the process cargo spawned may write
+/// them: cargo reads artifact notifications from its own child's stderr,
+/// so the lines travel with the `Served` answer and the facade prints
+/// them just before it exits (stow#633). An invocation whose `--json`
+/// set lacks `artifacts` carries an empty set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ArtifactNotifications(pub Vec<String>);
+
+impl ArtifactNotifications {
+    /// The notification lines, each a complete JSON message without its
+    /// terminating newline.
+    pub fn lines(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+}
+
 /// What the supervisor answers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Answer {
     /// The unit's outputs are in the target directory; the facade exits 0
-    /// without running rustc.
-    Served,
+    /// without running rustc. The payload is the artifact-notification
+    /// lines the facade owes cargo's stderr first (stow#633).
+    Served(ArtifactNotifications),
     /// Nothing serves this unit. The facade runs the real rustc and then
     /// sends [`Compiled`] carrying `ticket`.
     Compile {
@@ -300,7 +323,7 @@ where
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Answer, Plan, Request, read_frame, write_frame};
+    use super::{Answer, ArtifactNotifications, Plan, Request, read_frame, write_frame};
 
     #[tokio::test]
     async fn a_plan_round_trips_through_a_frame() {
@@ -341,14 +364,38 @@ mod tests {
         assert!(decoded.is_none());
     }
 
+    /// The artifact-notification lines a served unit owes cargo ride the
+    /// answer itself (stow#633).
+    #[tokio::test]
+    async fn a_served_answer_round_trips_its_notifications() {
+        let lines = ArtifactNotifications(vec![
+            r#"{"$message_type":"artifact","artifact":"/tmp/out/libserde-abc.rmeta","emit":"metadata"}"#
+                .to_owned(),
+            r#"{"$message_type":"artifact","artifact":"/tmp/out/libserde-abc.rlib","emit":"link"}"#
+                .to_owned(),
+        ]);
+        let mut buffer = Vec::new();
+        write_frame(&mut buffer, &Answer::Served(lines.clone()))
+            .await
+            .expect("write");
+        let decoded: Answer = read_frame(&mut buffer.as_slice())
+            .await
+            .expect("read")
+            .expect("a frame");
+        assert_eq!(decoded, Answer::Served(lines));
+    }
+
     /// A frame cut in half is an error, not a clean end — the difference
     /// decides whether the build fails or silently loses the cache.
     #[tokio::test]
     async fn a_truncated_frame_is_an_error() {
         let mut buffer = Vec::new();
-        write_frame(&mut buffer, &Answer::Served)
-            .await
-            .expect("write");
+        write_frame(
+            &mut buffer,
+            &Answer::Served(ArtifactNotifications::default()),
+        )
+        .await
+        .expect("write");
         buffer.truncate(buffer.len() - 1);
         let error = read_frame::<_, Answer>(&mut buffer.as_slice())
             .await

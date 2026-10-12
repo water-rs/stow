@@ -1002,7 +1002,7 @@ fn a_fresh_target_dir_serves_everything_the_local_cache_holds() {
     // local artifact cache.
     let edge_url = unreachable_edge_url();
 
-    let output = stow_build_command(
+    let first = stow_build_command(
         dir.path(),
         &edge_url,
         cache.path(),
@@ -1010,9 +1010,9 @@ fn a_fresh_target_dir_serves_everything_the_local_cache_holds() {
         target_a.path(),
     );
     assert!(
-        output.status.success(),
+        first.status.success(),
         "first stow build failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&first.stderr)
     );
 
     let output = stow_build_command(
@@ -1035,7 +1035,10 @@ fn a_fresh_target_dir_serves_everything_the_local_cache_holds() {
     assert_eq!(
         summary.trim(),
         "stow: served 4 of 4 cacheable dependencies",
-        "every locally stored dependency must serve on a fresh target dir"
+        "every locally stored dependency must serve on a fresh target dir\n\
+         first build stderr:\n{}\nsecond build stderr:\n{}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

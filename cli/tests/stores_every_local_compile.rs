@@ -101,7 +101,7 @@ fn every_compiled_unit_is_stored_before_the_build_exits() {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             stored, expected,
-            "run {run}: the local store must hold every cacheable unit of the fixture"
+            "run {run}: the local store must hold every cacheable unit of the fixture:\n{stderr}"
         );
     }
 }
