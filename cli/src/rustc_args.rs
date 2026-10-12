@@ -1,4 +1,5 @@
 use async_process::Command;
+use futures_util::future::{BoxFuture, Shared};
 
 pub use stow_types::rustc::ParsedRustcArgs;
 
@@ -78,13 +79,55 @@ pub async fn rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String
         .ok_or_else(|| "rustc -vV output missing host target".to_owned())
 }
 
-fn configured_public_cache_rustc_version() -> Option<String> {
+/// The raw stdout of one `rustc -vV` — the one probe every rustc-facts
+/// consumer shares (stow#608): the host probe, the version probe and the
+/// supervisor base's facts all come out of this output, so pre-cargo
+/// rustc spawns about rustc itself are exactly `-vV` and `--print
+/// sysroot`, run concurrently.
+pub async fn rustc_vv(rustc: &std::ffi::OsStr) -> Result<String, String> {
+    let output = Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .await
+        .map_err(|error| format!("spawn rustc -vV: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustc -vV failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("rustc -vV output is not UTF-8: {error}"))
+}
+
+/// The `host:` triple out of `rustc -vV` output.
+pub fn vv_host(vv: &str) -> Result<String, String> {
+    vv.lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+        .ok_or_else(|| "rustc -vV output missing host target".to_owned())
+}
+
+/// The `release:` version out of `rustc -vV` output — the same string
+/// `rustc --version` reports as its second word, so sharing `-vV`
+/// retires the separate `--version` spawn (stow#608).
+pub fn vv_release(vv: &str) -> Result<String, String> {
+    vv.lines()
+        .find_map(|line| line.strip_prefix("release: ").map(str::to_owned))
+        .ok_or_else(|| "rustc -vV output missing release".to_owned())
+}
+
+/// One `rustc -vV` shared by every consumer — the project context's
+/// target and version facts, the supervisor base's facts, and the link
+/// resolution's key — so the probe spawns once.
+pub type SharedRustcVv = Shared<BoxFuture<'static, Result<std::sync::Arc<String>, String>>>;
+
+pub fn configured_public_cache_rustc_version() -> Option<String> {
     std::env::var(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
 }
 
-fn configured_public_cache_target() -> Option<String> {
+pub fn configured_public_cache_target() -> Option<String> {
     std::env::var(STOW_PUBLIC_CACHE_TARGET_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
