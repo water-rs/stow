@@ -165,7 +165,16 @@ pub fn run() -> stow_types::error::Result<()> {
     std::thread::Builder::new()
         .name("stow-main".to_owned())
         .stack_size(MAIN_STACK_BYTES)
-        .spawn(move || runtime.block_on(async_main()))
+        .spawn(move || {
+            let result = runtime.block_on(async_main());
+            // The command returns when its main future does. Dropping the
+            // runtime instead waits for whatever is still running on it —
+            // a build sat out a trust-store scan that way (stow#624) — so
+            // what a command owes, its main future awaits, the way the
+            // supervisor's drain does (stow#618).
+            runtime.shutdown_background();
+            result
+        })
         .wrap_err("spawn the stow main thread")?
         .join()
         .map_err(|_| stow_types::error::Error::msg("the stow main thread panicked"))?
@@ -1379,10 +1388,14 @@ impl WrapperEnvCache {
             .or_default()
             .clone();
         cell.get_or_try_init(|| async {
-            let slice = index::cached_slice(config, target, rustc_version).await?;
-            Ok::<_, stow_types::error::Error>(
-                slice.map(|slice| std::sync::Arc::new(SliceIndex::new(slice))),
-            )
+            let Some(slice) = index::cached_slice(config, target, rustc_version).await? else {
+                return Ok(None);
+            };
+            // The lookup table is one entry per row the slice publishes,
+            // so it is built on a blocking thread like the decode behind
+            // it (stow#624).
+            let index = smol::unblock(move || SliceIndex::new(slice)).await;
+            Ok::<_, stow_types::error::Error>(Some(std::sync::Arc::new(index)))
         })
         .await
         .cloned()
@@ -4139,6 +4152,7 @@ mod tests {
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db_pool: std::sync::Arc::default(),
             trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
         };
         // A scan shaped like a build-script crate's: `default` resolved
         // plus `probe_from_build_script` the script printed itself.
@@ -4325,6 +4339,7 @@ mod tests {
                 verify_mode: crate::config::VerifyMode::GithubCi,
                 state_db_pool: std::sync::Arc::default(),
                 trust_material: std::sync::Arc::default(),
+                registry_http: std::sync::Arc::default(),
             }
         }
 
