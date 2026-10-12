@@ -82,7 +82,10 @@ pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Op
         features: parsed.features.iter().cloned().collect(),
         target: build.target.clone(),
         explicit_target: parsed.target.clone(),
-        build_override: parsed.debuginfo.is_none() && parsed.opt_level.is_none(),
+        // Cargo spells explicit codegen flags for target units but not
+        // for the build-override units on the host half — the split a
+        // target build leaves on the argv (stow#349).
+        build_override: crate::unit_node::build_override_signal(parsed),
         externs,
     })
 }

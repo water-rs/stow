@@ -116,8 +116,6 @@ pub struct GraphAnalysis {
     pub expanded_cached: usize,
     /// Total packages the transitive expansion resolved.
     pub expanded_total: usize,
-    /// The expanded graph normalized to [`DependencyGraphEntry`] form.
-    pub expanded_entries: Vec<DependencyGraphEntry>,
     /// Exact artifacts the driver should fetch to satisfy the graph.
     pub prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
@@ -186,7 +184,6 @@ pub fn analyze_dependency_graph(
             entries: Vec::new(),
             expanded_cached: 0,
             expanded_total: 0,
-            expanded_entries: Vec::new(),
             prefetch_artifacts: Vec::new(),
         });
     }
@@ -246,7 +243,6 @@ pub fn analyze_dependency_graph(
         entries: response_entries,
         expanded_cached: plan.expanded_cached,
         expanded_total: plan.expanded_total,
-        expanded_entries: plan.expanded_entries,
         prefetch_artifacts: plan.prefetch_artifacts,
     })
 }
@@ -281,7 +277,6 @@ fn expanded_scheduler_plan(
     Ok(ExpandedSchedulerPlan {
         expanded_cached,
         expanded_total,
-        expanded_entries: exact_graph.expanded_entries.clone(),
         prefetch_artifacts: cached.prefetch_artifacts,
     })
 }
@@ -289,14 +284,12 @@ fn expanded_scheduler_plan(
 struct ExpandedSchedulerPlan {
     expanded_cached: usize,
     expanded_total: usize,
-    expanded_entries: Vec<DependencyGraphEntry>,
     prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
 
 struct ExactExpandedGraph {
     feature_json_by_key: BTreeMap<PackageKey, String>,
     root_keys: BTreeSet<PackageKey>,
-    expanded_entries: Vec<DependencyGraphEntry>,
 }
 
 fn exact_graph_from_request(
@@ -317,7 +310,6 @@ fn exact_graph_from_request(
 
     let mut feature_json_by_key = BTreeMap::<PackageKey, String>::new();
     let mut dependency_keys_by_key = BTreeMap::<PackageKey, BTreeSet<PackageKey>>::new();
-    let mut normalized_entries = Vec::<DependencyGraphEntry>::with_capacity(expanded_entries.len());
 
     for entry in expanded_entries {
         let key = PackageKey {
@@ -348,11 +340,6 @@ fn exact_graph_from_request(
         }
         feature_json_by_key.insert(key.clone(), features_json);
         dependency_keys_by_key.insert(key.clone(), dependency_keys);
-        normalized_entries.push(DependencyGraphEntry {
-            crate_name: key.crate_name.clone(),
-            version: key.version.clone(),
-            features: features.into_iter().collect(),
-        });
     }
 
     for (package_key, dependency_keys) in &dependency_keys_by_key {
@@ -388,17 +375,9 @@ fn exact_graph_from_request(
         ));
     }
 
-    normalized_entries.sort_by(|left, right| {
-        left.crate_name
-            .cmp(&right.crate_name)
-            .then(left.version.cmp(&right.version))
-            .then(left.features.cmp(&right.features))
-    });
-
     Ok(ExactExpandedGraph {
         feature_json_by_key,
         root_keys,
-        expanded_entries: normalized_entries,
     })
 }
 
@@ -1317,14 +1296,8 @@ mod tests {
                 .contains_key(&unexpected_libm_key)
         );
         assert_eq!(
-            exact_graph.expanded_entries.iter().find(|entry| {
-                entry.crate_name == libm_key.crate_name && entry.version == libm_key.version
-            }),
-            Some(&DependencyGraphEntry {
-                crate_name: libm_key.crate_name.clone(),
-                version: libm_key.version.clone(),
-                features: Vec::new(),
-            }),
+            exact_graph.feature_json_by_key.get(&libm_key),
+            Some(&"[]".to_owned()),
         );
     }
 
@@ -1647,7 +1620,6 @@ mod tests {
 
         assert_eq!(analysis.expanded_total, 3);
         assert_eq!(analysis.expanded_cached, 2);
-        assert_eq!(analysis.expanded_entries.len(), 3);
         assert_eq!(analysis.entries.len(), 2);
         assert_eq!(analysis.entries[0].current_artifact_count, 1);
         assert_eq!(analysis.entries[1].current_artifact_count, 0);

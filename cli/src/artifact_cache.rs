@@ -116,7 +116,11 @@ pub struct ObservedUnit {
     pub crate_name: String,
     /// Crate version.
     pub crate_version: String,
-    /// The feature set the compile's argv carried.
+    /// The `--cfg feature="…"` scan of the compile's argv — evidence of
+    /// the command line, not the unit's cargo feature set: it may also
+    /// carry whatever the crate's build script printed as
+    /// `cargo:rustc-cfg=feature="…"`. The resolved set lives on the build's
+    /// unit graph node (stow#615).
     pub features: Vec<String>,
     /// The real platform the unit compiled for.
     pub target: String,
@@ -2533,8 +2537,12 @@ async fn replace_artifact_cache_metadata(
     last_accessed_ms: u64,
     metadata: &CacheEntryMetadata<'_>,
 ) -> stow_types::error::Result<()> {
-    upsert_artifact_cache_entry(
-        connection,
+    // One entry owns its child rows. Replacing the parent cascades the old
+    // children away; a new entry has none to delete. Keep the replacement
+    // and all its children on one connection in one atomic commit.
+    let mut transaction = connection.begin().await?;
+    insert_artifact_cache_entry(
+        &mut transaction,
         rustc_version,
         cache_key,
         relative_dir,
@@ -2543,26 +2551,27 @@ async fn replace_artifact_cache_metadata(
         metadata,
     )
     .await?;
-    delete_artifact_cache_children(connection, rustc_version, cache_key).await?;
-    insert_artifact_cache_outputs(connection, rustc_version, cache_key, metadata.outputs).await?;
+    insert_artifact_cache_outputs(&mut transaction, rustc_version, cache_key, metadata.outputs)
+        .await?;
     insert_artifact_cache_sigstore_signatures(
-        connection,
+        &mut transaction,
         rustc_version,
         cache_key,
         metadata.sigstore_signatures,
     )
     .await?;
     if let Some(native) = metadata.native {
-        insert_artifact_cache_native(connection, rustc_version, cache_key, native).await?;
+        insert_artifact_cache_native(&mut transaction, rustc_version, cache_key, native).await?;
     }
+    transaction.commit().await?;
     Ok(())
 }
 
 /// Insert or refresh the `artifact_cache_entries` row. A rewrite clears the
 /// verified-trust marker columns: the marker attests to the bytes that were
 /// verified, and a replacement entry has not been verified yet.
-async fn upsert_artifact_cache_entry(
-    connection: &sqlx::SqlitePool,
+async fn insert_artifact_cache_entry(
+    connection: &mut sqlx::SqliteConnection,
     rustc_version: &str,
     cache_key: &str,
     relative_dir: &str,
@@ -2580,32 +2589,9 @@ async fn upsert_artifact_cache_entry(
         None => None,
     };
     sqlx::query(
-        "INSERT INTO artifact_cache_entries \
+        "INSERT OR REPLACE INTO artifact_cache_entries \
          (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance, native_original_out_dir) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?) \
-         ON CONFLICT(rustc_version, cache_key) DO UPDATE SET \
-             relative_dir = excluded.relative_dir, \
-             size_bytes = excluded.size_bytes, \
-             last_accessed_ms = excluded.last_accessed_ms, \
-             oci_reference = excluded.oci_reference, \
-             oci_digest = excluded.oci_digest, \
-             compile_key = excluded.compile_key, \
-             crate_name = excluded.crate_name, \
-             crate_version = excluded.crate_version, \
-             c_metadata = excluded.c_metadata, \
-             features_json = excluded.features_json, \
-             dependency_c_metadata_json = excluded.dependency_c_metadata_json, \
-             dependency_compile_keys_json = excluded.dependency_compile_keys_json, \
-             compile_millis = excluded.compile_millis, \
-             target = excluded.target, \
-             profile_json = excluded.profile_json, \
-             emit_json = excluded.emit_json, \
-             kind_json = excluded.kind_json, \
-             crate_types_json = excluded.crate_types_json, \
-             verified_marker_version = NULL, \
-             verified_marker_policy = NULL, \
-             provenance = excluded.provenance, \
-             native_original_out_dir = excluded.native_original_out_dir",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
     )
     .bind(rustc_version)
     .bind(cache_key)
@@ -2642,7 +2628,7 @@ async fn upsert_artifact_cache_entry(
 
 /// Persist the bundle's output file list, one row per file in bundle order.
 async fn insert_artifact_cache_outputs(
-    connection: &sqlx::SqlitePool,
+    connection: &mut sqlx::SqliteConnection,
     rustc_version: &str,
     cache_key: &str,
     outputs: &[ArtifactBundleFile],
@@ -2659,7 +2645,7 @@ async fn insert_artifact_cache_outputs(
         .bind(&file.file_name)
         .bind(&file.media_type)
         .bind(&file.sha256)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
     }
     Ok(())
@@ -2668,7 +2654,7 @@ async fn insert_artifact_cache_outputs(
 /// Persist the bundle's sigstore signature material, one row per signature
 /// in bundle order.
 async fn insert_artifact_cache_sigstore_signatures(
-    connection: &sqlx::SqlitePool,
+    connection: &mut sqlx::SqliteConnection,
     rustc_version: &str,
     cache_key: &str,
     sigstore_signatures: &[SigstoreSignature],
@@ -2686,7 +2672,7 @@ async fn insert_artifact_cache_sigstore_signatures(
         .bind(&material.signature)
         .bind(&material.certificate_pem)
         .bind(material.rekor_bundle_json.as_deref())
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
     }
     Ok(())
@@ -2695,7 +2681,7 @@ async fn insert_artifact_cache_sigstore_signatures(
 /// Persist a `links=` crate's captured build-script products: static libs,
 /// cargo directives, dep env vars, and out-dir file digests.
 async fn insert_artifact_cache_native(
-    connection: &sqlx::SqlitePool,
+    connection: &mut sqlx::SqliteConnection,
     rustc_version: &str,
     cache_key: &str,
     native: &NativeArtifacts,
@@ -2711,7 +2697,7 @@ async fn insert_artifact_cache_native(
         .bind(db_int::<_, i64>(ordinal, "native static lib ordinal")?)
         .bind(&lib.name)
         .bind(&lib.bytes_sha256)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
     }
     for (ordinal, directive) in native.cargo_directives.iter().enumerate() {
@@ -2724,7 +2710,7 @@ async fn insert_artifact_cache_native(
         .bind(cache_key)
         .bind(db_int::<_, i64>(ordinal, "native cargo directive ordinal")?)
         .bind(directive)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
     }
     for (env_key, env_value) in &native.dep_env_vars {
@@ -2737,7 +2723,7 @@ async fn insert_artifact_cache_native(
         .bind(cache_key)
         .bind(env_key)
         .bind(env_value)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
     }
     for (ordinal, file) in native.out_dir_files.iter().enumerate() {
@@ -2751,31 +2737,7 @@ async fn insert_artifact_cache_native(
         .bind(db_int::<_, i64>(ordinal, "native out-dir file ordinal")?)
         .bind(&file.relative_path)
         .bind(&file.sha256)
-        .execute(connection)
-        .await?;
-    }
-    Ok(())
-}
-
-async fn delete_artifact_cache_children(
-    connection: &sqlx::SqlitePool,
-    rustc_version: &str,
-    cache_key: &str,
-) -> stow_types::error::Result<()> {
-    for table in [
-        "artifact_cache_outputs",
-        "artifact_cache_sigstore_signatures",
-        "artifact_cache_native_static_libs",
-        "artifact_cache_native_directives",
-        "artifact_cache_native_dep_env_vars",
-        "artifact_cache_native_out_dir_files",
-    ] {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE rustc_version = ? AND cache_key = ?"
-        )))
-        .bind(rustc_version)
-        .bind(cache_key)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
     }
     Ok(())
@@ -3127,6 +3089,130 @@ mod tests {
             );
             assert_eq!(loaded.sigstore_signatures.len(), 1);
         });
+    }
+
+    #[test]
+    fn metadata_replacement_rolls_back_children_and_verification_on_failure() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let mut bundle = sample_bundle("aabbccddeeff0011", "libdemo-aabbccddeeff0011.rmeta");
+        bundle.manifest.config.native = Some(NativeArtifacts {
+            static_libs: vec![stow_types::artifact::NativeLib {
+                name: "demo".to_owned(),
+                bytes_sha256: "native-digest".to_owned(),
+            }],
+            cargo_directives: vec!["cargo:rustc-link-lib=static=demo".to_owned()],
+            dep_env_vars: BTreeMap::from([("DEP_DEMO_ROOT".to_owned(), "/build/out".to_owned())]),
+            out_dir_files: vec![stow_types::artifact::OutDirFile {
+                relative_path: "libdemo.a".to_owned(),
+                sha256: "native-digest".to_owned(),
+            }],
+            original_out_dir: PathBuf::from("/build/out"),
+        });
+        run_async(async {
+            let pool = config.state_db_pool().await.expect("state db");
+            let original = super::CacheEntryMetadata::remote(&bundle);
+            super::replace_artifact_cache_metadata(
+                &pool, "1.91.1", "entry", "original", 100, 1, &original,
+            )
+            .await
+            .expect("original metadata");
+            sqlx::query(
+                "UPDATE artifact_cache_entries SET verified_marker_version = 2, verified_marker_policy = 'verified'",
+            )
+            .execute(&pool)
+            .await
+            .expect("verified original");
+            sqlx::raw_sql(include_str!("../tests/fixtures/reject-cache-output.sql"))
+                .execute(&pool)
+                .await
+                .expect("inject output write failure");
+            let mut replacement = super::CacheEntryMetadata::remote(&bundle);
+            replacement.sigstore_signatures = &[];
+            replacement.native = None;
+            let error = super::replace_artifact_cache_metadata(
+                &pool,
+                "1.91.1",
+                "entry",
+                "replacement",
+                200,
+                2,
+                &replacement,
+            )
+            .await
+            .expect_err("child insertion fails after parent replacement");
+            assert!(error.to_string().contains("injected output write failure"));
+            let row = super::load_artifact_cache_entry(&pool, "1.91.1", "entry")
+                .await
+                .expect("load original")
+                .expect("original survives");
+            assert_eq!(row.relative_dir, "original");
+            assert_eq!(row.size_bytes, 100);
+            assert_eq!(row.verified_marker_version, Some(2));
+            assert_eq!(row.verified_marker_policy.as_deref(), Some("verified"));
+            assert_metadata_children(&pool, &row, &original).await;
+
+            sqlx::query("DROP TRIGGER reject_cache_output")
+                .execute(&pool)
+                .await
+                .expect("remove injected failure");
+            super::replace_artifact_cache_metadata(
+                &pool,
+                "1.91.1",
+                "entry",
+                "replacement",
+                200,
+                2,
+                &replacement,
+            )
+            .await
+            .expect("replace metadata");
+            let row = super::load_artifact_cache_entry(&pool, "1.91.1", "entry")
+                .await
+                .expect("load replacement")
+                .expect("replacement exists");
+            assert_eq!(row.relative_dir, "replacement");
+            assert_eq!(row.size_bytes, 200);
+            assert_eq!(row.verified_marker_version, None);
+            assert_eq!(row.verified_marker_policy, None);
+            assert_metadata_children(&pool, &row, &replacement).await;
+        });
+    }
+
+    async fn assert_metadata_children(
+        pool: &sqlx::SqlitePool,
+        row: &super::ArtifactCacheEntryRow,
+        expected: &super::CacheEntryMetadata<'_>,
+    ) {
+        assert_eq!(
+            super::load_artifact_outputs(pool, "1.91.1", "entry")
+                .await
+                .expect("outputs"),
+            expected.outputs
+        );
+        assert_eq!(
+            super::load_sigstore_signatures(pool, "1.91.1", "entry")
+                .await
+                .expect("signatures")
+                .len(),
+            expected.sigstore_signatures.len()
+        );
+        let native = super::load_native_artifacts(
+            pool,
+            "1.91.1",
+            "entry",
+            row.native_original_out_dir.as_deref(),
+        )
+        .await
+        .expect("native artifacts");
+        let native = match native {
+            super::LoadedNativeArtifacts::Ready(native) => Some(native),
+            super::LoadedNativeArtifacts::Absent => None,
+            super::LoadedNativeArtifacts::MissingOutDir => {
+                panic!("native OUT_DIR must be preserved")
+            }
+        };
+        assert_eq!(native.as_ref(), expected.native);
     }
 
     #[test]
