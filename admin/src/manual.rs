@@ -32,6 +32,7 @@ use stow_types::records::parse_run_title;
 use stow_types::registry::GHCR_BASE;
 use stow_types::stow_error;
 use stow_types::task_graph::TaskNodeIdentity;
+use stow_types::transient::Backoff;
 use stow_types::trusted_builder::{BRANCH, INDEX_CERTIFICATE_IDENTITY, WORKFLOW_FILE};
 use zenwave::{Client, ResponseExt};
 
@@ -1597,6 +1598,7 @@ impl Dispatch {
                     token,
                     &format!("git/ref/heads/{BRANCH}"),
                     etag,
+                    Backoff::outage(),
                 )
                 .await?
                 {
@@ -1640,6 +1642,7 @@ impl Dispatch {
         let page: RunJobsPage = crate::github::get(
             token,
             &format!("actions/runs/{}/jobs", state.workflow_run_id),
+            Backoff::outage(),
         )
         .await?;
         let FailureClass::Infrastructure { job, step } = classify_failure(&page.jobs) else {
@@ -1691,8 +1694,12 @@ impl Dispatch {
                     since,
                     until,
                     |path| async move {
-                        crate::github::get::<crate::github::RunsPage<WorkflowRunRow>>(token, &path)
-                            .await
+                        crate::github::get::<crate::github::RunsPage<WorkflowRunRow>>(
+                            token,
+                            &path,
+                            Backoff::outage(),
+                        )
+                        .await
                     },
                 )
                 .await?;
@@ -1750,6 +1757,7 @@ impl Dispatch {
                             token,
                             &path,
                             etag.as_deref(),
+                            Backoff::outage(),
                         )
                         .await
                         {
@@ -1885,7 +1893,7 @@ async fn local_run_states(
     let url = format!("{base}/tasks");
     // The shared bounded idempotent read — the local server is
     // unauthenticated, so no operator token rides it.
-    let tasks: LocalTasksResponse = crate::github::get_url_json(&url, None).await?;
+    let tasks: LocalTasksResponse = crate::github::get_url_json(&url, None, Backoff::new()).await?;
     Ok(tasks
         .tasks
         .into_iter()

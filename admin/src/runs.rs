@@ -5,6 +5,7 @@
 use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
+use stow_types::transient::Backoff;
 
 use crate::github::{self, BUILD_WORKFLOW};
 use crate::render::{self, Output, Table};
@@ -310,7 +311,9 @@ async fn fetch_failed_runs(
         "status=failure",
         until - since,
         until,
-        |path| async move { github::get::<github::RunsPage<WorkflowRun>>(token, &path).await },
+        |path| async move {
+            github::get::<github::RunsPage<WorkflowRun>>(token, &path, Backoff::new()).await
+        },
     )
     .await
 }
@@ -323,8 +326,12 @@ async fn classify_runs(
     let mut groups: std::collections::BTreeMap<FailureClass, Vec<FailureExample>> =
         std::collections::BTreeMap::new();
     for run in runs {
-        let jobs: JobsPage =
-            github::get(token, &format!("actions/runs/{}/jobs?per_page=100", run.id)).await?;
+        let jobs: JobsPage = github::get(
+            token,
+            &format!("actions/runs/{}/jobs?per_page=100", run.id),
+            Backoff::new(),
+        )
+        .await?;
         for job in &jobs.jobs {
             if job.conclusion.as_deref() != Some("failure") {
                 continue;
@@ -334,7 +341,7 @@ async fn classify_runs(
                 github::REPO,
                 job.id
             );
-            let log = match github::get_text(token, &log_url).await {
+            let log = match github::get_text(token, &log_url, Backoff::new()).await {
                 Ok(log) => log,
                 Err(error) => {
                     tracing::warn!(job_id = job.id, %error, "job log unavailable; skipping");
