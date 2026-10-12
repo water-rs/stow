@@ -727,6 +727,7 @@ mod tests {
             state_db_pool: crate::config::StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
+            artifact_cache_staging: std::sync::Arc::default(),
         }
     }
 

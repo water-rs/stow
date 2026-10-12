@@ -4210,6 +4210,7 @@ mod tests {
             state_db_pool: std::sync::Arc::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
+            artifact_cache_staging: std::sync::Arc::default(),
         };
         // A scan shaped like a build-script crate's: `default` resolved
         // plus `probe_from_build_script` the script printed itself.
@@ -4397,6 +4398,7 @@ mod tests {
                 state_db_pool: std::sync::Arc::default(),
                 trust_material: std::sync::Arc::default(),
                 registry_http: std::sync::Arc::default(),
+                artifact_cache_staging: std::sync::Arc::default(),
             }
         }
 
