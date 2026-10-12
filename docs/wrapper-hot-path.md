@@ -58,7 +58,7 @@ in `cargo check`/`cargo build`. Keep them at `stow check` startup, on
 * **Full SQLite migration runs.** `state_db::connect` is fast on warm pools
   but should not call `ensure_migrations` on every invocation.
 * **`cargo metadata`.** Already removed; do not re-add. Use lockfile parsing
-  via `workspace_deps::resolve_lockfile_graph` instead.
+  via `workspace_deps::lockfile_registry_packages` instead.
 * **`rustc -vV` / `rustc --version` probes.** The parent `stow check`
   unconditionally sets `STOW_PUBLIC_CACHE_RUSTC_VERSION` /
   `STOW_PUBLIC_CACHE_TARGET` so the wrapper short-circuits in

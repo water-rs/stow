@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use stow_types::rustc::ParsedRustcArgs;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use super::protocol::{
     Answer, ArtifactNotifications, AwaitServeMap, Compiled, Observed, Plan, Request, read_frame,
@@ -369,8 +369,10 @@ impl InFlightUnits {
     /// Put the unit owning `paths` in flight; the returned guard is the
     /// flight's lifetime — dropping it completes the unit.
     fn register(&self, paths: Vec<String>) -> Completion {
-        let (done, _) = watch::channel(false);
-        let unit = Arc::new(InFlightUnit { paths, done });
+        let unit = Arc::new(InFlightUnit {
+            paths,
+            done: crate::Latch::pending(),
+        });
         {
             let mut units = self.units.lock().expect("in-flight units mutex");
             for path in &unit.paths {
@@ -423,11 +425,10 @@ impl InFlightUnits {
                 }
             }
         }
-        // `send_replace`, not `send`: a dependent waits on its
-        // dependencies one at a time, so this flight can end before the
-        // dependent has subscribed to it, and `send` stores nothing when
-        // nobody is subscribed.
-        unit.done.send_replace(true);
+        // A dependent waits on its dependencies one at a time, so this
+        // flight can end before the dependent has subscribed to it: the
+        // latch stores the end either way (stow#642).
+        unit.done.complete();
     }
 }
 
@@ -439,21 +440,16 @@ struct InFlightUnit {
     /// records — normalized by the same `path_to_string` the
     /// `materialized_outputs` rows and the extern lookup use.
     paths: Vec<String>,
-    /// `true` once the flight ends. `watch` so a waiter that arrives late
-    /// reads `true` instead of blocking on a signal already sent — which
-    /// holds only because the end is stored whether or not anyone is
-    /// subscribed at that moment.
-    done: watch::Sender<bool>,
+    /// Fired once the flight ends; a waiter that arrives late resolves
+    /// at once.
+    done: crate::Latch,
 }
 
 impl InFlightUnit {
     /// Resolve once this unit's bookkeeping has finished — immediately
     /// when it already has.
     async fn wait(&self) {
-        let mut done = self.done.subscribe();
-        if !*done.borrow() {
-            let _ = done.changed().await;
-        }
+        self.done.wait().await;
     }
 }
 

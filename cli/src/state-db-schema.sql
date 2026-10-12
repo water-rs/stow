@@ -177,3 +177,15 @@ CREATE TABLE IF NOT EXISTS lockfile_graph_cache (
 -- build — see `ObservedUnit` and `BuildSupervisor` in lib.rs. Misses
 -- mint post-build from the build's own compile observations; nothing
 -- about them is persisted here.
+
+-- stow#608: the link resolution's outcome — the cargo `--config` args
+-- mold provisioning returns — keyed by a digest of every input the
+-- resolution reads (rustc -vV, target triple, config document contents,
+-- env vars), with the probed files witnessed so a changed `cc` or
+-- `ld.mold` reads as a miss. Only successful resolutions are recorded.
+CREATE TABLE IF NOT EXISTS link_resolution_cache (
+    inputs_digest TEXT PRIMARY KEY,
+    args_json TEXT NOT NULL,
+    witnesses_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);

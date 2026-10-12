@@ -9,11 +9,12 @@
 //! in-flight units its `--extern` set names — so the count is the whole
 //! set every time.
 
+mod build_fixture;
 mod support;
 
 use std::path::Path;
 
-use support::{refused_url, stow_build_in, stow_setup_in, write_fixture};
+use build_fixture::{refused_url, stow_build_in, stow_setup_in, write_fixture};
 
 /// The fixture's dependency list: the `proc-macro2`/`quote` pair — a
 /// dependent small enough to finish before its dependency's rustc exits

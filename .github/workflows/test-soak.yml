@@ -1,0 +1,71 @@
+name: Test soak
+
+# Runs the Linux test leg of test.yml N times, each on a fresh runner, so a
+# timing-sensitive test — the never-slower-than-cargo gate above all — is
+# judged on many independent runs instead of the one a merge gets
+# (stow#608). Manual only: nothing schedules it and no push or pull request
+# triggers it, so it costs nothing until someone asks a question a single
+# run cannot answer. The steps mirror test.yml's `test` job on
+# ubuntu-latest; keep the two copies in step.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: How many independent runs of the Linux test leg
+        required: true
+        default: "20"
+        type: number
+      parallel:
+        description: How many of them may hold a runner at once
+        required: true
+        default: "10"
+        type: number
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      runs: ${{ steps.runs.outputs.runs }}
+    steps:
+      - id: runs
+        env:
+          RUNS: ${{ inputs.runs }}
+        run: echo "runs=$(seq 1 "$RUNS" | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  soak:
+    needs: plan
+    name: run ${{ matrix.run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.parallel }}
+      matrix:
+        run: ${{ fromJSON(needs.plan.outputs.runs) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/link-with-mold
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: nextest
+      # Restores the cache the test job saves on `dev` and never saves one
+      # of its own: N legs writing N copies would evict the caches the
+      # merge queue depends on.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-ubuntu-latest
+          save-if: false
+      - run: cargo nextest run --workspace --no-fail-fast

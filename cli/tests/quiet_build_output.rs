@@ -8,9 +8,10 @@
 //! with the serve decision to the facade cargo spawned, and the default
 //! verbosity is `warn` with per-unit and per-attempt lines at `debug`.
 
+mod build_fixture;
 mod support;
 
-use support::{refused_url, stow_build_in, stow_setup_in, write_fixture};
+use build_fixture::{refused_url, stow_build_in, stow_setup_in, write_fixture};
 
 /// Four leaf dependencies — four cacheable units, no dependency-identity
 /// chains, so every build-1 store and every build-2 serve keys exactly.

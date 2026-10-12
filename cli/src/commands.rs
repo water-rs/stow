@@ -56,6 +56,25 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
         mold_bin_dir.as_deref(),
     )
     .await?;
+    // The link resolution a first build would run, recorded now under
+    // the per-machine key — a project with no config of its own builds
+    // warm (stow#608). The record must come after the write: the key
+    // digests the global file's content. Linux only;
+    // `warm_global_link_cache` is a no-op elsewhere.
+    if cfg!(target_os = "linux") {
+        // Recording the row is an optimisation: a setup whose state DB
+        // is unavailable still configures cargo fully — the first build
+        // resolves the link itself and reports live (stow#608). Only a
+        // failure of the resolution itself is an error.
+        match StowConfig::load() {
+            Ok(stow_config) => {
+                mold::warm_global_link_cache(&cargo_home, &stow_config).await?;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "stow config unavailable, setup leaves the link cache cold");
+            }
+        }
+    }
 
     tracing::info!(
         path = %config_path.display(),
@@ -1071,7 +1090,7 @@ fn clean_stow_owned_entries(document: &mut DocumentMut, linker_selection: Linker
 /// inside a stow tools dir — the shims' home (`<data>/stow/tools`) and the
 /// tools dir older releases used (`/tmp/stow-tools`). The key holding a
 /// value never decides, so a user's own `CC` or `COMPILER_PATH` survives.
-fn is_stow_owned_value(value: &str) -> bool {
+pub fn is_stow_owned_value(value: &str) -> bool {
     const SHIM_STEMS: &[&str] = &[
         "stow-rustc-wrapper",
         "stow-cc",

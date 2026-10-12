@@ -5,21 +5,13 @@ use std::path::{Path, PathBuf};
 use async_process::Command;
 use cargo_lock::{Lockfile, package::SourceId};
 use glob::glob;
-use semver::{Version, VersionReq};
+use semver::Version;
 use serde::Deserialize;
 use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
 use stow_types::error::Context;
 use stow_types::public_cache::UnitSide;
 
 use crate::cargo_cmd::MetadataArgs;
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DirectDependency {
-    pub(crate) crate_name: String,
-    pub(crate) version: Version,
-    pub(crate) source: Option<String>,
-    pub(crate) features: Vec<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct SelectedRegistryDependency {
@@ -41,15 +33,6 @@ pub struct PackageKey {
     pub(crate) crate_name: String,
     pub(crate) version: Version,
     pub(crate) source: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockfileGraph {
-    pub(crate) direct_dependencies: Vec<DirectDependency>,
-    /// Every registry package the lockfile pins, `(name, version)` —
-    /// the units this build compiles as far as the lockfile knows
-    /// (stow#617).
-    pub(crate) registry_packages: BTreeSet<(String, Version)>,
 }
 
 /// The units cargo compiles for the wrapped command — one
@@ -161,108 +144,34 @@ pub fn resolve_workspace_layout(
     })
 }
 
-#[tracing::instrument(name = "stow.workspace.resolve_lockfile_graph", skip_all)]
-pub fn resolve_lockfile_graph(
+/// The registry `(name, version)` pairs `<workspace_root>/Cargo.lock`
+/// pins — the units this build compiles as far as the lockfile knows
+/// (stow#617). The serve map's local half is this read's only consumer,
+/// and it asks for the lockfile and nothing else: no manifest, no
+/// member walk, no feature resolution.
+///
+/// `Ok(None)` when the lockfile does not exist: cargo writes it during
+/// this very build, so absence is a defined state — the build carries
+/// no local half — not an error and not a warning (stow#608).
+#[tracing::instrument(name = "stow.workspace.lockfile_registry_packages", skip_all)]
+pub fn lockfile_registry_packages(
     workspace_root: &Path,
-    manifest_path: &Path,
-    args: &MetadataArgs,
-) -> stow_types::error::Result<LockfileGraph> {
-    let workspace_manifest_path = workspace_root.join("Cargo.toml");
-    let workspace_manifest = load_manifest(&workspace_manifest_path)?;
-    let workspace_members = expand_workspace_members(workspace_root, &workspace_manifest)?;
-    let selected_manifest_path = canonicalize_or_original(manifest_path);
-    let workspace_manifest_path = canonicalize_or_original(&workspace_manifest_path);
-    let selected_members = if selected_manifest_path == workspace_manifest_path {
-        workspace_members
-    } else {
-        BTreeSet::from([selected_manifest_path])
-    };
-
+) -> stow_types::error::Result<Option<BTreeSet<(String, Version)>>> {
     let lockfile_path = workspace_root.join("Cargo.lock");
+    if !lockfile_path.exists() {
+        return Ok(None);
+    }
     let lockfile = Lockfile::load(&lockfile_path).map_err(|error| {
         stow_types::stow_error!("load lockfile {}: {error}", lockfile_path.display())
     })?;
-    let lock_packages = lockfile
-        .packages
-        .iter()
-        .map(|package| {
-            (
-                PackageKey {
-                    crate_name: package.name.to_string(),
-                    version: package.version.clone(),
-                    source: package.source.as_ref().map(ToString::to_string),
-                },
-                package,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    let workspace_deps = workspace_manifest
-        .workspace
-        .as_ref()
-        .and_then(|workspace| workspace.dependencies.as_ref());
-    let mut merged_dependencies =
-        BTreeMap::<(String, Version, Option<String>), BTreeSet<String>>::new();
-    for member_path in &selected_members {
-        let member_manifest = load_manifest(member_path)?;
-        let member_package = member_manifest.package.as_ref().ok_or_else(|| {
-            stow_types::stow_error!(
-                "selected manifest {} is missing [package]",
-                member_path.display()
-            )
-        })?;
-        // The member's own lockfile entry records exactly which version cargo
-        // assigned to each of its dependency edges — the only correct answer
-        // when the lockfile pins several semver-compatible versions at once.
-        // A stow-synthesized lockfile omits workspace members entirely (it
-        // pins exactly one version per crate), so absence is a defined input
-        // shape, not an error: edges then resolve by requirement match with
-        // a uniqueness guarantee enforced in `resolve_lockfile_package`.
-        let member_lock_package = lockfile.packages.iter().find(|package| {
-            package.name.as_str() == member_package.name && package.source.is_none()
-        });
-        let feature_config = FeatureConfig::new(&member_manifest, &member_package.name, args);
-        collect_dependency_section(
-            member_manifest.dependencies.as_ref(),
-            workspace_deps,
-            &feature_config,
-            member_lock_package,
-            &lock_packages,
-            &mut merged_dependencies,
-        )?;
-        // Build- and dev-dependencies compile in a different rustc context
-        // (host triple, separate c_metadata chain) than the runtime closure
-        // that the public artifact cache covers. Including them here makes
-        // the lockfile-walker hard-fail when the synthesized stow lockfile
-        // intentionally pins only the runtime graph — even though those
-        // pins have no bearing on what the cache can serve. Skip them for
-        // the cache-graph builder; cargo's own resolver still handles them
-        // when it reads `Cargo.toml` directly.
-    }
-
-    let direct_dependencies = merged_dependencies
-        .into_iter()
-        .map(
-            |((crate_name, version, source), features)| DirectDependency {
-                crate_name,
-                version,
-                source,
-                features: features.into_iter().collect(),
-            },
-        )
-        .collect::<Vec<_>>();
-
-    let registry_packages = lockfile
-        .packages
-        .iter()
-        .filter(|package| package.source.as_ref().is_some_and(SourceId::is_registry))
-        .map(|package| (package.name.to_string(), package.version.clone()))
-        .collect();
-
-    Ok(LockfileGraph {
-        direct_dependencies,
-        registry_packages,
-    })
+    Ok(Some(
+        lockfile
+            .packages
+            .iter()
+            .filter(|package| package.source.as_ref().is_some_and(SourceId::is_registry))
+            .map(|package| (package.name.to_string(), package.version.clone()))
+            .collect(),
+    ))
 }
 
 /// Re-run the wrapped cargo subcommand as `cargo <subcommand>
@@ -1547,210 +1456,6 @@ pub fn parents_by_package(
     parents
 }
 
-fn collect_dependency_section(
-    section: Option<&BTreeMap<String, DependencySpec>>,
-    workspace_deps: Option<&BTreeMap<String, DependencySpec>>,
-    feature_config: &FeatureConfig,
-    member_lock_package: Option<&cargo_lock::Package>,
-    lock_packages: &BTreeMap<PackageKey, &cargo_lock::Package>,
-    merged_dependencies: &mut BTreeMap<(String, Version, Option<String>), BTreeSet<String>>,
-) -> stow_types::error::Result<()> {
-    let Some(section) = section else {
-        return Ok(());
-    };
-    for (dependency_key, raw_spec) in section {
-        let Some(spec) = resolve_dependency_spec(dependency_key, raw_spec, workspace_deps)? else {
-            continue;
-        };
-        if spec.optional
-            && !feature_config
-                .enabled_optional_deps
-                .contains(dependency_key)
-        {
-            continue;
-        }
-        let Some(version_req) = spec.version.as_deref() else {
-            continue;
-        };
-        let package = resolve_lockfile_package(
-            &spec.crate_name,
-            version_req,
-            member_lock_package,
-            lock_packages,
-        )?;
-        if !package_is_crates_io(package) {
-            continue;
-        }
-        let mut features = BTreeSet::<String>::new();
-        if spec.default_features {
-            features.insert("default".to_owned());
-        }
-        features.extend(spec.features);
-        if let Some(extra_features) = feature_config.dependency_features.get(dependency_key) {
-            features.extend(extra_features.iter().cloned());
-        }
-        merged_dependencies
-            .entry((
-                spec.crate_name,
-                package.version.clone(),
-                package.source.as_ref().map(ToString::to_string),
-            ))
-            .or_default()
-            .extend(features);
-    }
-    Ok(())
-}
-
-fn resolve_dependency_spec(
-    dependency_key: &str,
-    raw_spec: &DependencySpec,
-    workspace_deps: Option<&BTreeMap<String, DependencySpec>>,
-) -> stow_types::error::Result<Option<ResolvedDependencySpec>> {
-    let workspace_spec = if raw_spec.workspace() {
-        Some(
-            workspace_deps
-                .and_then(|deps| deps.get(dependency_key))
-                .ok_or_else(|| {
-                    stow_types::stow_error!(
-                        "workspace dependency `{dependency_key}` is missing from [workspace.dependencies]"
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-    let crate_name = raw_spec
-        .package()
-        .or_else(|| workspace_spec.and_then(|spec| spec.package()))
-        .unwrap_or(dependency_key)
-        .to_owned();
-    let version = raw_spec
-        .version()
-        .or_else(|| workspace_spec.and_then(|spec| spec.version()))
-        .map(str::to_owned);
-    let path = raw_spec
-        .path()
-        .or_else(|| workspace_spec.and_then(|spec| spec.path()));
-    let git = raw_spec
-        .git()
-        .or_else(|| workspace_spec.and_then(|spec| spec.git()));
-    let registry = raw_spec
-        .registry()
-        .or_else(|| workspace_spec.and_then(|spec| spec.registry()));
-    let registry_index = raw_spec
-        .registry_index()
-        .or_else(|| workspace_spec.and_then(|spec| spec.registry_index()));
-    if path.is_some() || git.is_some() || registry.is_some() || registry_index.is_some() {
-        return Ok(None);
-    }
-
-    let mut features = workspace_spec
-        .map(DependencySpec::features)
-        .unwrap_or_default();
-    features.extend(raw_spec.features());
-
-    Ok(Some(ResolvedDependencySpec {
-        crate_name,
-        version,
-        features,
-        optional: raw_spec
-            .optional()
-            .or_else(|| workspace_spec.and_then(DependencySpec::optional))
-            .unwrap_or(false),
-        default_features: raw_spec
-            .default_features()
-            .or_else(|| workspace_spec.and_then(DependencySpec::default_features))
-            .unwrap_or(true),
-    }))
-}
-
-fn resolve_lockfile_package<'a>(
-    crate_name: &str,
-    version_req: &str,
-    parent: Option<&cargo_lock::Package>,
-    lock_packages: &'a BTreeMap<PackageKey, &cargo_lock::Package>,
-) -> stow_types::error::Result<&'a cargo_lock::Package> {
-    let version_req = VersionReq::parse(version_req).wrap_err_with(|| {
-        format!("parse version requirement `{version_req}` for dependency `{crate_name}`")
-    })?;
-    // Without a member entry (stow-synthesized lockfiles omit workspace
-    // members), resolve by requirement match — but demand uniqueness so a
-    // lockfile pinning several compatible versions can never be silently
-    // mis-resolved.
-    let Some(parent) = parent else {
-        let mut matching = lock_packages.iter().filter(|(key, package)| {
-            key.crate_name == crate_name
-                && version_req.matches(&key.version)
-                && package_is_crates_io(package)
-        });
-        let package = matching.next().map(|(_, package)| *package).ok_or_else(|| {
-            stow_types::stow_error!(
-                "no lockfile package matched dependency `{crate_name}` requirement `{version_req}`"
-            )
-        })?;
-        if matching.next().is_some() {
-            return Err(stow_types::stow_error!(
-                "dependency `{crate_name} {version_req}` matches multiple lockfile versions and the                  workspace member entry needed to disambiguate is absent"
-            ));
-        }
-        return Ok(package);
-    };
-    // Cargo.lock records exactly which version this parent's edge resolved
-    // to. Picking `max_by(version)` over all matching packages instead would
-    // silently target the wrong artifact whenever the lockfile pins several
-    // semver-compatible versions of the same crate.
-    let edge = parent
-        .dependencies
-        .iter()
-        .find(|dependency| {
-            dependency.name.as_str() == crate_name && version_req.matches(&dependency.version)
-        })
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "Cargo.lock entry for `{}` has no dependency edge matching `{crate_name} {version_req}`",
-                parent.name
-            )
-        })?;
-    if let Some(source) = edge.source.as_ref() {
-        let key = PackageKey {
-            crate_name: crate_name.to_owned(),
-            version: edge.version.clone(),
-            source: Some(source.to_string()),
-        };
-        return lock_packages.get(&key).copied().ok_or_else(|| {
-            stow_types::stow_error!(
-                "Cargo.lock dependency edge `{crate_name} {}` has no package entry",
-                edge.version
-            )
-        });
-    }
-    // Lockfiles omit the dependency source when the (name, version) pair is
-    // unambiguous; require exactly one package entry in that case.
-    let mut matches = lock_packages
-        .iter()
-        .filter(|(key, _)| key.crate_name == crate_name && key.version == edge.version);
-    let package = matches.next().map(|(_, package)| *package).ok_or_else(|| {
-        stow_types::stow_error!(
-            "Cargo.lock dependency edge `{crate_name} {}` has no package entry",
-            edge.version
-        )
-    })?;
-    if matches.next().is_some() {
-        return Err(stow_types::stow_error!(
-            "Cargo.lock dependency edge `{crate_name} {}` is ambiguous across multiple sources",
-            edge.version
-        ));
-    }
-    Ok(package)
-}
-
-fn package_is_crates_io(package: &cargo_lock::Package) -> bool {
-    package
-        .source
-        .as_ref()
-        .is_some_and(SourceId::is_default_registry)
-}
-
 /// The manifests of every workspace member, following cargo's rules: the
 /// root package when the root manifest has one, every `[workspace].members`
 /// glob match, and every path dependency of a member that lives under the
@@ -1852,8 +1557,7 @@ pub fn enabled_optional_dependency_names(
         .as_ref()
         .map(|package| package.name.clone())
         .unwrap_or_default();
-    let feature_config = FeatureConfig::new(&manifest, &package_name, args);
-    Ok(feature_config.enabled_optional_deps)
+    Ok(enabled_optional_deps(&manifest, &package_name, args))
 }
 
 pub fn load_manifest(path: &Path) -> stow_types::error::Result<Manifest> {
@@ -1883,75 +1587,37 @@ pub fn canonicalize_or_original(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-#[derive(Debug, Clone, Default)]
-struct FeatureConfig {
-    enabled_optional_deps: BTreeSet<String>,
-    dependency_features: BTreeMap<String, BTreeSet<String>>,
-}
+/// The optional dependencies a manifest's feature graph activates under
+/// `args` — default features unless `--no-default-features`, plus any
+/// spelled `--features` for this package.
+fn enabled_optional_deps(
+    manifest: &Manifest,
+    package_name: &str,
+    args: &MetadataArgs,
+) -> BTreeSet<String> {
+    let feature_map = manifest.features.clone().unwrap_or_default();
+    let dependency_names = manifest
+        .dependencies
+        .iter()
+        .chain(manifest.build_dependencies.iter())
+        .chain(manifest.dev_dependencies.iter())
+        .flat_map(|deps| deps.keys().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut activated_features = BTreeSet::<String>::new();
+    let mut queue = VecDeque::<String>::new();
+    let mut enabled_optional_deps = BTreeSet::<String>::new();
 
-impl FeatureConfig {
-    fn new(manifest: &Manifest, package_name: &str, args: &MetadataArgs) -> Self {
-        let feature_map = manifest.features.clone().unwrap_or_default();
-        let dependency_names = manifest
-            .dependencies
-            .iter()
-            .chain(manifest.build_dependencies.iter())
-            .chain(manifest.dev_dependencies.iter())
-            .flat_map(|deps| deps.keys().cloned())
-            .collect::<BTreeSet<_>>();
-        let mut activated_features = BTreeSet::<String>::new();
-        let mut queue = VecDeque::<String>::new();
-        let mut enabled_optional_deps = BTreeSet::<String>::new();
-        let mut dependency_features = BTreeMap::<String, BTreeSet<String>>::new();
-
-        if args.all_features {
-            for feature in feature_map.keys() {
-                if activated_features.insert(feature.clone()) {
-                    queue.push_back(feature.clone());
-                }
-            }
-        } else {
-            if !args.no_default_features
-                && let Some(default_items) = feature_map.get("default")
-            {
-                for item in default_items {
-                    apply_feature_item(
-                        item,
-                        &feature_map,
-                        &dependency_names,
-                        &mut activated_features,
-                        &mut queue,
-                        &mut enabled_optional_deps,
-                        &mut dependency_features,
-                    );
-                }
-            }
-            for raw_feature in args.features.iter().map(String::as_str) {
-                if let Some((feature_package, feature_name)) = raw_feature.split_once('/') {
-                    if feature_package != package_name {
-                        continue;
-                    }
-                    let feature_name = feature_name.to_owned();
-                    if activated_features.insert(feature_name.clone()) {
-                        queue.push_back(feature_name);
-                    }
-                    continue;
-                }
-                let raw_feature = raw_feature.to_owned();
-                if activated_features.insert(raw_feature.clone()) {
-                    queue.push_back(raw_feature);
-                }
+    if args.all_features {
+        for feature in feature_map.keys() {
+            if activated_features.insert(feature.clone()) {
+                queue.push_back(feature.clone());
             }
         }
-
-        while let Some(feature) = queue.pop_front() {
-            let Some(items) = feature_map.get(&feature) else {
-                if dependency_names.contains(&feature) {
-                    enabled_optional_deps.insert(feature);
-                }
-                continue;
-            };
-            for item in items {
+    } else {
+        if !args.no_default_features
+            && let Some(default_items) = feature_map.get("default")
+        {
+            for item in default_items {
                 apply_feature_item(
                     item,
                     &feature_map,
@@ -1959,19 +1625,49 @@ impl FeatureConfig {
                     &mut activated_features,
                     &mut queue,
                     &mut enabled_optional_deps,
-                    &mut dependency_features,
                 );
             }
         }
-
-        Self {
-            enabled_optional_deps,
-            dependency_features,
+        for raw_feature in args.features.iter().map(String::as_str) {
+            if let Some((feature_package, feature_name)) = raw_feature.split_once('/') {
+                if feature_package != package_name {
+                    continue;
+                }
+                let feature_name = feature_name.to_owned();
+                if activated_features.insert(feature_name.clone()) {
+                    queue.push_back(feature_name);
+                }
+                continue;
+            }
+            let raw_feature = raw_feature.to_owned();
+            if activated_features.insert(raw_feature.clone()) {
+                queue.push_back(raw_feature);
+            }
         }
     }
+
+    while let Some(feature) = queue.pop_front() {
+        let Some(items) = feature_map.get(&feature) else {
+            if dependency_names.contains(&feature) {
+                enabled_optional_deps.insert(feature);
+            }
+            continue;
+        };
+        for item in items {
+            apply_feature_item(
+                item,
+                &feature_map,
+                &dependency_names,
+                &mut activated_features,
+                &mut queue,
+                &mut enabled_optional_deps,
+            );
+        }
+    }
+
+    enabled_optional_deps
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_feature_item(
     item: &str,
     feature_map: &BTreeMap<String, Vec<String>>,
@@ -1979,23 +1675,18 @@ fn apply_feature_item(
     activated_features: &mut BTreeSet<String>,
     queue: &mut VecDeque<String>,
     enabled_optional_deps: &mut BTreeSet<String>,
-    dependency_features: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     if let Some(dep_name) = item.strip_prefix("dep:") {
         enabled_optional_deps.insert(dep_name.to_owned());
         return;
     }
-    if let Some((dependency_name, dependency_feature)) = item.split_once('/') {
+    if let Some((dependency_name, _)) = item.split_once('/') {
         let conditional = dependency_name.ends_with('?');
         let dependency_name = dependency_name.trim_end_matches('?');
         if conditional && !enabled_optional_deps.contains(dependency_name) {
             return;
         }
         enabled_optional_deps.insert(dependency_name.to_owned());
-        dependency_features
-            .entry(dependency_name.to_owned())
-            .or_default()
-            .insert(dependency_feature.to_owned());
         return;
     }
     if feature_map.contains_key(item) {
@@ -2009,25 +1700,16 @@ fn apply_feature_item(
     }
 }
 
-#[derive(Debug, Clone)]
-struct ResolvedDependencySpec {
-    crate_name: String,
-    version: Option<String>,
-    features: BTreeSet<String>,
-    optional: bool,
-    default_features: bool,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     package: Option<PackageSection>,
     workspace: Option<WorkspaceSection>,
     features: Option<BTreeMap<String, Vec<String>>>,
-    dependencies: Option<BTreeMap<String, DependencySpec>>,
+    dependencies: Option<BTreeMap<String, toml::Value>>,
     #[serde(rename = "build-dependencies")]
-    build_dependencies: Option<BTreeMap<String, DependencySpec>>,
+    build_dependencies: Option<BTreeMap<String, toml::Value>>,
     #[serde(rename = "dev-dependencies")]
-    dev_dependencies: Option<BTreeMap<String, DependencySpec>>,
+    dev_dependencies: Option<BTreeMap<String, toml::Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2039,7 +1721,6 @@ struct PackageSection {
 struct WorkspaceSection {
     members: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
-    dependencies: Option<BTreeMap<String, DependencySpec>>,
 }
 
 impl Manifest {
@@ -2054,105 +1735,8 @@ impl Manifest {
         .into_iter()
         .flatten()
         .flat_map(BTreeMap::values)
-        .filter_map(DependencySpec::path)
+        .filter_map(|spec| spec.get("path").and_then(toml::Value::as_str))
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum DependencySpec {
-    Simple(String),
-    Detailed(DetailedDependencySpec),
-}
-
-impl DependencySpec {
-    fn version(&self) -> Option<&str> {
-        match self {
-            Self::Simple(version) => Some(version.as_str()),
-            Self::Detailed(spec) => spec.version.as_deref(),
-        }
-    }
-
-    fn features(&self) -> BTreeSet<String> {
-        match self {
-            Self::Simple(_) => BTreeSet::new(),
-            Self::Detailed(spec) => spec.features.iter().cloned().collect(),
-        }
-    }
-
-    const fn optional(&self) -> Option<bool> {
-        match self {
-            Self::Simple(_) => None,
-            Self::Detailed(spec) => spec.optional,
-        }
-    }
-
-    const fn default_features(&self) -> Option<bool> {
-        match self {
-            Self::Simple(_) => None,
-            Self::Detailed(spec) => spec.default_features,
-        }
-    }
-
-    const fn workspace(&self) -> bool {
-        match self {
-            Self::Simple(_) => false,
-            Self::Detailed(spec) => spec.workspace,
-        }
-    }
-
-    fn package(&self) -> Option<&str> {
-        match self {
-            Self::Simple(_) => None,
-            Self::Detailed(spec) => spec.package.as_deref(),
-        }
-    }
-
-    fn path(&self) -> Option<&str> {
-        match self {
-            Self::Simple(_) => None,
-            Self::Detailed(spec) => spec.path.as_deref(),
-        }
-    }
-
-    fn git(&self) -> Option<&str> {
-        match self {
-            Self::Simple(_) => None,
-            Self::Detailed(spec) => spec.git.as_deref(),
-        }
-    }
-
-    fn registry(&self) -> Option<&str> {
-        match self {
-            Self::Simple(_) => None,
-            Self::Detailed(spec) => spec.registry.as_deref(),
-        }
-    }
-
-    fn registry_index(&self) -> Option<&str> {
-        match self {
-            Self::Simple(_) => None,
-            Self::Detailed(spec) => spec.registry_index.as_deref(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct DetailedDependencySpec {
-    version: Option<String>,
-    #[serde(default)]
-    features: Vec<String>,
-    optional: Option<bool>,
-    #[serde(rename = "default-features")]
-    default_features: Option<bool>,
-    #[serde(default)]
-    workspace: bool,
-    package: Option<String>,
-    path: Option<String>,
-    git: Option<String>,
-    registry: Option<String>,
-    #[serde(rename = "registry-index")]
-    registry_index: Option<String>,
 }
 
 #[cfg(test)]
@@ -2249,6 +1833,55 @@ mod workspace_member_tests {
         assert_eq!(
             members(dir.path()),
             paths(&["app/Cargo.toml", "derive/Cargo.toml", "helper/Cargo.toml"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod lockfile_package_tests {
+    use std::collections::BTreeSet;
+
+    use super::lockfile_registry_packages;
+
+    /// Registry pins alone come back: path and workspace-member entries
+    /// carry no source, git entries carry a `git+` source, and neither
+    /// is a unit this build compiles from a registry (stow#617).
+    #[test]
+    fn only_registry_packages_are_returned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            "version = 4\n\n\
+             [[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [[package]]\nname = \"helper\"\nversion = \"0.2.0\"\n\
+             source = \"git+https://github.com/water-rs/helper?rev=9f8e7d6c#9f8e7d6c5b4a32109f8e7d6c5b4a32109f8e7d6c\"\n\n\
+             [[package]]\nname = \"sibling\"\nversion = \"0.3.0\"\n",
+        )
+        .expect("write lockfile");
+        let packages = lockfile_registry_packages(dir.path())
+            .expect("parse")
+            .expect("lockfile present");
+        assert_eq!(
+            packages,
+            BTreeSet::from([
+                ("cfg-if".to_owned(), semver::Version::new(1, 0, 0)),
+                ("serde".to_owned(), semver::Version::new(1, 0, 228)),
+            ])
+        );
+    }
+
+    /// A lockfile cargo has not written yet is a defined state, not an
+    /// error (stow#608).
+    #[test]
+    fn a_missing_lockfile_is_none_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            lockfile_registry_packages(dir.path()).expect("an absent lockfile is not an error"),
+            None
         );
     }
 }

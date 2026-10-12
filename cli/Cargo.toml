@@ -80,6 +80,8 @@ zstd = "0.14"
 shell-words = "1.1"
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "tls-rustls", "macros"] }
 axoupdater = "0.10"
+which = "8"
+same-file = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

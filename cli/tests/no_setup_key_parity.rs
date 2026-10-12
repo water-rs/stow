@@ -7,17 +7,31 @@
 //! serves.
 
 use std::ffi::OsString;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use stow_types::public_cache::stable_registry_artifact_identity_for_package;
 use stow_types::rustc::ParsedRustcArgs;
 
+mod support;
+
+use support::hermetic_stow_env;
+
 /// The smallest registry unit that invokes the linker: a proc-macro with
 /// no dependencies of its own, so the probe build stays cheap.
 const PROBE_PACKAGE: &str = "paste-impl";
 const PROBE_CRATE: &str = "paste_impl";
 const PROBE_DEP_VERSION: &str = "0.1.18";
+
+/// A URL nothing answers: bind a free port, drop the listener, and every
+/// lookup is a fast refused connect.
+fn dead_edge_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind to pick a port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
 
 fn write_probe_project(dir: &Path) {
     std::fs::create_dir_all(dir.join("src")).expect("create src dir");
@@ -34,13 +48,14 @@ fn write_probe_project(dir: &Path) {
 
 /// `stow build -v` in `project` against `cargo_home`, returning cargo's
 /// stderr (where `-v` writes the `Running` lines).
-fn verbose_build(project: &Path, cargo_home: &Path) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+fn verbose_build(project: &Path, cargo_home: &Path, edge_url: &str, cache_dir: &Path) -> String {
+    let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    build
         .args(["build", "-v"])
         .current_dir(project)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run stow-cli build -v");
+        .env("CARGO_HOME", cargo_home);
+    hermetic_stow_env(&mut build, edge_url, cache_dir);
+    let output = build.output().expect("run stow-cli build -v");
     assert!(
         output.status.success(),
         "stow-cli build failed: {}",
@@ -124,23 +139,32 @@ fn a_setup_free_build_keys_like_the_setup_path() {
     let root = tempfile::tempdir().expect("temp dir");
     let project = root.path().join("project");
     write_probe_project(&project);
+    let edge_url = dead_edge_url();
+    let cache_dir = root.path().join("stow-cache");
 
     // The setup path: the written `$CARGO_HOME/config.toml` carries the
     // mold selection.
     let setup_home = root.path().join("setup-cargo-home");
-    let status = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    setup
         .arg("setup")
         .current_dir(&project)
-        .env("CARGO_HOME", &setup_home)
-        .status()
-        .expect("run stow-cli setup");
+        .env("CARGO_HOME", &setup_home);
+    hermetic_stow_env(&mut setup, &edge_url, &cache_dir);
+    let status = setup.status().expect("run stow-cli setup");
     assert!(status.success(), "stow-cli setup failed");
-    let setup_argv = rustc_argv_for(&verbose_build(&project, &setup_home), PROBE_CRATE);
+    let setup_argv = rustc_argv_for(
+        &verbose_build(&project, &setup_home, &edge_url, &cache_dir),
+        PROBE_CRATE,
+    );
 
     // The no-setup path: an untouched CARGO_HOME, so `stow build` selects
     // the provisioned mold for the invocation alone.
     let bare_home: PathBuf = root.path().join("bare-cargo-home");
-    let no_setup_argv = rustc_argv_for(&verbose_build(&project, &bare_home), PROBE_CRATE);
+    let no_setup_argv = rustc_argv_for(
+        &verbose_build(&project, &bare_home, &edge_url, &cache_dir),
+        PROBE_CRATE,
+    );
 
     // Vacuity guard: the probe unit must actually link with mold on both
     // sides, or the comparison below proves nothing.

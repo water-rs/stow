@@ -297,9 +297,9 @@ async fn async_main() -> stow_types::error::Result<()> {
     let span = tracing::Span::current();
     span.record("subcommand", subcommand_name(&cli.command));
     match cli.command {
-        CliCommand::Check(command) => cargo_cmd::run("check", command).await,
-        CliCommand::Build(command) => cargo_cmd::run("build", command).await,
-        CliCommand::Test(command) => cargo_cmd::run("test", command).await,
+        CliCommand::Check(command) => Box::pin(cargo_cmd::run("check", command)).await,
+        CliCommand::Build(command) => Box::pin(cargo_cmd::run("build", command)).await,
+        CliCommand::Test(command) => Box::pin(cargo_cmd::run("test", command)).await,
         CliCommand::Predict(command) => cargo_cmd::predict(command).await,
         CliCommand::Setup(args) => commands::setup_project(args).await,
         CliCommand::Update => commands::update_self().await,
@@ -602,6 +602,34 @@ fn classify_invocation(
     }
 }
 
+/// The parsed invocation, or `None` after logging what the rejected
+/// argv was: a cargo probe at debug — expected, not a defect — and a
+/// unit whose arguments failed to parse at warn, with the crate name
+/// when `--crate-name` is still readable. `None` means run rustc and
+/// take its answer; each caller supplies its own way to do that.
+fn classify_or_log(
+    classified: Result<rustc_args::ParsedRustcArgs, UnparseableInvocation>,
+    args: &[OsString],
+) -> Option<rustc_args::ParsedRustcArgs> {
+    match classified {
+        Ok(parsed) => Some(parsed),
+        Err(UnparseableInvocation::Probe(error)) => {
+            tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
+            None
+        }
+        Err(UnparseableInvocation::Passthrough(error)) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = wrapped_crate_name(args)
+                    .as_deref()
+                    .unwrap_or("<unknown>"),
+                "rustc arguments failed to parse; passing the invocation through to rustc"
+            );
+            None
+        }
+    }
+}
+
 /// Best-effort `--crate-name` scrape for the warn emitted on an invocation
 /// the parser rejected — the name is usually present even when some other
 /// argument failed.
@@ -661,6 +689,94 @@ pub(crate) struct BuildContext {
     /// standalone wrapper's is empty — its invocations have no other
     /// connections to order against.
     pub(crate) in_flight: crate::supervisor::server::InFlightUnits,
+}
+
+/// The one-shot latch every build-scoped "it happened" signal shares —
+/// a `watch` cell `complete` flips once, awaited by subscribers whether
+/// they armed before or after the flip (stow#608). `send_replace`, not
+/// `send`: the state must be stored even while no waiter is subscribed
+/// yet, or a signal that completes before its first waiter is parked
+/// forever.
+#[derive(Debug, Clone)]
+pub(crate) struct Latch {
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Latch {
+    /// A latch that has not fired.
+    #[must_use]
+    pub(crate) fn pending() -> Self {
+        Self {
+            done: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    /// Fire it: release every waiter, present and late alike.
+    /// Idempotent — the second fire states the same truth.
+    pub(crate) fn complete(&self) {
+        self.done.send_replace(true);
+    }
+
+    /// Whether it has fired yet.
+    #[must_use]
+    pub(crate) fn has_completed(&self) -> bool {
+        *self.done.borrow()
+    }
+
+    /// Resolve on [`Self::complete`]. A latch that is never completed
+    /// resolves nothing: its waiters stay parked until the task or
+    /// process holding them ends.
+    pub(crate) async fn wait(&self) {
+        let mut receiver = self.done.subscribe();
+        if !*receiver.borrow() {
+            let _ = receiver.changed().await;
+        }
+    }
+}
+
+impl Default for Latch {
+    /// A latch nobody armed has not fired.
+    fn default() -> Self {
+        Self::pending()
+    }
+}
+
+/// The build's "cargo's resolution is over" signal.
+///
+/// The supervisor completes it on the first facade frame that
+/// describes a real compile unit — by then cargo holds only the shared
+/// package-cache lock, so the in-build enrichment's own `--unit-graph`
+/// cargo may take the exclusive one without queuing the user's build
+/// behind it. A build whose cargo compiles nothing never fires it; the
+/// waiter then ends with the process, as it already does when cargo
+/// exits first — no second trigger on cargo's exit (stow#608).
+pub(crate) type ResolutionDone = Latch;
+
+/// The `--crate-name` cargo's target-info probe gives its throwaway
+/// crate — a probe spelling, never a unit of the build (stow#608).
+const PROBE_CRATE_NAME: &str = "___";
+
+/// Whether a parsed invocation compiles a real unit — cargo's
+/// `--crate-name ___` probe crate is not one (stow#608).
+fn is_compile_unit(parsed: &rustc_args::ParsedRustcArgs) -> bool {
+    parsed.crate_name != PROBE_CRATE_NAME
+}
+
+/// Whether a facade's frame describes a real compile unit — the moment
+/// cargo's resolution is over. Cargo's own probes pass through the
+/// wrapper before resolution (`rustc -vV`, the `--crate-name ___
+/// --print=file-names` target-info query): the classifier's probe set
+/// and the `___` probe crate are not units. An invocation the parser
+/// rejects is a compile headed to rustc all the same — cargo does not
+/// spawn unparseable probes (stow#608).
+fn describes_compile_unit(
+    classified: &Result<rustc_args::ParsedRustcArgs, UnparseableInvocation>,
+) -> bool {
+    match classified {
+        Ok(parsed) => is_compile_unit(parsed),
+        Err(UnparseableInvocation::Passthrough(_)) => true,
+        Err(UnparseableInvocation::Probe(_)) => false,
+    }
 }
 
 /// What the graph analysis adds to the plan path when it commits: the
@@ -813,17 +929,35 @@ pub(crate) struct BuildSupervisor {
     /// policy dir, the expanded graph, the prefetch candidates — which
     /// this process's environment never carried.
     ctx: BuildContext,
+    /// Completed by the first facade frame that describes a real
+    /// compile unit — the boundary after which the enrichment's own
+    /// cargo may take the package-cache lock without holding the real
+    /// cargo back (stow#608).
+    resolution_done: ResolutionDone,
     observations: std::sync::Mutex<Vec<artifact_cache::ObservedUnit>>,
 }
 
 impl BuildSupervisor {
     /// A supervisor that owns the build's resolved context rather than
-    /// rediscovering it per invocation.
-    pub(crate) fn new(ctx: BuildContext) -> Self {
-        Self {
+    /// rediscovering it per invocation. `base` is the wrapper environment
+    /// the driver computed before cargo spawned — the facts the lazy
+    /// loader would have probed on the first facade's critical path —
+    /// seeded into the env cache so `compiled` answers immediately
+    /// (stow#608).
+    pub(crate) fn new(
+        ctx: BuildContext,
+        base: Option<std::sync::Arc<WrapperEnvBase>>,
+        resolution_done: ResolutionDone,
+    ) -> Self {
+        let supervisor = Self {
             ctx,
+            resolution_done,
             ..Self::default()
+        };
+        if let Some(base) = base {
+            supervisor.env_cache.seed(base);
         }
+        supervisor
     }
 
     /// Every unit this build compiled locally, in compile order.
@@ -866,15 +1000,15 @@ impl supervisor::server::Handler for BuildSupervisor {
         args: Vec<OsString>,
         build_script_out_dir: Option<OsString>,
     ) -> supervisor::server::Decision<Self::Pending> {
-        match decide_rustc_invocation(
-            &executable,
-            &args,
-            &self.env_cache,
-            build_script_out_dir.map(PathBuf::from),
-            &self.ctx,
-        )
-        .await
-        {
+        let out_dir = build_script_out_dir.map(PathBuf::from);
+        let classified = classify_invocation(&args, out_dir);
+        if !self.resolution_done.has_completed() && describes_compile_unit(&classified) {
+            self.resolution_done.complete();
+        }
+        let Some(parsed) = classify_or_log(classified, &args) else {
+            return supervisor::server::Decision::Compile(Box::new(PostCompile::raw(&executable)));
+        };
+        match decide_rustc_invocation(&executable, parsed, &self.env_cache, &self.ctx).await {
             Outcome::Served(notifications) => supervisor::server::Decision::Served(notifications),
             Outcome::Compile(post) => supervisor::server::Decision::Compile(post),
         }
@@ -900,6 +1034,9 @@ impl supervisor::server::Handler for BuildSupervisor {
             tracing::warn!("supervisor observation carried an unparseable invocation; dropped");
             return;
         };
+        if is_compile_unit(&parsed) {
+            self.resolution_done.complete();
+        }
         let Some(local_base) = self.env_cache.local_base(&observation.executable).await else {
             return;
         };
@@ -1010,13 +1147,31 @@ async fn delegate_to_supervisor(
 /// Decide and execute in this process: the configuration that has no
 /// supervisor to ask.
 async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error::Result<()> {
+    // Parse the argv once: the probe gate, the journal and the decision
+    // all read the one `ParsedRustcArgs` (stow#608). A non-compile
+    // invocation has nothing for the cache to decide and nothing to
+    // record — the classifier's probe set covers `-vV`, `-V`,
+    // `--version` and every `--print` query (none carry a
+    // `--crate-name`), and cargo's `___` probe crate is no real unit:
+    // run rustc and return its result rather than loading the wrapper
+    // base and opening the state DB for an answer that is never used.
+    let classified = classify_invocation(
+        &command.wrapped_args,
+        std::env::var_os("OUT_DIR").map(PathBuf::from),
+    );
+    let parsed = match classify_or_log(classified, &command.wrapped_args) {
+        Some(parsed) if is_compile_unit(&parsed) => parsed,
+        _ => {
+            let status =
+                run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    };
     // No supervising stow owns this build's misses: the wrappers
     // journal them, and the first invocation after the journaling cargo
     // exits kicks the detached drain (stow#317). Checked before the
     // decision so a fully-served build drains too.
-    if let Ok(parsed) = rustc_args::ParsedRustcArgs::parse(&command.wrapped_args)
-        && let Some(out_dir) = parsed.out_dir.as_deref()
-    {
+    if let Some(out_dir) = parsed.out_dir.as_deref() {
         miss_journal::drain_finished_builds(out_dir);
         miss_journal::note_consumer_context(out_dir);
     }
@@ -1032,15 +1187,7 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
             std::process::exit(status.code().unwrap_or(1));
         }
     };
-    match decide_rustc_invocation(
-        &command.executable,
-        &command.wrapped_args,
-        &env_cache,
-        std::env::var_os("OUT_DIR").map(PathBuf::from),
-        &ctx,
-    )
-    .await
-    {
+    match decide_rustc_invocation(&command.executable, parsed, &env_cache, &ctx).await {
         Outcome::Served(notifications) => {
             write_served_artifact_notifications(&notifications)?;
             std::process::exit(0)
@@ -1073,29 +1220,10 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
 /// runs rustc.
 async fn decide_rustc_invocation(
     rustc: &OsString,
-    wrapped_args: &[std::ffi::OsString],
+    parsed: rustc_args::ParsedRustcArgs,
     env_cache: &WrapperEnvCache,
-    build_script_out_dir: Option<PathBuf>,
     ctx: &BuildContext,
 ) -> Outcome {
-    let parsed = match classify_invocation(wrapped_args, build_script_out_dir) {
-        Ok(parsed) => parsed,
-        Err(UnparseableInvocation::Probe(error)) => {
-            tracing::debug!(error = %error, "rustc probe invocation detected, bypassing cache");
-            return Outcome::Compile(Box::new(PostCompile::raw(rustc)));
-        }
-        Err(UnparseableInvocation::Passthrough(error)) => {
-            tracing::warn!(
-                error = %error,
-                crate_name = wrapped_crate_name(wrapped_args)
-                    .as_deref()
-                    .unwrap_or("<unknown>"),
-                "rustc arguments failed to parse; passing the invocation through to rustc"
-            );
-            return Outcome::Compile(Box::new(PostCompile::raw(rustc)));
-        }
-    };
-
     tracing::Span::current().record("crate_name", parsed.crate_name.as_str());
     tracing::debug!(
         crate_name = %parsed.crate_name,
@@ -1324,16 +1452,28 @@ pub(crate) struct WrapperEnvBase {
 }
 
 /// Build-scoped memo for the wrapper environment: a base computed once
-/// per build rather than per invocation. The supervisor owns one for the
-/// whole build; a standalone invocation builds a fresh one and gets
-/// exactly the one-shot behavior it always had.
-#[derive(Debug, Default)]
+/// per distinct rustc *spelling* rather than per invocation (stow#608).
+/// The supervisor owns one for the whole build; a standalone invocation
+/// builds a fresh one and gets exactly the one-shot behavior it always
+/// had.
+#[derive(Debug)]
 pub(crate) struct WrapperEnvCache {
-    /// The remote path's base (`StowConfig::load`).
-    env_base: tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>,
-    /// The local path's base (`StowConfig::load_local`), shared by
+    /// The base the driver computed before cargo started. Any spelling
+    /// that resolves to the same file adopts it — cargo reports
+    /// `<sysroot>/bin/rustc` only in its rustup bypass, the bare `rustc`
+    /// or a symlinked path otherwise, and all of them can name the one
+    /// toolchain file the seed probed.
+    seeded: std::sync::Mutex<Option<std::sync::Arc<WrapperEnvBase>>>,
+    /// The remote path's bases (`StowConfig::load`), one memoized cell
+    /// per executable spelling the facades report.
+    env_bases: MemoizedBaseMap,
+    /// The local path's bases (`StowConfig::load_local`), shared by
     /// `decide_local_only` and the post-compile finish.
-    local_base: tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>,
+    local_bases: MemoizedBaseMap,
+    /// The `PATH` bare spellings resolve through, captured at
+    /// construction so the cache reads the environment the build
+    /// invoked the wrapper with.
+    path: OsString,
     /// The verified index slices this build's lookups read — the driver
     /// fetched them before cargo started, so each is decoded and keyed
     /// once per `(target, rustc)` instead of once per rustc invocation
@@ -1344,6 +1484,16 @@ pub(crate) struct WrapperEnvCache {
     circuit_tripped: tokio::sync::OnceCell<std::sync::Mutex<bool>>,
 }
 
+/// One memoized env-base cell per executable spelling a facade reports:
+/// each distinct spelling is probed at most once per build, whichever
+/// loader answers (stow#608).
+type MemoizedBaseMap = std::sync::Mutex<
+    std::collections::HashMap<
+        OsString,
+        std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>>,
+    >,
+>;
+
 /// The slice memoization key and cell shape: `(target, rustc)` to a
 /// shared cell each wrapper task awaits.
 type MemoizedSliceMap = std::sync::Mutex<
@@ -1353,39 +1503,96 @@ type MemoizedSliceMap = std::sync::Mutex<
     >,
 >;
 
-impl WrapperEnvCache {
-    /// The base `load` prepares for `rustc`, computed once per build. A
-    /// `None` means every invocation bypasses — the wrapper exists to
-    /// accelerate builds, never to break them.
-    async fn base(
-        cell: &tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>,
-        rustc: &OsStr,
-        load: fn() -> stow_types::error::Result<StowConfig>,
-    ) -> Option<std::sync::Arc<WrapperEnvBase>> {
-        if let Some(base) = cell
-            .get_or_init(|| async {
-                load_wrapper_env_base(rustc, load)
-                    .await
-                    .map(std::sync::Arc::new)
-            })
-            .await
-            && base.rustc == rustc
-        {
-            return Some(base.clone());
+impl Default for WrapperEnvCache {
+    fn default() -> Self {
+        Self {
+            seeded: std::sync::Mutex::new(None),
+            env_bases: MemoizedBaseMap::default(),
+            local_bases: MemoizedBaseMap::default(),
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            slices: MemoizedSliceMap::default(),
+            circuit_tripped: tokio::sync::OnceCell::new(),
         }
-        // A second rustc in one build never caches — it is a probe, not
-        // the build's toolchain.
-        load_wrapper_env_base(rustc, load)
-            .await
-            .map(std::sync::Arc::new)
+    }
+}
+
+/// Whether the facade's `spelling` and the seeded base's `target` rustc
+/// are the same file — bare names resolved through `path`, the
+/// wrapper's inherited `PATH`, with the platform's own rules for
+/// separators and executable suffixes (`PATHEXT` on Windows), and the
+/// two files compared by identity rather than by canonicalized string
+/// (stow#608). Runs off the runtime workers: the `PATH` walk and the
+/// comparison both stat the file system.
+async fn resolves_to_same_file(spelling: &OsStr, target: &OsStr, path: &OsStr) -> bool {
+    let spelling = spelling.to_os_string();
+    let target = PathBuf::from(target);
+    let path = path.to_os_string();
+    tokio::task::spawn_blocking(move || {
+        let cwd = std::env::current_dir().ok()?;
+        let resolved = which::which_in(&spelling, Some(&path), &cwd).ok()?;
+        same_file::is_same_file(&resolved, &target).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+impl WrapperEnvCache {
+    /// Seed the build's base: the base the driver computed before cargo
+    /// started, adopted by every spelling that resolves to the same file
+    /// (stow#608).
+    fn seed(&self, base: std::sync::Arc<WrapperEnvBase>) {
+        *self.seeded.lock().expect("seeded env base mutex") = Some(base);
+    }
+
+    /// The base `load` prepares for the executable `rustc` as the
+    /// facade spelled it — memoized per spelling, so no spelling is
+    /// probed twice in one build. A spelling that resolves to the seeded
+    /// base's file adopts it; one that resolves elsewhere is probed
+    /// once. A `None` means every invocation bypasses — the wrapper
+    /// exists to accelerate builds, never to break them.
+    async fn base(
+        &self,
+        map: &MemoizedBaseMap,
+        rustc: &OsStr,
+        load: impl Fn() -> stow_types::error::Result<StowConfig> + Send + Sync,
+    ) -> Option<std::sync::Arc<WrapperEnvBase>> {
+        let cell = map
+            .lock()
+            .expect("env base map mutex")
+            .entry(rustc.to_os_string())
+            .or_default()
+            .clone();
+        cell.get_or_init(|| async {
+            let seed = self.seeded.lock().expect("seeded env base mutex").clone();
+            if let Some(seed) = seed
+                && resolves_to_same_file(rustc, &seed.rustc, &self.path).await
+            {
+                return Some(seed);
+            }
+            let config = match load() {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::warn!(error = %error, "stow config unavailable, bypassing rust cache");
+                    return None;
+                }
+            };
+            load_wrapper_env_base(rustc, config)
+                .await
+                .map(std::sync::Arc::new)
+        })
+        .await
+        .clone()
     }
 
     async fn env_base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
-        Self::base(&self.env_base, rustc, StowConfig::load).await
+        self.base(&self.env_bases, rustc, StowConfig::load).await
     }
 
     pub(crate) async fn local_base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
-        Self::base(&self.local_base, rustc, StowConfig::load_local).await
+        self.base(&self.local_bases, rustc, StowConfig::load_local)
+            .await
     }
 
     /// The decoded index slice for `(target, rustc)` — read, decompressed
@@ -1467,29 +1674,25 @@ impl WrapperEnvCache {
 /// Load the config, probe the rustc and take the version lease — once
 /// for the whole build. Every step can legitimately be unavailable, so
 /// `None` means "run the real rustc".
-async fn load_wrapper_env_base(
-    rustc: &OsStr,
-    load: fn() -> stow_types::error::Result<StowConfig>,
-) -> Option<WrapperEnvBase> {
-    let config = match load() {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!(error = %error, "stow config unavailable, bypassing rust cache");
-            return None;
-        }
-    };
+async fn load_wrapper_env_base(rustc: &OsStr, config: StowConfig) -> Option<WrapperEnvBase> {
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing rust cache");
         return None;
     }
-    let host_target = match rustc_args::rustc_host_target(rustc).await {
+    // The host triple and the version probe are independent answers from
+    // the same rustc — await them together (stow#608).
+    let (host_target, rustc_version) = tokio::join!(
+        rustc_args::rustc_host_target(rustc),
+        rustc_args::detect_rustc_version(rustc),
+    );
+    let host_target = match host_target {
         Ok(target) => target,
         Err(error) => {
             tracing::warn!(error = %error, "failed to detect rustc host target, bypassing rust cache");
             return None;
         }
     };
-    let rustc_version = match rustc_args::detect_rustc_version(rustc).await {
+    let rustc_version = match rustc_version {
         Ok(version) => version,
         Err(error) => {
             tracing::warn!(error = %error, "failed to detect rustc version, bypassing rust cache");
@@ -1510,6 +1713,65 @@ async fn load_wrapper_env_base(
         rustc_version,
         _version_lease: version_lease,
     })
+}
+
+/// The wrapper environment base the supervisor seeds from, built on the
+/// driver's own timeline before cargo spawns rather than inside the
+/// first facade's `compiled` (stow#608). The facts are the ones the lazy
+/// path computes — the driver's `config` (whose state-DB pool `prepare`
+/// reuses, so no second `StowConfig`/pool), the host triple and release
+/// from the shared `rustc -vV` of the build's rustc, and the build's
+/// [`artifact_cache::RustcVersionLease`].
+///
+/// `build_rustc` is the one rustc the driver resolved for this build —
+/// the configured `RUSTC`/`build.rustc` when set, else the toolchain's
+/// `rustc` — so the shared `-vV` the driver spawned, the sysroot probe
+/// and the link key all read the same executable. A failed rustc probe
+/// fails the build (plain cargo fails there too); a cache-side failure —
+/// `ensure_dirs`, the version lease — costs the base, never the build,
+/// so `None` seeds nothing and the facades bypass (stow#608).
+pub(crate) async fn supervisor_env_base(
+    config: &StowConfig,
+    shared_vv: &rustc_args::SharedRustcVv,
+    build_rustc: &rustc_args::BuildRustc,
+) -> stow_types::error::Result<Option<WrapperEnvBase>> {
+    // The executable as the facades will report it — the configured
+    // `RUSTC`/`build.rustc` spelling verbatim when one names the build's
+    // compiler, else the toolchain's own `rustc` — so the seeded cell
+    // matches the spelling the first facade carries.
+    let (executable, vv) = tokio::join!(build_rustc.facade_spelling(), async {
+        shared_vv.clone().await.map(|vv| (*vv).clone())
+    },);
+    let rustc = executable.map_err(|error| {
+        stow_types::stow_error!("probe the rustc executable for the supervisor base: {error}")
+    })?;
+    let vv = vv.map_err(|error| {
+        stow_types::stow_error!("probe rustc -vV for the supervisor base: {error}")
+    })?;
+    let host_target = rustc_args::vv_host(&vv).map_err(|error| {
+        stow_types::stow_error!("probe rustc -vV for the supervisor base: {error}")
+    })?;
+    let rustc_version = rustc_args::vv_release(&vv).map_err(|error| {
+        stow_types::stow_error!("probe rustc -vV for the supervisor base: {error}")
+    })?;
+    if let Err(error) = config.ensure_dirs().await {
+        tracing::warn!(error = %error, "failed to prepare stow cache directories, seeding no env base");
+        return Ok(None);
+    }
+    let version_lease = match prepare_local_cache(config, &rustc_version).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to prepare the local cache, seeding no env base");
+            return Ok(None);
+        }
+    };
+    Ok(Some(WrapperEnvBase {
+        rustc,
+        config: config.clone(),
+        host_target,
+        rustc_version,
+        _version_lease: version_lease,
+    }))
 }
 
 /// What the remote-fetch phase decided for an invocation.
@@ -4042,6 +4304,116 @@ mod tests {
         );
     }
 
+    /// Cargo's probes reach the supervisor as `Plan` frames — `rustc -vV`
+    /// and the `--crate-name ___ --print=file-names` target-info query —
+    /// but they run before resolution and must not complete
+    /// `ResolutionDone`; only a real compile unit's frame may (stow#608).
+    #[tokio::test]
+    async fn resolution_done_fires_only_on_a_compile_unit_plan() {
+        let resolution_done = super::ResolutionDone::pending();
+        let handler = std::sync::Arc::new(super::BuildSupervisor::new(
+            super::BuildContext::default(),
+            None,
+            resolution_done.clone(),
+        ));
+
+        let _ = crate::supervisor::server::Handler::plan(
+            &handler,
+            OsString::from("rustc"),
+            args(&["-vV"]),
+            None,
+        )
+        .await;
+        assert!(!resolution_done.has_completed());
+
+        let _ = crate::supervisor::server::Handler::plan(
+            &handler,
+            OsString::from("rustc"),
+            args(&[
+                "--crate-name",
+                "___",
+                "--crate-type",
+                "lib",
+                "--print",
+                "file-names",
+            ]),
+            None,
+        )
+        .await;
+        assert!(!resolution_done.has_completed());
+
+        let _ = crate::supervisor::server::Handler::plan(
+            &handler,
+            OsString::from("rustc"),
+            args(&[
+                "--crate-name",
+                "demo",
+                "--crate-type",
+                "lib",
+                "--out-dir",
+                "/tmp/out",
+                "--emit",
+                "metadata",
+                "-C",
+                "metadata=abc123",
+            ]),
+            None,
+        )
+        .await;
+        assert!(resolution_done.has_completed());
+        // A waiter armed after completion resolves at once.
+        resolution_done.wait().await;
+    }
+
+    /// The uncovered fast path's `Observed` frames describe real compile
+    /// units by construction — the same signal fires on them, while a
+    /// probe that somehow arrived is dropped by the classifier before it
+    /// can complete the signal (stow#608).
+    #[tokio::test]
+    async fn resolution_done_fires_on_a_compile_unit_observed() {
+        let resolution_done = super::ResolutionDone::pending();
+        let handler = std::sync::Arc::new(super::BuildSupervisor::new(
+            super::BuildContext::default(),
+            None,
+            resolution_done.clone(),
+        ));
+
+        crate::supervisor::server::Handler::observed(
+            &handler,
+            crate::supervisor::server::Observation {
+                executable: OsString::from("rustc"),
+                args: args(&["-vV"]),
+                build_script_out_dir: None,
+                success: None,
+            },
+        )
+        .await;
+        assert!(!resolution_done.has_completed());
+
+        crate::supervisor::server::Handler::observed(
+            &handler,
+            crate::supervisor::server::Observation {
+                executable: OsString::from("rustc"),
+                args: args(&[
+                    "--crate-name",
+                    "demo",
+                    "--crate-type",
+                    "lib",
+                    "--out-dir",
+                    "/tmp/out",
+                    "--emit",
+                    "metadata",
+                    "-C",
+                    "metadata=abc123",
+                ]),
+                build_script_out_dir: None,
+                success: None,
+            },
+        )
+        .await;
+        assert!(resolution_done.has_completed());
+    }
+
     /// The line rustc prints for `file` under the fixtures' `/tmp/out`
     /// out-dir: the path is spelled the way this platform joins it and
     /// escaped as JSON, everything around it is the literal protocol.
@@ -4184,6 +4556,216 @@ mod tests {
         ]))
         .expect("parse rustc args");
         assert_eq!(super::expected_bundle_crate_name(&parsed), None);
+    }
+
+    /// A `StowConfig` whose every path and endpoint is a throwaway — the
+    /// env-base tests' shared fixture.
+    fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
+        crate::config::StowConfig {
+            edge_url: "http://127.0.0.1:9".to_owned(),
+            registry_base_url: "http://127.0.0.1:9/v2/water-rs/stow-cache".to_owned(),
+            cache_dir: dir.path().join("cache"),
+            request_timeout: std::time::Duration::from_millis(50),
+            negative_cache_ttl: std::time::Duration::from_secs(1),
+            circuit_reset_after: std::time::Duration::from_secs(1),
+            circuit_trip_threshold: 1,
+            artifact_cache_max_bytes: 1,
+            index_refresh_interval: std::time::Duration::from_secs(1),
+            verify_mode: crate::config::VerifyMode::GithubCi,
+            state_db_pool: crate::config::StowConfig::default_state_db_pool(),
+            trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
+            artifact_cache_staging: std::sync::Arc::default(),
+        }
+    }
+
+    /// The shared `rustc -vV` the driver hands these tests.
+    fn test_shared_vv() -> crate::rustc_args::SharedRustcVv {
+        crate::rustc_args::shared_rustc_vv(std::ffi::OsString::from("rustc"))
+    }
+
+    /// The real rustc's path — `PATH` order and the platform's own
+    /// executable rules, as the OS resolves cargo's bare spelling —
+    /// used as the seeded base's executable.
+    fn real_rustc_path() -> std::path::PathBuf {
+        which::which("rustc").expect("the test machine has rustc on PATH")
+    }
+
+    /// A `WrapperEnvCache` whose `PATH` is the test's injected value.
+    fn test_cache(path: &std::ffi::OsStr) -> super::WrapperEnvCache {
+        super::WrapperEnvCache {
+            seeded: std::sync::Mutex::new(None),
+            env_bases: super::MemoizedBaseMap::default(),
+            local_bases: super::MemoizedBaseMap::default(),
+            path: path.to_os_string(),
+            slices: super::MemoizedSliceMap::default(),
+            circuit_tripped: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// stow#608 A1: a seeded base computed from the driver's rustc and a
+    /// lazily resolved one for the same spelling are the same base. The
+    /// seeded base must carry exactly the facts the lazy path computes —
+    /// the same executable spelling, the machine's own host triple
+    /// (never the consumer target a `--target` build compiles for) and
+    /// the same release string.
+    #[tokio::test]
+    async fn the_seeded_env_base_matches_the_lazy_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = env_base_test_config(&dir);
+        let shared_vv = test_shared_vv();
+        let rustc = real_rustc_path();
+        let build_rustc = crate::rustc_args::BuildRustc::Configured(rustc.clone().into_os_string());
+        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &build_rustc)
+            .await
+            .expect("the seeded env base must build on a machine with rustc")
+        else {
+            panic!("the seeded env base must exist on a machine with rustc");
+        };
+        let Some(lazy) = super::load_wrapper_env_base(rustc.as_os_str(), config).await else {
+            panic!("the lazy env base must build on the same rustc");
+        };
+        assert_eq!(seeded.rustc, lazy.rustc);
+        assert_eq!(seeded.host_target, lazy.host_target);
+        assert_eq!(seeded.rustc_version, lazy.rustc_version);
+    }
+
+    /// A spelling that does not resolve to the seeded file is probed —
+    /// but exactly once, however many frames carry it (stow#608 A1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unseeded_spelling_loads_its_base_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = env_base_test_config(&dir);
+        let shared_vv = test_shared_vv();
+        let rustc = real_rustc_path();
+        let build_rustc = crate::rustc_args::BuildRustc::Configured(rustc.clone().into_os_string());
+        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &build_rustc)
+            .await
+            .expect("seeded env base")
+        else {
+            panic!("the seeded env base must exist");
+        };
+        // A second spelling naming a different file that still answers
+        // `rustc -vV` — a thin script in a directory of its own.
+        let tools = tempfile::tempdir().expect("tools");
+        let fake = tools.path().join("other-rustc");
+        std::fs::write(&fake, "#!/bin/sh\nexec rustc \"$@\"\n").expect("write fake rustc");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake rustc");
+        }
+
+        let cache = test_cache(std::ffi::OsStr::new(""));
+        cache.seed(std::sync::Arc::new(seeded));
+        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = {
+            let loads = loads.clone();
+            let config = config.clone();
+            move || {
+                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(config.clone())
+            }
+        };
+        for _ in 0..4 {
+            let base = cache
+                .base(&cache.env_bases, fake.as_os_str(), &counted)
+                .await;
+            assert!(
+                base.is_some(),
+                "the unseeded spelling still resolves a base"
+            );
+        }
+        assert_eq!(
+            loads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "four frames loaded the unseeded spelling's base exactly once"
+        );
+    }
+
+    /// A spelling that reaches the seed's file through a symlinked
+    /// directory adopts the seed — zero loads (stow#608 A1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spelling_through_a_symlinked_dir_adopts_the_seed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = env_base_test_config(&dir);
+        let shared_vv = test_shared_vv();
+        let rustc = real_rustc_path();
+        let build_rustc = crate::rustc_args::BuildRustc::Configured(rustc.clone().into_os_string());
+        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &build_rustc)
+            .await
+            .expect("seeded env base")
+        else {
+            panic!("the seeded env base must exist");
+        };
+        let seeded = std::sync::Arc::new(seeded);
+
+        let link_dir = tempfile::tempdir().expect("link dir");
+        std::os::unix::fs::symlink(
+            rustc.parent().expect("rustc has a parent"),
+            link_dir.path().join("bin"),
+        )
+        .expect("symlink bin dir");
+        let spelling = link_dir.path().join("bin").join("rustc");
+
+        let cache = test_cache(std::ffi::OsStr::new(""));
+        cache.seed(seeded.clone());
+        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = {
+            let loads = loads.clone();
+            move || {
+                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                unreachable!("the adopted seed never loads")
+            }
+        };
+        let base = cache
+            .base(&cache.env_bases, spelling.as_os_str(), &counted)
+            .await
+            .expect("the symlinked spelling adopts the seed");
+        assert!(
+            std::sync::Arc::ptr_eq(&base, &seeded),
+            "the adopted base IS the seeded base"
+        );
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A bare `rustc` found on the injected `PATH` adopts the seed —
+    /// cargo's spelling on any non-rustup toolchain (stow#608 A1).
+    #[tokio::test]
+    async fn a_bare_spelling_on_the_injected_path_adopts_the_seed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = env_base_test_config(&dir);
+        let shared_vv = test_shared_vv();
+        let rustc = real_rustc_path();
+        let build_rustc = crate::rustc_args::BuildRustc::Configured(rustc.clone().into_os_string());
+        let Some(seeded) = super::supervisor_env_base(&config, &shared_vv, &build_rustc)
+            .await
+            .expect("seeded env base")
+        else {
+            panic!("the seeded env base must exist");
+        };
+        let seeded = std::sync::Arc::new(seeded);
+
+        let path =
+            std::env::join_paths([rustc.parent().expect("rustc has a parent")]).expect("join PATH");
+        let cache = test_cache(&path);
+        cache.seed(seeded.clone());
+        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = {
+            let loads = loads.clone();
+            move || {
+                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                unreachable!("the adopted seed never loads")
+            }
+        };
+        let base = cache
+            .base(&cache.env_bases, std::ffi::OsStr::new("rustc"), &counted)
+            .await
+            .expect("the bare spelling adopts the seed");
+        assert!(std::sync::Arc::ptr_eq(&base, &seeded));
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// stow#615: the consumer's compile key is computed over the command
@@ -4458,9 +5040,10 @@ mod tests {
             .expect("write rmeta");
         }
 
-        /// A `BuildSupervisor` whose `local_base` is seeded with a
-        /// temp-dir config — the env-cache cell is set, so `observed`
-        /// never touches the process environment.
+        /// A `BuildSupervisor` whose local base for the `rustc` spelling
+        /// the fixture's frames carry is already memoized with a temp-dir
+        /// config — the cell is set, so `observed` never touches the
+        /// process environment or probes a toolchain.
         async fn fixture(
             root: &Path,
         ) -> (
@@ -4480,11 +5063,17 @@ mod tests {
                     .expect("prepare local cache"),
             });
             let in_flight = server::InFlightUnits::default();
+            let env_cache = crate::WrapperEnvCache::default();
+            env_cache
+                .local_bases
+                .lock()
+                .expect("env base map mutex")
+                .insert(
+                    OsString::from("rustc"),
+                    Arc::new(tokio::sync::OnceCell::from(Some(base))),
+                );
             let handler = Arc::new(BuildSupervisor {
-                env_cache: crate::WrapperEnvCache {
-                    local_base: tokio::sync::OnceCell::from(Some(base)),
-                    ..crate::WrapperEnvCache::default()
-                },
+                env_cache,
                 ctx: BuildContext {
                     policy_dir: None,
                     public_cache_target: Some(HOST_TARGET.to_owned()),
@@ -4498,6 +5087,7 @@ mod tests {
                     in_flight: in_flight.clone(),
                 },
                 observations: std::sync::Mutex::new(Vec::new()),
+                resolution_done: crate::ResolutionDone::pending(),
             });
             (config, in_flight, handler)
         }

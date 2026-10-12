@@ -312,6 +312,8 @@ mod tests {
             target_given: false,
             rustc_version: "1.99.0".to_owned(),
             mold_config_args: Vec::new(),
+            env_base: None,
+            build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
         }
     }
 
