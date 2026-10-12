@@ -82,8 +82,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::artifact_cache::{
-    load_cached_bundle, load_cached_bundle_by_compile_key, load_semantic_cached_bundle,
-    prepare_local_cache, record_materialized_bundle_outputs,
+    DependencyCMetadataResolution, load_cached_bundle, load_cached_bundle_by_compile_key,
+    load_semantic_cached_bundle, prepare_local_cache, record_materialized_bundle_outputs,
     record_materialized_local_build_outputs, remove_cached_bundle,
     resolve_dependency_c_metadata_json,
 };
@@ -471,8 +471,20 @@ async fn finish_rustc_compile(
     let mut artifact = None;
     if success {
         if let Some(base) = local_base {
+            // The identity resolution reads each `--extern` dependency's
+            // `materialized_outputs` row, which that dependency's own
+            // post-compile writes on another connection. A dependency
+            // still in flight — rustc running or bookkeeping unfinished
+            // — has not written its rows yet, so wait for it rather than
+            // misread a pending write as a missing one (stow#618). The
+            // waits follow dependency edges, and those form a DAG: a
+            // unit can only block on units it was compiled against, which
+            // can never transitively be waiting on it, so no cycle can
+            // form.
+            ctx.in_flight.wait_for_externs(parsed).await;
             match resolve_local_build_artifact(base, parsed, ctx.unit_nodes()).await {
-                Ok(Some(build)) => {
+                Ok(LocalBuildResolution::Resolved(build)) => {
+                    let build = *build;
                     log_nonfatal_result(
                         "failed to materialize stable local build aliases after successful rustc build",
                         inject::materialize_local_build_stable_aliases(
@@ -501,7 +513,19 @@ async fn finish_rustc_compile(
                     }
                     artifact = Some(build);
                 }
-                Ok(None) => {}
+                // A dependency whose bookkeeping genuinely never landed —
+                // a path or git dependency, or a store this build skipped.
+                // This used to be a silent drop, which is how stow#618
+                // stayed hidden; the debug line names the crate and the
+                // extern that has no row.
+                Ok(LocalBuildResolution::UnrecordedExtern { extern_path }) => {
+                    tracing::debug!(
+                        crate_name = %parsed.crate_name,
+                        extern_path,
+                        "not storing locally built unit: an extern's bookkeeping was never recorded"
+                    );
+                }
+                Ok(LocalBuildResolution::NotAnArtifactUnit) => {}
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
@@ -629,6 +653,12 @@ pub(crate) struct BuildContext {
     /// standalone wrapper's settles by construction — a driver with no
     /// pending map answers at once (stow#347).
     pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
+    /// The build's in-flight local compiles, shared with the supervisor:
+    /// a post-compile waits on the ones its `--extern` set names before
+    /// reading their `materialized_outputs` rows (stow#618). The
+    /// standalone wrapper's is empty — its invocations have no other
+    /// connections to order against.
+    pub(crate) in_flight: crate::supervisor::server::InFlightUnits,
 }
 
 /// What the graph analysis adds to the plan path when it commits: the
@@ -690,6 +720,9 @@ impl BuildContext {
                 prefetch_candidates,
             })),
             serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+            // No supervisor shares a standalone invocation's registry —
+            // the wait finds nothing and returns at once.
+            in_flight: crate::supervisor::server::InFlightUnits::default(),
         })
     }
 
@@ -2128,9 +2161,8 @@ async fn try_serve_local_prefetched_graph_bundle(
     };
     let expected_dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await {
-            Ok(Some(value)) => value,
-            Ok(None) if parsed.extern_crates.is_empty() => "[]".to_owned(),
-            Ok(None) => return false,
+            Ok(DependencyCMetadataResolution::Resolved(value)) => value,
+            Ok(DependencyCMetadataResolution::Unrecorded(..)) => return false,
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -3093,9 +3125,8 @@ async fn build_semantic_fetch_request(
     };
     let dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await? {
-            Some(value) => value,
-            None if parsed.extern_crates.is_empty() => "[]".to_owned(),
-            None => return Ok(None),
+            DependencyCMetadataResolution::Resolved(value) => value,
+            DependencyCMetadataResolution::Unrecorded(..) => return Ok(None),
         };
     let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
     let profile = semantic_request_profile(parsed)?;
@@ -3148,9 +3179,8 @@ async fn build_stable_exact_identity(
     };
     let dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await? {
-            Some(value) => value,
-            None if parsed.extern_crates.is_empty() => "[]".to_owned(),
-            None => {
+            DependencyCMetadataResolution::Resolved(value) => value,
+            DependencyCMetadataResolution::Unrecorded(..) => {
                 trace_identity_inputs(
                     parsed,
                     target,
@@ -3260,15 +3290,34 @@ async fn trace_identity_inputs(
     let _ = async_fs::write(trace_dir.join(file_name), payload).await;
 }
 
+/// What [`resolve_local_build_artifact`] concluded about a finished
+/// compile — the store inputs, or why there are none worth warning about
+/// (stow#618).
+enum LocalBuildResolution {
+    /// The unit's stable identity and the inputs `store_local_build_outputs`
+    /// persists.
+    Resolved(Box<artifact_cache::LocalBuildArtifact>),
+    /// The invocation is not a registry crate or carries no stable
+    /// identity — nothing was owed.
+    NotAnArtifactUnit,
+    /// An `--extern` dependency's `materialized_outputs` row is absent
+    /// after every in-flight unit completed: a dependency whose
+    /// bookkeeping genuinely never landed — a path or git dependency, or
+    /// a store that was skipped.
+    UnrecordedExtern {
+        /// The first extern path with no row, for the debug log.
+        extern_path: String,
+    },
+}
+
 /// Resolve the stable identity a finished local build would carry as a cache
 /// entry, plus the identity inputs `store_local_build_outputs` persists with
-/// it. `None` means the invocation is not a registry crate or its dependency
-/// identities have not been recorded yet.
+/// it.
 async fn resolve_local_build_artifact(
     base: &WrapperEnvBase,
     parsed: &rustc_args::ParsedRustcArgs,
     unit_nodes: Option<&unit_node::UnitNodeTable>,
-) -> stow_types::error::Result<Option<artifact_cache::LocalBuildArtifact>> {
+) -> stow_types::error::Result<LocalBuildResolution> {
     let config = &base.config;
     // The unit's own platform — the compiling rustc's real host triple
     // when cargo passed no `--target`, never the
@@ -3280,12 +3329,13 @@ async fn resolve_local_build_artifact(
     let rustc_version = base.rustc_version.clone();
     let dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await? {
-            Some(value) => value,
-            None if parsed.extern_crates.is_empty() => "[]".to_owned(),
-            None => return Ok(None),
+            DependencyCMetadataResolution::Resolved(value) => value,
+            DependencyCMetadataResolution::Unrecorded(extern_path) => {
+                return Ok(LocalBuildResolution::UnrecordedExtern { extern_path });
+            }
         };
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
-        return Ok(None);
+        return Ok(LocalBuildResolution::NotAnArtifactUnit);
     };
     // The compile key is the command line's scan, always — a build
     // script's `cargo:rustc-cfg=feature="…"` output is part of the
@@ -3299,7 +3349,7 @@ async fn resolve_local_build_artifact(
         &dependency_c_metadata_json,
     )?
     else {
-        return Ok(None);
+        return Ok(LocalBuildResolution::NotAnArtifactUnit);
     };
     // The stored row's label is the unit's cargo feature set when the
     // build's unit graph names the unit, the scan otherwise — a unit
@@ -3322,14 +3372,16 @@ async fn resolve_local_build_artifact(
             )
         })
         .unwrap_or(scan_features_json);
-    Ok(Some(artifact_cache::LocalBuildArtifact {
-        target,
-        rustc_version,
-        identity,
-        features_json,
-        dependency_c_metadata_json,
-        build_script_out_dir: parsed.build_script_out_dir.clone(),
-    }))
+    Ok(LocalBuildResolution::Resolved(Box::new(
+        artifact_cache::LocalBuildArtifact {
+            target,
+            rustc_version,
+            identity,
+            features_json,
+            dependency_c_metadata_json,
+            build_script_out_dir: parsed.build_script_out_dir.clone(),
+        },
+    )))
 }
 
 fn semantic_request_profile(
@@ -4109,5 +4161,378 @@ mod tests {
             scan_features_json, "[\"default\",\"probe_from_build_script\"]",
             "the scan, not the resolved set, is what the key covers"
         );
+    }
+
+    /// stow#618: a dependent's post-compile bookkeeping must wait for the
+    /// bookkeeping of the dependencies it was built against — an
+    /// `--extern` whose rows are still being written is a pending write,
+    /// not a missing one. These tests drive the real supervisor over the
+    /// real socket with `Observed` frames, a real `BuildSupervisor`, and
+    /// a temp-dir cache — cargo-free end to end.
+    mod in_flight_ordering {
+        use std::ffi::{OsStr, OsString};
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use crate::supervisor::protocol::{Observed, Request, write_frame};
+        use crate::supervisor::{Endpoint, server};
+        use crate::{AnalysisFacts, BuildContext, BuildSupervisor, WrapperEnvBase};
+
+        /// The shared `--out-dir` both fixture units compile into, cargo's
+        /// deps-dir shape.
+        const HOST_TARGET: &str = "aarch64-apple-darwin";
+        const RUSTC_VERSION: &str = "1.91.1";
+
+        fn test_config(root: &Path) -> crate::config::StowConfig {
+            crate::config::StowConfig {
+                edge_url: "http://127.0.0.1:9".to_owned(),
+                registry_base_url: "http://127.0.0.1:9/v2/stow".to_owned(),
+                cache_dir: root.join(".stow"),
+                request_timeout: Duration::from_millis(200),
+                negative_cache_ttl: Duration::ZERO,
+                circuit_reset_after: Duration::ZERO,
+                circuit_trip_threshold: 1,
+                artifact_cache_max_bytes: u64::MAX,
+                index_refresh_interval: Duration::ZERO,
+                verify_mode: crate::config::VerifyMode::GithubCi,
+                state_db_pool: std::sync::Arc::default(),
+                trust_material: std::sync::Arc::default(),
+            }
+        }
+
+        /// The argv a rustc-wrapper frame carries for one registry lib
+        /// unit; `metadata` is cargo's `-C metadata`, which names the
+        /// output files and the externs that point at them.
+        fn unit_args(
+            registry_src: &Path,
+            out_dir: &Path,
+            package: &str,
+            version: &str,
+            metadata: &str,
+            externs: &[(&str, &Path)],
+        ) -> Vec<OsString> {
+            let mut argv = vec![
+                OsString::from("--crate-name"),
+                OsString::from(package.replace('-', "_")),
+                OsString::from("--crate-type"),
+                OsString::from("lib"),
+                OsString::from("--emit"),
+                OsString::from("dep-info,metadata,link"),
+                OsString::from("--out-dir"),
+                out_dir.as_os_str().to_os_string(),
+                OsString::from("-C"),
+                OsString::from(format!("metadata={metadata}")),
+                OsString::from("-C"),
+                OsString::from(format!("extra-filename=-{metadata}")),
+                OsString::from("--target"),
+                OsString::from(HOST_TARGET),
+                registry_src
+                    .join(format!(
+                        "index.crates.io-0123abcd/{package}-{version}/src/lib.rs"
+                    ))
+                    .into_os_string(),
+            ];
+            for (name, path) in externs {
+                argv.push(OsString::from(format!(
+                    "--extern={name}={}",
+                    path.display()
+                )));
+            }
+            argv
+        }
+
+        /// The output files a successful rustc would have left behind.
+        fn write_outputs(out_dir: &Path, package: &str, metadata: &str) {
+            let stem = package.replace('-', "_");
+            std::fs::write(
+                out_dir.join(format!("lib{stem}-{metadata}.rlib")),
+                b"rlib-bytes",
+            )
+            .expect("write rlib");
+            std::fs::write(
+                out_dir.join(format!("lib{stem}-{metadata}.rmeta")),
+                b"rmeta-bytes",
+            )
+            .expect("write rmeta");
+        }
+
+        /// A `BuildSupervisor` whose `local_base` is seeded with a
+        /// temp-dir config — the env-cache cell is set, so `observed`
+        /// never touches the process environment.
+        async fn fixture(
+            root: &Path,
+        ) -> (
+            crate::config::StowConfig,
+            server::InFlightUnits,
+            Arc<BuildSupervisor>,
+        ) {
+            let config = test_config(root);
+            config.ensure_dirs().await.expect("ensure cache dirs");
+            let base = Arc::new(WrapperEnvBase {
+                rustc: OsString::from("rustc"),
+                config: config.clone(),
+                host_target: HOST_TARGET.to_owned(),
+                rustc_version: RUSTC_VERSION.to_owned(),
+                _version_lease: crate::prepare_local_cache(&config, RUSTC_VERSION)
+                    .await
+                    .expect("prepare local cache"),
+            });
+            let in_flight = server::InFlightUnits::default();
+            let handler = Arc::new(BuildSupervisor {
+                env_cache: crate::WrapperEnvCache {
+                    local_base: tokio::sync::OnceCell::from(Some(base)),
+                    ..crate::WrapperEnvCache::default()
+                },
+                ctx: BuildContext {
+                    policy_dir: None,
+                    public_cache_target: Some(HOST_TARGET.to_owned()),
+                    public_cache_disabled: false,
+                    analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
+                        semantic_fallback_enabled: false,
+                        unit_nodes: None,
+                        prefetch_candidates: std::collections::BTreeMap::new(),
+                    })),
+                    serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+                    in_flight: in_flight.clone(),
+                },
+                observations: std::sync::Mutex::new(Vec::new()),
+            });
+            (config, in_flight, handler)
+        }
+
+        /// The raw facade transport: `Observed` frames are one-way, so
+        /// the test writes them itself rather than going through the
+        /// client connection.
+        #[cfg(unix)]
+        async fn connect_raw(endpoint: &Endpoint) -> tokio::net::UnixStream {
+            let Endpoint::Unix(path) = endpoint else {
+                panic!("the unix transport is the only one this platform starts");
+            };
+            tokio::net::UnixStream::connect(path)
+                .await
+                .expect("connect to the supervisor")
+        }
+
+        /// The raw facade transport on the loopback listener.
+        #[cfg(not(unix))]
+        async fn connect_raw(endpoint: &Endpoint) -> tokio::net::TcpStream {
+            let Endpoint::Loopback(port) = endpoint else {
+                panic!("the loopback transport is the only one this platform starts");
+            };
+            tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                .await
+                .expect("connect to the supervisor")
+        }
+
+        async fn send_observed<S>(
+            stream: &mut S,
+            token: &str,
+            args: &[OsString],
+            success: Option<bool>,
+        ) where
+            S: tokio::io::AsyncWrite + Unpin + Send,
+        {
+            let frame = Observed::new(token.to_owned(), OsStr::new("rustc"), args, None, success);
+            write_frame(&mut *stream, &Request::Observed(frame))
+                .await
+                .expect("write the observation frame");
+        }
+
+        /// Guarantee the frames already written on `stream` have been
+        /// handled: the frames are sequential, so an answered
+        /// `AwaitServeMap` proves everything before it was processed.
+        async fn flush_frames<S>(stream: &mut S, token: &str)
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+        {
+            use crate::supervisor::protocol::read_frame;
+            write_frame(
+                &mut *stream,
+                &Request::AwaitServeMap(crate::supervisor::protocol::AwaitServeMap {
+                    token: token.to_owned(),
+                }),
+            )
+            .await
+            .expect("write the flush frame");
+            let answer: crate::supervisor::protocol::Answer = read_frame(&mut *stream)
+                .await
+                .expect("read the flush answer")
+                .expect("the supervisor answers the wait");
+            assert!(
+                matches!(answer, crate::supervisor::protocol::Answer::ServeMapReady),
+                "the flush answered with {answer:?}"
+            );
+        }
+
+        async fn stored_crates(config: &crate::config::StowConfig) -> Vec<String> {
+            let connection = config.state_db_pool().await.expect("state db pool");
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+                "SELECT crate_name FROM artifact_cache_entries ORDER BY crate_name".to_owned(),
+            ))
+            .fetch_all(&connection)
+            .await
+            .expect("list stored crates")
+        }
+
+        async fn wait_until(mut predicate: impl FnMut() -> bool, what: &str, timeout: Duration) {
+            let deadline = std::time::Instant::now() + timeout;
+            while !predicate() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// A dependent whose report the supervisor handles while its
+        /// dependency is still in flight is stored only once the
+        /// dependency's bookkeeping has landed (stow#618).
+        #[tokio::test]
+        async fn a_dependent_waits_for_its_dependencys_bookkeeping() {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+
+            let (config, in_flight, handler) = fixture(tempdir.path()).await;
+            let supervisor = server::start(handler, in_flight).expect("start supervisor");
+            let [(_, endpoint), (_, token)] = supervisor.env();
+            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
+
+            let dep_args = unit_args(&registry_src, &out_dir, "dep", "1.0.0", "depmeta", &[]);
+            write_outputs(&out_dir, "dep", "depmeta");
+            let consumer_args = unit_args(
+                &registry_src,
+                &out_dir,
+                "consumer",
+                "2.0.0",
+                "consmeta",
+                &[("dep", &out_dir.join("libdep-depmeta.rlib"))],
+            );
+            write_outputs(&out_dir, "consumer", "consmeta");
+
+            // The dependency's mark lands first: the flush guarantees the
+            // registration before the dependent's frames are written.
+            let mut dep_conn = connect_raw(&endpoint).await;
+            send_observed(&mut dep_conn, &token, &dep_args, None).await;
+            flush_frames(&mut dep_conn, &token).await;
+
+            let mut consumer_conn = connect_raw(&endpoint).await;
+            send_observed(&mut consumer_conn, &token, &consumer_args, None).await;
+            send_observed(&mut consumer_conn, &token, &consumer_args, Some(true)).await;
+
+            // No flush here — the report's bookkeeping is what waits, so
+            // the connection's next frame cannot be answered yet. Give it
+            // a beat to prove the wait is real: nothing may be stored
+            // while the dependency is in flight.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                stored_crates(&config).await.is_empty(),
+                "nothing may be stored while the dependency is in flight"
+            );
+
+            send_observed(&mut dep_conn, &token, &dep_args, Some(true)).await;
+            // The flush answers only after the dependency's bookkeeping —
+            // store included — has run to its end.
+            flush_frames(&mut dep_conn, &token).await;
+
+            // The dependent's wait releases now and its store lands.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while stored_crates(&config).await.len() != 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the dependent was not stored"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(stored_crates(&config).await, vec!["consumer", "dep"]);
+        }
+
+        /// A facade whose connection ends between the mark and the report
+        /// completes the unit's flight anyway — the dependent is
+        /// released, finds the bookkeeping genuinely absent, and the
+        /// debug line says which extern was never recorded (stow#618).
+        #[tokio::test]
+        async fn a_dead_connection_releases_the_dependent() {
+            #[derive(Clone)]
+            struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for SharedLog {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().expect("log buffer").extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _default = tracing::subscriber::set_default(subscriber);
+
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+
+            let (config, in_flight, handler) = fixture(tempdir.path()).await;
+            let supervisor = server::start(handler, in_flight).expect("start supervisor");
+            let [(_, endpoint), (_, token)] = supervisor.env();
+            let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
+
+            let dep_args = unit_args(&registry_src, &out_dir, "dep2", "1.0.0", "dep2meta", &[]);
+            write_outputs(&out_dir, "dep2", "dep2meta");
+            let consumer_args = unit_args(
+                &registry_src,
+                &out_dir,
+                "consumer2",
+                "2.0.0",
+                "cons2meta",
+                &[("dep2", &out_dir.join("libdep2-dep2meta.rlib"))],
+            );
+            write_outputs(&out_dir, "consumer2", "cons2meta");
+
+            // The dependency's mark lands — the flush proves it — then
+            // the facade's connection dies with no report ever coming.
+            let mut dep_conn = connect_raw(&endpoint).await;
+            send_observed(&mut dep_conn, &token, &dep_args, None).await;
+            flush_frames(&mut dep_conn, &token).await;
+            drop(dep_conn);
+
+            let mut consumer_conn = connect_raw(&endpoint).await;
+            send_observed(&mut consumer_conn, &token, &consumer_args, None).await;
+            send_observed(&mut consumer_conn, &token, &consumer_args, Some(true)).await;
+            // The dependent's bookkeeping waits only until the dead
+            // connection's flight completes — then the flush answers.
+            flush_frames(&mut consumer_conn, &token).await;
+
+            wait_until(
+                || {
+                    let captured = log.0.lock().expect("log buffer");
+                    String::from_utf8_lossy(&captured).contains("bookkeeping was never recorded")
+                },
+                "the unrecorded-dependency debug line",
+                Duration::from_secs(10),
+            )
+            .await;
+            let captured = {
+                let captured = log.0.lock().expect("log buffer");
+                String::from_utf8_lossy(&captured).into_owned()
+            };
+            assert!(
+                captured.contains("consumer2"),
+                "the debug line names the skipped unit:\n{captured}"
+            );
+            assert!(
+                stored_crates(&config).await.is_empty(),
+                "a dependent whose dependency never recorded is not stored"
+            );
+        }
     }
 }

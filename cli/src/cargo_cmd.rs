@@ -3965,15 +3965,20 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
                  writer when the analysis is not deferred",
             );
     }
+    // The supervisor and the handler share the build's in-flight unit
+    // registry: the server marks and completes flights, the post-compiles
+    // wait on them before resolving dependency identities (stow#618).
+    let in_flight = crate::supervisor::server::InFlightUnits::default();
     let handler = std::sync::Arc::new(crate::BuildSupervisor::new(crate::BuildContext {
         policy_dir: cache_policy_path.map(Path::to_path_buf),
         public_cache_target: Some(project.target.clone()),
         public_cache_disabled: public_cache_mode.disable_reason().is_some(),
         analysis: std::sync::Arc::clone(&analysis_cell),
         serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
+        in_flight: in_flight.clone(),
     }));
-    let supervisor = tracing::debug_span!("stow.precargo.supervisor_start")
-        .in_scope(|| crate::supervisor::server::start(handler.clone()))
+    let mut supervisor = tracing::debug_span!("stow.precargo.supervisor_start")
+        .in_scope(|| crate::supervisor::server::start(handler.clone(), in_flight))
         .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
     for (key, value) in supervisor.env() {
         command.env(key, value);
@@ -4009,7 +4014,11 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         .status()
         .await
         .wrap_err_with(|| format!("run cargo {action}"))?;
-    drop(supervisor);
+    // Cargo has exited, so every facade has: stop accepting and drain the
+    // last connections' post-compile bookkeeping before the runtime goes
+    // away — the last unit's store is inside that tail, and so is its
+    // miss observation (stow#618).
+    supervisor.shutdown().await;
     if let Some(config) = config {
         if status.success() {
             report_cache_coverage(config, before, covered_units).await;
