@@ -7,12 +7,32 @@ pub const STOW_PUBLIC_CACHE_TARGET_ENV: &str = "STOW_PUBLIC_CACHE_TARGET";
 
 /// Env channel carrying the rustc arguments a `stow`-supervised cargo run
 /// appends to every unit — the workspace path remap plus any flags the run
-/// itself selected — `\x1f`-joined like `CARGO_ENCODED_RUSTFLAGS`. A private
-/// channel rather than `RUSTFLAGS`, because env rustflags replace the
-/// user's configured rustflags outright: assigning `RUSTFLAGS` would make
-/// cargo ignore `.cargo/config.toml` `target.*.rustflags` — the usual way
+/// itself selected. It names a JSON `Vec<String>` build file rather than
+/// carrying the list itself: on the prebuilt-deps path the list is one
+/// `--extern` per direct dependency, which a workspace-sized project can
+/// grow past `execve`'s per-string limit (stow#625). A private channel
+/// rather than `RUSTFLAGS`, because env rustflags replace the user's
+/// configured rustflags outright: assigning `RUSTFLAGS` would make cargo
+/// ignore `.cargo/config.toml` `target.*.rustflags` — the usual way
 /// `-C link-arg=-fuse-ld=mold` is enabled — for the whole build.
-pub const STOW_RUSTC_EXTRA_ARGS_ENV: &str = "STOW_RUSTC_EXTRA_ARGS";
+pub const STOW_RUSTC_EXTRA_ARGS_FILE_ENV: &str = "STOW_RUSTC_EXTRA_ARGS_FILE";
+
+/// The extra rustc arguments the driver named on the environment —
+/// empty when the variable is unset.
+///
+/// # Errors
+///
+/// A set variable whose file is missing or malformed is a wiring bug and
+/// fails loudly, naming the path — the same contract the build's other
+/// table files follow (stow#625).
+pub fn extra_args_from_env() -> stow_types::error::Result<Vec<std::ffi::OsString>> {
+    let Some(path) = std::env::var_os(STOW_RUSTC_EXTRA_ARGS_FILE_ENV) else {
+        return Ok(Vec::new());
+    };
+    let path = std::path::PathBuf::from(path);
+    let args = crate::read_build_json_table::<Vec<String>>(&path, STOW_RUSTC_EXTRA_ARGS_FILE_ENV)?;
+    Ok(args.into_iter().map(std::ffi::OsString::from).collect())
+}
 #[tracing::instrument(name = "stow.rustc.probe.version", skip_all, fields(env_cache_hit))]
 pub async fn detect_rustc_version(rustc: &std::ffi::OsStr) -> Result<String, String> {
     if let Some(version) = configured_public_cache_rustc_version() {
