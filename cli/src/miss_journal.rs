@@ -668,6 +668,7 @@ impl SidecarKeyInputs {
     /// the function hashes changed since the build (stow#588).
     fn key_of(&self) -> stow_types::error::Result<String> {
         let cargo_args: Vec<OsString> = self.cargo_args.iter().map(OsString::from).collect();
+        let env = std::env::vars_os().collect::<Vec<_>>();
         crate::lockfile_graph_cache::key_of(&crate::lockfile_graph_cache::KeyInputs {
             action: &self.action,
             cargo_args: &cargo_args,
@@ -677,6 +678,7 @@ impl SidecarKeyInputs {
             target: &self.target,
             target_given: self.target_given,
             rustc_version: &self.rustc_version,
+            env: &env,
         })
     }
 }
@@ -1168,6 +1170,10 @@ mod tests {
                 target: "wasm32-unknown-unknown",
                 target_given: true,
                 rustc_version: "1.99.0",
+                // The same environment the drain's recompute sees —
+                // `cache_key` reads `vars_os` on the live path, so the
+                // memoized key must too (stow#617).
+                env: Box::leak(Box::new(std::env::vars_os().collect::<Vec<_>>())).as_slice(),
             },
         )
     }
