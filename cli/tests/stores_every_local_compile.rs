@@ -9,40 +9,20 @@
 //! in-flight units its `--extern` set names — so the count is the whole
 //! set every time.
 
-use std::net::TcpListener;
+mod support;
+
 use std::path::Path;
-use std::process::Command;
+
+use support::{refused_url, stow_build_in, stow_setup_in, write_fixture};
 
 /// The fixture's dependency list: the `proc-macro2`/`quote` pair — a
 /// dependent small enough to finish before its dependency's rustc exits
 /// — and two plain leaf crates. `unicode-ident` rides along as
 /// `proc-macro2`'s own dependency.
-fn write_fixture(dir: &Path, cargo_home: &Path) {
-    std::fs::write(
-        dir.join("Cargo.toml"),
-        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-         [dependencies]\n\
-         cfg-if = \"1\"\n\
-         memchr = \"2\"\n\
-         proc-macro2 = \"1\"\n\
-         quote = \"1\"\n",
-    )
-    .expect("write manifest");
-    std::fs::create_dir_all(dir.join("src")).expect("create src");
-    std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
-    // Resolve now, so the builds under test are not also network tests.
-    let fetched = Command::new("cargo")
-        .arg("fetch")
-        .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
-    assert!(
-        fetched.status.success(),
-        "cargo fetch failed:\n{}",
-        String::from_utf8_lossy(&fetched.stderr)
-    );
-}
+const FIXTURE_DEPENDENCIES: &str = "cfg-if = \"1\"\n\
+     memchr = \"2\"\n\
+     proc-macro2 = \"1\"\n\
+     quote = \"1\"\n";
 
 /// Every `crate_name` the fixture's all-miss build must store — the
 /// cacheable units of the tree, named explicitly.
@@ -50,66 +30,6 @@ fn expected_stored_crates() -> std::collections::BTreeSet<&'static str> {
     ["cfg-if", "memchr", "proc-macro2", "quote", "unicode-ident"]
         .into_iter()
         .collect()
-}
-
-/// A local port with nothing listening on it: the edge and the registry
-/// both fail fast instead of hanging the build.
-fn refused_url() -> String {
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to pick a port");
-        listener.local_addr().expect("local addr").port()
-    };
-    format!("http://127.0.0.1:{port}")
-}
-
-/// `stow-cli setup` in the isolated `CARGO_HOME` — the one-time mold
-/// selection, kept out of the builds under test (stow#294: a Linux
-/// `stow build` refuses to run without it).
-fn stow_setup_in(dir: &Path, cargo_home: &Path) {
-    let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
-        .arg("setup")
-        .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run stow-cli setup");
-    assert!(
-        setup.status.success(),
-        "stow setup failed:\n{}",
-        String::from_utf8_lossy(&setup.stderr)
-    );
-}
-
-fn stow_build_in(
-    dir: &Path,
-    edge_url: &str,
-    registry_url: &str,
-    cache_dir: &Path,
-    cargo_home: &Path,
-    target_dir: &Path,
-) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_stow-cli"))
-        .args(["build", "--offline"])
-        .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .env("STOW_EDGE_URL", edge_url)
-        .env("STOW_REGISTRY_BASE_URL", registry_url)
-        .env("STOW_CACHE_DIR", cache_dir)
-        // Isolate from the developer's ambient stow config: a user-level
-        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
-        // would make this binary reject the config and skip the cache.
-        .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
-        .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("CARGO_TARGET_DIR", target_dir)
-        // The supervisor runs in this process, so its warnings are on
-        // this stderr once `RUST_LOG` lets them through — the assertion
-        // below needs them visible (stow#619).
-        .env("RUST_LOG", "stow_cli=warn")
-        .output()
-        .expect("run stow-cli build")
 }
 
 fn stored_crate_names(db: &Path) -> std::collections::BTreeSet<String> {
@@ -142,7 +62,7 @@ fn stored_crate_names(db: &Path) -> std::collections::BTreeSet<String> {
 fn every_compiled_unit_is_stored_before_the_build_exits() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cargo_home = tempfile::tempdir().expect("cargo home");
-    write_fixture(dir.path(), cargo_home.path());
+    write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
     let registry_url = refused_url();
@@ -152,6 +72,7 @@ fn every_compiled_unit_is_stored_before_the_build_exits() {
         let target = tempfile::tempdir().expect("target dir");
         let output = stow_build_in(
             dir.path(),
+            &["build", "--offline"],
             &edge_url,
             &registry_url,
             cache.path(),
