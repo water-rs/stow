@@ -171,6 +171,28 @@ fn stow_build_in(
     stow_build_command(dir, edge_url, cache_dir, cargo_home, &dir.join("target"))
 }
 
+/// One untimed `stow build` of the empty crate under the same
+/// `STOW_CACHE_DIR` and environment the timed build sees — the
+/// per-machine state stow keeps in the cache dir (the link resolution's
+/// `rustc --print cfg` answer and the mold link probe, the row `stow
+/// setup` records) is paid once, off the clock. The timed build's own
+/// project stays all-miss: nothing about it is cached (stow#608).
+fn prime_stow_cache(primer_dir: &Path, edge_url: &str, cache_dir: &Path, cargo_home: &Path) {
+    let throwaway_target = tempfile::tempdir().expect("primer target");
+    let output = stow_build_command(
+        primer_dir,
+        edge_url,
+        cache_dir,
+        cargo_home,
+        throwaway_target.path(),
+    );
+    assert!(
+        output.status.success(),
+        "stow priming build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn stow_build_command(
     dir: &Path,
     edge_url: &str,
@@ -829,6 +851,11 @@ fn write_empty_crate(dir: &Path) {
 /// stow#347 bans, not the wrapper's existence. Measured rather than
 /// asserted so it scales with the tested binary's profile.
 fn stow_startup_floor(dir: &Path, cargo_home: &Path, edge_url: &str) -> std::time::Duration {
+    // The priming project is a second empty crate in another temp
+    // directory, so the timed empty build's own directory is still
+    // fresh: only the machine-level rows are warm (stow#608).
+    let primer_dir = tempfile::tempdir().expect("primer dir");
+    write_empty_crate(primer_dir.path());
     let mut cargo_windows = Vec::new();
     let mut stow_windows = Vec::new();
     for _ in 0..3 {
@@ -856,6 +883,7 @@ fn stow_startup_floor(dir: &Path, cargo_home: &Path, edge_url: &str) -> std::tim
 
         let stow_cache = tempfile::tempdir().expect("stow cache");
         let stow_target = tempfile::tempdir().expect("stow target");
+        prime_stow_cache(primer_dir.path(), edge_url, stow_cache.path(), cargo_home);
         let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
         command
             .arg("build")
@@ -1050,6 +1078,15 @@ fn timed_build(
 /// acceptance criterion is wall time: stow must never be slower than
 /// cargo.
 ///
+/// What is measured is an all-miss build on a machine where stow has
+/// already run once: each stow iteration still gets a fresh
+/// `STOW_CACHE_DIR`, so no artifact of the measured project is cached,
+/// but an untimed `stow build` of the empty crate primes that cache dir
+/// first — paying the one-time, per-machine cost the link resolution's
+/// `rustc --print cfg` evaluation and the mold link probe are, the same
+/// row `stow setup` records so a user's first build is already warm
+/// (stow#608).
+///
 /// Two measurements per run, each side `TIMED_RUNS` times, interleaved
 /// so both samples see the same machine load:
 ///
@@ -1108,6 +1145,12 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
 
         let stow_cache = tempfile::tempdir().expect("stow cache");
         let stow_target = tempfile::tempdir().expect("stow target");
+        prime_stow_cache(
+            empty_dir.path(),
+            &edge_url,
+            stow_cache.path(),
+            cargo_home.path(),
+        );
         let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
         command
             .arg("build")

@@ -56,6 +56,15 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
         mold_bin_dir.as_deref(),
     )
     .await?;
+    // The link resolution a first build would run, recorded now under
+    // the per-machine key — a project with no config of its own builds
+    // warm (stow#608). The record must come after the write: the key
+    // digests the global file's content. Linux only;
+    // `warm_global_link_cache` is a no-op elsewhere.
+    if cfg!(target_os = "linux") {
+        let stow_config = StowConfig::load()?;
+        mold::warm_global_link_cache(&cargo_home, &host_target, &stow_config).await?;
+    }
 
     tracing::info!(
         path = %config_path.display(),

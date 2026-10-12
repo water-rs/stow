@@ -234,13 +234,65 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     let cargo_home = crate::config::cargo_home();
-    let config = global_cargo_config(cargo_home.as_deref())
+    let (config, _de_wrapped) = global_cargo_config(cargo_home.as_deref())
         .map_err(|error| stow_types::stow_error!("load global cargo config: {error}"))?;
     let link = resolve_link_from(&config, &host, &process_env);
     if link.selects_mold && link.unavailable_reason().await.is_none() {
         return Ok(None);
     }
     Ok(Some(ensure_mold_install().await?))
+}
+
+/// The link resolution a build from a directory with no config of its
+/// own performs, run by `stow setup` against the global config it just
+/// wrote so the outcome is already recorded when that first build asks
+/// (stow#608). The invocation directory passed to the key is
+/// `cargo_home` itself — the directory the global read walked — whose
+/// document set is the global file plus its ancestors, exactly the set
+/// a bare project directory's walk digests (its own ancestors plus the
+/// same global file).
+///
+/// # Errors
+///
+/// Whatever the config load, the state-DB pool, or the resolution
+/// itself fails with.
+pub async fn warm_global_link_cache(
+    cargo_home: &Path,
+    host: &str,
+    stow_config: &crate::config::StowConfig,
+) -> stow_types::error::Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let (config, de_wrapped) = global_cargo_config(Some(cargo_home))
+        .map_err(|error| stow_types::stow_error!("load global cargo config: {error}"))?;
+    let pool = stow_config.state_db_pool().await?;
+    let cfg_rustc = config.build.rustc.clone();
+    let env_map = link_env_vars(std::env::vars_os(), de_wrapped);
+    provision_resolved(
+        config,
+        cfg_rustc,
+        cargo_home,
+        Some(cargo_home),
+        host,
+        &env_map,
+        &process_env,
+        &shared_rustc_vv(),
+        Some(&pool),
+    )
+    .await?;
+    Ok(())
+}
+
+/// One `rustc -vV` of the toolchain's rustc as the shared probe the
+/// driver's contexts build once — setup's cache key needs the same
+/// answer.
+fn shared_rustc_vv() -> crate::rustc_args::SharedRustcVv {
+    futures_util::FutureExt::shared(futures_util::FutureExt::boxed(async move {
+        crate::rustc_args::rustc_vv(OsStr::new("rustc"))
+            .await
+            .map(std::sync::Arc::new)
+    }))
 }
 
 /// Merge stow's mold selection into `document`: the `cfg(target_os =
@@ -521,9 +573,16 @@ fn link_config_documents(cargo_dir: &Path, cargo_home: Option<&Path>) -> Vec<(St
         paths.push(home.join("config.toml"));
         paths.push(home.join("config"));
     }
+    // Only documents that exist enter the key: two invocation
+    // directories whose Walk names only absent files then digest the
+    // same set — one key per machine, toolchain and target rather than
+    // per project directory. A document appearing or disappearing
+    // changes the set, so it is still a different key.
     let mut documents = Vec::new();
     for path in paths {
-        let contents = std::fs::read(&path).unwrap_or_default();
+        let Ok(contents) = std::fs::read(&path) else {
+            continue;
+        };
         documents.push((
             path.display().to_string(),
             hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&contents)),
@@ -999,9 +1058,14 @@ fn cargo_config_for_link_eval(
 /// where project-level files must not answer: ancestors of
 /// `cargo_home`, which reach `$CARGO_HOME/config.toml` and any
 /// system-level `.cargo` configs above it but never a project's.
+///
+/// The flag is whether the `RUSTC_WRAPPER=""` override was applied for
+/// the returned load — the same rule [`cargo_config_for_link_eval`]
+/// encodes in its env map, so a caller can digest the environment the
+/// evaluation actually saw.
 fn global_cargo_config(
     cargo_home: Option<&Path>,
-) -> Result<cargo_config2::Config, cargo_config2::Error> {
+) -> Result<(cargo_config2::Config, bool), cargo_config2::Error> {
     let cargo_home = cargo_home.map(Path::to_path_buf);
     let config = cargo_config2::Config::load_with_options(
         cargo_home.clone().unwrap_or_default(),
@@ -1017,15 +1081,16 @@ fn global_cargo_config(
         .and_then(Path::to_str)
         .is_some_and(crate::commands::is_stow_owned_value);
     if !stow_wrapped {
-        return Ok(config);
+        return Ok((config, false));
     }
     let env = std::env::vars_os().chain([(OsString::from("RUSTC_WRAPPER"), OsString::new())]);
-    cargo_config2::Config::load_with_options(
+    let config = cargo_config2::Config::load_with_options(
         cargo_home.clone().unwrap_or_default(),
         cargo_config2::ResolveOptions::default()
             .cargo_home(cargo_home)
             .env(env),
-    )
+    )?;
+    Ok((config, true))
 }
 
 /// Every cargo config document cargo reads for an invocation at
@@ -1423,7 +1488,7 @@ mod tests {
     /// directory and nothing else — injected into the walk under test, so
     /// no test ever touches the process environment its siblings share.
     struct IsolatedProject {
-        _tempdir: tempfile::TempDir,
+        tempdir: tempfile::TempDir,
         project: PathBuf,
         cargo_home: PathBuf,
         env: std::collections::HashMap<String, OsString>,
@@ -1461,7 +1526,7 @@ mod tests {
             cargo_home.clone().into_os_string(),
         )]);
         IsolatedProject {
-            _tempdir: tempdir,
+            tempdir,
             project,
             cargo_home,
             env,
@@ -1670,7 +1735,7 @@ mod tests {
         let fixture = isolated_project(
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
         );
-        let global = global_cargo_config(Some(&fixture.cargo_home)).expect("global config");
+        let (global, _) = global_cargo_config(Some(&fixture.cargo_home)).expect("global config");
         assert!(
             global
                 .rustflags(LINUX_TARGET)
@@ -2290,6 +2355,145 @@ mod tests {
             counter_lines(&cc_counter).len(),
             4,
             "a changed probed executable re-probes"
+        );
+
+        // A config document appearing in an ancestor directory changes
+        // the document set — a different key, so it re-probes.
+        let prints_before_ancestor = counter_lines(&rustc_counter)
+            .into_iter()
+            .filter(|line| line.contains("--print"))
+            .count();
+        let ancestor = fixture.tempdir.path().join(".cargo");
+        std::fs::create_dir_all(&ancestor).expect("ancestor .cargo");
+        std::fs::write(
+            ancestor.join("config.toml"),
+            format!(
+                "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\n[target.{LINUX_TARGET}]\nlinker = \"{}\"\n",
+                tools.path().join("stow-fake-cc").display()
+            ),
+        )
+        .expect("write ancestor config");
+        resolve_with_cache(&fixture, &pool)
+            .await
+            .expect("ancestor document");
+        assert_eq!(
+            counter_lines(&rustc_counter)
+                .into_iter()
+                .filter(|line| line.contains("--print"))
+                .count(),
+            prints_before_ancestor + 1,
+            "a document appearing in an ancestor directory re-probes"
+        );
+    }
+
+    /// Two invocation directories with no config of their own digest the
+    /// same document set — only the global file — so the second
+    /// resolution is a hit, not a re-probe. The mold wiring lives in
+    /// the global config here precisely so a config-less resolution
+    /// still pays the probes on a miss and the counters can tell hit
+    /// from miss (stow#608).
+    #[tokio::test]
+    async fn config_less_directories_share_one_key() {
+        let (_tools, _cache, _path, fixture, pool, rustc_counter, cc_counter) =
+            counting_fixture().await;
+        std::fs::write(
+            fixture.cargo_home.join("config.toml"),
+            std::fs::read_to_string(fixture.project.join(".cargo/config.toml"))
+                .expect("read project config"),
+        )
+        .expect("write global config");
+        std::fs::remove_file(fixture.project.join(".cargo/config.toml"))
+            .expect("drop the project config");
+        resolve_with_cache(&fixture, &pool)
+            .await
+            .expect("config-less resolution");
+        let prints = counter_lines(&rustc_counter)
+            .into_iter()
+            .filter(|line| line.contains("--print"))
+            .count();
+        let spawns = counter_lines(&cc_counter).len();
+        assert_eq!((prints, spawns), (1, 1), "cold key ran the probes");
+
+        // A bare directory elsewhere: no `.cargo` in it or above it, so
+        // its document set is the same global file — the shared key.
+        let bare_dir = tempfile::tempdir().expect("bare tempdir");
+        let bare = IsolatedProject {
+            project: bare_dir.path().to_path_buf(),
+            tempdir: bare_dir,
+            cargo_home: fixture.cargo_home.clone(),
+            env: fixture.env.clone(),
+        };
+        resolve_with_cache(&bare, &pool)
+            .await
+            .expect("shared-key resolution");
+        assert_eq!(
+            counter_lines(&rustc_counter)
+                .into_iter()
+                .filter(|line| line.contains("--print"))
+                .count(),
+            prints,
+            "a config-less directory in another path shares the key"
+        );
+        assert_eq!(
+            counter_lines(&cc_counter).len(),
+            spawns,
+            "the shared key skips the mold probe too"
+        );
+    }
+
+    /// `stow setup` records under the key a build computes for a project
+    /// with no config of its own: the invocation directory differs but
+    /// the inputs are the same — the shared rustc probe, the target, the
+    /// environment map and a document set of just the global file
+    /// (stow#608).
+    #[tokio::test]
+    async fn setup_key_equals_a_config_less_builds_key() {
+        let cargo_home = tempfile::tempdir().expect("cargo home");
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[build]\nrustc-wrapper = \"stow-rustc-wrapper\"\n",
+        )
+        .expect("write global config");
+        // The env map the eval saw — stow's own wrapper de-wrapped on
+        // both sides.
+        let env_map = link_env_vars(
+            [(
+                OsString::from("CARGO_HOME"),
+                cargo_home.path().as_os_str().to_os_string(),
+            )],
+            true,
+        );
+        let vv = ready_vv();
+
+        // The warm path computes against `cargo_home` itself — the
+        // directory the global read walked.
+        let setup = LinkResolutionKey::compute(
+            None,
+            cargo_home.path(),
+            Some(cargo_home.path()),
+            LINUX_TARGET,
+            &env_map,
+            &vv,
+        )
+        .await
+        .expect("setup key");
+
+        // A build invoked from a directory with no config of its own.
+        let bare = tempfile::tempdir().expect("bare project");
+        let build = LinkResolutionKey::compute(
+            None,
+            bare.path(),
+            Some(cargo_home.path()),
+            LINUX_TARGET,
+            &env_map,
+            &vv,
+        )
+        .await
+        .expect("build key");
+
+        assert_eq!(
+            setup.inputs_digest, build.inputs_digest,
+            "setup's key must equal the config-less build's"
         );
     }
 
