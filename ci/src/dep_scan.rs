@@ -7,6 +7,7 @@ use sha2::Digest as _;
 use stow_types::api::{BuildTaskPayload, ResolvedDependencyGraphEntry};
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
 use stow_types::platform::Profile;
+use stow_types::unit_graph::{TaskUnitKind, TaskUnitSide};
 
 use crate::task::{BuildWorkspace, BuiltWorkspace};
 use stow_types::capture::{
@@ -119,12 +120,15 @@ pub async fn scan_artifacts(
     )
     .await?;
     let output_owners = output_owner_index(&selected, &consumed_captures)?;
+    let phase_units = phase_feature_sets(task, built)?;
     let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
     let mut visiting = BTreeSet::<usize>::new();
     let mut cx = ResolveCx {
+        task,
         selected: &selected,
         consumed: &consumed_captures,
         output_owners: &output_owners,
+        phase_units: &phase_units,
         resolved: &mut resolved,
         visiting: &mut visiting,
     };
@@ -733,18 +737,140 @@ async fn build_scanned_artifact(
 
 /// The state resolution threads through [`resolve_artifact`] and
 /// [`resolve_dependencies`]: the record sets they walk, the output-owner
-/// index, and the memo maps accumulating across it.
+/// index, the unit-graph feature sets labelling each row, and the memo
+/// maps accumulating across it.
 struct ResolveCx<'a> {
+    /// The dispatched task — a selected artifact's side is always its.
+    task: &'a BuildTaskPayload,
     /// Selected compiled artifacts, by index.
     selected: &'a [SelectedCapturedArtifact],
     /// Consumed-capture groups, by index.
     consumed: &'a [ConsumedCapture],
     /// Output path → the record that produced it.
     output_owners: &'a BTreeMap<PathBuf, OutputOwner>,
+    /// Phase `CARGO_TARGET_DIR` → that phase×invocation's resolved lib-unit
+    /// feature sets.
+    phase_units: &'a BTreeMap<PathBuf, PhaseFeatureSets>,
     /// Resolved artifacts by selected index — the walk's memo.
     resolved: &'a mut BTreeMap<usize, ResolvedArtifact>,
     /// Selected indices on the current path — cycle detection.
     visiting: &'a mut BTreeSet<usize>,
+}
+
+/// One phase×invocation unit graph's resolved feature sets: every
+/// crates.io lib unit's `(package, version, side)` → the feature set
+/// cargo activated for it — the same set the task's dispatch and a
+/// consumer's unit graph compute (stow#611).
+struct PhaseFeatureSets {
+    /// The phase and invocation spelling, for errors.
+    label: String,
+    lib_features: BTreeMap<(String, String, bool), BTreeSet<String>>,
+}
+
+/// Every phase×invocation's lib-unit feature sets, keyed by the phase's
+/// `CARGO_TARGET_DIR` — the value a capture records as `target_dir`,
+/// which is the only fact that says which graph a record compiled under.
+fn phase_feature_sets(
+    task: &BuildTaskPayload,
+    built: &BuiltWorkspace,
+) -> stow_types::error::Result<BTreeMap<PathBuf, PhaseFeatureSets>> {
+    let host_triple = stow_types::api::runner_family(task.target.as_str())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "task {} {} targets {} — no runner family names its host triple",
+                task.crate_name.as_str(),
+                task.version,
+                task.target
+            )
+        })?
+        .host_triple();
+    let mut phases = BTreeMap::new();
+    for graph in built.unit_graphs() {
+        let units = graph.task_units(host_triple).map_err(|error| {
+            stow_types::stow_error!("{} unit graph does not convert: {error}", graph.label())
+        })?;
+        let mut lib_features = BTreeMap::new();
+        for unit in &units {
+            if unit.key.kind != TaskUnitKind::Lib || !unit.is_crates_io {
+                continue;
+            }
+            let key = (
+                unit.name.clone(),
+                unit.version.clone(),
+                unit.key.side == TaskUnitSide::Host,
+            );
+            let features = unit.features.iter().cloned().collect::<BTreeSet<_>>();
+            if let Some(existing) = lib_features.get(&key)
+                && *existing != features
+            {
+                return Err(stow_types::stow_error!(
+                    "{} unit graph holds two feature sets for the {} lib unit of {} {}",
+                    graph.label(),
+                    if unit.key.side == TaskUnitSide::Host {
+                        "host"
+                    } else {
+                        "target"
+                    },
+                    unit.name,
+                    unit.version,
+                ));
+            }
+            lib_features.insert(key, features);
+        }
+        phases.insert(
+            graph.target_dir(built.run_dir()),
+            PhaseFeatureSets {
+                label: graph.label(),
+                lib_features,
+            },
+        );
+    }
+    Ok(phases)
+}
+
+/// The feature set the artifact's row is labelled with: the feature set
+/// cargo's resolver computed for the package's lib unit in the unit graph
+/// of the phase and invocation the capture belongs to — the directory the
+/// record ran under names both (stow#611).
+///
+/// The capture's own `features` are *not* this set: they are the
+/// `--cfg feature="…"` scan of the rustc argv, which also carries
+/// whatever `cargo:rustc-cfg=feature="…"` lines the crate's build script
+/// printed — cargo passes them to rustc exactly like resolved features
+/// (`target-lexicon`'s `rust_1_40`, `winapi`'s implied set). Those cfgs
+/// stay the invocation's truth for the compile key; the semantic label
+/// is the resolver's answer alone.
+///
+/// No match is a hard error: the row has no honest label without the
+/// unit that produced it, and falling back to the captured scan is the
+/// mislabel this exists to remove.
+fn unit_features_json(
+    cx: &ResolveCx<'_>,
+    artifact: &SelectedCapturedArtifact,
+) -> stow_types::error::Result<String> {
+    let Some(phase) = cx.phase_units.get(&artifact.captured.target_dir) else {
+        return Err(stow_types::stow_error!(
+            "dep_scan capture of {} {} recorded target dir {}, which is no phase of this build",
+            artifact.package.name,
+            artifact.package.version,
+            artifact.captured.target_dir.display(),
+        ));
+    };
+    let key = (
+        artifact.package.name.clone(),
+        artifact.package.version.to_string(),
+        cx.task.host_side,
+    );
+    let Some(features) = phase.lib_features.get(&key) else {
+        return Err(stow_types::stow_error!(
+            "the {} unit graph holds no {}-side lib unit for {} {} — cannot label its row",
+            phase.label,
+            if cx.task.host_side { "host" } else { "target" },
+            artifact.package.name,
+            artifact.package.version,
+        ));
+    };
+    stow_types::unit_graph::serialize_feature_set(features)
 }
 
 fn resolve_artifact(
@@ -764,22 +890,7 @@ fn resolve_artifact(
         stow_types::stow_error!("selected artifact index {artifact_index} is out of bounds")
     })?;
     let dependencies = resolve_dependencies(cx, artifact_index)?;
-    // The row's feature set is the `--cfg feature="…"` list the wrapper
-    // recorded at rustc exit — the same invocation identity the consumer's
-    // unit graph reproduces when it looks the artifact up. Cargo
-    // metadata's resolve features are not this set: they are
-    // platform-agnostic and side-unified, and they keep the implicit
-    // feature of an optional dep this target never compiled, which is
-    // exactly the mislabelling stow#579 recorded.
-    let features_json = serde_json::to_string(
-        &artifact
-            .captured
-            .features
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>(),
-    )
-    .expect("feature serialization must succeed");
+    let features_json = unit_features_json(cx, artifact)?;
     cx.visiting.remove(&artifact_index);
 
     let resolved_artifact = ResolvedArtifact {
@@ -2024,16 +2135,54 @@ mod tests {
         }
     }
 
+    /// The label lookup's view of the phase graphs these tests run: one
+    /// phase target dir holding `(package, version, host-side, resolved
+    /// features)` lib units — the unit-graph answer the row label reads.
+    fn phase_units(
+        dir: &str,
+        units: &[(&str, &str, bool, &[&str])],
+    ) -> BTreeMap<PathBuf, super::PhaseFeatureSets> {
+        let lib_features = units
+            .iter()
+            .map(|(name, version, host_side, features)| {
+                (
+                    ((*name).to_owned(), (*version).to_owned(), *host_side),
+                    features
+                        .iter()
+                        .map(|feature| (*feature).to_owned())
+                        .collect(),
+                )
+            })
+            .collect();
+        BTreeMap::from([(
+            PathBuf::from(dir),
+            super::PhaseFeatureSets {
+                label: "check task-spelled".to_owned(),
+                lib_features,
+            },
+        )])
+    }
+
     fn resolve_consumer(
         selected: &[SelectedCapturedArtifact],
     ) -> stow_types::error::Result<ResolvedArtifact> {
+        let task = consumer_task();
         let output_owners = output_owner_index(selected, &[]).expect("build output owner index");
+        let phase_units = phase_units(
+            "/tmp/workspace/target",
+            &[
+                ("itoa", "1.0.18", false, &[]),
+                ("serde_json", "1.0.149", false, &["default", "std"]),
+            ],
+        );
         let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
         let mut visiting = BTreeSet::<usize>::new();
         let mut cx = super::ResolveCx {
+            task: &task,
             selected,
             consumed: &[],
             output_owners: &output_owners,
+            phase_units: &phase_units,
             resolved: &mut resolved,
             visiting: &mut visiting,
         };
@@ -2066,14 +2215,16 @@ mod tests {
         assert_eq!(consumer.dependencies[0].stable_c_metadata, "leaf-raw");
     }
 
-    /// stow#579: the row's `features_json` is the invocation's own
-    /// `--cfg feature="…"` set. Cargo metadata's resolve features for the
-    /// same package would report `["fs", "net", "windows-sys"]` — the
-    /// `windows-sys` implicit feature of an optional dep that only
-    /// `cfg(windows)` compiles — which labels the artifact with an
-    /// identity no consumer's unit graph ever computes.
+    /// stow#611: the row's `features_json` is the feature set of the
+    /// artifact's unit in the build's own cargo unit graph — the set
+    /// cargo's resolver, stow-resolver and a consumer's unit graph all
+    /// compute. For tokio on a non-Windows target the unit graph holds
+    /// `{fs, net}` while `windows-sys` — the implicit feature of an
+    /// optional dep only `cfg(windows)` compiles — stays out, because
+    /// the graph is per target (stow#579).
     #[test]
-    fn the_resolved_artifact_is_labelled_with_the_captured_feature_set() {
+    fn the_resolved_artifact_is_labelled_with_its_units_feature_set() {
+        let task = consumer_task();
         let mut capture = captured("tokio", "1797fe20bc19a8bf", "/tmp/workspace/target/deps");
         capture.features = ["fs".to_owned(), "net".to_owned()].into_iter().collect();
         let selected = [SelectedCapturedArtifact {
@@ -2082,18 +2233,111 @@ mod tests {
             captured: capture,
             dependency_aliases: Vec::new(),
         }];
+        let phase_units = phase_units(
+            "/tmp/workspace/target",
+            &[("tokio", "1.53.2", false, &["fs", "net"])],
+        );
         let output_owners = output_owner_index(&selected, &[]).expect("owners");
         let mut resolved = BTreeMap::new();
         let mut visiting = BTreeSet::new();
         let mut cx = super::ResolveCx {
+            task: &task,
             selected: &selected,
             consumed: &[],
             output_owners: &output_owners,
+            phase_units: &phase_units,
             resolved: &mut resolved,
             visiting: &mut visiting,
         };
         let artifact = resolve_artifact(&mut cx, 0).expect("resolve");
         assert_eq!(artifact.features_json, "[\"fs\",\"net\"]");
+    }
+
+    /// stow#611: a build script's `cargo:rustc-cfg=feature="…"` output
+    /// reaches the invocation's `--cfg` set exactly like a resolved
+    /// feature — `target-lexicon 0.13.5` compiles with
+    /// `--cfg feature="rust_1_40"` — but the label is the unit's resolved
+    /// set alone, `["default","std"]`, the only identity a consumer's
+    /// unit graph computes.
+    #[test]
+    fn a_build_script_cfg_feature_never_reaches_the_label() {
+        let task = consumer_task();
+        let mut capture = captured(
+            "target-lexicon",
+            "1797fe20bc19a8bf",
+            "/tmp/workspace/target/deps",
+        );
+        capture.features = [
+            "default".to_owned(),
+            "rust_1_40".to_owned(),
+            "std".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let selected = [SelectedCapturedArtifact {
+            package: indexed("target-lexicon", "0.13.5"),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: capture,
+            dependency_aliases: Vec::new(),
+        }];
+        let phase_units = phase_units(
+            "/tmp/workspace/target",
+            &[("target-lexicon", "0.13.5", false, &["default", "std"])],
+        );
+        let output_owners = output_owner_index(&selected, &[]).expect("owners");
+        let mut resolved = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        let mut cx = super::ResolveCx {
+            task: &task,
+            selected: &selected,
+            consumed: &[],
+            output_owners: &output_owners,
+            phase_units: &phase_units,
+            resolved: &mut resolved,
+            visiting: &mut visiting,
+        };
+        let artifact = resolve_artifact(&mut cx, 0).expect("resolve");
+        assert_eq!(artifact.features_json, "[\"default\",\"std\"]");
+    }
+
+    /// A selected artifact whose package has no lib unit on the task's
+    /// side in its phase's graph cannot be labelled honestly — the
+    /// capture claims a unit cargo never resolved, so the scan fails
+    /// rather than fall back to the invocation's `--cfg` scan.
+    #[test]
+    fn an_artifact_with_no_matching_unit_is_an_error() {
+        let task = consumer_task();
+        let selected = [SelectedCapturedArtifact {
+            package: indexed("unresolved", "4.2.0"),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: captured(
+                "unresolved",
+                "1797fe20bc19a8bf",
+                "/tmp/workspace/target/deps",
+            ),
+            dependency_aliases: Vec::new(),
+        }];
+        let phase_units = phase_units(
+            "/tmp/workspace/target",
+            &[("serde_json", "1.0.149", false, &["default", "std"])],
+        );
+        let output_owners = output_owner_index(&selected, &[]).expect("owners");
+        let mut resolved = BTreeMap::new();
+        let mut visiting = BTreeSet::new();
+        let mut cx = super::ResolveCx {
+            task: &task,
+            selected: &selected,
+            consumed: &[],
+            output_owners: &output_owners,
+            phase_units: &phase_units,
+            resolved: &mut resolved,
+            visiting: &mut visiting,
+        };
+        let error = resolve_artifact(&mut cx, 0).expect_err("no unit, no label");
+        let message = error.to_string();
+        assert!(message.contains("unresolved 4.2.0"), "{message}");
+        assert!(message.contains("target-side"), "{message}");
+        assert!(message.contains("check task-spelled"), "{message}");
     }
 
     fn captured(crate_name: &str, c_metadata: &str, out_dir: &str) -> CapturedRustcArtifact {

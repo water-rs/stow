@@ -1494,9 +1494,10 @@ mod tests {
     use stow_types::rustc::ParsedRustcArgs;
 
     /// stow#579: the record carries the invocation's own feature set —
-    /// the `--cfg feature="…"` args rustc compiled — which is what the
-    /// published row is labelled with, not cargo metadata's
-    /// platform-agnostic resolve features.
+    /// the `--cfg feature="…"` args rustc compiled, build-script
+    /// `cargo:rustc-cfg=feature` output included — which is the compile
+    /// key's feature input. The published row's label is the unit-graph
+    /// feature set instead (stow#611).
     #[test]
     fn the_record_stamps_the_invocations_feature_set() {
         let _guard = env_guard();

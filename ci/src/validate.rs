@@ -90,6 +90,12 @@ pub fn validate_plan(
                 task.task_id,
             ));
         }
+        // stow#611: the task's own node's rows carry the dispatched
+        // feature set verbatim — the same set its unit in the build's
+        // cargo unit graph resolved and the label consumers look it up
+        // by. A row that disagrees is a mislabel the publish must
+        // refuse, not a row the index should advertise.
+        validate_own_node_features(task, artifact)?;
         if !closure.contains(
             artifact.crate_name.as_str(),
             artifact.crate_version.as_semver(),
@@ -150,6 +156,32 @@ pub fn validate_plan(
                 task.version
             ));
         }
+    }
+    Ok(())
+}
+
+/// A row for the dispatched task's own node must carry `task`'s feature
+/// set exactly — the feature set the task's unit resolved at, which is
+/// the label the row will be looked up by. Anything else (for example
+/// the invocation's `--cfg feature="…"` scan, which build-script
+/// `cargo:rustc-cfg=feature` output can enter, stow#611) is a mislabel
+/// the publish refuses, named by both sets.
+fn validate_own_node_features(
+    task: &BuildTaskPayload,
+    artifact: &PlannedArtifact,
+) -> stow_types::error::Result<()> {
+    let dispatched_version = task.version.as_semver();
+    let own_node = artifact.crate_name == task.crate_name
+        && artifact.crate_version.as_semver() == dispatched_version;
+    if own_node && artifact.features_json != task.features_json {
+        return Err(stow_types::stow_error!(
+            "planned artifact {} for the task's own crate {} {} carries features {} but the task dispatched {}",
+            artifact.oci_reference,
+            artifact.crate_name,
+            artifact.crate_version,
+            artifact.features_json.raw(),
+            task.features_json.raw(),
+        ));
     }
     Ok(())
 }
@@ -380,6 +412,34 @@ mod tests {
             format!("{error}").contains("dependency_identity"),
             "the rejection names the differing claim: {error}"
         );
+    }
+
+    /// stow#611: a row for the task's own crate must carry the dispatched
+    /// feature set exactly — the set its unit resolved and consumers
+    /// compute. A row labelled with the invocation's `--cfg feature` scan
+    /// (a build script's `cargo:rustc-cfg=feature` output included) is a
+    /// mislabel the publish refuses, naming both sets.
+    #[test]
+    fn rejects_an_own_node_row_whose_features_differ_from_the_task() {
+        let mut artifact = planned("demo", "1.0.0");
+        artifact.features_json =
+            FeaturesJson::canonicalize(vec!["default".to_owned(), "rust_1_40".to_owned()]).unwrap();
+        artifact.oci_reference = oci_reference(
+            &planned_artifact_key(&artifact).unwrap(),
+            artifact.c_metadata.as_str(),
+        );
+        let error = validate_plan(
+            &task(),
+            &task(),
+            &[artifact],
+            &closure(&[("demo", "1.0.0")]),
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("[\"default\",\"rust_1_40\"]"), "{message}");
+        assert!(message.contains("task dispatched []"), "{message}");
     }
 
     #[test]
