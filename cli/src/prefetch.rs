@@ -211,7 +211,9 @@ async fn drain_prefetch(
             }
             Ok(Some(Ok(PrefetchOutcome::Absent))) => summary.misses += 1,
             Ok(Some(Err(error))) => {
-                tracing::warn!(error = %error, "prefetched stow artifact processing failed");
+                // Per artifact: `summary.failed` is what the driver warns
+                // with, once per build (stow#633).
+                tracing::debug!(error = %error, "prefetched stow artifact processing failed");
                 summary.failed += 1;
             }
             Ok(None) => break,

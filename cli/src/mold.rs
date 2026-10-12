@@ -922,7 +922,9 @@ async fn download(url: &str) -> stow_types::error::Result<Vec<u8>> {
                 let Some(wait) = backoff.next_wait(retry_after) else {
                     return Err(error);
                 };
-                tracing::warn!(url, %error, "mold download failed; retrying");
+                // Per attempt: the exhausted retry's error is what the
+                // caller surfaces (stow#633).
+                tracing::debug!(url, %error, "mold download failed; retrying");
                 wait
             }
             DownloadOutcome::Fatal(error) => return Err(error),

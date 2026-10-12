@@ -21,7 +21,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::protocol::{
-    Answer, AwaitServeMap, Compiled, Observed, Plan, Request, read_frame, write_frame,
+    Answer, ArtifactNotifications, AwaitServeMap, Compiled, Observed, Plan, Request, read_frame,
+    write_frame,
 };
 use super::{ENDPOINT_ENV, Endpoint, TOKEN_ENV};
 
@@ -84,8 +85,10 @@ pub struct Observation {
 
 /// A handler's decision about one invocation.
 pub enum Decision<P> {
-    /// The outputs are in place; the facade exits 0.
-    Served,
+    /// The outputs are in place; the facade exits 0. The payload is the
+    /// artifact-notification lines the facade owes cargo's stderr first
+    /// (stow#633).
+    Served(ArtifactNotifications),
     /// The facade runs rustc and reports back with `pending` restored.
     Compile(P),
 }
@@ -109,9 +112,10 @@ pub struct Supervisor {
     accept_task: Option<tokio::task::JoinHandle<()>>,
     /// Live connection count, read by the drain's overrun warning.
     connections: Arc<AtomicUsize>,
-    /// Removed when the supervisor drops, taking the socket with it.
+    /// Holds the socket. Removed by [`Self::shutdown`], or when the
+    /// supervisor drops without reaching it.
     #[cfg(unix)]
-    _socket_dir: Option<tempfile::TempDir>,
+    socket_dir: Option<tempfile::TempDir>,
 }
 
 impl Supervisor {
@@ -132,8 +136,19 @@ impl Supervisor {
     /// The wait is bounded: on overrun it warns with the number of
     /// connections abandoned rather than hanging the build. Returns that
     /// number — `0` is a clean drain.
+    ///
+    /// The socket's directory is removed here rather than at drop: a
+    /// failing build leaves through `std::process::exit`, which runs no
+    /// destructors (stow#630).
     pub async fn shutdown(&mut self) -> usize {
-        self.shutdown_within(CONNECTION_DRAIN_BUDGET).await
+        let abandoned = self.shutdown_within(CONNECTION_DRAIN_BUDGET).await;
+        #[cfg(unix)]
+        if let Some(socket_dir) = self.socket_dir.take()
+            && let Err(error) = socket_dir.close()
+        {
+            tracing::warn!(%error, "could not remove the supervisor socket directory");
+        }
+        abandoned
     }
 
     /// [`Self::shutdown`] with an explicit bound — the constant lives at
@@ -233,7 +248,7 @@ where
             shutdown: Some(shutdown_tx),
             accept_task: Some(accept_task),
             connections,
-            _socket_dir: Some(socket_dir),
+            socket_dir: Some(socket_dir),
         })
     }
 
@@ -408,7 +423,11 @@ impl InFlightUnits {
                 }
             }
         }
-        let _ = unit.done.send(true);
+        // `send_replace`, not `send`: a dependent waits on its
+        // dependencies one at a time, so this flight can end before the
+        // dependent has subscribed to it, and `send` stores nothing when
+        // nobody is subscribed.
+        unit.done.send_replace(true);
     }
 }
 
@@ -421,7 +440,9 @@ struct InFlightUnit {
     /// `materialized_outputs` rows and the extern lookup use.
     paths: Vec<String>,
     /// `true` once the flight ends. `watch` so a waiter that arrives late
-    /// reads `true` instead of blocking on a signal already sent.
+    /// reads `true` instead of blocking on a signal already sent — which
+    /// holds only because the end is stored whether or not anyone is
+    /// subscribed at that moment.
     done: watch::Sender<bool>,
 }
 
@@ -517,14 +538,7 @@ async fn accept_unix<H: Handler>(
             }
         }
     }
-    // The build is over when the last facade's queued bookkeeping has
-    // run: stopping accepting is not enough, the connections themselves
-    // are drained to their ends (stow#618).
-    while let Some(result) = tasks.join_next().await
-        && let Err(error) = result
-    {
-        tracing::warn!(%error, "supervisor connection task failed");
-    }
+    drain_connections(tasks).await;
 }
 
 #[cfg(not(unix))]
@@ -561,13 +575,23 @@ async fn accept_loopback<H: Handler>(
             }
         }
     }
-    // The build is over when the last facade's queued bookkeeping has
-    // run: stopping accepting is not enough, the connections themselves
-    // are drained to their ends (stow#618).
-    while let Some(result) = tasks.join_next().await
-        && let Err(error) = result
-    {
-        tracing::warn!(%error, "supervisor connection task failed");
+    drain_connections(tasks).await;
+}
+
+/// Wait for every accepted connection to run to its end. The build is
+/// over when the last facade's queued bookkeeping has run: stopping
+/// accepting is not enough (stow#618).
+///
+/// Every task is joined, whatever the ones before it returned. A
+/// `JoinSet` hands back the connections that finished long ago first,
+/// and dropping it aborts the rest — a drain that stopped at the first
+/// clean join cut off exactly the stores it exists to wait for
+/// (stow#660).
+async fn drain_connections(mut tasks: tokio::task::JoinSet<()>) {
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "supervisor connection task failed");
+        }
     }
 }
 
@@ -674,7 +698,7 @@ async fn answer_plan<H: Handler>(
         };
     let recordable_paths = recordable_output_paths(&args);
     match handler.plan(executable, args, build_script_out_dir).await {
-        Decision::Served => Answer::Served,
+        Decision::Served(notifications) => Answer::Served(notifications),
         Decision::Compile(pending) => {
             let (sender, allocated) = oneshot::channel();
             if tickets.send(Ticket::Allocate(pending, sender)).is_err() {
@@ -799,6 +823,7 @@ mod tests {
 
     use super::{Decision, Handler, start};
     use crate::supervisor::client::{Connection, Decision as ClientDecision};
+    use crate::supervisor::protocol::ArtifactNotifications;
 
     /// Serves anything whose first argument is `--serve-me`, asks for a
     /// compile otherwise, and counts the reports it receives.
@@ -816,7 +841,7 @@ mod tests {
             _build_script_out_dir: Option<OsString>,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
             std::future::ready(if args.first().is_some_and(|arg| arg == "--serve-me") {
-                Decision::Served
+                Decision::Served(ArtifactNotifications::default())
             } else {
                 Decision::Compile(args.first().cloned().unwrap_or_default())
             })
@@ -897,7 +922,7 @@ mod tests {
                 _args: Vec<OsString>,
                 _build_script_out_dir: Option<OsString>,
             ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
-                std::future::ready(Decision::Served)
+                std::future::ready(Decision::Served(ArtifactNotifications::default()))
             }
 
             fn compiled(
@@ -1006,7 +1031,7 @@ mod tests {
             )
             .await
             .expect("plan");
-        assert!(matches!(decision, ClientDecision::Served));
+        assert!(matches!(decision, ClientDecision::Served(_)));
         assert_eq!(handler.reports.load(Ordering::SeqCst), 0);
     }
 
@@ -1050,7 +1075,7 @@ mod tests {
             _args: Vec<OsString>,
             _build_script_out_dir: Option<OsString>,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
-            std::future::ready(Decision::Served)
+            std::future::ready(Decision::Served(ArtifactNotifications::default()))
         }
 
         fn compiled(
@@ -1180,6 +1205,52 @@ mod tests {
         assert_eq!(handler.finished.load(Ordering::SeqCst), 1);
     }
 
+    /// The drain waits for every connection, not for the first one it
+    /// joins: a build's early connections finished long before the stop,
+    /// and the one still storing is behind them (stow#660).
+    #[tokio::test]
+    async fn shutdown_drains_past_connections_that_already_finished() {
+        let (release_tx, _) = tokio::sync::watch::channel(false);
+        let handler = Arc::new(Bookkeeping {
+            release: release_tx,
+            started: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+        });
+        let mut supervisor = start(Arc::clone(&handler), super::InFlightUnits::default())
+            .expect("start the supervisor");
+        let [(_, endpoint), (_, token)] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+
+        // Connections that end without any bookkeeping in flight: they
+        // are finished tasks waiting to be joined when the stop comes.
+        for _ in 0..3 {
+            drop(connect_raw(&endpoint).await);
+        }
+        wait_for(
+            || supervisor.connections.load(Ordering::SeqCst) == 0,
+            "the idle connections to end",
+        )
+        .await;
+        let mut stream = connect_raw(&endpoint).await;
+        send_report(&mut stream, &token).await;
+        wait_for(
+            || handler.started.load(Ordering::SeqCst) == 1,
+            "the report's bookkeeping to start",
+        )
+        .await;
+
+        let mut drain = std::pin::pin!(supervisor.shutdown());
+        tokio::select! {
+            abandoned = &mut drain => panic!("shutdown returned {abandoned} early"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+        assert_eq!(handler.finished.load(Ordering::SeqCst), 0);
+        handler.release.send(true).expect("release the bookkeeping");
+        drop(stream);
+        assert_eq!(drain.await, 0, "the drain finishes cleanly");
+        assert_eq!(handler.finished.load(Ordering::SeqCst), 1);
+    }
+
     /// Bookkeeping that outlives the drain bound is abandoned with the
     /// count in the warning, and the stop returns — a hung store must not
     /// hang the build (stow#618).
@@ -1209,5 +1280,47 @@ mod tests {
             .await;
         assert_eq!(abandoned, 1);
         assert_eq!(handler.finished.load(Ordering::SeqCst), 0);
+    }
+
+    /// A dependent waits on its in-flight dependencies one at a time, so
+    /// a dependency can finish before the dependent has subscribed to
+    /// it. That completion has to be there when the dependent gets to
+    /// it: a signal handed to no subscriber was dropped, and the
+    /// dependent's post-compile — and the build behind it — waited
+    /// forever.
+    #[tokio::test]
+    async fn a_flight_ending_before_its_waiter_subscribes_still_releases_it() {
+        let in_flight = super::InFlightUnits::default();
+        let first = in_flight.register(vec!["/deps/libfirst.rlib".to_owned()]);
+        let second = in_flight.register(vec!["/deps/libsecond.rlib".to_owned()]);
+        let dependent = crate::rustc_args::ParsedRustcArgs::parse(
+            &[
+                "--crate-name",
+                "dependent",
+                "--crate-type",
+                "lib",
+                "--extern",
+                "first=/deps/libfirst.rlib",
+                "--extern",
+                "second=/deps/libsecond.rlib",
+                "src/lib.rs",
+            ]
+            .map(OsString::from),
+        )
+        .expect("parse the dependent's invocation");
+        let waiter = tokio::spawn({
+            let in_flight = in_flight.clone();
+            async move { in_flight.wait_for_externs(&dependent).await }
+        });
+        // The waiter parks on `first`, the flight it reaches first; it
+        // has not subscribed to `second` yet.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(second);
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the dependent is released once both flights have ended")
+            .expect("join the waiter");
     }
 }

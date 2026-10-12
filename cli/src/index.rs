@@ -215,7 +215,8 @@ async fn fetch_slice(
 
     let tag = index_tag(target, rustc_version);
     let base = stow_oci::RegistryBase::parse(&config.registry_base_url)?;
-    let session = base.session();
+    let http = config.registry_http().await?;
+    let session = base.session(&http);
     let reference = base.reference(&tag)?;
 
     // With a cached pointer the freshness check is one `HEAD`; without one
@@ -309,7 +310,14 @@ async fn download_verified_slice(
         &materials,
     )
     .await?;
-    let index = stow_types::index::decode(&blob).wrap_err("decode index slice")?;
+    // A slice decodes every row the index publishes for the target, so
+    // the decode runs on a blocking thread (stow#624).
+    let (index, blob) = smol::unblock(move || {
+        stow_types::index::decode(&blob)
+            .wrap_err("decode index slice")
+            .map(|index| (index, blob))
+    })
+    .await?;
     if index.header.target.as_str() != target
         || index.header.rustc_version.as_str() != rustc_version
     {
@@ -384,7 +392,9 @@ async fn load_cached(dir: &Path, pointer: &SlicePointer) -> stow_types::error::R
     let bytes = async_fs::read(&path)
         .await
         .wrap_err_with(|| format!("read cached index {}", path.display()))?;
-    let index = stow_types::index::decode(&bytes).wrap_err("decode cached index slice")?;
+    let index = smol::unblock(move || stow_types::index::decode(&bytes))
+        .await
+        .wrap_err("decode cached index slice")?;
     Ok(IndexSlice {
         manifest_digest: pointer.manifest_digest.clone(),
         index,
@@ -442,6 +452,8 @@ mod tests {
             verify_mode: VerifyMode::GithubCi,
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
+            artifact_cache_staging: std::sync::Arc::default(),
         }
     }
 
@@ -485,6 +497,23 @@ mod tests {
             },
             rows,
         }
+    }
+
+    /// stow#624: a build's slice fetches — the early one and the full
+    /// analysis's, which runs on the enrichment's own clone of the
+    /// config — draw their sessions from one client, built once.
+    #[tokio::test]
+    async fn every_clone_of_a_config_shares_one_registry_client() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let enrichment = config.clone();
+        let (early, full) = tokio::join!(config.registry_http(), enrichment.registry_http());
+        assert!(
+            early
+                .expect("build the registry client")
+                .same_client(&full.expect("share the registry client"))
+        );
     }
 
     #[test]
