@@ -36,6 +36,7 @@ use stow_types::transient::Backoff;
 use stow_types::trusted_builder::{BRANCH, INDEX_CERTIFICATE_IDENTITY, WORKFLOW_FILE};
 use zenwave::{Client, ResponseExt};
 
+use crate::github::{WriteFailure, classify_write};
 use crate::render::{self, Output};
 
 /// The build-crate runs poll cadence.
@@ -48,6 +49,12 @@ const PUBLISH_TIMEOUT_MINUTES: u64 = 120;
 /// GitHub may take a few seconds to materialize a dispatched run — a
 /// task whose run does not appear inside this window is a real error.
 const RUN_GRACE_MINUTES: u64 = 10;
+/// The clock allowance between this machine and GitHub: a dispatch's
+/// wall time minus this is both the resolution listing's `created`
+/// window start and the floor a candidate run's own `created_at` must
+/// clear — GitHub's clock may trail ours by this much before a run the
+/// dispatch created reads as older than its own attempt.
+const GITHUB_CLOCK_ALLOWANCE: time::Duration = time::Duration::seconds(60);
 /// The index slices ride this workflow's dispatch.
 const INDEX_PUBLISH_WORKFLOW: &str = "index-publish.yml";
 /// Concurrent slice pulls while reading coverage — `CI_TARGET_TRIPLES`
@@ -139,6 +146,95 @@ fn parse_adopt_since(raw: &str) -> Result<time::OffsetDateTime, String> {
         .map_err(|error| format!("{raw}: {error}"))
 }
 
+/// A dispatch sent but never answered clearly — a 5xx or a connection
+/// that failed after the request left, so whether the write happened
+/// is unknown. `wall` bounds the resolution listing's `created` window
+/// and each candidate run's acceptance floor; `instant` runs the
+/// `RUN_GRACE_MINUTES` deadline after which the node returns to unsent
+/// and the loop dispatches it again.
+struct UnansweredDispatch {
+    /// The wall clock taken just before the request was sent.
+    wall: time::OffsetDateTime,
+    /// The monotonic instant of the same moment.
+    instant: tokio::time::Instant,
+}
+
+/// A `rerun-failed-jobs` write sent but never answered clearly. The
+/// poll that sees the run take the rerun pushes the [`RerunRecord`]
+/// the success path would have pushed — `job`/`step` are what the
+/// classifier read at the time, kept here so the record reports the
+/// failure that earned the rerun.
+struct PendingRerun {
+    /// The failed `run_attempt` the rerun was asked on.
+    attempt: u64,
+    /// When the write went out — the `RUN_GRACE_MINUTES` deadline after
+    /// which an unchanged run is classified again, resending the ask.
+    asked_at: tokio::time::Instant,
+    job: String,
+    step: Option<String>,
+}
+
+/// The layer's write gate: one outage budget shared by every mutating
+/// call the wave makes — node dispatches and failed-job reruns alike —
+/// plus the earliest instant the next write may go out. A write whose
+/// answer settled nothing pauses sends until the backoff's wait
+/// elapses; a write that succeeded restores the whole budget. Reads
+/// never consult it: bound-run polls and unresolved-dispatch
+/// resolution run every iteration regardless.
+struct WriteGate {
+    backoff: Backoff,
+    /// The earliest `Instant` the next write may send — the backoff's
+    /// handed-out wait turned into a deadline.
+    next_at: Option<tokio::time::Instant>,
+}
+
+impl WriteGate {
+    const fn new() -> Self {
+        Self {
+            backoff: Backoff::outage(),
+            next_at: None,
+        }
+    }
+
+    /// Whether a write may go out now.
+    fn open(&self) -> bool {
+        self.next_at
+            .is_none_or(|at| tokio::time::Instant::now() >= at)
+    }
+
+    /// A write whose answer was clear restores the whole outage budget.
+    const fn confirmed(&mut self) {
+        *self = Self::new();
+    }
+
+    /// A write whose answer settled nothing asks the budget for the
+    /// next wait: `Some` pauses sends until it elapses, `None` is the
+    /// wave's error — GitHub writes stayed unanswerable past the
+    /// outage bound.
+    fn hold(&mut self, failure: &WriteFailure) -> stow_types::error::Result<()> {
+        match self.backoff.next_wait(failure.hint()) {
+            Some(wait) => {
+                self.next_at = Some(tokio::time::Instant::now() + wait);
+                tracing::warn!(%failure, wait = ?wait, "GitHub write unanswered; writes paused");
+                Ok(())
+            }
+            None => Err(stow_error!(
+                "GitHub writes stayed unanswerable for the outage bound; last failure: {failure}"
+            )),
+        }
+    }
+}
+
+/// The mutable wave state every fold, resolution and send pass inside
+/// `drive_layer` shares: the node map, the open-task set, the rerun
+/// report and the write gate.
+struct Wave<'a> {
+    nodes: &'a mut BTreeMap<String, NodeRun>,
+    open: &'a mut BTreeSet<String>,
+    reruns: &'a mut Vec<RerunRecord>,
+    gate: &'a mut WriteGate,
+}
+
 /// One node's run to completion — the dispatch knows it by `task_id`
 /// (`build-crate.yml`'s `run-name`); the outcome surfaces through the
 /// run's `conclusion`.
@@ -158,6 +254,16 @@ struct NodeRun {
     /// This node's own dispatch time — `RUN_GRACE_MINUTES` applies per
     /// node, not per layer.
     dispatched_at: Option<std::time::Instant>,
+    /// A dispatch whose answer was ambiguous — the write may or may not
+    /// have reached the dispatcher, so the node counts as dispatched
+    /// (it holds an `in_flight` slot and is never sent again) while the
+    /// resolution listing settles it. `None` when the last send's
+    /// answer was clear.
+    unresolved: Option<UnansweredDispatch>,
+    /// A `rerun-failed-jobs` write whose answer was ambiguous — what
+    /// was asked, held until a later poll's row says whether the run
+    /// took it.
+    pending_rerun: Option<PendingRerun>,
     done: bool,
     failed: bool,
     /// The failed ancestor that blocks this node — a node whose
@@ -204,6 +310,12 @@ struct RunState {
     /// server's rows carry a constant 1: it has no runner setup and
     /// never reruns, so the attempt is never consulted there.
     run_attempt: u64,
+    /// The run's `created_at` as GitHub served it — the
+    /// unresolved-dispatch resolution accepts only runs at or after
+    /// the node's own attempt (minus [`GITHUB_CLOCK_ALLOWANCE`]). The
+    /// local server's rows carry none: every run it lists was made by
+    /// a dispatch it took, so `None` accepts.
+    created_at: Option<time::OffsetDateTime>,
 }
 
 impl RunState {
@@ -429,6 +541,8 @@ fn build_graph(requests: Vec<EnqueueRequest>) -> stow_types::error::Result<Manua
             latest: None,
             dispatched: false,
             dispatched_at: None,
+            unresolved: None,
+            pending_rerun: None,
             done: false,
             failed: false,
             blocked_by: None,
@@ -1039,18 +1153,50 @@ fn task_payload(task_id: &str, request: &EnqueueRequest) -> BuildTaskPayload {
     }
 }
 
-/// Dispatch a node and bind it to the exact run returned by the transport.
+/// What one dispatch send settled — the driver's dispatch pass reads
+/// this to decide whether the pass continues.
+enum DispatchAnswer {
+    /// The run id came back — the node is bound.
+    Bound,
+    /// The answer was ambiguous: the write may have landed, so the
+    /// node holds the attempt and waits for the resolution listing.
+    Ambiguous(WriteFailure),
+    /// GitHub's rate limit answered first — nothing happened and the
+    /// node stays unsent; the hint is the answer's `Retry-After`.
+    RateLimited(WriteFailure),
+}
+
+/// Dispatch a node: a confirmed send binds it to the run id returned;
+/// an ambiguous answer leaves it [`NodeRun::unresolved`]; a rate
+/// limit leaves it unsent; a refusal is the error it always was.
 async fn dispatch_node(
     dispatch: &Dispatch,
     task_id: &str,
     node: &mut NodeRun,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<DispatchAnswer> {
     let payload = task_payload(task_id, &node.request);
-    let workflow_run_id = dispatch.send(&payload).await?;
+    // Both clocks ride every ambiguous attempt: the wall clock bounds
+    // the resolution listing, the monotonic instant the re-send grace.
+    let wall = time::OffsetDateTime::now_utc();
+    let instant = tokio::time::Instant::now();
+    let workflow_run_id = match dispatch.send(&payload).await {
+        Ok(run_id) => run_id,
+        Err(failure) => {
+            return Ok(match failure {
+                WriteFailure::Ambiguous(_) => {
+                    node.dispatched = true;
+                    node.unresolved = Some(UnansweredDispatch { wall, instant });
+                    DispatchAnswer::Ambiguous(failure)
+                }
+                WriteFailure::RateLimited { .. } => DispatchAnswer::RateLimited(failure),
+                WriteFailure::Refused(_) => return Err(failure.into()),
+            });
+        }
+    };
     node.dispatched = true;
     node.workflow_run_id = Some(workflow_run_id);
     node.dispatched_at = Some(std::time::Instant::now());
-    Ok(())
+    Ok(DispatchAnswer::Bound)
 }
 
 /// Fold one observed run state into its node — shared by the one-time
@@ -1058,7 +1204,7 @@ async fn dispatch_node(
 /// node's binding so it dispatches afresh; anything else binds the run
 /// (`dispatched`, `run_url`) and lands done/failed removals in `open`.
 fn fold_run(
-    state: RunState,
+    state: &RunState,
     nodes: &mut BTreeMap<String, NodeRun>,
     open: &mut BTreeSet<String>,
     main_head: &str,
@@ -1080,14 +1226,11 @@ fn fold_run(
             node.latest = None;
             node.dispatched = false;
             node.dispatched_at = None;
+            node.pending_rerun = None;
         }
         return;
     }
-    node.run_url = Some(state.url.clone());
-    node.workflow_run_id = Some(state.workflow_run_id);
-    // An adopted run is a dispatch, whichever invocation sent it: it
-    // counts against `in_flight` and is never sent twice.
-    node.dispatched = true;
+    bind_node(node, state);
     match (state.status.as_str(), state.conclusion.as_deref()) {
         ("completed", Some("success")) => {
             node.done = true;
@@ -1099,7 +1242,20 @@ fn fold_run(
         }
         _ => {}
     }
-    node.latest = Some(state);
+}
+
+/// Bind a node to `state`'s run without judging the outcome —
+/// `fold_run`'s own first half, and what every classify deferral does
+/// instead: a bound run settles an ambiguous dispatch and counts as
+/// dispatched whatever sent it (it holds an `in_flight` slot and is
+/// never sent twice), and `latest` records the freshest row so a 304
+/// refold sees it rather than a stale predecessor.
+fn bind_node(node: &mut NodeRun, state: &RunState) {
+    node.run_url = Some(state.url.clone());
+    node.workflow_run_id = Some(state.workflow_run_id);
+    node.dispatched = true;
+    node.unresolved = None;
+    node.latest = Some(state.clone());
 }
 
 /// A completed run's non-success conclusion, classified by which step
@@ -1180,25 +1336,27 @@ fn bind_rerun(state: &RunState, nodes: &mut BTreeMap<String, NodeRun>) {
     node.latest = None;
 }
 
-/// Fold one already-classified run state: a `Some` record means the
-/// failure was infrastructure and its rerun was just requested — bind
-/// the node to it and record it; `None` folds the state exactly as
-/// `fold_run` always did.
-fn fold_classified(
-    state: RunState,
-    record: Option<RerunRecord>,
-    nodes: &mut BTreeMap<String, NodeRun>,
-    open: &mut BTreeSet<String>,
-    main_head: &str,
-    reruns: &mut Vec<RerunRecord>,
-) {
-    match record {
-        Some(record) => {
-            bind_rerun(&state, nodes);
-            reruns.push(record);
-        }
-        None => fold_run(state, nodes, open, main_head),
-    }
+/// What `classify_failed_run` settled for a completed non-success run.
+enum Classified {
+    /// The failure is the node's verdict — fold the row as always.
+    Verdict,
+    /// The rerun write was confirmed — bind the node to the rerun and
+    /// record it.
+    Rerun(RerunRecord),
+    /// The rerun write's answer was ambiguous: whether GitHub took it
+    /// is unknown — the node keeps what was asked until a later row
+    /// settles it.
+    Asked {
+        /// The failure that classified ambiguous.
+        failure: WriteFailure,
+        /// The classified job and step — the record the acceptance
+        /// pushes.
+        job: String,
+        step: Option<String>,
+    },
+    /// The rerun write was refused by the rate limiter — nothing was
+    /// asked; the next poll classifies again.
+    RateLimited(WriteFailure),
 }
 
 /// The async half `fold_run` cannot do: a completed non-success run on
@@ -1206,30 +1364,121 @@ fn fold_classified(
 /// infrastructure failure gets its failed jobs rerun and never reaches
 /// the fold as a failure. Everything else — in-flight runs, successes,
 /// stale failures and runs of other tasks — folds untouched.
+///
+/// A node whose rerun write never answered carries `pending_rerun`:
+/// a row showing a later `run_attempt`, or one no longer `completed`,
+/// is the answer — the rerun was accepted, so the record the success
+/// path would have pushed lands and the row folds as usual. The same
+/// completed attempt inside `RUN_GRACE_MINUTES` is no answer yet;
+/// past the grace the pending record drops and the row classifies
+/// again, resending the ask.
 async fn classify_and_fold(
     dispatch: &Dispatch,
     state: RunState,
-    nodes: &mut BTreeMap<String, NodeRun>,
-    open: &mut BTreeSet<String>,
+    wave: &mut Wave<'_>,
     main_head: &str,
-    reruns: &mut Vec<RerunRecord>,
 ) -> stow_types::error::Result<()> {
+    match wave
+        .nodes
+        .get(&state.task_id)
+        .and_then(|node| node.pending_rerun.as_ref())
+    {
+        Some(pending) if state.run_attempt > pending.attempt || state.status != "completed" => {
+            let pending = wave
+                .nodes
+                .get_mut(&state.task_id)
+                .expect("pending node")
+                .pending_rerun
+                .take()
+                .expect("pending rerun");
+            wave.reruns.push(RerunRecord {
+                task_id: state.task_id.clone(),
+                url: state.url.clone(),
+                job: pending.job,
+                step: pending.step,
+                run_attempt: pending.attempt + 1,
+            });
+        }
+        Some(pending)
+            if pending.asked_at.elapsed()
+                < std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES) =>
+        {
+            // The same completed attempt inside the grace — the
+            // write's answer is still out; classify nothing until it
+            // resolves. The row still binds — it is the bound run's
+            // freshest state, and a 304 refolds it rather than a stale
+            // predecessor.
+            bind_node(
+                wave.nodes.get_mut(&state.task_id).expect("pending node"),
+                &state,
+            );
+            return Ok(());
+        }
+        Some(_) => {
+            // The same completed attempt past the grace — the write
+            // did not happen as far as the run can tell: drop the
+            // pending record and classify again below.
+            wave.nodes
+                .get_mut(&state.task_id)
+                .expect("pending node")
+                .pending_rerun = None;
+        }
+        None => {}
+    }
     let failed = state.status == "completed" && state.conclusion.as_deref() != Some("success");
-    if !failed || state.stale_failure(main_head) || !nodes.contains_key(&state.task_id) {
-        fold_run(state, nodes, open, main_head);
+    if !failed || state.stale_failure(main_head) || !wave.nodes.contains_key(&state.task_id) {
+        fold_run(&state, wave.nodes, wave.open, main_head);
         return Ok(());
     }
     // The run row lags a rerun request by a beat: a failure row for an
     // attempt a rerun already superseded is not a new verdict — wait
     // for the rerun's own state rather than classifying it again.
-    if reruns
+    if wave
+        .reruns
         .iter()
         .any(|rerun| rerun.task_id == state.task_id && rerun.run_attempt > state.run_attempt)
     {
         return Ok(());
     }
-    let record = dispatch.classify_failed_run(&state).await?;
-    fold_classified(state, record, nodes, open, main_head, reruns);
+    // Classification may ask for a rerun — a write, so it waits out a
+    // closed gate exactly like a dispatch does.
+    if !wave.gate.open() {
+        bind_node(
+            wave.nodes.get_mut(&state.task_id).expect("classified node"),
+            &state,
+        );
+        return Ok(());
+    }
+    match dispatch.classify_failed_run(&state).await? {
+        Classified::Verdict => fold_run(&state, wave.nodes, wave.open, main_head),
+        Classified::Rerun(record) => {
+            wave.gate.confirmed();
+            bind_rerun(&state, wave.nodes);
+            wave.reruns.push(record);
+        }
+        Classified::Asked { failure, job, step } => {
+            let node = wave.nodes.get_mut(&state.task_id).expect("classified node");
+            node.pending_rerun = Some(PendingRerun {
+                attempt: state.run_attempt,
+                asked_at: tokio::time::Instant::now(),
+                job,
+                step,
+            });
+            // Bind the deferred row so its verdict survives until the
+            // pending record resolves it.
+            bind_node(node, &state);
+            wave.gate.hold(&failure)?;
+        }
+        Classified::RateLimited(failure) => {
+            // Nothing was asked and nothing classifies — the next poll
+            // retries the same row once the gate reopens.
+            bind_node(
+                wave.nodes.get_mut(&state.task_id).expect("classified node"),
+                &state,
+            );
+            wave.gate.hold(&failure)?;
+        }
+    }
     Ok(())
 }
 
@@ -1239,6 +1488,14 @@ async fn classify_and_fold(
 /// is bound to until every node resolves. Nodes whose runs never
 /// materialize inside the grace window surface as an error — GitHub
 /// accepted the dispatch and dropped it.
+///
+/// A dispatch whose answer was ambiguous (`unresolved`) is settled by a
+/// runs listing over the attempt's window once per poll: a qualifying
+/// run binds the node, and an attempt that outlives `RUN_GRACE_MINUTES`
+/// with no run found returns to unsent for a fresh dispatch. Every
+/// write — dispatch or rerun — shares `gate`: an answer that settled
+/// nothing pauses sends for the backoff's wait while polling and
+/// resolution run on.
 async fn drive_layer(
     dispatch: &Dispatch,
     layer: &[String],
@@ -1261,91 +1518,83 @@ async fn drive_layer(
     // cap, subdividing as needed), so a run the wave tracks cannot drown
     // under newer unrelated history. Runs dispatched from here on are
     // bound by the id the dispatch response returns, and polls read only
-    // those ids — no listing ever runs again for this layer.
+    // those ids — later listings are only the narrow unresolved-dispatch
+    // resolutions, each restricted to the nodes still waiting on an
+    // answer.
     let mut head_cache: Option<HeadCache> = None;
+    let mut gate = WriteGate::new();
+    let mut wave = Wave {
+        nodes,
+        open: &mut open,
+        reruns,
+        gate: &mut gate,
+    };
     let main_head = dispatch.refresh_head(&mut head_cache).await?;
     {
         let mut latest = BTreeMap::<String, RunState>::new();
         for state in dispatch
             .adopt_runs(
-                &open,
+                wave.open,
                 adopt_since,
                 time::OffsetDateTime::now_utc(),
                 rustc_version,
             )
             .await?
         {
-            let Some(node) = nodes.get(&state.task_id) else {
+            let Some(node) = wave.nodes.get(&state.task_id) else {
                 continue;
             };
             retain_latest_run(&mut latest, state, node.workflow_run_id);
         }
         for state in latest.into_values() {
-            classify_and_fold(dispatch, state, nodes, &mut open, &main_head, reruns).await?;
+            classify_and_fold(dispatch, state, &mut wave, &main_head).await?;
         }
     }
     loop {
         // `main`'s head is read once per poll — usually a free 304 —
         // and every row's staleness is judged against it.
         let main_head = dispatch.refresh_head(&mut head_cache).await?;
-        for outcome in dispatch.poll_bound(nodes, &open, rustc_version).await? {
-            match outcome {
-                BoundPoll::State {
-                    task_id,
-                    state,
-                    etag,
-                } => {
-                    if let Some(node) = nodes.get_mut(&task_id) {
-                        node.run_etag = etag;
-                    }
-                    classify_and_fold(dispatch, state, nodes, &mut open, &main_head, reruns)
-                        .await?;
-                }
-                BoundPoll::Unmodified(task_id) => {
-                    // The cached row stands; refold it — a `main` head
-                    // that moved this poll can still stale it.
-                    let cached = nodes.get(&task_id).and_then(|node| node.latest.clone());
-                    if let Some(state) = cached {
-                        classify_and_fold(dispatch, state, nodes, &mut open, &main_head, reruns)
-                            .await?;
-                    }
-                }
-                BoundPoll::Pending => {}
-            }
+        // Settle the sends GitHub may never have heard: one listing
+        // over the window from the earliest unresolved attempt to now.
+        let unresolved: BTreeSet<String> = wave
+            .open
+            .iter()
+            .filter(|id| wave.nodes.get(*id).expect("open node").unresolved.is_some())
+            .cloned()
+            .collect();
+        if !unresolved.is_empty() {
+            resolve_unanswered(dispatch, &unresolved, &mut wave, &main_head, rustc_version).await?;
         }
-        let mut running = open
+        for outcome in dispatch
+            .poll_bound(wave.nodes, wave.open, rustc_version)
+            .await?
+        {
+            fold_bound_outcome(dispatch, outcome, &mut wave, &main_head).await?;
+        }
+        let mut running = wave
+            .open
             .iter()
             .filter(|id| {
-                let node = nodes.get(*id).expect("open node");
+                let node = wave.nodes.get(*id).expect("open node");
                 node.dispatched && !node.done && !node.failed
             })
             .count();
-        // Dispatches stay serial — mutating calls are what GitHub's
-        // secondary rate limits push back on. Only reads fan out.
-        for id in &open {
-            if running >= in_flight {
-                break;
-            }
-            let node = nodes.get_mut(id).expect("open node");
-            if node.dispatched {
-                continue;
-            }
-            dispatch_node(dispatch, id, node).await?;
-            running += 1;
-        }
-        if open.is_empty() {
+        dispatch_open(
+            dispatch,
+            wave.open,
+            wave.nodes,
+            in_flight,
+            &mut running,
+            wave.gate,
+        )
+        .await?;
+        if wave.open.is_empty() {
             return Ok(());
         }
-        let overdue: Vec<String> = open
+        let overdue: Vec<String> = wave
+            .open
             .iter()
-            .filter(|id| {
-                let node = nodes.get(*id).expect("open node");
-                node.dispatched
-                    && node.run_url.is_none()
-                    && node.dispatched_at.is_some_and(|since| {
-                        since.elapsed() > std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES)
-                    })
-            })
+            .filter(|id| dispatch_overdue(wave.nodes.get(*id).expect("open node")))
             .cloned()
             .collect();
         if !overdue.is_empty() {
@@ -1355,6 +1604,165 @@ async fn drive_layer(
             ));
         }
         tokio::time::sleep(std::time::Duration::from_secs(RUN_POLL_SECONDS)).await;
+    }
+}
+
+/// Fold one bound-run poll answer: a fresh row carries its validator
+/// onto the node before the fold; `Unmodified` refolds the node's
+/// cached row — a `main` head that moved this poll can still stale it;
+/// `Pending` is an id that has not materialized.
+async fn fold_bound_outcome(
+    dispatch: &Dispatch,
+    outcome: BoundPoll,
+    wave: &mut Wave<'_>,
+    main_head: &str,
+) -> stow_types::error::Result<()> {
+    match outcome {
+        BoundPoll::State {
+            task_id,
+            state,
+            etag,
+        } => {
+            if let Some(node) = wave.nodes.get_mut(&task_id) {
+                node.run_etag = etag;
+            }
+            classify_and_fold(dispatch, state, wave, main_head).await?;
+        }
+        BoundPoll::Unmodified(task_id) => {
+            let cached = wave
+                .nodes
+                .get(&task_id)
+                .and_then(|node| node.latest.clone());
+            if let Some(state) = cached {
+                classify_and_fold(dispatch, state, wave, main_head).await?;
+            }
+        }
+        BoundPoll::Pending => {}
+    }
+    Ok(())
+}
+
+/// One iteration's dispatch pass, gated by the wave's write gate: send
+/// `in_flight - running` more dispatches, serially — mutating calls are
+/// what GitHub's secondary rate limits push back on; only reads fan
+/// out. An ambiguous or rate-limited answer ends the pass: the node
+/// the answer belongs to has already taken its slot, and sends stay
+/// paused until the backoff's wait elapses.
+async fn dispatch_open(
+    dispatch: &Dispatch,
+    open: &BTreeSet<String>,
+    nodes: &mut BTreeMap<String, NodeRun>,
+    in_flight: usize,
+    running: &mut usize,
+    gate: &mut WriteGate,
+) -> stow_types::error::Result<()> {
+    if !gate.open() {
+        return Ok(());
+    }
+    for id in open {
+        if *running >= in_flight {
+            break;
+        }
+        let node = nodes.get_mut(id).expect("open node");
+        if node.dispatched {
+            continue;
+        }
+        match dispatch_node(dispatch, id, node).await? {
+            DispatchAnswer::Bound => {
+                gate.confirmed();
+            }
+            DispatchAnswer::Ambiguous(failure) => {
+                // The node holds its slot unresolved — no further send
+                // this iteration.
+                *running += 1;
+                return gate.hold(&failure);
+            }
+            DispatchAnswer::RateLimited(failure) => {
+                return gate.hold(&failure);
+            }
+        }
+        *running += 1;
+    }
+    Ok(())
+}
+
+/// One poll iteration's resolution of dispatch answers that never
+/// arrived: the listing runs from the earliest unresolved attempt's
+/// wall clock (minus [`GITHUB_CLOCK_ALLOWANCE`]) to now, restricted to
+/// the unresolved nodes. A qualifying run binds its node through the
+/// fold — the newest when several qualify; a run created before its
+/// node's own attempt can never be that attempt's answer and is
+/// dropped. An attempt still unresolved past `RUN_GRACE_MINUTES`
+/// returns to unsent, and the loop dispatches it again.
+async fn resolve_unanswered(
+    dispatch: &Dispatch,
+    unresolved: &BTreeSet<String>,
+    wave: &mut Wave<'_>,
+    main_head: &str,
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<()> {
+    let floor = unresolved
+        .iter()
+        .map(|id| {
+            wave.nodes
+                .get(id)
+                .and_then(|node| node.unresolved.as_ref())
+                .expect("unresolved node")
+                .wall
+        })
+        .min()
+        .expect("unresolved is nonempty")
+        - GITHUB_CLOCK_ALLOWANCE;
+    let states = dispatch
+        .adopt_runs(
+            unresolved,
+            floor,
+            time::OffsetDateTime::now_utc(),
+            rustc_version,
+        )
+        .await?;
+    let mut latest = BTreeMap::<String, RunState>::new();
+    retain_qualifying_runs(&mut latest, states, wave.nodes);
+    for state in latest.into_values() {
+        classify_and_fold(dispatch, state, wave, main_head).await?;
+    }
+    for id in unresolved {
+        let node = wave.nodes.get_mut(id).expect("open node");
+        if node.unresolved.as_ref().is_some_and(|attempt| {
+            attempt.instant.elapsed() > std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES)
+        }) {
+            node.unresolved = None;
+            node.dispatched = false;
+        }
+    }
+    Ok(())
+}
+
+/// Fold the listed runs into `latest` per unresolved node: a run may
+/// answer a node's attempt only when it was created at or after the
+/// attempt's wall clock minus [`GITHUB_CLOCK_ALLOWANCE`]; the local
+/// server's rows carry no `created_at` and always qualify. Among the
+/// qualifying runs the newest binds — `retain_latest_run` keeps the
+/// highest run id, and GitHub's ids mint in creation order.
+fn retain_qualifying_runs(
+    latest: &mut BTreeMap<String, RunState>,
+    states: impl IntoIterator<Item = RunState>,
+    nodes: &BTreeMap<String, NodeRun>,
+) {
+    for state in states {
+        let Some(node) = nodes.get(&state.task_id) else {
+            continue;
+        };
+        let Some(attempt) = node.unresolved.as_ref() else {
+            continue;
+        };
+        if state
+            .created_at
+            .is_some_and(|created| created < attempt.wall - GITHUB_CLOCK_ALLOWANCE)
+        {
+            continue;
+        }
+        retain_latest_run(latest, state, node.workflow_run_id);
     }
 }
 
@@ -1388,12 +1796,33 @@ async fn publish_and_wait(
                 inputs["stow_edge_url"] = serde_json::Value::String(url);
             }
             inputs["rustc_version"] = serde_json::Value::String(rustc_version.to_string());
-            crate::github::post_empty(
-                token,
-                &format!("actions/workflows/{INDEX_PUBLISH_WORKFLOW}/dispatches"),
-                &serde_json::json!({ "ref": BRANCH, "inputs": inputs }),
-            )
-            .await?;
+            // The publish dispatch is idempotent — a second
+            // `index-publish.yml` run publishes the same slices — so an
+            // answer that settled nothing simply waits the outage
+            // budget out and sends again.
+            let body = serde_json::json!({ "ref": BRANCH, "inputs": inputs });
+            let mut backoff = Backoff::outage();
+            loop {
+                match crate::github::post_empty(
+                    token,
+                    &format!("actions/workflows/{INDEX_PUBLISH_WORKFLOW}/dispatches"),
+                    &body,
+                )
+                .await
+                {
+                    Ok(()) => break,
+                    Err(failure @ WriteFailure::Refused(_)) => return Err(failure.into()),
+                    Err(failure) => {
+                        let Some(wait) = backoff.next_wait(failure.hint()) else {
+                            return Err(stow_error!(
+                                "index-publish dispatch stayed unanswerable for the outage bound: {failure}"
+                            ));
+                        };
+                        tracing::warn!(%failure, wait = ?wait, "index-publish dispatch unanswered; resending");
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+            }
         }
         Dispatch::Local { .. } => {
             local_index_publish(rustc_version).await?;
@@ -1543,14 +1972,18 @@ async fn local_index_publish(rustc_version: &WireRustcVersion) -> stow_types::er
 impl Dispatch {
     /// Send the build-crate dispatch: GitHub's `workflow_dispatch` under
     /// the operator token, or the local server's `/dispatch` POST — the
-    /// same payload the scheduler emits either way.
-    async fn send(&self, payload: &BuildTaskPayload) -> stow_types::error::Result<u64> {
+    /// same payload the scheduler emits either way, and the same
+    /// three-way answer either way: the run id on a confirmed send, or
+    /// the [`WriteFailure`] kind an ambiguous answer resolves through.
+    async fn send(&self, payload: &BuildTaskPayload) -> Result<u64, WriteFailure> {
         match self {
             Self::GitHub { token } => {
                 // The 65,535-char dispatch input cap is checked here —
                 // at the producer — so an oversized subgraph fails the
                 // wave before GitHub ever sees it (stow#588).
-                let task_json = payload.encode_dispatch_task()?;
+                let task_json = payload.encode_dispatch_task().map_err(|error| {
+                    WriteFailure::Refused(format!("encode dispatch task: {error}"))
+                })?;
                 let response: WorkflowDispatchResponse = crate::github::post(
                     token,
                     &format!("actions/workflows/{WORKFLOW_FILE}/dispatches"),
@@ -1569,16 +2002,28 @@ impl Dispatch {
                     "event_type": "build-crate",
                     "client_payload": payload,
                 });
+                let refused = |error: zenwave::Error| {
+                    WriteFailure::Refused(format!("build POST {url}: {error}"))
+                };
+                let context = format!("POST {url}");
+                let payload_bytes = serde_json::to_vec(&body).map_err(|error| {
+                    WriteFailure::Refused(format!("build POST {url} body: {error}"))
+                })?;
                 let mut client = zenwave::client();
                 let response: WorkflowDispatchResponse = client
-                    .post(&url)?
-                    .header("Content-Type", "application/json")?
-                    .bytes_body(serde_json::to_vec(&body)?)
-                    .await?
+                    .post(&url)
+                    .map_err(refused)?
+                    .header("Content-Type", "application/json")
+                    .map_err(refused)?
+                    .bytes_body(payload_bytes)
+                    .await
+                    .map_err(|error| classify_write(&context, &error))?
                     .error_for_status()
-                    .await?
+                    .await
+                    .map_err(|error| classify_write(&context, &error))?
                     .into_json()
-                    .await?;
+                    .await
+                    .map_err(|error| WriteFailure::Ambiguous(format!("read {context}: {error}")))?;
                 Ok(response.workflow_run_id)
             }
         }
@@ -1622,22 +2067,25 @@ impl Dispatch {
     }
 
     /// Classify one bound run's completed non-success conclusion:
-    /// `Ok(Some)` when a rerun of the run's failed jobs was requested,
-    /// `Ok(None)` when the failure is the node's verdict. GitHub reads
-    /// the run's jobs — a `VERDICT_STEPS` step is the crate's verdict
-    /// and anything else is infrastructure — then asks for the rerun.
-    /// The local server has no runner setup, so every failure is final.
-    /// A failure observed at `MAX_RUN_ATTEMPTS` is final either way,
-    /// without spending the jobs read.
-    async fn classify_failed_run(
-        &self,
-        state: &RunState,
-    ) -> stow_types::error::Result<Option<RerunRecord>> {
+    /// [`Classified::Rerun`] when a rerun of the run's failed jobs was
+    /// confirmed, [`Classified::Verdict`] when the failure is the
+    /// node's verdict. GitHub reads the run's jobs — a `VERDICT_STEPS`
+    /// step is the crate's verdict and anything else is infrastructure
+    /// — then asks for the rerun. The local server has no runner
+    /// setup, so every failure is final. A failure observed at
+    /// `MAX_RUN_ATTEMPTS` is final either way, without spending the
+    /// jobs read.
+    ///
+    /// The rerun write's own answer classifies too: ambiguous keeps
+    /// what was asked ([`Classified::Asked`]), a rate limit asks
+    /// nothing ([`Classified::RateLimited`]), a refusal stays the
+    /// error it was.
+    async fn classify_failed_run(&self, state: &RunState) -> stow_types::error::Result<Classified> {
         let Self::GitHub { token } = self else {
-            return Ok(None);
+            return Ok(Classified::Verdict);
         };
         if state.run_attempt >= MAX_RUN_ATTEMPTS {
-            return Ok(None);
+            return Ok(Classified::Verdict);
         }
         let page: RunJobsPage = crate::github::get(
             token,
@@ -1646,14 +2094,24 @@ impl Dispatch {
         )
         .await?;
         let FailureClass::Infrastructure { job, step } = classify_failure(&page.jobs) else {
-            return Ok(None);
+            return Ok(Classified::Verdict);
         };
-        crate::github::post_empty(
+        match crate::github::post_empty(
             token,
             &format!("actions/runs/{}/rerun-failed-jobs", state.workflow_run_id),
             &serde_json::json!({}),
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(failure) => {
+                return Ok(match failure {
+                    WriteFailure::Ambiguous(_) => Classified::Asked { failure, job, step },
+                    WriteFailure::RateLimited { .. } => Classified::RateLimited(failure),
+                    WriteFailure::Refused(_) => return Err(failure.into()),
+                });
+            }
+        }
         tracing::warn!(
             run = state.workflow_run_id,
             task = %state.task_id,
@@ -1662,7 +2120,7 @@ impl Dispatch {
             attempt = state.run_attempt + 1,
             "infrastructure failure; rerunning the run's failed jobs"
         );
-        Ok(Some(RerunRecord {
+        Ok(Classified::Rerun(RerunRecord {
             task_id: state.task_id.clone(),
             url: state.url.clone(),
             job,
@@ -1716,6 +2174,7 @@ impl Dispatch {
                                 url: run.html_url,
                                 head_sha: run.head_sha,
                                 run_attempt: run.run_attempt,
+                                created_at: Some(run.created_at),
                             }
                         })
                     })
@@ -1809,9 +2268,22 @@ impl Dispatch {
     }
 }
 
+/// The `overdue` predicate: a dispatch GitHub confirmed with a run id —
+/// `dispatched_at` was taken — whose run never materialized inside the
+/// grace window. An unresolved node holds no confirmed id and no
+/// `dispatched_at`, so it can never be overdue: its own grace lives on
+/// the attempt's `instant` instead.
+fn dispatch_overdue(node: &NodeRun) -> bool {
+    node.dispatched
+        && node.run_url.is_none()
+        && node.dispatched_at.is_some_and(|since| {
+            since.elapsed() > std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES)
+        })
+}
+
 /// One bound run's poll answer: a fresh row to fold, `Unmodified` when
-/// the node's cached row still stands (the fold re-judges it against the
-/// current `main` head), `Pending` when the run id has not materialized.
+/// the node's cached row still stands (the fold re-judges it against
+/// the current `main` head), `Pending` when the run id has not materialized.
 enum BoundPoll {
     State {
         task_id: String,
@@ -1879,6 +2351,7 @@ fn bound_run_state(
         url: row.html_url,
         head_sha: row.head_sha,
         run_attempt: row.run_attempt,
+        created_at: Some(row.created_at),
     })
 }
 
@@ -1907,6 +2380,7 @@ async fn local_run_states(
                 url: run.html_url,
                 head_sha: String::new(),
                 run_attempt: 1,
+                created_at: None,
             })
         })
         .collect())
@@ -1924,6 +2398,11 @@ struct WorkflowRunRow {
     html_url: String,
     /// GitHub's attempt counter — `rerun-failed-jobs` bumps it.
     run_attempt: u64,
+    /// GitHub's creation time for the run — the unresolved-dispatch
+    /// resolution accepts a run only at or after its node's attempt
+    /// (minus [`GITHUB_CLOCK_ALLOWANCE`]).
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: time::OffsetDateTime,
 }
 
 /// `GET actions/runs/{id}/jobs` — the fields failure classification
@@ -1989,6 +2468,27 @@ struct LocalTaskRun {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// Fold one already-classified run state: a `Some` record means the
+    /// failure was infrastructure and its rerun was confirmed — bind the
+    /// node to it and record it; `None` folds the state exactly as
+    /// `fold_run` always did.
+    fn fold_classified(
+        state: &RunState,
+        record: Option<RerunRecord>,
+        nodes: &mut BTreeMap<String, NodeRun>,
+        open: &mut BTreeSet<String>,
+        main_head: &str,
+        reruns: &mut Vec<RerunRecord>,
+    ) {
+        match record {
+            Some(record) => {
+                bind_rerun(state, nodes);
+                reruns.push(record);
+            }
+            None => fold_run(state, nodes, open, main_head),
+        }
+    }
 
     /// `main`'s sha in the test fixtures.
     const MAIN_HEAD: &str = "1111111111111111111111111111111111111111";
@@ -2086,6 +2586,7 @@ mod tests {
                 "2222222222222222222222222222222222222222".to_owned()
             },
             run_attempt: 1,
+            created_at: None,
         }
     }
 
@@ -2476,6 +2977,7 @@ mod tests {
             conclusion: conclusion.map(str::to_owned),
             html_url: format!("https://github.com/water-rs/stow/actions/runs/{workflow_run_id}"),
             run_attempt: 1,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
         }
     }
 
@@ -2571,7 +3073,7 @@ mod tests {
             retain_latest_run(&mut states, state, None);
         }
         for state in states.into_values() {
-            fold_run(state, &mut nodes, &mut open, MAIN_HEAD);
+            fold_run(&state, &mut nodes, &mut open, MAIN_HEAD);
         }
 
         let won = ids["won"].clone();
@@ -2595,7 +3097,7 @@ mod tests {
         node.workflow_run_id = Some(50);
         node.dispatched = true;
         node.dispatched_at = Some(std::time::Instant::now());
-        fold_run(old_run, &mut nodes, &mut open, MAIN_HEAD);
+        fold_run(&old_run, &mut nodes, &mut open, MAIN_HEAD);
         let node = &nodes[&stale];
         assert!(
             node.workflow_run_id.is_none()
@@ -2623,7 +3125,7 @@ mod tests {
 
         let mut other = run_state_with_id(99, "completed", Some("failure"), false);
         other.task_id = task.clone();
-        fold_run(other, &mut nodes, &mut open, MAIN_HEAD);
+        fold_run(&other, &mut nodes, &mut open, MAIN_HEAD);
         assert_eq!(nodes[&task].workflow_run_id, Some(50));
         assert!(nodes[&task].dispatched);
     }
@@ -2727,13 +3229,13 @@ mod tests {
         };
         let mut state = run_state("completed", Some("failure"), true);
         state.run_attempt = MAX_RUN_ATTEMPTS;
-        assert!(
+        assert!(matches!(
             dispatch
                 .classify_failed_run(&state)
                 .await
-                .expect("classified")
-                .is_none()
-        );
+                .expect("classified"),
+            Classified::Verdict
+        ));
     }
 
     /// The local CI server has no runner setup: a failure is always
@@ -2744,13 +3246,13 @@ mod tests {
             base: "http://localhost".to_owned(),
         };
         let state = run_state("completed", Some("failure"), true);
-        assert!(
+        assert!(matches!(
             dispatch
                 .classify_failed_run(&state)
                 .await
-                .expect("classified")
-                .is_none()
-        );
+                .expect("classified"),
+            Classified::Verdict
+        ));
     }
 
     /// A rerun keeps the node open and bound to the same run — the
@@ -2775,7 +3277,7 @@ mod tests {
         }
         let mut reruns = Vec::new();
         fold_classified(
-            state,
+            &state,
             Some(RerunRecord {
                 task_id: task.clone(),
                 url: "https://github.com/water-rs/stow/actions/runs/77".to_owned(),
@@ -2810,7 +3312,7 @@ mod tests {
         state.task_id = task.clone();
         let mut reruns = Vec::new();
         fold_classified(
-            state,
+            &state,
             Some(RerunRecord {
                 task_id: task.clone(),
                 url: "https://github.com/water-rs/stow/actions/runs/88".to_owned(),
@@ -2847,7 +3349,7 @@ mod tests {
         let mut state = run_state_with_id(90, "completed", Some("failure"), true);
         state.task_id = leaf.clone();
         let mut reruns = Vec::new();
-        fold_classified(state, None, &mut nodes, &mut open, MAIN_HEAD, &mut reruns);
+        fold_classified(&state, None, &mut nodes, &mut open, MAIN_HEAD, &mut reruns);
         assert!(nodes[&leaf].failed && !open.contains(&leaf));
         let blocked = mark_blocked(std::slice::from_ref(&mid), &mut nodes, &edges);
         assert_eq!(blocked, vec![(mid.clone(), leaf)]);
@@ -2935,6 +3437,509 @@ mod tests {
     fn finish_report_ok_when_all_done_and_resolved() {
         let nodes = all_done(&["built"]);
         finish_report(&nodes, &[], &[], &[], &[]).expect("a clean wave");
+    }
+
+    /// A wall-clock timestamp for the resolution tests.
+    fn at(unix: i64) -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(unix).expect("timestamp")
+    }
+
+    /// A node built in the unresolved state the ambiguous send leaves.
+    fn unresolved_node(
+        nodes: &mut BTreeMap<String, NodeRun>,
+        task: &str,
+        wall: time::OffsetDateTime,
+    ) {
+        let node = nodes.get_mut(task).expect("node");
+        node.dispatched = true;
+        node.unresolved = Some(UnansweredDispatch {
+            wall,
+            instant: tokio::time::Instant::now(),
+        });
+    }
+
+    /// stow#647: an ambiguous dispatch binds through the resolution
+    /// listing — only a run created at or after the attempt (minus
+    /// [`GITHUB_CLOCK_ALLOWANCE`]) may answer it, and the newest of
+    /// the qualifying runs is the one that binds.
+    #[tokio::test]
+    async fn an_unresolved_node_binds_the_newest_qualifying_run() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) =
+            build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        let wall = at(1_000_000);
+        unresolved_node(&mut nodes, &task, wall);
+        let state = |run_id: u64, created_unix: i64| {
+            let mut state = run_state_with_id(run_id, "in_progress", None, true);
+            state.task_id = task.clone();
+            state.created_at = Some(at(created_unix));
+            state
+        };
+        let mut latest = BTreeMap::new();
+        retain_qualifying_runs(
+            &mut latest,
+            vec![
+                // Created before the attempt's floor — it can never be
+                // this attempt's answer.
+                state(7, 1_000_000 - 61),
+                // Exactly at the floor — qualifies.
+                state(8, 1_000_000 - 60),
+                // The newest qualifying run binds.
+                state(9, 1_000_000 + 5),
+            ],
+            &nodes,
+        );
+        let selected = latest.remove(&task).expect("a qualifying run");
+        assert_eq!(selected.workflow_run_id, 9);
+
+        let dispatch = Dispatch::Local {
+            base: "http://localhost".to_owned(),
+        };
+        let mut gate = WriteGate::new();
+        let mut reruns = Vec::new();
+        {
+            let mut wave = Wave {
+                nodes: &mut nodes,
+                open: &mut open,
+                reruns: &mut reruns,
+                gate: &mut gate,
+            };
+            classify_and_fold(&dispatch, selected, &mut wave, MAIN_HEAD)
+                .await
+                .expect("fold");
+        }
+        let node = &nodes[&task];
+        assert_eq!(node.workflow_run_id, Some(9));
+        assert!(node.unresolved.is_none() && node.dispatched);
+    }
+
+    /// An attempt the listing never answers — GitHub never took the
+    /// write — returns to unsent once the grace expires, so the next
+    /// dispatch pass sends it again.
+    #[tokio::test(start_paused = true)]
+    async fn an_unresolved_node_past_the_grace_returns_to_unsent() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) =
+            build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        unresolved_node(&mut nodes, &task, at(1_000_000));
+        // The listing answers nothing for the task — an empty mock CI.
+        let server = MockCi::start(&[], &[], "1.99.0").await;
+        let dispatch = Dispatch::Local {
+            base: server.url.clone(),
+        };
+        let unresolved: BTreeSet<String> = std::iter::once(task.clone()).collect();
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
+        let mut gate = WriteGate::new();
+        let mut reruns = Vec::new();
+        {
+            let mut wave = Wave {
+                nodes: &mut nodes,
+                open: &mut open,
+                reruns: &mut reruns,
+                gate: &mut gate,
+            };
+            // Inside the grace the attempt stays unresolved.
+            resolve_unanswered(&dispatch, &unresolved, &mut wave, MAIN_HEAD, &rustc)
+                .await
+                .expect("resolve");
+            assert!(wave.nodes[&task].unresolved.is_some() && wave.nodes[&task].dispatched);
+            // Past it, the node returns to unsent.
+            tokio::time::advance(std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES + 60)).await;
+            resolve_unanswered(&dispatch, &unresolved, &mut wave, MAIN_HEAD, &rustc)
+                .await
+                .expect("resolve");
+        }
+        let node = &nodes[&task];
+        assert!(node.unresolved.is_none() && !node.dispatched);
+        server.shutdown().await;
+    }
+
+    /// The `overdue` check names confirmed dispatches whose run never
+    /// materialized — an unresolved node carries no confirmed id and
+    /// can never be overdue.
+    #[test]
+    fn the_overdue_check_never_fires_for_an_unresolved_node() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) =
+            build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
+        unresolved_node(&mut nodes, &task, at(1_000_000));
+        assert!(!dispatch_overdue(&nodes[&task]));
+        // A confirmed send's unmaterialized run still fires past the
+        // grace — the check itself is unchanged.
+        let node = nodes.get_mut(&task).expect("node");
+        node.unresolved = None;
+        node.dispatched_at = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES + 60))
+                .expect("the host has been up longer than the grace"),
+        );
+        assert!(dispatch_overdue(&nodes[&task]));
+    }
+
+    /// stow#647 section D: a rerun asked on attempt N is accepted once
+    /// the run shows a later attempt — the record the confirmed path
+    /// would have pushed lands, and the new row folds as usual.
+    #[tokio::test]
+    async fn a_later_attempt_settles_an_asked_rerun() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) =
+            build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        {
+            let node = nodes.get_mut(&task).expect("node");
+            node.dispatched = true;
+            node.workflow_run_id = Some(50);
+            node.pending_rerun = Some(PendingRerun {
+                attempt: 1,
+                asked_at: tokio::time::Instant::now(),
+                job: "build".to_owned(),
+                step: Some("setup".to_owned()),
+            });
+        }
+        let mut state = run_state_with_id(50, "in_progress", None, true);
+        state.task_id = task.clone();
+        state.run_attempt = 2;
+        let dispatch = Dispatch::Local {
+            base: "http://localhost".to_owned(),
+        };
+        let mut gate = WriteGate::new();
+        let mut reruns = Vec::new();
+        {
+            let mut wave = Wave {
+                nodes: &mut nodes,
+                open: &mut open,
+                reruns: &mut reruns,
+                gate: &mut gate,
+            };
+            classify_and_fold(&dispatch, state, &mut wave, MAIN_HEAD)
+                .await
+                .expect("fold");
+        }
+        assert_eq!(reruns.len(), 1);
+        assert_eq!(reruns[0].job, "build");
+        assert_eq!(reruns[0].step.as_deref(), Some("setup"));
+        assert_eq!(reruns[0].run_attempt, 2);
+        let node = &nodes[&task];
+        assert!(node.pending_rerun.is_none() && open.contains(&task) && !node.failed);
+    }
+
+    /// The same completed attempt inside the grace is no answer — the
+    /// row classifies nothing and the node keeps waiting.
+    #[tokio::test]
+    async fn a_same_attempt_row_inside_the_grace_waits() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) =
+            build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        {
+            let node = nodes.get_mut(&task).expect("node");
+            node.dispatched = true;
+            node.workflow_run_id = Some(50);
+            node.pending_rerun = Some(PendingRerun {
+                attempt: 1,
+                asked_at: tokio::time::Instant::now(),
+                job: "build".to_owned(),
+                step: None,
+            });
+        }
+        let mut state = run_state_with_id(50, "completed", Some("failure"), true);
+        state.task_id = task.clone();
+        state.run_attempt = 1;
+        let dispatch = Dispatch::Local {
+            base: "http://localhost".to_owned(),
+        };
+        let mut gate = WriteGate::new();
+        let mut reruns = Vec::new();
+        {
+            let mut wave = Wave {
+                nodes: &mut nodes,
+                open: &mut open,
+                reruns: &mut reruns,
+                gate: &mut gate,
+            };
+            classify_and_fold(&dispatch, state, &mut wave, MAIN_HEAD)
+                .await
+                .expect("fold");
+        }
+        let node = &nodes[&task];
+        assert!(node.pending_rerun.is_some() && !node.failed && open.contains(&task));
+        assert!(reruns.is_empty());
+    }
+
+    /// The same completed attempt past the grace drops the pending
+    /// record and classifies the row again — the rerun ask resends.
+    /// The local lane's classify is always the verdict, so the fold
+    /// lands the failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_same_attempt_row_past_the_grace_classifies_again() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) =
+            build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
+        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
+        {
+            let node = nodes.get_mut(&task).expect("node");
+            node.dispatched = true;
+            node.workflow_run_id = Some(50);
+            node.pending_rerun = Some(PendingRerun {
+                attempt: 1,
+                asked_at: tokio::time::Instant::now(),
+                job: "build".to_owned(),
+                step: None,
+            });
+        }
+        // The ask is now older than the grace.
+        tokio::time::advance(std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES + 60)).await;
+        let mut state = run_state_with_id(50, "completed", Some("failure"), true);
+        state.task_id = task.clone();
+        state.run_attempt = 1;
+        let dispatch = Dispatch::Local {
+            base: "http://localhost".to_owned(),
+        };
+        let mut gate = WriteGate::new();
+        let mut reruns = Vec::new();
+        {
+            let mut wave = Wave {
+                nodes: &mut nodes,
+                open: &mut open,
+                reruns: &mut reruns,
+                gate: &mut gate,
+            };
+            classify_and_fold(&dispatch, state, &mut wave, MAIN_HEAD)
+                .await
+                .expect("fold");
+        }
+        let node = &nodes[&task];
+        assert!(node.pending_rerun.is_none() && node.failed && !open.contains(&task));
+    }
+
+    /// The in-test local CI server `Dispatch::Local` drives: it
+    /// records every `/dispatch` it is scripted to take, answers the
+    /// scripted 500s — one after recording the task, one without —
+    /// and serves the recorded runs on `GET /tasks`, the same shape
+    /// `stow-build serve` speaks.
+    struct MockCi {
+        url: String,
+        state: std::sync::Arc<std::sync::Mutex<MockCiState>>,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    #[derive(Default)]
+    struct MockCiState {
+        /// `(task_id, run_id)` per recorded dispatch, in order.
+        recorded: Vec<(String, u64)>,
+        /// The task id of every `/dispatch` the server saw — including
+        /// the ones it answered 500.
+        seen: Vec<String>,
+        /// Crate names whose next dispatch records then answers 500.
+        ghost: BTreeSet<String>,
+        /// Crate names whose next dispatch answers 500 unrecorded.
+        unrecorded: BTreeSet<String>,
+        next_id: u64,
+        rustc: String,
+    }
+
+    impl MockCi {
+        /// `ghost` dispatches record then fail; `unrecorded` fail
+        /// without recording — each once, on the first matching send.
+        async fn start(ghost: &[&str], unrecorded: &[&str], rustc: &str) -> Self {
+            use axum::response::IntoResponse as _;
+            let state = std::sync::Arc::new(std::sync::Mutex::new(MockCiState {
+                ghost: ghost.iter().map(|name| (*name).to_owned()).collect(),
+                unrecorded: unrecorded.iter().map(|name| (*name).to_owned()).collect(),
+                next_id: 1,
+                rustc: rustc.to_owned(),
+                ..MockCiState::default()
+            }));
+            let shared = state.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/dispatch",
+                    axum::routing::post(
+                        |axum::extract::State(state): axum::extract::State<
+                            std::sync::Arc<std::sync::Mutex<MockCiState>>,
+                        >,
+                         body: axum::body::Bytes| async move {
+                            let body: serde_json::Value =
+                                serde_json::from_slice(&body).expect("dispatch body");
+                            let task_id = body["client_payload"]["task_id"]
+                                .as_str()
+                                .expect("task_id")
+                                .to_owned();
+                            let crate_name = body["client_payload"]["crate_name"]
+                                .as_str()
+                                .expect("crate_name")
+                                .to_owned();
+                            let mut state = state.lock().expect("mock state");
+                            state.seen.push(task_id.clone());
+                            let run_id = state.next_id;
+                            state.next_id += 1;
+                            let fail = if state.ghost.remove(&crate_name) {
+                                state.recorded.push((task_id, run_id));
+                                true
+                            } else if state.unrecorded.remove(&crate_name) {
+                                true
+                            } else {
+                                state.recorded.push((task_id, run_id));
+                                false
+                            };
+                            drop(state);
+                            if fail {
+                                return axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                                    .into_response();
+                            }
+                            axum::Json(serde_json::json!({ "workflow_run_id": run_id }))
+                                .into_response()
+                        },
+                    ),
+                )
+                .route(
+                    "/tasks",
+                    axum::routing::get(
+                        |axum::extract::State(state): axum::extract::State<
+                            std::sync::Arc<std::sync::Mutex<MockCiState>>,
+                        >| async move {
+                            let tasks: Vec<serde_json::Value> = {
+                                let state = state.lock().expect("mock state");
+                                state
+                                    .recorded
+                                    .iter()
+                                    .map(|(task_id, run_id)| {
+                                        serde_json::json!({
+                                            "workflow_run_id": run_id,
+                                            "display_title": format!("{}-{task_id}", state.rustc),
+                                            "status": "completed",
+                                            "conclusion": "success",
+                                            "html_url": format!("http://localhost/run/{run_id}"),
+                                        })
+                                    })
+                                    .collect()
+                            };
+                            axum::Json(serde_json::json!({ "tasks": tasks })).into_response()
+                        },
+                    ),
+                )
+                .with_state(shared);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock ci");
+            let addr = listener.local_addr().expect("local addr");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("mock ci serves");
+            });
+            Self {
+                url: format!("http://{addr}"),
+                state,
+                task: Some(task),
+            }
+        }
+
+        /// Stop the server — the panic-path cleanup is `Drop`'s abort.
+        async fn shutdown(mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    impl Drop for MockCi {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    /// stow#647 end to end: the wave survives ambiguous dispatch
+    /// answers — a 500 that recorded the run resolves through the
+    /// listing, a 500 that recorded nothing re-sends after the grace,
+    /// and every node finishes with each task dispatched exactly once.
+    /// Virtual time makes the ten-minute grace and the backoff waits
+    /// free. The bound is a real-time watchdog thread, not a tokio
+    /// timer: under the paused clock every virtual deadline fires at
+    /// the first park for real I/O, which would cut the wave's first
+    /// network call mid-flight.
+    #[tokio::test(start_paused = true)]
+    async fn a_wave_resolves_ambiguous_dispatches_instead_of_dying() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _edges) = build_graph(vec![
+            request("kept", T, false, &[]),
+            request("ghost", T, false, &[]),
+            request("unrecorded", T, false, &[]),
+        ])
+        .expect("valid graph");
+        let ids = |name: &str| node_task_id(request_by_name(name, &nodes)).expect("task id");
+        let (kept, ghost, unrecorded) = (ids("kept"), ids("ghost"), ids("unrecorded"));
+        let layer: Vec<String> = nodes.keys().cloned().collect();
+        let server = MockCi::start(&["ghost"], &["unrecorded"], "1.99.0").await;
+        let dispatch = Dispatch::Local {
+            base: server.url.clone(),
+        };
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
+        let mut reruns = Vec::new();
+        {
+            let drive = drive_layer(&dispatch, &layer, &mut nodes, &mut reruns, 8, at(0), &rustc);
+            tokio::pin!(drive);
+            let (bound_tx, bound) = tokio::sync::oneshot::channel::<()>();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                let _ = bound_tx.send(());
+            });
+            tokio::select! {
+                result = &mut drive => result.expect("every node built"),
+                _ = bound => panic!("the wave did not finish inside its real bound"),
+            }
+        }
+        assert!(nodes.values().all(|node| node.done));
+        {
+            let state = server.state.lock().expect("mock state");
+            for id in &layer {
+                assert_eq!(
+                    state
+                        .recorded
+                        .iter()
+                        .filter(|(task_id, _)| task_id == id)
+                        .count(),
+                    1,
+                    "{id} recorded exactly once"
+                );
+            }
+            // The unrecorded 500 re-sent exactly once; the recorded one
+            // and the clean dispatch never re-sent.
+            assert_eq!(
+                state
+                    .seen
+                    .iter()
+                    .filter(|task_id| **task_id == unrecorded)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                state
+                    .seen
+                    .iter()
+                    .filter(|task_id| **task_id == ghost)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                state
+                    .seen
+                    .iter()
+                    .filter(|task_id| **task_id == kept)
+                    .count(),
+                1
+            );
+        }
+        server.shutdown().await;
     }
 
     /// An undone node and an unresolved project both land in the error.
