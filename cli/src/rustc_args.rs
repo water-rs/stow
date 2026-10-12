@@ -1,5 +1,7 @@
 use async_process::Command;
+use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
+use tracing::Instrument as _;
 
 pub use stow_types::rustc::ParsedRustcArgs;
 
@@ -59,24 +61,7 @@ pub async fn detect_rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String,
 /// *consumer* target, which is a different platform than the host a
 /// unit without `--target` links for under a `--target` build (stow#317).
 pub async fn rustc_host_target(rustc: &std::ffi::OsStr) -> Result<String, String> {
-    let output = Command::new(rustc)
-        .arg("-vV")
-        .output()
-        .await
-        .map_err(|error| format!("spawn rustc -vV: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rustc -vV failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|error| format!("rustc -vV output is not UTF-8: {error}"))?;
-    stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
-        .ok_or_else(|| "rustc -vV output missing host target".to_owned())
+    vv_host(&rustc_vv(rustc).await?)
 }
 
 /// The raw stdout of one `rustc -vV` — the one probe every rustc-facts
@@ -120,6 +105,25 @@ pub fn vv_release(vv: &str) -> Result<String, String> {
 /// target and version facts, the supervisor base's facts, and the link
 /// resolution's key — so the probe spawns once.
 pub type SharedRustcVv = Shared<BoxFuture<'static, Result<std::sync::Arc<String>, String>>>;
+
+/// The one constructor every `SharedRustcVv` comes from: spawn the
+/// `-vV` probe now, share the pending result. `rustc` is the build's
+/// rustc — the configured one when `RUSTC` / `build.rustc` names one,
+/// else the toolchain default (stow#608).
+pub fn shared_rustc_vv(rustc: std::ffi::OsString) -> SharedRustcVv {
+    let probe = tokio::spawn(
+        async move { rustc_vv(&rustc).await }
+            .instrument(tracing::debug_span!("stow.precargo.rustc_vv_probe")),
+    );
+    async move {
+        match probe.await {
+            Ok(result) => result.map(std::sync::Arc::new),
+            Err(error) => Err(format!("join rustc -vV probe task: {error}")),
+        }
+    }
+    .boxed()
+    .shared()
+}
 
 pub fn configured_public_cache_rustc_version() -> Option<String> {
     std::env::var(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV)

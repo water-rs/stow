@@ -128,6 +128,18 @@ cache keys linked units on `-fuse-ld=mold` alone. An existing
 only when no matching `target.*` table carries flags, so it would
 silently stop applying otherwise.
 
+On Linux the setup also **records the link resolution** into the local
+state database: the `rustc --print cfg` evaluation and the driver mold
+probe a first build would pay are settled once, so a project with no
+cargo configuration of its own builds warm from its first `stow build`.
+The record is keyed on the toolchain (`rustc -vV`), the target, the
+existing cargo config documents, the environment inputs the resolution
+reads (`PATH` included), and the witnessed driver and `ld.mold` files —
+changing any of them, or letting a row age past 24 hours, re-resolves
+instead of serving a stale answer. To reset it, rerun `stow setup`, or
+remove the state database with the rest of the local cache (`stow
+clean`).
+
 `stow check`/`build`/`test` work without setup: on Linux, when the cargo
 configuration does not already select a reachable mold, they provision
 the managed install and pass the same selection to cargo as `--config`

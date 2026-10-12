@@ -134,6 +134,40 @@ fn write_crate(dir: &Path, cargo_home: &Path) {
     );
 }
 
+/// stow#608: a `STOW_CACHE_DIR` that cannot be used — here one below a
+/// regular file, which fails for root too — costs cache hits, never the
+/// build: every cache-state failure is a logged miss, and the build
+/// still produces its binary.
+#[test]
+fn an_unusable_cache_dir_costs_cache_hits_not_the_build() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_crate(dir.path(), cargo_home.path());
+    let setup_cache = tempfile::tempdir().expect("setup cache");
+    stow_setup_in(dir.path(), cargo_home.path(), setup_cache.path());
+    let edge_url = unreachable_edge_url();
+
+    let blocker = tempfile::NamedTempFile::new().expect("blocker file");
+    let cache_dir = blocker.path().join("cache");
+    let target = tempfile::tempdir().expect("target");
+    let output = stow_build_command(
+        dir.path(),
+        &edge_url,
+        &cache_dir,
+        cargo_home.path(),
+        target.path(),
+    );
+    assert!(
+        output.status.success(),
+        "stow build failed with an unusable cache dir:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        probe_binary(target.path()).exists(),
+        "the build still produced its binary"
+    );
+}
+
 /// The probe crate's binary under `target_dir`, with the platform suffix.
 fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
     target_dir
@@ -143,15 +177,19 @@ fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
 
 /// `stow-cli setup` in the isolated `CARGO_HOME` — the one-time mold
 /// selection, kept out of every timed build.
-fn stow_setup_in(dir: &Path, cargo_home: &Path) {
+fn stow_setup_in(dir: &Path, cargo_home: &Path, cache_dir: &Path) {
     // stow#294: a Linux `stow build` refuses to run without a mold
     // selection — `stow setup` installs mold and writes it. Idempotent.
     // Setup writes the global cargo config; the isolated CARGO_HOME keeps
-    // the developer's real one untouched.
+    // the developer's real one untouched, and every call carries its own
+    // STOW_CACHE_DIR so no test writes the developer's state DB — the
+    // link-resolution row `stow setup` records lands where the caller
+    // points (stow#608).
     let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
         .arg("setup")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home)
+        .env("STOW_CACHE_DIR", cache_dir)
         .output()
         .expect("run stow-cli setup");
     assert!(
@@ -167,30 +205,8 @@ fn stow_build_in(
     cache_dir: &Path,
     cargo_home: &Path,
 ) -> std::process::Output {
-    stow_setup_in(dir, cargo_home);
+    stow_setup_in(dir, cargo_home, cache_dir);
     stow_build_command(dir, edge_url, cache_dir, cargo_home, &dir.join("target"))
-}
-
-/// One untimed `stow build` of the empty crate under the same
-/// `STOW_CACHE_DIR` and environment the timed build sees — the
-/// per-machine state stow keeps in the cache dir (the link resolution's
-/// `rustc --print cfg` answer and the mold link probe, the row `stow
-/// setup` records) is paid once, off the clock. The timed build's own
-/// project stays all-miss: nothing about it is cached (stow#608).
-fn prime_stow_cache(primer_dir: &Path, edge_url: &str, cache_dir: &Path, cargo_home: &Path) {
-    let throwaway_target = tempfile::tempdir().expect("primer target");
-    let output = stow_build_command(
-        primer_dir,
-        edge_url,
-        cache_dir,
-        cargo_home,
-        throwaway_target.path(),
-    );
-    assert!(
-        output.status.success(),
-        "stow priming build failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn stow_build_command(
@@ -851,11 +867,6 @@ fn write_empty_crate(dir: &Path) {
 /// stow#347 bans, not the wrapper's existence. Measured rather than
 /// asserted so it scales with the tested binary's profile.
 fn stow_startup_floor(dir: &Path, cargo_home: &Path, edge_url: &str) -> std::time::Duration {
-    // The priming project is a second empty crate in another temp
-    // directory, so the timed empty build's own directory is still
-    // fresh: only the machine-level rows are warm (stow#608).
-    let primer_dir = tempfile::tempdir().expect("primer dir");
-    write_empty_crate(primer_dir.path());
     let mut cargo_windows = Vec::new();
     let mut stow_windows = Vec::new();
     for _ in 0..3 {
@@ -883,7 +894,7 @@ fn stow_startup_floor(dir: &Path, cargo_home: &Path, edge_url: &str) -> std::tim
 
         let stow_cache = tempfile::tempdir().expect("stow cache");
         let stow_target = tempfile::tempdir().expect("stow target");
-        prime_stow_cache(primer_dir.path(), edge_url, stow_cache.path(), cargo_home);
+        stow_setup_in(dir, cargo_home, stow_cache.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
         command
             .arg("build")
@@ -1103,12 +1114,20 @@ fn timed_build(
 ///   binary's own per-invocation cost the suite cannot remove. In a
 ///   release build the allowance is zero and the gate is the raw noise
 ///   band — a systematic 5% bias stands above it.
+///
+/// Each timed stow build is the first build after `stow setup` in a
+/// fresh `STOW_CACHE_DIR` (stow#608): the one-time machine-level costs
+/// `stow setup` records — the link resolution's `rustc --print cfg`
+/// evaluation and the driver's mold link probe — are warm on every
+/// platform where a link resolution exists, while the project's own
+/// artifacts stay all-miss. The same priming covers the startup floor.
 #[test]
 fn an_all_miss_build_is_never_slower_than_cargo() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cargo_home = tempfile::tempdir().expect("cargo home");
     write_multi_crate(dir.path(), cargo_home.path());
-    stow_setup_in(dir.path(), cargo_home.path());
+    let setup_cache = tempfile::tempdir().expect("setup cache");
+    stow_setup_in(dir.path(), cargo_home.path(), setup_cache.path());
     let edge_url = unreachable_edge_url();
 
     let empty_dir = tempfile::tempdir().expect("empty dir");
@@ -1145,12 +1164,7 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
 
         let stow_cache = tempfile::tempdir().expect("stow cache");
         let stow_target = tempfile::tempdir().expect("stow target");
-        prime_stow_cache(
-            empty_dir.path(),
-            &edge_url,
-            stow_cache.path(),
-            cargo_home.path(),
-        );
+        stow_setup_in(dir.path(), cargo_home.path(), stow_cache.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
         command
             .arg("build")

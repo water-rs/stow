@@ -78,91 +78,146 @@ pub async fn provision(
     explicit_target: Option<&str>,
     cargo_dir: &Path,
     stow_config: Option<&crate::config::StowConfig>,
-    rustc_vv: crate::rustc_args::SharedRustcVv,
+    rustc_vv: &crate::rustc_args::SharedRustcVv,
+    cargo_config: cargo_config2::Config,
 ) -> stow_types::error::Result<Vec<String>> {
     if !cfg!(target_os = "linux") || explicit_target.is_some_and(|target| !linux_target(target)) {
         return Ok(Vec::new());
     }
-    // Loading the config files does not evaluate `target.<cfg>` tables —
-    // `cargo-config2` answers the cfg question lazily on first resolution
-    // — so the read overlaps rustc's host probe; only the evaluation
-    // waits for the real triple (stow#608).
-    let (config, env_map) =
-        cargo_config_for_link_eval(cargo_dir, None, std::env::vars_os().collect())
-            .map_err(|error| stow_types::stow_error!("load cargo config: {error}"))?;
+    // The driver already loaded the config chain: de-wrap on a clone
+    // rather than parsing the same documents again (stow#608).
+    let (config, de_wrapped) = de_wrap(&cargo_config);
+    let env_map = link_env_vars(std::env::vars_os(), de_wrapped);
     let target = target
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     if !linux_target(&target) {
         return Ok(Vec::new());
     }
+    // A state DB that cannot be opened is a cache miss, not a build
+    // failure: the resolution is fully computable without it (stow#608).
     let pool = match stow_config {
-        Some(config) => Some(config.state_db_pool().await?),
+        Some(config) => match config.state_db_pool().await {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                tracing::warn!(error = %error, "link resolution cache unavailable, resolving without it");
+                None
+            }
+        },
         None => None,
     };
-    let cfg_rustc = config.build.rustc.clone();
-    provision_resolved(
-        config,
-        cfg_rustc,
+    let cargo_home = process_env("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(crate::config::cargo_home);
+    let ctx = LinkResolutionContext {
         cargo_dir,
-        crate::config::cargo_home().as_deref(),
-        &target,
-        &env_map,
-        &process_env,
-        &rustc_vv,
-        pool.as_ref(),
-    )
-    .await
+        cargo_home: cargo_home.as_deref(),
+        target: &target,
+        env_map: &env_map,
+        env: &process_env,
+        rustc_vv,
+    };
+    provision_resolved(config, &ctx, &crate::config::tools_dir()?, pool.as_ref()).await
+}
+
+/// The inputs `LinkResolutionKey::compute` digests and the resolution
+/// reads — one struct because every carrier of them (the build's
+/// provision, `stow setup`'s warm, the tests) hands over the same set.
+struct LinkResolutionContext<'a> {
+    cargo_dir: &'a Path,
+    cargo_home: Option<&'a Path>,
+    target: &'a str,
+    /// The allowlisted environment the key digests.
+    env_map: &'a std::collections::BTreeMap<String, OsString>,
+    /// The environment the resolution reads (`PATH`, `COMPILER_PATH`).
+    env: EnvLookup<'a>,
+    /// The driver's shared `rustc -vV` of `build_rustc`.
+    rustc_vv: &'a crate::rustc_args::SharedRustcVv,
 }
 
 /// The cached-or-computed answer to "what `--config` values does this
 /// invocation need" (stow#608): a hit skips both the `target.<cfg>`
 /// evaluation's `rustc --print cfg` spawn and the mold probe's compiler
-/// spawn. `None` for `pool` or a stale row computes exactly what the
-/// uncached path would.
-#[allow(clippy::too_many_arguments)]
+/// spawn. `None` for `pool`, a stale row, or any cache failure computes
+/// exactly what the uncached path would — the cache may cost a hit,
+/// never the build.
 async fn provision_resolved(
     config: cargo_config2::Config,
-    cfg_rustc: Option<PathBuf>,
-    cargo_dir: &Path,
-    cargo_home: Option<&Path>,
-    target: &str,
-    env_map: &std::collections::BTreeMap<String, OsString>,
-    env: EnvLookup<'_>,
-    rustc_vv: &crate::rustc_args::SharedRustcVv,
+    ctx: &LinkResolutionContext<'_>,
+    tools_dir: &Path,
     pool: Option<&sqlx::SqlitePool>,
 ) -> stow_types::error::Result<Vec<String>> {
     let cache = match pool {
-        Some(_) => Some(
-            LinkResolutionKey::compute(cfg_rustc, cargo_dir, cargo_home, target, env_map, rustc_vv)
-                .await?,
-        ),
+        Some(_) => Some(LinkResolutionKey::compute(ctx).await?),
         None => None,
     };
-    if let (Some(pool), Some(key)) = (pool, &cache)
-        && let Some(args) = cached_link_args(pool, key).await?
-    {
-        return Ok(args);
+    if let (Some(pool), Some(key)) = (pool, &cache) {
+        match cached_link_args(pool, key).await {
+            Ok(Some(args)) => return Ok(args),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "link resolution cache read failed, resolving fresh");
+            }
+        }
     }
-    let link = resolve_link_from(&config, target, env);
+    let link = resolve_link_from(&config, ctx.target, ctx.env);
     let (args, witnesses) = if link.selects_mold
         && link
-            .unavailable_reason()
+            .unavailable_reason(ctx.env)
             .instrument(tracing::debug_span!("stow.precargo.mold_probe"))
             .await
             .is_none()
     {
-        (Vec::new(), probe_witnesses(&link.probe()))
+        let probe = link.probe();
+        // The file the driver actually resolves `ld.mold` to — asked at
+        // record time only — is witnessed too, so a driver-internal
+        // program directory's `ld.mold` is covered (stow#608).
+        let path = (ctx.env)("PATH");
+        let resolved = match &probe {
+            MoldProbe::Driver { driver, .. } => {
+                driver_resolved_program(driver, "ld.mold", path.as_deref()).await
+            }
+            MoldProbe::Linker(_) => None,
+        };
+        let witnesses = tokio::task::spawn_blocking(move || {
+            let mut witnesses = probe_witnesses(&probe, path.as_deref());
+            if let Some(resolved) = resolved {
+                witnesses.push(witness_path(&resolved));
+            }
+            witnesses
+        })
+        .await
+        .wrap_err("join link witness task")?;
+        (Vec::new(), witnesses)
     } else {
-        let bin_dir = ensure_mold_install()
+        let bin_dir = ensure_mold_install(tools_dir)
             .instrument(tracing::debug_span!("stow.precargo.mold_install"))
             .await?;
         (selection_args(&bin_dir)?, managed_witnesses(&bin_dir))
     };
-    // Only a successful resolution is cached: a build that would be
-    // refused re-probes and reports the live reason every time.
-    if let (Some(pool), Some(key)) = (pool, cache) {
-        record_link_args(pool, key, &args, &witnesses).await?;
+    // Only a successful resolution is cached — a build that would be
+    // refused re-probes and reports the live reason every time, and a
+    // resolution whose `target.<cfg>` read could not run at all is
+    // never recorded: it answered by default, not by what the
+    // configuration says (stow#517, stow#608).
+    if !link.cfg_unreadable
+        && let (Some(pool), Some(key)) = (pool, cache)
+    {
+        // Record only the bytes the resolution actually read: a config
+        // document that moved between the key's digest and now is a
+        // different key, not a row under this one (stow#608).
+        let cargo_dir = ctx.cargo_dir.to_path_buf();
+        let cargo_home = ctx.cargo_home.map(Path::to_path_buf);
+        let current = tokio::task::spawn_blocking(move || {
+            link_config_documents(&cargo_dir, cargo_home.as_deref())
+        })
+        .await
+        .wrap_err("join link document digest task")?;
+        if current == key.documents
+            && let Err(error) = record_link_args(pool, key, &args, &witnesses).await
+        {
+            tracing::warn!(error = %error, "link resolution cache write failed; the next build re-probes");
+        }
     }
     Ok(args)
 }
@@ -234,13 +289,20 @@ pub async fn prepare_global() -> stow_types::error::Result<Option<PathBuf>> {
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
     let cargo_home = crate::config::cargo_home();
-    let (config, _de_wrapped) = global_cargo_config(cargo_home.as_deref())
-        .map_err(|error| stow_types::stow_error!("load global cargo config: {error}"))?;
+    let (config, _de_wrapped) = de_wrap(
+        &cargo_config(
+            &cargo_home.clone().unwrap_or_default(),
+            cargo_home.as_deref(),
+        )
+        .map_err(|error| stow_types::stow_error!("load global cargo config: {error}"))?,
+    );
     let link = resolve_link_from(&config, &host, &process_env);
-    if link.selects_mold && link.unavailable_reason().await.is_none() {
+    if link.selects_mold && link.unavailable_reason(&process_env).await.is_none() {
         return Ok(None);
     }
-    Ok(Some(ensure_mold_install().await?))
+    Ok(Some(
+        ensure_mold_install(&crate::config::tools_dir()?).await?,
+    ))
 }
 
 /// The link resolution a build from a directory with no config of its
@@ -264,35 +326,36 @@ pub async fn warm_global_link_cache(
     if !cfg!(target_os = "linux") {
         return Ok(());
     }
-    let (config, de_wrapped) = global_cargo_config(Some(cargo_home))
-        .map_err(|error| stow_types::stow_error!("load global cargo config: {error}"))?;
-    let pool = stow_config.state_db_pool().await?;
-    let cfg_rustc = config.build.rustc.clone();
+    let (config, de_wrapped) = de_wrap(
+        &cargo_config(cargo_home, Some(cargo_home))
+            .map_err(|error| stow_types::stow_error!("load global cargo config: {error}"))?,
+    );
+    // A state DB that cannot be opened costs the warm record, never
+    // the setup that already wrote the configuration (stow#608).
+    let pool = match stow_config.state_db_pool().await {
+        Ok(pool) => Some(pool),
+        Err(error) => {
+            tracing::warn!(error = %error, "link resolution cache unavailable, setup leaves it cold");
+            None
+        }
+    };
+    let build_rustc = config
+        .build
+        .rustc
+        .clone()
+        .map_or_else(|| OsString::from("rustc"), PathBuf::into_os_string);
     let env_map = link_env_vars(std::env::vars_os(), de_wrapped);
-    provision_resolved(
-        config,
-        cfg_rustc,
-        cargo_home,
-        Some(cargo_home),
-        host,
-        &env_map,
-        &process_env,
-        &shared_rustc_vv(),
-        Some(&pool),
-    )
-    .await?;
+    let shared_vv = crate::rustc_args::shared_rustc_vv(build_rustc.clone());
+    let ctx = LinkResolutionContext {
+        cargo_dir: cargo_home,
+        cargo_home: Some(cargo_home),
+        target: host,
+        env_map: &env_map,
+        env: &process_env,
+        rustc_vv: &shared_vv,
+    };
+    provision_resolved(config, &ctx, &crate::config::tools_dir()?, pool.as_ref()).await?;
     Ok(())
-}
-
-/// One `rustc -vV` of the toolchain's rustc as the shared probe the
-/// driver's contexts build once — setup's cache key needs the same
-/// answer.
-fn shared_rustc_vv() -> crate::rustc_args::SharedRustcVv {
-    futures_util::FutureExt::shared(futures_util::FutureExt::boxed(async move {
-        crate::rustc_args::rustc_vv(OsStr::new("rustc"))
-            .await
-            .map(std::sync::Arc::new)
-    }))
 }
 
 /// Merge stow's mold selection into `document`: the `cfg(target_os =
@@ -409,6 +472,11 @@ struct LinkResolution {
     /// `env` entry wins over the ambient value, a plain one loses to it —
     /// which is where `stow setup` puts the managed install's `bin`.
     compiler_path: Option<std::ffi::OsString>,
+    /// The `target.<cfg>` evaluation's `rustc --print cfg` could not
+    /// run — the resolution answered by default (stow#517). Such an
+    /// answer is never recorded: it says what the fallback computes,
+    /// not what the configuration resolves to (stow#608).
+    cfg_unreadable: bool,
 }
 
 /// The environment a link resolution reads — `std::env::var_os` on a
@@ -461,6 +529,7 @@ fn resolve_link_from(
         linker,
         rustflags,
         compiler_path: effective_compiler_path(config, env),
+        cfg_unreadable: probe_failed,
     }
 }
 
@@ -503,13 +572,19 @@ fn effective_compiler_path(config: &cargo_config2::Config, env: EnvLookup<'_>) -
 /// directly via `std::env::var_os` in cargo-config2's resolver
 /// (bypassing the injected env); `COMPILER_PATH` and
 /// `CARGO_ENV_COMPILER_PATH` feed `effective_compiler_path` (the latter
-/// lands in the config's `[env]` table as `COMPILER_PATH`); `CARGO` is
-/// cargo-config2's cargo binary on cfg-eval error paths. `-B` prefixes
-/// reach the probe through rustflags, and `PATH` plus the probed
+/// lands in the config's `[env]` table as `COMPILER_PATH`); `CARGO`
+/// names the cargo whose sibling `rustc` cargo-config2 evaluates
+/// `--print cfg` through when set — the key digests the build
+/// rustc's `-vV`, so a `CARGO` pointing at another toolchain's cargo
+/// is also a different key. `PATH` is where the probe and the
+/// record-time witnesses resolve `ld.mold` and the driver — a
+/// different `PATH` can honestly answer differently (stow#608).
+/// `-B` prefixes reach the probe through rustflags, and the probed
 /// driver/`ld.mold` are witnessed by resolved absolute path with size
 /// and mtime rather than digested — a file that changes under a stable
 /// name is still a miss.
 const LINK_ENV_VARS: &[&str] = &[
+    "PATH",
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_BUILD_RUSTFLAGS",
@@ -538,7 +613,7 @@ fn is_target_table_env(key: &str) -> bool {
 /// The environment map the link resolution reads — the allowlist above
 /// plus `COMPILER_PATH`, which [`effective_compiler_path`] consults
 /// directly. `de_wrapped` records the `RUSTC_WRAPPER=""` override
-/// [`cargo_config_for_link_eval`] applies when the configured wrapper
+/// [`de_wrap`] applies when the configured wrapper
 /// is stow's own, so the digested map is the map the evaluation
 /// actually saw.
 fn link_env_vars(
@@ -557,9 +632,6 @@ fn link_env_vars(
     if de_wrapped {
         map.insert("RUSTC_WRAPPER".to_owned(), OsString::new());
     }
-    if let Some(value) = std::env::var_os("COMPILER_PATH") {
-        map.insert("COMPILER_PATH".to_owned(), value);
-    }
     map
 }
 
@@ -568,11 +640,13 @@ fn link_env_vars(
 /// file under `cargo_home` — each as `(label, sha256)` so a changed file
 /// is a different key.
 fn link_config_documents(cargo_dir: &Path, cargo_home: Option<&Path>) -> Vec<(String, String)> {
-    let mut paths: Vec<PathBuf> = cargo_config2::Walk::new(cargo_dir).collect();
-    if let Some(home) = cargo_home {
-        paths.push(home.join("config.toml"));
-        paths.push(home.join("config"));
-    }
+    // The walk carries the *injected* cargo home — `Walk::new` would
+    // resolve the process `CARGO_HOME` and digest the developer's real
+    // global config into every test key (stow#608).
+    let paths: Vec<PathBuf> = cargo_home.map_or_else(
+        || cargo_config2::Walk::new(cargo_dir).collect(),
+        |home| cargo_config2::Walk::with_cargo_home(cargo_dir, Some(home.to_path_buf())).collect(),
+    );
     // Only documents that exist enter the key: two invocation
     // directories whose Walk names only absent files then digest the
     // same set — one key per machine, toolchain and target rather than
@@ -598,40 +672,52 @@ fn link_config_documents(cargo_dir: &Path, cargo_home: Option<&Path>) -> Vec<(St
 /// reads. A changed input is a different key, so the probes run again.
 struct LinkResolutionKey {
     inputs_digest: String,
+    /// The `(label, sha256)` pairs the digest was computed over — the
+    /// record path re-reads them to skip recording against documents
+    /// that moved since (stow#608).
+    documents: Vec<(String, String)>,
 }
 
+/// The key format's version, digested first: bumped whenever
+/// `selection_args`, `resolve_link_from`, `FUSE_LD_MOLD` or
+/// `FileWitness` changes meaning, so rows written under the old
+/// semantics miss rather than answer the new question (stow#608).
+const LINK_KEY_FORMAT: u32 = 2;
+
 impl LinkResolutionKey {
-    async fn compute(
-        cfg_rustc: Option<PathBuf>,
-        cargo_dir: &Path,
-        cargo_home: Option<&Path>,
-        target: &str,
-        env_map: &std::collections::BTreeMap<String, OsString>,
-        shared_vv: &crate::rustc_args::SharedRustcVv,
-    ) -> stow_types::error::Result<Self> {
-        // The rustc the `target.<cfg>` evaluation invokes — a configured
-        // `build.rustc`, else the toolchain's. When it is the toolchain's
-        // the driver's shared probe answers; a configured one is probed
-        // itself (stow#608).
-        let vv = match cfg_rustc.as_deref() {
-            Some(rustc) => crate::rustc_args::rustc_vv(rustc.as_os_str()).await,
-            None => shared_vv.clone().await.map(|vv| (*vv).clone()),
-        }
-        .map_err(|error| {
-            stow_types::stow_error!("probe rustc -vV for the link resolution: {error}")
-        })?;
+    async fn compute(ctx: &LinkResolutionContext<'_>) -> stow_types::error::Result<Self> {
+        // The `target.<cfg>` evaluation invokes the build rustc — the
+        // shared probe is already that executable's `-vV` (stow#608).
+        let vv = ctx
+            .rustc_vv
+            .clone()
+            .await
+            .map(|vv| (*vv).clone())
+            .map_err(|error| {
+                stow_types::stow_error!("probe rustc -vV for the link resolution: {error}")
+            })?;
+        let cargo_dir = ctx.cargo_dir.to_path_buf();
+        let cargo_home = ctx.cargo_home.map(Path::to_path_buf);
+        // Reading the config documents is a filesystem walk — off the
+        // runtime worker (stow#608).
+        let documents = tokio::task::spawn_blocking(move || {
+            link_config_documents(&cargo_dir, cargo_home.as_deref())
+        })
+        .await
+        .wrap_err("join link document digest task")?;
         let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        hasher.update(LINK_KEY_FORMAT.to_le_bytes());
         hasher.update(vv.as_bytes());
         hasher.update([0]);
-        hasher.update(target.as_bytes());
+        hasher.update(ctx.target.as_bytes());
         hasher.update([0]);
-        for (label, digest) in link_config_documents(cargo_dir, cargo_home) {
+        for (label, digest) in &documents {
             hasher.update(label.as_bytes());
             hasher.update([0]);
             hasher.update(digest.as_bytes());
             hasher.update([0]);
         }
-        for (key, value) in env_map {
+        for (key, value) in ctx.env_map {
             hasher.update(key.as_bytes());
             hasher.update([0]);
             hasher.update(value.as_encoded_bytes());
@@ -639,6 +725,7 @@ impl LinkResolutionKey {
         }
         Ok(Self {
             inputs_digest: hex::encode(hasher.finalize()),
+            documents,
         })
     }
 }
@@ -676,14 +763,14 @@ fn witness_path(candidate: &Path) -> FileWitness {
 
 /// The candidate paths a bare `name` resolves through — `PATH` order —
 /// or the path itself when the name carries a slash.
-fn candidacies(name: &str) -> Vec<PathBuf> {
+fn candidacies(name: &str, path: Option<&OsStr>) -> Vec<PathBuf> {
     if name.contains('/') {
         return vec![PathBuf::from(name)];
     }
-    let Some(path) = std::env::var_os("PATH") else {
+    let Some(path) = path else {
         return Vec::new();
     };
-    std::env::split_paths(&path)
+    std::env::split_paths(path)
         .map(|dir| dir.join(name))
         .collect()
 }
@@ -693,9 +780,9 @@ fn candidacies(name: &str) -> Vec<PathBuf> {
 /// prefixes and `PATH`, witnessed at every candidate location so a new
 /// `ld.mold` appearing earlier in the search order also changes the
 /// answer, plus the driver itself the same way.
-fn probe_witnesses(probe: &MoldProbe) -> Vec<FileWitness> {
+fn probe_witnesses(probe: &MoldProbe, path: Option<&OsStr>) -> Vec<FileWitness> {
     match probe {
-        MoldProbe::Linker(linker) => candidacies(linker)
+        MoldProbe::Linker(linker) => candidacies(linker, path)
             .iter()
             .map(|candidate| witness_path(candidate))
             .collect(),
@@ -709,15 +796,15 @@ fn probe_witnesses(probe: &MoldProbe) -> Vec<FileWitness> {
                 .map(|path| std::env::split_paths(path).collect())
                 .unwrap_or_default();
             dirs.extend(b_dirs.iter().cloned());
-            if let Some(path) = std::env::var_os("PATH") {
-                dirs.extend(std::env::split_paths(&path));
+            if let Some(path) = path {
+                dirs.extend(std::env::split_paths(path));
             }
             let mut witnesses = Vec::new();
             for dir in dirs {
                 witnesses.push(witness_path(&dir.join("ld.mold")));
             }
             witnesses.extend(
-                candidacies(driver)
+                candidacies(driver, path)
                     .iter()
                     .map(|candidate| witness_path(candidate)),
             );
@@ -746,10 +833,31 @@ fn witnesses_current(witnesses: &[FileWitness]) -> bool {
 /// The cached args for `key`, or `None` when absent or stale — a row
 /// whose witnessed files changed answers as a miss and is overwritten
 /// by the fresh resolution.
+/// How long a recorded link resolution may serve: the same one-day
+/// horizon the lockfile-graph cache prunes by. Rows also die early
+/// whenever a witness disagrees — the TTL only bounds rows whose files
+/// never changed (stow#608).
+const LINK_CACHE_TTL: std::time::Duration = std::time::Duration::from_hours(24);
+
 async fn cached_link_args(
     pool: &sqlx::SqlitePool,
     key: &LinkResolutionKey,
 ) -> stow_types::error::Result<Option<Vec<String>>> {
+    // Rows accumulate forever without this — prune by age the way the
+    // lockfile-graph cache does before reading (stow#608).
+    let now_ms: i64 = crate::state_db::db_int(
+        crate::state_db::now_millis(),
+        "link resolution cache current time",
+    )?;
+    let ttl_ms: i64 = crate::state_db::db_int(
+        crate::state_db::duration_millis(LINK_CACHE_TTL),
+        "link resolution cache TTL",
+    )?;
+    sqlx::query("DELETE FROM link_resolution_cache WHERE ? - created_at_ms >= ?")
+        .bind(now_ms)
+        .bind(ttl_ms)
+        .execute(pool)
+        .await?;
     let row = sqlx::query_as::<_, (String, String)>(
         "SELECT args_json, witnesses_json FROM link_resolution_cache WHERE inputs_digest = ?",
     )
@@ -761,7 +869,10 @@ async fn cached_link_args(
     };
     let witnesses: Vec<FileWitness> =
         serde_json::from_str(&witnesses_json).wrap_err("decode cached link witnesses")?;
-    if !witnesses_current(&witnesses) {
+    let current = tokio::task::spawn_blocking(move || witnesses_current(&witnesses))
+        .await
+        .wrap_err("join link witness check task")?;
+    if !current {
         return Ok(None);
     }
     let args: Vec<String> = serde_json::from_str(&args_json).wrap_err("decode cached link args")?;
@@ -828,23 +939,26 @@ impl LinkResolution {
     }
 
     /// Why mold cannot run for this link, or `None` when it can.
-    async fn unavailable_reason(&self) -> Option<String> {
-        probe_unavailable_reason(&self.probe()).await
+    async fn unavailable_reason(&self, env: EnvLookup<'_>) -> Option<String> {
+        probe_unavailable_reason(&self.probe(), env).await
     }
 }
 
 /// Runs `probe` against the machine and reports why mold cannot run for
-/// it, or `None` when it can.
-async fn probe_unavailable_reason(probe: &MoldProbe) -> Option<String> {
+/// it, or `None` when it can. `env` is the environment `PATH` is read
+/// from — the injected one, never the process's (stow#608).
+async fn probe_unavailable_reason(probe: &MoldProbe, env: EnvLookup<'_>) -> Option<String> {
     match probe {
-        MoldProbe::Linker(linker) => (!program_resolves(linker)).then(|| {
+        MoldProbe::Linker(linker) => (!program_resolves(linker, env("PATH").as_deref())).then(|| {
             format!("the configured linker `{linker}` does not resolve to an executable")
         }),
         MoldProbe::Driver {
             driver,
             b_dirs,
             compiler_path,
-        } => (!ld_mold_resolves(driver, b_dirs, compiler_path.as_deref()).await).then(|| {
+        } => (!ld_mold_resolves(driver, b_dirs, compiler_path.as_deref(), env("PATH").as_deref())
+            .await)
+        .then(|| {
             format!(
                 "`{driver}` finds no `ld.mold` for `-fuse-ld=mold` — run `stow setup` to install mold"
             )
@@ -860,8 +974,17 @@ async fn probe_unavailable_reason(probe: &MoldProbe) -> Option<String> {
 /// exercises exactly the lookup and nothing else. The configured `-B`
 /// prefixes and the effective `COMPILER_PATH` are passed through so the
 /// probe sees the environment the build would.
-async fn ld_mold_resolves(driver: &str, b_dirs: &[PathBuf], compiler_path: Option<&OsStr>) -> bool {
-    let mut probe = async_process::Command::new(driver);
+async fn ld_mold_resolves(
+    driver: &str,
+    b_dirs: &[PathBuf],
+    compiler_path: Option<&OsStr>,
+    path: Option<&OsStr>,
+) -> bool {
+    let resolved = candidacies(driver, path)
+        .into_iter()
+        .find(|candidate| is_executable(candidate));
+    let mut probe =
+        async_process::Command::new(resolved.as_deref().unwrap_or_else(|| Path::new(driver)));
     for dir in b_dirs {
         probe.arg(format!("-B{}", dir.display()));
     }
@@ -886,19 +1009,44 @@ async fn ld_mold_resolves(driver: &str, b_dirs: &[PathBuf], compiler_path: Optio
 
 /// Whether `name` resolves to an executable: a name containing a slash is
 /// checked as a path, a bare name is looked up on `PATH`.
-fn program_resolves(name: &str) -> bool {
+fn program_resolves(name: &str, path: Option<&OsStr>) -> bool {
     if name.contains('/') {
         return is_executable(Path::new(name));
     }
-    path_contains(name)
+    path.is_some_and(|path| path_contains(name, path))
 }
 
 /// Whether an executable named `name` exists anywhere on `PATH`.
-fn path_contains(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(name)))
+fn path_contains(name: &str, path: &OsStr) -> bool {
+    std::env::split_paths(path).any(|dir| is_executable(&dir.join(name)))
+}
+
+/// The path `driver` resolves `program` to — gcc/clang's
+/// `-print-prog-name`, echoed back unresolved when the driver cannot
+/// find one. `Some` only for a resolved path, so the caller witnesses
+/// real files only (stow#608).
+async fn driver_resolved_program(
+    driver: &str,
+    program: &str,
+    path: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let resolved_driver = candidacies(driver, path)
+        .into_iter()
+        .find(|candidate| is_executable(candidate));
+    let output = async_process::Command::new(
+        resolved_driver
+            .as_deref()
+            .unwrap_or_else(|| Path::new(driver)),
+    )
+    .arg(format!("-print-prog-name={program}"))
+    .output()
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let resolved = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    (!resolved.as_os_str().is_empty() && resolved != Path::new(program)).then_some(resolved)
 }
 
 /// A rustflag selects mold when a `-C` link option's value names it —
@@ -1006,74 +1154,17 @@ pub fn cargo_config(
     cargo_config2::Config::load_with_options(cargo_dir, options)
 }
 
-/// The cargo configuration for `target.<cfg>`/rustflags/linker
-/// evaluation, with stow's own rustc wrapper taken out of the probe: the
-/// shim passes `--print` through unchanged so the answers are identical,
-/// while evaluating through it would boot the whole standalone wrapper —
-/// its own rustc probes and state-DB open — once per `cfg()` table read
-/// (stow#608). The wrapper is removed the way cargo removes it —
-/// `RUSTC_WRAPPER` set to the empty string overrides `build.rustc-wrapper`
-/// — so a user-configured wrapper is left in place, because it can
-/// legitimately change rustc's answers.
-fn cargo_config_for_link_eval(
-    cargo_dir: &Path,
-    cargo_home: Option<&Path>,
-    vars: Vec<(OsString, OsString)>,
-) -> Result<
-    (
-        cargo_config2::Config,
-        std::collections::BTreeMap<String, OsString>,
-    ),
-    cargo_config2::Error,
-> {
-    let mut first_options = cargo_config2::ResolveOptions::default().env(vars.iter().cloned());
-    if let Some(home) = cargo_home {
-        first_options = first_options.cargo_home(Some(home.to_path_buf()));
-    }
-    let config = cargo_config2::Config::load_with_options(cargo_dir, first_options)?;
-    let stow_wrapped = config
-        .build
-        .rustc_wrapper
-        .as_deref()
-        .and_then(Path::to_str)
-        .is_some_and(crate::commands::is_stow_owned_value);
-    if !stow_wrapped {
-        let env_map = link_env_vars(vars, false);
-        return Ok((config, env_map));
-    }
-    let env = vars
-        .iter()
-        .cloned()
-        .chain([(OsString::from("RUSTC_WRAPPER"), OsString::new())]);
-    let mut options = cargo_config2::ResolveOptions::default().env(env);
-    if let Some(home) = cargo_home {
-        options = options.cargo_home(Some(home.to_path_buf()));
-    }
-    let config = cargo_config2::Config::load_with_options(cargo_dir, options)?;
-    let env_map = link_env_vars(vars, true);
-    Ok((config, env_map))
-}
-
-/// Only the global end of the chain — the read `stow setup` makes,
-/// where project-level files must not answer: ancestors of
-/// `cargo_home`, which reach `$CARGO_HOME/config.toml` and any
-/// system-level `.cargo` configs above it but never a project's.
+/// Clear stow's own rustc wrapper on a clone of a loaded config — the
+/// one de-wrap function (stow#608). The shim passes `--print` through
+/// unchanged so the answers are identical, while evaluating through it
+/// would boot the whole standalone wrapper — its own rustc probes and
+/// state-DB open — once per `cfg()` table read. A user-configured
+/// wrapper stays: it can legitimately change rustc's answers.
 ///
-/// The flag is whether the `RUSTC_WRAPPER=""` override was applied for
-/// the returned load — the same rule [`cargo_config_for_link_eval`]
-/// encodes in its env map, so a caller can digest the environment the
-/// evaluation actually saw.
-fn global_cargo_config(
-    cargo_home: Option<&Path>,
-) -> Result<(cargo_config2::Config, bool), cargo_config2::Error> {
-    let cargo_home = cargo_home.map(Path::to_path_buf);
-    let config = cargo_config2::Config::load_with_options(
-        cargo_home.clone().unwrap_or_default(),
-        cargo_config2::ResolveOptions::default().cargo_home(cargo_home.clone()),
-    )?;
-    // Same rule as `cargo_config_for_link_eval`: stow's own wrapper must
-    // not answer the `target.<cfg>` probes setup's re-run makes once its
-    // own `rustc-wrapper` entry is on disk.
+/// Returns the de-wrapped config and whether the override applied, so
+/// the caller's key can digest the `RUSTC_WRAPPER=""` the evaluation
+/// conceptually saw.
+fn de_wrap(config: &cargo_config2::Config) -> (cargo_config2::Config, bool) {
     let stow_wrapped = config
         .build
         .rustc_wrapper
@@ -1081,16 +1172,11 @@ fn global_cargo_config(
         .and_then(Path::to_str)
         .is_some_and(crate::commands::is_stow_owned_value);
     if !stow_wrapped {
-        return Ok((config, false));
+        return (config.clone(), false);
     }
-    let env = std::env::vars_os().chain([(OsString::from("RUSTC_WRAPPER"), OsString::new())]);
-    let config = cargo_config2::Config::load_with_options(
-        cargo_home.clone().unwrap_or_default(),
-        cargo_config2::ResolveOptions::default()
-            .cargo_home(cargo_home)
-            .env(env),
-    )?;
-    Ok((config, true))
+    let mut config = config.clone();
+    config.build.rustc_wrapper = None;
+    (config, true)
 }
 
 /// Every cargo config document cargo reads for an invocation at
@@ -1271,8 +1357,8 @@ fn mold_release(arch: &str) -> Option<(&'static str, &'static str)> {
 /// Fails when no mold release exists for this architecture, the download
 /// or extraction fails, the checksum mismatches, or the installed binary
 /// cannot run — each error saying which.
-async fn ensure_mold_install() -> stow_types::error::Result<PathBuf> {
-    let bin_dir = crate::config::tools_dir()?.join("mold").join("bin");
+async fn ensure_mold_install(tools_dir: &Path) -> stow_types::error::Result<PathBuf> {
+    let bin_dir = tools_dir.join("mold").join("bin");
     if is_executable(&bin_dir.join("mold")) && is_executable(&bin_dir.join("ld.mold")) {
         return Ok(bin_dir);
     }
@@ -1735,7 +1821,9 @@ mod tests {
         let fixture = isolated_project(
             "[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
         );
-        let (global, _) = global_cargo_config(Some(&fixture.cargo_home)).expect("global config");
+        let (global, _) = de_wrap(
+            &cargo_config(&fixture.cargo_home, Some(&fixture.cargo_home)).expect("global config"),
+        );
         assert!(
             global
                 .rustflags(LINUX_TARGET)
@@ -2138,11 +2226,7 @@ mod tests {
     /// once up front in tests so the vv probe of the toolchain's own
     /// rustc is not part of the count under test.
     fn ready_vv() -> crate::rustc_args::SharedRustcVv {
-        futures_util::FutureExt::shared(futures_util::FutureExt::boxed(async move {
-            crate::rustc_args::rustc_vv(OsStr::new("rustc"))
-                .await
-                .map(std::sync::Arc::new)
-        }))
+        crate::rustc_args::shared_rustc_vv(OsString::from("rustc"))
     }
 
     /// The resolution the driver performs: config loaded for the link
@@ -2150,79 +2234,46 @@ mod tests {
     /// cache row serves.
     async fn resolve_with_cache(
         fixture: &IsolatedProject,
+        tools_dir: &Path,
         pool: &sqlx::SqlitePool,
     ) -> stow_types::error::Result<Vec<String>> {
         let vars = fixture_vars(fixture);
-        let (config, env_map) =
-            cargo_config_for_link_eval(&fixture.project, Some(&fixture.cargo_home), vars)
-                .expect("load config");
-        let cfg_rustc = config.build.rustc.clone();
+        let (config, de_wrapped) = de_wrap(&fixture.config());
+        let env_map = link_env_vars(vars, de_wrapped);
         let env = fixture.env();
-        provision_resolved(
-            config,
-            cfg_rustc,
-            &fixture.project,
-            Some(&fixture.cargo_home),
-            LINUX_TARGET,
-            &env_map,
-            &env,
-            &ready_vv(),
-            Some(pool),
-        )
-        .await
+        let shared_vv = ready_vv();
+        let ctx = LinkResolutionContext {
+            cargo_dir: &fixture.project,
+            cargo_home: Some(&fixture.cargo_home),
+            target: LINUX_TARGET,
+            env_map: &env_map,
+            env: &env,
+            rustc_vv: &shared_vv,
+        };
+        provision_resolved(config, &ctx, tools_dir, Some(pool)).await
     }
 
-    /// `PATH` with `dir` prepended, restored on drop — the probe's
-    /// driver is a basename resolved by `Command::new` through the
-    /// process `PATH`, so the counting `cc` can only be seen this way.
-    /// Process-env mutation is `unsafe` under the 2024 edition; the only
-    /// basename spawns anywhere in this test binary are these tests'
-    /// driver probes, so shadowing `cc` for the duration is contained.
-    /// `PATH` mutation is process-global: a `cc` probe in one test would
-    /// resolve through whichever test's tools dir was prepended last.
-    /// The counting tests hold this lock for their whole duration.
-    static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    struct ScopedPath(Option<OsString>);
-
-    impl ScopedPath {
-        fn prepend(dir: &Path) -> Self {
-            let original = std::env::var_os("PATH");
-            let mut entries = vec![dir.to_path_buf()];
-            if let Some(original) = &original {
-                entries.extend(std::env::split_paths(original));
-            }
-            let joined = std::env::join_paths(entries).expect("join PATH");
-            unsafe { std::env::set_var("PATH", joined) };
-            Self(original)
-        }
+    /// The counting fixture: a fake rustc as `RUSTC` and a fake `cc`
+    /// reachable through the injected `PATH` — never the process's — so
+    /// every probe the resolution runs leaves a line, and no test
+    /// touches the environment its siblings share (stow#608).
+    struct CountingFixture {
+        tools: tempfile::TempDir,
+        /// The state DB's parent — field position only keeps it alive.
+        _cache: tempfile::TempDir,
+        /// The mold install root handed to the resolution.
+        tools_root: tempfile::TempDir,
+        fixture: IsolatedProject,
+        pool: sqlx::SqlitePool,
+        rustc_counter: PathBuf,
+        cc_counter: PathBuf,
     }
 
-    impl Drop for ScopedPath {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(path) => std::env::set_var("PATH", path),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
-    }
-
-    /// The fixture with a counting fake rustc as `RUSTC` and a counting
-    /// `stow-fake-cc` on `PATH` as the configured driver — so every
-    /// probe the resolution runs leaves a line, and `-fuse-ld=mold`
-    /// resolves without linking anything.
-    #[allow(clippy::type_complexity)]
-    async fn counting_fixture() -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        (tokio::sync::MutexGuard<'static, ()>, ScopedPath),
-        IsolatedProject,
-        sqlx::SqlitePool,
-        PathBuf,
-        PathBuf,
-    ) {
+    /// A counting fake rustc as `RUSTC`, a counting `stow-fake-cc` as
+    /// the configured driver, and `PATH` carrying the tools dir so the
+    /// driver's bare name resolves under the injected environment —
+    /// `-fuse-ld=mold` resolves without linking anything.
+    async fn counting_fixture() -> CountingFixture {
         let tools = tempfile::tempdir().expect("tools");
         let rustc_counter = tools.path().join("rustc.count");
         let cc_counter = tools.path().join("cc.count");
@@ -2233,22 +2284,39 @@ mod tests {
             "exec rustc \"$@\"",
         );
         // A uniquely named driver: the configured `linker`'s basename
-        // becomes the probe's `Command::new` argument, so the fake never
-        // shadows the machine's real `cc` for anything else running.
+        // becomes the probe's program name, so the fake never shadows
+        // the machine's real `cc`.
         counting_script(tools.path(), "stow-fake-cc", &cc_counter, "exit 0");
-        let path = (PATH_LOCK.lock().await, ScopedPath::prepend(tools.path()));
         let mut fixture = isolated_project(&format!(
-            "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\n[target.{LINUX_TARGET}]\nlinker = \"{}\"\n",
-            tools.path().join("stow-fake-cc").display()
+            "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\n[target.{LINUX_TARGET}]\nlinker = \"stow-fake-cc\"\n",
         ));
         fixture
             .env
-            .insert("RUSTC".to_owned(), fake_rustc.clone().into_os_string());
+            .insert("RUSTC".to_owned(), fake_rustc.into_os_string());
+        // The injected PATH: the tools dir first so `stow-fake-cc`
+        // resolves, the process's after so nothing else changes.
+        let mut entries = vec![tools.path().to_path_buf()];
+        if let Some(path) = std::env::var_os("PATH") {
+            entries.extend(std::env::split_paths(&path));
+        }
+        fixture.env.insert(
+            "PATH".to_owned(),
+            std::env::join_paths(entries).expect("join PATH"),
+        );
         let cache = tempfile::tempdir().expect("cache");
+        let tools_root = tempfile::tempdir().expect("tools root");
         let pool = crate::state_db::connect(cache.path())
             .await
             .expect("state db");
-        (tools, cache, path, fixture, pool, rustc_counter, cc_counter)
+        CountingFixture {
+            tools,
+            _cache: cache,
+            tools_root,
+            fixture,
+            pool,
+            rustc_counter,
+            cc_counter,
+        }
     }
 
     /// A warm row answers without a single probe: the second call spawns
@@ -2256,35 +2324,34 @@ mod tests {
     /// the driver's `-fuse-ld=mold` link probe.
     #[tokio::test]
     async fn a_cache_hit_skips_both_probes() {
-        let (_tools, _cache, _path, fixture, pool, rustc_counter, cc_counter) =
-            counting_fixture().await;
-        let args = resolve_with_cache(&fixture, &pool)
+        let fx = counting_fixture().await;
+        let args = resolve_with_cache(&fx.fixture, fx.tools_root.path(), &fx.pool)
             .await
             .expect("first resolution");
         assert_eq!(args, Vec::<String>::new());
-        let cfg_after_first = counter_lines(&rustc_counter)
+        let cfg_after_first = counter_lines(&fx.rustc_counter)
             .into_iter()
             .filter(|line| line.contains("--print"))
             .count();
         assert_eq!(cfg_after_first, 1, "cold key runs one cfg evaluation");
         assert_eq!(
-            counter_lines(&cc_counter).len(),
-            1,
-            "cold key runs the mold probe"
+            counter_lines(&fx.cc_counter).len(),
+            2,
+            "cold key runs the mold probe and the record-time witness query"
         );
 
-        let args = resolve_with_cache(&fixture, &pool)
+        let args = resolve_with_cache(&fx.fixture, fx.tools_root.path(), &fx.pool)
             .await
             .expect("second resolution");
         assert_eq!(args, Vec::<String>::new());
-        let cfg_after_second = counter_lines(&rustc_counter)
+        let cfg_after_second = counter_lines(&fx.rustc_counter)
             .into_iter()
             .filter(|line| line.contains("--print"))
             .count();
         assert_eq!(cfg_after_second, 1, "warm key runs no cfg evaluation");
         assert_eq!(
-            counter_lines(&cc_counter).len(),
-            1,
+            counter_lines(&fx.cc_counter).len(),
+            2,
             "warm key runs no mold probe"
         );
     }
@@ -2294,72 +2361,90 @@ mod tests {
     /// miss and re-probe.
     #[tokio::test]
     async fn a_changed_key_input_misses_the_cache() {
-        let (tools, _cache, _path, fixture, pool, rustc_counter, cc_counter) =
-            counting_fixture().await;
-        resolve_with_cache(&fixture, &pool)
+        let fx = counting_fixture().await;
+        resolve_with_cache(&fx.fixture, fx.tools_root.path(), &fx.pool)
             .await
             .expect("cold resolution");
 
         // A config document's content.
-        let mut fixture = fixture;
+        let mut fixture = fx.fixture;
         std::fs::write(
             fixture.project.join(".cargo/config.toml"),
             format!(
-                "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", \"link-arg=-Wl,-O2\"]\n\n[target.{LINUX_TARGET}]\nlinker = \"{}\"\n",
-                tools.path().join("stow-fake-cc").display()
+                "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", \"link-arg=-Wl,-O2\"]\n\n[target.{LINUX_TARGET}]\nlinker = \"stow-fake-cc\"\n"
             ),
         )
         .expect("rewrite config");
-        resolve_with_cache(&fixture, &pool)
+        resolve_with_cache(&fixture, fx.tools_root.path(), &fx.pool)
             .await
             .expect("changed config document");
         assert_eq!(
-            counter_lines(&rustc_counter)
+            counter_lines(&fx.rustc_counter)
                 .into_iter()
                 .filter(|line| line.contains("--print"))
                 .count(),
             2,
             "a changed config document re-probes"
         );
-        assert_eq!(counter_lines(&cc_counter).len(), 2);
+        assert_eq!(counter_lines(&fx.cc_counter).len(), 4);
 
         // An environment variable the resolution reads.
         fixture.env.insert(
             "RUSTFLAGS".to_owned(),
             OsString::from("-C link-arg=-fuse-ld=mold -Copt-level=3"),
         );
-        resolve_with_cache(&fixture, &pool)
+        resolve_with_cache(&fixture, fx.tools_root.path(), &fx.pool)
             .await
             .expect("changed env var");
         assert_eq!(
-            counter_lines(&rustc_counter)
+            counter_lines(&fx.rustc_counter)
                 .into_iter()
                 .filter(|line| line.contains("--print"))
                 .count(),
             3,
             "a changed env var re-probes"
         );
-        assert_eq!(counter_lines(&cc_counter).len(), 3);
+        assert_eq!(counter_lines(&fx.cc_counter).len(), 6);
 
         // The probed executable itself.
         fixture.env.remove("RUSTFLAGS");
-        let cc = tools.path().join("stow-fake-cc");
+        let cc = fx.tools.path().join("stow-fake-cc");
         let mut script = std::fs::read_to_string(&cc).expect("read cc");
-        script.push_str("# different\n");
+        // A longer body is a different file at a different size — the
+        // witness catches it without an mtime wait.
+        script.push_str("# a different driver body\n");
         std::fs::write(&cc, script).expect("rewrite cc");
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        resolve_with_cache(&fixture, &pool)
+        resolve_with_cache(&fixture, fx.tools_root.path(), &fx.pool)
             .await
             .expect("changed driver");
         assert_eq!(
-            counter_lines(&cc_counter).len(),
-            4,
+            counter_lines(&fx.cc_counter).len(),
+            8,
             "a changed probed executable re-probes"
+        );
+
+        // `PATH` is digested — the search order the witnesses were
+        // recorded under — so the same inputs under a different `PATH`
+        // are a different key and re-probe.
+        let extra = tempfile::tempdir().expect("extra PATH dir");
+        let mut entries = vec![extra.path().to_path_buf()];
+        entries.extend(std::env::split_paths(&fixture.env["PATH"].clone()));
+        fixture.env.insert(
+            "PATH".to_owned(),
+            std::env::join_paths(entries).expect("join PATH"),
+        );
+        resolve_with_cache(&fixture, fx.tools_root.path(), &fx.pool)
+            .await
+            .expect("changed PATH");
+        assert_eq!(
+            counter_lines(&fx.cc_counter).len(),
+            10,
+            "a changed PATH re-probes"
         );
 
         // A config document appearing in an ancestor directory changes
         // the document set — a different key, so it re-probes.
-        let prints_before_ancestor = counter_lines(&rustc_counter)
+        let prints_before_ancestor = counter_lines(&fx.rustc_counter)
             .into_iter()
             .filter(|line| line.contains("--print"))
             .count();
@@ -2367,17 +2452,14 @@ mod tests {
         std::fs::create_dir_all(&ancestor).expect("ancestor .cargo");
         std::fs::write(
             ancestor.join("config.toml"),
-            format!(
-                "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\n[target.{LINUX_TARGET}]\nlinker = \"{}\"\n",
-                tools.path().join("stow-fake-cc").display()
-            ),
+            "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n\n[target.x86_64-unknown-linux-gnu]\nlinker = \"stow-fake-cc\"\n",
         )
         .expect("write ancestor config");
-        resolve_with_cache(&fixture, &pool)
+        resolve_with_cache(&fixture, fx.tools_root.path(), &fx.pool)
             .await
             .expect("ancestor document");
         assert_eq!(
-            counter_lines(&rustc_counter)
+            counter_lines(&fx.rustc_counter)
                 .into_iter()
                 .filter(|line| line.contains("--print"))
                 .count(),
@@ -2394,8 +2476,8 @@ mod tests {
     /// from miss (stow#608).
     #[tokio::test]
     async fn config_less_directories_share_one_key() {
-        let (_tools, _cache, _path, fixture, pool, rustc_counter, cc_counter) =
-            counting_fixture().await;
+        let fx = counting_fixture().await;
+        let fixture = &fx.fixture;
         std::fs::write(
             fixture.cargo_home.join("config.toml"),
             std::fs::read_to_string(fixture.project.join(".cargo/config.toml"))
@@ -2404,15 +2486,15 @@ mod tests {
         .expect("write global config");
         std::fs::remove_file(fixture.project.join(".cargo/config.toml"))
             .expect("drop the project config");
-        resolve_with_cache(&fixture, &pool)
+        resolve_with_cache(fixture, fx.tools_root.path(), &fx.pool)
             .await
             .expect("config-less resolution");
-        let prints = counter_lines(&rustc_counter)
+        let prints = counter_lines(&fx.rustc_counter)
             .into_iter()
             .filter(|line| line.contains("--print"))
             .count();
-        let spawns = counter_lines(&cc_counter).len();
-        assert_eq!((prints, spawns), (1, 1), "cold key ran the probes");
+        let spawns = counter_lines(&fx.cc_counter).len();
+        assert_eq!((prints, spawns), (1, 2), "cold key ran the probes");
 
         // A bare directory elsewhere: no `.cargo` in it or above it, so
         // its document set is the same global file — the shared key.
@@ -2423,11 +2505,11 @@ mod tests {
             cargo_home: fixture.cargo_home.clone(),
             env: fixture.env.clone(),
         };
-        resolve_with_cache(&bare, &pool)
+        resolve_with_cache(&bare, fx.tools_root.path(), &fx.pool)
             .await
             .expect("shared-key resolution");
         assert_eq!(
-            counter_lines(&rustc_counter)
+            counter_lines(&fx.rustc_counter)
                 .into_iter()
                 .filter(|line| line.contains("--print"))
                 .count(),
@@ -2435,101 +2517,93 @@ mod tests {
             "a config-less directory in another path shares the key"
         );
         assert_eq!(
-            counter_lines(&cc_counter).len(),
+            counter_lines(&fx.cc_counter).len(),
             spawns,
             "the shared key skips the mold probe too"
         );
     }
 
-    /// `stow setup` records under the key a build computes for a project
-    /// with no config of its own: the invocation directory differs but
-    /// the inputs are the same — the shared rustc probe, the target, the
-    /// environment map and a document set of just the global file
-    /// (stow#608).
-    #[tokio::test]
-    async fn setup_key_equals_a_config_less_builds_key() {
-        let cargo_home = tempfile::tempdir().expect("cargo home");
-        std::fs::write(
-            cargo_home.path().join("config.toml"),
-            "[build]\nrustc-wrapper = \"stow-rustc-wrapper\"\n",
-        )
-        .expect("write global config");
-        // The env map the eval saw — stow's own wrapper de-wrapped on
-        // both sides.
-        let env_map = link_env_vars(
-            [(
-                OsString::from("CARGO_HOME"),
-                cargo_home.path().as_os_str().to_os_string(),
-            )],
-            true,
-        );
-        let vv = ready_vv();
-
-        // The warm path computes against `cargo_home` itself — the
-        // directory the global read walked.
-        let setup = LinkResolutionKey::compute(
-            None,
-            cargo_home.path(),
-            Some(cargo_home.path()),
-            LINUX_TARGET,
-            &env_map,
-            &vv,
-        )
-        .await
-        .expect("setup key");
-
-        // A build invoked from a directory with no config of its own.
-        let bare = tempfile::tempdir().expect("bare project");
-        let build = LinkResolutionKey::compute(
-            None,
-            bare.path(),
-            Some(cargo_home.path()),
-            LINUX_TARGET,
-            &env_map,
-            &vv,
-        )
-        .await
-        .expect("build key");
-
-        assert_eq!(
-            setup.inputs_digest, build.inputs_digest,
-            "setup's key must equal the config-less build's"
-        );
-    }
-
-    /// A failed resolution writes nothing: the row exists only for an
-    /// outcome the probes actually produced.
+    /// stow#608: a failed resolution is never recorded — a `rustc`
+    /// whose `--print cfg` fails selects mold by default, and a driver
+    /// that finds no `ld.mold` falls through to an install that fails;
+    /// neither answer may write a row. The next build pays the probes
+    /// again instead of inheriting a guess.
     #[tokio::test]
     async fn a_failed_resolution_is_never_cached() {
-        let tools = tempfile::tempdir().expect("tools");
-        let counter = tools.path().join("rustc.count");
-        let fake_rustc = counting_script(
-            tools.path(),
-            "fake-rustc",
-            &counter,
-            "case \"$*\" in *-vV*) exit 1;; *) exec rustc \"$@\";; esac",
+        async fn rows(pool: &sqlx::SqlitePool) -> i64 {
+            let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM link_resolution_cache")
+                .fetch_one(pool)
+                .await
+                .expect("count rows");
+            count
+        }
+
+        // (a) `--print cfg` fails while `-vV` succeeds: the selection
+        // answered by default, so even a probe-resolved `args = []` is
+        // not written — and the second call pays the probe again.
+        let fx = counting_fixture().await;
+        let cfg_fail = counting_script(
+            fx.tools.path(),
+            "cfg-fail-rustc",
+            &fx.rustc_counter,
+            "case \"$*\" in *--print*) exit 1;; *) exec rustc \"$@\";; esac",
         );
-        let mut fixture = isolated_project(
-            "[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n",
-        );
+        let mut fixture = fx.fixture;
         fixture
             .env
-            .insert("RUSTC".to_owned(), fake_rustc.into_os_string());
-        let cache = tempfile::tempdir().expect("cache");
-        let pool = crate::state_db::connect(cache.path())
+            .insert("RUSTC".to_owned(), cfg_fail.into_os_string());
+        let args = resolve_with_cache(&fixture, fx.tools_root.path(), &fx.pool)
             .await
-            .expect("state db");
-        let error = resolve_with_cache(&fixture, &pool)
-            .await
-            .expect_err("the failed probe fails the resolution");
-        assert!(
-            error.to_string().contains("rustc -vV"),
-            "the error names what was being probed: {error}"
+            .expect("the default answer still resolves");
+        assert_eq!(args, Vec::<String>::new());
+        assert_eq!(
+            rows(&fx.pool).await,
+            0,
+            "a cfg-unreadable answer is not recorded"
         );
-        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM link_resolution_cache")
-            .fetch_one(&pool)
+        let prints_before = counter_lines(&fx.rustc_counter)
+            .into_iter()
+            .filter(|line| line.contains("--print"))
+            .count();
+        resolve_with_cache(&fixture, fx.tools_root.path(), &fx.pool)
             .await
-            .expect("count rows");
-        assert_eq!(rows.0, 0, "a failed resolution is never cached");
+            .expect("second resolution");
+        assert!(
+            counter_lines(&fx.rustc_counter)
+                .into_iter()
+                .filter(|line| line.contains("--print"))
+                .count()
+                > prints_before,
+            "no row means the second call pays the cfg probe again"
+        );
+        assert_eq!(rows(&fx.pool).await, 0, "still no row");
+
+        // (b) the probes ran but the install failed: the driver finds no
+        // `ld.mold`, `ensure_mold_install` errors out, and no row is
+        // written — the failure is reported live every time.
+        let fx = counting_fixture().await;
+        let cc = fx.tools.path().join("stow-fake-cc");
+        let script = std::fs::read_to_string(&cc)
+            .expect("read cc")
+            .replace("exit 0", "exit 1");
+        std::fs::write(&cc, script).expect("rewrite cc");
+        // An install root below a regular file fails `ensure_mold_install`
+        // deterministically — the download's unpack cannot create the
+        // directory, and an unreachable network fails even earlier.
+        let blocker = tempfile::NamedTempFile::new().expect("blocker file");
+        let tools_root = blocker.path().join("tools");
+        let error = resolve_with_cache(&fx.fixture, &tools_root, &fx.pool)
+            .await
+            .expect_err("the failed install fails the resolution");
+        assert_eq!(
+            rows(&fx.pool).await,
+            0,
+            "{error}: a failed resolution is never cached"
+        );
+        assert_eq!(
+            counter_lines(&fx.cc_counter).len(),
+            1,
+            "the mold probe ran before the failure"
+        );
     }
 }

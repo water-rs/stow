@@ -281,6 +281,7 @@ mod tests {
             rustc_version: "1.99.0".to_owned(),
             mold_config_args: Vec::new(),
             env_base: None,
+            build_rustc: OsString::from("rustc"),
         }
     }
 

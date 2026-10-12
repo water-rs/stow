@@ -62,8 +62,18 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     // digests the global file's content. Linux only;
     // `warm_global_link_cache` is a no-op elsewhere.
     if cfg!(target_os = "linux") {
-        let stow_config = StowConfig::load()?;
-        mold::warm_global_link_cache(&cargo_home, &host_target, &stow_config).await?;
+        // Recording the row is an optimisation: a setup whose state DB
+        // is unavailable still configures cargo fully — the first build
+        // resolves the link itself and reports live (stow#608). Only a
+        // failure of the resolution itself is an error.
+        match StowConfig::load() {
+            Ok(stow_config) => {
+                mold::warm_global_link_cache(&cargo_home, &host_target, &stow_config).await?;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "stow config unavailable, setup leaves the link cache cold");
+            }
+        }
     }
 
     tracing::info!(
