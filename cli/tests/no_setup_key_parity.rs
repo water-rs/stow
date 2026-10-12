@@ -14,30 +14,15 @@ use std::process::Command;
 use stow_types::public_cache::stable_registry_artifact_identity_for_package;
 use stow_types::rustc::ParsedRustcArgs;
 
+mod support;
+
+use support::hermetic_stow_env;
+
 /// The smallest registry unit that invokes the linker: a proc-macro with
 /// no dependencies of its own, so the probe build stays cheap.
 const PROBE_PACKAGE: &str = "paste-impl";
 const PROBE_CRATE: &str = "paste_impl";
 const PROBE_DEP_VERSION: &str = "0.1.18";
-
-/// The environment a hermetic `stow-cli` invocation needs: an edge
-/// nothing answers — and the same URL as the OCI registry base, so the
-/// CLI never reaches the real registry — an isolated cache dir, a
-/// verify mode the developer's ambient config cannot poison, and
-/// loopback's proxy exclusions.
-fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path) {
-    command
-        .env("STOW_EDGE_URL", edge_url)
-        .env(
-            "STOW_REGISTRY_BASE_URL",
-            format!("{edge_url}/water-rs/stow"),
-        )
-        .env("STOW_CACHE_DIR", cache_dir)
-        .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost");
-}
 
 /// A URL nothing answers: bind a free port, drop the listener, and every
 /// lookup is a fast refused connect.

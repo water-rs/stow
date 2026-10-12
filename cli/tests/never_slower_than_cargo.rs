@@ -14,6 +14,10 @@ use std::process::Command;
 
 use stow_cli::protocol::{Answer, Request};
 
+mod support;
+
+use support::hermetic_stow_env;
+
 /// An edge that answers the miss-admissions mint with an empty list and
 /// then fails every other call with a 500.
 ///
@@ -189,29 +193,6 @@ fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
     target_dir
         .join("debug")
         .join(format!("probe{}", std::env::consts::EXE_SUFFIX))
-}
-
-/// The environment a hermetic `stow-cli` invocation needs in this file:
-/// the test's edge for both the edge URL and the OCI registry base —
-/// without it the CLI reaches the real registry, and once the public
-/// index covers the fixture's crates an "all-miss" build is no longer
-/// one — the isolated cache dir, a verify mode the developer's ambient
-/// config cannot poison, and loopback's proxy exclusions (stow#608).
-fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path) {
-    command
-        .env("STOW_EDGE_URL", edge_url)
-        .env(
-            "STOW_REGISTRY_BASE_URL",
-            format!("{edge_url}/water-rs/stow"),
-        )
-        .env("STOW_CACHE_DIR", cache_dir)
-        // Isolate from the developer's ambient stow config: a user-level
-        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
-        // would make this binary reject the config and skip the cache.
-        .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost");
 }
 
 /// `stow-cli setup` in the isolated `CARGO_HOME` — the one-time mold

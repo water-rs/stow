@@ -412,8 +412,9 @@ pub async fn warm_global_link_cache(
 ///
 /// Rustflags the project already had stay; entries stow itself wrote —
 /// `-fuse-ld=mold` and `-B` prefixes pointing at a `mold/bin` from an
-/// earlier wiring — are replaced in place, so re-running `setup` rewrites
-/// the same keys rather than appending duplicates.
+/// earlier wiring, in any `target` table — are replaced in place, so
+/// re-running `setup` rewrites the same keys rather than appending
+/// duplicates.
 ///
 /// # Errors
 ///
@@ -450,6 +451,32 @@ pub fn write_linker_selection(
     let target = target.as_table_mut().ok_or_else(|| {
         stow_types::stow_error!(".cargo/config.toml `target` exists but is not a table")
     })?;
+    // An earlier wiring may have left stow's flags in any `target`
+    // table — strip them everywhere before writing, so the selection
+    // below replaces them instead of duplicating them or leaving a
+    // table the new selection does not cover.
+    for (_, table) in target.iter_mut() {
+        let Some(table) = table.as_table_like_mut() else {
+            continue;
+        };
+        let flags = match table.get("rustflags") {
+            Some(item) if item.is_array() || item.is_str() => rustflags_value(item),
+            _ => continue,
+        };
+        let flag_count = flags.len();
+        let kept = strip_stow_linker_flags(flags);
+        if kept.len() == flag_count {
+            continue;
+        }
+        if kept.is_empty() {
+            table.remove("rustflags");
+        } else {
+            let mut array = toml_edit::Array::new();
+            array.extend(kept);
+            *table.get_mut("rustflags").expect("rustflags exists") =
+                toml_edit::Item::Value(toml_edit::Value::Array(array));
+        }
+    }
     let table =
         target[LINUX_TARGET_TABLE].or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
     let table = table.as_table_mut().ok_or_else(|| {
@@ -468,7 +495,7 @@ pub fn write_linker_selection(
     };
     let mut flags = Vec::with_capacity(carried.len() + existing.len() + 2);
     flags.extend(carried);
-    flags.extend(strip_stow_linker_flags(existing));
+    flags.extend(existing);
     flags.extend(["-C".to_owned(), FUSE_LD_MOLD.to_owned()]);
     let mut rustflags = toml_edit::Array::new();
     rustflags.extend(flags);
@@ -1110,7 +1137,7 @@ async fn driver_resolved_program(
 /// A rustflag selects mold when a `-C` link option's value names it —
 /// `-C link-arg=-fuse-ld=mold`, `-C linker=mold`, a `-C link-args` bundle
 /// carrying `-fuse-ld=mold`, and so on.
-fn flag_mentions_mold(flag: &str) -> bool {
+pub fn flag_mentions_mold(flag: &str) -> bool {
     let option = flag
         .strip_prefix("--codegen=")
         .or_else(|| flag.strip_prefix("-C"))

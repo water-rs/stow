@@ -17,6 +17,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod support;
+
+use support::hermetic_stow_env;
+
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const RUSTC_VERSION: &str = "1.85.0";
 const ADMISSION_TASK_ID: &str = "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0-d9f3a7c1";
@@ -169,25 +173,6 @@ fn read_request_body(reader: &mut impl std::io::BufRead) -> Vec<u8> {
         let _ = std::io::Read::read_exact(reader, &mut body);
     }
     body
-}
-
-/// The environment a hermetic `stow-cli` invocation needs in this file:
-/// the test's edge for both the edge URL and the OCI registry base —
-/// without it the CLI reaches the real registry — the isolated cache
-/// dir, a verify mode the developer's ambient config cannot poison, and
-/// loopback's proxy exclusions.
-fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path) {
-    command
-        .env("STOW_EDGE_URL", edge_url)
-        .env(
-            "STOW_REGISTRY_BASE_URL",
-            format!("{edge_url}/water-rs/stow"),
-        )
-        .env("STOW_CACHE_DIR", cache_dir)
-        .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost");
 }
 
 fn write_crate(dir: &Path, cargo_home: &Path) {
