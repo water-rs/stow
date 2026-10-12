@@ -77,11 +77,15 @@ impl BuildWorkspace {
 /// Owns the run directory holding each phase's `CARGO_TARGET_DIR` — kept
 /// outside the workspace root because the sandbox working dir denies
 /// execution on every backend — plus the capture records the host collected
-/// over IPC.
+/// over IPC and the phase×invocation unit graphs the phases compiled.
+/// The scan reads both: a capture's `target_dir` names the phase and
+/// invocation it ran under, and that graph's units carry the resolved
+/// feature set the published row is labelled with (stow#611).
 pub struct BuiltWorkspace {
     workspace: BuildWorkspace,
-    _run_dir: TempDir,
+    run_dir: TempDir,
     captures: Vec<CapturedRustcArtifact>,
+    unit_graphs: Vec<PhaseUnitGraph>,
 }
 
 impl BuiltWorkspace {
@@ -91,6 +95,17 @@ impl BuiltWorkspace {
 
     pub fn captures(&self) -> &[CapturedRustcArtifact] {
         &self.captures
+    }
+
+    /// The directory every phase's `CARGO_TARGET_DIR` sits under —
+    /// [`PhaseUnitGraph::target_dir`] derives the per-phase dirs from it.
+    pub fn run_dir(&self) -> &Path {
+        self.run_dir.path()
+    }
+
+    /// The unit graph of every phase×invocation the build ran.
+    pub fn unit_graphs(&self) -> &[PhaseUnitGraph] {
+        &self.unit_graphs
     }
 }
 
@@ -659,6 +674,30 @@ pub struct PhaseUnitGraph {
     graph: stow_cli::ExpandedDependencyGraph,
 }
 
+impl PhaseUnitGraph {
+    /// The `CARGO_TARGET_DIR` this phase ran under — the value a capture
+    /// of one of its units records as `target_dir`, which is how the scan
+    /// tells which phase and invocation a record belongs to.
+    pub(crate) fn target_dir(&self, run_dir: &Path) -> PathBuf {
+        phase_target_dir(run_dir, self.phase, self.invocation)
+    }
+
+    /// Phase and invocation spelling, for diagnostics.
+    pub(crate) fn label(&self) -> String {
+        format!("{} {}", self.phase.as_str(), self.invocation.spelling())
+    }
+
+    /// This graph's units in the shared task-unit model — the resolved
+    /// feature set the scan labels each captured unit's row with
+    /// (stow#611).
+    pub(crate) fn task_units(
+        &self,
+        host_triple: &str,
+    ) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
+        self.graph.task_units(self.target.as_deref(), host_triple)
+    }
+}
+
 /// The units this build's workspace will compile, read from cargo's own
 /// unit graphs — the consumable set (stow#589). Each graph is computed
 /// with the same argv a phase runs (`cargo_phase_args`, minus the
@@ -758,19 +797,16 @@ pub fn verify_dependency_context(
         })?
         .host_triple();
     for unit_graph in unit_graphs {
-        let units = unit_graph
-            .graph
-            .task_units(unit_graph.target.as_deref(), host_triple)
-            .map_err(|error| {
-                stow_types::stow_error!(
-                    "task {} {} ({}): {} {} unit graph does not convert: {error}",
-                    task.crate_name.as_str(),
-                    task.version,
-                    task.target,
-                    unit_graph.phase.as_str(),
-                    unit_graph.invocation.spelling(),
-                )
-            })?;
+        let units = unit_graph.task_units(host_triple).map_err(|error| {
+            stow_types::stow_error!(
+                "task {} {} ({}): {} {} unit graph does not convert: {error}",
+                task.crate_name.as_str(),
+                task.version,
+                task.target,
+                unit_graph.phase.as_str(),
+                unit_graph.invocation.spelling(),
+            )
+        })?;
         let actual = stow_types::unit_graph::resolved_task_graph(&units, &task.rustc_version)
             .map_err(|error| {
                 stow_types::stow_error!(
@@ -999,8 +1035,9 @@ pub async fn build(
 
     Ok(BuiltWorkspace {
         workspace,
-        _run_dir: run_dir,
+        run_dir,
         captures: collector.into_records()?,
+        unit_graphs,
     })
 }
 

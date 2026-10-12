@@ -172,12 +172,16 @@ pub fn stable_c_metadata_for_compile_key(compile_key: &str) -> crate::error::Res
     Ok(compile_key[..STABLE_METADATA_HEX_LEN].to_owned())
 }
 
-/// Split a `<name>-<version>` directory component on the last `-` that
-/// leaves a valid semver on the right. Registry package dirs carry the
-/// *package* name, which differs from the lib crate name whenever the
-/// package renames its lib.
+/// Split a `<name>-<version>` directory component on the first `-` that
+/// leaves a valid semver on the right. A package name never contains a
+/// `.`, so no shorter prefix can end in a semver — while a version's
+/// prerelease or build metadata may carry hyphens of its own
+/// (`1.1.2+spec-1.1.0`), and splitting on a later one would cut the
+/// version in half. Registry package dirs carry the *package* name,
+/// which differs from the lib crate name whenever the package renames
+/// its lib.
 fn split_package_version_component(component: &str) -> Option<(String, String)> {
-    for (index, _) in component.match_indices('-').rev() {
+    for (index, _) in component.match_indices('-') {
         let crate_name = &component[..index];
         let version = &component[index + 1..];
         if semver::Version::parse(version).is_err() {
@@ -725,6 +729,34 @@ mod tests {
         assert_eq!(
             detect_registry_crate_version(&parsed).expect("detect"),
             Some(("anyhow".to_owned(), "1.0.99".to_owned()))
+        );
+    }
+
+    /// The version is everything after the package name: build metadata
+    /// and prereleases carry hyphens of their own, and a package name
+    /// carries hyphens and digits.
+    #[test]
+    fn the_package_version_split_keeps_hyphenated_versions_whole() {
+        for (component, name, version) in [
+            (
+                "toml_datetime-1.1.2+spec-1.1.0",
+                "toml_datetime",
+                "1.1.2+spec-1.1.0",
+            ),
+            ("clap-4.0.0-rc.1", "clap", "4.0.0-rc.1"),
+            ("foo-1.0.0-alpha-2+build-7", "foo", "1.0.0-alpha-2+build-7"),
+            ("md-5-0.10.6", "md-5", "0.10.6"),
+            ("anyhow-1.0.99", "anyhow", "1.0.99"),
+        ] {
+            assert_eq!(
+                super::split_package_version_component(component),
+                Some((name.to_owned(), version.to_owned())),
+                "{component}"
+            );
+        }
+        assert_eq!(
+            super::split_package_version_component("not-a-package"),
+            None
         );
     }
 
