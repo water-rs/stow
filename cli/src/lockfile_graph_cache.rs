@@ -245,20 +245,22 @@ pub async fn load(
     let Some((json,)) = row else {
         return Ok(None);
     };
-    let graph: ExpandedDependencyGraph =
-        serde_json::from_str(&json).wrap_err("decode cached lockfile graph")?;
-    // The post-query half of the key: every local (path-source)
-    // manifest cargo consulted must still hash the same — workspace
-    // member edits and path dependencies outside the root are covered
-    // without walking them into the key (stow#551).
-    if !graph
-        .local_manifests
-        .iter()
-        .all(super::workspace_deps::LocalManifestHash::verify)
-    {
-        return Ok(None);
-    }
-    Ok(Some(graph))
+    // The decode and the manifest hashes below both grow with the
+    // workspace, so they run on a blocking thread (stow#624).
+    smol::unblock(move || {
+        let graph: ExpandedDependencyGraph =
+            serde_json::from_str(&json).wrap_err("decode cached lockfile graph")?;
+        // The post-query half of the key: every local (path-source)
+        // manifest cargo consulted must still hash the same — workspace
+        // member edits and path dependencies outside the root are covered
+        // without walking them into the key (stow#551).
+        Ok(graph
+            .local_manifests
+            .iter()
+            .all(super::workspace_deps::LocalManifestHash::verify)
+            .then_some(graph))
+    })
+    .await
 }
 
 /// Store an expanded graph under a fingerprint key.
@@ -269,7 +271,12 @@ pub async fn store(
     graph: &ExpandedDependencyGraph,
 ) -> stow_types::error::Result<()> {
     let pool = config.state_db_pool().await?;
-    let json = serde_json::to_string(graph).wrap_err("encode lockfile graph")?;
+    // The encode grows with the workspace like the decode above, so it
+    // runs on a blocking thread too (stow#624).
+    let graph = graph.clone();
+    let json = smol::unblock(move || serde_json::to_string(&graph))
+        .await
+        .wrap_err("encode lockfile graph")?;
     let now_ms: i64 = db_int(now_millis(), "lockfile graph cache current time")?;
     sqlx::query(
         "INSERT OR REPLACE INTO lockfile_graph_cache (cache_key, inserted_at_ms, expanded_json) \

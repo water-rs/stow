@@ -20,6 +20,7 @@
 //! minimum the OCI distribution spec allows: `2` requests to mint the token
 //! once, `1-2` per blob, `1` per manifest.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use oci_client::Reference;
@@ -189,15 +190,58 @@ impl SessionRequest {
     }
 }
 
-/// One HTTP session over a `RegistryBase` — owns the reqwest client, the
-/// single minted bearer, and the one retry loop.
+/// The registry's HTTP client, built once per process and shared by every
+/// session the process opens (stow#624).
+///
+/// Building a `reqwest::Client` loads the platform trust store
+/// synchronously — on Linux the system bundle plus every entry under
+/// `/etc/ssl/certs`, hundreds of certificate files parsed before the
+/// constructor returns. A session that built its own paid that scan per
+/// session, on whichever runtime worker polled it. [`RegistryHttp::new`]
+/// is the only constructor and runs the build on a blocking thread;
+/// sessions clone the handle instead.
+#[derive(Debug, Clone)]
+pub struct RegistryHttp {
+    /// `reqwest::Client` is itself reference-counted; the outer `Arc`
+    /// gives the handle an identity [`Self::same_client`] can compare.
+    client: Arc<reqwest::Client>,
+}
+
+impl RegistryHttp {
+    /// Build the client on a blocking thread.
+    ///
+    /// # Errors
+    ///
+    /// A TLS backend that cannot initialize — `reqwest::Client::new`
+    /// panics on it, the builder returns it — and a blocking task that
+    /// cannot be joined.
+    pub async fn new() -> stow_types::error::Result<Self> {
+        let client = tokio::task::spawn_blocking(|| reqwest::Client::builder().build())
+            .await
+            .map_err(|error| stow_types::stow_error!("join registry HTTP client build: {error}"))?
+            .map_err(|error| stow_types::stow_error!("build registry HTTP client: {error}"))?;
+        Ok(Self {
+            client: Arc::new(client),
+        })
+    }
+
+    /// Whether `other` is a clone of this handle — the same client, the
+    /// same connection pool, the same single trust-store load.
+    #[must_use]
+    pub fn same_client(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.client, &other.client)
+    }
+}
+
+/// One HTTP session over a `RegistryBase` — holds the process's client
+/// handle, and owns the single minted bearer and the one retry loop.
 ///
 /// Construct through [`RegistryBase::session`] (anonymous `pull`) or
 /// [`RegistryBase::push_session`] (credentialed `pull,push`); the bearer is
 /// minted lazily on the first request so a session is cheap to create and a
 /// registry that answers the challenge with `200` needs no token at all.
 pub struct RegistrySession {
-    http: reqwest::Client,
+    http: RegistryHttp,
     /// `{scheme}://{host[:port]}` — challenge ping and asset URLs hang off it.
     origin: String,
     /// The repository every request addresses (`water-rs/stow-cache`).
@@ -266,10 +310,17 @@ struct BearerChallenge {
 impl RegistrySession {
     /// A session on `base`: `origin` keeps the parsed scheme and host so
     /// `http` stays plain HTTP for the mock registry and `https` for GHCR.
+    /// `http` is the process's [`RegistryHttp`]; a session never builds a
+    /// client of its own (stow#624).
     #[must_use]
-    pub fn new(base: &RegistryBase, credential: SessionCredential, scope: &'static str) -> Self {
+    pub fn new(
+        base: &RegistryBase,
+        credential: SessionCredential,
+        scope: &'static str,
+        http: &RegistryHttp,
+    ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: http.clone(),
             origin: format!("{}://{}", base.scheme(), base.registry()),
             repository: base.repository().to_owned(),
             credential,
@@ -618,7 +669,10 @@ impl RegistrySession {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let mut builder = self.http.request(request.method.clone(), &request.url);
+            let mut builder = self
+                .http
+                .client
+                .request(request.method.clone(), &request.url);
             if request.authenticated
                 && let Some(bearer) = self.bearer().await?
             {
@@ -989,14 +1043,18 @@ impl RegistryBase {
     /// package is public, so the bearer mints with a `pull` scope and no
     /// credential.
     #[must_use]
-    pub fn session(&self) -> RegistrySession {
-        RegistrySession::new(self, SessionCredential::Anonymous, "pull")
+    pub fn session(&self, http: &RegistryHttp) -> RegistrySession {
+        RegistrySession::new(self, SessionCredential::Anonymous, "pull", http)
     }
 
     /// The credentialed publish session — `pull,push` scope over
     /// `GHCR_USERNAME`/`GHCR_TOKEN`.
     #[must_use]
-    pub fn push_session(&self, credentials: &RegistryCredentials) -> RegistrySession {
+    pub fn push_session(
+        &self,
+        credentials: &RegistryCredentials,
+        http: &RegistryHttp,
+    ) -> RegistrySession {
         RegistrySession::new(
             self,
             SessionCredential::Basic {
@@ -1004,6 +1062,40 @@ impl RegistryBase {
                 password: credentials.password.clone(),
             },
             "pull,push",
+            http,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RegistryBase, RegistryCredentials, RegistryHttp};
+
+    /// stow#624: sessions opened from one handle ride the one client it
+    /// built. The handle's own identity is the count — one constructor
+    /// call, one client, however many sessions clone it — and a second
+    /// constructor call is a second client.
+    #[tokio::test]
+    async fn sessions_from_one_handle_share_its_client() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = RegistryHttp::new().await.expect("build registry http");
+        let base = RegistryBase::production().expect("production registry base");
+        let pull = base.session(&http);
+        let push = base.push_session(
+            &RegistryCredentials {
+                username: "u".to_owned(),
+                password: "p".to_owned(),
+            },
+            &http,
+        );
+        assert!(pull.http.same_client(&http));
+        assert!(push.http.same_client(&http));
+        assert!(pull.http.same_client(&push.http));
+
+        let second = RegistryHttp::new().await.expect("build a second handle");
+        assert!(
+            !base.session(&second).http.same_client(&http),
+            "a second constructor call builds a second client"
+        );
     }
 }
