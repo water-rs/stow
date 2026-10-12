@@ -163,37 +163,53 @@ async fn fetch_once(url: &str, timeout: Duration) -> FetchOutcome {
     // zenwave lifts 4xx/5xx into `Err` before any status branch — whichever
     // arm carries the response, one `(status, hint)` extraction feeds the
     // single classification below; transport/timeout failures retry with
-    // no hint.
-    let (status, retry_after, error) =
-        match tokio::time::timeout(timeout, async move { request.await }).await {
-            Ok(Err(error)) => {
-                let Some(response) = error.response() else {
-                    return FetchOutcome::Retryable {
-                        error: stow_error!("fetch crates.io {url}: {error}"),
-                        retry_after: None,
-                    };
-                };
-                (
-                    response.status().as_u16(),
-                    retry_after_hint(response.headers()),
-                    stow_error!("fetch crates.io {url}: {error}"),
-                )
-            }
-            Ok(Ok(response)) if response.status().is_success() => {
-                return FetchOutcome::Body(response);
-            }
-            Ok(Ok(response)) => (
-                response.status().as_u16(),
-                retry_after_hint(response.headers()),
-                stow_error!("crates.io {url} returned HTTP {}", response.status()),
-            ),
-            Err(_) => {
+    // no hint. The retried unit is the whole read — request, status and
+    // body: a success response's body is read to completion inside the
+    // same bound and the response rebuilt over the buffered bytes, so a
+    // connection cut mid-body lands on the `Err` arm and retries like
+    // any other transport failure.
+    let read = tokio::time::timeout(timeout, async move {
+        let response = request.await?;
+        if !response.status().is_success() {
+            return Ok::<_, zenwave::Error>(response);
+        }
+        let (parts, body) = response.into_parts();
+        let bytes = body.into_bytes().await.map_err(zenwave::Error::BodyParse)?;
+        Ok(zenwave::Response::from_parts(
+            parts,
+            zenwave::Body::from(bytes),
+        ))
+    })
+    .await;
+    let (status, retry_after, error) = match read {
+        Ok(Err(error)) => {
+            let Some(response) = error.response() else {
                 return FetchOutcome::Retryable {
-                    error: stow_error!("fetch crates.io {url}: timed out"),
+                    error: stow_error!("fetch crates.io {url}: {error}"),
                     retry_after: None,
                 };
-            }
-        };
+            };
+            (
+                response.status().as_u16(),
+                retry_after_hint(response.headers()),
+                stow_error!("fetch crates.io {url}: {error}"),
+            )
+        }
+        Ok(Ok(response)) if response.status().is_success() => {
+            return FetchOutcome::Body(response);
+        }
+        Ok(Ok(response)) => (
+            response.status().as_u16(),
+            retry_after_hint(response.headers()),
+            stow_error!("crates.io {url} returned HTTP {}", response.status()),
+        ),
+        Err(_) => {
+            return FetchOutcome::Retryable {
+                error: stow_error!("fetch crates.io {url}: timed out"),
+                retry_after: None,
+            };
+        }
+    };
     if is_transient_status(status) {
         FetchOutcome::Retryable { error, retry_after }
     } else {
@@ -517,7 +533,8 @@ pub fn latest_version(releases: &[IndexRelease]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FetchOutcome, IndexRelease, fetch_once, index_releases_at, index_url, latest_version,
+        CratesIo, FetchOutcome, IndexRelease, fetch_once, index_releases_at, index_url,
+        latest_version,
     };
 
     /// The sharding rule is cargo's own — pin it so a regression names
@@ -689,6 +706,37 @@ mod tests {
         };
         assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
         assert_eq!(server.join().await.len(), 1);
+    }
+
+    /// A `200` whose body the connection cuts mid-read is the same
+    /// transport failure a dropped request is — the retried unit is the
+    /// whole read, so the second attempt answers the parsed value.
+    #[tokio::test]
+    async fn get_json_retries_a_body_cut_mid_read() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::Stall {
+                status: 200,
+                body: r#"{"ok":tr"#,
+                content_length: 64,
+            },
+            crate::test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            },
+        ])
+        .await;
+        let mut crates_io = CratesIo::new();
+        let body: serde_json::Value = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            crates_io.get_json(&server.url),
+        )
+        .await
+        .expect("a cut body completes inside the bound")
+        .expect("a cut body retries");
+        assert_eq!(body["ok"], true);
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
     }
 
     /// A server failure inside the `Err` retries — with no hint to
