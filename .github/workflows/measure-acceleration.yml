@@ -1,0 +1,118 @@
+name: Measure acceleration
+
+# Measures what a developer gains from the public cache on a machine stow
+# does not control: one project, built under plain cargo and under stow
+# with a release build of the CLI from the dispatched ref, every arm
+# several times in a fresh target directory (stow#627). Manual only:
+# nothing schedules it and no push or pull request triggers it, so it
+# costs nothing until someone asks for a number. The arms and what each
+# sample holds are documented in `scripts/measure-acceleration.py`.
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Repository to build, as owner/name
+        required: true
+        default: BurntSushi/ripgrep
+        type: string
+      ref:
+        description: Tag or commit of the project
+        required: true
+        type: string
+      cargo-args:
+        description: Arguments after `cargo build`
+        required: false
+        default: ""
+        type: string
+      touch:
+        description: Workspace source file touched before each incremental build, relative to the project root
+        required: true
+        type: string
+      rustc:
+        description: Toolchain every arm builds with — the one the published index was built for
+        required: true
+        default: "1.99.0"
+        type: string
+      rounds:
+        description: How many times every arm runs its full build
+        required: true
+        default: "3"
+        type: number
+      increments:
+        description: Incremental builds after each full build
+        required: true
+        default: "5"
+        type: number
+      prepare:
+        description: Shell command run once in the project before measuring, for the system packages it needs
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    name: ${{ inputs.project }}
+    runs-on: ubuntu-latest
+    # A large workspace builds five times per round; the bound is GitHub's
+    # own six hours less the time to report.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - name: Build the CLI under measurement
+        run: cargo build --release -p stow-cli
+      - name: Install the toolchain the arms build with
+        env:
+          RUSTC: ${{ inputs.rustc }}
+        run: rustup toolchain install "$RUSTC" --profile minimal
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.project }}
+          ref: ${{ inputs.ref }}
+          path: project
+          persist-credentials: false
+      - name: Prepare the project
+        if: inputs.prepare != ''
+        working-directory: project
+        env:
+          PREPARE: ${{ inputs.prepare }}
+        run: bash -euo pipefail -c "$PREPARE"
+      - name: Measure
+        env:
+          PROJECT: ${{ inputs.project }}
+          RUSTC: ${{ inputs.rustc }}
+          TOUCH: ${{ inputs.touch }}
+          ROUNDS: ${{ inputs.rounds }}
+          INCREMENTS: ${{ inputs.increments }}
+          CARGO_ARGS: ${{ inputs.cargo-args }}
+        run: |
+          python3 scripts/measure-acceleration.py \
+            --stow "$PWD/target/release/stow-cli" \
+            --project "$PWD/project" \
+            --project-name "$PROJECT" \
+            --rustc "$RUSTC" \
+            --touch "$TOUCH" \
+            --rounds "$ROUNDS" \
+            --increments "$INCREMENTS" \
+            --cargo-args="$CARGO_ARGS" \
+            --out "$RUNNER_TEMP/measure" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: acceleration
+          path: |
+            ${{ runner.temp }}/measure/samples.jsonl
+            ${{ runner.temp }}/measure/facts.json
+            ${{ runner.temp }}/measure/summary.md
+            ${{ runner.temp }}/measure/logs

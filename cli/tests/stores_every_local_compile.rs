@@ -84,6 +84,16 @@ fn every_compiled_unit_is_stored_before_the_build_exits() {
             "stow build {run} failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // `proc-macro2` compiles a `build_script_build` `bin` unit, which
+        // the cache can never hold — its post-compile must not warn
+        // about an identity it was never owed (stow#619).
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr
+                .lines()
+                .any(|line| line.contains("failed to resolve local artifact identity")),
+            "run {run}: a never-cacheable unit is not an identity failure:\n{stderr}"
+        );
         let stored = stored_crate_names(&cache.path().join("state-v3.sqlite3"));
         let expected = expected_stored_crates()
             .iter()

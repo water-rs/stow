@@ -189,16 +189,7 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
         return Ok(FastPath::Defer);
     }
     let mut wrapped_args = args.get(3..).map(<[_]>::to_vec).unwrap_or_default();
-    if let Some(encoded) = std::env::var_os(rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV)
-        .and_then(|value| value.into_string().ok())
-    {
-        wrapped_args.extend(
-            encoded
-                .split('\x1f')
-                .filter(|arg| !arg.is_empty())
-                .map(OsString::from),
-        );
-    }
+    wrapped_args.extend(rustc_args::extra_args_from_env()?);
     let Ok(parsed) = ParsedRustcArgs::parse(&wrapped_args) else {
         return Ok(FastPath::Defer);
     };

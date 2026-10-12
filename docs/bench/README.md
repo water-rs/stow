@@ -33,8 +33,8 @@ artifact cache afterwards, so peak disk stays flat regardless of list length.
 - `projects.txt` is `name|version|git url|tag`.
 
 Gotcha when comparing by hand: `stow build` has the wrapper append a
-`--remap-path-prefix` to every rustc unit's argv — it travels through
-`STOW_RUSTC_EXTRA_ARGS`, not `RUSTFLAGS`, where cargo's precedence rules
+`--remap-path-prefix` to every rustc unit's argv — it travels through the
+file `STOW_RUSTC_EXTRA_ARGS_FILE` names, not `RUSTFLAGS`, where cargo's precedence rules
 would discard a user's `.cargo/config.toml` rustflags — so a plain
 `cargo build` in the same `target/` recompiles everything.
 `run_bench.sh` keeps them in separate target directories.

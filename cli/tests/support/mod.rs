@@ -84,6 +84,9 @@ pub fn stow_build_in(
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_TARGET_DIR", target_dir)
+        // The default filter, whatever the developer's shell exports: the
+        // supervisor runs in this process, so the warnings it logs are on
+        // this stderr, where a test can assert on them (stow#619).
         .env_remove("RUST_LOG")
         .output()
         .expect("run stow-cli build")
