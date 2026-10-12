@@ -116,7 +116,11 @@ pub struct ObservedUnit {
     pub crate_name: String,
     /// Crate version.
     pub crate_version: String,
-    /// The feature set the compile's argv carried.
+    /// The `--cfg feature="…"` scan of the compile's argv — evidence of
+    /// the command line, not the unit's cargo feature set: it may also
+    /// carry whatever the crate's build script printed as
+    /// `cargo:rustc-cfg=feature="…"`. The resolved set lives on the build's
+    /// unit graph node (stow#615).
     pub features: Vec<String>,
     /// The real platform the unit compiled for.
     pub target: String,
