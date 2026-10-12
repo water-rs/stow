@@ -977,6 +977,10 @@ async fn delegate_to_supervisor(
     );
     let ticket = match decision {
         supervisor::client::Decision::Served(notifications) => {
+            connection
+                .close()
+                .await
+                .map_err(|error| stow_types::stow_error!("{error}"))?;
             write_served_artifact_notifications(&notifications)?;
             std::process::exit(0)
         }
@@ -985,6 +989,10 @@ async fn delegate_to_supervisor(
     let status = run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
     connection
         .report(&ticket, status.success())
+        .await
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    connection
+        .close()
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     std::process::exit(status.code().unwrap_or(1));
@@ -4021,6 +4029,15 @@ mod tests {
         );
     }
 
+    /// The line rustc prints for `file` under the fixtures' `/tmp/out`
+    /// out-dir: the path is spelled the way this platform joins it and
+    /// escaped as JSON, everything around it is the literal protocol.
+    fn notification_line(file: &str, emit: &str) -> String {
+        let artifact = serde_json::to_string(&PathBuf::from("/tmp/out").join(file))
+            .expect("a UTF-8 path serializes");
+        format!(r#"{{"$message_type":"artifact","artifact":{artifact},"emit":"{emit}"}}"#)
+    }
+
     #[test]
     fn cached_rlib_notifications_match_rustc_protocol() {
         let parsed = ParsedRustcArgs::parse(&args(&[
@@ -4049,9 +4066,9 @@ mod tests {
         assert_eq!(
             notifications,
             crate::supervisor::protocol::ArtifactNotifications(vec![
-                r#"{"$message_type":"artifact","artifact":"/tmp/out/autocfg-xyz789.d","emit":"dep-info"}"#.to_owned(),
-                r#"{"$message_type":"artifact","artifact":"/tmp/out/libautocfg-xyz789.rmeta","emit":"metadata"}"#.to_owned(),
-                r#"{"$message_type":"artifact","artifact":"/tmp/out/libautocfg-xyz789.rlib","emit":"link"}"#.to_owned(),
+                notification_line("autocfg-xyz789.d", "dep-info"),
+                notification_line("libautocfg-xyz789.rmeta", "metadata"),
+                notification_line("libautocfg-xyz789.rlib", "link"),
             ])
         );
         assert!(parsed.requests_json_artifact_notifications());
@@ -4085,8 +4102,8 @@ mod tests {
         assert_eq!(
             notifications,
             crate::supervisor::protocol::ArtifactNotifications(vec![
-                r#"{"$message_type":"artifact","artifact":"/tmp/out/serde_derive-xyz789.d","emit":"dep-info"}"#.to_owned(),
-                r#"{"$message_type":"artifact","artifact":"/tmp/out/libserde_derive-xyz789.dylib","emit":"link"}"#.to_owned(),
+                notification_line("serde_derive-xyz789.d", "dep-info"),
+                notification_line("libserde_derive-xyz789.dylib", "link"),
             ])
         );
     }

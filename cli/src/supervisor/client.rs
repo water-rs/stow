@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::Endpoint;
 use super::protocol::{
@@ -107,6 +107,24 @@ impl Connection {
                 Err("supervisor answered a report with a plan answer".to_owned())
             }
         }
+    }
+
+    /// End the conversation: send the stream's end and release the
+    /// connection. `std::process::exit` runs no destructor, and a process
+    /// that exits with the loopback connection still open resets it — the
+    /// supervisor then reads an error where the conversation simply
+    /// ended (stow#633).
+    ///
+    /// # Errors
+    ///
+    /// A stream that cannot be shut down.
+    pub async fn close(mut self) -> Result<(), String> {
+        match &mut self.stream {
+            #[cfg(unix)]
+            Stream::Unix(stream) => stream.shutdown().await,
+            Stream::Loopback(stream) => stream.shutdown().await,
+        }
+        .map_err(|error| format!("close the supervisor connection: {error}"))
     }
 
     async fn exchange(&mut self, request: &Request) -> Result<Answer, String> {
