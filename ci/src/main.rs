@@ -177,7 +177,10 @@ async fn publish(
     )?;
 
     let credentials = stow_oci::RegistryCredentials::from_env()?;
-    let upload_outcome = stow_oci::push_artifacts(&output.plan, &credentials).await?;
+    // One client for the whole publish: the artifact push and the
+    // records push share the trust-store load (stow#624).
+    let http = stow_oci::RegistryHttp::new().await?;
+    let upload_outcome = stow_oci::push_artifacts(&output.plan, &credentials, &http).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
         &upload_outcome.published_by_reference,
@@ -188,6 +191,7 @@ async fn publish(
     // webhook handler reads it back before marking the task done.
     let records = stow_oci::push_records(
         &credentials,
+        &http,
         task.rustc_version.as_str(),
         &task.task_id,
         &artifact_records,

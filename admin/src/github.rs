@@ -130,7 +130,12 @@ pub async fn get_url_json<T: serde::de::DeserializeOwned>(
 /// the response inside it — a terminal status is its error without
 /// another attempt, a transient one carries its `Retry-After` hint into
 /// the wait, and a failure that outlives the budget returns as its
-/// final error.
+/// final error. The retried unit is the whole read — request, status
+/// and body: the body is read to completion inside the loop, so a
+/// connection cut mid-body retries like any other transport failure,
+/// and what leaves the loop is a response whose body is already in
+/// memory — a complete body that does not parse is terminal, never a
+/// retry.
 async fn send_get(
     token: Option<&str>,
     url: &str,
@@ -154,7 +159,21 @@ async fn send_get(
         };
         let (error, retry_after) = match request.await {
             Ok(response) if !is_transient_status(response.status().as_u16()) => {
-                return Ok(response);
+                // A response cut while its body streams is the same
+                // transport failure a cut request is — buffer the body
+                // inside the loop so the retry covers it, and rebuild
+                // the response over the complete bytes so nothing the
+                // caller reads can still meet the wire.
+                let (parts, body) = response.into_parts();
+                match body.into_bytes().await {
+                    Ok(bytes) => {
+                        return Ok(zenwave::Response::from_parts(
+                            parts,
+                            zenwave::Body::from(bytes),
+                        ));
+                    }
+                    Err(error) => (zenwave::Error::BodyParse(error), None),
+                }
             }
             Ok(response) => {
                 let retry_after = retry_after_hint(response.headers());
@@ -995,6 +1014,61 @@ mod url_json_tests {
         assert!(result.is_err());
         let heads = server.join().await;
         assert_eq!(heads.len(), 1);
+    }
+
+    /// A `200` whose body the connection cuts mid-read is the same
+    /// transport failure a dropped request is — the retried unit is the
+    /// whole read, so the second attempt answers the parsed value.
+    #[tokio::test]
+    async fn get_url_json_retries_a_body_cut_mid_read() {
+        let server = test_server::Loopback::start(vec![
+            test_server::Step::Stall {
+                status: 200,
+                body: r#"{"ok":tr"#,
+                content_length: 64,
+            },
+            test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            },
+        ])
+        .await;
+        let body: serde_json::Value = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            get_url_json(&server.url, None),
+        )
+        .await
+        .expect("a cut body completes inside the bound")
+        .expect("a cut body retries");
+        assert_eq!(body["ok"], true);
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
+    }
+
+    /// The same cut on every attempt spends the budget and returns the
+    /// final error — never a hang and never a panic.
+    #[tokio::test]
+    async fn get_url_json_fails_a_body_cut_past_the_budget() {
+        let server = test_server::Loopback::start(
+            (0..4)
+                .map(|_| test_server::Step::Stall {
+                    status: 200,
+                    body: r#"{"ok":tr"#,
+                    content_length: 64,
+                })
+                .collect(),
+        )
+        .await;
+        let result: stow_types::error::Result<serde_json::Value> = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            get_url_json(&server.url, None),
+        )
+        .await
+        .expect("a cut body ends inside the bound");
+        assert!(result.is_err(), "the final error returns, it does not hang");
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 4);
     }
 
     /// A 2xx that does not decode is a failure, not a retry — the same

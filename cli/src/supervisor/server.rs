@@ -112,9 +112,10 @@ pub struct Supervisor {
     accept_task: Option<tokio::task::JoinHandle<()>>,
     /// Live connection count, read by the drain's overrun warning.
     connections: Arc<AtomicUsize>,
-    /// Removed when the supervisor drops, taking the socket with it.
+    /// Holds the socket. Removed by [`Self::shutdown`], or when the
+    /// supervisor drops without reaching it.
     #[cfg(unix)]
-    _socket_dir: Option<tempfile::TempDir>,
+    socket_dir: Option<tempfile::TempDir>,
 }
 
 impl Supervisor {
@@ -135,8 +136,19 @@ impl Supervisor {
     /// The wait is bounded: on overrun it warns with the number of
     /// connections abandoned rather than hanging the build. Returns that
     /// number — `0` is a clean drain.
+    ///
+    /// The socket's directory is removed here rather than at drop: a
+    /// failing build leaves through `std::process::exit`, which runs no
+    /// destructors (stow#630).
     pub async fn shutdown(&mut self) -> usize {
-        self.shutdown_within(CONNECTION_DRAIN_BUDGET).await
+        let abandoned = self.shutdown_within(CONNECTION_DRAIN_BUDGET).await;
+        #[cfg(unix)]
+        if let Some(socket_dir) = self.socket_dir.take()
+            && let Err(error) = socket_dir.close()
+        {
+            tracing::warn!(%error, "could not remove the supervisor socket directory");
+        }
+        abandoned
     }
 
     /// [`Self::shutdown`] with an explicit bound — the constant lives at
@@ -236,7 +248,7 @@ where
             shutdown: Some(shutdown_tx),
             accept_task: Some(accept_task),
             connections,
-            _socket_dir: Some(socket_dir),
+            socket_dir: Some(socket_dir),
         })
     }
 

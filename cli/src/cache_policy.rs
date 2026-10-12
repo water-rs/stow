@@ -12,33 +12,18 @@ pub struct CachePolicyEntry {
 }
 
 /// The per-build policy directory a build's allow markers and local-build
-/// provenance markers live under. Created empty and handed to cargo
+/// provenance markers live under, inside the scratch directory the build
+/// removes when it ends (stow#630). Created empty and handed to cargo
 /// immediately: the supervisor writes provenance markers into it during
 /// the build, and the graph analysis's allow entries are committed into
 /// the same directory as the build's background enrichment lands — the
 /// checks that consult them read the directory per plan call, so a
 /// late-arriving marker still gates the unit it names (stow#347).
-pub async fn create_policy_dir(
-    config: &crate::config::StowConfig,
-) -> stow_types::error::Result<PathBuf> {
-    async_fs::create_dir_all(config.graph_plan_dir())
-        .await
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "create cache policy dir {}: {error}",
-                config.graph_plan_dir().display()
-            )
-        })?;
-
-    let dir = config.graph_plan_dir().join(format!(
-        "cache-policy-{}-{}",
-        std::process::id(),
-        crate::state_db::now_millis()
-    ));
+pub async fn create_policy_dir(scratch_dir: &Path) -> stow_types::error::Result<PathBuf> {
+    let dir = scratch_dir.join("cache-policy");
     async_fs::create_dir_all(&dir).await.map_err(|error| {
         stow_types::stow_error!("create cache policy dir {}: {error}", dir.display())
     })?;
-
     Ok(dir)
 }
 

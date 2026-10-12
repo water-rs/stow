@@ -298,7 +298,11 @@ pub async fn resolve_exact_dependency_graph(
         .arg("--unit-graph")
         .arg("-Z")
         .arg("unstable-options")
-        .current_dir(current_dir);
+        .current_dir(current_dir)
+        // A build aborts its in-flight analysis when cargo exits: dropping
+        // this resolve kills the child rather than orphaning it to keep
+        // probing rustc after stow has returned (stow#624).
+        .kill_on_drop(true);
     // `-Z` needs nightly cargo or RUSTC_BOOTSTRAP. On a stable channel
     // with no user-set value, the child gets cargo's own channel
     // override instead: cargo treats itself as nightly and accepts
@@ -340,14 +344,20 @@ pub async fn resolve_exact_dependency_graph(
             String::from_utf8_lossy(&unit_graph_output.stderr).trim()
         ));
     }
-    let mut graph = expanded_dependency_graph(
-        &unit_graph_output.stdout,
-        target,
-        host_triple,
-        rustc_version,
-    )?;
-    graph.raw_unit_graph = unit_graph_output.stdout;
-    Ok(graph)
+    // The parse and the expansion walk cargo's whole unit table — input
+    // that grows with the workspace — so they run on a blocking thread
+    // (stow#624).
+    let stdout = unit_graph_output.stdout;
+    let target = target.map(str::to_owned);
+    let host_triple = host_triple.to_owned();
+    let rustc_version = rustc_version.clone();
+    smol::unblock(move || {
+        let mut graph =
+            expanded_dependency_graph(&stdout, target.as_deref(), &host_triple, &rustc_version)?;
+        graph.raw_unit_graph = stdout;
+        Ok(graph)
+    })
+    .await
 }
 
 /// The read half of [`resolve_exact_dependency_graph`].
@@ -416,6 +426,8 @@ async fn cargo_channel_is_stable(current_dir: &Path) -> stow_types::error::Resul
     let output = Command::new("cargo")
         .arg("-V")
         .current_dir(current_dir)
+        // Dropped with the resolve it answers for (stow#624).
+        .kill_on_drop(true)
         .output()
         .await
         .wrap_err("spawn cargo -V")?;

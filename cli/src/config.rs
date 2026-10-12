@@ -69,6 +69,12 @@ pub struct StowConfig {
     /// artifact made verification the whole cost of a cold prefetch.
     #[serde(skip, default = "Arc::default")]
     pub trust_material: Arc<OnceCell<Arc<crate::verify::TrustMaterial>>>,
+    /// Lazily built registry HTTP client, shared by every registry
+    /// session this process opens. Building one loads the platform trust
+    /// store — hundreds of certificate files on Linux — so a client per
+    /// session made each index fetch pay that scan again (stow#624).
+    #[serde(skip, default = "Arc::default")]
+    pub registry_http: Arc<OnceCell<stow_oci::RegistryHttp>>,
 }
 
 impl StowConfig {
@@ -98,6 +104,19 @@ impl StowConfig {
             })
             .await?;
         Ok(Arc::clone(material))
+    }
+
+    /// Get (lazily building) the registry HTTP client for this config.
+    ///
+    /// # Errors
+    ///
+    /// Whatever building the client fails with.
+    pub async fn registry_http(&self) -> stow_types::error::Result<stow_oci::RegistryHttp> {
+        let http = self
+            .registry_http
+            .get_or_try_init(stow_oci::RegistryHttp::new)
+            .await?;
+        Ok(http.clone())
     }
 
     /// Build a fresh, uninitialized lazy cache for the state `SQLite` pool.
@@ -200,6 +219,7 @@ impl StowConfig {
             verify_mode,
             state_db_pool: Arc::default(),
             trust_material: Arc::default(),
+            registry_http: Arc::default(),
         })
     }
 
@@ -240,6 +260,7 @@ impl StowConfig {
             verify_mode,
             state_db_pool: Arc::default(),
             trust_material: Arc::default(),
+            registry_http: Arc::default(),
         })
     }
 
@@ -259,10 +280,6 @@ impl StowConfig {
 
     pub fn artifact_cache_purge_root(&self) -> PathBuf {
         self.cache_dir.join("purge")
-    }
-
-    pub fn graph_plan_dir(&self) -> PathBuf {
-        self.cache_dir.join("graph-plans")
     }
 }
 

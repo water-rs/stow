@@ -194,7 +194,22 @@ fn stow_build_command(
     cargo_home: &Path,
     target_dir: &Path,
 ) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    stow_build(dir, edge_url, cache_dir, cargo_home, target_dir)
+        .output()
+        .expect("run stow-cli build")
+}
+
+/// The `stow-cli build` invocation every build under test shares, before
+/// it runs — a test that needs one more variable adds it here.
+fn stow_build(
+    dir: &Path,
+    edge_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+    target_dir: &Path,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    command
         .arg("build")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home)
@@ -213,9 +228,8 @@ fn stow_build_command(
         .env("no_proxy", "127.0.0.1,localhost")
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("run stow-cli build")
+        .env_remove("RUST_LOG");
+    command
 }
 
 fn state_db_pool(db: &Path) -> sqlx::SqlitePool {
@@ -318,6 +332,146 @@ fn an_unreachable_edge_costs_cache_hits_not_the_build() {
         "stow build failed against an unreachable edge:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The live `cargo --unit-graph` processes of the build whose cache
+/// directory is `cache_dir`: the analysis's cargo child inherits the
+/// build's `STOW_CACHE_DIR`, and keeps it when stow's exit reparents it —
+/// the parent link is what an orphan loses. A process that has exited
+/// reads back no environment and no command line.
+#[cfg(target_os = "linux")]
+fn live_unit_graph_children(cache_dir: &Path) -> Vec<u32> {
+    let marker = format!("STOW_CACHE_DIR={}", cache_dir.display());
+    let fields = |pid: u32, file: &str| -> Vec<Vec<u8>> {
+        std::fs::read(format!("/proc/{pid}/{file}"))
+            .unwrap_or_default()
+            .split(|byte| *byte == 0)
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    std::fs::read_dir("/proc")
+        .expect("list /proc")
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fields(*pid, "environ")
+                .iter()
+                .any(|field| field == marker.as_bytes())
+                && fields(*pid, "cmdline")
+                    .iter()
+                    .any(|arg| arg == b"--unit-graph")
+        })
+        .collect()
+}
+
+/// stow#624: the in-build analysis stops with cargo. Its `cargo
+/// --unit-graph` child used to outlive stow and keep probing rustc
+/// through the wrapper after the build had returned; an empty crate is
+/// the build whose cargo finishes before that child does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_leaves_no_unit_graph_child_behind() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    write_empty_crate(dir.path());
+    let output = stow_build_in(
+        dir.path(),
+        &unreachable_edge_url(),
+        cache.path(),
+        cargo_home.path(),
+    );
+    assert!(
+        output.status.success(),
+        "stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let orphans = live_unit_graph_children(cache.path());
+    assert!(
+        orphans.is_empty(),
+        "stow returned with its unit-graph children still running: {orphans:?}"
+    );
+}
+
+/// Build an empty crate whose `main.rs` is `main_rs` and list what the
+/// build left where a build writes its generated files (stow#630): its
+/// scratch and socket directories under the system temp directory —
+/// pointed at a root this test owns, so every `stow-` entry there is this
+/// build's — and the two places those files lived before the scratch
+/// directory, `<STOW_CACHE_DIR>/graph-plans` and the target directory's
+/// `rustc-extra-args-*`.
+fn build_leftovers(main_rs: &str) -> (std::process::Output, Vec<std::path::PathBuf>) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cargo_home = tempfile::tempdir().expect("cargo home");
+    let target = tempfile::tempdir().expect("target dir");
+    let temp_root = tempfile::tempdir().expect("temp root");
+    write_empty_crate(dir.path());
+    std::fs::write(dir.path().join("src").join("main.rs"), main_rs).expect("write main.rs");
+    stow_setup_in(dir.path(), cargo_home.path());
+    let output = stow_build(
+        dir.path(),
+        &unreachable_edge_url(),
+        cache.path(),
+        cargo_home.path(),
+        target.path(),
+    )
+    // `std::env::temp_dir` reads `TMPDIR` on Unix, `TMP` and `TEMP` on
+    // Windows.
+    .env("TMPDIR", temp_root.path())
+    .env("TMP", temp_root.path())
+    .env("TEMP", temp_root.path())
+    .output()
+    .expect("run stow-cli build");
+
+    let named = |dir: &Path, prefix: &str| -> Vec<std::path::PathBuf> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => panic!("list {}: {error}", dir.display()),
+        };
+        entries
+            .map(|entry| entry.expect("read directory entry"))
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .map(|entry| entry.path())
+            .collect()
+    };
+    let mut leftovers = named(temp_root.path(), "stow-");
+    leftovers.extend(named(&cache.path().join("graph-plans"), ""));
+    leftovers.extend(named(target.path(), "rustc-extra-args"));
+    (output, leftovers)
+}
+
+/// stow#630: a build removes the directory its generated files live in
+/// when it ends.
+#[test]
+fn a_successful_build_leaves_no_generated_files_behind() {
+    let (output, leftovers) = build_leftovers("fn main() {}\n");
+    assert!(
+        output.status.success(),
+        "stow build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(leftovers.is_empty(), "the build left {leftovers:?}");
+}
+
+/// stow#630: a failing build leaves through `std::process::exit`, which
+/// runs no destructors — its directories are removed all the same.
+#[test]
+fn a_failing_build_leaves_no_generated_files_behind() {
+    let (output, leftovers) = build_leftovers("fn main() { let _: u32 = \"not a number\"; }\n");
+    assert!(
+        !output.status.success(),
+        "a crate that does not compile built:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("mismatched types"),
+        "the build failed before rustc did:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(leftovers.is_empty(), "the build left {leftovers:?}");
 }
 
 /// The `stow rustc` wrapper as `RUSTC_WRAPPER` — the shape `stow setup`

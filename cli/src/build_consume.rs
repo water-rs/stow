@@ -71,6 +71,16 @@ impl ConsumeConfig {
     pub fn registry_base_url(&self) -> &str {
         &self.0.registry_base_url
     }
+
+    /// The registry HTTP client every session of this process shares —
+    /// the cell the index pull above draws from too.
+    ///
+    /// # Errors
+    ///
+    /// Whatever building the client fails with.
+    pub async fn registry_http(&self) -> stow_types::error::Result<stow_oci::RegistryHttp> {
+        self.0.registry_http().await
+    }
 }
 
 /// Pull and signature-verify the index slice for `(target, rustc_version)`,
