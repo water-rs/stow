@@ -45,6 +45,13 @@ const BASE_DELAY: Duration = Duration::from_millis(250);
 /// both capped here, so a hostile `Retry-After` cannot stall a publish.
 const MAX_DELAY: Duration = Duration::from_secs(30);
 
+/// The default log filter of the operator tools (`stow-admin`, `stow-build`).
+///
+/// `info`, plus this module's per-attempt retry lines: they sit at `debug`
+/// because a user's build must not print one per attempt, while an operator
+/// reads them as the sign of an unhealthy registry.
+pub const OPERATOR_LOG_FILTER: &str = concat!("info,", module_path!(), "=debug");
+
 /// The OCI error codes that mean "the object is absent" inside a refusal's
 /// `{"errors":[{"code":…}]}` envelope.
 const NOT_FOUND_CODES: [&str; 3] = ["MANIFEST_UNKNOWN", "BLOB_UNKNOWN", "NOT_FOUND"];
@@ -651,7 +658,7 @@ impl RegistrySession {
                         return Err(error);
                     }
                     let delay = retry_delay(attempt, None);
-                    tracing::warn!(
+                    tracing::debug!(
                         what,
                         attempt,
                         %error,
@@ -682,7 +689,7 @@ impl RegistrySession {
                 return Ok(response);
             }
             let delay = retry_delay(attempt, retry_after_hint(&response));
-            tracing::warn!(
+            tracing::debug!(
                 what,
                 attempt,
                 %status,

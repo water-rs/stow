@@ -2864,7 +2864,7 @@ async fn evict_invalid_entry(
     else {
         return Ok(());
     };
-    tracing::warn!(
+    tracing::debug!(
         cache_key,
         rustc_version,
         "artifact cache entry carries native artifacts but no recorded OUT_DIR; evicted and reporting a miss"

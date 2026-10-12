@@ -272,7 +272,8 @@ fn env_required(name: &str) -> stow_types::error::Result<String> {
 }
 
 fn install_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(stow_oci::OPERATOR_LOG_FILTER));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

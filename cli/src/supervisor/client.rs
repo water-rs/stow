@@ -5,13 +5,17 @@ use std::ffi::OsString;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::Endpoint;
-use super::protocol::{Answer, Compiled, Plan, Request, read_frame, write_frame};
+use super::protocol::{
+    Answer, ArtifactNotifications, Compiled, Plan, Request, read_frame, write_frame,
+};
 
 /// What the supervisor decided for this invocation.
 #[derive(Debug)]
 pub enum Decision {
-    /// The outputs are already in place; exit 0 without running rustc.
-    Served,
+    /// The outputs are already in place; exit 0 after writing the
+    /// artifact-notification lines cargo is owed to this process's
+    /// stderr (stow#633).
+    Served(ArtifactNotifications),
     /// Run the real rustc, then call [`report`] with its outcome.
     Compile(Ticket),
 }
@@ -75,7 +79,7 @@ impl Connection {
     ) -> Result<Decision, String> {
         let plan = Plan::new(self.token.clone(), executable, args, build_script_out_dir);
         match self.exchange(&Request::Plan(plan)).await? {
-            Answer::Served => Ok(Decision::Served),
+            Answer::Served(notifications) => Ok(Decision::Served(notifications)),
             Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
             Answer::Recorded | Answer::ServeMapReady => {
                 Err("supervisor answered a plan with an answer that is not a decision".to_owned())
@@ -99,7 +103,7 @@ impl Connection {
         match self.exchange(&Request::Compiled(report)).await? {
             Answer::Recorded => Ok(()),
             Answer::Failed { message } => Err(message),
-            Answer::Served | Answer::Compile { .. } | Answer::ServeMapReady => {
+            Answer::Served(..) | Answer::Compile { .. } | Answer::ServeMapReady => {
                 Err("supervisor answered a report with a plan answer".to_owned())
             }
         }
