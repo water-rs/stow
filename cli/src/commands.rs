@@ -47,7 +47,7 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
     let mold_bin_dir = mold::prepare_global().await?;
     let wrappers = detect_wrapper_commands()?;
     let cleaned = clean_stale_project_configs(&current_dir, &cargo_home.join("config.toml"))?;
-    let config_path = write_cargo_config(
+    let (config_path, selects_mold) = write_cargo_config(
         &cargo_home,
         &wrappers,
         &host_target,
@@ -66,10 +66,12 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
         mold_bin_dir = ?mold_bin_dir,
         "configured cargo for stow"
     );
-    let linker_line = match &mold_bin_dir {
-        Some(dir) => format!("\nlinker: mold ({})", dir.join("mold").display()),
-        None if cfg!(target_os = "linux") => "\nlinker: mold (already configured)".to_owned(),
-        None => String::new(),
+    let linker_line = match (&mold_bin_dir, selects_mold) {
+        (Some(dir), _) => format!("\nlinker: mold ({})", dir.join("mold").display()),
+        (None, true) if cfg!(target_os = "linux") => {
+            "\nlinker: mold (already configured)".to_owned()
+        }
+        _ => String::new(),
     };
     write_stdout(&format!(
         "configured {}\nrustc-wrapper: {}\ncc: {}\ncxx: {}\ncc-launcher: {}{}\n",
@@ -98,7 +100,9 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
 /// `build.rustc-wrapper`, `[env]` compiler keys and stow's linker wiring
 /// are replaced in place, so re-running `setup` — including over a stale
 /// `/tmp/stow-tools` entry left by an older stow — rewrites the same keys
-/// instead of appending duplicates.
+/// instead of appending duplicates. Returns the config path and whether
+/// the written document selects mold, so the caller's report follows the
+/// file rather than the probe answer.
 async fn write_cargo_config(
     cargo_dir: &Path,
     wrappers: &WrapperCommands,
@@ -106,7 +110,7 @@ async fn write_cargo_config(
     real_cc: Option<&str>,
     real_cxx: Option<&str>,
     mold_bin_dir: Option<&Path>,
-) -> stow_types::error::Result<PathBuf> {
+) -> stow_types::error::Result<(PathBuf, bool)> {
     let config_path = cargo_dir.join("config.toml");
     async_fs::create_dir_all(cargo_dir)
         .await
@@ -152,11 +156,12 @@ async fn write_cargo_config(
         ),
         mold_bin_dir,
     )?;
+    let selects_mold = document_selects_mold(&document);
 
     async_fs::write(&config_path, document.to_string())
         .await
         .wrap_err_with(|| format!("write {}", config_path.display()))?;
-    Ok(config_path)
+    Ok((config_path, selects_mold))
 }
 
 /// Point `document` at `wrappers` and `mold_bin_dir`: `build.rustc-wrapper`,
@@ -164,19 +169,28 @@ async fn write_cargo_config(
 /// provisioned one. Entries an earlier stow wrote and this revision no
 /// longer emits are removed first — by value, never by key name alone —
 /// and replacement of the rest is by key, so the operation is idempotent.
+/// The linker selection is the one entry the clean step never owns:
+/// `mold::write_linker_selection` replaces it in place when a new one is
+/// written, and with no `mold_bin_dir` — the configuration already
+/// selects a reachable mold — the document's linker entries stand
+/// exactly as they are.
 fn configure_document(
     document: &mut DocumentMut,
     wrappers: &WrapperCommands,
     env_entries: Vec<(String, String)>,
     mold_bin_dir: Option<&Path>,
 ) -> stow_types::error::Result<()> {
-    clean_stow_owned_entries(document);
+    clean_stow_owned_entries(document, LinkerSelection::Keep);
     set_build_wrapper(document, &wrappers.rustc);
-    for (key, value) in env_entries {
-        set_env_wrapper(document, &key, &value);
-    }
+    // The selection writes `env.COMPILER_PATH`, so it goes ahead of the
+    // rewritten env keys: remove-then-write appends after the entries a
+    // pass keeps, and keeping the selection identical across a run that
+    // writes nothing needs it first in the table.
     if let Some(bin_dir) = mold_bin_dir {
         mold::write_linker_selection(document, bin_dir)?;
+    }
+    for (key, value) in env_entries {
+        set_env_wrapper(document, &key, &value);
     }
     Ok(())
 }
@@ -883,12 +897,59 @@ fn clean_stale_project_configs(
         let mut document = contents
             .parse::<DocumentMut>()
             .wrap_err_with(|| format!("parse {}", path.display()))?;
-        clean_stow_owned_entries(&mut document);
+        clean_stow_owned_entries(&mut document, LinkerSelection::Strip);
         std::fs::write(&path, document.to_string())
             .wrap_err_with(|| format!("write {}", path.display()))?;
         cleaned.push(path);
     }
     Ok(cleaned)
+}
+
+/// Whether `document`'s own entries select mold — a `linker` naming it
+/// or a rustflag mentioning it under `build`, any `target` table, or the
+/// `[env]` `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`. `stow setup`'s report
+/// follows the file it wrote: a mold selected only by the ambient
+/// environment is not the file's selection.
+fn document_selects_mold(document: &DocumentMut) -> bool {
+    fn flags_select(item: &Item) -> bool {
+        (item.is_array() || item.is_str())
+            && mold::rustflags_value(item)
+                .iter()
+                .any(|flag| mold::flag_mentions_mold(flag))
+    }
+    fn table_selects(table: &dyn toml_edit::TableLike) -> bool {
+        table
+            .get("linker")
+            .and_then(Item::as_str)
+            .is_some_and(|linker| linker.contains("mold"))
+            || table.get("rustflags").is_some_and(flags_select)
+    }
+    if document
+        .get("build")
+        .and_then(Item::as_table_like)
+        .is_some_and(table_selects)
+    {
+        return true;
+    }
+    if let Some(target) = document.get("target").and_then(Item::as_table_like) {
+        for (_, table) in target.iter() {
+            if table.as_table_like().is_some_and(table_selects) {
+                return true;
+            }
+        }
+    }
+    document
+        .get("env")
+        .and_then(Item::as_table_like)
+        .is_some_and(|env| {
+            ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"].iter().any(|key| {
+                env.get(key).and_then(env_item_value).is_some_and(|flags| {
+                    flags
+                        .split(['\u{1f}', ' ', '\t'])
+                        .any(mold::flag_mentions_mold)
+                })
+            })
+        })
 }
 
 /// Whether `document` holds any value stow's wiring owns — a
@@ -911,13 +972,28 @@ fn document_is_stow_wired(document: &DocumentMut) -> bool {
     rustc_wrapper_is_stow || env_has_stow_value
 }
 
+/// What `clean_stow_owned_entries` does with stow's linker selection —
+/// the `target`-table rustflags and the stow-owned `env.COMPILER_PATH`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkerSelection {
+    /// Leave it in the document: the caller either rewrites it in place
+    /// through `mold::write_linker_selection` or — the configuration
+    /// already selects a reachable mold — keeps it exactly as it stands.
+    Keep,
+    /// Strip it: a project-level config must not carry the wiring the
+    /// global file owns.
+    Strip,
+}
+
 /// Remove the entries older stow versions wrote into `document`, by value:
 /// any `build.rustc-wrapper` or `[env]` entry pointing at a stow shim or
 /// the tools dir, the `STOW_REAL_*` companion variables once the document
 /// is proven stow-wired, the `PATH`/`LIB`/`LIBPATH`/`INCLUDE` MSVC
-/// toolchain snapshot an earlier revision persisted, and stow's mold
-/// rustflags inside `target` tables. Returns whether anything changed.
-fn clean_stow_owned_entries(document: &mut DocumentMut) -> bool {
+/// toolchain snapshot an earlier revision persisted, and — when
+/// `linker_selection` is [`LinkerSelection::Strip`] — stow's mold
+/// rustflags inside `target` tables and the stow-owned `env.COMPILER_PATH`.
+/// Returns whether anything changed.
+fn clean_stow_owned_entries(document: &mut DocumentMut, linker_selection: LinkerSelection) -> bool {
     let mut changed = false;
     let wired = document_is_stow_wired(document);
 
@@ -935,7 +1011,12 @@ fn clean_stow_owned_entries(document: &mut DocumentMut) -> bool {
         let keys: Vec<String> = env.iter().map(|(key, _)| key.to_owned()).collect();
         for key in keys {
             let remove = match env.get(&key).and_then(env_item_value) {
-                Some(value) if is_stow_owned_value(value) => true,
+                // `env.COMPILER_PATH` is half of the linker selection —
+                // `Keep` leaves it for `write_linker_selection`, which
+                // overwrites the key when a new selection is written.
+                Some(value) if is_stow_owned_value(value) => {
+                    linker_selection == LinkerSelection::Strip || key != "COMPILER_PATH"
+                }
                 Some(value)
                     if matches!(key.as_str(), "PATH" | "LIB" | "LIBPATH" | "INCLUDE")
                         && is_msvc_snapshot_value(value) =>
@@ -953,8 +1034,13 @@ fn clean_stow_owned_entries(document: &mut DocumentMut) -> bool {
     }
 
     // Stow's linker selection lives in `target` rustflags — strip it only
-    // where the document already proved stow-wired by value.
-    if wired && let Some(target) = document.get_mut("target").and_then(Item::as_table_mut) {
+    // where the document already proved stow-wired by value, and only on
+    // the caller that owns removal; the global config's copy is rewritten
+    // in place by `write_linker_selection` or left standing.
+    if linker_selection == LinkerSelection::Strip
+        && wired
+        && let Some(target) = document.get_mut("target").and_then(Item::as_table_mut)
+    {
         for (_, table) in target.iter_mut() {
             let Some(table) = table.as_table_like_mut() else {
                 continue;
@@ -1159,7 +1245,7 @@ mod tests {
         .expect("seed stale cargo config");
 
         let wrappers = test_wrappers();
-        let config_path = super::write_cargo_config(
+        let (config_path, _) = super::write_cargo_config(
             &cargo_dir,
             &wrappers,
             "x86_64-unknown-linux-gnu",
@@ -1219,7 +1305,10 @@ mod tests {
             .parse()
             .expect("parse fixture");
 
-        assert!(super::clean_stow_owned_entries(&mut document));
+        assert!(super::clean_stow_owned_entries(
+            &mut document,
+            super::LinkerSelection::Strip
+        ));
         let text = document.to_string();
 
         for gone in [
@@ -1251,7 +1340,10 @@ mod tests {
              STOW_REAL_CC = \"not-a-path\"\n"
             .parse()
             .expect("parse fixture");
-        assert!(!super::clean_stow_owned_entries(&mut document));
+        assert!(!super::clean_stow_owned_entries(
+            &mut document,
+            super::LinkerSelection::Strip
+        ));
     }
 
     /// Setup walking ancestors removes the stale project file and reports
@@ -1287,6 +1379,111 @@ mod tests {
             std::fs::read_to_string(&untouched).expect("read user config"),
             "[env]\nCC = \"/usr/bin/clang\"\n"
         );
+    }
+
+    /// stow#623 — an "already configured" run (`prepare_global` answered
+    /// `None`) must leave the document it wrote byte-identical, and a
+    /// later provisioned run identical again: the selection is only ever
+    /// rewritten on the path that writes a new one.
+    #[test]
+    fn configure_document_is_idempotent_across_mold_answers() {
+        let wrappers = test_wrappers();
+        let env_entries = || {
+            super::compiler_env_entries(
+                &wrappers,
+                "x86_64-unknown-linux-gnu",
+                Some("clang"),
+                Some("clang++"),
+            )
+        };
+        let bin_dir = std::path::Path::new("/home/user/.local/share/stow/tools/mold/bin");
+
+        let mut document = toml_edit::DocumentMut::new();
+        super::configure_document(&mut document, &wrappers, env_entries(), Some(bin_dir))
+            .expect("first configure");
+        let written = document.to_string();
+
+        super::configure_document(&mut document, &wrappers, env_entries(), None)
+            .expect("already-configured configure");
+        assert_eq!(
+            document.to_string(),
+            written,
+            "the already-reachable answer dropped the selection"
+        );
+
+        super::configure_document(&mut document, &wrappers, env_entries(), Some(bin_dir))
+            .expect("provisioned configure");
+        assert_eq!(document.to_string(), written, "rewriting drifted");
+    }
+
+    /// A document carrying the user's own rustflags beside stow's
+    /// selection keeps both through an already-configured run.
+    #[test]
+    fn configure_document_keeps_user_rustflags_and_the_selection() {
+        let mut document: toml_edit::DocumentMut = "[build]\n\
+             rustc-wrapper = \"/home/user/.local/share/stow/tools/stow-rustc-wrapper\"\n\
+             \n[env.COMPILER_PATH]\n\
+             value = \"/home/user/.local/share/stow/tools/mold/bin\"\n\
+             force = true\n\
+             \n[target.'cfg(target_os = \"linux\")']\n\
+             rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", \"debuginfo=2\"]\n"
+            .parse()
+            .expect("parse fixture");
+
+        let wrappers = test_wrappers();
+        super::configure_document(
+            &mut document,
+            &wrappers,
+            super::compiler_env_entries(&wrappers, "x86_64-unknown-linux-gnu", None, None),
+            None,
+        )
+        .expect("configure");
+        let text = document.to_string();
+        assert!(
+            text.contains("link-arg=-fuse-ld=mold"),
+            "selection dropped:\n{text}"
+        );
+        assert!(text.contains("debuginfo=2"), "user flag dropped:\n{text}");
+        assert!(
+            text.contains("COMPILER_PATH"),
+            "compiler path dropped:\n{text}"
+        );
+    }
+
+    /// The stale-config walk still strips stow's linker selection from a
+    /// project config — the global file owns that wiring.
+    #[test]
+    fn clean_stale_project_configs_strips_the_linker_selection() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let cargo_dir = tempdir.path().join("proj/.cargo");
+        std::fs::create_dir_all(&cargo_dir).expect("create .cargo");
+        let stale = cargo_dir.join("config.toml");
+        std::fs::write(
+            &stale,
+            "[env]\n\
+             CC = \"/tmp/stow-tools/stow-cc\"\n\
+             COMPILER_PATH = { value = \"/tmp/stow-tools/mold/bin\", force = true }\n\
+             \n[target.'cfg(target_os = \"linux\")']\n\
+             rustflags = [\"-C\", \"link-arg=-fuse-ld=mold\", \"-C\", \"debuginfo=2\"]\n",
+        )
+        .expect("seed stale config");
+
+        let cleaned = super::clean_stale_project_configs(
+            &tempdir.path().join("proj"),
+            &tempdir.path().join("elsewhere/config.toml"),
+        )
+        .expect("clean");
+        assert_eq!(cleaned, vec![stale.clone()]);
+        let text = std::fs::read_to_string(&stale).expect("read cleaned");
+        assert!(
+            !text.contains("fuse-ld=mold"),
+            "linker selection survived:\n{text}"
+        );
+        assert!(
+            !text.contains("COMPILER_PATH"),
+            "compiler path survived:\n{text}"
+        );
+        assert!(text.contains("debuginfo=2"), "user flag dropped:\n{text}");
     }
 
     /// `stow update` refuses a receipt recorded for a different install
