@@ -535,14 +535,7 @@ async fn accept_unix<H: Handler>(
             }
         }
     }
-    // The build is over when the last facade's queued bookkeeping has
-    // run: stopping accepting is not enough, the connections themselves
-    // are drained to their ends (stow#618).
-    while let Some(result) = tasks.join_next().await
-        && let Err(error) = result
-    {
-        tracing::warn!(%error, "supervisor connection task failed");
-    }
+    drain_connections(tasks).await;
 }
 
 #[cfg(not(unix))]
@@ -579,13 +572,23 @@ async fn accept_loopback<H: Handler>(
             }
         }
     }
-    // The build is over when the last facade's queued bookkeeping has
-    // run: stopping accepting is not enough, the connections themselves
-    // are drained to their ends (stow#618).
-    while let Some(result) = tasks.join_next().await
-        && let Err(error) = result
-    {
-        tracing::warn!(%error, "supervisor connection task failed");
+    drain_connections(tasks).await;
+}
+
+/// Wait for every accepted connection to run to its end. The build is
+/// over when the last facade's queued bookkeeping has run: stopping
+/// accepting is not enough (stow#618).
+///
+/// Every task is joined, whatever the ones before it returned. A
+/// `JoinSet` hands back the connections that finished long ago first,
+/// and dropping it aborts the rest — a drain that stopped at the first
+/// clean join cut off exactly the stores it exists to wait for
+/// (stow#660).
+async fn drain_connections(mut tasks: tokio::task::JoinSet<()>) {
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "supervisor connection task failed");
+        }
     }
 }
 
@@ -1178,6 +1181,52 @@ mod tests {
             .expect("start the supervisor");
         let [(_, endpoint), (_, token)] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+        let mut stream = connect_raw(&endpoint).await;
+        send_report(&mut stream, &token).await;
+        wait_for(
+            || handler.started.load(Ordering::SeqCst) == 1,
+            "the report's bookkeeping to start",
+        )
+        .await;
+
+        let mut drain = std::pin::pin!(supervisor.shutdown());
+        tokio::select! {
+            abandoned = &mut drain => panic!("shutdown returned {abandoned} early"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+        assert_eq!(handler.finished.load(Ordering::SeqCst), 0);
+        handler.release.send(true).expect("release the bookkeeping");
+        drop(stream);
+        assert_eq!(drain.await, 0, "the drain finishes cleanly");
+        assert_eq!(handler.finished.load(Ordering::SeqCst), 1);
+    }
+
+    /// The drain waits for every connection, not for the first one it
+    /// joins: a build's early connections finished long before the stop,
+    /// and the one still storing is behind them (stow#660).
+    #[tokio::test]
+    async fn shutdown_drains_past_connections_that_already_finished() {
+        let (release_tx, _) = tokio::sync::watch::channel(false);
+        let handler = Arc::new(Bookkeeping {
+            release: release_tx,
+            started: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+        });
+        let mut supervisor = start(Arc::clone(&handler), super::InFlightUnits::default())
+            .expect("start the supervisor");
+        let [(_, endpoint), (_, token)] = supervisor.env();
+        let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
+
+        // Connections that end without any bookkeeping in flight: they
+        // are finished tasks waiting to be joined when the stop comes.
+        for _ in 0..3 {
+            drop(connect_raw(&endpoint).await);
+        }
+        wait_for(
+            || supervisor.connections.load(Ordering::SeqCst) == 0,
+            "the idle connections to end",
+        )
+        .await;
         let mut stream = connect_raw(&endpoint).await;
         send_report(&mut stream, &token).await;
         wait_for(
