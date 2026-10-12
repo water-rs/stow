@@ -46,6 +46,10 @@ pub struct PackageKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockfileGraph {
     pub(crate) direct_dependencies: Vec<DirectDependency>,
+    /// Every registry package the lockfile pins, `(name, version)` —
+    /// the units this build compiles as far as the lockfile knows
+    /// (stow#617).
+    pub(crate) registry_packages: BTreeSet<(String, Version)>,
 }
 
 /// The units cargo compiles for the wrapped command — one
@@ -248,8 +252,16 @@ pub fn resolve_lockfile_graph(
         )
         .collect::<Vec<_>>();
 
+    let registry_packages = lockfile
+        .packages
+        .iter()
+        .filter(|package| package.source.as_ref().is_some_and(SourceId::is_registry))
+        .map(|package| (package.name.to_string(), package.version.clone()))
+        .collect();
+
     Ok(LockfileGraph {
         direct_dependencies,
+        registry_packages,
     })
 }
 
