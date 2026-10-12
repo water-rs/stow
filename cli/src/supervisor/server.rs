@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use stow_types::rustc::ParsedRustcArgs;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use super::protocol::{
     Answer, AwaitServeMap, Compiled, Observed, Plan, Request, read_frame, write_frame,
@@ -354,8 +354,10 @@ impl InFlightUnits {
     /// Put the unit owning `paths` in flight; the returned guard is the
     /// flight's lifetime — dropping it completes the unit.
     fn register(&self, paths: Vec<String>) -> Completion {
-        let (done, _) = watch::channel(false);
-        let unit = Arc::new(InFlightUnit { paths, done });
+        let unit = Arc::new(InFlightUnit {
+            paths,
+            done: crate::Latch::pending(),
+        });
         {
             let mut units = self.units.lock().expect("in-flight units mutex");
             for path in &unit.paths {
@@ -408,7 +410,10 @@ impl InFlightUnits {
                 }
             }
         }
-        let _ = unit.done.send(true);
+        // A dependent waits on its dependencies one at a time, so this
+        // flight can end before the dependent has subscribed to it: the
+        // latch stores the end either way (stow#642).
+        unit.done.complete();
     }
 }
 
@@ -420,19 +425,16 @@ struct InFlightUnit {
     /// records — normalized by the same `path_to_string` the
     /// `materialized_outputs` rows and the extern lookup use.
     paths: Vec<String>,
-    /// `true` once the flight ends. `watch` so a waiter that arrives late
-    /// reads `true` instead of blocking on a signal already sent.
-    done: watch::Sender<bool>,
+    /// Fired once the flight ends; a waiter that arrives late resolves
+    /// at once.
+    done: crate::Latch,
 }
 
 impl InFlightUnit {
     /// Resolve once this unit's bookkeeping has finished — immediately
     /// when it already has.
     async fn wait(&self) {
-        let mut done = self.done.subscribe();
-        if !*done.borrow() {
-            let _ = done.changed().await;
-        }
+        self.done.wait().await;
     }
 }
 
@@ -1209,5 +1211,47 @@ mod tests {
             .await;
         assert_eq!(abandoned, 1);
         assert_eq!(handler.finished.load(Ordering::SeqCst), 0);
+    }
+
+    /// A dependent waits on its in-flight dependencies one at a time, so
+    /// a dependency can finish before the dependent has subscribed to
+    /// it. That completion has to be there when the dependent gets to
+    /// it: a signal handed to no subscriber was dropped, and the
+    /// dependent's post-compile — and the build behind it — waited
+    /// forever.
+    #[tokio::test]
+    async fn a_flight_ending_before_its_waiter_subscribes_still_releases_it() {
+        let in_flight = super::InFlightUnits::default();
+        let first = in_flight.register(vec!["/deps/libfirst.rlib".to_owned()]);
+        let second = in_flight.register(vec!["/deps/libsecond.rlib".to_owned()]);
+        let dependent = crate::rustc_args::ParsedRustcArgs::parse(
+            &[
+                "--crate-name",
+                "dependent",
+                "--crate-type",
+                "lib",
+                "--extern",
+                "first=/deps/libfirst.rlib",
+                "--extern",
+                "second=/deps/libsecond.rlib",
+                "src/lib.rs",
+            ]
+            .map(OsString::from),
+        )
+        .expect("parse the dependent's invocation");
+        let waiter = tokio::spawn({
+            let in_flight = in_flight.clone();
+            async move { in_flight.wait_for_externs(&dependent).await }
+        });
+        // The waiter parks on `first`, the flight it reaches first; it
+        // has not subscribed to `second` yet.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(second);
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the dependent is released once both flights have ended")
+            .expect("join the waiter");
     }
 }

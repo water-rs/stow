@@ -32,7 +32,8 @@ use crate::workspace_deps::{
     self, ExpandedDependencyGraph, PackageKey, SelectedRegistryDependency,
 };
 use crate::{
-    STOW_ENABLE_SEMANTIC_FALLBACK_ENV, STOW_EXPANDED_GRAPH_ENV, STOW_PREFETCH_ARTIFACTS_ENV,
+    STOW_ENABLE_SEMANTIC_FALLBACK_ENV, STOW_EXPANDED_GRAPH_PATH_ENV,
+    STOW_PREFETCH_ARTIFACTS_PATH_ENV,
 };
 use crate::{detect_wrapper_commands, write_stdout};
 use stow_types::api::{
@@ -2707,7 +2708,7 @@ async fn try_run_top_crate_with_cached_dependencies(
     let plan =
         resolve_cached_dependency_plan(config, project, &direct_dependencies, &shape).await?;
 
-    let target_dir = cargo_target_dir(project, cargo_args);
+    let target_dir = resolved_target_dir(project, cargo_args, &project.current_dir);
     let prebuilt_dir = target_dir.join("stow-prebuilt").join(action).join("deps");
     validate_top_crate_cached_native_support(action, &plan)?;
     materialize_cached_dependency_plan(&prebuilt_dir, &plan).await?;
@@ -4179,7 +4180,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
         // last unit did. They land in the same journal a plain-cargo
         // wrapper writes, and a detached drain posts the admission —
         // this command returns as soon as cargo does.
-        journal_and_drain_misses(project, cargo_args, &handler.observations());
+        journal_and_drain_misses(project, cargo_args, current_dir, &handler.observations());
     }
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -4188,9 +4189,12 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
 }
 
 /// The `STOW_*` contract a cargo run's wrappers read: the toolchain
-/// shims, the resolved config blob, the graph facts, the serve map file
-/// path the facades answer from, and the cache policy — everything a
-/// wrapper would otherwise load itself on every invocation (stow#347).
+/// shims, the resolved config blob, the graph-fact file paths, the
+/// serve map file path the facades answer from, and the cache policy —
+/// everything a wrapper would otherwise load itself on every invocation
+/// (stow#347). Build-sized payloads travel as files: one environment
+/// string past Linux's `MAX_ARG_STRLEN` fails the whole `execve`, which
+/// a workspace-sized graph or ledger clears (stow#625).
 fn export_wrapper_env(
     command: &mut Command,
     plan: &CargoRunPlan<'_>,
@@ -4201,6 +4205,7 @@ fn export_wrapper_env(
         project,
         config,
         cargo_args,
+        current_dir,
         source_root,
         cache_policy_path,
         public_cache_mode,
@@ -4228,9 +4233,21 @@ fn export_wrapper_env(
     }
     command.env("CMAKE_C_COMPILER_LAUNCHER", &wrappers.cc_launcher);
     command.env("CMAKE_CXX_COMPILER_LAUNCHER", &wrappers.cc_launcher);
+    // The extra rustc arguments ride a build file like the other
+    // workspace-sized payloads — on the prebuilt-deps path the list is
+    // one `--extern` per direct dependency (stow#625). It lives in the
+    // run's resolved target dir — the build-scoped location that exists
+    // without a stow config, unlike `graph_plan_dir()` — and `cargo
+    // clean` reclaims it.
+    let extra_args = rustc_wrapper_extra_args(source_root, extra_rustflags)?;
+    let extra_args_path = write_named_build_json_file(
+        &resolved_target_dir(project, cargo_args, current_dir),
+        "rustc-extra-args",
+        &extra_args,
+    )?;
     command.env(
-        rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV,
-        rustc_wrapper_extra_args(source_root, extra_rustflags)?,
+        rustc_args::STOW_RUSTC_EXTRA_ARGS_FILE_ENV,
+        extra_args_path.as_os_str(),
     );
     command.env(STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, &project.rustc_version);
     command.env(STOW_PUBLIC_CACHE_TARGET_ENV, &project.target);
@@ -4246,17 +4263,19 @@ fn export_wrapper_env(
     );
     // The per-side node table every wrapper invocation resolves its
     // unit's cargo feature set and side against — the argv scan is
-    // compile-key evidence, never the semantic label (stow#615).
-    if let Some(unit_nodes) = unit_nodes {
-        let expanded_graph_json = serde_json::to_string(unit_nodes)
-            .wrap_err("serialize expanded dependency graph for rustc wrapper")?;
-        command.env(STOW_EXPANDED_GRAPH_ENV, expanded_graph_json);
+    // compile-key evidence, never the semantic label (stow#615) — and
+    // the prefetch ledger. Both travel as files beside the serve map:
+    // with no `StowConfig` there is no `graph_plan_dir()` to write them
+    // under, so nothing is written and no variable is exported — the
+    // same answer the serve map gives (stow#625).
+    if let (Some(config), Some(unit_nodes)) = (config, unit_nodes) {
+        let path = write_build_json_table(config, "expanded-graph", unit_nodes)?;
+        command.env(STOW_EXPANDED_GRAPH_PATH_ENV, path.as_os_str());
     }
-    if let Some(prefetch_artifacts) = prefetch_artifacts {
-        command.env(
-            STOW_PREFETCH_ARTIFACTS_ENV,
-            prefetch_artifacts_env_json(prefetch_artifacts)?,
-        );
+    if let (Some(config), Some(prefetch_artifacts)) = (config, prefetch_artifacts) {
+        let rows = prefetch_artifact_rows(prefetch_artifacts)?;
+        let path = write_build_json_table(config, "prefetch-artifacts", &rows)?;
+        command.env(STOW_PREFETCH_ARTIFACTS_PATH_ENV, path.as_os_str());
     }
     if let Some(path) = serve_map_path {
         command.env(crate::facade::STOW_SERVE_MAP_FILE_ENV, path.as_os_str());
@@ -4289,44 +4308,72 @@ fn write_initial_serve_map(
     let (Some(config), Some(map)) = (config, map) else {
         return (None, None);
     };
-    // A serve-map directory that cannot be created is a cache-state
-    // failure: no map is better than no build — the facades read an
-    // absent map as empty and decide per invocation (stow#608).
-    if let Err(error) = std::fs::create_dir_all(config.graph_plan_dir()) {
-        tracing::warn!(dir = %config.graph_plan_dir().display(), error = %error, "serve map dir unavailable; the build has no serve map");
-        return (None, None);
-    }
-    let path = config.graph_plan_dir().join(format!(
-        "serve-map-{}-{}.json",
-        std::process::id(),
-        crate::state_db::now_millis()
-    ));
     // Arm the waiters' guard before the map that announces it: a facade
     // that reads `pending` asks the supervisor to hold it — the signal
     // exists by construction, so there is no bind to fail here. An
     // empty pending map waits on nothing (stow#347).
     let waiters = (map.pending && !map.is_empty())
         .then(|| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(serve_map_ready)));
-    if let Err(error) = write_serve_map(&path, map) {
-        tracing::warn!(error = %error, "serve map write failed; the build has no serve map");
-        return (None, None);
+    // A serve map that cannot be written is a cache-state failure: no
+    // map is better than no build — the facades read an absent map as
+    // empty and decide per invocation (stow#608).
+    match write_build_json_table(config, "serve-map", map) {
+        Ok(path) => (Some(path), waiters),
+        Err(error) => {
+            tracing::warn!(error = %error, "serve map write failed; the build has no serve map");
+            (None, None)
+        }
     }
-    (Some(path), waiters)
 }
 
-/// Write `map` to `path` through a tmp file + rename — a facade reading
-/// the file mid-rewrite must never see a torn payload.
-fn write_serve_map(path: &Path, map: &crate::facade::ServeMap) -> stow_types::error::Result<()> {
-    let json = serde_json::to_vec(map).wrap_err("serialize the build's serve map")?;
+/// One build-scoped JSON table under `graph_plan_dir()` — the serve
+/// map, the expanded unit graph and the prefetch ledger share this
+/// directory, naming scheme and write discipline; the two graph tables
+/// joined it when they outgrew the environment strings they rode on
+/// (stow#625). Returns the path the caller exports on the environment.
+fn write_build_json_table(
+    config: &StowConfig,
+    name: &str,
+    table: &impl serde::Serialize,
+) -> stow_types::error::Result<PathBuf> {
+    write_named_build_json_file(&config.graph_plan_dir(), name, table)
+}
+
+/// Mint `dir/{name}-{pid}-{millis}.json` — creating `dir` first — and
+/// write `table` to it atomically, returning the path.
+fn write_named_build_json_file(
+    dir: &Path,
+    name: &str,
+    table: &impl serde::Serialize,
+) -> stow_types::error::Result<PathBuf> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| stow_types::stow_error!("create {name} dir {}: {error}", dir.display()))?;
+    let path = dir.join(format!(
+        "{name}-{}-{}.json",
+        std::process::id(),
+        crate::state_db::now_millis()
+    ));
+    write_build_json_file(&path, table)?;
+    Ok(path)
+}
+
+/// Write `table` to `path` as JSON through a tmp file + rename — a
+/// reader catching the file mid-rewrite must never see a torn payload.
+fn write_build_json_file(
+    path: &Path,
+    table: &impl serde::Serialize,
+) -> stow_types::error::Result<()> {
+    let json = serde_json::to_vec(table)
+        .map_err(|error| stow_types::stow_error!("serialize {}: {error}", path.display()))?;
     let tmp = path.with_file_name(format!(
         ".{}.tmp-{}",
         path.file_name().and_then(OsStr::to_str).unwrap_or_default(),
         std::process::id()
     ));
     std::fs::write(&tmp, &json)
-        .map_err(|error| stow_types::stow_error!("write serve map {}: {error}", tmp.display()))?;
+        .map_err(|error| stow_types::stow_error!("write {}: {error}", tmp.display()))?;
     std::fs::rename(&tmp, path)
-        .map_err(|error| stow_types::stow_error!("install serve map {}: {error}", path.display()))
+        .map_err(|error| stow_types::stow_error!("install {}: {error}", path.display()))
 }
 
 /// What the in-build enrichment needs: the project and config the full
@@ -4380,7 +4427,7 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     {
         ensure_consumer_slices(&work.config, &work.project).await?;
         let lite = analyze_workspace_prediction_lite(&work.project, &work.config).await?;
-        write_serve_map(map_path, &lite.servable_units.unwrap_or_default())?;
+        write_build_json_file(map_path, &lite.servable_units.unwrap_or_default())?;
         drop(work.readiness.take());
     }
     let analysis = analyze_workspace_prediction(
@@ -4393,7 +4440,7 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     .await?;
     if let Some(map_path) = &work.map_path {
         let map = analysis.servable_units.clone().unwrap_or_default();
-        write_serve_map(map_path, &map)?;
+        write_build_json_file(map_path, &map)?;
     }
     if let Some(policy_dir) = &work.policy_dir {
         cache_policy::write_policy_entries(policy_dir, &analysis.cache_policy_entries).await?;
@@ -4437,10 +4484,10 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
 fn journal_and_drain_misses(
     project: &ProjectContext,
     cargo_args: &[OsString],
+    current_dir: &Path,
     observations: &[crate::artifact_cache::ObservedUnit],
 ) {
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| cargo_target_dir(project, cargo_args), PathBuf::from);
+    let target_dir = resolved_target_dir(project, cargo_args, current_dir);
     // The drain mints each miss's dependency subgraph off the build's
     // persisted expanded graph when it can load it, and off the
     // journal's context sidecar when it cannot (stow#588).
@@ -4478,12 +4525,12 @@ fn journal_and_drain_misses(
     crate::miss_journal::spawn_drain(&target_dir);
 }
 
-/// Serialize `prefetch_artifacts` into the `STOW_PREFETCH_ARTIFACTS` env
-/// payload the rustc wrapper reads.
-fn prefetch_artifacts_env_json(
+/// The `PrefetchArtifactRow`s `STOW_PREFETCH_ARTIFACTS_PATH`'s file
+/// carries to the rustc wrapper, validated into their newtypes.
+fn prefetch_artifact_rows(
     prefetch_artifacts: &[PrefetchArtifact],
-) -> stow_types::error::Result<String> {
-    let prefetch_entries = prefetch_artifacts
+) -> stow_types::error::Result<Vec<resolve::PrefetchArtifactRow>> {
+    prefetch_artifacts
         .iter()
         .map(|artifact| {
             let crate_name = stow_types::identity::CrateName::parse(artifact.crate_name.as_str())
@@ -4506,9 +4553,7 @@ fn prefetch_artifacts_env_json(
                 bundle_digest: artifact.bundle_digest.clone(),
             })
         })
-        .collect::<stow_types::error::Result<Vec<_>>>()?;
-    serde_json::to_string(&prefetch_entries)
-        .wrap_err("serialize prefetched graph artifacts for rustc wrapper")
+        .collect()
 }
 
 /// What the cache counters held before cargo ran.
@@ -4602,22 +4647,45 @@ fn has_explicit_target_dir(cargo_args: &[OsString]) -> bool {
     })
 }
 
-fn cargo_target_dir(project: &ProjectContext, cargo_args: &[OsString]) -> PathBuf {
+/// The directory cargo resolves as this run's target dir — an
+/// inherited `CARGO_TARGET_DIR`, a spelled `--target-dir`, else the
+/// workspace's own `target/`; a relative value resolves against
+/// `current_dir`, the directory cargo runs in.
+fn resolved_target_dir(
+    project: &ProjectContext,
+    cargo_args: &[OsString],
+    current_dir: &Path,
+) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map_or_else(
+            || cargo_target_dir(&project.workspace_root, cargo_args, current_dir),
+            |dir| {
+                if dir.is_absolute() {
+                    dir
+                } else {
+                    current_dir.join(dir)
+                }
+            },
+        )
+}
+
+fn cargo_target_dir(workspace_root: &Path, cargo_args: &[OsString], current_dir: &Path) -> PathBuf {
     let mut iter = cargo_args.iter();
     while let Some(arg) = iter.next() {
         let Some(arg_str) = arg.to_str() else {
             continue;
         };
         if let Some(value) = arg_str.strip_prefix("--target-dir=") {
-            return resolve_user_path(project.current_dir(), value);
+            return resolve_user_path(current_dir, value);
         }
         if arg_str == "--target-dir"
             && let Some(value) = iter.next().and_then(|value| value.to_str())
         {
-            return resolve_user_path(project.current_dir(), value);
+            return resolve_user_path(current_dir, value);
         }
     }
-    project.workspace_root.join("target")
+    workspace_root.join("target")
 }
 
 async fn strip_selected_manifest_dependencies(
@@ -4850,25 +4918,23 @@ fn unsupported_public_cache_reason(rustc_version: &str) -> Option<&'static str> 
     }
 }
 
-/// The rustc arguments a supervised run appends to every unit,
-/// `\x1f`-encoded like `CARGO_ENCODED_RUSTFLAGS`: the workspace path remap
-/// plus any flags the run itself selected. They travel through
-/// [`rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV`] — which the rustc wrapper
-/// appends to each unit's argv — rather than `RUSTFLAGS`, where cargo's
-/// precedence rules would discard the user's `.cargo/config.toml`
-/// `target.*.rustflags` for the whole build.
+/// The rustc arguments a supervised run appends to every unit: the
+/// workspace path remap plus any flags the run itself selected. They
+/// travel through the file [`rustc_args::STOW_RUSTC_EXTRA_ARGS_FILE_ENV`]
+/// names — which the rustc wrapper appends to each unit's argv — rather
+/// than `RUSTFLAGS`, where cargo's precedence rules would discard the
+/// user's `.cargo/config.toml` `target.*.rustflags` for the whole build.
 fn rustc_wrapper_extra_args(
     source_root: &Path,
     extra_rustflags: &[String],
-) -> stow_types::error::Result<String> {
+) -> stow_types::error::Result<Vec<String>> {
     let source_root = source_root.to_str().ok_or_else(|| {
         stow_types::stow_error!("workspace root {} is not UTF-8", source_root.display())
     })?;
     let remap_flag = format!("--remap-path-prefix={source_root}=stow-ci://workspace");
     Ok(std::iter::once(remap_flag)
         .chain(extra_rustflags.iter().cloned())
-        .collect::<Vec<_>>()
-        .join("\x1f"))
+        .collect())
 }
 
 #[cfg(unix)]
@@ -4890,13 +4956,14 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::build_serve_map;
     use super::{
-        CachedDependencyPlan, MetadataArgs, ProjectContext, WorkspaceMirror,
-        cached_dependency_profile, feature_references_dependency, native_requires_link_replay,
-        relative_path, rewrite_args_for_mirror, rewrite_args_for_root,
+        CachedDependencyPlan, CargoRunPlan, MetadataArgs, ProjectContext, PublicCacheMode,
+        WorkspaceMirror, cached_dependency_profile, feature_references_dependency,
+        native_requires_link_replay, relative_path, rewrite_args_for_mirror, rewrite_args_for_root,
         validate_top_crate_cached_native_support,
     };
     #[cfg(unix)]
     use super::{create_workspace_mirror, strip_selected_manifest_dependencies};
+    use crate::prefetch::PrefetchArtifact;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -5512,5 +5579,198 @@ mod tests {
                 ("d".to_owned(), "4.0.0".to_owned()),
             ]
         );
+    }
+
+    /// stow#625: the tables a workspace-sized build carries — the unit
+    /// graph, the prefetch ledger, the extra rustc args — travel as
+    /// files, so every environment value `export_wrapper_env` sets must
+    /// stay a path or a flag, never the payload.
+    struct TableExport {
+        _cache: tempfile::TempDir,
+        env: Vec<(OsString, OsString)>,
+        table: crate::unit_node::UnitNodeTable,
+        ledger: Vec<PrefetchArtifact>,
+    }
+
+    fn stow_config(cache_dir: &Path) -> crate::config::StowConfig {
+        crate::config::StowConfig {
+            edge_url: "http://127.0.0.1:1".to_owned(),
+            registry_base_url: "http://127.0.0.1:1/v2/mock".to_owned(),
+            cache_dir: cache_dir.to_path_buf(),
+            request_timeout: std::time::Duration::from_secs(1),
+            negative_cache_ttl: std::time::Duration::from_secs(1),
+            circuit_reset_after: std::time::Duration::from_secs(1),
+            circuit_trip_threshold: 1,
+            artifact_cache_max_bytes: 1,
+            index_refresh_interval: std::time::Duration::from_secs(1),
+            verify_mode: crate::config::VerifyMode::GithubCi,
+            state_db_pool: crate::config::StowConfig::default_state_db_pool(),
+            trust_material: std::sync::Arc::default(),
+        }
+    }
+
+    fn unit_table(nodes: usize) -> crate::unit_node::UnitNodeTable {
+        crate::unit_node::UnitNodeTable {
+            consumer_spelled_target: true,
+            nodes: (0..nodes)
+                .map(|index| crate::unit_node::UnitNode {
+                    crate_name: stow_types::identity::CrateName::parse(format!("crate-{index}"))
+                        .expect("crate name"),
+                    version: semver::Version::new(1, (index / 100) as u64, (index % 100) as u64),
+                    host_side: index % 2 == 0,
+                    features: vec![
+                        "default".to_owned(),
+                        format!("feature-{index}"),
+                        format!("a-longer-feature-name-{index}"),
+                    ],
+                })
+                .collect(),
+        }
+    }
+
+    fn prefetch_ledger(rows: usize) -> Vec<PrefetchArtifact> {
+        (0..rows)
+            .map(|index| PrefetchArtifact {
+                crate_name: format!("crate-{index}"),
+                c_metadata: format!("{index:016x}"),
+                bundle_digest: format!("sha256:{index:064x}"),
+                target: "aarch64-apple-darwin".to_owned(),
+                rustc_version: "1.91.1".to_owned(),
+                depth: index,
+            })
+            .collect()
+    }
+
+    fn row_identity(row: &crate::resolve::PrefetchArtifactRow) -> (&str, &str, &str) {
+        (
+            row.crate_name.as_str(),
+            row.c_metadata.as_str(),
+            row.bundle_digest.as_str(),
+        )
+    }
+
+    /// Run `export_wrapper_env` against a `nodes`-entry unit table and a
+    /// `ledger_rows`-entry prefetch ledger, collecting the environment
+    /// it hands cargo.
+    fn exported_wrapper_env(nodes: usize, ledger_rows: usize) -> TableExport {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let workspace = cache.path().join("ws");
+        let project = ProjectContext {
+            workspace_root: workspace.clone(),
+            current_dir: workspace.clone(),
+            manifest_path: workspace.join("Cargo.toml"),
+            ..project_context()
+        };
+        let config = stow_config(cache.path());
+        let table = unit_table(nodes);
+        let ledger = prefetch_ledger(ledger_rows);
+        let wrappers = crate::commands::WrapperCommands {
+            rustc: "/tools/stow-rustc-wrapper".to_owned(),
+            cc_launcher: "/tools/stow-cc-launcher".to_owned(),
+            cc_compiler: "/tools/stow-cc".to_owned(),
+            cxx_compiler: "/tools/stow-cxx".to_owned(),
+        };
+        let plan = CargoRunPlan {
+            project: &project,
+            config: Some(&config),
+            action: "check",
+            cargo_args: &[],
+            source_root: &project.workspace_root,
+            current_dir: &project.current_dir,
+            cache_policy_path: None,
+            public_cache_mode: &PublicCacheMode::Enabled,
+            unit_nodes: Some(&table),
+            prefetch_artifacts: Some(&ledger),
+            servable_units: None,
+            semantic_fallback_enabled: true,
+            deferred_analysis: false,
+            extra_rustflags: &[],
+            covered_units: ledger.len(),
+        };
+        let mut command = async_process::Command::new("cargo");
+        super::export_wrapper_env(&mut command, &plan, &wrappers, None)
+            .expect("export wrapper env");
+        let env = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_os_string(),
+                    value
+                        .expect("an exported variable carries a value")
+                        .to_os_string(),
+                )
+            })
+            .collect();
+        TableExport {
+            _cache: cache,
+            env,
+            table,
+            ledger,
+        }
+    }
+
+    #[test]
+    fn build_sized_tables_ride_files_not_environment_strings() {
+        let export = exported_wrapper_env(3_000, 3_000);
+        for (key, value) in &export.env {
+            assert!(
+                value.len() <= 4_096,
+                "{} holds {} bytes; a build-sized payload must travel as a file path",
+                key.to_string_lossy(),
+                value.len()
+            );
+        }
+        let path_of = |name: &str| -> PathBuf {
+            PathBuf::from(
+                export
+                    .env
+                    .iter()
+                    .find(|(key, _)| key.as_os_str() == name)
+                    .unwrap_or_else(|| panic!("{name} was not exported"))
+                    .1
+                    .clone(),
+            )
+        };
+        let graph: crate::unit_node::UnitNodeTable = crate::read_build_json_table(
+            &path_of(crate::STOW_EXPANDED_GRAPH_PATH_ENV),
+            crate::STOW_EXPANDED_GRAPH_PATH_ENV,
+        )
+        .expect("read back the expanded graph file");
+        assert_eq!(
+            serde_json::to_vec(&graph).expect("encode read-back table"),
+            serde_json::to_vec(&export.table).expect("encode source table"),
+            "the file round-trips the unit table"
+        );
+        let read_rows: Vec<crate::resolve::PrefetchArtifactRow> = crate::read_build_json_table(
+            &path_of(crate::STOW_PREFETCH_ARTIFACTS_PATH_ENV),
+            crate::STOW_PREFETCH_ARTIFACTS_PATH_ENV,
+        )
+        .expect("read back the prefetch ledger file");
+        let read: Vec<_> = read_rows.iter().map(row_identity).collect();
+        let expected_rows = super::prefetch_artifact_rows(&export.ledger).expect("expected rows");
+        let expected: Vec<_> = expected_rows.iter().map(row_identity).collect();
+        assert_eq!(read, expected, "the file round-trips the prefetch ledger");
+    }
+
+    /// stow#625's control: a single environment value past Linux's
+    /// `MAX_ARG_STRLEN` fails `execve` outright — the failure mode the
+    /// file transport removes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_exported_environment_survives_execve_where_an_inline_table_cannot() {
+        let export = exported_wrapper_env(3_000, 3_000);
+        let status = std::process::Command::new("/bin/true")
+            .env_clear()
+            .envs(export.env.iter().map(|(key, value)| (key, value)))
+            .status()
+            .expect("spawn /bin/true with the build's environment");
+        assert!(status.success());
+
+        let error = std::process::Command::new("/bin/true")
+            .env_clear()
+            .env("STOW_INLINE_TABLE", "x".repeat(200_000))
+            .spawn()
+            .expect_err("a 200,000-byte environment value cannot pass execve");
+        assert_eq!(error.raw_os_error(), Some(libc::E2BIG));
     }
 }

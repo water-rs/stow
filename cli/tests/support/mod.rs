@@ -1,4 +1,4 @@
-//! Helpers the integration tests share.
+//! The environment every integration test's `stow-cli` invocation shares.
 
 use std::path::Path;
 use std::process::Command;

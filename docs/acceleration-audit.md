@@ -285,8 +285,9 @@ let cargo compile the rest.
 ### Build scripts are never cached
 
 Cargo compiles *and runs* one per package on every clean build; `is_cacheable()`
-excludes them. `NativeArtifacts` do travel in the bundle but are injected during
-the library's rustc call — after the script already ran. This is most of the
+excludes them. `NativeArtifacts` still travel in the bundle but nothing on the
+default path injects them — cargo's own build-script run already produced the
+`OUT_DIR` products before the library's rustc call. This is most of the
 remaining floor gap on C-heavy projects: fd's floor is 2.1 s against a 50.8 s
 plain build.
 
