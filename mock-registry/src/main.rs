@@ -41,7 +41,8 @@ use stow_types::index::{
     STOW_INDEX_MEDIA_TYPE, content_sha256, folded_tag, index_tag,
 };
 use stow_types::records::{
-    RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION, records_tag,
+    BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
+    records_tag,
 };
 use stow_types::registry::{GHCR_BASE, bundle_oci_reference, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
@@ -254,7 +255,14 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     // production's cosign signs — never the mock transport base.
     let oci_reference = format!(
         "{GHCR_BASE}:{}",
-        records_tag(&request.rustc_version, &request.task_id)
+        records_tag(
+            &request.rustc_version,
+            &request.task_id,
+            BuildRun {
+                run_id: request.run_id,
+                run_attempt: request.run_attempt,
+            },
+        )
     );
 
     let layer_digest = sha256_digest(&bytes);
@@ -1332,11 +1340,11 @@ enum Command {
     /// straight from a `populate --records-out` file — the bench pipeline
     /// has no edge to `stow-admin index export` from.
     IndexFromRecords(IndexFromRecordsArgs),
-    /// Write one task's records artifact — the records blob, the
+    /// Write one build's records artifact — the records blob, the
     /// `dev.stow.records.task-id`-annotated manifest under
-    /// `records-<rustc>-<task_id hash>`, and its mock signature — the write
-    /// the production publish stage performs on GHCR once a build's
-    /// records live there (stow#455).
+    /// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`, and its
+    /// mock signature — the write the production publish stage performs
+    /// on GHCR once a build's records live there (stow#455).
     PushRecords(PushRecordsArgs),
     Serve(ServeArgs),
 }
@@ -1352,6 +1360,12 @@ struct PushRecordsArgs {
     /// The rustc the task ran under — the tag's `records-<rustc>-` half.
     #[arg(long = "rustc-version")]
     rustc_version: String,
+    /// The run the build published under — the tag's `run_id` leg.
+    #[arg(long = "run-id")]
+    run_id: u64,
+    /// The run's attempt — the tag's last leg.
+    #[arg(long = "run-attempt")]
+    run_attempt: u32,
     #[arg(long = "registry-root")]
     registry_root: PathBuf,
     #[arg(long = "private-key")]

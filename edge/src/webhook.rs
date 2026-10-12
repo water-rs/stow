@@ -7,7 +7,10 @@
 //! `STOW_GITHUB_WEBHOOK_SECRET` binding, and this route parses
 //! `display_title` back into its rustc and task id. A `success`
 //! conclusion is only forwarded once the run's
-//! `records-<rustc>-<task_id hash>` artifact exists in GHCR — the registry is
+//! `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifact exists
+//! in GHCR — the tag names the run that published it, so a completed run
+//! is matched to the artifact that run pushed and to no other
+//! (stow#655). The registry is
 //! the record store, so the record must be where the claim says it is
 //! before the queue marks the work done.
 //!
@@ -146,6 +149,11 @@ struct WorkflowRunFields {
     #[allow(dead_code)]
     conclusion: Option<String>,
     id: u64,
+    /// `run_attempt` — GitHub's attempt number for the run, a positive
+    /// integer. Read only by the wasm handler's records check, which
+    /// builds the run's `BuildRun` from it and `id`.
+    #[allow(dead_code)]
+    run_attempt: std::num::NonZeroU32,
     /// Read only by the wasm handler's completion record.
     #[allow(dead_code)]
     html_url: Option<String>,
@@ -356,7 +364,11 @@ async fn complete_build_task(
     let mut success = run.conclusion.as_deref() == Some("success");
     let mut error = None;
     if success {
-        match records_artifact_exists(ghcr, rustc_version, task_id).await {
+        let build = stow_types::records::BuildRun {
+            run_id: run.id,
+            run_attempt: run.run_attempt.get(),
+        };
+        match records_artifact_exists(ghcr, rustc_version, task_id, build).await {
             Ok(true) => {}
             Ok(false) => {
                 success = false;
@@ -462,16 +474,19 @@ async fn update_request_run(
     Ok(())
 }
 
-/// Whether GHCR holds the task's records artifact — the manifest's
-/// artifact type and task-id annotation must both match, so a tag
-/// pointing at anything else does not satisfy the check.
+/// Whether GHCR holds the records artifact this `build` of the task
+/// published — the tag names the run, so the check matches the artifact
+/// this run pushed and no other build's. The manifest's artifact type
+/// and task-id annotation must both match, so a tag pointing at anything
+/// else does not satisfy the check.
 #[cfg(target_arch = "wasm32")]
 async fn records_artifact_exists(
     config: &GhcrConfig,
     rustc_version: &str,
     task_id: &str,
+    build: stow_types::records::BuildRun,
 ) -> Result<bool, ghcr::FetchError> {
-    let tag = records_tag(rustc_version, task_id);
+    let tag = records_tag(rustc_version, task_id, build);
     let reference = format!("{GHCR_BASE}:{tag}");
     let Some(repository) = repository_path(&reference) else {
         return Err(ghcr::FetchError::InvalidRequest(format!(
@@ -565,6 +580,7 @@ mod tests {
                 "path": ".github/workflows/build-crate.yml",
                 "conclusion": "success",
                 "id": 987_654_321_u64,
+                "run_attempt": 1,
                 "html_url": "https://github.com/water-rs/stow/actions/runs/987654321",
                 "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
             },
@@ -698,6 +714,31 @@ mod tests {
         assert_eq!(rustc_version, "1.99.0");
         assert_eq!(task_id, "serde-1.0.0-abc123");
         assert_eq!(run.id, 987_654_321_u64);
+        assert_eq!(run.run_attempt.get(), 1);
+    }
+
+    /// `run_attempt` is required and positive — the records tag is
+    /// per-build, so a delivery that cannot name its run's build is
+    /// malformed like any other missing field.
+    #[tokio::test]
+    async fn a_run_without_a_valid_attempt_is_a_400() {
+        for body in [
+            completed_event(|event| {
+                let _ = event["workflow_run"]
+                    .as_object_mut()
+                    .expect("workflow_run object")
+                    .remove("run_attempt");
+            }),
+            completed_event(|event| {
+                event["workflow_run"]["run_attempt"] = serde_json::json!(0);
+            }),
+        ] {
+            let delivery = verified("workflow_run", &body)
+                .await
+                .expect("signed delivery verifies");
+            let error = decode_delivery(&delivery).expect_err("an unusable run_attempt rejects");
+            assert!(matches!(error, GetArtifactError::BadRequestWithMessage(_)));
+        }
     }
 
     /// A `resolve-request.yml` run on both lifecycle actions decodes

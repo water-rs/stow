@@ -33,7 +33,7 @@ use stow_types::index::{
     IndexError, content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
 };
 use stow_types::public_cache::UnitShape;
-use stow_types::records::{record_to_index_row, records_tag_rustc};
+use stow_types::records::{parse_records_tag, record_to_index_row};
 use stow_types::registry::{GHCR_BASE, sha256_digest};
 use stow_types::stow_error;
 
@@ -451,10 +451,10 @@ pub fn index_tag_parts(tag: &str) -> Option<(&str, &str)> {
 /// `pull_records` resolves a `records-*` tag to its rows.
 ///
 /// `rustc` scopes the whole pass: a records tag names its rustc
-/// (`records-<rustc>-<task_id hash>`) and a folded/index pair names it in its
-/// suffix, so tag selection alone decides what this rustc's publish
-/// touches — another rustc's tags are never pulled, and `--full` stays
-/// inside the same scope.
+/// (`records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`) and a
+/// folded/index pair names it in its suffix, so tag selection alone
+/// decides what this rustc's publish touches — another rustc's tags are
+/// never pulled, and `--full` stays inside the same scope.
 async fn export_pass<P, R>(
     tags: &[String],
     pull_prev: P,
@@ -506,31 +506,38 @@ where
         .values()
         .flat_map(|slice| slice.folded.iter().map(String::as_str))
         .collect();
-    let mut missing: Vec<&str> = tags
+    // Per-build tags make a rebuilt task's artifact a tag no folded set
+    // names. The pull order feeds the `(c_metadata, unit_shape)` dedup —
+    // later rows win — so for one task hash the greater build folds
+    // last and the newest build's row survives; a tag with no build
+    // suffix, the shape every build of a task shared before stow#655,
+    // folds before all of them. Across hashes the order is
+    // deterministic by hash. Sorting by the tag string would misorder
+    // run ids: `…-9-1` precedes `…-10-1` numerically, not lexically.
+    let mut missing: Vec<(&str, Option<stow_types::records::BuildRun>, &str)> = tags
         .iter()
-        .filter(|tag| {
-            records_tag_rustc(tag) == Some(rustc.as_str())
-                && (full || !folded_union.contains(tag.as_str()))
+        .filter_map(|tag| {
+            let parsed = parse_records_tag(tag)?;
+            (parsed.rustc_version == rustc.as_str()
+                && (full || !folded_union.contains(tag.as_str())))
+            .then_some((parsed.task_hash, parsed.build, tag.as_str()))
         })
-        .map(String::as_str)
         .collect();
-    // Tag order feeds the dedup — sort so a re-run's record is
-    // deterministic regardless of listing order.
     missing.sort_unstable();
     let pulled_count = missing.len();
     let mut new_rows: BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity> = BTreeMap::new();
     let mut new_folded: BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>> =
         BTreeMap::new();
     let mut new_records: Vec<ArtifactRecord> = Vec::new();
-    let per_tag = futures_util::stream::iter(missing.iter().copied().map(&pull_records))
+    let per_tag = futures_util::stream::iter(missing.iter().map(|entry| pull_records(entry.2)))
         .buffered(RECORDS_PULL_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
-    for (tag, records) in missing.iter().zip(per_tag) {
+    for ((_, _, tag), records) in missing.iter().zip(per_tag) {
         // The tag joins the folded set of every slice its records name;
-        // records are write-once per task, so the tag is never pulled
-        // again once marked — including an artifact whose rows are all
-        // still unbundled.
+        // a records artifact is immutable per build, so the tag is never
+        // pulled again once marked — including an artifact whose rows
+        // are all still unbundled.
         let mut named = BTreeSet::new();
         for record in &records {
             let key = (record.target.clone(), record.rustc_version.clone());
@@ -1163,12 +1170,25 @@ mod tests {
         CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson,
     };
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
-    use stow_types::records::records_tag;
+    use stow_types::records::{BuildRun, records_tag};
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.88.0";
     /// A second rustc's tags the pass must never pull.
     const OTHER_RUSTC: &str = "1.99.0";
+
+    /// The run identity an ordinary build's records tag carries.
+    const BUILD: BuildRun = BuildRun {
+        run_id: 1,
+        run_attempt: 1,
+    };
+
+    fn build(run_id: u64) -> BuildRun {
+        BuildRun {
+            run_id,
+            run_attempt: 1,
+        }
+    }
 
     fn record(task_id: &str) -> ArtifactRecord {
         let c_metadata = CMetadata::parse(task_id).expect("c_metadata");
@@ -1194,7 +1214,7 @@ mod tests {
             version: CrateVersion::new(Version::new(1, 0, 0)),
             features_json: FeaturesJson::canonicalize(vec![]).expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
-            oci_reference: format!("{GHCR_BASE}:{}", records_tag(RUSTC, task_id)),
+            oci_reference: format!("{GHCR_BASE}:{}", records_tag(RUSTC, task_id, BUILD)),
             oci_digest: "sha256:deadbeef".to_owned(),
             has_native: false,
             artifact_kind: ArtifactKind::Rlib,
@@ -1247,7 +1267,7 @@ mod tests {
             .flat_map(|rustc| {
                 ["aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555"]
                     .iter()
-                    .map(move |id| (records_tag(rustc, id), (*id).to_owned()))
+                    .map(move |id| (records_tag(rustc, id, BUILD), (*id).to_owned()))
             })
             .collect();
         let pull_records = |tag: &str| {
@@ -1261,7 +1281,7 @@ mod tests {
             index: prev_index(prev_rows, 7),
             folded: prior
                 .iter()
-                .map(|r| records_tag(RUSTC, r.c_metadata.as_str()))
+                .map(|r| records_tag(RUSTC, r.c_metadata.as_str(), BUILD))
                 .collect(),
         };
         let folded_prev: Vec<String> = prev.folded.iter().cloned().collect();
@@ -1297,14 +1317,14 @@ mod tests {
             folded_tag_name.clone(),
             index_tag(TARGET, OTHER_RUSTC),
             folded_tag(TARGET, OTHER_RUSTC),
-            records_tag(OTHER_RUSTC, "eeee5555"),
+            records_tag(OTHER_RUSTC, "eeee5555", BUILD),
             index_tag(TARGET, "1.98.0"),
         ]
         .into_iter()
         .chain(folded_prev)
         .chain(
             new.iter()
-                .map(|r| records_tag(RUSTC, r.c_metadata.as_str())),
+                .map(|r| records_tag(RUSTC, r.c_metadata.as_str(), BUILD)),
         )
         .collect();
         let pass = block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
@@ -1314,8 +1334,8 @@ mod tests {
         assert_eq!(
             pulled,
             vec![
-                records_tag(RUSTC, "cccc3333"),
-                records_tag(RUSTC, "dddd4444")
+                records_tag(RUSTC, "cccc3333", BUILD),
+                records_tag(RUSTC, "dddd4444", BUILD)
             ],
         );
         assert_eq!(
@@ -1349,7 +1369,7 @@ mod tests {
         // The tag's digest is one-way — model the registry's
         // tag→task-id lookup the same way the gate test does.
         let ids_by_tag = std::sync::Arc::new(BTreeMap::from([(
-            records_tag(RUSTC, "aaaa1111"),
+            records_tag(RUSTC, "aaaa1111", BUILD),
             "aaaa1111".to_owned(),
         )]));
         let pull_records = {
@@ -1371,7 +1391,7 @@ mod tests {
         };
         // One records artifact for TARGET only; no folded/index pairs
         // exist at all — the first publish of a fresh registry.
-        let tags = vec![records_tag(RUSTC, "aaaa1111")];
+        let tags = vec![records_tag(RUSTC, "aaaa1111", BUILD)];
         let pass = block_on(export_pass(&tags, no_prev, pull_records, false, &rustc))
             .expect("export pass");
         let mut emitted: Vec<&str> = pass.slices.iter().map(|s| s.target.as_str()).collect();
@@ -1407,7 +1427,7 @@ mod tests {
                     ),
                     PrevSlice {
                         index: prev_index(vec![], 1),
-                        folded: [records_tag(RUSTC, "aaaa1111")].into(),
+                        folded: [records_tag(RUSTC, "aaaa1111", BUILD)].into(),
                     },
                 )))
             })
@@ -1416,7 +1436,7 @@ mod tests {
         let tags: Vec<String> = CI_TARGET_TRIPLES
             .iter()
             .map(|target| folded_tag(target, RUSTC))
-            .chain(std::iter::once(records_tag(RUSTC, "aaaa1111")))
+            .chain(std::iter::once(records_tag(RUSTC, "aaaa1111", BUILD)))
             .collect();
         let pull_records = move |tag: &str| {
             let task_id = ids_by_tag.get(&tag.to_owned()).expect("known tag").clone();
@@ -1427,6 +1447,174 @@ mod tests {
             .expect("export pass");
         assert!(pass.slices.is_empty(), "nothing new emits nothing");
         assert_eq!(pass.pulled, 0);
+    }
+
+    /// The future a `pull_prev` half returns.
+    type PrevPull = PullFut<'static, Option<((TargetTriple, WireRustcVersion), PrevSlice)>>;
+
+    /// A `pull_prev` half for a pass with no published slices at all.
+    fn no_prev(_tag: &str) -> PrevPull {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// A rebuilt task publishes under its own tag — a build-2 artifact
+    /// no folded set names — so the pass pulls exactly it, and its rows
+    /// replace build 1's at the same `(c_metadata, unit_shape)` key.
+    /// Before stow#655 the rebuild overwrote build 1's tag and no pass
+    /// ever pulled it.
+    #[test]
+    fn a_rebuilt_tasks_new_build_tag_is_pulled_and_replaces_the_old_row() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let folded_tag_name = folded_tag(TARGET, RUSTC);
+        // Build 1's record, already folded; build 2 rebuilt the same
+        // unit — same c_metadata, a different bundle behind it.
+        let mut first = record("aaaa1111");
+        first.bundle_size = 1;
+        let mut second = record("aaaa1111");
+        second.bundle_size = 2;
+        let prev = PrevSlice {
+            index: prev_index(
+                vec![record_to_index_row(&first).expect("bundled record")],
+                7,
+            ),
+            folded: [records_tag(RUSTC, "aaaa1111", build(1))].into(),
+        };
+        let pull_prev = {
+            let folded_tag_name = folded_tag_name.clone();
+            move |tag: &str| {
+                let got = if tag == folded_tag_name {
+                    Some((
+                        (
+                            TargetTriple::parse(TARGET).expect("t"),
+                            WireRustcVersion::parse(RUSTC).expect("r"),
+                        ),
+                        PrevSlice {
+                            index: prev.index.clone(),
+                            folded: prev.folded.clone(),
+                        },
+                    ))
+                } else {
+                    None
+                };
+                Box::pin(async move { Ok(got) })
+                    as PullFut<'static, Option<((TargetTriple, WireRustcVersion), PrevSlice)>>
+            }
+        };
+        let pulled = Mutex::new(Vec::<String>::new());
+        let pull_records = |tag: &str| {
+            pulled.lock().unwrap().push(tag.to_owned());
+            let second = second.clone();
+            Box::pin(async move { Ok(vec![second]) }) as PullFut<'static, Vec<ArtifactRecord>>
+        };
+        let build2_tag = records_tag(RUSTC, "aaaa1111", build(2));
+        let tags: Vec<String> = vec![
+            folded_tag_name,
+            records_tag(RUSTC, "aaaa1111", build(1)),
+            build2_tag.clone(),
+        ];
+        let pass = block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
+            .expect("export pass");
+        assert_eq!(pass.pulled, 1);
+        assert_eq!(pulled.into_inner().unwrap(), vec![build2_tag]);
+        let slice = pass
+            .slices
+            .iter()
+            .find(|s| s.target.as_str() == TARGET)
+            .expect("slice emitted");
+        let row = slice
+            .index
+            .rows
+            .iter()
+            .find(|row| row.c_metadata.as_str() == "aaaa1111")
+            .expect("row");
+        assert_eq!(row.bundle_size, 2, "build 2's row replaced build 1's");
+        assert_eq!(slice.folded.len(), 2, "both builds' tags are folded");
+    }
+
+    /// Two builds of one task pulled in the same pass fold in build
+    /// order regardless of listing order — `…-9-1` precedes `…-10-1`
+    /// numerically, never by tag string — so the newest build's row
+    /// wins the `(c_metadata, unit_shape)` dedup.
+    #[test]
+    fn later_builds_fold_last_for_one_task() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let pull_records = |tag: &str| {
+            let tag = tag.to_owned();
+            Box::pin(async move {
+                let build = parse_records_tag(&tag).expect("records tag").build;
+                let mut record = record("aaaa1111");
+                record.bundle_size = build.map_or(0, |build| build.run_id);
+                Ok(vec![record])
+            }) as PullFut<'static, Vec<ArtifactRecord>>
+        };
+        // The listing hands the pass run 10's tag before run 9's.
+        let tags = vec![
+            records_tag(RUSTC, "aaaa1111", build(10)),
+            records_tag(RUSTC, "aaaa1111", build(9)),
+        ];
+        let pass = block_on(export_pass(&tags, no_prev, pull_records, false, &rustc))
+            .expect("export pass");
+        assert_eq!(pass.pulled, 2);
+        let slice = pass
+            .slices
+            .iter()
+            .find(|s| s.target.as_str() == TARGET)
+            .expect("slice emitted");
+        let rows: Vec<_> = slice
+            .index
+            .rows
+            .iter()
+            .filter(|row| row.c_metadata.as_str() == "aaaa1111")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bundle_size, 10, "run 10's row folded last");
+    }
+
+    /// A tag with no build suffix — what every build published before
+    /// stow#655 — is still a records artifact: a pass that no folded set
+    /// excuses from it pulls it, and it folds before every named build
+    /// of its task, so the named build's row is the one that survives.
+    #[test]
+    fn a_tag_without_a_build_folds_before_its_tasks_named_builds() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let named = records_tag(RUSTC, "aaaa1111", build(3));
+        let unnamed = named
+            .strip_suffix("-3-1")
+            .expect("the named tag ends in its build")
+            .to_owned();
+        let pull_records = |tag: &str| {
+            let tag = tag.to_owned();
+            Box::pin(async move {
+                let build = parse_records_tag(&tag).expect("records tag").build;
+                let mut record = record("aaaa1111");
+                record.bundle_size = build.map_or(0, |build| build.run_id);
+                Ok(vec![record])
+            }) as PullFut<'static, Vec<ArtifactRecord>>
+        };
+        for full in [false, true] {
+            let pass = block_on(export_pass(
+                &[named.clone(), unnamed.clone()],
+                no_prev,
+                pull_records,
+                full,
+                &rustc,
+            ))
+            .expect("export pass");
+            assert_eq!(pass.pulled, 2);
+            let slice = pass
+                .slices
+                .iter()
+                .find(|slice| slice.target.as_str() == TARGET)
+                .expect("slice emitted");
+            let rows: Vec<_> = slice
+                .index
+                .rows
+                .iter()
+                .filter(|row| row.c_metadata.as_str() == "aaaa1111")
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].bundle_size, 3, "the named build folded last");
+        }
     }
 
     /// A path whose `.prev` sidecar provably does not exist.
@@ -1530,7 +1718,7 @@ mod tests {
     /// makes.
     #[test]
     fn the_signature_binds_the_canonical_reference_not_the_transport() {
-        let tag = records_tag(RUSTC, "aaaa1111");
+        let tag = records_tag(RUSTC, "aaaa1111", BUILD);
         let digest = "sha256:deadbeef";
         let payload = serde_json::to_vec(&serde_json::json!({
             "critical": {
