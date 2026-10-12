@@ -28,6 +28,7 @@ use futures_util::{StreamExt, stream};
 use stow_types::api::{EnqueueRequest, SchedulerSubmitResponse};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::stow_error;
+use stow_types::transient::Backoff;
 
 use crate::render::{self, Output, Table};
 use crate::{Edge, github};
@@ -545,6 +546,7 @@ async fn search(
             &format!(
                 "/search/repositories?q=language:rust+stars%3A%3E{min_stars}&sort=stars&order=desc&per_page={SEARCH_PER_PAGE}&page={page}"
             ),
+            Backoff::new(),
         )
         .await?;
         let exhausted = response.items.is_empty();
@@ -715,8 +717,12 @@ fn merge_listed(verdicts: &[(String, ListedVerdict)], admitted: &[String]) -> Ve
 /// repository, so it rejects — while any other failure to read the
 /// record says nothing about it.
 async fn inspect_listed(token: &str, full_name: &str) -> Result<(), InspectFailure> {
-    let record: RepoRecord = match github::get_path_result(token, &format!("/repos/{full_name}"))
-        .await
+    let record: RepoRecord = match github::get_path_result(
+        token,
+        &format!("/repos/{full_name}"),
+        Backoff::new(),
+    )
+    .await
     {
         Ok(record) => record,
         Err(zenwave::Error::Http { status, .. }) if status == zenwave::StatusCode::NOT_FOUND => {
@@ -763,6 +769,7 @@ async fn inspect(token: &str, candidate: &SearchItem) -> Result<(), InspectFailu
             candidate.full_name,
             url_path_escape(branch)
         ),
+        Backoff::new(),
     )
     .await
     .map_err(|error| InspectFailure::NotEvaluated(format!("git tree fetch failed: {error}")))?;

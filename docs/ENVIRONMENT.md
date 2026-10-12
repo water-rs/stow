@@ -47,7 +47,7 @@ default, and the purpose.
 | `CARGO_HOME` | unset | Cargo's own home — `stow setup` writes its wrapper wiring into `$CARGO_HOME/config.toml`, resolving it exactly as cargo does (the variable, else `~/.cargo`). |
 | `STOW_CLI_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, then `GH_TOKEN` | GitHub token `stow update` sends with its release lookups — only useful against rate limits or a private mirror. |
 | `STOW_NO_ANALYTICS` | unset | When `1`, every edge request carries `x-stow-no-analytics: 1` and the edge writes no usage-statistics point and computes no install hash for it. See [`PRIVACY.md`](../PRIVACY.md). |
-| `RUST_LOG` | unset | Standard tracing-env-filter directive (e.g., `stow_cli=debug,info`). |
+| `RUST_LOG` | unset (defaults to `warn`) | Standard tracing-env-filter directive (e.g., `stow_cli=debug,info`). Without it, only `warn`/`error` events print — one per condition per build; per-unit lookup detail and per-attempt retries sit at `debug`. |
 
 `stow stats` prints this install's own cache counters (`--json` for
 JSON) and sends nothing.
@@ -69,6 +69,7 @@ JSON) and sends nothing.
 | `STOW_REGISTRY_BASE_URL` | production GHCR | OCI base URL (`scheme://host/v2/repository`) `index export`/`preheat manual` pull records, bundles and published slices from — anonymously, signatures verified. Override for mock-registry runs. |
 | `STOW_MOCK_PUBLIC_KEY_PATH` | unset | Mock cosign key `index export`/`preheat manual` verify records and index slices against under a mock registry — the `mock-verify` code path, never production. |
 | `STOW_CACHE_DIR` | `~/.cache/stow` | Fulcio/Rekor trust material cache for `index export` and `preheat manual` signature verification. |
+| `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), operator-visible here. |
 
 `stow-admin index export --out-dir <dir>` lists the registry's
 `records-*` tags once, pulls and verifies only the records artifacts the
@@ -130,6 +131,7 @@ the run, so publish never calls the edge); `stow-build serve --listen
 | `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` for the edge OIDC token minted when a publish step calls a trusted edge route (`index publish` D1 sync); unused when the run only pushes GHCR artifacts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | serve (falls back to `gh auth token`) | Developer GitHub credential the edge's trusted endpoints accept outside Actions. |
 | `STOW_MOCK_PUBLIC_KEY_PATH` / `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign key pair and mock registry root the local dispatcher populates. Required. |
+| `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
 
 ## stow-mock-registry
 

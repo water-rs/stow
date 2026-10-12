@@ -24,8 +24,9 @@ pub const BUILD_WORKFLOW: &str = "build-crate.yml";
 pub async fn get<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
+    backoff: Backoff,
 ) -> stow_types::error::Result<T> {
-    get_path(token, &format!("/repos/{REPO}/{path}")).await
+    get_path(token, &format!("/repos/{REPO}/{path}"), backoff).await
 }
 
 /// `GET` an absolute `api.github.com` path (leading `/`) and decode the
@@ -34,9 +35,10 @@ pub async fn get<T: serde::de::DeserializeOwned>(
 pub async fn get_path<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
+    backoff: Backoff,
 ) -> stow_types::error::Result<T> {
     let url = format!("{API_BASE}{path}");
-    get_path_result(token, path)
+    get_path_result(token, path, backoff)
         .await
         .map_err(|error| stow_error!("GET {url}: {error}"))
 }
@@ -49,9 +51,17 @@ pub async fn get_path<T: serde::de::DeserializeOwned>(
 pub async fn get_path_result<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
+    backoff: Backoff,
 ) -> std::result::Result<T, zenwave::Error> {
     let url = format!("{API_BASE}{path}");
-    let response = send_get(Some(token), &url, Some("application/vnd.github+json"), None).await?;
+    let response = send_get(
+        Some(token),
+        &url,
+        Some("application/vnd.github+json"),
+        None,
+        backoff,
+    )
+    .await?;
     Ok(response.error_for_status().await?.into_json().await?)
 }
 
@@ -74,8 +84,9 @@ pub async fn get_conditional<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
     etag: Option<&str>,
+    backoff: Backoff,
 ) -> stow_types::error::Result<Conditional<T>> {
-    get_conditional_result(token, path, etag)
+    get_conditional_result(token, path, etag, backoff)
         .await
         .map_err(|error| stow_error!("GET {API_BASE}/repos/{REPO}/{path}: {error}"))
 }
@@ -87,9 +98,17 @@ pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
     etag: Option<&str>,
+    backoff: Backoff,
 ) -> std::result::Result<Conditional<T>, zenwave::Error> {
     let url = format!("{API_BASE}/repos/{REPO}/{path}");
-    let response = send_get(Some(token), &url, Some("application/vnd.github+json"), etag).await?;
+    let response = send_get(
+        Some(token),
+        &url,
+        Some("application/vnd.github+json"),
+        etag,
+        backoff,
+    )
+    .await?;
     if response.status().as_u16() == 304 {
         drop(response);
         return Ok(Conditional::Unmodified);
@@ -111,8 +130,9 @@ pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
 pub async fn get_url_json<T: serde::de::DeserializeOwned>(
     url: &str,
     token: Option<&str>,
+    backoff: Backoff,
 ) -> stow_types::error::Result<T> {
-    let response = send_get(token, url, None, None)
+    let response = send_get(token, url, None, None, backoff)
         .await
         .map_err(|error| stow_error!("GET {url}: {error}"))?;
     response
@@ -125,7 +145,7 @@ pub async fn get_url_json<T: serde::de::DeserializeOwned>(
 }
 
 /// `GET` `url`, retried on transport errors and transient statuses by
-/// the shared [`Backoff`] policy; `Authorization` rides the request only
+/// the caller's [`Backoff`]; `Authorization` rides the request only
 /// when `token` is `Some`. zenwave delivers an error status as `Err`,
 /// the response inside it — a terminal status is its error without
 /// another attempt, a transient one carries its `Retry-After` hint into
@@ -141,8 +161,8 @@ async fn send_get(
     url: &str,
     accept: Option<&str>,
     if_none_match: Option<&str>,
+    mut backoff: Backoff,
 ) -> std::result::Result<zenwave::Response, zenwave::Error> {
-    let mut backoff = Backoff::new();
     loop {
         let mut client = zenwave::client();
         let mut request = client.get(url)?.header("User-Agent", USER_AGENT)?;
@@ -199,7 +219,7 @@ async fn send_get(
         let Some(wait) = backoff.next_wait(retry_after) else {
             return Err(error);
         };
-        tracing::warn!(url, %error, "request failed; retrying");
+        tracing::warn!(url, %error, wait = ?wait, "request failed; retrying");
         tokio::time::sleep(wait).await;
     }
 }
@@ -207,8 +227,12 @@ async fn send_get(
 /// `GET` an absolute URL as text — job-log fetches redirect to GitHub's
 /// signed blob host, where the `Authorization` header must not follow
 /// (zenwave strips it cross-origin).
-pub async fn get_text(token: &str, url: &str) -> stow_types::error::Result<String> {
-    let response = send_get(Some(token), url, None, None)
+pub async fn get_text(
+    token: &str,
+    url: &str,
+    backoff: Backoff,
+) -> stow_types::error::Result<String> {
+    let response = send_get(Some(token), url, None, None, backoff)
         .await
         .map_err(|error| stow_error!("GET {url}: {error}"))?;
     response
@@ -942,7 +966,7 @@ mod tests {
 
 #[cfg(test)]
 mod url_json_tests {
-    use super::get_url_json;
+    use super::{Backoff, get_url_json};
     use crate::test_server;
 
     /// A connection the server drops without answering is a transport
@@ -959,7 +983,7 @@ mod url_json_tests {
             },
         ])
         .await;
-        let body: serde_json::Value = get_url_json(&server.url, None)
+        let body: serde_json::Value = get_url_json(&server.url, None, Backoff::new())
             .await
             .expect("a dropped connection retries");
         assert_eq!(body["ok"], true);
@@ -985,7 +1009,7 @@ mod url_json_tests {
         ])
         .await;
         let started = std::time::Instant::now();
-        let body: serde_json::Value = get_url_json(&server.url, None)
+        let body: serde_json::Value = get_url_json(&server.url, None, Backoff::new())
             .await
             .expect("a transient status retries");
         assert_eq!(body["ok"], true);
@@ -1010,7 +1034,7 @@ mod url_json_tests {
         }])
         .await;
         let result: stow_types::error::Result<serde_json::Value> =
-            get_url_json(&server.url, None).await;
+            get_url_json(&server.url, None, Backoff::new()).await;
         assert!(result.is_err());
         let heads = server.join().await;
         assert_eq!(heads.len(), 1);
@@ -1036,7 +1060,7 @@ mod url_json_tests {
         .await;
         let body: serde_json::Value = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            get_url_json(&server.url, None),
+            get_url_json(&server.url, None, Backoff::new()),
         )
         .await
         .expect("a cut body completes inside the bound")
@@ -1062,7 +1086,7 @@ mod url_json_tests {
         .await;
         let result: stow_types::error::Result<serde_json::Value> = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            get_url_json(&server.url, None),
+            get_url_json(&server.url, None, Backoff::new()),
         )
         .await
         .expect("a cut body ends inside the bound");
@@ -1082,10 +1106,42 @@ mod url_json_tests {
         }])
         .await;
         let result: stow_types::error::Result<serde_json::Value> =
-            get_url_json(&server.url, None).await;
+            get_url_json(&server.url, None, Backoff::new()).await;
         assert!(result.is_err());
         let heads = server.join().await;
         assert_eq!(heads.len(), 1);
+    }
+
+    /// An outage budget waits an incident out: four `502`s spend the
+    /// burst budget's four attempts, and the read still answers the
+    /// fifth attempt's `200`. The waits are real — a paused clock would
+    /// fire the loopback's own per-connection bound mid-burst — so this
+    /// test costs the 7.5 s of pauses it proves.
+    #[tokio::test]
+    async fn get_url_json_waits_out_a_502_burst_under_the_outage_budget() {
+        let steps = (0..4)
+            .map(|_| test_server::Step::Respond {
+                status: 502,
+                retry_after: None,
+                body: "{}",
+            })
+            .chain([test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            }])
+            .collect();
+        let server = test_server::Loopback::start(steps).await;
+        let body: serde_json::Value = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            get_url_json(&server.url, None, Backoff::outage()),
+        )
+        .await
+        .expect("the outage read completes inside its real-time bound")
+        .expect("four 502s are inside the outage budget");
+        assert_eq!(body["ok"], true);
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 5);
     }
 
     /// A transient failure that outlives the budget returns its final
@@ -1103,7 +1159,7 @@ mod url_json_tests {
         )
         .await;
         let result: stow_types::error::Result<serde_json::Value> =
-            get_url_json(&server.url, None).await;
+            get_url_json(&server.url, None, Backoff::new()).await;
         assert!(result.is_err());
         let heads = server.join().await;
         assert_eq!(heads.len(), 4);
@@ -1112,7 +1168,7 @@ mod url_json_tests {
 
 #[cfg(test)]
 mod send_get_tests {
-    use super::send_get;
+    use super::{Backoff, send_get};
     use crate::test_server;
 
     /// A conditional GET's 304 answer carries no `Location` — it is a
@@ -1129,7 +1185,7 @@ mod send_get_tests {
         .await;
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            send_get(None, &server.url, None, Some("\"v1\"")),
+            send_get(None, &server.url, None, Some("\"v1\""), Backoff::new()),
         )
         .await
         .expect("the conditional read answers inside the bound");
