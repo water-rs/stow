@@ -160,8 +160,8 @@ fn an_unusable_cache_dir_costs_cache_hits_not_the_build() {
     let cargo_home = tempfile::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let setup_cache = tempfile::tempdir().expect("setup cache");
-    stow_setup_in(dir.path(), cargo_home.path(), setup_cache.path());
     let edge_url = unreachable_edge_url();
+    stow_setup_in(dir.path(), &edge_url, setup_cache.path(), cargo_home.path());
 
     let blocker = tempfile::NamedTempFile::new().expect("blocker file");
     let cache_dir = blocker.path().join("cache");
@@ -191,9 +191,32 @@ fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
         .join(format!("probe{}", std::env::consts::EXE_SUFFIX))
 }
 
+/// The environment a hermetic `stow-cli` invocation needs in this file:
+/// the test's edge for both the edge URL and the OCI registry base —
+/// without it the CLI reaches the real registry, and once the public
+/// index covers the fixture's crates an "all-miss" build is no longer
+/// one — the isolated cache dir, a verify mode the developer's ambient
+/// config cannot poison, and loopback's proxy exclusions (stow#608).
+fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path) {
+    command
+        .env("STOW_EDGE_URL", edge_url)
+        .env(
+            "STOW_REGISTRY_BASE_URL",
+            format!("{edge_url}/water-rs/stow"),
+        )
+        .env("STOW_CACHE_DIR", cache_dir)
+        // Isolate from the developer's ambient stow config: a user-level
+        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
+        // would make this binary reject the config and skip the cache.
+        .env("STOW_VERIFY_MODE", "github-ci")
+        .env_remove("STOW_CONFIG_BLOB")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost");
+}
+
 /// `stow-cli setup` in the isolated `CARGO_HOME` — the one-time mold
 /// selection, kept out of every timed build.
-fn stow_setup_in(dir: &Path, cargo_home: &Path, cache_dir: &Path) {
+fn stow_setup_in(dir: &Path, edge_url: &str, cache_dir: &Path, cargo_home: &Path) {
     // stow#294: a Linux `stow build` refuses to run without a mold
     // selection — `stow setup` installs mold and writes it. Idempotent.
     // Setup writes the global cargo config; the isolated CARGO_HOME keeps
@@ -201,13 +224,13 @@ fn stow_setup_in(dir: &Path, cargo_home: &Path, cache_dir: &Path) {
     // STOW_CACHE_DIR so no test writes the developer's state DB — the
     // link-resolution row `stow setup` records lands where the caller
     // points (stow#608).
-    let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    setup
         .arg("setup")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .env("STOW_CACHE_DIR", cache_dir)
-        .output()
-        .expect("run stow-cli setup");
+        .env("CARGO_HOME", cargo_home);
+    hermetic_stow_env(&mut setup, edge_url, cache_dir);
+    let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
         "stow setup failed:\n{}",
@@ -221,7 +244,7 @@ fn stow_build_in(
     cache_dir: &Path,
     cargo_home: &Path,
 ) -> std::process::Output {
-    stow_setup_in(dir, cargo_home, cache_dir);
+    stow_setup_in(dir, edge_url, cache_dir, cargo_home);
     stow_build_command(dir, edge_url, cache_dir, cargo_home, &dir.join("target"))
 }
 
@@ -232,28 +255,17 @@ fn stow_build_command(
     cargo_home: &Path,
     target_dir: &Path,
 ) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    command
         .arg("build")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .env("STOW_EDGE_URL", edge_url)
-        .env(
-            "STOW_REGISTRY_BASE_URL",
-            format!("{edge_url}/water-rs/stow"),
-        )
-        .env("STOW_CACHE_DIR", cache_dir)
-        // Isolate from the developer's ambient stow config: a user-level
-        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
-        // would make this binary reject the config and skip the cache.
-        .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
+        .env("CARGO_HOME", cargo_home);
+    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    command
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("run stow-cli build")
+        .env_remove("RUST_LOG");
+    command.output().expect("run stow-cli build")
 }
 
 fn state_db_pool(db: &Path) -> sqlx::SqlitePool {
@@ -399,14 +411,11 @@ fn cargo_build_in(
     command
         .arg("build")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .env("STOW_EDGE_URL", edge_url)
-        .env("STOW_CACHE_DIR", cache_dir)
-        // Isolate from the developer's ambient stow config: a user-level
-        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
-        // would make the wrapper reject the config and skip the cache.
-        .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
+        .env("CARGO_HOME", cargo_home);
+    // The wrapper shim is `stow-cli rustc` under cargo: same hermetic
+    // environment as a driver invocation.
+    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    command
         .env("RUSTC_WRAPPER", wrapper)
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
@@ -879,12 +888,12 @@ fn a_fresh_target_dir_serves_everything_the_local_cache_holds() {
     let target_b = tempfile::tempdir().expect("target dir b");
     let cargo_home = tempfile::tempdir().expect("cargo home");
     write_leaf_dep_crate(dir.path(), cargo_home.path());
-    stow_setup_in(dir.path(), cargo_home.path(), cache.path());
 
     // Nothing listens on this port: the edge and the index registry
     // both refuse every connection, so build 2 can only serve from the
     // local artifact cache.
     let edge_url = unreachable_edge_url();
+    stow_setup_in(dir.path(), &edge_url, cache.path(), cargo_home.path());
 
     let output = stow_build_command(
         dir.path(),
@@ -972,18 +981,14 @@ fn stow_startup_floor(dir: &Path, cargo_home: &Path, edge_url: &str) -> std::tim
 
         let stow_cache = tempfile::tempdir().expect("stow cache");
         let stow_target = tempfile::tempdir().expect("stow target");
-        stow_setup_in(dir, cargo_home, stow_cache.path());
+        stow_setup_in(dir, edge_url, stow_cache.path(), cargo_home);
         let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
         command
             .arg("build")
             .current_dir(dir)
-            .env("CARGO_HOME", cargo_home)
-            .env("STOW_EDGE_URL", edge_url)
-            .env("STOW_CACHE_DIR", stow_cache.path())
-            .env("STOW_VERIFY_MODE", "github-ci")
-            .env_remove("STOW_CONFIG_BLOB")
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .env("no_proxy", "127.0.0.1,localhost")
+            .env("CARGO_HOME", cargo_home);
+        hermetic_stow_env(&mut command, edge_url, stow_cache.path());
+        command
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_TARGET_DIR", stow_target.path())
             .env_remove("RUST_LOG");
@@ -1205,8 +1210,8 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
     let cargo_home = tempfile::tempdir().expect("cargo home");
     write_multi_crate(dir.path(), cargo_home.path());
     let setup_cache = tempfile::tempdir().expect("setup cache");
-    stow_setup_in(dir.path(), cargo_home.path(), setup_cache.path());
     let edge_url = unreachable_edge_url();
+    stow_setup_in(dir.path(), &edge_url, setup_cache.path(), cargo_home.path());
 
     let empty_dir = tempfile::tempdir().expect("empty dir");
     write_empty_crate(empty_dir.path());
@@ -1242,18 +1247,14 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
 
         let stow_cache = tempfile::tempdir().expect("stow cache");
         let stow_target = tempfile::tempdir().expect("stow target");
-        stow_setup_in(dir.path(), cargo_home.path(), stow_cache.path());
+        stow_setup_in(dir.path(), &edge_url, stow_cache.path(), cargo_home.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
         command
             .arg("build")
             .current_dir(dir.path())
-            .env("CARGO_HOME", cargo_home.path())
-            .env("STOW_EDGE_URL", &edge_url)
-            .env("STOW_CACHE_DIR", stow_cache.path())
-            .env("STOW_VERIFY_MODE", "github-ci")
-            .env_remove("STOW_CONFIG_BLOB")
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .env("no_proxy", "127.0.0.1,localhost")
+            .env("CARGO_HOME", cargo_home.path());
+        hermetic_stow_env(&mut command, &edge_url, stow_cache.path());
+        command
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_TARGET_DIR", stow_target.path())
             .env_remove("RUST_LOG");

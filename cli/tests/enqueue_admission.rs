@@ -171,6 +171,25 @@ fn read_request_body(reader: &mut impl std::io::BufRead) -> Vec<u8> {
     body
 }
 
+/// The environment a hermetic `stow-cli` invocation needs in this file:
+/// the test's edge for both the edge URL and the OCI registry base —
+/// without it the CLI reaches the real registry — the isolated cache
+/// dir, a verify mode the developer's ambient config cannot poison, and
+/// loopback's proxy exclusions.
+fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path) {
+    command
+        .env("STOW_EDGE_URL", edge_url)
+        .env(
+            "STOW_REGISTRY_BASE_URL",
+            format!("{edge_url}/water-rs/stow"),
+        )
+        .env("STOW_CACHE_DIR", cache_dir)
+        .env("STOW_VERIFY_MODE", "github-ci")
+        .env_remove("STOW_CONFIG_BLOB")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost");
+}
+
 fn write_crate(dir: &Path, cargo_home: &Path) {
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -208,35 +227,30 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     // selection — `stow setup` installs mold and writes it. Setup writes
     // the global cargo config; the isolated CARGO_HOME keeps the
     // developer's real one untouched.
-    let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    setup
         .arg("setup")
         .current_dir(dir.path())
-        .env("CARGO_HOME", cargo_home.path())
-        .output()
-        .expect("run stow-cli setup");
+        .env("CARGO_HOME", cargo_home.path());
+    hermetic_stow_env(&mut setup, &edge_url, cache.path());
+    let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
         "stow setup failed:\n{}",
         String::from_utf8_lossy(&setup.stderr)
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    build
         .arg("build")
         .current_dir(dir.path())
-        .env("CARGO_HOME", cargo_home.path())
-        .env("STOW_EDGE_URL", &edge_url)
-        .env("STOW_CACHE_DIR", cache.path())
-        // Isolate from the developer's ambient stow config: a user-level
-        // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
-        // would abort analysis before any admission is minted.
-        .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
+        .env("CARGO_HOME", cargo_home.path());
+    hermetic_stow_env(&mut build, &edge_url, cache.path());
+    let output = build
         // The public cache only serves recent stable toolchains; pin the
         // probed identity so the analysis runs even when the host rustc is
         // a nightly build.
         .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
         .output()
@@ -318,18 +332,15 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
         url
     };
 
-    let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    build
         .arg("build")
         .current_dir(dir.path())
-        .env("CARGO_HOME", cargo_home.path())
-        .env("STOW_EDGE_URL", &dead_edge)
-        .env("STOW_CACHE_DIR", cache.path())
-        .env("STOW_VERIFY_MODE", "github-ci")
-        .env_remove("STOW_CONFIG_BLOB")
+        .env("CARGO_HOME", cargo_home.path());
+    hermetic_stow_env(&mut build, &dead_edge, cache.path());
+    let output = build
         .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
         .output()
@@ -453,19 +464,16 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
     let shim = install_wrapper_shim(tools.path());
 
     let cargo_build = |dir: &Path| {
-        let output = Command::new("cargo")
+        let mut command = Command::new("cargo");
+        command
             .arg("build")
             .current_dir(dir)
             .env("CARGO_HOME", cargo_home.path())
-            .env("RUSTC_WRAPPER", &shim)
-            .env("STOW_EDGE_URL", &edge_url)
-            .env("STOW_CACHE_DIR", cache.path())
-            .env("STOW_VERIFY_MODE", "github-ci")
-            .env_remove("STOW_CONFIG_BLOB")
+            .env("RUSTC_WRAPPER", &shim);
+        hermetic_stow_env(&mut command, &edge_url, cache.path());
+        let output = command
             .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
             .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .env("no_proxy", "127.0.0.1,localhost")
             .env("CARGO_INCREMENTAL", "0")
             .env_remove("RUST_LOG")
             .output()

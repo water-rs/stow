@@ -108,7 +108,8 @@ impl ServeMap {
     /// `pending` map names nothing to wait on (stow#347). Local
     /// coverage does not wait on a cached unit graph: the lockfile's
     /// registry packages name the build's units when no graph is on
-    /// disk (stow#617).
+    /// disk (stow#617), and a lockfile cargo has not written yet names
+    /// none — the local half is then empty, not an error (stow#608).
     pub const fn is_empty(&self) -> bool {
         self.target.is_empty() && self.host.is_empty()
     }
