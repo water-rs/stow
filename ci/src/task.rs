@@ -2485,6 +2485,7 @@ mod tests {
 
     /// The `host:` triple the ambient toolchain compiles for — the same
     /// `rustc -vV` probe `active_release` reads its release from.
+    #[cfg(not(windows))]
     fn host_triple() -> String {
         let output = std::process::Command::new("rustc")
             .arg("-vV")
@@ -3139,13 +3140,13 @@ checksum = "33"
         );
     }
 
-    /// This is the shape that broke on Windows: a build script is a host
-    /// binary, so compiling one runs the linker, and the sandboxed rustc
-    /// could not find MSVC's. It picked up Git for Windows' msys `link`
-    /// instead, which cannot start inside an `AppContainer` at all — every
-    /// Windows build of every crate carrying a build script or a proc
-    /// macro failed, and nothing in the test suite noticed because the
-    /// only sandbox test was Unix-only.
+    /// A build script is a host binary, so compiling one runs the linker
+    /// inside the sandbox. Windows checks the same thing in
+    /// `the_target_c_compiler_runs_inside_the_phase_sandbox`, whose
+    /// build script does this and more: a sandbox of its own would
+    /// grant the machine's toolchain trees to one more container, and
+    /// that takes minutes there.
+    #[cfg(not(windows))]
     #[test]
     fn a_build_script_compiles_inside_the_phase_sandbox() {
         smol::block_on(async {
@@ -3172,11 +3173,19 @@ checksum = "33"
         });
     }
 
-    /// stow#708's half the linker fix does not reach: inside the sandbox
-    /// the `cc` crate's own MSVC lookup comes up empty the same way
-    /// rustc's does, and a build script that compiles C for the task's
-    /// target then falls back to the first `cl.exe` on PATH — the
-    /// host's. `MsvcToolchain` answers by naming the target's own
+    /// Two shapes that broke on Windows, in one build. A build script is
+    /// a host binary, so compiling one runs the linker, and the sandboxed
+    /// rustc could not find MSVC's. It picked up Git for Windows' msys
+    /// `link` instead, which cannot start inside an `AppContainer` at
+    /// all — every Windows build of every crate carrying a build script
+    /// or a proc macro failed, and nothing in the test suite noticed
+    /// because the only sandbox test was Unix-only.
+    ///
+    /// stow#708 is the half the linker fix does not reach: inside the
+    /// sandbox the `cc` crate's own MSVC lookup comes up empty the same
+    /// way rustc's does, and a build script that compiles C for the
+    /// task's target then falls back to the first `cl.exe` on PATH —
+    /// the host's. `MsvcToolchain` answers by naming the target's own
     /// compiler in `CC_<target>`; the probe uses exactly that variable,
     /// the way `cc` resolves it, and the object it leaves behind must be
     /// an ARM64 COFF (`IMAGE_FILE_MACHINE_ARM64`, `0xAA64`
