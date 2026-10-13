@@ -2950,6 +2950,11 @@ checksum = "33"
             let mut command = sandbox
                 .command("cargo")
                 .args(["build", "--offline", "--quiet"])
+                // The phase command pins both, and cargo then ignores what
+                // the cargo home configures for them. With no shim to name,
+                // the empty wrapper is cargo's spelling of "none".
+                .env("RUSTFLAGS", setup.rustflags)
+                .env("RUSTC_WRAPPER", "")
                 .env(
                     "CARGO_TARGET_DIR",
                     super::path_arg(target_dir.path()).expect("utf8 target dir"),
