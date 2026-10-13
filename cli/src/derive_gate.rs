@@ -282,19 +282,7 @@ impl DerivationSlot {
     /// stop request, and it is kept inside the slot so the requester
     /// stays parked until the slot drops it.
     pub async fn stop_requested(&mut self) {
-        let accepted = match &self.listener {
-            #[cfg(unix)]
-            Listener::Unix(listener, _) => listener
-                .accept()
-                .await
-                .map(|(stream, _)| Stream::Unix(stream)),
-            #[cfg(not(unix))]
-            Listener::Loopback(listener) => listener
-                .accept()
-                .await
-                .map(|(stream, _)| Stream::Loopback(stream)),
-        };
-        match accepted {
+        match self.listener.accept().await {
             Ok(stream) => self.stop = Some(stream),
             // The only peer that ever connects is a command asking the
             // drain to stop; if accepting it fails the drain cannot
@@ -324,7 +312,8 @@ fn open_slot_blocking(gate_dir: &Path) -> Result<OpenAttempt, String> {
     let derive = gate_dir.join(DERIVE_DIR);
     std::fs::create_dir_all(&derive)
         .map_err(|error| format!("create {}: {error}", derive.display()))?;
-    let (listener, endpoint) = supervisor::bind("stow-derive-")?;
+    let listener = supervisor::bind("stow-derive-")?;
+    let endpoint = listener.endpoint();
     let pid = std::process::id();
     let pointer = derive.join(pid.to_string());
     // The pointer lands by rename: a reader either sees the finished
@@ -487,7 +476,8 @@ mod tests {
         // An endpoint nobody listens on, under the pid of a process
         // that is alive — this one: the listener is dropped as soon as
         // the pointer is written.
-        let (listener, endpoint) = supervisor::bind("stow-derive-").expect("bind");
+        let listener = supervisor::bind("stow-derive-").expect("bind");
+        let endpoint = listener.endpoint();
         let pointer = derive.join(std::process::id().to_string());
         std::fs::write(&pointer, endpoint.encode()).expect("write pointer");
         drop(listener);
@@ -511,7 +501,8 @@ mod tests {
         std::fs::create_dir_all(&derive).expect("derive dir");
         // A listener that would hold a connection for the whole
         // deadline, under the pid of a process that has exited.
-        let (_listener, endpoint) = supervisor::bind("stow-derive-").expect("bind");
+        let listener = supervisor::bind("stow-derive-").expect("bind");
+        let endpoint = listener.endpoint();
         let pointer = derive.join(crate::miss_journal::dead_pid().to_string());
         std::fs::write(&pointer, endpoint.encode()).expect("write pointer");
 
@@ -533,26 +524,15 @@ mod tests {
         let gate_dir = dir.path().join("gate");
         let derive = gate_dir.join(DERIVE_DIR);
         std::fs::create_dir_all(&derive).expect("derive dir");
-        let (listener, endpoint) = supervisor::bind("stow-derive-").expect("bind");
+        let listener = supervisor::bind("stow-derive-").expect("bind");
+        let endpoint = listener.endpoint();
         std::fs::write(
             derive.join(std::process::id().to_string()),
             endpoint.encode(),
         )
         .expect("write pointer");
         let _serving = tokio::spawn(async move {
-            let accepted = match &listener {
-                #[cfg(unix)]
-                Listener::Unix(listener, _) => listener
-                    .accept()
-                    .await
-                    .map(|(stream, _)| Stream::Unix(stream)),
-                #[cfg(not(unix))]
-                Listener::Loopback(listener) => listener
-                    .accept()
-                    .await
-                    .map(|(stream, _)| Stream::Loopback(stream)),
-            };
-            if let Ok(_stream) = accepted {
+            if let Ok(_stream) = listener.accept().await {
                 std::future::pending::<()>().await;
             }
         });

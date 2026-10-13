@@ -104,17 +104,64 @@ pub fn from_env() -> Result<Option<(Endpoint, String)>, String> {
     Ok(Some((endpoint, token)))
 }
 
-/// A listener bound for an [`Endpoint`]: the Unix socket inside the
-/// temp directory that owns it, or the loopback TCP listener.
+/// The socket's file name inside its directory.
+#[cfg(unix)]
+const SOCKET_NAME: &str = "sock";
+
+/// A listener [`bind`] produced: the Unix socket with the temp
+/// directory that owns it, or the loopback TCP listener with its port.
 pub enum Listener {
-    /// The `sock` Unix socket inside `dir` — the directory's removal
-    /// takes the socket with it.
+    /// The socket inside `dir` — the directory's removal takes the
+    /// socket with it.
     #[cfg(unix)]
-    Unix(tokio::net::UnixListener, tempfile::TempDir),
+    Unix {
+        /// The bound socket.
+        listener: tokio::net::UnixListener,
+        /// The directory holding it.
+        dir: tempfile::TempDir,
+    },
     /// A loopback TCP listener — the transport every non-Unix platform
     /// binds.
     #[cfg(not(unix))]
-    Loopback(tokio::net::TcpListener),
+    Loopback {
+        /// The bound listener.
+        listener: tokio::net::TcpListener,
+        /// The kernel-picked port it listens on.
+        port: u16,
+    },
+}
+
+impl Listener {
+    /// The endpoint that reaches this listener.
+    #[must_use]
+    pub fn endpoint(&self) -> Endpoint {
+        match self {
+            #[cfg(unix)]
+            Self::Unix { dir, .. } => Endpoint::Unix(dir.path().join(SOCKET_NAME)),
+            #[cfg(not(unix))]
+            Self::Loopback { port, .. } => Endpoint::Loopback(*port),
+        }
+    }
+
+    /// Accept one connection.
+    ///
+    /// # Errors
+    ///
+    /// The listener's accept error.
+    pub async fn accept(&self) -> std::io::Result<Stream> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix { listener, .. } => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Stream::Unix(stream)),
+            #[cfg(not(unix))]
+            Self::Loopback { listener, .. } => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Stream::Loopback(stream)),
+        }
+    }
 }
 
 /// The connected half of the [`Endpoint`] transport — what [`connect`]
@@ -127,8 +174,7 @@ pub enum Stream {
     Loopback(tokio::net::TcpStream),
 }
 
-/// Bind a listener and return it with the [`Endpoint`] that reaches it:
-/// on Unix a `sock` socket inside a fresh `dir_prefix` temp directory,
+/// Bind a listener: on Unix a socket inside a fresh `dir_prefix` temp directory,
 /// restricted to the owner; elsewhere a loopback TCP listener on a
 /// kernel-picked port. `dir_prefix` spells `stow-<what>-`, and `<what>`
 /// is the subject the error text names.
@@ -138,7 +184,7 @@ pub enum Stream {
 /// A socket directory that cannot be created, a socket that cannot be
 /// bound or restricted, a loopback listener that cannot be bound or
 /// adopted.
-pub fn bind(dir_prefix: &str) -> Result<(Listener, Endpoint), String> {
+pub fn bind(dir_prefix: &str) -> Result<Listener, String> {
     let subject = dir_prefix
         .strip_prefix("stow-")
         .and_then(|rest| rest.strip_suffix('-'))
@@ -149,11 +195,14 @@ pub fn bind(dir_prefix: &str) -> Result<(Listener, Endpoint), String> {
             .prefix(dir_prefix)
             .tempdir()
             .map_err(|error| format!("create {subject} socket directory: {error}"))?;
-        let path = socket_dir.path().join("sock");
+        let path = socket_dir.path().join(SOCKET_NAME);
         let listener = tokio::net::UnixListener::bind(&path)
             .map_err(|error| format!("bind {subject} socket {}: {error}", path.display()))?;
         restrict_socket(&path, subject)?;
-        Ok((Listener::Unix(listener, socket_dir), Endpoint::Unix(path)))
+        Ok(Listener::Unix {
+            listener,
+            dir: socket_dir,
+        })
     }
     #[cfg(not(unix))]
     {
@@ -171,7 +220,7 @@ pub fn bind(dir_prefix: &str) -> Result<(Listener, Endpoint), String> {
             .port();
         let listener = tokio::net::TcpListener::from_std(listener)
             .map_err(|error| format!("adopt the {subject} listener: {error}"))?;
-        Ok((Listener::Loopback(listener), Endpoint::Loopback(port)))
+        Ok(Listener::Loopback { listener, port })
     }
 }
 

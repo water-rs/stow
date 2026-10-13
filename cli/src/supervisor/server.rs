@@ -214,15 +214,15 @@ where
     tokio::spawn(run_tickets(ticket_rx));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let connections = Arc::new(AtomicUsize::new(0));
-    let (listener, endpoint) = super::bind("stow-supervisor-")?;
+    let listener = super::bind("stow-supervisor-")?;
+    let endpoint = listener.endpoint();
 
     #[cfg(unix)]
     {
-        let (super::Listener::Unix(listener, socket_dir), Endpoint::Unix(path)) =
-            (listener, endpoint)
-        else {
-            unreachable!("the unix bind returns the unix listener and endpoint")
-        };
+        let super::Listener::Unix {
+            listener,
+            dir: socket_dir,
+        } = listener;
         let accept_task = tokio::spawn(accept_unix(
             listener,
             handler,
@@ -232,9 +232,9 @@ where
             in_flight,
             Arc::clone(&connections),
         ));
-        tracing::debug!(endpoint = %path.display(), "build supervisor listening");
+        tracing::debug!(endpoint = %endpoint.encode(), "build supervisor listening");
         Ok(Supervisor {
-            endpoint: Endpoint::Unix(path),
+            endpoint,
             token,
             shutdown: Some(shutdown_tx),
             accept_task: Some(accept_task),
@@ -245,7 +245,7 @@ where
 
     #[cfg(not(unix))]
     {
-        let (super::Listener::Loopback(listener), Endpoint::Loopback(port)) = (listener, endpoint);
+        let super::Listener::Loopback { listener, port } = listener;
         let accept_task = tokio::spawn(accept_loopback(
             listener,
             handler,
@@ -257,7 +257,7 @@ where
         ));
         tracing::debug!(port, "build supervisor listening");
         Ok(Supervisor {
-            endpoint: Endpoint::Loopback(port),
+            endpoint,
             token,
             shutdown: Some(shutdown_tx),
             accept_task: Some(accept_task),
