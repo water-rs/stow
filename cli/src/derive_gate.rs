@@ -38,6 +38,13 @@ const DERIVE_DIR: &str = "derive";
 /// closes cannot hold a command's start past it.
 const STOP_DEADLINE: Duration = Duration::from_secs(2);
 
+/// The bound a connect to a drain's endpoint may take. A connect to a
+/// live local listener completes in the kernel, whatever the drain is
+/// doing, so one still pending after this has no listener behind it —
+/// which Windows reports for a loopback port only after its own
+/// connect retries, about as long as the whole stop deadline.
+const CONNECT_DEADLINE: Duration = Duration::from_millis(250);
+
 /// A stow command's claim on the package-cache lock's next holder:
 /// while it is held, no miss drain starts a cargo of its own
 /// (stow#667).
@@ -172,7 +179,9 @@ async fn stop_derivation(pointer: &Path) {
     let Some(endpoint) = read_pointer(pointer).await else {
         return;
     };
-    let Ok(mut stream) = supervisor::connect(&endpoint).await else {
+    let Ok(Ok(mut stream)) =
+        tokio::time::timeout(CONNECT_DEADLINE, supervisor::connect(&endpoint)).await
+    else {
         remove_pointer(pointer).await;
         return;
     };
@@ -482,10 +491,15 @@ mod tests {
         std::fs::write(&pointer, endpoint.encode()).expect("write pointer");
         drop(listener);
 
+        let started = std::time::Instant::now();
         let hold = ForegroundHold::enter(&gate_dir).await.expect("enter");
         assert!(
             !pointer.exists(),
             "a dead drain's pointer is removed by the sweep"
+        );
+        assert!(
+            started.elapsed() < STOP_DEADLINE,
+            "an endpoint nobody listens on held the command for the stop deadline"
         );
         hold.release();
     }
