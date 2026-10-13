@@ -28,9 +28,24 @@
 # libstdc++ headers the debs ship via -nostdinc++ + explicit
 # -I order (baked on for the C++ drivers; a C driver adds it
 # only when a C++ TU shows up in argv, since -nostdinc++
-# warns on every .c compile). Deterministic — written every
-# run so a cache-restored sysroot and a fresh extract wire
-# the same way.
+# warns on every .c compile).
+#
+# And --sysroot does not move every directory the driver
+# searches by itself. A cross driver has a tool include
+# directory — /usr/aarch64-linux-gnu/include, the runner's own
+# cross glibc headers — that it searches before the sysroot's:
+# readable, it puts those newer headers in front of the 2.28
+# ones; unreadable, as in the build sandbox, gcc stops with
+# "stdc-predef.h: Permission denied" and every C compile on
+# the aarch64 leg failed (stow#691). So the shim drops the
+# driver's whole default list (-nostdinc) and names what
+# belongs on it: the compiler's own headers, asked of the
+# driver when the shim is written, then the sysroot's.
+#
+# Deterministic — written every run so a cache-restored
+# sysroot and a fresh extract wire the same way. A driver
+# that is not installed gets no shim: the x86_64 leg has no
+# cross toolchain to ask.
 set -euo pipefail
 
 sysroot="${1:?usage: wrappers.sh <sysroot-dir>}"
@@ -39,7 +54,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$sysroot/bin"
 write_wrapper() {
     local shim="$1" real="$2" arch="$3" triple="$4" cxx="$5"
+    rm -f "$sysroot/bin/$shim"
+    [ -x "$real" ] || return 0
+    local own_include
+    own_include="$("$real" -print-file-name=include)"
     sed -e "s|@SYSROOT@|$sysroot|g" \
+        -e "s|@OWN_INCLUDE@|$own_include|g" \
         -e "s|@ARCH@|$arch|g" \
         -e "s|@TRIPLE@|$triple|g" \
         -e "s|@CXX@|$cxx|g" \
