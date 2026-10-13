@@ -79,10 +79,6 @@ walkdir = "2"
 zstd = "0.14"
 shell-words = "1.1"
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "tls-rustls", "macros"] }
-# The `sqlite3*` sqlx hands out is this crate's type: one
-# `sqlite3_db_config` call on it (`state_db::keep_wal_on_close`). The
-# version is the one sqlx links — see the workspace manifest's pin note.
-libsqlite3-sys = "0.38"
 axoupdater = "0.10"
 which = "8"
 same-file = "1"

@@ -148,20 +148,34 @@ async fn keep_wal_on_close(connection: &mut sqlx::SqliteConnection) -> Result<()
     // the duration of the call, and `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`
     // takes an `int` and a nullable `int*`.
     let code = unsafe {
-        libsqlite3_sys::sqlite3_db_config(
-            handle.as_raw_handle().as_ptr(),
-            libsqlite3_sys::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-            1_i32,
-            std::ptr::null_mut::<i32>(),
+        sqlite3_db_config(
+            handle.as_raw_handle().as_ptr().cast(),
+            SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            1 as std::ffi::c_int,
+            std::ptr::null_mut::<std::ffi::c_int>(),
         )
     };
-    if code == libsqlite3_sys::SQLITE_OK {
+    if code == 0 {
         Ok(())
     } else {
         Err(sqlx::Error::Protocol(format!(
             "sqlite3_db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE) returned {code}"
         )))
     }
+}
+
+/// `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, from `sqlite3.h`.
+const SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE: std::ffi::c_int = 1006;
+
+// The one `SQLite` entry point sqlx does not expose, from the library
+// sqlx links. Declared here rather than taken from `libsqlite3-sys`: only
+// one crate may link `sqlite3`, the workspace builds against a pinned sqlx
+// revision that allows `libsqlite3-sys` 0.38 while the released sqlx this
+// crate is packaged against stops below it, and a direct dependency is
+// locked to the workspace's version — so `cargo package` cannot resolve
+// the two together. It moves to the crate's binding when that pin goes.
+unsafe extern "C" {
+    fn sqlite3_db_config(db: *mut std::ffi::c_void, op: std::ffi::c_int, ...) -> std::ffi::c_int;
 }
 
 /// Add every column `state-db-schema.sql` declares that the database on
