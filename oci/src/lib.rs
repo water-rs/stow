@@ -14,7 +14,10 @@ pub mod retry;
 mod sign;
 pub mod verify;
 
-pub use artifacts::{UploadOutcome, pull_signature_materials, push_artifacts, push_artifacts_with};
+pub use artifacts::{
+    UploadOutcome, pull_pushed_signature_materials, pull_signature_materials, push_artifacts,
+    push_artifacts_with,
+};
 pub use client::{OPERATOR_LOG_FILTER, RegistryError, RegistryHttp, RegistrySession};
 pub use index::{
     IndexPublishOutcome, PulledFolded, PulledIndex, publish_folded, publish_index,
