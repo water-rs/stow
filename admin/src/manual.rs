@@ -33,7 +33,9 @@ use stow_types::registry::GHCR_BASE;
 use stow_types::stow_error;
 use stow_types::task_graph::TaskNodeIdentity;
 use stow_types::transient::Backoff;
-use stow_types::trusted_builder::{BRANCH, INDEX_CERTIFICATE_IDENTITY, WORKFLOW_FILE};
+use stow_types::trusted_builder::{
+    BRANCH, INDEX_CERTIFICATE_IDENTITY, WORKFLOW_FILE, WORKFLOW_NAME,
+};
 use zenwave::{Client, ResponseExt};
 
 use crate::github::{WriteFailure, classify_write};
@@ -1702,7 +1704,8 @@ async fn drive_layer(
 /// Fold one bound-run poll answer: a fresh row carries its validator
 /// onto the node before the fold; `Unmodified` refolds the node's
 /// cached row — a `main` head that moved this poll can still stale it;
-/// `Pending` is an id that has not materialized.
+/// `Pending` is an id that has not materialized or a row whose title
+/// has not rendered.
 async fn fold_bound_outcome(
     dispatch: &Dispatch,
     outcome: BoundPoll,
@@ -2250,9 +2253,11 @@ impl Dispatch {
     /// Poll only the runs the wave is bound to: each open node's tracked
     /// run id gets one conditional `actions/runs/{id}` read — a 304 keeps
     /// the node's cached row — at the read bound of 8. A run id GitHub
-    /// has not materialized yet answers `Pending` and stays under the
-    /// node grace window. The local server keeps its `/tasks` contract:
-    /// it answers the open tasks' states from one list read.
+    /// has not materialized yet, or a row still titled with the
+    /// workflow's `name:` because `run-name` has not rendered, answers
+    /// `Pending` and stays under the node grace window. The local server
+    /// keeps its `/tasks` contract: it answers the open tasks' states
+    /// from one list read.
     async fn poll_bound(
         &self,
         nodes: &BTreeMap<String, NodeRun>,
@@ -2287,7 +2292,14 @@ impl Dispatch {
                                 Ok(BoundPoll::Unmodified(task_id))
                             }
                             Ok(crate::github::Conditional::Modified { body: row, etag }) => {
-                                let state = bound_run_state(row, run_id, &task_id, rustc_version)?;
+                                let Some(state) =
+                                    bound_run_state(row, run_id, &task_id, rustc_version)?
+                                else {
+                                    // `Pending` leaves the node's
+                                    // `run_etag` untouched, so the next
+                                    // poll reads the row again.
+                                    return untitled_run(run_id, observed);
+                                };
                                 Ok(BoundPoll::State {
                                     task_id,
                                     state,
@@ -2346,7 +2358,8 @@ fn dispatch_overdue(node: &NodeRun) -> bool {
 
 /// One bound run's poll answer: a fresh row to fold, `Unmodified` when
 /// the node's cached row still stands (the fold re-judges it against
-/// the current `main` head), `Pending` when the run id has not materialized.
+/// the current `main` head), `Pending` when the run id has not
+/// materialized or its row's title has not rendered yet.
 enum BoundPoll {
     State {
         task_id: String,
@@ -2371,6 +2384,21 @@ fn run_404(run_id: u64, observed: bool) -> stow_types::error::Result<BoundPoll> 
     }
 }
 
+/// A bound run's row before GitHub has rendered its title: a dispatch
+/// id the node has never read a state from is still materializing and
+/// waits out its grace window as `Pending`, like a 404. A node that
+/// already read a titled row cannot meet an untitled one — that is
+/// GitHub answering with something else.
+fn untitled_run(run_id: u64, observed: bool) -> stow_types::error::Result<BoundPoll> {
+    if observed {
+        Err(stow_error!(
+            "workflow run {run_id} was observed and now answers with the workflow's name for a title"
+        ))
+    } else {
+        Ok(BoundPoll::Pending)
+    }
+}
+
 /// `main`'s cached head for one layer — the sha and the validator that
 /// turns the next read into a 304.
 struct HeadCache {
@@ -2381,18 +2409,23 @@ struct HeadCache {
 /// Fold a `GET actions/runs/{id}` row into a run state: the row's own id
 /// must be the bound one and its `display_title` the node's
 /// `<rustc>-<task_id>` — anything else means GitHub answered for a
-/// different run, which is never a state this node may take.
+/// different run, which is never a state this node may take. A row still
+/// titled with the workflow's own `name:` is GitHub not having rendered
+/// `run-name` yet — `Ok(None)`, a title pending rather than a state.
 fn bound_run_state(
     row: WorkflowRunRow,
     run_id: u64,
     task_id: &str,
     rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<RunState> {
+) -> stow_types::error::Result<Option<RunState>> {
     if row.id != run_id {
         return Err(stow_error!(
             "actions/runs/{run_id} answered with run {} — binding refused",
             row.id
         ));
+    }
+    if row.display_title == WORKFLOW_NAME {
+        return Ok(None);
     }
     let Some((rustc, title_task)) = parse_run_title(&row.display_title) else {
         return Err(stow_error!(
@@ -2406,7 +2439,7 @@ fn bound_run_state(
             row.display_title
         ));
     }
-    Ok(RunState {
+    Ok(Some(RunState {
         task_id: task_id.to_owned(),
         workflow_run_id: row.id,
         status: row.status,
@@ -2415,7 +2448,7 @@ fn bound_run_state(
         head_sha: row.head_sha,
         run_attempt: row.run_attempt,
         created_at: Some(row.created_at),
-    })
+    }))
 }
 
 /// The local CI server's `/tasks` rows folded to run states — the same
@@ -3110,15 +3143,14 @@ mod tests {
     #[test]
     fn a_bound_poll_validates_the_run_title() {
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        assert!(
-            bound_run_state(
-                run_row(10, "1.99.0-task", "completed", Some("success")),
-                10,
-                "task",
-                &rustc
-            )
-            .is_ok()
+        let state = bound_run_state(
+            run_row(10, "1.99.0-task", "completed", Some("success")),
+            10,
+            "task",
+            &rustc,
         );
+        assert!(state.is_ok());
+        assert!(matches!(state, Ok(Some(_))));
         assert!(
             bound_run_state(
                 run_row(10, "1.99.0-other", "completed", Some("success")),
@@ -3141,6 +3173,33 @@ mod tests {
             bound_run_state(
                 run_row(10, "no-task-title", "completed", Some("success")),
                 10,
+                "task",
+                &rustc
+            )
+            .is_err()
+        );
+    }
+
+    /// stow#704: until GitHub renders a run's `run-name`, its
+    /// `display_title` is the workflow's `name:` — a title pending,
+    /// `Ok(None)`, not a state and not another workflow's run. The id
+    /// check still comes first.
+    #[test]
+    fn an_untitled_bound_run_is_not_a_state() {
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
+        assert!(matches!(
+            bound_run_state(
+                run_row(10, "build-crate", "queued", None),
+                10,
+                "task",
+                &rustc
+            ),
+            Ok(None)
+        ));
+        assert!(
+            bound_run_state(
+                run_row(10, "build-crate", "queued", None),
+                11,
                 "task",
                 &rustc
             )
@@ -3475,6 +3534,27 @@ mod tests {
     fn a_404_on_an_observed_run_is_missing_not_pending() {
         assert!(run_404(50, true).is_err());
         assert!(matches!(run_404(50, false), Ok(BoundPoll::Pending)));
+    }
+
+    /// An untitled row waits like a 404 — only before the node's first
+    /// state. A node that already read its run titled cannot meet the
+    /// workflow's `name:` again.
+    #[test]
+    fn an_untitled_run_waits_only_before_its_first_state() {
+        assert!(matches!(untitled_run(50, false), Ok(BoundPoll::Pending)));
+        assert!(untitled_run(50, true).is_err());
+    }
+
+    /// The constant and the workflow file cannot drift: the YAML must
+    /// declare the `name:` the constant spells.
+    #[test]
+    fn the_trusted_workflow_declares_the_name_the_constant_spells() {
+        let yaml = include_str!("../../.github/workflows/build-crate.yml");
+        let declared = format!("name: {}", stow_types::trusted_builder::WORKFLOW_NAME);
+        assert!(
+            yaml.lines().any(|line| line == declared),
+            "build-crate.yml must declare `{declared}`"
+        );
     }
 
     /// The local lane's `GET /tasks` poll rides the shared bounded
