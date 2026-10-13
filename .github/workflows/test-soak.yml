@@ -47,7 +47,9 @@ jobs:
     timeout-minutes: 40
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.parallel }}
+      # `max-parallel` takes a number and a dispatch input reaches an
+      # expression as a string: unconverted, the matrix fails to start.
+      max-parallel: ${{ fromJSON(inputs.parallel) }}
       matrix:
         run: ${{ fromJSON(needs.plan.outputs.runs) }}
     steps:
