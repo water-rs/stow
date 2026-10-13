@@ -104,7 +104,7 @@ A `rustc` wrapper installed on the user's machine, similar to sccache. When Carg
 
 The CLI resolves artifact identities against a locally cached, cryptographically verified index — the dependency graph is never sent anywhere for a lookup. The only graph that leaves the machine is the *miss* set posted to `/api/v1/admissions`, and only when the index could not cover it.
 
-Cached artifacts are materialized into Cargo's target directory with `reflink-or-copy` by default: APFS and other clone-capable filesystems share bytes with the local stow cache, while filesystems without clone support fall back to a real copy. For target directories that should hold links back to the stow cache instead, set `STOW_CACHED_ARTIFACT_MATERIALIZATION=symlink`.
+Cached artifacts are materialized into Cargo's target directory as a reflink where the filesystem clones — APFS and other clone-capable filesystems share bytes with the local stow cache — and as a real copy where it does not.
 
 ### Edge (`edge/`)
 

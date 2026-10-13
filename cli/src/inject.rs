@@ -10,71 +10,6 @@ use crate::rustc_args::ParsedRustcArgs;
 
 const MATERIALIZED_MARKERS_DIR: &str = ".stow-materialized";
 const MATERIALIZED_MARKER_VERSION: &str = "stow-materialized-v1";
-const STOW_CACHED_ARTIFACT_MATERIALIZATION_ENV: &str = "STOW_CACHED_ARTIFACT_MATERIALIZATION";
-const REFLINK_OR_COPY_MATERIALIZATION: &str = "reflink-or-copy";
-const SYMLINK_MATERIALIZATION: &str = "symlink";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CachedArtifactMaterialization {
-    ReflinkOrCopy,
-    Symlink,
-}
-
-impl CachedArtifactMaterialization {
-    fn load() -> stow_types::error::Result<Self> {
-        let Some(raw) = std::env::var_os(STOW_CACHED_ARTIFACT_MATERIALIZATION_ENV) else {
-            return Ok(Self::ReflinkOrCopy);
-        };
-        let raw = raw.to_str().ok_or_else(|| {
-            stow_types::stow_error!(
-                "{STOW_CACHED_ARTIFACT_MATERIALIZATION_ENV} must be valid UTF-8"
-            )
-        })?;
-        Self::parse(raw)
-    }
-
-    fn parse(raw: &str) -> stow_types::error::Result<Self> {
-        match raw {
-            REFLINK_OR_COPY_MATERIALIZATION => Ok(Self::ReflinkOrCopy),
-            SYMLINK_MATERIALIZATION => Ok(Self::Symlink),
-            other => Err(stow_types::stow_error!(
-                "unsupported cached artifact materialization `{other}`; expected `{REFLINK_OR_COPY_MATERIALIZATION}` or `{SYMLINK_MATERIALIZATION}`"
-            )),
-        }
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::ReflinkOrCopy => REFLINK_OR_COPY_MATERIALIZATION,
-            Self::Symlink => SYMLINK_MATERIALIZATION,
-        }
-    }
-
-    fn materialize(
-        self,
-        source_path: &std::path::Path,
-        output_path: &std::path::Path,
-    ) -> stow_types::error::Result<()> {
-        match self {
-            Self::ReflinkOrCopy => reflink::reflink_or_copy(source_path, output_path)
-                .map(|_| ())
-                .wrap_err_with(|| {
-                    format!(
-                        "clone or copy cached artifact {} into {}",
-                        source_path.display(),
-                        output_path.display()
-                    )
-                }),
-            Self::Symlink => symlink_file(source_path, output_path).wrap_err_with(|| {
-                format!(
-                    "symlink cached artifact {} into {}",
-                    source_path.display(),
-                    output_path.display()
-                )
-            }),
-        }
-    }
-}
 
 /// Who else can write to the directory the outputs land in.
 ///
@@ -338,24 +273,6 @@ pub async fn write_cached_output(
     expected_sha256: Option<&str>,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
-    let materialization = CachedArtifactMaterialization::load()?;
-    write_cached_output_with_materialization(
-        source_path,
-        output_path,
-        expected_sha256,
-        materialization,
-        writers,
-    )
-    .await
-}
-
-async fn write_cached_output_with_materialization(
-    source_path: &std::path::Path,
-    output_path: &std::path::Path,
-    expected_sha256: Option<&str>,
-    materialization: CachedArtifactMaterialization,
-    writers: OutputDirWriters,
-) -> stow_types::error::Result<()> {
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -374,7 +291,6 @@ async fn write_cached_output_with_materialization(
             &source_for_copy,
             &output_for_copy,
             expected_sha256.as_deref(),
-            materialization,
             writers,
         )
     })
@@ -383,7 +299,6 @@ async fn write_cached_output_with_materialization(
         tracing::debug!(
             source = %source_path.display(),
             output = %output_path.display(),
-            materialization = materialization.name(),
             "materialized cached artifact"
         );
     } else {
@@ -478,7 +393,6 @@ fn materialize_cached_file_blocking(
     source_path: &std::path::Path,
     output_path: &std::path::Path,
     expected_sha256: Option<&str>,
-    materialization: CachedArtifactMaterialization,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<bool> {
     let source_metadata = std::fs::metadata(source_path)
@@ -505,7 +419,15 @@ fn materialize_cached_file_blocking(
         return Ok(false);
     }
     remove_existing_output(output_path)?;
-    materialization.materialize(source_path, output_path)?;
+    reflink::reflink_or_copy(source_path, output_path)
+        .map(|_| ())
+        .wrap_err_with(|| {
+            format!(
+                "clone or copy cached artifact {} into {}",
+                source_path.display(),
+                output_path.display()
+            )
+        })?;
     stamp_materialized_mtime(output_path)?;
     write_materialized_marker(output_path, expected_sha256)?;
     Ok(true)
@@ -518,17 +440,7 @@ fn materialize_cached_file_blocking(
 /// files cargo's other units wrote this build, which cargo's
 /// dependency-mtime check reads as "a dependency was rebuilt" and
 /// rebuilds the unit forever (stow#634).
-///
-/// A symlinked output is left alone: the mtime cargo stats through the
-/// link belongs to the cache entry, which every target directory linking
-/// to it shares, and stamping it here would dirty that unit's dependents
-/// in all of them.
 fn stamp_materialized_mtime(output_path: &std::path::Path) -> stow_types::error::Result<()> {
-    let metadata = std::fs::symlink_metadata(output_path)
-        .wrap_err_with(|| format!("stat materialized output {}", output_path.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Ok(());
-    }
     std::fs::File::options()
         .write(true)
         .open(output_path)
@@ -546,22 +458,6 @@ fn remove_existing_output(output_path: &std::path::Path) -> stow_types::error::R
             output_path.display()
         ))),
     }
-}
-
-#[cfg(unix)]
-fn symlink_file(
-    source_path: &std::path::Path,
-    output_path: &std::path::Path,
-) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(source_path, output_path)
-}
-
-#[cfg(windows)]
-fn symlink_file(
-    source_path: &std::path::Path,
-    output_path: &std::path::Path,
-) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(source_path, output_path)
 }
 
 fn target_matches_cached_file(
@@ -726,9 +622,8 @@ mod tests {
     };
 
     use super::{
-        CachedArtifactMaterialization, OutputDirWriters, materialize_cached_file_blocking,
-        materialized_marker_matches, materialized_marker_path, write_artifacts,
-        write_materialized_marker,
+        OutputDirWriters, materialize_cached_file_blocking, materialized_marker_matches,
+        materialized_marker_path, write_artifacts, write_materialized_marker,
     };
     use crate::artifact_cache::CachedArtifactBundle;
     use crate::rustc_args::ParsedRustcArgs;
@@ -894,7 +789,6 @@ mod tests {
                 &source,
                 &output,
                 Some(&sha256),
-                CachedArtifactMaterialization::ReflinkOrCopy,
                 OutputDirWriters::StowOnly,
             )
             .expect("first materialization")
@@ -906,7 +800,6 @@ mod tests {
                 &source,
                 &output,
                 Some(&sha256),
-                CachedArtifactMaterialization::ReflinkOrCopy,
                 OutputDirWriters::StowOnly,
             )
             .expect("marker hit avoids copy")
@@ -952,7 +845,6 @@ mod tests {
                 &source,
                 &output,
                 Some(&sha256),
-                CachedArtifactMaterialization::ReflinkOrCopy,
                 OutputDirWriters::UntrustedCodeToo,
             )
             .expect("materialization"),
@@ -963,92 +855,6 @@ mod tests {
             b"genuine artifact",
             "the bytes left behind are the verified ones"
         );
-    }
-
-    #[test]
-    fn cached_artifact_materialization_accepts_documented_strategies() {
-        assert_eq!(
-            CachedArtifactMaterialization::parse("reflink-or-copy")
-                .expect("default strategy parses"),
-            CachedArtifactMaterialization::ReflinkOrCopy
-        );
-        assert_eq!(
-            CachedArtifactMaterialization::parse("symlink").expect("symlink strategy parses"),
-            CachedArtifactMaterialization::Symlink
-        );
-        let error = CachedArtifactMaterialization::parse("copy")
-            .expect_err("unsupported materialization must fail fast");
-        assert!(error.to_string().contains("reflink-or-copy"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_materialization_links_cached_artifact_without_copying_bytes() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let source = tempdir.path().join("cache").join("lib.rlib");
-        let output = tempdir.path().join("target").join("lib.rlib");
-        std::fs::create_dir_all(source.parent().unwrap()).expect("source parent");
-        std::fs::create_dir_all(output.parent().unwrap()).expect("output parent");
-        std::fs::write(&source, b"artifact").expect("source");
-        let sha256 = hex::encode(sha2::Sha256::digest(b"artifact"));
-
-        assert!(
-            materialize_cached_file_blocking(
-                &source,
-                &output,
-                Some(&sha256),
-                CachedArtifactMaterialization::Symlink,
-                OutputDirWriters::StowOnly,
-            )
-            .expect("first symlink materialization")
-        );
-        assert!(
-            std::fs::symlink_metadata(&output)
-                .expect("output metadata")
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(std::fs::read_link(&output).expect("read link"), source);
-        assert_eq!(std::fs::read(&output).expect("output"), b"artifact");
-        let marker = materialized_marker_path(&output).expect("marker path");
-        assert!(marker.exists());
-        assert!(
-            !materialize_cached_file_blocking(
-                &source,
-                &output,
-                Some(&sha256),
-                CachedArtifactMaterialization::Symlink,
-                OutputDirWriters::StowOnly,
-            )
-            .expect("marker hit avoids rematerialization")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_materialization_replaces_dangling_output_symlink() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let source = tempdir.path().join("cache").join("lib.rlib");
-        let output = tempdir.path().join("target").join("lib.rlib");
-        let missing_target = tempdir.path().join("missing").join("lib.rlib");
-        std::fs::create_dir_all(source.parent().unwrap()).expect("source parent");
-        std::fs::create_dir_all(output.parent().unwrap()).expect("output parent");
-        std::fs::write(&source, b"artifact").expect("source");
-        std::os::unix::fs::symlink(&missing_target, &output).expect("dangling link");
-        let sha256 = hex::encode(sha2::Sha256::digest(b"artifact"));
-
-        assert!(
-            materialize_cached_file_blocking(
-                &source,
-                &output,
-                Some(&sha256),
-                CachedArtifactMaterialization::Symlink,
-                OutputDirWriters::StowOnly,
-            )
-            .expect("replace dangling symlink")
-        );
-        assert_eq!(std::fs::read_link(&output).expect("read link"), source);
-        assert_eq!(std::fs::read(&output).expect("output"), b"artifact");
     }
 
     #[test]
@@ -1065,7 +871,6 @@ mod tests {
             &source,
             &output,
             Some(&sha256),
-            CachedArtifactMaterialization::ReflinkOrCopy,
             OutputDirWriters::StowOnly,
         )
         .expect("first materialization");
@@ -1090,7 +895,6 @@ mod tests {
                 &source,
                 &output,
                 Some(&sha256),
-                CachedArtifactMaterialization::ReflinkOrCopy,
                 OutputDirWriters::StowOnly,
             )
             .expect("stale marker is rejected")
