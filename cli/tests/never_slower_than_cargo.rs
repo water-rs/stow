@@ -489,14 +489,19 @@ fn a_successful_build_leaves_no_generated_files_behind() {
     assert!(leftovers.is_empty(), "the build left {leftovers:?}");
 }
 
-/// stow#630: a failing build leaves through `std::process::exit`, which
-/// runs no destructors — its directories are removed all the same.
+/// stow#630: a failing build's status ends the process only after the
+/// build's owners have dropped — its directories are removed all the
+/// same (stow#652).
 #[test]
 fn a_failing_build_leaves_no_generated_files_behind() {
     let (output, leftovers) = build_leftovers("fn main() { let _: u32 = \"not a number\"; }\n");
-    assert!(
-        !output.status.success(),
-        "a crate that does not compile built:\n{}",
+    // cargo's own exit code for a build that did not compile, carried
+    // out of the process unchanged (stow#652).
+    assert_eq!(
+        output.status.code(),
+        Some(101),
+        "a crate that does not compile ended with {}:\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
@@ -1085,19 +1090,15 @@ fn write_empty_crate(dir: &Path) {
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
 }
 
-/// One timed pair on `dir`: plain cargo, then stow in a fresh
-/// `STOW_CACHE_DIR` right after `stow setup`, each into a fresh target
-/// directory — `(cargo, stow)`, each side its wall clock and its
-/// pre-cargo window. The pair runs back to back so both sides see the
-/// same machine load.
-fn timed_pair(dir: &Path, cargo_home: &Path, edge_url: &str) -> (TimedBuild, TimedBuild) {
-    let cargo_target = tempfile::tempdir().expect("cargo target");
+/// The plain cargo build of `dir` into `target_dir` — the baseline both
+/// gates compare stow against.
+fn cargo_baseline(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Command {
     let mut command = Command::new("cargo");
     command
         .arg("build")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home)
-        .env("CARGO_TARGET_DIR", cargo_target.path())
+        .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         // An empty RUSTC_WRAPPER is no wrapper to cargo, and it
         // overrides the `build.rustc-wrapper` stow setup wrote into
@@ -1105,52 +1106,99 @@ fn timed_pair(dir: &Path, cargo_home: &Path, edge_url: &str) -> (TimedBuild, Tim
         // (stow#608).
         .env("RUSTC_WRAPPER", "")
         .env_remove("RUST_LOG");
-    let (output, wall, window) = timed_build(&mut command);
-    assert!(
-        output.status.success(),
-        "plain cargo build failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let cargo = TimedBuild { wall, window };
+    command
+}
 
-    let stow_cache = tempfile::tempdir().expect("stow cache");
-    let stow_target = tempfile::tempdir().expect("stow target");
-    stow_setup_in(dir, edge_url, stow_cache.path(), cargo_home);
+/// The stow build of `dir` into `target_dir` — the first build after
+/// `stow setup` in `cache_dir`, which the caller hands over fresh.
+fn stow_candidate(
+    dir: &Path,
+    cargo_home: &Path,
+    edge_url: &str,
+    cache_dir: &Path,
+    target_dir: &Path,
+) -> Command {
+    stow_setup_in(dir, edge_url, cache_dir, cargo_home);
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     command
         .arg("build")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut command, edge_url, stow_cache.path());
+    hermetic_stow_env(&mut command, edge_url, cache_dir);
     command
         .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_TARGET_DIR", stow_target.path())
+        .env("CARGO_TARGET_DIR", target_dir)
         .env_remove("RUST_LOG");
-    let (output, wall, window) = timed_build(&mut command);
+    command
+}
+
+/// stow's in-build `--unit-graph` query must never take the
+/// package-cache lock ahead of the real cargo — when it wins the race,
+/// cargo's own resolve prints this on the user's stderr (stow#608).
+fn assert_cargo_never_waited_on_stow(stderr: &str) {
+    assert!(
+        !stderr.contains("Blocking waiting for file lock on package cache"),
+        "stow's unit-graph query held the package-cache lock ahead of \
+         the real cargo, which printed `Blocking waiting for file \
+         lock`:\n{stderr}"
+    );
+}
+
+/// One pair of pre-cargo windows on `dir`: plain cargo, then stow in a
+/// fresh `STOW_CACHE_DIR` right after `stow setup`, each into a fresh
+/// target directory — `(cargo, stow)`. The pair runs back to back so
+/// both sides see the same machine load.
+fn window_pair(
+    dir: &Path,
+    cargo_home: &Path,
+    edge_url: &str,
+) -> (std::time::Duration, std::time::Duration) {
+    let cargo_target = tempfile::tempdir().expect("cargo target");
+    let cargo = window_sample(cargo_baseline(dir, cargo_home, cargo_target.path()));
+
+    let stow_cache = tempfile::tempdir().expect("stow cache");
+    let stow_target = tempfile::tempdir().expect("stow target");
+    let stow = window_sample(stow_candidate(
+        dir,
+        cargo_home,
+        edge_url,
+        stow_cache.path(),
+        stow_target.path(),
+    ));
+    (cargo, stow)
+}
+
+/// One pair of whole builds on `dir`, set up like [`window_pair`] and
+/// run to completion — `(cargo, stow)` wall clocks.
+fn wall_pair(
+    dir: &Path,
+    cargo_home: &Path,
+    edge_url: &str,
+) -> (std::time::Duration, std::time::Duration) {
+    let cargo_target = tempfile::tempdir().expect("cargo target");
+    let (output, cargo) = timed_build(&mut cargo_baseline(dir, cargo_home, cargo_target.path()));
+    assert!(
+        output.status.success(),
+        "plain cargo build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stow_cache = tempfile::tempdir().expect("stow cache");
+    let stow_target = tempfile::tempdir().expect("stow target");
+    let (output, stow) = timed_build(&mut stow_candidate(
+        dir,
+        cargo_home,
+        edge_url,
+        stow_cache.path(),
+        stow_target.path(),
+    ));
     assert!(
         output.status.success(),
         "stow build failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // stow's in-build `--unit-graph` query must never take the
-    // package-cache lock ahead of the real cargo — when it wins the
-    // race, cargo's own resolve prints this on the user's stderr
-    // (stow#608).
-    assert!(
-        !String::from_utf8_lossy(&output.stderr)
-            .contains("Blocking waiting for file lock on package cache"),
-        "stow's unit-graph query held the package-cache lock ahead of \
-         the real cargo, which printed `Blocking waiting for file \
-         lock`:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    (cargo, TimedBuild { wall, window })
-}
-
-/// One timed build's two clocks.
-struct TimedBuild {
-    wall: std::time::Duration,
-    window: std::time::Duration,
+    assert_cargo_never_waited_on_stow(&String::from_utf8_lossy(&output.stderr));
+    (cargo, stow)
 }
 
 /// A real multi-package project's manifest: fifty crates from
@@ -1195,10 +1243,22 @@ fn write_multi_crate(dir: &Path, cargo_home: &Path) {
     );
 }
 
-/// Timed runs per side: five is the smallest count whose median is
-/// stable against the occasional scheduling stall while keeping the
-/// suite fast.
+/// Whole builds per side for the wall-clock gate: five is the smallest
+/// count whose median is stable against the occasional scheduling stall
+/// while keeping a release run of the suite fast.
 const TIMED_RUNS: usize = 5;
+
+/// Window samples per side. A sample stops its build at the first
+/// `Compiling` line, so it costs a fraction of a second and the count
+/// can be what the comparison needs rather than what whole builds
+/// allow. Five whole builds a side — what this gate took before — left
+/// the floor and the residual so uncertain that on GitHub's two-core
+/// Linux runners one run in ten failed with no serial work to find:
+/// resampling nine-round measurements from twelve such runners puts
+/// five samples at an 11% false failure rate and twenty-five under
+/// 0.1%, while 20 ms of serial work is still caught nine times in ten
+/// and 40 ms always (stow#608).
+const WINDOW_RUNS: usize = 25;
 
 fn median(times: &[std::time::Duration]) -> std::time::Duration {
     let mut sorted = times.to_vec();
@@ -1206,9 +1266,10 @@ fn median(times: &[std::time::Duration]) -> std::time::Duration {
     sorted[sorted.len() / 2]
 }
 
-/// How far a typical run drifts from the median — the second-largest
-/// absolute deviation, so a single freak stall cannot widen the gate a
-/// regression would hide inside.
+/// How far a typical run drifts from the median: the largest absolute
+/// deviation once the freak stalls are set aside — one run in five,
+/// the second-largest of five — so a stall cannot widen the gate a
+/// regression would hide inside, however many runs were taken.
 fn typical_deviation(
     times: &[std::time::Duration],
     median: std::time::Duration,
@@ -1216,7 +1277,8 @@ fn typical_deviation(
     let mut deviations: Vec<std::time::Duration> =
         times.iter().map(|time| time.abs_diff(median)).collect();
     deviations.sort_unstable();
-    deviations[deviations.len().saturating_sub(2)]
+    let stalls = (deviations.len() / 5).max(1);
+    deviations[deviations.len().saturating_sub(stalls + 1)]
 }
 
 /// The tested `stow-cli` is built at the same profile as this test
@@ -1320,46 +1382,62 @@ fn compare_windows(cargo: &Windows<'_>, stow: &Windows<'_>) -> WindowComparison 
     }
 }
 
-/// Run a build to completion and report its wall clock along with the
-/// time its first `Compiling` line arrived — the end of the pre-cargo
-/// window the issue profiles. stderr is drained line by line so the
-/// timestamp is read live, and kept for failure messages.
-fn timed_build(
-    command: &mut Command,
-) -> (
-    std::process::Output,
-    std::time::Duration,
-    std::time::Duration,
-) {
-    let mut child = command
+/// Run a build to completion and report its wall clock, with its
+/// stderr kept for failure messages.
+fn timed_build(command: &mut Command) -> (std::process::Output, std::time::Duration) {
+    let child = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn build");
     let started = std::time::Instant::now();
-    let stderr = child.stderr.take().expect("piped stderr");
-    let mut first_compile = None;
-    let mut collected = String::new();
+    let output = child.wait_with_output().expect("wait on build");
+    (output, started.elapsed())
+}
+
+/// One build's pre-cargo window: the wall clock until its first
+/// `Compiling` line — the end of the window the issue profiles — after
+/// which the build is stopped. Nothing past that line belongs to the
+/// window, and the whole process tree goes with it: cargo's rustc
+/// children would otherwise keep compiling into the next sample.
+fn window_sample(command: Command) -> std::time::Duration {
+    use process_wrap::std::CommandWrap;
+
+    // A stopped build removes nothing it created: its scratch and
+    // socket directories go with a temp root this sample owns. Both
+    // sides get one, so the comparison stays like for like.
+    let temp_root = tempfile::tempdir().expect("temp root");
+    let mut command = CommandWrap::from(command);
+    command
+        .command_mut()
+        // `std::env::temp_dir` reads `TMPDIR` on Unix, `TMP` and `TEMP`
+        // on Windows.
+        .env("TMPDIR", temp_root.path())
+        .env("TMP", temp_root.path())
+        .env("TEMP", temp_root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    command.wrap(process_wrap::std::ProcessGroup::leader());
+    #[cfg(windows)]
+    command.wrap(process_wrap::std::JobObject);
+    let mut child = command.spawn().expect("spawn build");
+    let started = std::time::Instant::now();
+    let stderr = child.stderr().take().expect("piped stderr");
+    let mut window = None;
+    let mut seen = String::new();
     for line in std::io::BufRead::lines(std::io::BufReader::new(stderr)) {
         let Ok(line) = line else { break };
-        if first_compile.is_none() && line.contains("Compiling") {
-            first_compile = Some(started.elapsed());
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("Compiling") {
+            window = Some(started.elapsed());
+            break;
         }
-        collected.push_str(&line);
-        collected.push('\n');
     }
-    let status = child.wait().expect("wait on build");
-    (
-        std::process::Output {
-            status,
-            stdout: Vec::new(),
-            stderr: collected.into_bytes(),
-        },
-        started.elapsed(),
-        // A build that printed nothing compiled nothing; treat the
-        // window as the whole wall clock rather than dropping it.
-        first_compile.unwrap_or_else(|| started.elapsed()),
-    )
+    child.kill().expect("stop the sampled build");
+    assert_cargo_never_waited_on_stow(&seen);
+    window.unwrap_or_else(|| panic!("the build ended before it compiled anything:\n{seen}"))
 }
 
 /// The wall-clock floor the frame census above cannot see: on a cold
@@ -1378,26 +1456,26 @@ fn timed_build(
 /// row `stow setup` records so a user's first build is already warm
 /// (stow#608).
 ///
-/// Two measurements per run, each side `TIMED_RUNS` times, interleaved
-/// so both samples see the same machine load:
+/// Two measurements, each interleaved cargo-then-stow so both sides
+/// see the same machine load:
 ///
 /// - the **pre-cargo window**: wall clock until the first `Compiling`
-///   line. The regression this test exists for was ~3.5s of serial work
-///   before cargo's first rustc — a window measurement isolates it at
-///   ~50ms resolution in any build profile, because work overlapped
-///   with cargo can never delay the first unit. The same pair is
-///   timed on an empty crate in the same loop, which measures the
-///   startup floor — the wrapper's own spawn/init cost, the one serial
-///   cost a wrapper cannot remove — and what stow adds beyond that
-///   floor is compared against the measured spread of all four sample
-///   sets ([`compare_windows`]).
-/// - the **total wall clock**: medians compared against the measured
-///   spread plus `PROFILE_RESIDUAL_ALLOWANCE`, which covers the debug
-///   binary's own per-invocation cost the suite cannot remove. In a
-///   release build the allowance is zero and the gate is the raw noise
-///   band — a systematic 5% bias stands above it.
+///   line, sampled `WINDOW_RUNS` times a side from builds stopped at
+///   that line. The regression this test exists for was ~3.5s of serial
+///   work before cargo's first rustc — a window isolates it in any
+///   build profile, because work overlapped with cargo delays the first
+///   unit by no more than sharing a core costs, which the measured
+///   spread covers. The same pair is sampled on an empty crate in the
+///   same loop, which measures the startup floor — the wrapper's own
+///   spawn/init cost, the one serial cost a wrapper cannot remove — and
+///   what stow adds beyond that floor is compared against the measured
+///   spread of all four sample sets ([`compare_windows`]).
+/// - the **total wall clock**, only where the tested binary is the one
+///   that ships ([`WALL_GATE_ENABLED`]): `TIMED_RUNS` whole builds a
+///   side, medians compared against their measured spread — a
+///   systematic 5% bias stands above it.
 ///
-/// Each timed stow build is the first build after `stow setup` in a
+/// Each measured stow build is the first build after `stow setup` in a
 /// fresh `STOW_CACHE_DIR` (stow#608): the one-time machine-level costs
 /// `stow setup` records — the link resolution's `rustc --print cfg`
 /// evaluation and the driver's mold link probe — are warm on every
@@ -1415,22 +1493,18 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
     let empty_dir = tempfile::tempdir().expect("empty dir");
     write_empty_crate(empty_dir.path());
 
-    let mut cargo_walls = Vec::with_capacity(TIMED_RUNS);
-    let mut cargo_windows = Vec::with_capacity(TIMED_RUNS);
-    let mut stow_walls = Vec::with_capacity(TIMED_RUNS);
-    let mut stow_windows = Vec::with_capacity(TIMED_RUNS);
-    let mut cargo_empty_windows = Vec::with_capacity(TIMED_RUNS);
-    let mut stow_empty_windows = Vec::with_capacity(TIMED_RUNS);
-    for _ in 0..TIMED_RUNS {
-        let (cargo, stow) = timed_pair(empty_dir.path(), cargo_home.path(), &edge_url);
-        cargo_empty_windows.push(cargo.window);
-        stow_empty_windows.push(stow.window);
+    let mut cargo_windows = Vec::with_capacity(WINDOW_RUNS);
+    let mut stow_windows = Vec::with_capacity(WINDOW_RUNS);
+    let mut cargo_empty_windows = Vec::with_capacity(WINDOW_RUNS);
+    let mut stow_empty_windows = Vec::with_capacity(WINDOW_RUNS);
+    for _ in 0..WINDOW_RUNS {
+        let (cargo, stow) = window_pair(empty_dir.path(), cargo_home.path(), &edge_url);
+        cargo_empty_windows.push(cargo);
+        stow_empty_windows.push(stow);
 
-        let (cargo, stow) = timed_pair(dir.path(), cargo_home.path(), &edge_url);
-        cargo_walls.push(cargo.wall);
-        cargo_windows.push(cargo.window);
-        stow_walls.push(stow.wall);
-        stow_windows.push(stow.window);
+        let (cargo, stow) = window_pair(dir.path(), cargo_home.path(), &edge_url);
+        cargo_windows.push(cargo);
+        stow_windows.push(stow);
     }
 
     let window_comparison = compare_windows(
@@ -1456,6 +1530,13 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
     );
 
     if WALL_GATE_ENABLED {
+        let mut cargo_walls = Vec::with_capacity(TIMED_RUNS);
+        let mut stow_walls = Vec::with_capacity(TIMED_RUNS);
+        for _ in 0..TIMED_RUNS {
+            let (cargo, stow) = wall_pair(dir.path(), cargo_home.path(), &edge_url);
+            cargo_walls.push(cargo);
+            stow_walls.push(stow);
+        }
         let wall_comparison =
             compare_wall_clock(&cargo_walls, &stow_walls, std::time::Duration::ZERO);
         assert!(
