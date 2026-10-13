@@ -16,9 +16,9 @@ run-name: ${{ fromJSON(inputs.task).rustc_version }}-${{ fromJSON(inputs.task).t
 #             signing uses. Validates the build output against the task and
 #             an independently resolved dependency closure, then pushes the
 #             bundles and the task's ArtifactRecord set — cosign-signed under
-#             this workflow's identity — to GHCR (the `records-<rustc>-<task_id>`
-#             tag). GHCR is the only record store; the task talks to no edge
-#             route.
+#             this workflow's identity — to GHCR (the
+#             `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag).
+#             GHCR is the only record store; the task talks to no edge route.
 #
 # Completion reaches the scheduler through GitHub itself: `run-name`
 # above stamps `<rustc>-<task_id>`, so the `workflow_run` `completed`
