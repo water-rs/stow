@@ -1255,9 +1255,9 @@ const TIMED_RUNS: usize = 5;
 /// the floor and the residual so uncertain that on GitHub's two-core
 /// Linux runners one run in ten failed with no serial work to find:
 /// resampling nine-round measurements from twelve such runners puts
-/// five samples at an 11% false failure rate and twenty-five at none
-/// in forty-eight thousand draws, while 30 ms of serial work is still
-/// caught nineteen times in twenty and 50 ms always (stow#608).
+/// five samples at an 11% false failure rate and twenty-five under
+/// 0.1%, while 20 ms of serial work is still caught nine times in ten
+/// and 40 ms always (stow#608).
 const WINDOW_RUNS: usize = 25;
 
 fn median(times: &[std::time::Duration]) -> std::time::Duration {
@@ -1267,8 +1267,8 @@ fn median(times: &[std::time::Duration]) -> std::time::Duration {
 }
 
 /// How far a typical run drifts from the median: the largest absolute
-/// deviation once the freak stalls are set aside — one run in seven,
-/// and never fewer than one — so a stall cannot widen the gate a
+/// deviation once the freak stalls are set aside — one run in five,
+/// the second-largest of five — so a stall cannot widen the gate a
 /// regression would hide inside, however many runs were taken.
 fn typical_deviation(
     times: &[std::time::Duration],
@@ -1277,7 +1277,7 @@ fn typical_deviation(
     let mut deviations: Vec<std::time::Duration> =
         times.iter().map(|time| time.abs_diff(median)).collect();
     deviations.sort_unstable();
-    let stalls = (deviations.len() / 7).max(1);
+    let stalls = (deviations.len() / 5).max(1);
     deviations[deviations.len().saturating_sub(stalls + 1)]
 }
 
