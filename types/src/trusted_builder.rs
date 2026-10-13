@@ -37,6 +37,13 @@ macro_rules! branch {
 pub const REPOSITORY: &str = repository!();
 /// Workflow file under `.github/workflows/` that performs trusted builds.
 pub const WORKFLOW_FILE: &str = workflow_file!();
+/// The `name:` the trusted workflow declares.
+///
+/// GitHub shows it as a run's `display_title` until it has rendered the
+/// workflow's `run-name`, so a reader that meets it is looking at a run
+/// whose title is not known yet, not at another workflow's run
+/// (stow#704).
+pub const WORKFLOW_NAME: &str = "build-crate";
 /// Branch the trusted workflow runs from. `workflow_dispatch` takes the bare
 /// branch name; the certificate subject carries the full ref.
 pub const BRANCH: &str = branch!();
