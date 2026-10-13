@@ -49,6 +49,11 @@ utoipa.workspace = true
 executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread"] }
 async-net = "2"
+# The machine check on every object the plan stage packs — objects and
+# archive members only, never image parsing (`read` covers COFF, ELF,
+# Mach-O, PE, XCOFF and Unix archives; `wasm` would pull wasmparser for a
+# format the check passes through unchecked anyway).
+object = { version = "0.39", default-features = false, features = ["read", "std"] }
 
 # The MSVC lookup rustc performs for itself — run out here on the host,
 # because it cannot run inside the sandbox. Maintained by the `cc`
@@ -60,6 +65,9 @@ find-msvc-tools = "0.1.9"
 url = "2"
 stow-resolver.workspace = true
 http = "1"
+# Test fixtures write minimal objects through `object::write`; cargo
+# unifies this with the dependency's `read`/`std` for test builds.
+object = { version = "0.39", default-features = false, features = ["write"] }
 
 [lints]
 workspace = true

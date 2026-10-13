@@ -1016,7 +1016,7 @@ pub async fn build(
     // The grant set below is identical for all phases anyway: the only
     // per-phase path is `CARGO_TARGET_DIR`, and every phase's target dir
     // sits under `run_dir`, which the grant covers.
-    let msvc = MsvcToolchain::resolve();
+    let msvc = MsvcToolchain::resolve(task.target.as_str())?;
     let sandbox = phase_sandbox(&setup, run_dir.path(), &msvc).await?;
     let ipc_endpoint = sandbox
         .ipc_endpoint()
@@ -1857,7 +1857,10 @@ fn toolchain_grant_dirs() -> Vec<PathBuf> {
 }
 
 /// The MSVC toolchain a sandboxed Windows build needs, resolved out here
-/// on the host.
+/// on the host: the host architecture's linker for what a task links —
+/// its build scripts and proc macros are host binaries — and the task
+/// target's own compiler and archiver for what those build scripts
+/// compile.
 ///
 /// rustc looks the linker up for itself, but that lookup runs
 /// `vswhere.exe` from a Program Files tree the sandbox does not grant, so
@@ -1869,50 +1872,135 @@ fn toolchain_grant_dirs() -> Vec<PathBuf> {
 /// carrying a build script or a proc macro — failed that way, which is
 /// two of the nine target triples producing almost nothing.
 ///
-/// Resolving it out here and handing the answer in costs one lookup and
-/// keeps rustc's own behaviour: the linker is found on PATH, with `LIB`
-/// and `INCLUDE` pointing at the CRT and the Windows SDK.
+/// A build script's `cc` call hits the same wall: the `cc` crate's own
+/// MSVC lookup cannot run inside the sandbox, and it falls back to the
+/// first `cl.exe` on PATH — the host's — so an arm64 task compiled its C
+/// sources for x86-64 and archived the objects into the artifact
+/// (stow#708). The target's own `cl.exe` and `lib.exe` therefore go in
+/// through the `cc` crate's per-target `CC_<target>`/`CXX_<target>`/
+/// `AR_<target>` variables, with the compiler's directory appended to
+/// PATH and granted to the sandbox.
+///
+/// Resolving all of it out here and handing the answer in costs one
+/// lookup per tool and keeps rustc's own behaviour for the linker: it is
+/// found on PATH, with `LIB` and `INCLUDE` pointing at the CRT and the
+/// Windows SDK.
 #[derive(Debug, Default)]
 pub struct MsvcToolchain {
-    /// `PATH`, `LIB` and `INCLUDE` as the linker needs to see them,
-    /// already composed with this process's own values.
+    /// `PATH`, `LIB`, `INCLUDE` and the `cc` crate's per-target
+    /// `CC_<target>`/`CXX_<target>`/`AR_<target>` as the toolchain needs
+    /// to see them, already composed with this process's own values.
     pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    /// The linker's own directory, which holds the DLLs it loads.
+    /// The host linker's own directory, which holds the DLLs it loads.
     bin_dir: Option<PathBuf>,
+    /// The target compiler's own directory — the host linker's when the
+    /// task's machine is the host's.
+    compiler_dir: Option<PathBuf>,
 }
 
 impl MsvcToolchain {
-    /// Look the host toolchain up. Empty on every non-Windows host, and on
-    /// a Windows host with no MSVC installation — there the build fails on
-    /// its own terms rather than on a missing grant.
+    /// Look the toolchain up for a task on `target`.
+    ///
+    /// The linker is always the host architecture's — a dependency
+    /// crate's own units are rlibs and never reach a linker, so the only
+    /// linking a cross task does is its build scripts and proc macros —
+    /// while the compiler and archiver are `target`'s own, resolved only
+    /// when `target` spells `-windows-msvc`; a `-windows-msvc` task whose
+    /// target toolchain is not installed fails here, because its C
+    /// sources would otherwise silently come out for the wrong machine.
+    /// Empty on every non-Windows host; on a Windows host a missing host
+    /// linker still only warns, and the build fails on its own terms
+    /// rather than on a missing grant.
     #[cfg(windows)]
-    pub fn resolve() -> Self {
-        // The host architecture, not the task's: a dependency crate's own
-        // units are rlibs and never reach a linker, so the only linking a
-        // cross task does is its build scripts and proc macros, which are
-        // host binaries.
-        let Some(tool) = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe") else {
-            tracing::warn!(
-                arch = std::env::consts::ARCH,
-                "no MSVC installation found for the host; a sandboxed build that links will fail"
-            );
-            return Self::default();
+    pub fn resolve(target: &str) -> stow_types::error::Result<Self> {
+        let tool = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe");
+        let mut toolchain = match tool {
+            Some(tool) => {
+                let bin_dir = tool.path().parent().map(Path::to_path_buf);
+                tracing::debug!(linker = %tool.path().display(), "resolved the MSVC linker for the sandbox");
+                Self {
+                    env: tool.env().into_iter().cloned().collect(),
+                    bin_dir,
+                    compiler_dir: None,
+                }
+            }
+            None => {
+                tracing::warn!(
+                    arch = std::env::consts::ARCH,
+                    "no MSVC installation found for the host; a sandboxed build that links will fail"
+                );
+                Self::default()
+            }
         };
-        let bin_dir = tool.path().parent().map(Path::to_path_buf);
-        tracing::debug!(linker = %tool.path().display(), "resolved the MSVC linker for the sandbox");
-        Self {
-            env: tool.env().into_iter().cloned().collect(),
-            bin_dir,
+        if target.ends_with("-windows-msvc") {
+            let cl = find_msvc_tools::find_tool(target, "cl.exe").ok_or_else(|| {
+                stow_types::stow_error!(
+                    "no MSVC C toolchain for {target} is installed on this builder: \
+                     cl.exe was not found; its C sources would be compiled by the \
+                     host's compiler"
+                )
+            })?;
+            let lib = find_msvc_tools::find_tool(target, "lib.exe").ok_or_else(|| {
+                stow_types::stow_error!(
+                    "no MSVC C toolchain for {target} is installed on this builder: \
+                     lib.exe was not found; its C sources would be compiled by the \
+                     host's compiler"
+                )
+            })?;
+            let (cl_path, lib_path) = (cl.path(), lib.path());
+            toolchain.env.push((
+                cc_target_var("CC", target).into(),
+                cl_path.as_os_str().to_owned(),
+            ));
+            toolchain.env.push((
+                cc_target_var("CXX", target).into(),
+                cl_path.as_os_str().to_owned(),
+            ));
+            toolchain.env.push((
+                cc_target_var("AR", target).into(),
+                lib_path.as_os_str().to_owned(),
+            ));
+
+            let compiler_dir = cl_path.parent().map(Path::to_path_buf);
+            // One PATH entry: the host lookup's composed value, or this
+            // process's own when it came back empty. The compiler's
+            // directory goes last so a `link.exe` or `cl.exe` lookup by
+            // name still resolves to the host's, and is skipped entirely
+            // when it is the host's own bin directory — a native x64
+            // task.
+            let mut dirs: Vec<PathBuf> = match toolchain.env.iter().find(|(key, _)| key == "PATH") {
+                Some((_, value)) => std::env::split_paths(value).collect(),
+                None => std::env::var_os("PATH")
+                    .map(|value| std::env::split_paths(&value).collect())
+                    .unwrap_or_default(),
+            };
+            if let Some(dir) = &compiler_dir
+                && toolchain.bin_dir.as_ref() != Some(dir)
+            {
+                dirs.push(dir.clone());
+            }
+            let path = std::env::join_paths(&dirs).map_err(|error| {
+                stow_types::stow_error!("compose the sandbox PATH for {target}: {error}")
+            })?;
+            match toolchain.env.iter_mut().find(|(key, _)| key == "PATH") {
+                Some((_, value)) => *value = path,
+                None => toolchain.env.push(("PATH".into(), path)),
+            }
+            toolchain.compiler_dir = compiler_dir;
         }
+        Ok(toolchain)
     }
 
+    // The signature is the Windows one's so call sites compile the same
+    // on either platform.
+    #[allow(clippy::unnecessary_wraps)]
     #[cfg(not(windows))]
-    pub fn resolve() -> Self {
-        Self::default()
+    pub fn resolve(_target: &str) -> stow_types::error::Result<Self> {
+        Ok(Self::default())
     }
 
-    /// Directories the sandbox must reach: the linker's own, and every
-    /// library or include directory it searches.
+    /// Directories the sandbox must reach: the linker's own, the target
+    /// compiler's, and every library or include directory it searches.
     fn grants(&self) -> Vec<(PathBuf, Access, &'static str)> {
         let mut grants = Vec::new();
         if let Some(bin_dir) = self.bin_dir.clone() {
@@ -1920,6 +2008,15 @@ impl MsvcToolchain {
                 bin_dir,
                 Access::READ | Access::EXEC,
                 "the MSVC linker and the DLLs it loads from its own directory",
+            ));
+        }
+        if let Some(compiler_dir) = self.compiler_dir.clone()
+            && self.bin_dir.as_ref() != Some(&compiler_dir)
+        {
+            grants.push((
+                compiler_dir,
+                Access::READ | Access::EXEC,
+                "the MSVC compiler and archiver for the task's target",
             ));
         }
         for (key, value) in &self.env {
@@ -1936,6 +2033,13 @@ impl MsvcToolchain {
         }
         grants
     }
+}
+
+/// The `cc` crate's per-target environment variable spelling:
+/// `CC_aarch64_pc_windows_msvc` for `aarch64-pc-windows-msvc`.
+#[cfg(windows)]
+fn cc_target_var(prefix: &str, target: &str) -> String {
+    format!("{prefix}_{}", target.replace('-', "_"))
 }
 
 /// The directory PATH resolves `name` from, if any.
@@ -2300,7 +2404,7 @@ pub fn unpack_crate_archive(
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use flate2::Compression;
     use tempfile::TempDir;
@@ -2377,6 +2481,21 @@ mod tests {
             .find_map(|line| line.strip_prefix("release: "))
             .expect("rustc -vV reports a release");
         WireRustcVersion::parse(release).expect("active release parses")
+    }
+
+    /// The `host:` triple the ambient toolchain compiles for — the same
+    /// `rustc -vV` probe `active_release` reads its release from.
+    fn host_triple() -> String {
+        let output = std::process::Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .expect("run rustc -vV");
+        let verbose = String::from_utf8_lossy(&output.stdout);
+        verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .expect("rustc -vV reports a host triple")
+            .to_owned()
     }
 
     /// A run toolchain whose `rustc -vV` release differs from the task's
@@ -2937,6 +3056,89 @@ checksum = "33"
 
     /// A crate with a build script must compile inside the phase sandbox.
     ///
+    /// One sandboxed `cargo build` over the probe crate rooted at `root` —
+    /// the same shape `run_sandboxed_phase` drives, minus the capture
+    /// drain. `extra_env` lands on the command after `msvc`'s entries.
+    async fn cargo_build_probe(
+        root: &Path,
+        target_dir: &Path,
+        msvc: &super::MsvcToolchain,
+        extra_env: &[(String, String)],
+    ) {
+        let capture_dir = root.join(".stow-rustc-capture");
+        std::fs::create_dir_all(&capture_dir).expect("capture dir");
+        let tools_dir = TempDir::new().expect("tools dir");
+        let workspace = BuildWorkspace {
+            _tempdir: None,
+            manifest_path: root.join("Cargo.toml"),
+            workspace_root: root.to_path_buf(),
+            capture_dir,
+            bundled_lockfile: None,
+        };
+        let exe = std::env::consts::EXE_SUFFIX;
+        let wrappers = stow_shim::WrapperShimPaths {
+            rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
+            cc_launcher: tools_dir.path().join(format!("stow-cc-launcher{exe}")),
+            cc_compiler: tools_dir.path().join(format!("stow-cc{exe}")),
+            cxx_compiler: tools_dir.path().join(format!("stow-cxx{exe}")),
+        };
+        let wrapper = std::env::current_exe().expect("current exe");
+        let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
+        let audit_log =
+            heel::NetworkAuditLog::file(root.join("network-audit.jsonl")).expect("audit log");
+        let setup = super::PhaseSetup {
+            workspace: &workspace,
+            wrappers: &wrappers,
+            runtime_wrapper: &wrapper,
+            capture_wrapper: &wrapper,
+            capture_command: &capture_command,
+            audit_log: &audit_log,
+            rustflags: "",
+            consume_store: None,
+        };
+        let sandbox = super::phase_sandbox(&setup, target_dir, msvc)
+            .await
+            .expect("phase sandbox");
+
+        let mut command = sandbox
+            .command("cargo")
+            .args(["build", "--offline", "--quiet"])
+            // The phase command pins both, and cargo then ignores what
+            // the cargo home configures for them. With no shim to name,
+            // the empty wrapper is cargo's spelling of "none".
+            .env("RUSTFLAGS", setup.rustflags)
+            .env("RUSTC_WRAPPER", "")
+            .env(
+                "CARGO_TARGET_DIR",
+                super::path_arg(target_dir).expect("utf8 target dir"),
+            )
+            .env(
+                "CARGO_HOME",
+                super::path_arg(&cargo_home().expect("cargo home")).expect("utf8 cargo home"),
+            )
+            .env(
+                "RUSTUP_HOME",
+                super::path_arg(&super::rustup_home().expect("rustup home"))
+                    .expect("utf8 rustup home"),
+            )
+            .current_dir(root);
+        for (key, value) in &msvc.env {
+            command = command.env(
+                super::os_str_arg(key).expect("utf8 env key"),
+                super::os_str_arg(value).expect("utf8 env value"),
+            );
+        }
+        for (key, value) in extra_env {
+            command = command.env(key, value);
+        }
+        let output = command.output().await.expect("sandboxed cargo build");
+        assert!(
+            output.status.success(),
+            "cargo build failed inside the sandbox:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// This is the shape that broke on Windows: a build script is a host
     /// binary, so compiling one runs the linker, and the sandboxed rustc
     /// could not find MSVC's. It picked up Git for Windows' msys `link`
@@ -2949,8 +3151,6 @@ checksum = "33"
         smol::block_on(async {
             let workspace_root = TempDir::new().expect("workspace root");
             let root = workspace_root.path();
-            let capture_dir = root.join(".stow-rustc-capture");
-            std::fs::create_dir_all(&capture_dir).expect("capture dir");
             std::fs::create_dir_all(root.join("src")).expect("src dir");
             std::fs::write(
                 root.join("Cargo.toml"),
@@ -2967,73 +3167,85 @@ checksum = "33"
             .expect("write build script");
 
             let target_dir = TempDir::new().expect("target dir");
-            let tools_dir = TempDir::new().expect("tools dir");
-            let workspace = BuildWorkspace {
-                _tempdir: None,
-                manifest_path: root.join("Cargo.toml"),
-                workspace_root: root.to_path_buf(),
-                capture_dir,
-                bundled_lockfile: None,
-            };
-            let exe = std::env::consts::EXE_SUFFIX;
-            let wrappers = stow_shim::WrapperShimPaths {
-                rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
-                cc_launcher: tools_dir.path().join(format!("stow-cc-launcher{exe}")),
-                cc_compiler: tools_dir.path().join(format!("stow-cc{exe}")),
-                cxx_compiler: tools_dir.path().join(format!("stow-cxx{exe}")),
-            };
-            let wrapper = std::env::current_exe().expect("current exe");
-            let (_collector, capture_command) = crate::capture::CaptureCollector::channel();
-            let audit_log =
-                heel::NetworkAuditLog::file(root.join("network-audit.jsonl")).expect("audit log");
-            let setup = super::PhaseSetup {
-                workspace: &workspace,
-                wrappers: &wrappers,
-                runtime_wrapper: &wrapper,
-                capture_wrapper: &wrapper,
-                capture_command: &capture_command,
-                audit_log: &audit_log,
-                rustflags: "",
-                consume_store: None,
-            };
-            let msvc = super::MsvcToolchain::resolve();
-            let sandbox = super::phase_sandbox(&setup, target_dir.path(), &msvc)
-                .await
-                .expect("phase sandbox");
+            let msvc = super::MsvcToolchain::resolve(&host_triple()).expect("MSVC toolchain");
+            cargo_build_probe(root, target_dir.path(), &msvc, &[]).await;
+        });
+    }
 
-            let mut command = sandbox
-                .command("cargo")
-                .args(["build", "--offline", "--quiet"])
-                // The phase command pins both, and cargo then ignores what
-                // the cargo home configures for them. With no shim to name,
-                // the empty wrapper is cargo's spelling of "none".
-                .env("RUSTFLAGS", setup.rustflags)
-                .env("RUSTC_WRAPPER", "")
-                .env(
-                    "CARGO_TARGET_DIR",
-                    super::path_arg(target_dir.path()).expect("utf8 target dir"),
-                )
-                .env(
-                    "CARGO_HOME",
-                    super::path_arg(&cargo_home().expect("cargo home")).expect("utf8 cargo home"),
-                )
-                .env(
-                    "RUSTUP_HOME",
-                    super::path_arg(&super::rustup_home().expect("rustup home"))
-                        .expect("utf8 rustup home"),
-                )
-                .current_dir(root);
-            for (key, value) in &msvc.env {
-                command = command.env(
-                    super::os_str_arg(key).expect("utf8 env key"),
-                    super::os_str_arg(value).expect("utf8 env value"),
-                );
-            }
-            let output = command.output().await.expect("sandboxed cargo build");
+    /// stow#708's half the linker fix does not reach: inside the sandbox
+    /// the `cc` crate's own MSVC lookup comes up empty the same way
+    /// rustc's does, and a build script that compiles C for the task's
+    /// target then falls back to the first `cl.exe` on PATH — the
+    /// host's. `MsvcToolchain` answers by naming the target's own
+    /// compiler in `CC_<target>`; the probe uses exactly that variable,
+    /// the way `cc` resolves it, and the object it leaves behind must be
+    /// an ARM64 COFF (`IMAGE_FILE_MACHINE_ARM64`, `0xAA64`
+    /// little-endian).
+    #[cfg(windows)]
+    #[test]
+    fn the_target_c_compiler_runs_inside_the_phase_sandbox() {
+        smol::block_on(async {
+            let workspace_root = TempDir::new().expect("workspace root");
+            let root = workspace_root.path();
+            std::fs::create_dir_all(root.join("src")).expect("src dir");
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"stow-sandbox-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+            )
+            .expect("write manifest");
+            std::fs::write(root.join("src/lib.rs"), "pub fn probe() {}\n").expect("write lib");
+            std::fs::write(
+                root.join("probe.c"),
+                "#include <stdint.h>\n#include <string.h>\nuint32_t probe(const char *s) { return (uint32_t)strlen(s); }\n",
+            )
+            .expect("write probe.c");
+            // The build script takes the compiler the toolchain env
+            // names — `cc` reads `CC_<target>` the same way — compiles
+            // the probe with it, and parks the object where the test can
+            // check what machine it was built for.
+            std::fs::write(
+                root.join("build.rs"),
+                r#"fn main() {
+    let compiler = std::env::var("CC_aarch64_pc_windows_msvc")
+        .expect("CC_aarch64_pc_windows_msvc is not set");
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is not set");
+    let object = std::path::Path::new(&out_dir).join("probe.obj");
+    let output = std::process::Command::new(&compiler)
+        .args(["/nologo", "/c", "probe.c"])
+        .arg(format!("/Fo{}", object.display()))
+        .output()
+        .unwrap_or_else(|error| panic!("run {compiler}: {error}"));
+    assert!(
+        output.status.success(),
+        "{compiler} failed:\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let probe = std::env::var("STOW_PROBE_OBJECT").expect("STOW_PROBE_OBJECT is not set");
+    std::fs::copy(&object, &probe).expect("copy the probe object");
+}
+"#,
+            )
+            .expect("write build script");
+
+            let target_dir = TempDir::new().expect("target dir");
+            let probe_object = target_dir.path().join("probe.obj");
+            let msvc = super::MsvcToolchain::resolve("aarch64-pc-windows-msvc")
+                .expect("resolve the arm64 MSVC toolchain");
+            cargo_build_probe(
+                root,
+                target_dir.path(),
+                &msvc,
+                &[(
+                    "STOW_PROBE_OBJECT".to_owned(),
+                    super::path_arg(&probe_object).expect("utf8 probe path"),
+                )],
+            )
+            .await;
+            let bytes = std::fs::read(&probe_object).expect("read the probe object");
             assert!(
-                output.status.success(),
-                "cargo build failed inside the sandbox:\n{}",
-                String::from_utf8_lossy(&output.stderr)
+                bytes.len() >= 2 && bytes[..2] == [0x64, 0xAA],
+                "probe.obj must be an ARM64 COFF object; its first bytes are {bytes:02x?}"
             );
         });
     }
@@ -3078,7 +3290,7 @@ checksum = "33"
             // must reach the sandboxed phases, read-only so a build script
             // cannot rewrite another crate's source.
             let cargo_home = cargo_home().expect("cargo home");
-            let msvc = super::MsvcToolchain::resolve();
+            let msvc = super::MsvcToolchain::resolve(&host_triple()).expect("MSVC toolchain");
             let grants = sandbox_grants(
                 &workspace,
                 target_dir.path(),

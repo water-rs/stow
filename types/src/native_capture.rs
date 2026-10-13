@@ -115,11 +115,7 @@ fn collect_out_dir(out_dir: &Path) -> crate::error::Result<(Vec<NativeLib>, Vec<
                 .wrap_err_with(|| format!("read native artifact file {}", path.display()))?;
             let sha256 = hex::encode(Sha256::digest(&bytes));
             let relative_path = relative_path(out_dir, &path)?;
-            if path
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|ext| ext == "a" || ext == "lib")
-            {
+            if is_static_library(&path) {
                 let name = path
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -142,6 +138,15 @@ fn collect_out_dir(out_dir: &Path) -> crate::error::Result<(Vec<NativeLib>, Vec<
     out_dir_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     static_libs.sort_by(|left, right| left.name.cmp(&right.name));
     Ok((static_libs, out_dir_files))
+}
+
+/// Whether `path` is named like a static library — what a consumer's
+/// link takes out of an `OUT_DIR`.
+#[must_use]
+pub fn is_static_library(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext == "a" || ext == "lib")
 }
 
 /// The bundle-portable relative path of `path` under `root`: components
