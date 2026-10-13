@@ -401,11 +401,7 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         } else {
             &mut dependencies
         };
-        let alias = format!(
-            "{}-v{}",
-            node.crate_name.as_str(),
-            node.version.to_string().replace('.', "_")
-        );
+        let alias = pin_alias(node.crate_name.as_str(), &node.version.to_string());
         if section.insert(alias.clone(), pinned).is_some() {
             return Err(stow_types::stow_error!(
                 "dep pin alias {alias} collides with an earlier entry in the wrapper manifest"
@@ -423,6 +419,21 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         build_dependencies,
     })
     .map_err(|error| stow_types::stow_error!("serialize generated wrapper manifest: {error}"))
+}
+
+/// The wrapper manifest's table key for a pin of `crate_name` at
+/// `version`: `<name>-v<version>`, spelled in the characters cargo
+/// accepts in a dependency name. A semver version holds letters, digits
+/// and `-`, which pass through, plus `.` between identifiers and one `+`
+/// before build metadata (`toml_datetime 1.1.2+spec-1.1.0`), which do
+/// not. `.` becomes `_` and `+` becomes `__`: no identifier is empty, so
+/// a doubled underscore can only be the `+`, and two versions of one
+/// crate never share an alias.
+fn pin_alias(crate_name: &str, version: &str) -> String {
+    format!(
+        "{crate_name}-v{}",
+        version.replace('+', "__").replace('.', "_")
+    )
 }
 
 /// The seeded `Cargo.lock` for the generated wrapper package.
@@ -2301,8 +2312,8 @@ mod tests {
 
     use super::{
         BuildWorkspace, CargoInvocation, CargoSubcommand, STOW_PROBE_FORBIDDEN_PATH_ENV,
-        cargo_home, phase_invocations, phase_target_dir, sandbox_grants, unpack_crate_archive,
-        verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
+        cargo_home, phase_invocations, phase_target_dir, pin_alias, sandbox_grants,
+        unpack_crate_archive, verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
     };
 
     #[test]
@@ -2544,6 +2555,49 @@ mod tests {
             manifest["dependencies"].get("syn-v2_0_106").is_none(),
             "a host-side pin never lands in the target-side section"
         );
+    }
+
+    /// A pinned version with build metadata keys under a name cargo
+    /// accepts: the `+` left in the alias failed `cargo fetch` for every
+    /// task above `toml_datetime 1.1.2+spec-1.1.0` (stow#689).
+    #[test]
+    fn wrapper_manifest_pins_a_version_with_build_metadata_under_a_valid_alias() {
+        let mut task = task_with_features(&["derive"]);
+        task.dependency_subgraph = leaf_pins(vec![SubgraphNode {
+            crate_name: CrateName::parse("toml_datetime").expect("crate name"),
+            version: CrateVersion::new(
+                semver::Version::parse("1.1.2+spec-1.1.0").expect("version"),
+            ),
+            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
+                .expect("features"),
+            host_side: false,
+            deps: Vec::new(),
+        }]);
+        let manifest: toml::Table =
+            toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
+                .expect("generated manifest parses");
+
+        let deps = manifest["dependencies"]
+            .as_table()
+            .expect("dependencies table");
+        let pin = &deps["toml_datetime-v1_1_2__spec-1_1_0"];
+        assert_eq!(pin["version"].as_str(), Some("=1.1.2+spec-1.1.0"));
+        assert_eq!(pin["package"].as_str(), Some("toml_datetime"));
+        for name in deps.keys() {
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "cargo rejects the dependency name {name}"
+            );
+        }
+    }
+
+    /// Versions that differ only in where the pre-release ends and the
+    /// build metadata begins keep distinct aliases.
+    #[test]
+    fn pin_aliases_of_distinct_versions_differ() {
+        assert_ne!(pin_alias("a", "1.0.0-x.y"), pin_alias("a", "1.0.0-x+y"),);
+        assert_eq!(pin_alias("syn", "2.0.106"), "syn-v2_0_106");
     }
 
     /// Two semver-incompatible versions of one crate in a closure — and a
