@@ -35,11 +35,7 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         return print_setup_env(state_db).await;
     }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
-    let cargo_home = config::cargo_home().ok_or_else(|| {
-        stow_types::stow_error!(
-            "resolve the cargo home — neither $CARGO_HOME nor a home directory is available"
-        )
-    })?;
+    let cargo_home = config::require_cargo_home()?;
     let host_target = detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
@@ -315,11 +311,7 @@ fn setup_env_output(
 /// left in the ancestor `.cargo/config.toml` files, plus rolling
 /// cache-hit stats.
 pub async fn status_project(state_db: &StateDb) -> stow_types::error::Result<()> {
-    let cargo_home = config::cargo_home().ok_or_else(|| {
-        stow_types::stow_error!(
-            "resolve the cargo home — neither $CARGO_HOME nor a home directory is available"
-        )
-    })?;
+    let cargo_home = config::require_cargo_home()?;
     let config_path = cargo_home.join("config.toml");
 
     if async_fs::metadata(&config_path).await.is_err() {
@@ -407,9 +399,9 @@ pub async fn status_project(state_db: &StateDb) -> stow_types::error::Result<()>
 /// the GitHub repository, and axoupdater downloads that release's own
 /// installer and runs it against the recorded prefix, so a `cargo
 /// install` or source build cannot clobber itself (the receipt check
-/// fails first, with the reason). Afterwards the wrapper shims under the
-/// tools dir are re-materialized so they keep resolving to the fresh
-/// binary.
+/// fails first, with the reason). Afterwards the wrapper shims under
+/// this binary's own shim dir — [`crate::config::shims_dir`] — are
+/// re-materialized so they keep resolving to the fresh binary.
 pub async fn update_self() -> stow_types::error::Result<()> {
     let mut updater = axoupdater::AxoUpdater::new_for("stow-cli");
     if let Ok(token) = std::env::var("STOW_CLI_GITHUB_TOKEN")
@@ -781,6 +773,11 @@ pub struct WrapperCommands {
     pub(crate) cc_compiler: String,
     /// Compiler-shaped, for C++.
     pub(crate) cxx_compiler: String,
+    /// The executable the shims resolve to — the path
+    /// [`crate::config::shims_dir`] keyed on, and the binary whose
+    /// identity the supervisor exports so a wrapper can tell its own
+    /// build from a replacement (stow#645).
+    pub(crate) runtime_executable: PathBuf,
 }
 
 pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
@@ -820,8 +817,13 @@ pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
             capture_exe
         }
     };
+    // The shim dir is one per (cargo home, stow binary), so a second
+    // install never re-points this binary's shims (stow#645). The old
+    // per-user shim files under `stow/tools` are deliberately left alone:
+    // another cargo home's `config.toml` may still name them.
+    let shims_dir = config::shims_dir(&config::require_cargo_home()?, &runtime_executable);
     let shims = wrapper_shim::materialize_wrapper_shims(
-        &config::tools_dir()?,
+        &shims_dir,
         &runtime_executable,
         &capture_executable,
     )?;
@@ -830,6 +832,7 @@ pub fn detect_wrapper_commands() -> stow_types::error::Result<WrapperCommands> {
         cc_launcher: shim_path(&shims.cc_launcher, "cc launcher")?,
         cc_compiler: shim_path(&shims.cc_compiler, "cc compiler")?,
         cxx_compiler: shim_path(&shims.cxx_compiler, "cxx compiler")?,
+        runtime_executable,
     })
 }
 
@@ -1097,9 +1100,11 @@ fn clean_stow_owned_entries(document: &mut DocumentMut, linker_selection: Linker
 }
 
 /// A value stow's wiring owns: a path to one of its shims, or anything
-/// inside a stow tools dir — the shims' home (`<data>/stow/tools`) and the
-/// tools dir older releases used (`/tmp/stow-tools`). The key holding a
-/// value never decides, so a user's own `CC` or `COMPILER_PATH` survives.
+/// inside a directory stow installs into — the shims' home
+/// (`<cargo home>/stow/shims`), the tools dir that hosts the mold install
+/// (`<data>/stow/tools`), and the tools dir older releases used
+/// (`/tmp/stow-tools`). The key holding a value never decides, so a
+/// user's own `CC` or `COMPILER_PATH` survives.
 pub fn is_stow_owned_value(value: &str) -> bool {
     const SHIM_STEMS: &[&str] = &[
         "stow-rustc-wrapper",
@@ -1117,11 +1122,12 @@ pub fn is_stow_owned_value(value: &str) -> bool {
     {
         return true;
     }
-    // tools-dir segment pairs: "…/stow/tools/…" or "…/stow-tools/…".
+    // Segment pairs stow installs under: "…/stow/tools/…", "…/stow/shims/…"
+    // or "…/stow-tools/…".
     let mut previous_was_stow = false;
     for component in path.components() {
         let name = component.as_os_str().to_string_lossy();
-        if name == "stow-tools" || (previous_was_stow && name == "tools") {
+        if name == "stow-tools" || (previous_was_stow && matches!(&*name, "tools" | "shims")) {
             return true;
         }
         previous_was_stow = name == "stow";
@@ -1185,6 +1191,7 @@ mod tests {
             cc_launcher: format!("{TEST_TOOLS_DIR}/stow-cc-launcher"),
             cc_compiler: format!("{TEST_TOOLS_DIR}/stow-cc"),
             cxx_compiler: format!("{TEST_TOOLS_DIR}/stow-cxx"),
+            runtime_executable: PathBuf::from("/usr/local/bin/stow-cli"),
         }
     }
 

@@ -796,6 +796,16 @@ fn spawn_stub_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<StubSuper
     (format!("tcp:{port}"), counts)
 }
 
+/// What the stub exports as `STOW_SUPERVISOR_BINARY`: the identity of
+/// the binary the shim resolves to. A wrapper refuses a supervisor that
+/// does not vouch for its own build (stow#645), and the stub stands in
+/// for the supervisor that build would have started.
+fn supervisor_binary() -> String {
+    stow_cli::BinaryIdentity::of(Path::new(env!("CARGO_BIN_EXE_stow-cli")))
+        .expect("identity of the stow-cli binary")
+        .encode()
+}
+
 /// A port nothing listens on, for the edge URL: every remote lookup is a
 /// fast refused connect, which is the all-miss shape the issue profiles.
 fn unreachable_edge_url() -> String {
@@ -819,6 +829,7 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
     let (endpoint, counts) = spawn_stub_supervisor();
+    let supervisor_binary = supervisor_binary();
     let map_path = dir.path().join("serve-map.json");
     std::fs::write(&map_path, "{\"target\":[],\"host\":[]}").expect("write serve map");
     let map_path = map_path.to_str().expect("utf8 path");
@@ -832,6 +843,7 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
         &[
             ("STOW_SUPERVISOR_ENDPOINT", endpoint.as_str()),
             ("STOW_SUPERVISOR_TOKEN", "test-token"),
+            ("STOW_SUPERVISOR_BINARY", supervisor_binary.as_str()),
             ("STOW_SERVE_MAP_FILE", map_path),
         ],
         cargo_home.path(),
@@ -891,6 +903,7 @@ fn a_covered_unit_still_takes_the_plan_path() {
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
     let (endpoint, counts) = spawn_stub_supervisor();
+    let supervisor_binary = supervisor_binary();
     // `cfg-if` compiles unspelled — no `--target` on a native build — so
     // the host side carries it, at any version. Map entries are
     // canonical crate names (underscores).
@@ -908,6 +921,7 @@ fn a_covered_unit_still_takes_the_plan_path() {
         &[
             ("STOW_SUPERVISOR_ENDPOINT", endpoint.as_str()),
             ("STOW_SUPERVISOR_TOKEN", "test-token"),
+            ("STOW_SUPERVISOR_BINARY", supervisor_binary.as_str()),
             ("STOW_SERVE_MAP_FILE", map_path),
         ],
         cargo_home.path(),
