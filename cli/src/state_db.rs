@@ -119,6 +119,7 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
 
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
+        .after_connect(|connection, _| Box::pin(keep_wal_on_close(connection)))
         .connect_with(options)
         .await
         .wrap_err_with(|| format!("open state db {}", path.display()))?;
@@ -128,6 +129,39 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
         .wrap_err_with(|| format!("initialize state db schema {}", path.display()))?;
     ensure_declared_columns(&pool, &path).await?;
     Ok(pool)
+}
+
+/// Tell `SQLite` not to checkpoint the WAL when this connection is the
+/// last one to close.
+///
+/// A process closes its connection before it exits (see [`StateDb`]),
+/// and the last connection's close otherwise checkpoints the WAL and
+/// syncs the database file — about 20 ms on macOS and Windows for a
+/// process that is the database's only connection, which a standalone
+/// wrapper is once per compiled unit. The close this leaves still
+/// unmaps `-shm` before it releases the file's locks, which is all the
+/// next opener needs (stow#682); the WAL is checkpointed where it
+/// always was, by the automatic checkpoint inside a commit.
+async fn keep_wal_on_close(connection: &mut sqlx::SqliteConnection) -> Result<(), sqlx::Error> {
+    let mut handle = connection.lock_handle().await?;
+    // SAFETY: `handle` is this live connection's `sqlite3*`, locked for
+    // the duration of the call, and `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`
+    // takes an `int` and a nullable `int*`.
+    let code = unsafe {
+        libsqlite3_sys::sqlite3_db_config(
+            handle.as_raw_handle().as_ptr(),
+            libsqlite3_sys::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            1_i32,
+            std::ptr::null_mut::<i32>(),
+        )
+    };
+    if code == libsqlite3_sys::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(sqlx::Error::Protocol(format!(
+            "sqlite3_db_config(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE) returned {code}"
+        )))
+    }
 }
 
 /// Add every column `state-db-schema.sql` declares that the database on
@@ -367,6 +401,28 @@ mod handle_tests {
 
         state_db.close().await;
         assert!(pool.is_closed(), "the close must reach the pool's clones");
+    }
+
+    /// The close leaves the WAL where it is: the last connection's
+    /// default close would checkpoint it, sync the database and delete
+    /// it, which is the cost `keep_wal_on_close` exists to avoid.
+    #[tokio::test]
+    async fn closing_does_not_checkpoint_the_wal() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let state_db = StateDb::default();
+        // Opening ran the schema, so the WAL already holds frames.
+        state_db
+            .pool(cache_dir.path())
+            .await
+            .expect("open the state database");
+
+        state_db.close().await;
+        let mut wal = state_db_path(cache_dir.path()).into_os_string();
+        wal.push("-wal");
+        let wal_len = std::fs::metadata(&wal)
+            .expect("the close must leave the WAL file in place")
+            .len();
+        assert!(wal_len > 0, "the close checkpointed the WAL");
     }
 
     /// The regression the early connect makes possible (stow#682): an

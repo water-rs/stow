@@ -7920,6 +7920,7 @@ dependencies = [
  "glob",
  "hex",
  "libc",
+ "libsqlite3-sys",
  "oci-client 0.16.1",
  "oci-spec 0.10.0",
  "olpc-cjson",
