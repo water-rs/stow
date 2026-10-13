@@ -88,6 +88,7 @@ impl BinaryIdentity {
     }
 
     /// The `STOW_SUPERVISOR_BINARY` spelling: `<len>:<modified-nanos>`.
+    #[must_use]
     pub fn encode(&self) -> String {
         format!("{}:{}", self.len, self.modified_nanos)
     }
