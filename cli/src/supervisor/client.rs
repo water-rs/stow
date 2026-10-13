@@ -4,10 +4,10 @@ use std::ffi::OsString;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use super::Endpoint;
 use super::protocol::{
     Answer, ArtifactNotifications, Compiled, Plan, Request, read_frame, write_frame,
 };
+use super::{Endpoint, Stream};
 
 /// What the supervisor decided for this invocation.
 #[derive(Debug)]
@@ -33,12 +33,6 @@ pub struct Connection {
     token: String,
 }
 
-enum Stream {
-    #[cfg(unix)]
-    Unix(tokio::net::UnixStream),
-    Loopback(tokio::net::TcpStream),
-}
-
 impl Connection {
     /// Connect to `endpoint`.
     ///
@@ -49,17 +43,7 @@ impl Connection {
     /// and a build that quietly stops using the cache is the failure that
     /// hides.
     pub async fn open(endpoint: &Endpoint, token: String) -> Result<Self, String> {
-        let stream = match endpoint {
-            #[cfg(unix)]
-            Endpoint::Unix(path) => tokio::net::UnixStream::connect(path)
-                .await
-                .map(Stream::Unix)
-                .map_err(|error| format!("connect to supervisor at {}: {error}", path.display()))?,
-            Endpoint::Loopback(port) => tokio::net::TcpStream::connect(("127.0.0.1", *port))
-                .await
-                .map(Stream::Loopback)
-                .map_err(|error| format!("connect to supervisor on port {port}: {error}"))?,
-        };
+        let stream = super::connect(endpoint).await?;
         Ok(Self { stream, token })
     }
 
@@ -107,10 +91,13 @@ impl Connection {
     }
 
     /// End the conversation: send the stream's end and release the
-    /// connection. `std::process::exit` runs no destructor, and a process
-    /// that exits with the loopback connection still open resets it — the
-    /// supervisor then reads an error where the conversation simply
-    /// ended (stow#633).
+    /// connection. A process that exits with the loopback connection
+    /// still open resets it — the supervisor then reads an error where
+    /// the conversation simply ended (stow#633). No facade leaves through
+    /// `std::process::exit` with a connection in hand (stow#682), so a
+    /// drop releases it too; the close stays explicit because it ends the
+    /// stream in order and reports a shutdown that fails, where a drop
+    /// reports nothing.
     ///
     /// # Errors
     ///

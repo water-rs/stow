@@ -1231,8 +1231,10 @@ pub async fn remove_cached_bundle(
 /// The lock file is created under a temporary name, locked, then renamed
 /// to `<name>.lock`, so a `<name>.lock` a sweeper sees is always either
 /// held by its live owner or left by a dead one — never mid-acquisition.
-/// Dropping removes the directory and the lock file; a process that
-/// leaves through `std::process::exit` runs no destructor, which is what
+/// Dropping removes the directory and the lock file. Every command
+/// returns to the entry point rather than exiting on the spot
+/// (stow#682), so the drop is the ordinary end; a process killed before
+/// it gets there runs no destructor, which is what
 /// [`sweep_staging_locks`] covers.
 #[derive(Debug)]
 pub struct StagingDir {
@@ -1913,7 +1915,7 @@ fn acquire_version_shared_lock(
 /// lock. The platform error differs (`EWOULDBLOCK` on Unix,
 /// `ERROR_LOCK_VIOLATION` on Windows, which maps to no `ErrorKind`), so the
 /// comparison goes through fs2's own contended-error value.
-fn is_lock_contended(error: &std::io::Error) -> bool {
+pub fn is_lock_contended(error: &std::io::Error) -> bool {
     error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
@@ -2756,7 +2758,7 @@ pub fn artifact_cache_key(target: &str, c_metadata: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -4051,7 +4053,7 @@ mod tests {
             artifact_cache_max_bytes: u64::MAX,
             index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,
-            state_db_pool: StowConfig::default_state_db_pool(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
@@ -4066,7 +4068,7 @@ mod tests {
         }
     }
 
-    fn sample_bundle(c_metadata: &str, file_name: &str) -> ArtifactBundle {
+    pub fn sample_bundle(c_metadata: &str, file_name: &str) -> ArtifactBundle {
         let file_contents = b"demo-artifact".to_vec();
         let compression_level = *zstd::compression_level_range().end();
         let stored_contents = zstd::bulk::compress(&file_contents, compression_level)

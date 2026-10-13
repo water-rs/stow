@@ -239,6 +239,13 @@ pub fn emit_units(
         let mut run_deps = Vec::new();
         let has_custom_build = pkg.has_custom_build();
         for edge in edges {
+            // The edge list is keyed by feature key, but the platform
+            // gate is the unit's side's — under `resolver = "1"` a host
+            // unit shares `NormalOrDev` with its target sibling, so the
+            // key alone cannot decide which cfg holds (stow#697).
+            if !edge.compiled_from(side) {
+                continue;
+            }
             if edge.dep_kind == DepKind::Development {
                 continue;
             }

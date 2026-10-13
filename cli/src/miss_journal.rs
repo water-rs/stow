@@ -20,6 +20,7 @@ use std::process::Stdio;
 use crate::artifact_cache::{LocalBuildArtifact, ObservedUnit};
 use crate::config::StowConfig;
 use crate::rustc_args::ParsedRustcArgs;
+use crate::state_db::StateDb;
 
 const JOURNAL_PREFIX: &str = "stow-misses.";
 const JOURNAL_SUFFIX: &str = ".jsonl";
@@ -174,7 +175,7 @@ fn supervised_build() -> String {
 /// Anything unanswerable reads as alive too: draining a live writer's
 /// journal is worse than waiting one more build.
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return true;
     };
@@ -186,7 +187,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -207,8 +208,24 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_alive(_pid: u32) -> bool {
+pub fn process_alive(_pid: u32) -> bool {
     true
+}
+
+/// The pid a just-exited child leaves behind: guaranteed dead.
+#[cfg(test)]
+pub fn dead_pid() -> u32 {
+    #[cfg(unix)]
+    let mut command = std::process::Command::new("true");
+    #[cfg(windows)]
+    let mut command = {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "exit", "0"]);
+        cmd
+    };
+    let mut child = command.spawn().expect("spawn");
+    child.wait().expect("wait");
+    child.id()
 }
 
 /// Whether the journal's writing build has finished: a driver's `stow-*`
@@ -310,16 +327,15 @@ pub fn spawn_drain(target_dir: &Path) {
     {
         use std::os::unix::process::CommandExt as _;
         // A session of its own: a `SIGINT`/`SIGTERM` aimed at the
-        // build's process group never kills the drain mid-claim. And a
-        // nicer scheduling slot: the drain re-runs `cargo build
-        // --unit-graph` as background work — at interactive priority it
-        // competes with the user's next build for CPU, so it runs below
-        // it (`setpriority` best-effort; a failure leaves the drain no
-        // worse than before).
+        // build's process group never kills the drain mid-claim. The
+        // drain starts at the caller's own priority: its re-derivation
+        // cargo holds the package-cache lock the user's next command
+        // needs, so a niced cargo would hold it *longer* — the drain
+        // lowers itself before the part that only burns CPU instead
+        // (stow#667).
         unsafe {
             command.pre_exec(|| {
                 libc::setsid();
-                libc::setpriority(libc::PRIO_PROCESS, 0, 15);
                 Ok(())
             });
         }
@@ -327,10 +343,12 @@ pub fn spawn_drain(target_dir: &Path) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
-        // DETACHED_PROCESS | CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS:
-        // no console flashes open, and the drain's re-derivation builds
-        // yield to the user's foreground builds (0x0000_4000).
-        command.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0000_4000);
+        // DETACHED_PROCESS | CREATE_NO_WINDOW: no console flashes open.
+        // The drain starts at the caller's priority for the same
+        // reason — its cargo holds the lock the user's next command
+        // needs; it lowers itself once only CPU-bound posting remains
+        // (stow#667).
+        command.creation_flags(0x0000_0008 | 0x0000_0200);
     }
     if let Err(error) = command.spawn() {
         tracing::warn!(error = %error, "could not spawn the miss drain");
@@ -474,8 +492,13 @@ pub fn drain_finished_builds(out_dir: &Path) {
 /// post its entries as that build's misses, and delete it. Entries whose
 /// post fails go back under the journal's name so a later drain retries
 /// only them.
-pub async fn drain(target_dir: &Path) -> stow_types::error::Result<()> {
-    let config = StowConfig::load_local()?;
+///
+/// The drain runs in two phases: *prepare* — claim, parse, group, and
+/// resolve each group's graph, deriving through the gate a stow command
+/// can stop — then, with the gate shut and the priority lowered, *post*
+/// (stow#667).
+pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::Result<()> {
+    let config = StowConfig::load_local(state_db.clone())?;
     let journals = finished_journals(target_dir);
     // The drain runs detached with stderr in `stow-drain.log`: one line
     // naming how many journals it found is what separates "the drain
@@ -485,11 +508,64 @@ pub async fn drain(target_dir: &Path) -> stow_types::error::Result<()> {
         journals = journals.len(),
         "miss drain starting"
     );
-    for journal in journals {
-        drain_journal(&config, &journal).await;
+    // The gate directory is the cargo home's: the package-cache lock a
+    // derivation cargo holds is per cargo home, so the gate is too
+    // (stow#667).
+    let mut gate = crate::config::cargo_home().map_or_else(
+        || {
+            tracing::warn!(
+                "could not resolve the cargo home; this drain will not re-derive unit graphs"
+            );
+            crate::derive_gate::DerivationGate::Shut
+        },
+        |cargo_home| crate::derive_gate::DerivationGate::unopened(cargo_home.join("stow")),
+    );
+    let mut prepared = Vec::new();
+    for journal in &journals {
+        if let Some(journal) = prepare_journal(&config, journal, &mut gate).await {
+            prepared.push(journal);
+        }
+    }
+    // Every derivation this drain will ever run has run — or a stow
+    // command shut the gate mid-prepare — so the listener and pointer
+    // go away here (stow#667).
+    gate.shut().await;
+    // Everything left only burns CPU — posting solves each admission's
+    // proof of work — so the drain lowers itself now. Doing it at spawn
+    // would have put the derivation phase's cargo at this priority
+    // while it held the package-cache lock the user's next command
+    // needs (stow#667).
+    lower_own_priority();
+    for journal in prepared {
+        post_journal(&config, journal).await;
     }
     Ok(())
 }
+
+/// Drop the drain's scheduling priority for its CPU-only posting
+/// phase. Best-effort, as the spawn-time call was: a failure leaves
+/// the drain no worse than before.
+#[cfg(unix)]
+fn lower_own_priority() {
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 15);
+    }
+}
+
+/// [`lower_own_priority`]'s Windows spelling.
+#[cfg(windows)]
+fn lower_own_priority() {
+    use windows_sys::Win32::System::Threading::{
+        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+    };
+    unsafe {
+        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
+}
+
+/// Nowhere to lower to on other platforms.
+#[cfg(not(any(unix, windows)))]
+fn lower_own_priority() {}
 
 /// Put `entries` back for a later drain: append them under the journal's
 /// own name — never a rename over a recreated same-named file, which
@@ -506,7 +582,53 @@ fn restore(work: &Path, journal: &Path, entries: &[JournalEntry]) {
     let _ = std::fs::remove_file(work);
 }
 
-async fn drain_journal(config: &StowConfig, journal: &Path) {
+/// One journal carried from its prepare half to its post half: the
+/// claim path and the real journal path, the build-level facts every
+/// group posts under, and the groups themselves — each with the graph
+/// it mints from, or `None` for one that stays journaled (stow#667).
+struct PreparedJournal {
+    journal: PathBuf,
+    work: PathBuf,
+    consumer_target: String,
+    build_host: String,
+    consumer_spelled_target: bool,
+    groups: Vec<PreparedGroup>,
+}
+
+/// One `(rustc_version, expanded_cache_key)` group with its graph
+/// resolution already done — `graph` is `None` when the units stay
+/// journaled for a later drain. A dropped group (`MemoMiss::Drop`) is
+/// simply absent from the list (stow#674).
+struct PreparedGroup {
+    key: DrainGroupKey,
+    entries: Vec<JournalEntry>,
+    graph: Option<crate::ExpandedDependencyGraph>,
+}
+
+/// Prepare then post one journal — the shape the tests that drive a
+/// single journal use; the priority stays the caller's, only `drain`
+/// lowers it (stow#667).
+#[cfg(test)]
+async fn drain_journal(
+    config: &StowConfig,
+    journal: &Path,
+    gate: &mut crate::derive_gate::DerivationGate,
+) {
+    if let Some(prepared) = prepare_journal(config, journal, gate).await {
+        post_journal(config, prepared).await;
+    }
+}
+
+/// The prepare half of draining a journal: claim it, parse it, group
+/// it, and resolve each group's graph — the memoized load first, else
+/// a derivation through `gate`, which is where a stow command can stop
+/// this drain's cargo (stow#667). `None` is a journal this drain did
+/// not claim or could not read.
+async fn prepare_journal(
+    config: &StowConfig,
+    journal: &Path,
+    gate: &mut crate::derive_gate::DerivationGate,
+) -> Option<PreparedJournal> {
     let file_name = journal
         .file_name()
         .and_then(OsStr::to_str)
@@ -523,10 +645,10 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
             journal.with_file_name(format!("{file_name}{DRAIN_CLAIM}{}", std::process::id()));
         match std::fs::rename(journal, &work) {
             Ok(()) => (file_name, work),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
             Err(error) => {
                 tracing::warn!(error = %error, journal = %journal.display(), "could not claim the miss journal; leaving it for a later drain");
-                return;
+                return None;
             }
         }
     };
@@ -536,7 +658,7 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
         Err(error) => {
             tracing::warn!(error = %error, journal = %journal.display(), "could not read miss journal");
             restore(&work, &journal, &[]);
-            return;
+            return None;
         }
     };
     let mut entries = Vec::new();
@@ -558,7 +680,7 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
     }
     if entries.is_empty() {
         let _ = std::fs::remove_file(&work);
-        return;
+        return None;
     }
     // One journal is one build: every explicit `--target` in it names the
     // same consumer, and a native build's consumer is the host it built
@@ -588,10 +710,54 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
             .or_default()
             .push(entry);
     }
-    let mut unposted = Vec::new();
+    let mut prepared_groups = Vec::new();
     for (key, group) in groups {
+        if let Some(prepared) = prepare_group(
+            config,
+            &journal,
+            DrainContext {
+                consumer_target: &consumer_target,
+                build_host: &build_host,
+                spelled: consumer_spelled_target,
+            },
+            &key,
+            context.as_ref(),
+            group,
+            gate,
+        )
+        .await
+        {
+            prepared_groups.push(prepared);
+        }
+    }
+    Some(PreparedJournal {
+        journal,
+        work,
+        consumer_target,
+        build_host,
+        consumer_spelled_target,
+        groups: prepared_groups,
+    })
+}
+
+/// The post half: admit each prepared group that has a graph, restore
+/// the rest under the journal's own name, and remove the sidecar of a
+/// fully drained journal. This is the phase that solves the
+/// admissions' proof of work, which is why `drain` runs it after
+/// lowering its own priority (stow#667).
+async fn post_journal(config: &StowConfig, prepared: PreparedJournal) {
+    let PreparedJournal {
+        journal,
+        work,
+        consumer_target,
+        build_host,
+        consumer_spelled_target,
+        groups,
+    } = prepared;
+    let mut unposted = Vec::new();
+    for group in groups {
         unposted.extend(
-            drain_group(
+            post_group(
                 config,
                 &journal,
                 DrainContext {
@@ -599,8 +765,6 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
                     build_host: &build_host,
                     spelled: consumer_spelled_target,
                 },
-                &key,
-                context.as_ref(),
                 group,
             )
             .await,
@@ -615,7 +779,7 @@ async fn drain_journal(config: &StowConfig, journal: &Path) {
 /// What names one journal group: the rustc its build ran, plus the
 /// supervised lane's persisted expanded graph (by cache key). Empty key
 /// groups drain through the journal's context sidecar instead (stow#588).
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DrainGroupKey {
     rustc_version: String,
     expanded_cache_key: String,
@@ -793,9 +957,11 @@ async fn rederive_memoized_graph(
     context: &JournalContext,
     key: &DrainGroupKey,
     units: usize,
-    consumer_target: &str,
-    consumer_spelled_target: bool,
+    ctx: &DrainContext<'_>,
+    gate: &mut crate::derive_gate::DerivationGate,
 ) -> MemoMiss {
+    let consumer_target = ctx.consumer_target;
+    let consumer_spelled_target = ctx.spelled;
     let DrainGroupKey {
         rustc_version,
         expanded_cache_key,
@@ -828,24 +994,42 @@ async fn rederive_memoized_graph(
             tracing::warn!(error = %error, journal = %journal.display(), "miss journal's rustc version does not parse; keeping its units");
             return MemoMiss::Keep;
         }
-        Ok(rustc) => match crate::workspace_deps::resolve_exact_dependency_graph(
-            &context.manifest_dir.join("Cargo.toml"),
-            "build",
-            &[],
-            consumer_spelled_target.then_some(consumer_target),
-            &context.manifest_dir,
-            stow_types::api::runner_family(consumer_target)
-                .map_or(consumer_target, |family| family.host_triple()),
-            &rustc,
-        )
-        .await
-        {
-            Ok(graph) => graph,
-            Err(error) => {
-                tracing::warn!(error = %error, journal = %journal.display(), manifest = %context.manifest_dir.display(), "could not re-derive the miss journal's unit graph; keeping its units");
+        Ok(rustc) => {
+            // A stow command's hold on the gate means its cargo is
+            // next for the package-cache lock: this drain derives
+            // nothing while one is present (stow#667).
+            let Some(slot) = gate.slot().await else {
+                tracing::info!(journal = %journal.display(), "a stow command is running; keeping the miss journal's units for a later drain");
                 return MemoMiss::Keep;
+            };
+            match crate::workspace_deps::resolve_exact_dependency_graph_stoppable(
+                &context.manifest_dir.join("Cargo.toml"),
+                "build",
+                &[],
+                consumer_spelled_target.then_some(consumer_target),
+                &context.manifest_dir,
+                stow_types::api::runner_family(consumer_target)
+                    .map_or(consumer_target, |family| family.host_triple()),
+                &rustc,
+                slot,
+            )
+            .await
+            {
+                Ok(Some(graph)) => graph,
+                // A command asked for the stop mid-resolve: its cargo
+                // is dead and reaped, so shut the gate — releasing the
+                // requester — and keep the units (stow#667).
+                Ok(None) => {
+                    gate.shut().await;
+                    tracing::info!(journal = %journal.display(), "a stow command started; stopped the miss drain's cargo and kept the units");
+                    return MemoMiss::Keep;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, journal = %journal.display(), manifest = %context.manifest_dir.display(), "could not re-derive the miss journal's unit graph; keeping its units");
+                    return MemoMiss::Keep;
+                }
             }
-        },
+        }
     };
     // A supervised re-derivation fills the memo under the build's own
     // key — the same function of the same inputs — so the next drain of
@@ -859,40 +1043,32 @@ async fn rederive_memoized_graph(
     MemoMiss::Derived(expanded)
 }
 
-/// Drains one `(rustc_version, expanded_cache_key)` group, returning the
-/// entries that stay journaled. The misses' subgraphs mint off the
+/// The prepare half of draining one `(rustc_version,
+/// expanded_cache_key)` group: the misses' subgraphs mint off the
 /// build's own expanded graph — the memoized keyed value, or the same
-/// function re-derived over unchanged inputs — and a journal line whose
-/// build recorded none (a wrapper-written line, or a key whose memo
-/// both missed and could not re-derive) cannot mint a real context, so
-/// its units stay journaled (stow#588). A group the drain can prove
-/// will never mint — the project no longer hashes to the key its build
-/// recorded — is dropped instead of kept (stow#674).
-async fn drain_group(
+/// function re-derived over unchanged inputs — and a journal line
+/// whose build recorded none (a wrapper-written line, or a key whose
+/// memo both missed and could not re-derive) cannot mint a real
+/// context, so its units stay journaled (stow#588). A group the drain
+/// can prove will never mint — the project no longer hashes to the
+/// key its build recorded — is dropped: `None` (stow#674).
+async fn prepare_group(
     config: &StowConfig,
     journal: &Path,
     ctx: DrainContext<'_>,
     key: &DrainGroupKey,
     context: Option<&JournalContext>,
     group: Vec<JournalEntry>,
-) -> Vec<JournalEntry> {
-    let DrainContext {
-        consumer_target,
-        build_host,
-        spelled: consumer_spelled_target,
-    } = ctx;
-    let DrainGroupKey {
-        rustc_version,
-        expanded_cache_key,
-    } = key;
-    let mut expanded = if expanded_cache_key.is_empty() {
+    gate: &mut crate::derive_gate::DerivationGate,
+) -> Option<PreparedGroup> {
+    let mut expanded = if key.expanded_cache_key.is_empty() {
         None
     } else {
-        match crate::lockfile_graph_cache::load(config, expanded_cache_key).await {
+        match crate::lockfile_graph_cache::load(config, &key.expanded_cache_key).await {
             Ok(None) => {
                 tracing::warn!(
                     journal = %journal.display(),
-                    cache_key = %expanded_cache_key,
+                    cache_key = %key.expanded_cache_key,
                     "miss journal's expanded graph is not in the lockfile graph cache"
                 );
                 None
@@ -907,26 +1083,47 @@ async fn drain_group(
     if expanded.is_none()
         && let Some(context) = context
     {
-        match rederive_memoized_graph(
-            config,
-            journal,
-            context,
-            key,
-            group.len(),
-            consumer_target,
-            consumer_spelled_target,
-        )
-        .await
+        match rederive_memoized_graph(config, journal, context, key, group.len(), &ctx, gate).await
         {
             MemoMiss::Derived(graph) => expanded = Some(graph),
             // Dropped units neither post nor go back: no build will
             // ever store the graph they mint off (stow#674).
-            MemoMiss::Drop => return Vec::new(),
+            MemoMiss::Drop => return None,
             MemoMiss::Keep => {}
         }
     }
+    Some(PreparedGroup {
+        key: key.clone(),
+        entries: group,
+        graph: expanded,
+    })
+}
+
+/// The post half of a prepared group: admit its units when it has a
+/// graph, returning the entries that stay journaled — all of them on
+/// a failed post or a graph the prepare phase could not get (stow#588).
+async fn post_group(
+    config: &StowConfig,
+    journal: &Path,
+    ctx: DrainContext<'_>,
+    group: PreparedGroup,
+) -> Vec<JournalEntry> {
+    let DrainContext {
+        consumer_target,
+        build_host,
+        spelled: consumer_spelled_target,
+    } = ctx;
+    let PreparedGroup {
+        key,
+        entries: group,
+        graph,
+    } = group;
+    let DrainGroupKey {
+        rustc_version,
+        expanded_cache_key,
+    } = &key;
     let units: Vec<ObservedUnit> = group.iter().map(|entry| entry.unit.clone()).collect();
-    let posted = match &expanded {
+    let posted = match &graph {
         // The one keep-path that must name its cause: every other way
         // entries stay journaled already warns, and a silent failure
         // leaves the drain's own log saying nothing at all (stow#588).
@@ -1001,21 +1198,6 @@ mod tests {
         }
     }
 
-    /// The pid a just-exited child leaves behind: guaranteed dead.
-    fn dead_pid() -> u32 {
-        #[cfg(unix)]
-        let mut command = std::process::Command::new("true");
-        #[cfg(windows)]
-        let mut command = {
-            let mut cmd = std::process::Command::new("cmd");
-            cmd.args(["/c", "exit", "0"]);
-            cmd
-        };
-        let mut child = command.spawn().expect("spawn");
-        child.wait().expect("wait");
-        child.id()
-    }
-
     fn test_config(cache_dir: &Path) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
@@ -1028,7 +1210,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             verify_mode: crate::config::VerifyMode::GithubCi,
-            state_db_pool: std::sync::Arc::default(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
@@ -1225,7 +1407,8 @@ mod tests {
         )
         .expect("write journal");
 
-        drain_journal(&config, &journal).await;
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        drain_journal(&config, &journal, &mut gate).await;
 
         assert!(
             !journal.exists(),
@@ -1268,7 +1451,8 @@ mod tests {
         )
         .expect("edit manifest");
 
-        drain_journal(&config, &journal).await;
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        drain_journal(&config, &journal, &mut gate).await;
 
         assert!(
             !journal.exists(),
@@ -1285,6 +1469,53 @@ mod tests {
                 .is_none(),
             "a changed project must not fill the memo"
         );
+    }
+
+    /// A drain that would re-derive — the project unchanged, the memo
+    /// empty — derives nothing while a stow command holds the gate:
+    /// the units stay journaled and the gate is shut for the rest of
+    /// the drain (stow#667).
+    #[tokio::test]
+    async fn a_drain_does_not_derive_while_a_stow_command_runs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = test_config(dir.path());
+        let (project, key_inputs) = keyed_project(dir.path());
+        let build_key = crate::lockfile_graph_cache::key_of(&key_inputs).expect("key");
+        let journal = journal_path(dir.path(), "stow-1");
+        write_consumer_context(&journal, &project, Some(&key_inputs));
+        append_lines(
+            &journal,
+            &[JournalEntry {
+                expanded_cache_key: build_key.clone(),
+                ..entry("not a crate", "1.99.0")
+            }],
+        )
+        .expect("write journal");
+        let gate_dir = dir.path().join("gate");
+        let hold = crate::derive_gate::ForegroundHold::enter(&gate_dir)
+            .await
+            .expect("enter the foreground hold");
+
+        let mut gate = crate::derive_gate::DerivationGate::unopened(gate_dir);
+        drain_journal(&config, &journal, &mut gate).await;
+
+        let contents = std::fs::read_to_string(&journal).expect("journal kept");
+        assert!(
+            contents.contains("not a crate"),
+            "a command-held gate keeps the units journaled"
+        );
+        assert!(
+            crate::lockfile_graph_cache::load(&config, &build_key)
+                .await
+                .expect("load")
+                .is_none(),
+            "a drain that never derived fills nothing"
+        );
+        assert!(
+            matches!(gate, crate::derive_gate::DerivationGate::Shut),
+            "the gate is shut for the rest of this drain"
+        );
+        hold.release();
     }
 
     /// A journal mixing a never-mintable group with a kept one: the
@@ -1323,7 +1554,8 @@ mod tests {
         )
         .expect("edit manifest");
 
-        drain_journal(&config, &journal).await;
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        drain_journal(&config, &journal, &mut gate).await;
 
         let contents = std::fs::read_to_string(&journal).expect("journal kept");
         assert!(
@@ -1364,7 +1596,8 @@ mod tests {
         )
         .expect("write journal");
 
-        drain_journal(&config, &journal).await;
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        drain_journal(&config, &journal, &mut gate).await;
 
         let contents = std::fs::read_to_string(&journal).expect("journal kept");
         assert!(contents.contains("\"serde\""));
@@ -1431,7 +1664,8 @@ mod tests {
         };
         append_lines(&journal, &[broken, postable]).expect("write journal");
 
-        drain_journal(&config, &journal).await;
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        drain_journal(&config, &journal, &mut gate).await;
 
         assert!(
             journal.exists(),

@@ -45,14 +45,18 @@ fn stored_crate_names(db: &Path) -> std::collections::BTreeSet<String> {
             let pool = sqlx::SqlitePool::connect_with(options)
                 .await
                 .expect("open the state db read-only");
-            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
+            let stored = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(
                 "SELECT crate_name FROM artifact_cache_entries".to_owned(),
             ))
             .fetch_all(&pool)
             .await
             .expect("list stored crates")
             .into_iter()
-            .collect()
+            .collect();
+            // The next run's stow opens a database of its own; this
+            // reader leaves nothing open behind it (stow#682).
+            pool.close().await;
+            stored
         })
 }
 

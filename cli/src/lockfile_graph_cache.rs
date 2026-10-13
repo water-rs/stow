@@ -314,6 +314,7 @@ mod tests {
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
+            foreground: crate::derive_gate::ForegroundHold::detached(),
         }
     }
 

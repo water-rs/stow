@@ -214,17 +214,15 @@ where
     tokio::spawn(run_tickets(ticket_rx));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let connections = Arc::new(AtomicUsize::new(0));
+    let listener = super::bind("stow-supervisor-")?;
+    let endpoint = listener.endpoint();
 
     #[cfg(unix)]
     {
-        let socket_dir = tempfile::Builder::new()
-            .prefix("stow-supervisor-")
-            .tempdir()
-            .map_err(|error| format!("create supervisor socket directory: {error}"))?;
-        let path = socket_dir.path().join("sock");
-        let listener = tokio::net::UnixListener::bind(&path)
-            .map_err(|error| format!("bind supervisor socket {}: {error}", path.display()))?;
-        restrict_socket(&path)?;
+        let super::Listener::Unix {
+            listener,
+            dir: socket_dir,
+        } = listener;
         let accept_task = tokio::spawn(accept_unix(
             listener,
             handler,
@@ -234,9 +232,9 @@ where
             in_flight,
             Arc::clone(&connections),
         ));
-        tracing::debug!(endpoint = %path.display(), "build supervisor listening");
+        tracing::debug!(endpoint = %endpoint.encode(), "build supervisor listening");
         Ok(Supervisor {
-            endpoint: Endpoint::Unix(path),
+            endpoint,
             token,
             shutdown: Some(shutdown_tx),
             accept_task: Some(accept_task),
@@ -247,20 +245,7 @@ where
 
     #[cfg(not(unix))]
     {
-        // Bound through the std listener so binding needs no runtime of
-        // its own: the supervisor is started from ordinary code, and the
-        // accept loop is what belongs on the runtime.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|error| format!("bind supervisor loopback listener: {error}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("set the supervisor listener non-blocking: {error}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|error| format!("read supervisor listener port: {error}"))?
-            .port();
-        let listener = tokio::net::TcpListener::from_std(listener)
-            .map_err(|error| format!("adopt the supervisor listener: {error}"))?;
+        let super::Listener::Loopback { listener, port } = listener;
         let accept_task = tokio::spawn(accept_loopback(
             listener,
             handler,
@@ -272,7 +257,7 @@ where
         ));
         tracing::debug!(port, "build supervisor listening");
         Ok(Supervisor {
-            endpoint: Endpoint::Loopback(port),
+            endpoint,
             token,
             shutdown: Some(shutdown_tx),
             accept_task: Some(accept_task),
@@ -304,13 +289,6 @@ fn getrandom(bytes: &mut [u8; 16]) {
         std::time::Instant::now()
     );
     bytes.copy_from_slice(&blake3::hash(seed.as_bytes()).as_bytes()[..16]);
-}
-
-#[cfg(unix)]
-fn restrict_socket(path: &std::path::Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("restrict supervisor socket {}: {error}", path.display()))
 }
 
 async fn run_tickets<P>(mut messages: mpsc::UnboundedReceiver<Ticket<P>>) {

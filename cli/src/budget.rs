@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 const PER_UNIT_ALLOWANCE: Duration = Duration::from_millis(150);
 
 /// Ceiling regardless of graph size, so a huge workspace cannot authorise an
-/// unbounded stall.
-const MAX_BUDGET: Duration = Duration::from_secs(30);
+/// unbounded stall. The prefetch bounds the one wait its allowance does not
+/// cover, the trust root's load, by the same ceiling.
+pub const MAX_BUDGET: Duration = Duration::from_secs(30);
 
 /// Overrides the computed budget, in seconds. `0` disables the pre-build phase
 /// entirely, which is the cheapest way to measure stow's overhead against a

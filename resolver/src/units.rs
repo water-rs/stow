@@ -164,9 +164,10 @@ pub struct SpecsAndResolvedFeatures {
     /// The features activated per package.
     pub resolved_features: ResolvedFeatures,
     /// Resolved dependency edges per `(package, side)` as decided by the
-    /// feature resolver — the graph cargo actually compiles, host edges
-    /// keyed `FeaturesFor::HostDep` with cfg evaluated against the host
-    /// triple.
+    /// feature resolver — the graph cargo actually compiles. Each edge
+    /// carries where its `[target.…]` platform condition holds, and the
+    /// emitting unit's side picks
+    /// (`crate::edges::SideEdge::compiled_from`).
     pub edges: HashMap<PackageFeaturesKey, Vec<crate::edges::SideEdge>>,
 }
 

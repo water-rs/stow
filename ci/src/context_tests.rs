@@ -312,12 +312,66 @@ fn resolver_at(cargo_home: &Path) -> stow_resolver::Resolver {
 /// `stow-cli` whose `current_exe` read `stow-cli (deleted)`, and its
 /// drain re-exec failed ENOENT (stow#588). A private
 /// `CARGO_TARGET_DIR` still gets sccache and the warm registry but
-/// never touches `target/debug`.
+/// never touches `target/debug`; `once_per_run` covers the
+/// sibling-process half of the same hazard inside it.
 fn context_target_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crate dir has a parent")
         .join("target/context-tests")
+}
+
+/// Run `build` at most once per test run.
+///
+/// `shim_binary`/`build_binaries`' `OnceLock`s are per process, and
+/// under nextest every test is a process, so each one re-ran its
+/// `cargo build` into this directory. Cargo re-uplifts a root unit
+/// into `debug/` on every build, a fresh one included, and on macOS
+/// the uplift is a copy that removes and recreates the destination —
+/// a sibling's build unlinked the binary another test was executing
+/// (stow#683). The run is identified by nextest's `NEXTEST_RUN_ID`:
+/// the first process to take the lock builds and stamps the id, and a
+/// sibling that reads it back returns without building. A process
+/// with no run id (plain `cargo test`, one process per test binary) is
+/// its own run and is already covered by the callers' `OnceLock`.
+fn once_per_run(dir: &Path, stamp: &str, run_id: Option<&str>, build: impl FnOnce()) {
+    std::fs::create_dir_all(dir)
+        .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
+    let lock_path = dir.join(format!("{stamp}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", lock_path.display()));
+    lock.lock()
+        .unwrap_or_else(|error| panic!("lock {}: {error}", lock_path.display()));
+
+    let Some(id) = run_id else {
+        build();
+        return;
+    };
+    let stamp_path = dir.join(format!("{stamp}.run"));
+    let ran = match std::fs::read_to_string(&stamp_path) {
+        Ok(ran) => Some(ran),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read {}: {error}", stamp_path.display()),
+    };
+    if ran.as_deref() == Some(id) {
+        return;
+    }
+    build();
+    // The stamp lands only after `build` returned: a panicking build
+    // records nothing, so the next sibling in the run builds again.
+    std::fs::write(&stamp_path, id)
+        .unwrap_or_else(|error| panic!("write {}: {error}", stamp_path.display()));
+}
+
+/// The run id nextest stamps on every test process of one run —
+/// absent under plain `cargo test`.
+fn test_run_id() -> Option<String> {
+    std::env::var("NEXTEST_RUN_ID").ok()
 }
 
 fn shim_binary() -> PathBuf {
@@ -328,18 +382,20 @@ fn shim_binary() -> PathBuf {
             .expect("crate dir has a parent")
             .to_path_buf();
         let target_dir = context_target_dir();
-        let mut build = std::process::Command::new("cargo");
-        build
-            .args(["build", "-p", "stow-resolver", "--bin", "stow-rustc-shim"])
-            .current_dir(&workspace)
-            .env("CARGO_TARGET_DIR", &target_dir);
-        if let Some(home) = original_cargo_home() {
-            build.env("CARGO_HOME", home);
-        } else {
-            build.env_remove("CARGO_HOME");
-        }
-        let status = build.status().expect("build the resolve shim");
-        assert!(status.success(), "cargo build stow-rustc-shim failed");
+        once_per_run(&target_dir, "shim", test_run_id().as_deref(), || {
+            let mut build = std::process::Command::new("cargo");
+            build
+                .args(["build", "-p", "stow-resolver", "--bin", "stow-rustc-shim"])
+                .current_dir(&workspace)
+                .env("CARGO_TARGET_DIR", &target_dir);
+            if let Some(home) = original_cargo_home() {
+                build.env("CARGO_HOME", home);
+            } else {
+                build.env_remove("CARGO_HOME");
+            }
+            let status = build.status().expect("build the resolve shim");
+            assert!(status.success(), "cargo build stow-rustc-shim failed");
+        });
         target_dir.join(format!(
             "debug/stow-rustc-shim{}",
             std::env::consts::EXE_SUFFIX
@@ -361,18 +417,20 @@ fn build_binaries() -> (PathBuf, PathBuf) {
             .expect("crate dir has a parent")
             .to_path_buf();
         let target_dir = context_target_dir();
-        let mut build = std::process::Command::new("cargo");
-        build
-            .args(["build", "-p", "stow-build", "-p", "stow-cli"])
-            .current_dir(&workspace)
-            .env("CARGO_TARGET_DIR", &target_dir);
-        if let Some(home) = original_cargo_home() {
-            build.env("CARGO_HOME", home);
-        } else {
-            build.env_remove("CARGO_HOME");
-        }
-        let status = build.status().expect("build stow-build and stow-cli");
-        assert!(status.success(), "cargo build stow-build failed");
+        once_per_run(&target_dir, "binaries", test_run_id().as_deref(), || {
+            let mut build = std::process::Command::new("cargo");
+            build
+                .args(["build", "-p", "stow-build", "-p", "stow-cli"])
+                .current_dir(&workspace)
+                .env("CARGO_TARGET_DIR", &target_dir);
+            if let Some(home) = original_cargo_home() {
+                build.env("CARGO_HOME", home);
+            } else {
+                build.env_remove("CARGO_HOME");
+            }
+            let status = build.status().expect("build stow-build and stow-cli");
+            assert!(status.success(), "cargo build stow-build failed");
+        });
         (
             target_dir.join(format!("debug/stow-cli{}", std::env::consts::EXE_SUFFIX)),
             target_dir.join(format!("debug/stow-build{}", std::env::consts::EXE_SUFFIX)),
@@ -422,6 +480,84 @@ fn context_builds_leave_the_shared_debug_binaries_untouched() {
             path.display()
         );
     }
+}
+
+/// Two calls under one run id share the stamp: the second sees the
+/// `.run` file the first wrote and never calls `build`.
+#[test]
+fn a_run_builds_once() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let builds = std::cell::Cell::new(0_u32);
+    once_per_run(dir.path(), "stamp", Some("run-a"), || {
+        builds.set(builds.get() + 1);
+    });
+    once_per_run(dir.path(), "stamp", Some("run-a"), || {
+        builds.set(builds.get() + 1);
+    });
+    assert_eq!(builds.get(), 1);
+}
+
+/// A new run id builds again — nextest assigns it per run — and a
+/// repeat of the new id does not: the stamp tracks the run, not the
+/// call.
+#[test]
+fn a_new_run_builds_again() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let builds = std::cell::Cell::new(0_u32);
+    once_per_run(dir.path(), "stamp", Some("run-a"), || {
+        builds.set(builds.get() + 1);
+    });
+    once_per_run(dir.path(), "stamp", Some("run-b"), || {
+        builds.set(builds.get() + 1);
+    });
+    once_per_run(dir.path(), "stamp", Some("run-b"), || {
+        builds.set(builds.get() + 1);
+    });
+    assert_eq!(builds.get(), 2);
+}
+
+/// Plain `cargo test` carries no `NEXTEST_RUN_ID`: every call builds —
+/// the process is its own run and the caller's `OnceLock` is the gate —
+/// and nothing is stamped.
+#[test]
+fn a_process_with_no_run_id_always_builds() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let builds = std::cell::Cell::new(0_u32);
+    once_per_run(dir.path(), "stamp", None, || {
+        builds.set(builds.get() + 1);
+    });
+    once_per_run(dir.path(), "stamp", None, || {
+        builds.set(builds.get() + 1);
+    });
+    assert_eq!(builds.get(), 2);
+    assert!(
+        !dir.path().join("stamp.run").exists(),
+        "a run-id-less build writes no .run stamp"
+    );
+}
+
+/// A panicking build records no `.run` stamp, so the next call under
+/// the same run id builds again rather than trusting a partial result.
+#[test]
+fn a_failed_build_leaves_no_stamp() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let builds = std::cell::Cell::new(0_u32);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        once_per_run(dir.path(), "stamp", Some("run-a"), || {
+            builds.set(builds.get() + 1);
+            panic!("the build failed");
+        });
+    }));
+    assert!(failed.is_err());
+    assert_eq!(builds.get(), 1);
+    assert!(
+        !dir.path().join("stamp.run").exists(),
+        "a failed build writes no .run stamp"
+    );
+    once_per_run(dir.path(), "stamp", Some("run-a"), || {
+        builds.set(builds.get() + 1);
+    });
+    assert_eq!(builds.get(), 2);
 }
 
 /// A consumer project manifest: `deps` under `[dependencies]`,

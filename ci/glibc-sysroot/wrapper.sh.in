@@ -39,4 +39,4 @@ cxx_args=()
 if (( want_cxx )); then
   cxx_args=(-nostdinc++ -I@SYSROOT@/@ARCH@/usr/include/c++/8 -I@SYSROOT@/@ARCH@/usr/include/@TRIPLE@/c++/8)
 fi
-exec @REAL@   -B@SYSROOT@/@ARCH@/usr/lib/@TRIPLE@   -B@SYSROOT@/@ARCH@/lib/@TRIPLE@   --sysroot=@SYSROOT@/@ARCH@   "${cxx_args[@]}"   "${args[@]}"   -idirafter /usr/include
+exec @REAL@   -B@SYSROOT@/@ARCH@/usr/lib/@TRIPLE@   -B@SYSROOT@/@ARCH@/lib/@TRIPLE@   --sysroot=@SYSROOT@/@ARCH@   "${cxx_args[@]}"   "${args[@]}"   -nostdinc   -isystem @OWN_INCLUDE@   -isystem @SYSROOT@/@ARCH@/usr/include/@TRIPLE@   -isystem @SYSROOT@/@ARCH@/usr/include   -idirafter /usr/include
