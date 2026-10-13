@@ -20,6 +20,8 @@ struct Fixture {
     version: &'static str,
     /// `(name, req, features)` registry deps.
     deps: Vec<(&'static str, &'static str, &'static [&'static str])>,
+    /// `(cfg, name, req)` platform deps — `[target.'<cfg>'.dependencies]`.
+    target_deps: Vec<(&'static str, &'static str, &'static str)>,
     features: &'static [(&'static str, &'static [&'static str])],
     yanked: bool,
     proc_macro: bool,
@@ -49,6 +51,16 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
             })
             .collect::<serde_json::Map<_, _>>(),
     });
+    if !fixture.target_deps.is_empty() {
+        let mut target = serde_json::Map::new();
+        for (cfg, name, req) in &fixture.target_deps {
+            let section = target
+                .entry((*cfg).to_owned())
+                .or_insert_with(|| json!({ "dependencies": {} }));
+            section["dependencies"][name] = json!(req);
+        }
+        manifest["target"] = json!(target);
+    }
     if fixture.proc_macro {
         manifest["lib"] = json!({ "proc-macro": true });
     }
@@ -84,21 +96,7 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     tar.into_inner().unwrap().finish().unwrap();
     let cksum = format!("{:x}", Sha256::digest(std::fs::read(&tarball).unwrap()));
 
-    let deps: Vec<Value> = fixture
-        .deps
-        .iter()
-        .map(|(name, req, features)| {
-            json!({
-                "name": name,
-                "req": format!("^{req}"),
-                "features": features,
-                "optional": false,
-                "default_features": true,
-                "target": null,
-                "kind": "normal",
-            })
-        })
-        .collect();
+    let deps = index_deps(fixture);
     let mut line = serde_json::to_string(&json!({
         "name": fixture.name,
         "vers": fixture.version,
@@ -127,6 +125,32 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     index.push_str(&line);
     std::fs::write(&entry, index).unwrap();
     cksum
+}
+
+/// `fixture`'s ordinary and target-gated deps as index-line entries.
+fn index_deps(fixture: &Fixture) -> Vec<Value> {
+    let entry = |name: &str, req: &str, features: &Value, target: &Value| {
+        json!({
+            "name": name,
+            "req": format!("^{req}"),
+            "features": features,
+            "optional": false,
+            "default_features": true,
+            "target": target,
+            "kind": "normal",
+        })
+    };
+    fixture
+        .deps
+        .iter()
+        .map(|(name, req, features)| entry(name, req, &json!(features), &Value::Null))
+        .chain(
+            fixture
+                .target_deps
+                .iter()
+                .map(|(cfg, name, req)| entry(name, req, &json!([]), &json!(cfg))),
+        )
+        .collect()
 }
 
 /// The release the test binary's own toolchain reports — the version
@@ -276,6 +300,31 @@ fn project(dir: &Path, dependencies: &Value) -> PathBuf {
     manifest
 }
 
+/// A single-member project tree with a `build.rs`; returns its
+/// manifest path. `edition` selects cargo's feature resolver —
+/// 2015/2018 is `resolver = "1"`, 2021+ is `resolver = "2"`.
+fn project_with_build_dependency(
+    dir: &Path,
+    edition: &str,
+    dependencies: &Value,
+    build_dependencies: &Value,
+) -> PathBuf {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(dir.join("build.rs"), "fn main() {}").unwrap();
+    let manifest = dir.join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": edition },
+            "dependencies": dependencies,
+            "build-dependencies": build_dependencies,
+        })),
+    )
+    .unwrap();
+    manifest
+}
+
 fn lock_entry(name: &str, version: &str, source: &str) -> Value {
     json!({ "name": name, "version": version, "source": source })
 }
@@ -309,6 +358,7 @@ fn operator_lockfile_preservation_keeps_the_resolved_dependency_context() {
         name: "dep",
         version,
         deps: vec![],
+        target_deps: vec![],
         features: &[],
         yanked: false,
         proc_macro: false,
@@ -372,6 +422,7 @@ fn yanked_pin_is_admitted() {
             name: "dep",
             version: "1.0.0",
             deps: vec![],
+            target_deps: vec![],
             features: &[],
             yanked: true,
             proc_macro: false,
@@ -410,6 +461,7 @@ fn newer_release_beats_the_pin() {
                 name: "dep",
                 version,
                 deps: vec![],
+                target_deps: vec![],
                 features: &[],
                 yanked,
                 proc_macro: false,
@@ -451,6 +503,7 @@ fn the_default_sentinel_resolves_a_featureless_package() {
             name: "dep",
             version: "1.0.0",
             deps: vec![],
+            target_deps: vec![],
             features: &[],
             yanked: false,
             proc_macro: false,
@@ -489,6 +542,7 @@ fn crate_lane_drops_bundled_lockfile() {
                 name: "dep",
                 version,
                 deps: vec![],
+                target_deps: vec![],
                 features: &[],
                 yanked: false,
                 proc_macro: false,
@@ -600,6 +654,7 @@ fn normal_and_proc_macro_sides_split() {
             name: "shared",
             version: "1.0.0",
             deps: vec![],
+            target_deps: vec![],
             features: &[("a", &[]), ("b", &[])],
             yanked: false,
             proc_macro: false,
@@ -611,6 +666,7 @@ fn normal_and_proc_macro_sides_split() {
             name: "pm",
             version: "1.0.0",
             deps: vec![("shared", "1", &["b"])],
+            target_deps: vec![],
             features: &[],
             yanked: false,
             proc_macro: true,
@@ -645,6 +701,103 @@ fn normal_and_proc_macro_sides_split() {
     assert_eq!(target.features, ["a"]);
 }
 
+/// `b` is a normal dep and a build dep of the root, carrying a
+/// `cfg(unix)` dep and a `cfg(target_family = "wasm")` dep. Resolved
+/// for wasm32 at the root's `edition`, returns `b`'s `Lib` units —
+/// one per side (stow#697).
+fn dual_use_bs_lib_units(edition: &str) -> Vec<StowUnit> {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    let plain = |name| Fixture {
+        name,
+        version: "1.0.0",
+        deps: vec![],
+        target_deps: vec![],
+        features: &[],
+        yanked: false,
+        proc_macro: false,
+    };
+    publish(&reg, &plain("u"));
+    publish(&reg, &plain("w"));
+    publish(
+        &reg,
+        &Fixture {
+            name: "b",
+            version: "1.0.0",
+            deps: vec![],
+            target_deps: vec![
+                ("cfg(unix)", "u", "1"),
+                ("cfg(target_family = \"wasm\")", "w", "1"),
+            ],
+            features: &[],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let manifest = project_with_build_dependency(
+        &work.path().join("root"),
+        edition,
+        &json!({ "b": "1" }),
+        &json!({ "b": "1" }),
+    );
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve(
+            &manifest,
+            &ResolveOptions::default(),
+            &["wasm32-unknown-unknown".to_owned()],
+        )
+        .unwrap();
+    let mut libs: Vec<StowUnit> = out
+        .into_iter()
+        .flat_map(|(_target, out)| out.units)
+        .filter(|unit| unit.name == "b" && unit.unit_kind == stow_resolver::StowUnitKind::Lib)
+        .collect();
+    libs.sort_by_key(|unit| unit.key.side);
+    assert_eq!(libs.len(), 2, "b emits one lib unit per side");
+    libs
+}
+
+/// The dep names a unit edges to.
+fn dep_names(unit: &StowUnit) -> Vec<&str> {
+    unit.deps.iter().map(|dep| dep.name.as_str()).collect()
+}
+
+/// stow#697: a `resolver = "1"` workspace keys every package
+/// `NormalOrDev` — there is no `HostDep` key for the host `b` unit's
+/// edge list to ride on. The host unit still gates `b`'s platform deps
+/// on the host: cargo gates on the compile kind of the unit that
+/// declares the dep, not the feature key's namespace.
+#[test]
+fn a_resolver_one_host_unit_gates_its_platform_deps_on_the_host() {
+    let libs = dual_use_bs_lib_units("2018");
+    let host = &libs[1];
+    let target = &libs[0];
+    assert_eq!(host.key.side, StowSide::Host);
+    assert_eq!(host.key.platform, "x86_64-unknown-linux-gnu");
+    assert_eq!(dep_names(host), ["u"]);
+    assert_eq!(target.key.side, StowSide::Target);
+    assert_eq!(target.key.platform, "wasm32-unknown-unknown");
+    assert_eq!(dep_names(target), ["w"]);
+}
+
+/// The `resolver = "2"` spelling: the host unit's edges are keyed
+/// `HostDep`, which always gated on the host — this shape is the
+/// control that already passed before stow#697's fix.
+#[test]
+fn a_resolver_two_host_unit_gates_its_platform_deps_on_the_host() {
+    let libs = dual_use_bs_lib_units("2021");
+    let host = &libs[1];
+    let target = &libs[0];
+    assert_eq!(host.key.side, StowSide::Host);
+    assert_eq!(host.key.platform, "x86_64-unknown-linux-gnu");
+    assert_eq!(dep_names(host), ["u"]);
+    assert_eq!(target.key.side, StowSide::Target);
+    assert_eq!(target.key.platform, "wasm32-unknown-unknown");
+    assert_eq!(dep_names(target), ["w"]);
+}
+
 /// `leaf` is a normal dep of the root and a normal dep of the proc-macro
 /// `pm`, at the same features: a native `cargo build` dedups it into one
 /// unit — the normal one — and `pm`'s extern resolves to that artifact.
@@ -663,6 +816,7 @@ fn a_host_dep_shared_with_a_normal_one_emits_the_deduped_edge() {
             name: "leaf",
             version: "1.0.0",
             deps: vec![],
+            target_deps: vec![],
             features: &[("a", &[])],
             yanked: false,
             proc_macro: false,
@@ -674,6 +828,7 @@ fn a_host_dep_shared_with_a_normal_one_emits_the_deduped_edge() {
             name: "pm",
             version: "1.0.0",
             deps: vec![("leaf", "1", &["a"])],
+            target_deps: vec![],
             features: &[],
             yanked: false,
             proc_macro: true,
@@ -727,6 +882,7 @@ fn a_host_dep_with_different_features_keeps_its_own_edge() {
             name: "leaf",
             version: "1.0.0",
             deps: vec![],
+            target_deps: vec![],
             features: &[("a", &[]), ("b", &[])],
             yanked: false,
             proc_macro: false,
@@ -738,6 +894,7 @@ fn a_host_dep_with_different_features_keeps_its_own_edge() {
             name: "pm",
             version: "1.0.0",
             deps: vec![("leaf", "1", &["b"])],
+            target_deps: vec![],
             features: &[],
             yanked: false,
             proc_macro: true,
@@ -792,6 +949,7 @@ fn a_host_tasks_closure_pins_deduped_packages_at_target_sides() {
             name: "leaf",
             version: "1.0.0",
             deps: vec![],
+            target_deps: vec![],
             features: &[("a", &[])],
             yanked: false,
             proc_macro: false,
@@ -803,6 +961,7 @@ fn a_host_tasks_closure_pins_deduped_packages_at_target_sides() {
             name: "deep",
             version: "1.0.0",
             deps: vec![("leaf", "1", &["a"])],
+            target_deps: vec![],
             features: &[],
             yanked: false,
             proc_macro: false,
@@ -814,6 +973,7 @@ fn a_host_tasks_closure_pins_deduped_packages_at_target_sides() {
             name: "pm",
             version: "1.0.0",
             deps: vec![("deep", "1", &[])],
+            target_deps: vec![],
             features: &[],
             yanked: false,
             proc_macro: true,
@@ -990,6 +1150,7 @@ fn publish_deps(reg: &Path) {
                 name,
                 version: "1.0.0",
                 deps: vec![],
+                target_deps: vec![],
                 features: &[],
                 yanked: false,
                 proc_macro: false,
@@ -2172,6 +2333,7 @@ fn a_lockless_parent_keeps_its_manifest_over_a_locked_child() {
                     name: "dep_feat",
                     version: "1.0.0",
                     deps: vec![],
+                    target_deps: vec![],
                     features: &[("parent-only", &[])],
                     yanked: false,
                     proc_macro: false,
@@ -2362,6 +2524,7 @@ fn two_disjoint_source_trees_materialize_through_the_fanout() {
                     name: "dep_feat",
                     version: "1.0.0",
                     deps: vec![],
+                    target_deps: vec![],
                     features: &[("side-only", &[])],
                     yanked: false,
                     proc_macro: false,
@@ -2532,6 +2695,7 @@ fn merkle_context_propagates_from_offline_resolve() {
             name: "alloc-no-stdlib",
             version: "2.0.4",
             deps: vec![],
+            target_deps: vec![],
             features: &[("unsafe", &[])],
             yanked: false,
             proc_macro: false,
@@ -2543,6 +2707,7 @@ fn merkle_context_propagates_from_offline_resolve() {
             name: "alloc-stdlib",
             version: "0.3.0",
             deps: vec![("alloc-no-stdlib", "2", &[])],
+            target_deps: vec![],
             features: &[],
             yanked: false,
             proc_macro: false,
