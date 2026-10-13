@@ -69,6 +69,21 @@ pub struct StowConfig {
     /// artifact made verification the whole cost of a cold prefetch.
     #[serde(skip, default = "Arc::default")]
     pub trust_material: Arc<OnceCell<Arc<crate::verify::TrustMaterial>>>,
+    /// Lazily built registry HTTP client, shared by every registry
+    /// session this process opens. Building one loads the platform trust
+    /// store — hundreds of certificate files on Linux — so a client per
+    /// session made each index fetch pay that scan again (stow#624).
+    #[serde(skip, default = "Arc::default")]
+    pub registry_http: Arc<OnceCell<stow_oci::RegistryHttp>>,
+    /// This process's artifact cache staging directory, created on its
+    /// first store and held for its whole life: every staged entry is a
+    /// temp dir under `<version>/staging/<name>/` renamed into place,
+    /// while the sibling `<name>.lock` marks the owner alive to the
+    /// `prepare_local_cache` sweep that reclaims dead processes'
+    /// staging. Most wrapper processes never store, so it must not be
+    /// paid for eagerly.
+    #[serde(skip, default = "Arc::default")]
+    pub artifact_cache_staging: Arc<OnceCell<Arc<crate::artifact_cache::StagingDir>>>,
 }
 
 impl StowConfig {
@@ -98,6 +113,59 @@ impl StowConfig {
             })
             .await?;
         Ok(Arc::clone(material))
+    }
+
+    /// Get (lazily building) the registry HTTP client for this config.
+    ///
+    /// # Errors
+    ///
+    /// Whatever building the client fails with.
+    pub async fn registry_http(&self) -> stow_types::error::Result<stow_oci::RegistryHttp> {
+        let http = self
+            .registry_http
+            .get_or_try_init(stow_oci::RegistryHttp::new)
+            .await?;
+        Ok(http.clone())
+    }
+
+    /// Get (lazily creating) this process's staging directory inside
+    /// `rustc_version`'s artifact cache: `<version_dir>/staging/<name>/`,
+    /// with its `<name>.lock` held until the handle drops.
+    ///
+    /// # Errors
+    ///
+    /// Whatever creating or locking the staging directory fails with, and
+    /// a request to stage a second rustc version after the directory was
+    /// created for a different one.
+    pub async fn artifact_cache_staging_dir(
+        &self,
+        rustc_version: &str,
+    ) -> stow_types::error::Result<Arc<crate::artifact_cache::StagingDir>> {
+        let staging_root = self
+            .artifact_cache_version_dir(rustc_version)
+            .join(crate::artifact_cache::STAGING_DIR);
+        let staging = self
+            .artifact_cache_staging
+            .get_or_try_init(|| {
+                let staging_root = staging_root.clone();
+                let rustc_version = rustc_version.to_owned();
+                async move {
+                    let staging = tokio::task::spawn_blocking(move || {
+                        crate::artifact_cache::StagingDir::acquire(&staging_root, &rustc_version)
+                    })
+                    .await
+                    .wrap_err("join artifact cache staging task")??;
+                    stow_types::error::Result::Ok(Arc::new(staging))
+                }
+            })
+            .await?;
+        if staging.rustc_version() != rustc_version {
+            return Err(stow_types::stow_error!(
+                "artifact cache staging is bound to rustc {}, cannot stage {rustc_version}",
+                staging.rustc_version()
+            ));
+        }
+        Ok(Arc::clone(staging))
     }
 
     /// Build a fresh, uninitialized lazy cache for the state `SQLite` pool.
@@ -200,6 +268,8 @@ impl StowConfig {
             verify_mode,
             state_db_pool: Arc::default(),
             trust_material: Arc::default(),
+            registry_http: Arc::default(),
+            artifact_cache_staging: Arc::default(),
         })
     }
 
@@ -240,6 +310,8 @@ impl StowConfig {
             verify_mode,
             state_db_pool: Arc::default(),
             trust_material: Arc::default(),
+            registry_http: Arc::default(),
+            artifact_cache_staging: Arc::default(),
         })
     }
 
@@ -259,10 +331,6 @@ impl StowConfig {
 
     pub fn artifact_cache_purge_root(&self) -> PathBuf {
         self.cache_dir.join("purge")
-    }
-
-    pub fn graph_plan_dir(&self) -> PathBuf {
-        self.cache_dir.join("graph-plans")
     }
 }
 

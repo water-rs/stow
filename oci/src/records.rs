@@ -1,8 +1,11 @@
-//! The per-task records artifact: a task's `Vec<ArtifactRecord>` pushed,
+//! The per-build records artifact: a build's `Vec<ArtifactRecord>` pushed,
 //! signed and read back as one OCI artifact in the same namespace the
-//! bundles use (stow#455). Records are the registry's only mutable
-//! record store — the edge's D1 catalog is a read replica synced off
-//! these artifacts, never a source of truth.
+//! bundles use (stow#455). Each build publishes under its own
+//! `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag, so a
+//! rebuilt task never overwrites the previous build's artifact
+//! (stow#655). Records are the registry's only record store — the
+//! edge's D1 catalog is a read replica synced off these artifacts,
+//! never a source of truth.
 
 use std::collections::BTreeMap;
 
@@ -10,12 +13,12 @@ use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::OciImageManifest;
 use stow_types::api::ArtifactRecord;
 use stow_types::records::{
-    RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION, is_records_tag,
-    records_tag,
+    BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
+    is_records_tag, records_tag,
 };
 use stow_types::registry::sha256_digest;
 
-use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::client::{RegistryHttp, RegistrySession, canonical_manifest_bytes};
 use crate::registry::{
     RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest,
 };
@@ -25,7 +28,7 @@ use crate::sign;
 /// artifact landed under.
 #[derive(Debug, Clone)]
 pub struct RecordsPublishOutcome {
-    /// The OCI tag (`records-<rustc>-<task_id hash>`).
+    /// The OCI tag (`records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`).
     pub tag: String,
     /// Full `registry/repo:tag` reference the artifact signed under.
     pub oci_reference: String,
@@ -46,8 +49,8 @@ pub struct PulledRecords {
     pub task_id: String,
 }
 
-/// Push `records` as `task_id`'s signed records artifact on the
-/// production registry.
+/// Push `records` as the signed records artifact `task_id`'s `build`
+/// produced, on the production registry.
 ///
 /// One JSON layer, an empty config, the task-id annotation, then the
 /// same cosign signature every `build-crate.yml` artifact carries.
@@ -58,21 +61,23 @@ pub struct PulledRecords {
 /// signing does.
 pub async fn push_records(
     credentials: &RegistryCredentials,
+    http: &RegistryHttp,
     rustc_version: &str,
     task_id: &str,
+    build: BuildRun,
     records: &[ArtifactRecord],
 ) -> stow_types::error::Result<RecordsPublishOutcome> {
     let base = RegistryBase::production()?;
-    let session = base.push_session(credentials);
-    push_records_with(&session, &base, rustc_version, task_id, records, |reference, digest| async move {
+    let session = base.push_session(credentials, http);
+    push_records_with(&session, &base, rustc_version, task_id, build, records, |reference, digest| async move {
         sign::sign_artifact(&reference, &digest, credentials).await
     })
     .await
 }
 
 /// [`push_records`] with the session, registry base and signer supplied —
-/// the mock-registry test and the local-CI path sign in-process so no
-/// cosign binary is involved.
+/// for in-process signers (tests, the mock registry's own writer) where
+/// no cosign binary is involved.
 ///
 /// # Errors
 ///
@@ -82,6 +87,7 @@ pub async fn push_records_with<S, Fut>(
     base: &RegistryBase,
     rustc_version: &str,
     task_id: &str,
+    build: BuildRun,
     records: &[ArtifactRecord],
     sign: S,
 ) -> stow_types::error::Result<RecordsPublishOutcome>
@@ -89,7 +95,7 @@ where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<()>> + Send,
 {
-    let tag = records_tag(rustc_version, task_id);
+    let tag = records_tag(rustc_version, task_id, build);
     let reference = base.reference(&tag)?;
     let body = serde_json::to_vec(records)
         .map_err(|error| stow_types::stow_error!("encode records for {task_id}: {error}"))?;
@@ -134,7 +140,7 @@ where
     })
 }
 
-/// Read `task_id`'s records artifact back.
+/// Read back the records artifact `task_id`'s `build` pushed.
 ///
 /// The manifest under the records tag must declare
 /// [`RECORDS_ARTIFACT_TYPE`] and carry the task-id annotation naming the
@@ -150,8 +156,10 @@ pub async fn pull_records(
     base: &RegistryBase,
     rustc_version: &str,
     task_id: &str,
+    build: BuildRun,
 ) -> stow_types::error::Result<PulledRecords> {
-    let pulled = pull_records_by_tag(session, base, &records_tag(rustc_version, task_id)).await?;
+    let pulled =
+        pull_records_by_tag(session, base, &records_tag(rustc_version, task_id, build)).await?;
     if pulled.task_id != task_id {
         return Err(stow_types::stow_error!(
             "{} carries no {RECORDS_TASK_ID_ANNOTATION} annotation naming {task_id}",

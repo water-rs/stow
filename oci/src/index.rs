@@ -10,7 +10,7 @@ use stow_types::index::{
 };
 use stow_types::registry::{GHCR_BASE, sha256_digest};
 
-use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::client::{RegistryHttp, RegistrySession, canonical_manifest_bytes};
 use crate::registry::{RegistryBase, RegistryCredentials, pull_blob_verified};
 use crate::sign;
 
@@ -192,12 +192,13 @@ pub async fn pull_published_index(
 /// cosign signature fails.
 pub async fn publish_index(
     credentials: &RegistryCredentials,
+    http: &RegistryHttp,
     index_bytes: &[u8],
     target: &str,
     rustc_version: &str,
     content_sha256: &str,
 ) -> stow_types::error::Result<IndexPublishOutcome> {
-    let session = credentials.session()?;
+    let session = credentials.session(http)?;
     let reference = format!("{GHCR_BASE}:{}", index_tag(target, rustc_version));
     let parsed_reference: Reference = reference
         .parse()
@@ -385,11 +386,12 @@ pub async fn pull_folded(
 /// Same as [`publish_index`].
 pub async fn publish_folded(
     credentials: &RegistryCredentials,
+    http: &RegistryHttp,
     folded_bytes: &[u8],
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<IndexPublishOutcome> {
-    let session = credentials.session()?;
+    let session = credentials.session(http)?;
     let reference = format!("{GHCR_BASE}:{}", folded_tag(target, rustc_version));
     let parsed_reference: Reference = reference
         .parse()

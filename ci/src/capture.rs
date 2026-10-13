@@ -110,6 +110,12 @@ pub async fn run_rustc_capture_wrapper(
         .await?
     {
         send_capture_record(record).await?;
+        // This process is the rustc cargo spawned: a served unit owes it
+        // the artifact notifications the invocation asked for, the same
+        // lines a compile would have printed (stow#633).
+        stow_cli::build_consume::write_artifact_notifications(
+            &stow_cli::build_consume::artifact_notifications(&original_parsed)?,
+        )?;
         std::process::exit(0);
     }
 

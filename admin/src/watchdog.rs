@@ -31,6 +31,7 @@ use clap::{Args, Subcommand};
 use stow_types::analytics::{self, Envelope};
 use stow_types::api::{AdminStatus, DispatchFreeze};
 use stow_types::stow_error;
+use stow_types::transient::Backoff;
 
 use crate::maintenance::{self, MaintenanceScope};
 use time::OffsetDateTime;
@@ -677,6 +678,7 @@ impl Watcher<'_> {
             let jobs: GhJobsPage = match github::get(
                 self.gh_token,
                 &format!("actions/runs/{}/jobs?per_page=100", run.id),
+                Backoff::new(),
             )
             .await
             {
@@ -703,7 +705,7 @@ impl Watcher<'_> {
                     github::REPO,
                     job.id
                 );
-                let log = match github::get_text(self.gh_token, &log_url).await {
+                let log = match github::get_text(self.gh_token, &log_url, Backoff::new()).await {
                     Ok(log) => log,
                     Err(error) => {
                         tracing::warn!(job_id = job.id, %error, "job log unavailable");
@@ -897,7 +899,8 @@ impl Watcher<'_> {
     /// not the D1 mirror.
     async fn pick_bundle_digest(&self) -> stow_types::error::Result<Option<String>> {
         let base = crate::index_cmd::registry_base()?;
-        let session = base.session();
+        let http = stow_oci::RegistryHttp::new().await?;
+        let session = base.session(&http);
         let trust = crate::index_cmd::records_trust().await?;
         let mut tags = session
             .list_tags()
@@ -1412,7 +1415,9 @@ async fn fetch_completed_runs(gh_token: &str, since: OffsetDateTime) -> Result<V
         "status=completed",
         since,
         OffsetDateTime::now_utc(),
-        |path| async move { github::get::<github::RunsPage<GhRun>>(gh_token, &path).await },
+        |path| async move {
+            github::get::<github::RunsPage<GhRun>>(gh_token, &path, Backoff::new()).await
+        },
     )
     .await
     .map_err(|error| error.to_string())
@@ -1521,6 +1526,7 @@ async fn find_incident(gh_token: &str) -> Result<Option<GhIssue>, String> {
     let issues: Vec<GhIssue> = github::get(
         gh_token,
         &format!("issues?labels={INCIDENT_LABEL}&state=open&per_page=100"),
+        Backoff::new(),
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -1694,10 +1700,13 @@ fn digest_due(last: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
 
 /// Newest digest comment time on the issue.
 async fn last_digest_at(gh_token: &str, issue: u64) -> Result<Option<OffsetDateTime>, String> {
-    let comments: Vec<GhComment> =
-        github::get(gh_token, &format!("issues/{issue}/comments?per_page=100"))
-            .await
-            .map_err(|error| error.to_string())?;
+    let comments: Vec<GhComment> = github::get(
+        gh_token,
+        &format!("issues/{issue}/comments?per_page=100"),
+        Backoff::new(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let mut latest = None;
     for comment in &comments {
         let body = comment.body.as_deref().unwrap_or_default();

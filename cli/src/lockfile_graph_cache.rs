@@ -45,7 +45,6 @@ const VALUE_FLAGS: &[&[u8]] = &[
     b"-Z",
     b"--jobs",
     b"-j",
-    b"--target-dir",
     b"--profile",
     b"--message-format",
     b"--color",
@@ -71,6 +70,16 @@ fn normalized_args<'a>(action: &str, cargo_args: &'a [OsString]) -> Vec<&'a [u8]
         if (action == "test" || action == "bench") && !arg.starts_with(b"-") {
             continue;
         }
+        // The output directory picks where artifacts land, never which
+        // units the graph holds — a fresh `--target-dir` must not mint
+        // a fresh key, in either spelling (stow#617).
+        if arg == b"--target-dir" {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with(b"--target-dir=") {
+            continue;
+        }
         normalized.push(arg);
         if VALUE_FLAGS.contains(&arg) && index < args.len() {
             normalized.push(args[index]);
@@ -91,6 +100,7 @@ fn normalized_args<'a>(action: &str, cargo_args: &'a [OsString]) -> Vec<&'a [u8]
 /// Member manifests leave the key — the entry's recorded local-manifest
 /// hashes verify them on load.
 pub fn cache_key(project: &crate::cargo_cmd::ProjectContext) -> stow_types::error::Result<String> {
+    let env = std::env::vars_os().collect::<Vec<_>>();
     key_of(&KeyInputs {
         action: &project.action,
         cargo_args: &project.cargo_args,
@@ -100,6 +110,7 @@ pub fn cache_key(project: &crate::cargo_cmd::ProjectContext) -> stow_types::erro
         target: &project.target,
         target_given: project.target_given,
         rustc_version: &project.rustc_version,
+        env: &env,
     })
 }
 
@@ -118,6 +129,10 @@ pub struct KeyInputs<'a> {
     pub target: &'a str,
     pub target_given: bool,
     pub rustc_version: &'a str,
+    /// The environment the unit-graph run reads — the process
+    /// environment for a live build or drain; a test hands its own.
+    /// `key_of` picks the variables cargo's own inputs map to.
+    pub env: &'a [(OsString, OsString)],
 }
 
 /// [`cache_key`] over a borrowed input set — the single function both
@@ -150,14 +165,24 @@ pub fn key_of(project: &KeyInputs<'_>) -> stow_types::error::Result<String> {
     let workspace_root = project.workspace_root;
     hash_file_if_present(&mut hasher, &workspace_root.join("Cargo.lock"))?;
     hash_file_if_present(&mut hasher, &manifest_path)?;
-    // Cargo reads its effective rustflags, linker, target and profile
-    // out of these env vars — hash the inputs so a change misses
-    // rather than serving a stale graph.
-    for (key, value) in std::env::vars_os() {
+    // Hash what `cargo <action> --unit-graph` reads, by name: the
+    // effective rustflags, the rustc binary, the resolved target, the
+    // resolver's settings and the profile — so a change misses rather
+    // than serving a stale graph. The output directories change where artifacts land, never
+    // which units exist, so `CARGO_TARGET_DIR` and every
+    // `CARGO_BUILD_*` other than the three named stay out (stow#617).
+    for (key, value) in project.env {
         let Some(key) = key.to_str() else { continue };
-        if matches!(key, "RUSTFLAGS" | "CARGO_ENCODED_RUSTFLAGS" | "RUSTC")
-            || key.starts_with("CARGO_BUILD_")
-            || key.starts_with("CARGO_TARGET_")
+        if matches!(
+            key,
+            "RUSTFLAGS"
+                | "CARGO_ENCODED_RUSTFLAGS"
+                | "RUSTC"
+                | "CARGO_BUILD_TARGET"
+                | "CARGO_BUILD_RUSTFLAGS"
+                | "CARGO_BUILD_RUSTC"
+        ) || (key.starts_with("CARGO_TARGET_") && key != "CARGO_TARGET_DIR")
+            || key.starts_with("CARGO_RESOLVER_")
             || key.starts_with("CARGO_PROFILE_")
             || key.starts_with("CARGO_UNSTABLE_")
         {
@@ -220,20 +245,22 @@ pub async fn load(
     let Some((json,)) = row else {
         return Ok(None);
     };
-    let graph: ExpandedDependencyGraph =
-        serde_json::from_str(&json).wrap_err("decode cached lockfile graph")?;
-    // The post-query half of the key: every local (path-source)
-    // manifest cargo consulted must still hash the same — workspace
-    // member edits and path dependencies outside the root are covered
-    // without walking them into the key (stow#551).
-    if !graph
-        .local_manifests
-        .iter()
-        .all(super::workspace_deps::LocalManifestHash::verify)
-    {
-        return Ok(None);
-    }
-    Ok(Some(graph))
+    // The decode and the manifest hashes below both grow with the
+    // workspace, so they run on a blocking thread (stow#624).
+    smol::unblock(move || {
+        let graph: ExpandedDependencyGraph =
+            serde_json::from_str(&json).wrap_err("decode cached lockfile graph")?;
+        // The post-query half of the key: every local (path-source)
+        // manifest cargo consulted must still hash the same — workspace
+        // member edits and path dependencies outside the root are covered
+        // without walking them into the key (stow#551).
+        Ok(graph
+            .local_manifests
+            .iter()
+            .all(super::workspace_deps::LocalManifestHash::verify)
+            .then_some(graph))
+    })
+    .await
 }
 
 /// Store an expanded graph under a fingerprint key.
@@ -244,7 +271,12 @@ pub async fn store(
     graph: &ExpandedDependencyGraph,
 ) -> stow_types::error::Result<()> {
     let pool = config.state_db_pool().await?;
-    let json = serde_json::to_string(graph).wrap_err("encode lockfile graph")?;
+    // The encode grows with the workspace like the decode above, so it
+    // runs on a blocking thread too (stow#624).
+    let graph = graph.clone();
+    let json = smol::unblock(move || serde_json::to_string(&graph))
+        .await
+        .wrap_err("encode lockfile graph")?;
     let now_ms: i64 = db_int(now_millis(), "lockfile graph cache current time")?;
     sqlx::query(
         "INSERT OR REPLACE INTO lockfile_graph_cache (cache_key, inserted_at_ms, expanded_json) \
@@ -264,7 +296,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{cache_key, normalized_args};
-    use crate::cargo_cmd::{MetadataArgs, ProjectContext};
+    use crate::cargo_cmd::{MetadataArgs, MoldSelection, ProjectContext};
     use crate::workspace_deps::ExpandedDependencyGraph;
 
     fn project(dir: &std::path::Path, manifest: &std::path::Path) -> ProjectContext {
@@ -279,7 +311,9 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".to_owned(),
             target_given: false,
             rustc_version: "1.99.0".to_owned(),
-            mold_config_args: Vec::new(),
+            mold: MoldSelection::resolved(Vec::new()),
+            env_base: None,
+            build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
         }
     }
 
@@ -306,6 +340,104 @@ mod tests {
             cache_key(&a).expect("key a"),
             cache_key(&b).expect("key b"),
             "the canonical manifest and invocation dir separate the keys"
+        );
+    }
+
+    /// A `KeyInputs` over `project`'s fields with explicit args and
+    /// environment — the test-side mirror of `cache_key`.
+    fn key_inputs<'a>(
+        project: &'a crate::cargo_cmd::ProjectContext,
+        cargo_args: &'a [OsString],
+        env: &'a [(OsString, OsString)],
+    ) -> super::KeyInputs<'a> {
+        super::KeyInputs {
+            action: &project.action,
+            cargo_args,
+            current_dir: &project.current_dir,
+            manifest_path: &project.manifest_path,
+            workspace_root: &project.workspace_root,
+            target: &project.target,
+            target_given: project.target_given,
+            rustc_version: &project.rustc_version,
+            env,
+        }
+    }
+
+    /// The output directory picks where artifacts land, never which
+    /// units exist — `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`,
+    /// `CARGO_BUILD_JOBS` and a spelled `--target-dir` must not split
+    /// the key, while the vars cargo's unit graph does read still do
+    /// (stow#617).
+    #[test]
+    fn output_directories_do_not_split_the_key_but_graph_inputs_do() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(root.join("Cargo.lock"), "").expect("lockfile");
+        let project = project(root, &root.join("Cargo.toml"));
+
+        let key = |vars: &[(&str, &str)], args: &[&str]| {
+            let env: Vec<(OsString, OsString)> = vars
+                .iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect();
+            let cargo_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            super::key_of(&key_inputs(&project, &cargo_args, &env)).expect("key")
+        };
+
+        // Output and scheduling inputs: different values, same key.
+        assert_eq!(
+            key(&[("CARGO_TARGET_DIR", "/a")], &[]),
+            key(&[("CARGO_TARGET_DIR", "/b")], &[]),
+            "CARGO_TARGET_DIR selects the output dir, not the graph"
+        );
+        assert_eq!(
+            key(&[("CARGO_BUILD_TARGET_DIR", "/a")], &[]),
+            key(&[("CARGO_BUILD_TARGET_DIR", "/b")], &[]),
+        );
+        assert_eq!(
+            key(&[("CARGO_BUILD_JOBS", "4")], &[]),
+            key(&[("CARGO_BUILD_JOBS", "8")], &[]),
+        );
+        assert_eq!(key(&[], &[]), key(&[("CARGO_TARGET_DIR", "/a")], &[]));
+        assert_eq!(
+            key(&[], &["--target-dir", "/a"]),
+            key(&[], &["--target-dir", "/b"]),
+        );
+        assert_eq!(
+            key(&[], &["--target-dir=/a"]),
+            key(&[], &["--target-dir=/b"]),
+        );
+
+        // Graph inputs: different values, different keys.
+        assert_ne!(
+            key(&[("CARGO_BUILD_TARGET", "x86_64-unknown-linux-gnu")], &[]),
+            key(&[("CARGO_BUILD_TARGET", "aarch64-unknown-linux-gnu")], &[]),
+            "the resolved target changes the unit graph"
+        );
+        assert_ne!(
+            key(
+                &[("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", "-Cfoo")],
+                &[]
+            ),
+            key(
+                &[("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", "-Cbar")],
+                &[]
+            ),
+            "target.<triple> rustflags change the unit graph"
+        );
+        assert_ne!(
+            key(&[("RUSTFLAGS", "-Cfoo")], &[]),
+            key(&[("RUSTFLAGS", "-Cbar")], &[]),
+        );
+        assert_ne!(
+            key(&[], &[]),
+            key(&[("RUSTFLAGS", "-Cfoo")], &[]),
+            "a rustflag's presence changes the graph too"
         );
     }
 

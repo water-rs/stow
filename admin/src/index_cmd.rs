@@ -27,13 +27,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport, PublishedSliceRow};
-use stow_types::identity::{TargetTriple, WireRustcVersion};
+use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
     IndexError, content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
 };
 use stow_types::public_cache::UnitShape;
-use stow_types::records::{record_to_index_row, records_tag_rustc};
+use stow_types::records::{parse_records_tag, record_to_index_row};
 use stow_types::registry::{GHCR_BASE, sha256_digest};
 use stow_types::stow_error;
 
@@ -434,10 +434,46 @@ struct ExportPass {
 type PullFut<'a, T> =
     std::pin::Pin<Box<dyn Future<Output = stow_types::error::Result<T>> + Send + 'a>>;
 
-/// Index rows keyed by the `(c_metadata, unit_shape)` pair a consumer's
-/// key space identifies — one artifact keeps every shape it can serve
-/// (stow#506).
-type RowsByIdentity = BTreeMap<(String, Option<UnitShape>), ArtifactIndexRow>;
+/// Index rows keyed by the `(c_metadata, unit_shape, dependency_identity)`
+/// node a unit was published for. The `(c_metadata, unit_shape)` pair is
+/// what a consumer's key space identifies, but it is not the row key:
+/// two nodes that differ only in dependency context can compile to the
+/// same unit, and each keeps a row so the slice answers for both
+/// (stow#657). A record carrying no dependency identity — an archive
+/// record predating stow#588 — keys on `None`, which sorts ahead of the
+/// identified rows of the same unit and gives the emitted order a
+/// defined tie-break.
+type RowsByIdentity =
+    BTreeMap<(String, Option<UnitShape>, Option<DependencyIdentity>), ArtifactIndexRow>;
+
+/// Fold `row` into `rows` under its
+/// `(c_metadata, unit_shape, dependency_identity)` key.
+///
+/// An identified row also evicts the identity-less archive row of the
+/// same `(c_metadata, unit_shape)`: the archive row answers no
+/// contextual question once an identified sibling exists. An
+/// identity-less row arriving after an identified sibling — inside one
+/// pass or from the previous slice — is skipped instead, so either
+/// arrival order keeps exactly the identified set.
+fn fold_row(rows: &mut RowsByIdentity, row: ArtifactIndexRow) {
+    let unit = (row.c_metadata.as_str().to_owned(), row.unit_shape);
+    if let Some(identity) = row.dependency_identity.clone() {
+        rows.remove(&(unit.0.clone(), unit.1, None));
+        rows.insert((unit.0, unit.1, Some(identity)), row);
+    } else {
+        // `None` sorts ahead of every `Some` under the same
+        // `(c_metadata, unit_shape)`, so the first key at or past the
+        // `None` key is an identified sibling exactly when one exists.
+        let identified_sibling = matches!(
+            rows.range((unit.0.clone(), unit.1, None)..).next(),
+            Some(((c_metadata, shape, Some(_)), _))
+                if c_metadata == &unit.0 && shape == &unit.1
+        );
+        if !identified_sibling {
+            rows.insert((unit.0, unit.1, None), row);
+        }
+    }
+}
 
 /// The `(target, rustc)` an `index.*` tag names — the same suffix shape
 /// [`folded_tag_parts`] splits, under the other half of the tag pair.
@@ -451,10 +487,10 @@ pub fn index_tag_parts(tag: &str) -> Option<(&str, &str)> {
 /// `pull_records` resolves a `records-*` tag to its rows.
 ///
 /// `rustc` scopes the whole pass: a records tag names its rustc
-/// (`records-<rustc>-<task_id hash>`) and a folded/index pair names it in its
-/// suffix, so tag selection alone decides what this rustc's publish
-/// touches — another rustc's tags are never pulled, and `--full` stays
-/// inside the same scope.
+/// (`records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`) and a
+/// folded/index pair names it in its suffix, so tag selection alone
+/// decides what this rustc's publish touches — another rustc's tags are
+/// never pulled, and `--full` stays inside the same scope.
 async fn export_pass<P, R>(
     tags: &[String],
     pull_prev: P,
@@ -506,40 +542,44 @@ where
         .values()
         .flat_map(|slice| slice.folded.iter().map(String::as_str))
         .collect();
-    let mut missing: Vec<&str> = tags
+    // Per-build tags make a rebuilt task's artifact a tag no folded set
+    // names. The pull order feeds the row-key dedup —
+    // later rows win — so for one task hash the greater build folds
+    // last and the newest build's row survives; a tag with no build
+    // suffix, the shape every build of a task shared before stow#655,
+    // folds before all of them. Across hashes the order is
+    // deterministic by hash. Sorting by the tag string would misorder
+    // run ids: `…-9-1` precedes `…-10-1` numerically, not lexically.
+    let mut missing: Vec<(&str, Option<stow_types::records::BuildRun>, &str)> = tags
         .iter()
-        .filter(|tag| {
-            records_tag_rustc(tag) == Some(rustc.as_str())
-                && (full || !folded_union.contains(tag.as_str()))
+        .filter_map(|tag| {
+            let parsed = parse_records_tag(tag)?;
+            (parsed.rustc_version == rustc.as_str()
+                && (full || !folded_union.contains(tag.as_str())))
+            .then_some((parsed.task_hash, parsed.build, tag.as_str()))
         })
-        .map(String::as_str)
         .collect();
-    // Tag order feeds the dedup — sort so a re-run's record is
-    // deterministic regardless of listing order.
     missing.sort_unstable();
     let pulled_count = missing.len();
     let mut new_rows: BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity> = BTreeMap::new();
     let mut new_folded: BTreeMap<(TargetTriple, WireRustcVersion), BTreeSet<String>> =
         BTreeMap::new();
     let mut new_records: Vec<ArtifactRecord> = Vec::new();
-    let per_tag = futures_util::stream::iter(missing.iter().copied().map(&pull_records))
+    let per_tag = futures_util::stream::iter(missing.iter().map(|entry| pull_records(entry.2)))
         .buffered(RECORDS_PULL_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
-    for (tag, records) in missing.iter().zip(per_tag) {
+    for ((_, _, tag), records) in missing.iter().zip(per_tag) {
         // The tag joins the folded set of every slice its records name;
-        // records are write-once per task, so the tag is never pulled
-        // again once marked — including an artifact whose rows are all
-        // still unbundled.
+        // a records artifact is immutable per build, so the tag is never
+        // pulled again once marked — including an artifact whose rows
+        // are all still unbundled.
         let mut named = BTreeSet::new();
         for record in &records {
             let key = (record.target.clone(), record.rustc_version.clone());
             named.insert(key.clone());
             if let Some(row) = record_to_index_row(record) {
-                new_rows
-                    .entry(key)
-                    .or_default()
-                    .insert((row.c_metadata.as_str().to_owned(), row.unit_shape), row);
+                fold_row(new_rows.entry(key).or_default(), row);
             }
         }
         for key in named {
@@ -559,8 +599,10 @@ where
 }
 
 /// Fold the new records into the previous slices: previous rows first,
-/// new rows winning the dedup-by-`(c_metadata, unit_shape)`
-/// `records_into_slices` applies, and the folded set growing by every
+/// then each new row through [`fold_row`] — a rebuilt unit replaces its
+/// node's row, a second node publishing the same unit adds a row beside
+/// it, and an incoming identified row retires the slice's identity-less
+/// archive row of the same unit — and the folded set growing by every
 /// tag a record named. `generated_at` is stamped once so every slice of
 /// the pass matches.
 fn merge_exports(
@@ -578,24 +620,19 @@ fn merge_exports(
         let mut merged: RowsByIdentity = prev_slice
             .as_ref()
             .map(|slice| {
-                slice
-                    .index
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        (
-                            (row.c_metadata.as_str().to_owned(), row.unit_shape),
-                            row.clone(),
-                        )
-                    })
-                    .collect()
+                let mut rows = RowsByIdentity::new();
+                for row in &slice.index.rows {
+                    fold_row(&mut rows, row.clone());
+                }
+                rows
             })
             .unwrap_or_default();
-        // A re-run task rebuilding the same unit wins — the same dedup
-        // by `(c_metadata, unit_shape)` `records_into_slices` applies.
+        // New rows fold on top of the slice's own: a re-run task
+        // rebuilding the same unit under the same node replaces its
+        // row, and the sibling rule holds across the pass boundary.
         if let Some(rows) = new_rows.get(key) {
-            for (row_key, row) in rows {
-                merged.insert(row_key.clone(), row.clone());
+            for row in rows.values() {
+                fold_row(&mut merged, row.clone());
             }
         }
         let mut folded: BTreeSet<String> = prev_slice
@@ -684,7 +721,8 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
     let base = registry_base()?;
-    let session = base.session();
+    let http = stow_oci::RegistryHttp::new().await?;
+    let session = base.session(&http);
     let trust = records_trust().await?;
     let mut tags = session
         .list_tags()
@@ -911,36 +949,44 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
     let tag = index_tag(&target, &rustc_version);
     let ftag = folded_tag(&target, &rustc_version);
 
-    let (manifest_digest, outcome) = if let Ok(private_key_path) =
-        std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV)
-    {
-        publish_index_mock(&args.file, &args.folded, &private_key_path).await?
-    } else {
-        let credentials = stow_oci::RegistryCredentials::from_env()?;
-        let outcome =
-            stow_oci::publish_index(&credentials, &bytes, &target, &rustc_version, &sha256).await?;
-        // The folded set publishes under the same identity in the
-        // same step — the export that follows only ever sees pairs
-        // this command pushed.
-        stow_oci::publish_folded(
-            &credentials,
-            &serde_json::to_vec(&folded)?,
-            &target,
-            &rustc_version,
-        )
-        .await?;
-        match outcome {
-            stow_oci::IndexPublishOutcome::Published { manifest_digest } => {
-                (manifest_digest, "published")
+    let (manifest_digest, outcome) =
+        if let Ok(private_key_path) = std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV) {
+            publish_index_mock(&args.file, &args.folded, &private_key_path).await?
+        } else {
+            let credentials = stow_oci::RegistryCredentials::from_env()?;
+            let http = stow_oci::RegistryHttp::new().await?;
+            let outcome = stow_oci::publish_index(
+                &credentials,
+                &http,
+                &bytes,
+                &target,
+                &rustc_version,
+                &sha256,
+            )
+            .await?;
+            // The folded set publishes under the same identity in the
+            // same step — the export that follows only ever sees pairs
+            // this command pushed.
+            stow_oci::publish_folded(
+                &credentials,
+                &http,
+                &serde_json::to_vec(&folded)?,
+                &target,
+                &rustc_version,
+            )
+            .await?;
+            match outcome {
+                stow_oci::IndexPublishOutcome::Published { manifest_digest } => {
+                    (manifest_digest, "published")
+                }
+                stow_oci::IndexPublishOutcome::Unchanged { manifest_digest } => {
+                    (manifest_digest, "unchanged")
+                }
+                stow_oci::IndexPublishOutcome::Resigned { manifest_digest } => {
+                    (manifest_digest, "resigned")
+                }
             }
-            stow_oci::IndexPublishOutcome::Unchanged { manifest_digest } => {
-                (manifest_digest, "unchanged")
-            }
-            stow_oci::IndexPublishOutcome::Resigned { manifest_digest } => {
-                (manifest_digest, "resigned")
-            }
-        }
-    };
+        };
     tracing::info!(%tag, %ftag, %manifest_digest, outcome, "published artifact index slice");
     let line = serde_json::to_string(&IndexPublishSummary {
         tag,
@@ -1154,12 +1200,25 @@ mod tests {
         CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson,
     };
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
-    use stow_types::records::records_tag;
+    use stow_types::records::{BuildRun, records_tag};
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.88.0";
     /// A second rustc's tags the pass must never pull.
     const OTHER_RUSTC: &str = "1.99.0";
+
+    /// The run identity an ordinary build's records tag carries.
+    const BUILD: BuildRun = BuildRun {
+        run_id: 1,
+        run_attempt: 1,
+    };
+
+    fn build(run_id: u64) -> BuildRun {
+        BuildRun {
+            run_id,
+            run_attempt: 1,
+        }
+    }
 
     fn record(task_id: &str) -> ArtifactRecord {
         let c_metadata = CMetadata::parse(task_id).expect("c_metadata");
@@ -1185,7 +1244,7 @@ mod tests {
             version: CrateVersion::new(Version::new(1, 0, 0)),
             features_json: FeaturesJson::canonicalize(vec![]).expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
-            oci_reference: format!("{GHCR_BASE}:{}", records_tag(RUSTC, task_id)),
+            oci_reference: format!("{GHCR_BASE}:{}", records_tag(RUSTC, task_id, BUILD)),
             oci_digest: "sha256:deadbeef".to_owned(),
             has_native: false,
             artifact_kind: ArtifactKind::Rlib,
@@ -1238,7 +1297,7 @@ mod tests {
             .flat_map(|rustc| {
                 ["aaaa1111", "bbbb2222", "cccc3333", "dddd4444", "eeee5555"]
                     .iter()
-                    .map(move |id| (records_tag(rustc, id), (*id).to_owned()))
+                    .map(move |id| (records_tag(rustc, id, BUILD), (*id).to_owned()))
             })
             .collect();
         let pull_records = |tag: &str| {
@@ -1252,7 +1311,7 @@ mod tests {
             index: prev_index(prev_rows, 7),
             folded: prior
                 .iter()
-                .map(|r| records_tag(RUSTC, r.c_metadata.as_str()))
+                .map(|r| records_tag(RUSTC, r.c_metadata.as_str(), BUILD))
                 .collect(),
         };
         let folded_prev: Vec<String> = prev.folded.iter().cloned().collect();
@@ -1288,14 +1347,14 @@ mod tests {
             folded_tag_name.clone(),
             index_tag(TARGET, OTHER_RUSTC),
             folded_tag(TARGET, OTHER_RUSTC),
-            records_tag(OTHER_RUSTC, "eeee5555"),
+            records_tag(OTHER_RUSTC, "eeee5555", BUILD),
             index_tag(TARGET, "1.98.0"),
         ]
         .into_iter()
         .chain(folded_prev)
         .chain(
             new.iter()
-                .map(|r| records_tag(RUSTC, r.c_metadata.as_str())),
+                .map(|r| records_tag(RUSTC, r.c_metadata.as_str(), BUILD)),
         )
         .collect();
         let pass = block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
@@ -1305,8 +1364,8 @@ mod tests {
         assert_eq!(
             pulled,
             vec![
-                records_tag(RUSTC, "cccc3333"),
-                records_tag(RUSTC, "dddd4444")
+                records_tag(RUSTC, "cccc3333", BUILD),
+                records_tag(RUSTC, "dddd4444", BUILD)
             ],
         );
         assert_eq!(
@@ -1340,7 +1399,7 @@ mod tests {
         // The tag's digest is one-way — model the registry's
         // tag→task-id lookup the same way the gate test does.
         let ids_by_tag = std::sync::Arc::new(BTreeMap::from([(
-            records_tag(RUSTC, "aaaa1111"),
+            records_tag(RUSTC, "aaaa1111", BUILD),
             "aaaa1111".to_owned(),
         )]));
         let pull_records = {
@@ -1362,7 +1421,7 @@ mod tests {
         };
         // One records artifact for TARGET only; no folded/index pairs
         // exist at all — the first publish of a fresh registry.
-        let tags = vec![records_tag(RUSTC, "aaaa1111")];
+        let tags = vec![records_tag(RUSTC, "aaaa1111", BUILD)];
         let pass = block_on(export_pass(&tags, no_prev, pull_records, false, &rustc))
             .expect("export pass");
         let mut emitted: Vec<&str> = pass.slices.iter().map(|s| s.target.as_str()).collect();
@@ -1398,7 +1457,7 @@ mod tests {
                     ),
                     PrevSlice {
                         index: prev_index(vec![], 1),
-                        folded: [records_tag(RUSTC, "aaaa1111")].into(),
+                        folded: [records_tag(RUSTC, "aaaa1111", BUILD)].into(),
                     },
                 )))
             })
@@ -1407,7 +1466,7 @@ mod tests {
         let tags: Vec<String> = CI_TARGET_TRIPLES
             .iter()
             .map(|target| folded_tag(target, RUSTC))
-            .chain(std::iter::once(records_tag(RUSTC, "aaaa1111")))
+            .chain(std::iter::once(records_tag(RUSTC, "aaaa1111", BUILD)))
             .collect();
         let pull_records = move |tag: &str| {
             let task_id = ids_by_tag.get(&tag.to_owned()).expect("known tag").clone();
@@ -1418,6 +1477,459 @@ mod tests {
             .expect("export pass");
         assert!(pass.slices.is_empty(), "nothing new emits nothing");
         assert_eq!(pass.pulled, 0);
+    }
+
+    /// The future a `pull_prev` half returns.
+    type PrevPull = PullFut<'static, Option<((TargetTriple, WireRustcVersion), PrevSlice)>>;
+
+    /// A `pull_prev` half for a pass with no published slices at all.
+    fn no_prev(_tag: &str) -> PrevPull {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// A rebuilt task publishes under its own tag — a build-2 artifact
+    /// no folded set names — so the pass pulls exactly it, and its rows
+    /// replace build 1's at the same row key.
+    /// Before stow#655 the rebuild overwrote build 1's tag and no pass
+    /// ever pulled it.
+    #[test]
+    fn a_rebuilt_tasks_new_build_tag_is_pulled_and_replaces_the_old_row() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let folded_tag_name = folded_tag(TARGET, RUSTC);
+        // Build 1's record, already folded; build 2 rebuilt the same
+        // unit — same c_metadata, a different bundle behind it.
+        let mut first = record("aaaa1111");
+        first.bundle_size = 1;
+        let mut second = record("aaaa1111");
+        second.bundle_size = 2;
+        let prev = PrevSlice {
+            index: prev_index(
+                vec![record_to_index_row(&first).expect("bundled record")],
+                7,
+            ),
+            folded: [records_tag(RUSTC, "aaaa1111", build(1))].into(),
+        };
+        let pull_prev = {
+            let folded_tag_name = folded_tag_name.clone();
+            move |tag: &str| {
+                let got = if tag == folded_tag_name {
+                    Some((
+                        (
+                            TargetTriple::parse(TARGET).expect("t"),
+                            WireRustcVersion::parse(RUSTC).expect("r"),
+                        ),
+                        PrevSlice {
+                            index: prev.index.clone(),
+                            folded: prev.folded.clone(),
+                        },
+                    ))
+                } else {
+                    None
+                };
+                Box::pin(async move { Ok(got) })
+                    as PullFut<'static, Option<((TargetTriple, WireRustcVersion), PrevSlice)>>
+            }
+        };
+        let pulled = Mutex::new(Vec::<String>::new());
+        let pull_records = |tag: &str| {
+            pulled.lock().unwrap().push(tag.to_owned());
+            let second = second.clone();
+            Box::pin(async move { Ok(vec![second]) }) as PullFut<'static, Vec<ArtifactRecord>>
+        };
+        let build2_tag = records_tag(RUSTC, "aaaa1111", build(2));
+        let tags: Vec<String> = vec![
+            folded_tag_name,
+            records_tag(RUSTC, "aaaa1111", build(1)),
+            build2_tag.clone(),
+        ];
+        let pass = block_on(export_pass(&tags, pull_prev, pull_records, false, &rustc))
+            .expect("export pass");
+        assert_eq!(pass.pulled, 1);
+        assert_eq!(pulled.into_inner().unwrap(), vec![build2_tag]);
+        let slice = pass
+            .slices
+            .iter()
+            .find(|s| s.target.as_str() == TARGET)
+            .expect("slice emitted");
+        let row = slice
+            .index
+            .rows
+            .iter()
+            .find(|row| row.c_metadata.as_str() == "aaaa1111")
+            .expect("row");
+        assert_eq!(row.bundle_size, 2, "build 2's row replaced build 1's");
+        assert_eq!(slice.folded.len(), 2, "both builds' tags are folded");
+    }
+
+    /// Two builds of one task pulled in the same pass fold in build
+    /// order regardless of listing order — `…-9-1` precedes `…-10-1`
+    /// numerically, never by tag string — so the newest build's row
+    /// wins the row-key dedup.
+    #[test]
+    fn later_builds_fold_last_for_one_task() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let pull_records = |tag: &str| {
+            let tag = tag.to_owned();
+            Box::pin(async move {
+                let build = parse_records_tag(&tag).expect("records tag").build;
+                let mut record = record("aaaa1111");
+                record.bundle_size = build.map_or(0, |build| build.run_id);
+                Ok(vec![record])
+            }) as PullFut<'static, Vec<ArtifactRecord>>
+        };
+        // The listing hands the pass run 10's tag before run 9's.
+        let tags = vec![
+            records_tag(RUSTC, "aaaa1111", build(10)),
+            records_tag(RUSTC, "aaaa1111", build(9)),
+        ];
+        let pass = block_on(export_pass(&tags, no_prev, pull_records, false, &rustc))
+            .expect("export pass");
+        assert_eq!(pass.pulled, 2);
+        let slice = pass
+            .slices
+            .iter()
+            .find(|s| s.target.as_str() == TARGET)
+            .expect("slice emitted");
+        let rows: Vec<_> = slice
+            .index
+            .rows
+            .iter()
+            .filter(|row| row.c_metadata.as_str() == "aaaa1111")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bundle_size, 10, "run 10's row folded last");
+    }
+
+    /// A tag with no build suffix — what every build published before
+    /// stow#655 — is still a records artifact: a pass that no folded set
+    /// excuses from it pulls it, and it folds before every named build
+    /// of its task, so the named build's row is the one that survives.
+    #[test]
+    fn a_tag_without_a_build_folds_before_its_tasks_named_builds() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let named = records_tag(RUSTC, "aaaa1111", build(3));
+        let unnamed = named
+            .strip_suffix("-3-1")
+            .expect("the named tag ends in its build")
+            .to_owned();
+        let pull_records = |tag: &str| {
+            let tag = tag.to_owned();
+            Box::pin(async move {
+                let build = parse_records_tag(&tag).expect("records tag").build;
+                let mut record = record("aaaa1111");
+                record.bundle_size = build.map_or(0, |build| build.run_id);
+                Ok(vec![record])
+            }) as PullFut<'static, Vec<ArtifactRecord>>
+        };
+        for full in [false, true] {
+            let pass = block_on(export_pass(
+                &[named.clone(), unnamed.clone()],
+                no_prev,
+                pull_records,
+                full,
+                &rustc,
+            ))
+            .expect("export pass");
+            assert_eq!(pass.pulled, 2);
+            let slice = pass
+                .slices
+                .iter()
+                .find(|slice| slice.target.as_str() == TARGET)
+                .expect("slice emitted");
+            let rows: Vec<_> = slice
+                .index
+                .rows
+                .iter()
+                .filter(|row| row.c_metadata.as_str() == "aaaa1111")
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].bundle_size, 3, "the named build folded last");
+        }
+    }
+
+    /// The `pull_prev` injection's answer — the slice key and its
+    /// published pair, or `None` when the folded tag is not the pass's.
+    type PrevPullOut = Option<((TargetTriple, WireRustcVersion), PrevSlice)>;
+
+    /// A records pull answering `tag` with `by_tag`'s entry — each
+    /// `records-*` tag the test's registry listing names maps to the
+    /// records artifact it stands for.
+    fn pull_records_by_tag(
+        by_tag: BTreeMap<String, Vec<ArtifactRecord>>,
+    ) -> impl Fn(&str) -> PullFut<'static, Vec<ArtifactRecord>> + Send + Sync {
+        move |tag: &str| {
+            let records = by_tag
+                .get(tag)
+                .unwrap_or_else(|| panic!("unknown records tag {tag}"))
+                .clone();
+            Box::pin(async move { Ok(records) }) as PullFut<'static, Vec<ArtifactRecord>>
+        }
+    }
+
+    /// A prev pull answering `folded.<TARGET>.<RUSTC>` with `prev` and
+    /// every other folded tag with `None`.
+    fn pull_only_prev(
+        index: ArtifactIndex,
+        folded: BTreeSet<String>,
+    ) -> impl Fn(&str) -> PullFut<'static, PrevPullOut> + Send + Sync {
+        let folded_name = folded_tag(TARGET, RUSTC);
+        move |tag: &str| {
+            let got = (tag == folded_name).then(|| {
+                (
+                    (
+                        TargetTriple::parse(TARGET).expect("target"),
+                        WireRustcVersion::parse(RUSTC).expect("rustc"),
+                    ),
+                    PrevSlice {
+                        index: index.clone(),
+                        folded: folded.clone(),
+                    },
+                )
+            });
+            Box::pin(async move { Ok(got) }) as PullFut<'static, PrevPullOut>
+        }
+    }
+
+    /// No published pairs — a first-publish registry.
+    fn pull_no_prev() -> impl Fn(&str) -> PullFut<'static, PrevPullOut> + Send + Sync {
+        |_tag| Box::pin(async move { Ok(None) }) as PullFut<'static, PrevPullOut>
+    }
+
+    /// A second publish of the `aaaa1111` unit — the same `c_metadata`
+    /// and `unit_shape`, under `deps`' dependency context. stow#657: two
+    /// nodes differing only in context compile to the same unit.
+    fn shared_unit_record(deps: &[&str]) -> ArtifactRecord {
+        let mut record = record("aaaa1111");
+        record.dependency_identity = Some(
+            stow_types::identity::DependencyIdentity::from_task_ids(deps.iter().copied())
+                .expect("dependency identity"),
+        );
+        record
+    }
+
+    /// The `aaaa1111` unit as an archive record — a row registered
+    /// before stow#588 carries no dependency identity.
+    fn archive_unit_record() -> ArtifactRecord {
+        let mut record = record("aaaa1111");
+        record.dependency_identity = None;
+        record
+    }
+
+    /// The slice `export_pass` emitted for `TARGET`.
+    fn target_slice(pass: &ExportPass) -> &SliceExport {
+        pass.slices
+            .iter()
+            .find(|slice| slice.target.as_str() == TARGET)
+            .expect("TARGET slice")
+    }
+
+    /// stow#657: two nodes differing only in dependency context publish
+    /// the same `(c_metadata, unit_shape)` unit — the fold keeps a row
+    /// for each rather than letting the second node's record replace
+    /// the first's, and the emitted order sorts them by their
+    /// dependency identity.
+    #[test]
+    fn two_nodes_publishing_one_unit_keep_a_row_each() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let left = shared_unit_record(&["dep-left"]);
+        let right = shared_unit_record(&["dep-right"]);
+        let tags = [
+            records_tag(RUSTC, "bbbb2222", BUILD),
+            records_tag(RUSTC, "cccc3333", BUILD),
+        ];
+        let by_tag = BTreeMap::from([
+            (tags[0].clone(), vec![left.clone()]),
+            (tags[1].clone(), vec![right.clone()]),
+        ]);
+        let pass = block_on(export_pass(
+            &tags,
+            pull_no_prev(),
+            pull_records_by_tag(by_tag),
+            false,
+            &rustc,
+        ))
+        .expect("export pass");
+        let rows = &target_slice(&pass).index.rows;
+        assert_eq!(rows.len(), 2);
+        let left_identity = left.dependency_identity.expect("left identity");
+        let right_identity = right.dependency_identity.expect("right identity");
+        let identities: Vec<_> = rows
+            .iter()
+            .map(|row| row.dependency_identity.clone().expect("identified row"))
+            .collect();
+        assert_eq!(
+            identities.iter().collect::<BTreeSet<_>>(),
+            [&left_identity, &right_identity].into_iter().collect(),
+            "both nodes keep a row"
+        );
+        assert!(
+            identities[0] < identities[1],
+            "rows of one unit order by dependency identity"
+        );
+    }
+
+    /// The same fold across the pass boundary: the first node's row is
+    /// already in the published slice, the second node's record arrives
+    /// in this pass — the slice gains a row beside the existing one and
+    /// leaves it untouched.
+    #[test]
+    fn a_second_nodes_row_lands_beside_the_previous_slices() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let left = shared_unit_record(&["dep-left"]);
+        let right = shared_unit_record(&["dep-right"]);
+        let left_row = record_to_index_row(&left).expect("left row");
+        let right_row = record_to_index_row(&right).expect("right row");
+        let prev = prev_index(vec![left_row.clone()], 7);
+        let tags = vec![
+            folded_tag(TARGET, RUSTC),
+            records_tag(RUSTC, "cccc3333", BUILD),
+        ];
+        let by_tag = BTreeMap::from([(tags[1].clone(), vec![right])]);
+        let pass = block_on(export_pass(
+            &tags,
+            pull_only_prev(prev, [records_tag(RUSTC, "bbbb2222", BUILD)].into()),
+            pull_records_by_tag(by_tag),
+            false,
+            &rustc,
+        ))
+        .expect("export pass");
+        let slice = target_slice(&pass);
+        assert_eq!(slice.index.header.generation, 8);
+        let rows = &slice.index.rows;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&left_row), "the earlier row is untouched");
+        assert!(rows.contains(&right_row), "the second node's row landed");
+    }
+
+    /// An identity-less archive row and an identified row of the same
+    /// unit may meet either way — the archive record arriving first in
+    /// the pass or second — and either way only the identified row
+    /// survives, since it is the row that answers a contextual
+    /// question. The same holds when the archive row is already in the
+    /// published slice. An archive row with no identified sibling
+    /// stays as it is.
+    #[test]
+    fn an_identified_row_retires_its_units_identity_less_row() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let identified = shared_unit_record(&["dep-a"]);
+        let identified_identity = identified.dependency_identity.clone().expect("identified");
+        let mut tags = [
+            records_tag(RUSTC, "bbbb2222", BUILD),
+            records_tag(RUSTC, "cccc3333", BUILD),
+        ];
+        tags.sort_unstable();
+        for archive_first in [true, false] {
+            let (first, second) = if archive_first {
+                (archive_unit_record(), identified.clone())
+            } else {
+                (identified.clone(), archive_unit_record())
+            };
+            let by_tag = BTreeMap::from([
+                (tags[0].clone(), vec![first]),
+                (tags[1].clone(), vec![second]),
+            ]);
+            let pass = block_on(export_pass(
+                &tags,
+                pull_no_prev(),
+                pull_records_by_tag(by_tag),
+                false,
+                &rustc,
+            ))
+            .expect("export pass");
+            let rows = &target_slice(&pass).index.rows;
+            assert_eq!(rows.len(), 1, "archive_first={archive_first}");
+            assert_eq!(
+                rows[0].dependency_identity.as_ref(),
+                Some(&identified_identity),
+                "archive_first={archive_first}"
+            );
+        }
+
+        // The archive row already sits in the published slice; the
+        // identified record's pass retires it.
+        let archive_row = record_to_index_row(&archive_unit_record()).expect("archive row");
+        let prev = prev_index(vec![archive_row], 7);
+        let tags = vec![
+            folded_tag(TARGET, RUSTC),
+            records_tag(RUSTC, "cccc3333", BUILD),
+        ];
+        let by_tag = BTreeMap::from([(tags[1].clone(), vec![identified])]);
+        let pass = block_on(export_pass(
+            &tags,
+            pull_only_prev(prev, [records_tag(RUSTC, "bbbb2222", BUILD)].into()),
+            pull_records_by_tag(by_tag),
+            false,
+            &rustc,
+        ))
+        .expect("export pass");
+        let rows = &target_slice(&pass).index.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].dependency_identity.as_ref(),
+            Some(&identified_identity)
+        );
+
+        // An archive row with no identified sibling stays.
+        let tags = [records_tag(RUSTC, "bbbb2222", BUILD)];
+        let by_tag = BTreeMap::from([(tags[0].clone(), vec![archive_unit_record()])]);
+        let pass = block_on(export_pass(
+            &tags,
+            pull_no_prev(),
+            pull_records_by_tag(by_tag),
+            false,
+            &rustc,
+        ))
+        .expect("export pass");
+        let rows = &target_slice(&pass).index.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].dependency_identity, None);
+    }
+
+    /// The membership the export reports to the scheduler covers both
+    /// nodes of a shared unit — the second node's row is semantic slice
+    /// membership like the first's, not a duplicate.
+    #[test]
+    fn semantic_rows_reports_each_node_of_a_shared_unit() {
+        let left = record_to_index_row(&shared_unit_record(&["dep-left"])).expect("left row");
+        let right = record_to_index_row(&shared_unit_record(&["dep-right"])).expect("right row");
+        let index = prev_index(vec![left.clone(), right.clone()], 3);
+        let rows = semantic_rows(&index);
+        assert_eq!(rows.len(), 2);
+        let identities: BTreeSet<_> = rows
+            .iter()
+            .map(|row| row.dependency_identity.clone())
+            .collect();
+        assert!(identities.contains(left.dependency_identity.as_ref().expect("left")));
+        assert!(identities.contains(right.dependency_identity.as_ref().expect("right")));
+    }
+
+    /// The publish delta already diffs on the dependency identity: a
+    /// pass that adds a second node's row for a unit the slice already
+    /// serves under another context reports exactly that row as added
+    /// and retires nothing.
+    #[test]
+    fn a_second_nodes_row_reports_as_a_pure_addition() {
+        let left = record_to_index_row(&shared_unit_record(&["dep-left"])).expect("left row");
+        let right = record_to_index_row(&shared_unit_record(&["dep-right"])).expect("right row");
+        let right_identity = right.dependency_identity.clone().expect("right identity");
+        let previous = semantic_rows(&prev_index(vec![left.clone()], 7));
+        let current = semantic_rows(&prev_index(vec![left, right], 8));
+        assert_eq!(previous.len(), 1);
+        assert_eq!(current.len(), 2);
+        let current_keys: std::collections::BTreeSet<_> = current.iter().map(row_key).collect();
+        let previous_keys: std::collections::BTreeSet<_> = previous.iter().map(row_key).collect();
+        let added: Vec<_> = current
+            .iter()
+            .filter(|row| !previous_keys.contains(&row_key(row)))
+            .collect();
+        assert!(
+            !previous
+                .iter()
+                .any(|row| !current_keys.contains(&row_key(row))),
+            "nothing is retired"
+        );
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].dependency_identity, right_identity);
     }
 
     /// A path whose `.prev` sidecar provably does not exist.
@@ -1521,7 +2033,7 @@ mod tests {
     /// makes.
     #[test]
     fn the_signature_binds_the_canonical_reference_not_the_transport() {
-        let tag = records_tag(RUSTC, "aaaa1111");
+        let tag = records_tag(RUSTC, "aaaa1111", BUILD);
         let digest = "sha256:deadbeef";
         let payload = serde_json::to_vec(&serde_json::json!({
             "critical": {

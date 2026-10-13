@@ -104,7 +104,7 @@ A `rustc` wrapper installed on the user's machine, similar to sccache. When Carg
 
 The CLI resolves artifact identities against a locally cached, cryptographically verified index — the dependency graph is never sent anywhere for a lookup. The only graph that leaves the machine is the *miss* set posted to `/api/v1/admissions`, and only when the index could not cover it.
 
-Cached artifacts are materialized into Cargo's target directory with `reflink-or-copy` by default: APFS and other clone-capable filesystems share bytes with the local stow cache, while filesystems without clone support fall back to a real copy. For target directories that should hold links back to the stow cache instead, set `STOW_CACHED_ARTIFACT_MATERIALIZATION=symlink`.
+Cached artifacts are materialized into Cargo's target directory as a reflink where the filesystem clones — APFS and other clone-capable filesystems share bytes with the local stow cache — and as a real copy where it does not.
 
 ### Edge (`edge/`)
 
@@ -135,7 +135,7 @@ The trusted build runner, hosted on GitHub Actions. This is the root of trust �
 1. Receives the task as a `workflow_dispatch` input from the scheduler.
 2. `build` job (read-only token, no secrets): builds the crate with the specified features, target, and rustc version, and hands the outputs over as a workflow artifact. Third-party build scripts run here and nowhere else.
 3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them with cosign.
-4. Pushes the task's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed run to the edge, which verifies the records artifact exists before the scheduler dispatches the next queued task.
+4. Pushes the build's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed run to the edge, which verifies the records artifact exists before the scheduler dispatches the next queued task.
 
 ### Admin (`admin/`)
 

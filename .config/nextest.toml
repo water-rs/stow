@@ -1,0 +1,9 @@
+# The pre-cargo window gate compares two wall clocks to within a few
+# milliseconds: time until cargo's first `Compiling` line under cargo and
+# under stow. Work stow overlaps with cargo's startup is free only while
+# a core is free; on a machine whose every core runs another test it is
+# serial, and the gate measures the scheduler instead of stow. It
+# therefore holds every test thread while it runs (stow#608).
+[[profile.default.overrides]]
+filter = 'binary(never_slower_than_cargo) and test(=an_all_miss_build_is_never_slower_than_cargo)'
+threads-required = "num-cpus"

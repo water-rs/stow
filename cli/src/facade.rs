@@ -103,9 +103,13 @@ impl ServeMap {
     }
 
     /// Any coverage at all, exact or wildcard: the empty map is the
-    /// build that provably has nothing to serve yet — nothing local, no
-    /// cached slice — so a `pending` map names nothing to wait on
-    /// (stow#347).
+    /// build that provably has nothing to serve yet — no locally stored
+    /// unit this build could compile, no covered index row — so a
+    /// `pending` map names nothing to wait on (stow#347). Local
+    /// coverage does not wait on a cached unit graph: the lockfile's
+    /// registry packages name the build's units when no graph is on
+    /// disk (stow#617), and a lockfile cargo has not written yet names
+    /// none — the local half is then empty, not an error (stow#608).
     pub const fn is_empty(&self) -> bool {
         self.target.is_empty() && self.host.is_empty()
     }
@@ -186,16 +190,7 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
         return Ok(FastPath::Defer);
     }
     let mut wrapped_args = args.get(3..).map(<[_]>::to_vec).unwrap_or_default();
-    if let Some(encoded) = std::env::var_os(rustc_args::STOW_RUSTC_EXTRA_ARGS_ENV)
-        .and_then(|value| value.into_string().ok())
-    {
-        wrapped_args.extend(
-            encoded
-                .split('\x1f')
-                .filter(|arg| !arg.is_empty())
-                .map(OsString::from),
-        );
-    }
+    wrapped_args.extend(rustc_args::extra_args_from_env()?);
     let Ok(parsed) = ParsedRustcArgs::parse(&wrapped_args) else {
         return Ok(FastPath::Defer);
     };
@@ -245,36 +240,21 @@ fn run_uncovered(
     executable: &OsString,
     wrapped_args: &[OsString],
 ) -> stow_types::error::Result<i32> {
-    let out_dir = std::env::var_os("OUT_DIR");
     let mut wire = connect(endpoint).map_err(|error| stow_types::stow_error!("{error}"))?;
     // The mark a `Compile` decision writes before rustc runs: dependents
     // plan only after this unit's metadata lands, so the file is on disk
     // before the frame that could consult it. (stow's own identity is
     // insensitive to provenance; an artifact compiled against CI's copy of
     // a locally-built crate links against the wrong copy.)
-    write_observed(
-        &mut wire,
-        token,
-        executable,
-        wrapped_args,
-        out_dir.as_deref(),
-        None,
-    )
-    .map_err(|error| stow_types::stow_error!("{error}"))?;
+    write_observed(&mut wire, token, executable, wrapped_args, None)
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
     let status = std::process::Command::new(executable)
         .args(wrapped_args)
         .status()
         .wrap_err("failed to spawn wrapped compiler")?;
     let success = status.success();
-    write_observed(
-        &mut wire,
-        token,
-        executable,
-        wrapped_args,
-        out_dir.as_deref(),
-        Some(success),
-    )
-    .map_err(|error| stow_types::stow_error!("{error}"))?;
+    write_observed(&mut wire, token, executable, wrapped_args, Some(success))
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -353,7 +333,7 @@ fn await_serve_map_within(
 /// included — drops the waiter's connection the same way (stow#347).
 #[derive(Debug)]
 pub struct ServeMapSignal {
-    ready: tokio::sync::watch::Sender<bool>,
+    latch: crate::Latch,
 }
 
 impl ServeMapSignal {
@@ -361,7 +341,7 @@ impl ServeMapSignal {
     #[must_use]
     pub fn pending() -> Self {
         Self {
-            ready: tokio::sync::watch::channel(false).0,
+            latch: crate::Latch::pending(),
         }
     }
 
@@ -369,23 +349,23 @@ impl ServeMapSignal {
     /// pending map to wait on gives.
     #[must_use]
     pub fn settled() -> Self {
-        Self {
-            ready: tokio::sync::watch::channel(true).0,
-        }
+        let signal = Self::pending();
+        signal.complete();
+        signal
     }
 
-    /// The final map has landed: release every waiter.
+    /// The final map has landed: release every waiter, the ones already
+    /// parked and the ones that have not asked yet.
     pub fn complete(&self) {
-        let _ = self.ready.send(true);
+        self.latch.complete();
     }
 
-    /// Wait for [`Self::complete`], or for the signal's own end: a
-    /// sender that is gone resolves the same wait a completed one does.
+    /// Wait for [`Self::complete`], whether the completion lands before
+    /// or after the wait starts. A signal nobody completes resolves
+    /// nothing — a dropped one drops the waiter's connection with it
+    /// (stow#347), so the latch need not resolve on its own.
     pub async fn wait(&self) {
-        let mut receiver = self.ready.subscribe();
-        if !*receiver.borrow() {
-            let _ = receiver.changed().await;
-        }
+        self.latch.wait().await;
     }
 }
 
@@ -533,14 +513,12 @@ fn write_observed(
     token: &str,
     executable: &OsString,
     wrapped_args: &[OsString],
-    out_dir: Option<&std::ffi::OsStr>,
     success: Option<bool>,
 ) -> std::io::Result<()> {
     let request = Request::Observed(Observed::new(
         token.to_owned(),
         executable,
         wrapped_args,
-        out_dir,
         success,
     ));
     write_request(wire, &request)
@@ -552,6 +530,18 @@ mod tests {
 
     use super::{ServeMap, WILDCARD};
     use crate::supervisor::Endpoint;
+
+    /// The final write can land before any facade has asked: a facade
+    /// that asks afterwards must hear it at once, not wait out its
+    /// timeout on a signal handed to no subscriber.
+    #[tokio::test]
+    async fn a_signal_completed_before_its_first_waiter_still_releases_it() {
+        let signal = super::ServeMapSignal::pending();
+        signal.complete();
+        tokio::time::timeout(std::time::Duration::from_secs(5), signal.wait())
+            .await
+            .expect("a completed signal answers a late waiter at once");
+    }
 
     fn map(target: &[(&str, &str)], host: &[(&str, &str)]) -> ServeMap {
         ServeMap {
@@ -781,5 +771,18 @@ mod tests {
             error.to_string().contains("supervisor token mismatch"),
             "{error}"
         );
+    }
+
+    /// stow#608: a completion that lands before anyone waits still
+    /// releases a waiter that arrives later — the latch stores its
+    /// state with `send_replace`, where `watch::Sender::send` would
+    /// have stored nothing for a receiver that was not yet subscribed.
+    #[tokio::test]
+    async fn a_late_waiter_sees_a_completed_serve_map() {
+        let signal = super::ServeMapSignal::pending();
+        signal.complete();
+        tokio::time::timeout(std::time::Duration::from_secs(5), signal.wait())
+            .await
+            .expect("a waiter after completion returns at once");
     }
 }

@@ -527,6 +527,8 @@ mod tests {
             verify_mode: VerifyMode::GithubCi,
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
+            artifact_cache_staging: std::sync::Arc::default(),
         }
     }
 
@@ -556,24 +558,41 @@ mod tests {
         assert!(tickets.iter().all(|ticket| ticket.nonce == 0));
     }
 
+    /// A budget that scans in no time. The 24-bit fixture's first nonce
+    /// lies far past it.
+    const SMALL_BUDGET: u64 = 1 << 12;
+
     /// The contract the build depends on: draining waits for the solver,
-    /// but the attempt budget bounds the wait — a 24-bit admission would
-    /// take seconds of mining, and the drain returns as soon as the
-    /// budget is spent.
+    /// and the attempt budget bounds the wait. A 24-bit admission asks for
+    /// far more than the budget holds, so the drain returns with the
+    /// budget spent to the last attempt: it waited for the scan, and the
+    /// scan ended where the budget did.
     #[tokio::test]
     async fn drain_is_bounded_by_the_attempt_budget() {
         let config = test_config();
-        let mut collector = AdmissionCollector::default();
+        let mut collector = AdmissionCollector {
+            budget: Arc::new(AtomicU64::new(SMALL_BUDGET)),
+            ..AdmissionCollector::default()
+        };
         collector.record(&config, [test_admission("task-hard", 24)]);
 
-        let start = std::time::Instant::now();
         collector.drain(&config).await;
-        let elapsed = start.elapsed();
 
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "draining the worker took {elapsed:?}"
-        );
+        assert_eq!(collector.budget.load(Ordering::Relaxed), 0);
+    }
+
+    /// The scan never runs past what the budget granted it: the fixture's
+    /// nonce is there to be found by a scan that does, and such a scan
+    /// would charge the budget for more than it held.
+    #[test]
+    fn a_scan_ends_where_the_budget_does() {
+        let budget = AtomicU64::new(SMALL_BUDGET);
+        let batch = [test_admission("task-hard", 24)];
+
+        let tickets = super::solve_all(&batch, &budget, &running());
+
+        assert!(tickets.is_empty());
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
     }
 
     /// And the scan really stops rather than mining on to its bound: a
@@ -584,16 +603,10 @@ mod tests {
         let cancelled = AtomicBool::new(true);
         let batch = [test_admission("task-hard", 24)];
 
-        let start = std::time::Instant::now();
         let tickets = super::solve_all(&batch, &budget, &cancelled);
-        let elapsed = start.elapsed();
 
         assert!(tickets.is_empty());
         assert_eq!(budget.load(Ordering::Relaxed), SOLVE_ATTEMPT_BUDGET);
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "scan took {elapsed:?}"
-        );
     }
 
     #[tokio::test]

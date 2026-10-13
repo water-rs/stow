@@ -2,16 +2,20 @@
 
 use std::ffi::OsString;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::Endpoint;
-use super::protocol::{Answer, Compiled, Plan, Request, read_frame, write_frame};
+use super::protocol::{
+    Answer, ArtifactNotifications, Compiled, Plan, Request, read_frame, write_frame,
+};
 
 /// What the supervisor decided for this invocation.
 #[derive(Debug)]
 pub enum Decision {
-    /// The outputs are already in place; exit 0 without running rustc.
-    Served,
+    /// The outputs are already in place; exit 0 after writing the
+    /// artifact-notification lines cargo is owed to this process's
+    /// stderr (stow#633).
+    Served(ArtifactNotifications),
     /// Run the real rustc, then call [`report`] with its outcome.
     Compile(Ticket),
 }
@@ -59,9 +63,7 @@ impl Connection {
         Ok(Self { stream, token })
     }
 
-    /// Ask what to do with one rustc invocation. `build_script_out_dir` is
-    /// the `OUT_DIR` this invocation's environment carried — per-invocation
-    /// env facts exist only in this process, so they ride the request.
+    /// Ask what to do with one rustc invocation.
     ///
     /// # Errors
     ///
@@ -71,11 +73,10 @@ impl Connection {
         &mut self,
         executable: &std::ffi::OsStr,
         args: &[OsString],
-        build_script_out_dir: Option<&std::ffi::OsStr>,
     ) -> Result<Decision, String> {
-        let plan = Plan::new(self.token.clone(), executable, args, build_script_out_dir);
+        let plan = Plan::new(self.token.clone(), executable, args);
         match self.exchange(&Request::Plan(plan)).await? {
-            Answer::Served => Ok(Decision::Served),
+            Answer::Served(notifications) => Ok(Decision::Served(notifications)),
             Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
             Answer::Recorded | Answer::ServeMapReady => {
                 Err("supervisor answered a plan with an answer that is not a decision".to_owned())
@@ -99,10 +100,28 @@ impl Connection {
         match self.exchange(&Request::Compiled(report)).await? {
             Answer::Recorded => Ok(()),
             Answer::Failed { message } => Err(message),
-            Answer::Served | Answer::Compile { .. } | Answer::ServeMapReady => {
+            Answer::Served(..) | Answer::Compile { .. } | Answer::ServeMapReady => {
                 Err("supervisor answered a report with a plan answer".to_owned())
             }
         }
+    }
+
+    /// End the conversation: send the stream's end and release the
+    /// connection. `std::process::exit` runs no destructor, and a process
+    /// that exits with the loopback connection still open resets it — the
+    /// supervisor then reads an error where the conversation simply
+    /// ended (stow#633).
+    ///
+    /// # Errors
+    ///
+    /// A stream that cannot be shut down.
+    pub async fn close(mut self) -> Result<(), String> {
+        match &mut self.stream {
+            #[cfg(unix)]
+            Stream::Unix(stream) => stream.shutdown().await,
+            Stream::Loopback(stream) => stream.shutdown().await,
+        }
+        .map_err(|error| format!("close the supervisor connection: {error}"))
     }
 
     async fn exchange(&mut self, request: &Request) -> Result<Answer, String> {

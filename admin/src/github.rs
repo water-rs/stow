@@ -3,6 +3,7 @@
 //! token; the edge is not involved.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use stow_types::stow_error;
@@ -24,8 +25,9 @@ pub const BUILD_WORKFLOW: &str = "build-crate.yml";
 pub async fn get<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
+    backoff: Backoff,
 ) -> stow_types::error::Result<T> {
-    get_path(token, &format!("/repos/{REPO}/{path}")).await
+    get_path(token, &format!("/repos/{REPO}/{path}"), backoff).await
 }
 
 /// `GET` an absolute `api.github.com` path (leading `/`) and decode the
@@ -34,9 +36,10 @@ pub async fn get<T: serde::de::DeserializeOwned>(
 pub async fn get_path<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
+    backoff: Backoff,
 ) -> stow_types::error::Result<T> {
     let url = format!("{API_BASE}{path}");
-    get_path_result(token, path)
+    get_path_result(token, path, backoff)
         .await
         .map_err(|error| stow_error!("GET {url}: {error}"))
 }
@@ -49,9 +52,17 @@ pub async fn get_path<T: serde::de::DeserializeOwned>(
 pub async fn get_path_result<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
+    backoff: Backoff,
 ) -> std::result::Result<T, zenwave::Error> {
     let url = format!("{API_BASE}{path}");
-    let response = send_get(Some(token), &url, Some("application/vnd.github+json"), None).await?;
+    let response = send_get(
+        Some(token),
+        &url,
+        Some("application/vnd.github+json"),
+        None,
+        backoff,
+    )
+    .await?;
     Ok(response.error_for_status().await?.into_json().await?)
 }
 
@@ -74,8 +85,9 @@ pub async fn get_conditional<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
     etag: Option<&str>,
+    backoff: Backoff,
 ) -> stow_types::error::Result<Conditional<T>> {
-    get_conditional_result(token, path, etag)
+    get_conditional_result(token, path, etag, backoff)
         .await
         .map_err(|error| stow_error!("GET {API_BASE}/repos/{REPO}/{path}: {error}"))
 }
@@ -87,9 +99,17 @@ pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
     etag: Option<&str>,
+    backoff: Backoff,
 ) -> std::result::Result<Conditional<T>, zenwave::Error> {
     let url = format!("{API_BASE}/repos/{REPO}/{path}");
-    let response = send_get(Some(token), &url, Some("application/vnd.github+json"), etag).await?;
+    let response = send_get(
+        Some(token),
+        &url,
+        Some("application/vnd.github+json"),
+        etag,
+        backoff,
+    )
+    .await?;
     if response.status().as_u16() == 304 {
         drop(response);
         return Ok(Conditional::Unmodified);
@@ -111,8 +131,9 @@ pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
 pub async fn get_url_json<T: serde::de::DeserializeOwned>(
     url: &str,
     token: Option<&str>,
+    backoff: Backoff,
 ) -> stow_types::error::Result<T> {
-    let response = send_get(token, url, None, None)
+    let response = send_get(token, url, None, None, backoff)
         .await
         .map_err(|error| stow_error!("GET {url}: {error}"))?;
     response
@@ -125,19 +146,24 @@ pub async fn get_url_json<T: serde::de::DeserializeOwned>(
 }
 
 /// `GET` `url`, retried on transport errors and transient statuses by
-/// the shared [`Backoff`] policy; `Authorization` rides the request only
+/// the caller's [`Backoff`]; `Authorization` rides the request only
 /// when `token` is `Some`. zenwave delivers an error status as `Err`,
 /// the response inside it — a terminal status is its error without
 /// another attempt, a transient one carries its `Retry-After` hint into
 /// the wait, and a failure that outlives the budget returns as its
-/// final error.
+/// final error. The retried unit is the whole read — request, status
+/// and body: the body is read to completion inside the loop, so a
+/// connection cut mid-body retries like any other transport failure,
+/// and what leaves the loop is a response whose body is already in
+/// memory — a complete body that does not parse is terminal, never a
+/// retry.
 async fn send_get(
     token: Option<&str>,
     url: &str,
     accept: Option<&str>,
     if_none_match: Option<&str>,
+    mut backoff: Backoff,
 ) -> std::result::Result<zenwave::Response, zenwave::Error> {
-    let mut backoff = Backoff::new();
     loop {
         let mut client = zenwave::client();
         let mut request = client.get(url)?.header("User-Agent", USER_AGENT)?;
@@ -154,7 +180,21 @@ async fn send_get(
         };
         let (error, retry_after) = match request.await {
             Ok(response) if !is_transient_status(response.status().as_u16()) => {
-                return Ok(response);
+                // A response cut while its body streams is the same
+                // transport failure a cut request is — buffer the body
+                // inside the loop so the retry covers it, and rebuild
+                // the response over the complete bytes so nothing the
+                // caller reads can still meet the wire.
+                let (parts, body) = response.into_parts();
+                match body.into_bytes().await {
+                    Ok(bytes) => {
+                        return Ok(zenwave::Response::from_parts(
+                            parts,
+                            zenwave::Body::from(bytes),
+                        ));
+                    }
+                    Err(error) => (zenwave::Error::BodyParse(error), None),
+                }
             }
             Ok(response) => {
                 let retry_after = retry_after_hint(response.headers());
@@ -180,7 +220,7 @@ async fn send_get(
         let Some(wait) = backoff.next_wait(retry_after) else {
             return Err(error);
         };
-        tracing::warn!(url, %error, "request failed; retrying");
+        tracing::warn!(url, %error, wait = ?wait, "request failed; retrying");
         tokio::time::sleep(wait).await;
     }
 }
@@ -188,8 +228,12 @@ async fn send_get(
 /// `GET` an absolute URL as text — job-log fetches redirect to GitHub's
 /// signed blob host, where the `Authorization` header must not follow
 /// (zenwave strips it cross-origin).
-pub async fn get_text(token: &str, url: &str) -> stow_types::error::Result<String> {
-    let response = send_get(Some(token), url, None, None)
+pub async fn get_text(
+    token: &str,
+    url: &str,
+    backoff: Backoff,
+) -> stow_types::error::Result<String> {
+    let response = send_get(Some(token), url, None, None, backoff)
         .await
         .map_err(|error| stow_error!("GET {url}: {error}"))?;
     response
@@ -202,17 +246,102 @@ pub async fn get_text(token: &str, url: &str) -> stow_types::error::Result<Strin
         .map_err(|error| stow_error!("read {url}: {error}"))
 }
 
+/// How a GitHub write's failure classifies: whether the write reached
+/// GitHub is the only thing that decides what the caller may do next —
+/// a write that provably did not happen can be sent again or failed,
+/// a write that might have happened can only be resolved by reading
+/// the object it would have created.
+#[derive(Debug)]
+pub enum WriteFailure {
+    /// GitHub answered with a status that is neither a rate limit nor
+    /// 5xx — the write did not happen and repeating it is pointless.
+    Refused(String),
+    /// A 429, or a 403 carrying `Retry-After`: the write did not
+    /// happen, and the hint is the answer's own wait.
+    RateLimited {
+        /// The rendered failure, context included.
+        message: String,
+        /// The answer's `Retry-After` hint, when it carried one.
+        hint: Option<Duration>,
+    },
+    /// A 5xx, or a transport failure from the send or the response-body
+    /// read: nobody knows whether the write happened.
+    Ambiguous(String),
+}
+
+impl WriteFailure {
+    /// The `Retry-After` hint a rate-limited answer carried — `None`
+    /// for every other kind and for a hintless 429.
+    #[must_use]
+    pub const fn hint(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { hint, .. } => *hint,
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Refused(message)
+            | Self::Ambiguous(message)
+            | Self::RateLimited { message, .. } => message,
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for WriteFailure {}
+
+/// Whether an answered status is GitHub's rate limit rather than the
+/// request's own verdict: a 429 outright, or a 403 carrying
+/// `Retry-After` — what GitHub's secondary rate limits send on writes,
+/// and the same answer [`send_get`] waits out under its hint.
+fn rate_limited_answer(response: &zenwave::Response) -> bool {
+    let status = response.status().as_u16();
+    status == 429 || (status == 403 && retry_after_hint(response.headers()).is_some())
+}
+
+/// Classify a write's failure answer for the caller's
+/// resolve-then-resend decision — `pub` for the local dispatch arm in
+/// `manual`, which speaks to the mock server over the same zenwave
+/// path. `context` is the `"{method} {url}"` prefix the message
+/// renders with.
+pub fn classify_write(context: &str, error: &zenwave::Error) -> WriteFailure {
+    let message = format!("{context}: {error}");
+    let Some(response) = error.response() else {
+        return WriteFailure::Ambiguous(message);
+    };
+    let status = response.status().as_u16();
+    if rate_limited_answer(response) {
+        WriteFailure::RateLimited {
+            message,
+            hint: retry_after_hint(response.headers()),
+        }
+    } else if status >= 500 {
+        WriteFailure::Ambiguous(message)
+    } else {
+        WriteFailure::Refused(message)
+    }
+}
+
 /// `POST` one API path under `/repos/{REPO}/` with a JSON body and
 /// decode the JSON response.
+///
+/// # Errors
+/// The typed [`WriteFailure`] — callers that do not branch on the kind
+/// convert it with `?`; callers that do get to tell a refused write
+/// from one whose answer never settled.
 pub async fn post<T: serde::de::DeserializeOwned>(
     token: &str,
     path: &str,
     body: &(impl serde::Serialize + Sync),
-) -> stow_types::error::Result<T> {
+) -> Result<T, WriteFailure> {
     send_json(
         token,
         zenwave::Method::POST,
-        &format!("/repos/{REPO}/{path}"),
+        &format!("{API_BASE}/repos/{REPO}/{path}"),
         Some(body),
     )
     .await
@@ -225,13 +354,13 @@ pub async fn patch<T: serde::de::DeserializeOwned>(
     path: &str,
     body: &(impl serde::Serialize + Sync),
 ) -> stow_types::error::Result<T> {
-    send_json(
+    Ok(send_json(
         token,
         zenwave::Method::PATCH,
-        &format!("/repos/{REPO}/{path}"),
+        &format!("{API_BASE}/repos/{REPO}/{path}"),
         Some(body),
     )
-    .await
+    .await?)
 }
 
 /// `PUT` an empty body to one API path under `/repos/{REPO}/` —
@@ -241,71 +370,70 @@ pub async fn put(token: &str, path: &str) -> stow_types::error::Result<()> {
     send_empty(
         token,
         zenwave::Method::PUT,
-        &format!("/repos/{REPO}/{path}"),
+        &format!("{API_BASE}/repos/{REPO}/{path}"),
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// One `send_json`/`send_empty` implementation behind the verb helpers:
-/// an authenticated request to `api.github.com` whose 2xx body decodes
-/// as `T`.
+/// an authenticated request to `url` whose 2xx body decodes as `T`.
 async fn send_json<T: serde::de::DeserializeOwned>(
     token: &str,
     method: zenwave::Method,
-    path: &str,
+    url: &str,
     body: Option<&(impl serde::Serialize + Sync)>,
-) -> stow_types::error::Result<T> {
-    let url = format!("{API_BASE}{path}");
-    let mut client = zenwave::client();
-    let request = client
-        .method(method.clone(), &url)
-        .map_err(|error| stow_error!("build {method} {url}: {error}"))?
-        .header("Authorization", format!("Bearer {token}"))
-        .and_then(|request| request.header("User-Agent", USER_AGENT))
-        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
-        .and_then(|request| request.header("X-GitHub-Api-Version", "2022-11-28"))
-        .map_err(|error| stow_error!("build {method} {url}: {error}"))?;
-    let request = match body {
-        Some(body) => request
-            .json_body(body)
-            .map_err(|error| stow_error!("build {method} {url} body: {error}"))?,
-        None => request,
-    };
-    let response = request
-        .await
-        .map_err(|error| stow_error!("{method} {url}: {error}"))?
-        .error_for_status()
-        .await
-        .map_err(|error| stow_error!("{method} {url}: {error}"))?;
+) -> Result<T, WriteFailure> {
+    let response = send_write(token, method.clone(), url, body).await?;
     response
         .into_json()
         .await
-        .map_err(|error| stow_error!("read {method} {url}: {error}"))
+        .map_err(|error| WriteFailure::Ambiguous(format!("read {method} {url}: {error}")))
 }
 
 /// Like [`send_json`] for endpoints whose 2xx answer carries no body —
 /// the response is status-checked and dropped.
-async fn send_empty(
+async fn send_empty(token: &str, method: zenwave::Method, url: &str) -> Result<(), WriteFailure> {
+    let response = send_write(token, method, url, None::<&serde_json::Value>).await?;
+    drop(response);
+    Ok(())
+}
+
+/// The send half every write shares: an authenticated request whose
+/// answer is status-checked. A failure to build the request is a write
+/// that never happened — [`WriteFailure::Refused`]; the answer's own
+/// failure classifies through [`classify_write`].
+async fn send_write(
     token: &str,
     method: zenwave::Method,
-    path: &str,
-) -> stow_types::error::Result<()> {
-    let url = format!("{API_BASE}{path}");
+    url: &str,
+    body: Option<&(impl serde::Serialize + Sync)>,
+) -> Result<zenwave::Response, WriteFailure> {
+    let refused =
+        |error: zenwave::Error| WriteFailure::Refused(format!("build {method} {url}: {error}"));
     let mut client = zenwave::client();
-    let response = client
-        .method(method.clone(), &url)
-        .map_err(|error| stow_error!("build {method} {url}: {error}"))?
+    let request = client
+        .method(method.clone(), url)
+        .map_err(refused)?
         .header("Authorization", format!("Bearer {token}"))
         .and_then(|request| request.header("User-Agent", USER_AGENT))
         .and_then(|request| request.header("Accept", "application/vnd.github+json"))
-        .map_err(|error| stow_error!("build {method} {url}: {error}"))?
+        .and_then(|request| request.header("X-GitHub-Api-Version", "2022-11-28"))
+        .map_err(refused)?;
+    let request = match body {
+        Some(body) => request.json_body(body).map_err(|error| {
+            WriteFailure::Refused(format!("build {method} {url} body: {error}"))
+        })?,
+        None => request,
+    };
+    let context = format!("{method} {url}");
+    let response = request
         .await
-        .map_err(|error| stow_error!("{method} {url}: {error}"))?
+        .map_err(|error| classify_write(&context, &error))?
         .error_for_status()
         .await
-        .map_err(|error| stow_error!("{method} {url}: {error}"))?;
-    drop(response);
-    Ok(())
+        .map_err(|error| classify_write(&context, &error))?;
+    Ok(response)
 }
 
 /// `DELETE` one API path under `/repos/{REPO}/`; 2xx/404 both count —
@@ -347,26 +475,22 @@ async fn delete_at(api_base: &str, token: &str, path: &str) -> stow_types::error
 /// `POST` one API path under `/repos/{REPO}/` with a JSON body whose
 /// 2xx answer carries no body of interest — the `workflow_dispatch`
 /// calls `preheat manual` drives, which answer 204.
+///
+/// # Errors
+/// The typed [`WriteFailure`], exactly like [`post`].
 pub async fn post_empty(
     token: &str,
     path: &str,
     body: &serde_json::Value,
-) -> stow_types::error::Result<()> {
-    let url = format!("{API_BASE}/repos/{REPO}/{path}");
-    let mut client = zenwave::client();
-    client
-        .post(&url)
-        .map_err(|error| stow_error!("build POST {url}: {error}"))?
-        .header("Authorization", format!("Bearer {token}"))
-        .and_then(|request| request.header("User-Agent", USER_AGENT))
-        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
-        .and_then(|request| request.json_body(body))
-        .map_err(|error| stow_error!("build POST {url}: {error}"))?
-        .await
-        .map_err(|error| stow_error!("POST {url}: {error}"))?
-        .error_for_status()
-        .await
-        .map_err(|error| stow_error!("POST {url}: {error}"))?;
+) -> Result<(), WriteFailure> {
+    let response = send_write(
+        token,
+        zenwave::Method::POST,
+        &format!("{API_BASE}/repos/{REPO}/{path}"),
+        Some(body),
+    )
+    .await?;
+    drop(response);
     Ok(())
 }
 
@@ -923,7 +1047,7 @@ mod tests {
 
 #[cfg(test)]
 mod url_json_tests {
-    use super::get_url_json;
+    use super::{Backoff, get_url_json};
     use crate::test_server;
 
     /// A connection the server drops without answering is a transport
@@ -940,7 +1064,7 @@ mod url_json_tests {
             },
         ])
         .await;
-        let body: serde_json::Value = get_url_json(&server.url, None)
+        let body: serde_json::Value = get_url_json(&server.url, None, Backoff::new())
             .await
             .expect("a dropped connection retries");
         assert_eq!(body["ok"], true);
@@ -966,7 +1090,7 @@ mod url_json_tests {
         ])
         .await;
         let started = std::time::Instant::now();
-        let body: serde_json::Value = get_url_json(&server.url, None)
+        let body: serde_json::Value = get_url_json(&server.url, None, Backoff::new())
             .await
             .expect("a transient status retries");
         assert_eq!(body["ok"], true);
@@ -991,10 +1115,65 @@ mod url_json_tests {
         }])
         .await;
         let result: stow_types::error::Result<serde_json::Value> =
-            get_url_json(&server.url, None).await;
+            get_url_json(&server.url, None, Backoff::new()).await;
         assert!(result.is_err());
         let heads = server.join().await;
         assert_eq!(heads.len(), 1);
+    }
+
+    /// A `200` whose body the connection cuts mid-read is the same
+    /// transport failure a dropped request is — the retried unit is the
+    /// whole read, so the second attempt answers the parsed value.
+    #[tokio::test]
+    async fn get_url_json_retries_a_body_cut_mid_read() {
+        let server = test_server::Loopback::start(vec![
+            test_server::Step::Stall {
+                status: 200,
+                body: r#"{"ok":tr"#,
+                content_length: 64,
+            },
+            test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            },
+        ])
+        .await;
+        let body: serde_json::Value = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            get_url_json(&server.url, None, Backoff::new()),
+        )
+        .await
+        .expect("a cut body completes inside the bound")
+        .expect("a cut body retries");
+        assert_eq!(body["ok"], true);
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 2);
+    }
+
+    /// The same cut on every attempt spends the budget and returns the
+    /// final error — never a hang and never a panic.
+    #[tokio::test]
+    async fn get_url_json_fails_a_body_cut_past_the_budget() {
+        let server = test_server::Loopback::start(
+            (0..4)
+                .map(|_| test_server::Step::Stall {
+                    status: 200,
+                    body: r#"{"ok":tr"#,
+                    content_length: 64,
+                })
+                .collect(),
+        )
+        .await;
+        let result: stow_types::error::Result<serde_json::Value> = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            get_url_json(&server.url, None, Backoff::new()),
+        )
+        .await
+        .expect("a cut body ends inside the bound");
+        assert!(result.is_err(), "the final error returns, it does not hang");
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 4);
     }
 
     /// A 2xx that does not decode is a failure, not a retry — the same
@@ -1008,10 +1187,42 @@ mod url_json_tests {
         }])
         .await;
         let result: stow_types::error::Result<serde_json::Value> =
-            get_url_json(&server.url, None).await;
+            get_url_json(&server.url, None, Backoff::new()).await;
         assert!(result.is_err());
         let heads = server.join().await;
         assert_eq!(heads.len(), 1);
+    }
+
+    /// An outage budget waits an incident out: four `502`s spend the
+    /// burst budget's four attempts, and the read still answers the
+    /// fifth attempt's `200`. The waits are real — a paused clock would
+    /// fire the loopback's own per-connection bound mid-burst — so this
+    /// test costs the 7.5 s of pauses it proves.
+    #[tokio::test]
+    async fn get_url_json_waits_out_a_502_burst_under_the_outage_budget() {
+        let steps = (0..4)
+            .map(|_| test_server::Step::Respond {
+                status: 502,
+                retry_after: None,
+                body: "{}",
+            })
+            .chain([test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            }])
+            .collect();
+        let server = test_server::Loopback::start(steps).await;
+        let body: serde_json::Value = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            get_url_json(&server.url, None, Backoff::outage()),
+        )
+        .await
+        .expect("the outage read completes inside its real-time bound")
+        .expect("four 502s are inside the outage budget");
+        assert_eq!(body["ok"], true);
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 5);
     }
 
     /// A transient failure that outlives the budget returns its final
@@ -1029,7 +1240,7 @@ mod url_json_tests {
         )
         .await;
         let result: stow_types::error::Result<serde_json::Value> =
-            get_url_json(&server.url, None).await;
+            get_url_json(&server.url, None, Backoff::new()).await;
         assert!(result.is_err());
         let heads = server.join().await;
         assert_eq!(heads.len(), 4);
@@ -1038,7 +1249,7 @@ mod url_json_tests {
 
 #[cfg(test)]
 mod send_get_tests {
-    use super::send_get;
+    use super::{Backoff, send_get};
     use crate::test_server;
 
     /// A conditional GET's 304 answer carries no `Location` — it is a
@@ -1055,7 +1266,7 @@ mod send_get_tests {
         .await;
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            send_get(None, &server.url, None, Some("\"v1\"")),
+            send_get(None, &server.url, None, Some("\"v1\""), Backoff::new()),
         )
         .await
         .expect("the conditional read answers inside the bound");
@@ -1071,5 +1282,129 @@ mod send_get_tests {
             "\"v1\""
         );
         assert_eq!(response.status().as_u16(), 304);
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::{WriteFailure, send_write};
+    use crate::test_server;
+
+    /// One scripted POST through the shared write path — the body is a
+    /// dispatch-like JSON object.
+    async fn write(url: &str) -> Result<(), WriteFailure> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            send_write(
+                "test-token",
+                zenwave::Method::POST,
+                url,
+                Some(&serde_json::json!({"a": 1})),
+            ),
+        )
+        .await
+        .expect("the write answers inside the bound")
+        .map(|_| ())
+    }
+
+    /// Every 5xx is ambiguous: the write may have landed before the
+    /// error answer left, so it can be neither retried blind nor
+    /// treated as a failure.
+    #[tokio::test]
+    async fn a_5xx_answer_is_ambiguous() {
+        for status in [500u16, 502] {
+            let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+                status,
+                retry_after: None,
+                body: "{}",
+            }])
+            .await;
+            let result = write(&server.url).await;
+            assert!(
+                matches!(result, Err(WriteFailure::Ambiguous(_))),
+                "status {status} must classify ambiguous, got {result:?}"
+            );
+            let heads = server.join().await;
+            assert_eq!(heads.len(), 1);
+        }
+    }
+
+    /// A terminal non-rate-limit answer is refused: the write did not
+    /// happen and repeating it is pointless.
+    #[tokio::test]
+    async fn a_terminal_answer_is_refused() {
+        for status in [422u16, 403] {
+            let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+                status,
+                retry_after: None,
+                body: "{}",
+            }])
+            .await;
+            let result = write(&server.url).await;
+            assert!(
+                matches!(result, Err(WriteFailure::Refused(_))),
+                "status {status} must classify refused, got {result:?}"
+            );
+            let heads = server.join().await;
+            assert_eq!(heads.len(), 1);
+        }
+    }
+
+    /// A 429 outright, and a 403 carrying `Retry-After` — GitHub's
+    /// secondary-limit shape on writes — are rate-limited answers
+    /// carrying the hint through to the caller's backoff.
+    #[tokio::test]
+    async fn rate_limits_carry_their_retry_after_hint() {
+        for (status, retry_after) in [(429u16, 3), (403, 7)] {
+            let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+                status,
+                retry_after: Some(retry_after),
+                body: "{}",
+            }])
+            .await;
+            let result = write(&server.url).await;
+            match result {
+                Err(WriteFailure::RateLimited { hint, .. }) => {
+                    assert_eq!(
+                        hint,
+                        Some(std::time::Duration::from_secs(retry_after)),
+                        "status {status} carries the hint"
+                    );
+                }
+                other => panic!("status {status} must classify rate-limited, got {other:?}"),
+            }
+            let heads = server.join().await;
+            assert_eq!(heads.len(), 1);
+        }
+    }
+
+    /// A connection closed before any answer is the ambiguous case the
+    /// driver exists for — the request left the machine and nobody can
+    /// say whether it landed.
+    #[tokio::test]
+    async fn a_connection_closed_before_the_answer_is_ambiguous() {
+        let server = test_server::Loopback::start(vec![test_server::Step::Drop]).await;
+        let result = write(&server.url).await;
+        assert!(
+            matches!(result, Err(WriteFailure::Ambiguous(_))),
+            "a dropped connection must classify ambiguous, got {result:?}"
+        );
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].method, http::Method::POST);
+    }
+
+    /// A 2xx answer is the confirmed write — no failure kind at all.
+    #[tokio::test]
+    async fn a_success_answer_returns_the_response() {
+        let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+            status: 204,
+            retry_after: None,
+            body: "",
+        }])
+        .await;
+        write(&server.url).await.expect("204 is a confirmed write");
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
     }
 }

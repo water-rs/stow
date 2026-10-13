@@ -447,6 +447,7 @@ async fn run_dispatched_task(
         push_records(
             &state,
             &task,
+            workflow_run_id,
             &layout.records_path,
             &std::env::current_exe()?,
         )
@@ -488,7 +489,14 @@ async fn run_dispatched_task(
     if upload_plan_len(&layout.upload_plan_path).await? == 0 {
         // Even an artifact-less task publishes its (empty) records
         // artifact — the webhook's existence check must find it.
-        push_records(&state, &task, &layout.records_path, exe.as_path()).await?;
+        push_records(
+            &state,
+            &task,
+            workflow_run_id,
+            &layout.records_path,
+            exe.as_path(),
+        )
+        .await?;
         state.mark_build_run(&task, workflow_run_id, "completed", Some("success"));
         return post_workflow_run(
             &state,
@@ -498,7 +506,14 @@ async fn run_dispatched_task(
     }
 
     populate_mock_registry(&exe, &state, &task, workflow_run_id, &layout).await?;
-    push_records(&state, &task, &layout.records_path, exe.as_path()).await?;
+    push_records(
+        &state,
+        &task,
+        workflow_run_id,
+        &layout.records_path,
+        exe.as_path(),
+    )
+    .await?;
     state.mark_build_run(&task, workflow_run_id, "completed", Some("success"));
     post_workflow_run(
         &state,
@@ -605,12 +620,17 @@ async fn populate_mock_registry(
     Err(stow_types::stow_error!("{error}"))
 }
 
-/// Write the task's records artifact into the mock registry — the same
+/// Write the build's records artifact into the mock registry — the same
 /// object the production publish stage pushes to GHCR under
-/// `records-<rustc>-<task_id hash>`, signed by the mock key instead of cosign.
+/// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`, signed by the
+/// mock key instead of cosign. The run is the dispatch's own
+/// `workflow_run_id` at attempt 1 — the run identity the `workflow_run`
+/// webhook report below carries, so the edge's records check resolves
+/// to this tag.
 async fn push_records(
     state: &LocalServerState,
     task: &BuildTaskPayload,
+    workflow_run_id: u64,
     records_path: &Path,
     exe: &Path,
 ) -> stow_types::error::Result<()> {
@@ -636,6 +656,10 @@ async fn push_records(
         .arg(&task.task_id)
         .arg("--rustc-version")
         .arg(&task.rustc_version)
+        .arg("--run-id")
+        .arg(workflow_run_id.to_string())
+        .arg("--run-attempt")
+        .arg("1")
         .arg("--registry-root")
         .arg(PathBuf::from(&state.mock_registry_root))
         .arg("--private-key")
@@ -720,6 +744,10 @@ async fn post_workflow_run(
         "repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
         "workflow_run": {
             "id": run.workflow_run_id,
+            // The local server models a fresh run per dispatch — every
+            // run is attempt 1, the same attempt the records push above
+            // tags the artifact under.
+            "run_attempt": 1,
             "name": run.workflow_file,
             "path": format!(".github/workflows/{}", run.workflow_file),
             "event": "workflow_dispatch",

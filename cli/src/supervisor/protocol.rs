@@ -59,11 +59,6 @@ pub struct Plan {
     pub executable: Vec<u8>,
     /// Everything after the executable, in order.
     pub args: Vec<Vec<u8>>,
-    /// The `OUT_DIR` cargo exported on this invocation's environment,
-    /// for a crate with a build script. Per-invocation facts like this
-    /// only exist in the facade's environment — nothing on the
-    /// supervisor side could recover them from its own.
-    pub build_script_out_dir: Option<Vec<u8>>,
 }
 
 /// The facade reporting the compile the supervisor asked for.
@@ -91,9 +86,6 @@ pub struct Observed {
     pub executable: Vec<u8>,
     /// Everything after the executable, in order.
     pub args: Vec<Vec<u8>>,
-    /// The `OUT_DIR` cargo exported on this invocation's environment, for
-    /// a crate with a build script.
-    pub build_script_out_dir: Option<Vec<u8>>,
     /// `None` marks the unit as compiling locally — the bookkeeping
     /// [`crate::provenance::record_local_build`] does inside a `Compile`
     /// decision, carried as a frame because this unit never asked for a
@@ -108,14 +100,12 @@ impl Observed {
         token: String,
         executable: &std::ffi::OsStr,
         args: &[OsString],
-        build_script_out_dir: Option<&std::ffi::OsStr>,
         success: Option<bool>,
     ) -> Self {
         Self {
             token,
             executable: os_bytes::encode(executable),
             args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
-            build_script_out_dir: build_script_out_dir.map(os_bytes::encode),
             success,
         }
     }
@@ -137,19 +127,6 @@ impl Observed {
     pub fn args(&self) -> Result<Vec<OsString>, String> {
         self.args.iter().map(|arg| os_bytes::decode(arg)).collect()
     }
-
-    /// The `OUT_DIR` this invocation's environment carried, when cargo
-    /// exported one.
-    ///
-    /// # Errors
-    ///
-    /// When the peer's encoding is not decodable on this platform.
-    pub fn build_script_out_dir(&self) -> Result<Option<OsString>, String> {
-        self.build_script_out_dir
-            .as_ref()
-            .map(|encoded| os_bytes::decode(encoded))
-            .transpose()
-    }
 }
 
 /// The serve-map wait is the whole request — the token is its only
@@ -160,12 +137,35 @@ pub struct AwaitServeMap {
     pub token: String,
 }
 
+/// The rustc artifact-notification lines a served invocation owes cargo.
+///
+/// Each entry is one complete `{"$message_type":"artifact",…}` line —
+/// the JSON message rustc itself would have printed under
+/// `--json=…artifacts…`. The supervisor computes them because it holds
+/// the serve decision, but only the process cargo spawned may write
+/// them: cargo reads artifact notifications from its own child's stderr,
+/// so the lines travel with the `Served` answer and the facade prints
+/// them just before it exits (stow#633). An invocation whose `--json`
+/// set lacks `artifacts` carries an empty set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ArtifactNotifications(pub Vec<String>);
+
+impl ArtifactNotifications {
+    /// The notification lines, each a complete JSON message without its
+    /// terminating newline.
+    pub fn lines(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+}
+
 /// What the supervisor answers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Answer {
     /// The unit's outputs are in the target directory; the facade exits 0
-    /// without running rustc.
-    Served,
+    /// without running rustc. The payload is the artifact-notification
+    /// lines the facade owes cargo's stderr first (stow#633).
+    Served(ArtifactNotifications),
     /// Nothing serves this unit. The facade runs the real rustc and then
     /// sends [`Compiled`] carrying `ticket`.
     Compile {
@@ -189,17 +189,11 @@ pub enum Answer {
 impl Plan {
     /// Build a plan for this invocation.
     #[must_use]
-    pub fn new(
-        token: String,
-        executable: &std::ffi::OsStr,
-        args: &[OsString],
-        build_script_out_dir: Option<&std::ffi::OsStr>,
-    ) -> Self {
+    pub fn new(token: String, executable: &std::ffi::OsStr, args: &[OsString]) -> Self {
         Self {
             token,
             executable: os_bytes::encode(executable),
             args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
-            build_script_out_dir: build_script_out_dir.map(os_bytes::encode),
         }
     }
 
@@ -219,19 +213,6 @@ impl Plan {
     /// When the peer's encoding is not decodable on this platform.
     pub fn args(&self) -> Result<Vec<OsString>, String> {
         self.args.iter().map(|arg| os_bytes::decode(arg)).collect()
-    }
-
-    /// The `OUT_DIR` this invocation's environment carried, when cargo
-    /// exported one.
-    ///
-    /// # Errors
-    ///
-    /// When the peer's encoding is not decodable on this platform.
-    pub fn build_script_out_dir(&self) -> Result<Option<OsString>, String> {
-        self.build_script_out_dir
-            .as_ref()
-            .map(|encoded| os_bytes::decode(encoded))
-            .transpose()
     }
 }
 
@@ -300,7 +281,7 @@ where
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Answer, Plan, Request, read_frame, write_frame};
+    use super::{Answer, ArtifactNotifications, Plan, Request, read_frame, write_frame};
 
     #[tokio::test]
     async fn a_plan_round_trips_through_a_frame() {
@@ -308,7 +289,6 @@ mod tests {
             "token".to_owned(),
             std::ffi::OsStr::new("/usr/bin/rustc"),
             &[OsString::from("--crate-name"), OsString::from("serde")],
-            Some(std::ffi::OsStr::new("/tmp/build/demo-aaa/out")),
         );
         let mut buffer = Vec::new();
         write_frame(&mut buffer, &Request::Plan(plan.clone()))
@@ -324,13 +304,6 @@ mod tests {
         };
         assert_eq!(decoded.executable().expect("executable"), "/usr/bin/rustc");
         assert_eq!(decoded.args().expect("args"), vec!["--crate-name", "serde"]);
-        assert_eq!(
-            decoded
-                .build_script_out_dir()
-                .expect("build_script_out_dir")
-                .as_deref(),
-            Some(std::ffi::OsStr::new("/tmp/build/demo-aaa/out"))
-        );
     }
 
     /// A peer that closes between frames is not an error: that is how a
@@ -341,14 +314,38 @@ mod tests {
         assert!(decoded.is_none());
     }
 
+    /// The artifact-notification lines a served unit owes cargo ride the
+    /// answer itself (stow#633).
+    #[tokio::test]
+    async fn a_served_answer_round_trips_its_notifications() {
+        let lines = ArtifactNotifications(vec![
+            r#"{"$message_type":"artifact","artifact":"/tmp/out/libserde-abc.rmeta","emit":"metadata"}"#
+                .to_owned(),
+            r#"{"$message_type":"artifact","artifact":"/tmp/out/libserde-abc.rlib","emit":"link"}"#
+                .to_owned(),
+        ]);
+        let mut buffer = Vec::new();
+        write_frame(&mut buffer, &Answer::Served(lines.clone()))
+            .await
+            .expect("write");
+        let decoded: Answer = read_frame(&mut buffer.as_slice())
+            .await
+            .expect("read")
+            .expect("a frame");
+        assert_eq!(decoded, Answer::Served(lines));
+    }
+
     /// A frame cut in half is an error, not a clean end — the difference
     /// decides whether the build fails or silently loses the cache.
     #[tokio::test]
     async fn a_truncated_frame_is_an_error() {
         let mut buffer = Vec::new();
-        write_frame(&mut buffer, &Answer::Served)
-            .await
-            .expect("write");
+        write_frame(
+            &mut buffer,
+            &Answer::Served(ArtifactNotifications::default()),
+        )
+        .await
+        .expect("write");
         buffer.truncate(buffer.len() - 1);
         let error = read_frame::<_, Answer>(&mut buffer.as_slice())
             .await

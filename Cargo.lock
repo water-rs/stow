@@ -5936,6 +5936,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-wrap"
+version = "10.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f21b97672d2dc848e7b25701ab4535618b92f4861c13cc3f7f7bed52ad3c8da"
+dependencies = [
+ "indexmap 2.14.2",
+ "nix 0.31.3",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "process_path"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7913,11 +7924,13 @@ dependencies = [
  "oci-spec 0.10.0",
  "olpc-cjson",
  "pathdiff",
+ "process-wrap",
  "rcgen",
  "reflink",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
+ "same-file",
  "semver",
  "serde",
  "serde_json",
@@ -7940,6 +7953,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "walkdir",
+ "which 8.0.6",
  "windows-sys 0.60.2",
  "x509-cert",
  "zenwave",
@@ -8036,6 +8050,7 @@ dependencies = [
  "olpc-cjson",
  "rcgen",
  "reqwest",
+ "rustls",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
@@ -8046,6 +8061,7 @@ dependencies = [
  "stow-shim",
  "stow-types",
  "time",
+ "tokio",
  "tracing",
  "x509-cert",
  "zstd",

@@ -3,7 +3,7 @@ use oci_client::manifest::{OciDescriptor, OciImageManifest};
 use stow_types::error::Context;
 use stow_types::registry::{GHCR_V2_BASE_URL, verify_oci_digest};
 
-use crate::client::RegistrySession;
+use crate::client::{RegistryHttp, RegistrySession};
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
 const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
@@ -39,8 +39,8 @@ impl RegistryCredentials {
     ///
     /// Returns an error if [`GHCR_V2_BASE_URL`] is malformed — a bug, not a
     /// runtime condition.
-    pub fn session(&self) -> stow_types::error::Result<RegistrySession> {
-        Ok(RegistryBase::production()?.push_session(self))
+    pub fn session(&self, http: &RegistryHttp) -> stow_types::error::Result<RegistrySession> {
+        Ok(RegistryBase::production()?.push_session(self, http))
     }
 }
 

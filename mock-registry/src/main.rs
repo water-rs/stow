@@ -41,7 +41,8 @@ use stow_types::index::{
     STOW_INDEX_MEDIA_TYPE, content_sha256, folded_tag, index_tag,
 };
 use stow_types::records::{
-    RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION, records_tag,
+    BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
+    records_tag,
 };
 use stow_types::registry::{GHCR_BASE, bundle_oci_reference, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
@@ -254,7 +255,14 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     // production's cosign signs — never the mock transport base.
     let oci_reference = format!(
         "{GHCR_BASE}:{}",
-        records_tag(&request.rustc_version, &request.task_id)
+        records_tag(
+            &request.rustc_version,
+            &request.task_id,
+            BuildRun {
+                run_id: request.run_id,
+                run_attempt: request.run_attempt,
+            },
+        )
     );
 
     let layer_digest = sha256_digest(&bytes);
@@ -1332,11 +1340,11 @@ enum Command {
     /// straight from a `populate --records-out` file — the bench pipeline
     /// has no edge to `stow-admin index export` from.
     IndexFromRecords(IndexFromRecordsArgs),
-    /// Write one task's records artifact — the records blob, the
+    /// Write one build's records artifact — the records blob, the
     /// `dev.stow.records.task-id`-annotated manifest under
-    /// `records-<rustc>-<task_id hash>`, and its mock signature — the write
-    /// the production publish stage performs on GHCR once a build's
-    /// records live there (stow#455).
+    /// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`, and its
+    /// mock signature — the write the production publish stage performs
+    /// on GHCR once a build's records live there (stow#455).
     PushRecords(PushRecordsArgs),
     Serve(ServeArgs),
 }
@@ -1352,6 +1360,12 @@ struct PushRecordsArgs {
     /// The rustc the task ran under — the tag's `records-<rustc>-` half.
     #[arg(long = "rustc-version")]
     rustc_version: String,
+    /// The run the build published under — the tag's `run_id` leg.
+    #[arg(long = "run-id")]
+    run_id: u64,
+    /// The run's attempt — the tag's last leg.
+    #[arg(long = "run-attempt")]
+    run_attempt: u32,
     #[arg(long = "registry-root")]
     registry_root: PathBuf,
     #[arg(long = "private-key")]
@@ -2599,14 +2613,14 @@ mod tests {
     }
 
     /// A credentialed `pull,push` session on the served mock.
-    fn push_session(listen: &str) -> stow_oci::RegistrySession {
+    fn push_session(listen: &str, http: &stow_oci::RegistryHttp) -> stow_oci::RegistrySession {
         let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{}", GHCR_REPOSITORY))
             .expect("registry base");
         let credentials = stow_oci::RegistryCredentials {
             username: "mock".to_owned(),
             password: "mock".to_owned(),
         };
-        base.push_session(&credentials)
+        base.push_session(&credentials, http)
     }
 
     /// The in-process signer the push tests inject: writes the signature
@@ -2646,7 +2660,8 @@ mod tests {
         let plan = test_plan(root.path());
         let (listen, probe) = serve_probe_registry(root.path()).await;
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds");
@@ -2722,7 +2737,8 @@ mod tests {
         let manifests = root.path().join("manifests");
         let sign = mock_sign(root.path());
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(
             &session,
             &[plan],
@@ -2758,7 +2774,8 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.rate_limit(Method::POST, "/blobs/uploads", 3);
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds after retries");
@@ -2784,7 +2801,8 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.refuse_single_post();
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds through commit PUTs");
@@ -2824,7 +2842,8 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.omit_manifest_digest_header();
 
-        let session = push_session(&listen);
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push verifies manifests by read-back");
@@ -2861,7 +2880,8 @@ mod tests {
 
         let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
             .expect("registry base");
-        let session = base.session();
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = base.session(&http);
 
         let tag_reference = base.reference("forged-tag").expect("tag reference");
         let error = session
@@ -2920,7 +2940,8 @@ mod tests {
         let (listen, _probe) = serve_probe_registry(root.path()).await;
         let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
             .expect("registry base");
-        let session = base.session();
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = base.session(&http);
         let reference = base.reference(tag_a).expect("reference");
         let materials = stow_oci::pull_signature_materials(&session, &reference, digest)
             .await

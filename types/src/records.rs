@@ -1,23 +1,22 @@
-//! The per-task artifact records as a signed OCI artifact (stow#455).
+//! The per-build artifact records as a signed OCI artifact (stow#455).
 //!
-//! The trusted publish stage pushes each task's `Vec<ArtifactRecord>` as
-//! one signed artifact — the `records-<rustc>-<task_id hash>` tag in the
-//! same `water-rs/stow-cache` namespace the bundles use — instead of
-//! posting records to the edge. The index export and the D1 catalog sync both
-//! read that artifact back from GHCR, so the registry plus cosign is the
-//! only record store and no `STOW_EDGE_URL` reaches `build-crate.yml`.
-
-use std::collections::BTreeMap;
+//! The trusted publish stage pushes each build's `Vec<ArtifactRecord>` as
+//! one signed artifact — the `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
+//! tag in the same `water-rs/stow-cache` namespace the bundles use —
+//! instead of posting records to the edge. The tag names the Actions run
+//! that published it, so a second build of the same task lands on a new
+//! tag rather than overwriting the first's rows (stow#655). The index
+//! export and the D1 catalog sync both read that artifact back from GHCR,
+//! so the registry plus cosign is the only record store and no
+//! `STOW_EDGE_URL` reaches `build-crate.yml`.
 
 use crate::api::ArtifactRecord;
-use crate::identity::{TargetTriple, WireRustcVersion};
 use crate::index::ArtifactIndexRow;
-use crate::public_cache::UnitShape;
 use crate::registry::MAX_OCI_TAG_LEN;
 
 /// `artifactType` (and single-layer media type) of a records artifact: a
 /// JSON array of [`ArtifactRecord`] — the full set of rows one
-/// `build-crate.yml` task published.
+/// `build-crate.yml` run published.
 pub const RECORDS_ARTIFACT_TYPE: &str = "application/vnd.stow.records.v1+json";
 
 /// Media type of the records artifact's empty OCI config blob.
@@ -75,7 +74,23 @@ pub fn parse_resolve_run_title(title: &str) -> Option<(u32, &str)> {
     (!request_id.is_empty()).then_some((attempt, request_id))
 }
 
-/// Tag prefix a records artifact publishes under: `records-<rustc>-<task_id hash>`.
+/// The GitHub Actions run a records artifact published under.
+///
+/// `run_id` is the run's `GITHUB_RUN_ID` and `run_attempt` its
+/// `GITHUB_RUN_ATTEMPT`. Every build publishes under its own tag —
+/// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` — so nothing
+/// overwrites a records tag and a rebuilt task's rows always reach the
+/// index (stow#655).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BuildRun {
+    /// The Actions workflow run id.
+    pub run_id: u64,
+    /// The run's attempt number — `1` on the first run.
+    pub run_attempt: u32,
+}
+
+/// Tag prefix a records artifact publishes under:
+/// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`.
 ///
 /// The leading `records-` keeps the tag namespace disjoint from bundle
 /// and index tags, and starts with a letter so it always satisfies the
@@ -83,22 +98,26 @@ pub fn parse_resolve_run_title(title: &str) -> Option<(u32, &str)> {
 /// records by tag alone.
 pub const RECORDS_TAG_PREFIX: &str = "records-";
 
-/// The OCI tag of `task_id`'s records artifact at `rustc_version`.
+/// The OCI tag of `task_id`'s records artifact as `build` published it
+/// at `rustc_version`.
 ///
 /// A task id is the full `<crate>-<version>-<features>-<target>-<rustc>`
 /// string — well past OCI's tag limit at long crate names — so the tag
-/// carries its blake3 hash instead: `records-<rustc>-<task_id hash>` is
-/// 8 + ≤10 + 1 + 64 characters, always under [`MAX_OCI_TAG_LEN`]. The
-/// full task id rides on the manifest's
-/// [`RECORDS_TASK_ID_ANNOTATION`].
+/// carries its blake3 hash instead: `records-<rustc>-<task_id
+/// hash>-<run_id>-<run_attempt>` is 8 + ≤10 + 1 + 64 + 1 + ≤20 + 1 +
+/// ≤10 characters, always under [`MAX_OCI_TAG_LEN`]. The full task id
+/// rides on the manifest's [`RECORDS_TASK_ID_ANNOTATION`].
 ///
 /// # Panics
 ///
 /// When the produced tag exceeds [`MAX_OCI_TAG_LEN`].
 #[must_use]
-pub fn records_tag(rustc_version: &str, task_id: &str) -> String {
+pub fn records_tag(rustc_version: &str, task_id: &str, build: BuildRun) -> String {
     let digest = blake3::hash(task_id.as_bytes()).to_hex();
-    let tag = format!("{RECORDS_TAG_PREFIX}{rustc_version}-{digest}");
+    let tag = format!(
+        "{RECORDS_TAG_PREFIX}{rustc_version}-{digest}-{}-{}",
+        build.run_id, build.run_attempt
+    );
     assert!(
         tag.len() <= MAX_OCI_TAG_LEN,
         "records tag {tag:?} exceeds {MAX_OCI_TAG_LEN} chars"
@@ -106,19 +125,59 @@ pub fn records_tag(rustc_version: &str, task_id: &str) -> String {
     tag
 }
 
-/// The rustc version a `records-*` tag selects.
+/// Whether `field` is a decimal literal — non-empty ASCII digits, so no
+/// sign and no leading `+` pass.
+fn is_decimal(field: &str) -> bool {
+    !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// What a `records-*` tag names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordsTag<'a> {
+    /// The rustc the build ran under.
+    pub rustc_version: &'a str,
+    /// The blake3 of the task id, as 64 hex digits.
+    pub task_hash: &'a str,
+    /// The run that published the artifact. `None` on a tag with no
+    /// build suffix — the shape every build published before tags named
+    /// their build (stow#655). Such a tag was shared by every build of
+    /// its task, so what it holds is older than any named build of that
+    /// task, and `None` orders first.
+    pub build: Option<BuildRun>,
+}
+
+/// The parts of a `records-*` tag — the inverse of [`records_tag`], and
+/// the reader of the suffix-less tags still in the registry.
 ///
-/// `None` when the tag is not one of ours (wrong digest shape or missing
-/// prefix). The task id the tag names is the blake3 the digest hashes,
-/// so it can never be read back out; a caller needing it takes the
-/// manifest's [`RECORDS_TASK_ID_ANNOTATION`].
+/// `None` when the tag is not a records tag. The task id the tag names
+/// is the blake3 the digest hashes, so it can never be read back out; a
+/// caller needing it takes the manifest's
+/// [`RECORDS_TASK_ID_ANNOTATION`].
 #[must_use]
-pub fn records_tag_rustc(tag: &str) -> Option<&str> {
-    let (rustc_version, digest) = tag.strip_prefix(RECORDS_TAG_PREFIX)?.split_once('-')?;
+pub fn parse_records_tag(tag: &str) -> Option<RecordsTag<'_>> {
+    let (rustc_version, rest) = tag.strip_prefix(RECORDS_TAG_PREFIX)?.split_once('-')?;
+    let (task_hash, build) = match rest.split_once('-') {
+        Some((task_hash, build)) => {
+            let (run_id, run_attempt) = build.split_once('-')?;
+            if !is_decimal(run_id) || !is_decimal(run_attempt) {
+                return None;
+            }
+            let build = BuildRun {
+                run_id: run_id.parse().ok()?,
+                run_attempt: run_attempt.parse().ok()?,
+            };
+            (task_hash, Some(build))
+        }
+        None => (rest, None),
+    };
     (!rustc_version.is_empty()
-        && digest.len() == 64
-        && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    .then_some(rustc_version)
+        && task_hash.len() == 64
+        && task_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(RecordsTag {
+        rustc_version,
+        task_hash,
+        build,
+    })
 }
 
 /// Whether `tag` names a records artifact — the tag-space selector the
@@ -155,85 +214,9 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> Option<ArtifactIndexRow> 
     })
 }
 
-type RowsByIdentity = BTreeMap<(String, Option<UnitShape>), ArtifactIndexRow>;
-
-/// Group records into `(target, rustc_version)` slices of index rows,
-/// ordered by `c_metadata` — the shape `index export` writes and the D1
-/// catalog's `SELECT … ORDER BY c_metadata` produces.
-///
-/// A `(c_metadata, unit_shape)` pair carried by more than one records
-/// artifact (a re-run task that rebuilt the same unit) collapses to the
-/// record later in iteration order; feed records in tag order to keep
-/// the outcome deterministic. The same `c_metadata` under a second
-/// `unit_shape` is not a duplicate: one artifact serves every shape a
-/// real consumer's build computes it under, so each shape keeps its
-/// row (stow#506).
-#[must_use]
-pub fn records_into_slices(
-    records: impl IntoIterator<Item = ArtifactRecord>,
-) -> BTreeMap<(TargetTriple, WireRustcVersion), Vec<ArtifactIndexRow>> {
-    let mut slices: BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity> = BTreeMap::new();
-    for record in records {
-        let Some(row) = record_to_index_row(&record) else {
-            continue;
-        };
-        slices
-            .entry((record.target, record.rustc_version))
-            .or_default()
-            .insert((row.c_metadata.as_str().to_owned(), row.unit_shape), row);
-    }
-    slices
-        .into_iter()
-        .map(|(key, rows)| (key, rows.into_values().collect()))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use semver::Version;
-
     use super::*;
-    use crate::artifact::{ArtifactKind, RustCrateType};
-    use crate::identity::{
-        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson,
-    };
-    use crate::platform::{PanicStrategy, Profile, StripLevel};
-
-    fn record(target: &str, rustc: &str, c_metadata: &str, bundle_digest: &str) -> ArtifactRecord {
-        ArtifactRecord {
-            compile_key: format!("{c_metadata}{c_metadata}"),
-            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
-            extra_filename: String::new(),
-            target: TargetTriple::parse(target).expect("target"),
-            rustc_version: WireRustcVersion::parse(rustc).expect("rustc"),
-            profile: Profile {
-                opt_level: "3".to_owned(),
-                debuginfo: 0,
-                debug_assertions: false,
-                overflow_checks: false,
-                panic: PanicStrategy::Unwind,
-                strip: StripLevel::None,
-            },
-            emit: vec!["link".to_owned()],
-            crate_name: CrateName::parse("serde").expect("crate name"),
-            version: CrateVersion::new(Version::new(1, 0, 219)),
-            features_json: FeaturesJson::canonicalize(vec![]).expect("features"),
-            dependency_c_metadata_json: DependencyCMetadataJson::default(),
-            dependency_identity: None,
-            oci_reference: "ghcr.io/water-rs/stow-cache:serde.1.0.219-x86_64-unknown-linux-gnu"
-                .to_owned(),
-            oci_digest: "sha256:deadbeef".to_owned(),
-            has_native: false,
-            artifact_kind: ArtifactKind::Rlib,
-            crate_types: vec![RustCrateType::Rlib],
-            artifact_size: 10,
-            bundle_digest: bundle_digest.to_owned(),
-            bundle_size: 100,
-            compile_millis: 5,
-            unit_shape: None,
-            min_glibc: None,
-        }
-    }
 
     #[test]
     fn run_title_round_trips() {
@@ -248,25 +231,96 @@ mod tests {
         assert_eq!(parse_run_title("1.99.0-"), None);
     }
 
+    const BUILD: BuildRun = BuildRun {
+        run_id: 9,
+        run_attempt: 1,
+    };
+
     #[test]
-    fn records_tag_stays_legal() {
-        let tag = records_tag("1.99.0", "serde-1.0.0-abc");
+    fn records_tag_round_trips() {
+        let tag = records_tag("1.99.0", "serde-1.0.0-abc", BUILD);
         assert!(is_records_tag(&tag));
-        assert_eq!(records_tag_rustc(&tag), Some("1.99.0"));
+        let parsed = parse_records_tag(&tag).expect("per-build tag parses");
+        assert_eq!(parsed.rustc_version, "1.99.0");
         assert_eq!(
-            records_tag_rustc("index.x86_64-unknown-linux-gnu.1.91.1"),
-            None
+            parsed.task_hash,
+            blake3::hash(b"serde-1.0.0-abc").to_hex().as_str()
         );
-        // An unhashed task id in the tag's tail is not our format.
-        assert_eq!(records_tag_rustc("records-1.99.0-serde-1.0.0-abc"), None);
+        assert_eq!(parsed.build, Some(BUILD));
+    }
+
+    /// A tag parses only as one of the two shapes a records artifact
+    /// was ever published under: a malformed build suffix or task hash
+    /// is not a records tag, never a tag with part of its name ignored.
+    #[test]
+    fn parse_records_tag_refuses_malformed_tags() {
+        let digest = blake3::hash(b"serde-1.0.0-abc").to_hex();
+        for tag in [
+            // A non-numeric run id.
+            format!("records-1.99.0-{digest}-abc-1"),
+            // A missing run attempt.
+            format!("records-1.99.0-{digest}-9"),
+            // A signed or empty field is not a decimal.
+            format!("records-1.99.0-{digest}-+9-1"),
+            format!("records-1.99.0-{digest}--1"),
+            // A wrong-length task hash, with and without a build.
+            "records-1.99.0-deadbeef-9-1".to_owned(),
+            "records-1.99.0-deadbeef".to_owned(),
+            // Not ours at all.
+            "index.x86_64-unknown-linux-gnu.1.91.1".to_owned(),
+            "records-1.99.0-serde-1.0.0-abc".to_owned(),
+        ] {
+            assert_eq!(parse_records_tag(&tag), None, "{tag}");
+        }
+    }
+
+    /// The suffix-less tags in the registry still parse, as a build
+    /// older than every named build of the same task.
+    #[test]
+    fn a_tag_without_a_build_is_its_tasks_oldest() {
+        let digest = blake3::hash(b"serde-1.0.0-abc").to_hex();
+        let tag = format!("records-1.99.0-{digest}");
+        let unnamed = parse_records_tag(&tag).expect("suffix-less tag parses");
+        assert_eq!(unnamed.rustc_version, "1.99.0");
+        assert_eq!(unnamed.task_hash, digest.as_str());
+        assert_eq!(unnamed.build, None);
+        let first = BuildRun {
+            run_id: 0,
+            run_attempt: 0,
+        };
+        assert!(unnamed.build < Some(first));
+    }
+
+    /// `BuildRun` orders numerically on run id, then attempt — a
+    /// run-9 build folds before a run-10 build regardless of how the
+    /// tag strings would sort.
+    #[test]
+    fn build_run_orders_numerically() {
+        let run9 = BuildRun {
+            run_id: 9,
+            run_attempt: 1,
+        };
+        let run10 = BuildRun {
+            run_id: 10,
+            run_attempt: 1,
+        };
+        assert!(run9 < run10, "run id 9 sorts before run id 10");
+        assert!(
+            BuildRun {
+                run_id: 9,
+                run_attempt: 2
+            } < run10,
+            "attempt orders within one run id"
+        );
     }
 
     /// The gate mock-e2e ran into: a real task id — `<crate>-<version>
     /// with prerelease>-<features>-<target>-<rustc>` — blows past OCI's
     /// 128-character tag limit at a 64-character crate name, so the tag
     /// carries the task id's blake3 and stays legal by construction.
-    /// The webhook computes the same tag off the run's `display_title`,
-    /// which is exactly what `push_records` signed the artifact under.
+    /// The webhook computes the same tag off the run's `display_title`
+    /// and run identity, which is exactly what `push_records` signed
+    /// the artifact under.
     #[test]
     fn a_long_task_id_still_produces_a_legal_tag() {
         let task_id = format!(
@@ -278,13 +332,16 @@ mod tests {
             "1.99.0"
         );
         assert!(task_id.len() > MAX_OCI_TAG_LEN - "records-".len());
-        let tag = records_tag("1.99.0", &task_id);
+        let tag = records_tag("1.99.0", &task_id, BUILD);
         assert!(tag.len() <= MAX_OCI_TAG_LEN, "tag {tag:?} overflows");
-        assert_eq!(records_tag_rustc(&tag), Some("1.99.0"));
+        assert_eq!(
+            parse_records_tag(&tag).map(|parsed| parsed.rustc_version),
+            Some("1.99.0")
+        );
         // The webhook path: parse the run title, hash the task id.
         let title = run_title("1.99.0", &task_id);
         let (title_rustc, title_task_id) = parse_run_title(&title).expect("run title");
-        assert_eq!(records_tag(title_rustc, title_task_id), tag);
+        assert_eq!(records_tag(title_rustc, title_task_id, BUILD), tag);
     }
 
     #[test]
@@ -292,38 +349,5 @@ mod tests {
         assert!(is_records_tag("records-anything"));
         assert!(!is_records_tag("index.x86_64-unknown-linux-gnu.1.91.1"));
         assert!(!is_records_tag("serde.1.0.0.bundle"));
-    }
-
-    #[test]
-    fn slices_group_sort_and_drop_unbundled() {
-        let records = vec![
-            record("x86_64-unknown-linux-gnu", "1.98.1", "bbbb", "sha256:b"),
-            record("aarch64-apple-darwin", "1.98.1", "cccc", "sha256:c"),
-            record("x86_64-unknown-linux-gnu", "1.98.1", "aaaa", "sha256:a"),
-            record("x86_64-unknown-linux-gnu", "1.98.1", "dddd", ""),
-        ];
-        let slices = records_into_slices(records);
-        assert_eq!(slices.len(), 2);
-        let linux = slices
-            .get(&(
-                TargetTriple::parse("x86_64-unknown-linux-gnu").expect("t"),
-                WireRustcVersion::parse("1.98.1").expect("r"),
-            ))
-            .expect("linux slice");
-        assert_eq!(linux.len(), 2);
-        assert_eq!(linux[0].c_metadata.as_str(), "aaaa");
-        assert_eq!(linux[1].c_metadata.as_str(), "bbbb");
-    }
-
-    #[test]
-    fn duplicate_c_metadata_collapses_to_the_later_record() {
-        let mut first = record("x86_64-unknown-linux-gnu", "1.98.1", "aa11", "sha256:1");
-        first.bundle_size = 1;
-        let mut second = record("x86_64-unknown-linux-gnu", "1.98.1", "aa11", "sha256:2");
-        second.bundle_size = 2;
-        let slices = records_into_slices(vec![first, second]);
-        let rows = slices.values().next().expect("slice");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].bundle_size, 2);
     }
 }

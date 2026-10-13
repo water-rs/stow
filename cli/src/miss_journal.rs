@@ -82,7 +82,10 @@ pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Op
         features: parsed.features.iter().cloned().collect(),
         target: build.target.clone(),
         explicit_target: parsed.target.clone(),
-        build_override: parsed.debuginfo.is_none() && parsed.opt_level.is_none(),
+        // Cargo spells explicit codegen flags for target units but not
+        // for the build-override units on the host half — the split a
+        // target build leaves on the argv (stow#349).
+        build_override: crate::unit_node::build_override_signal(parsed),
         externs,
     })
 }
@@ -450,11 +453,10 @@ pub fn journal_supervised(
     if let Err(error) = append_lines(&journal, &entries) {
         tracing::warn!(error = %error, journal = %journal.display(), "could not journal the build's compile observations");
     }
-    // The expanded graph's store lands only when the detached
-    // build-analysis enrichment finishes — a fast build's drain can
-    // run before it (or after the process has already killed it), so
-    // the journal also carries the context the drain re-derives the
-    // same graph from (stow#588).
+    // The expanded graph's store lands only when the in-build analysis
+    // reaches it — a build aborts that analysis when cargo exits, and a
+    // fast build's cargo exits first — so the journal also carries the
+    // context the drain re-derives the same graph from (stow#588).
     write_consumer_context(&journal, consumer.manifest_dir, Some(consumer.key));
 }
 
@@ -665,6 +667,7 @@ impl SidecarKeyInputs {
     /// the function hashes changed since the build (stow#588).
     fn key_of(&self) -> stow_types::error::Result<String> {
         let cargo_args: Vec<OsString> = self.cargo_args.iter().map(OsString::from).collect();
+        let env = std::env::vars_os().collect::<Vec<_>>();
         crate::lockfile_graph_cache::key_of(&crate::lockfile_graph_cache::KeyInputs {
             action: &self.action,
             cargo_args: &cargo_args,
@@ -674,6 +677,7 @@ impl SidecarKeyInputs {
             target: &self.target,
             target_given: self.target_given,
             rustc_version: &self.rustc_version,
+            env: &env,
         })
     }
 }
@@ -758,6 +762,19 @@ struct DrainContext<'a> {
     spelled: bool,
 }
 
+/// What a drain group's memo miss comes to.
+enum MemoMiss {
+    /// The same function of the same inputs, derived again.
+    Derived(crate::ExpandedDependencyGraph),
+    /// No graph now, and one may still arrive: the units stay journaled.
+    Keep,
+    /// The project no longer hashes to the key the build recorded and
+    /// the memo holds nothing under it, so no build of the project as it
+    /// now is will store this group's graph: its units are dropped
+    /// (stow#674).
+    Drop,
+}
+
 /// Re-derive a drain group's expanded graph when the keyed memo missed.
 ///
 /// The keyed store is the memo of "the expanded graph for the inputs
@@ -766,50 +783,50 @@ struct DrainContext<'a> {
 /// files before re-deriving: equal keys mean the same function of the
 /// same inputs — the derived graph is the memo's own value and fills
 /// the store under the build's key. A different key means the project
-/// changed since the build, and the units stay journaled rather than
-/// mint subgraphs for units that were never built that way. A
-/// standalone build journals no key; its re-derivation is the only
-/// graph it ever had (stow#588).
+/// changed since the build: no build of the project as it now is will
+/// ever store a graph under the recorded key, so the group's units can
+/// never mint and are dropped (stow#674). A standalone build journals
+/// no key; its re-derivation is the only graph it ever had (stow#588).
 async fn rederive_memoized_graph(
     config: &StowConfig,
     journal: &Path,
     context: &JournalContext,
-    expanded_cache_key: &str,
+    key: &DrainGroupKey,
+    units: usize,
     consumer_target: &str,
     consumer_spelled_target: bool,
-    rustc_version: &str,
-) -> Option<crate::ExpandedDependencyGraph> {
-    let rederive = if expanded_cache_key.is_empty() {
-        true
-    } else {
+) -> MemoMiss {
+    let DrainGroupKey {
+        rustc_version,
+        expanded_cache_key,
+    } = key;
+    if !expanded_cache_key.is_empty() {
         match context.cache_key.as_ref().map(SidecarKeyInputs::key_of) {
-            Some(Ok(drain_key)) if drain_key == *expanded_cache_key => true,
+            Some(Ok(drain_key)) if drain_key == *expanded_cache_key => {}
             Some(Ok(drain_key)) => {
                 tracing::warn!(
                     journal = %journal.display(),
                     cache_key = %expanded_cache_key,
                     drain_key = %drain_key,
-                    "the project changed since the build; keeping the miss journal's units"
+                    units = units,
+                    "the project changed since the build; dropping the miss journal's units"
                 );
-                false
+                return MemoMiss::Drop;
             }
             Some(Err(error)) => {
                 tracing::warn!(error = %error, journal = %journal.display(), "could not recompute the miss journal's cache key; keeping its units");
-                false
+                return MemoMiss::Keep;
             }
             None => {
                 tracing::warn!(journal = %journal.display(), "the miss journal's context sidecar carries no cache-key inputs; keeping its units");
-                false
+                return MemoMiss::Keep;
             }
         }
-    };
-    if !rederive {
-        return None;
     }
-    let expanded = match stow_types::identity::WireRustcVersion::parse(rustc_version) {
+    let expanded = match stow_types::identity::WireRustcVersion::parse(rustc_version.as_str()) {
         Err(error) => {
             tracing::warn!(error = %error, journal = %journal.display(), "miss journal's rustc version does not parse; keeping its units");
-            return None;
+            return MemoMiss::Keep;
         }
         Ok(rustc) => match crate::workspace_deps::resolve_exact_dependency_graph(
             &context.manifest_dir.join("Cargo.toml"),
@@ -823,23 +840,23 @@ async fn rederive_memoized_graph(
         )
         .await
         {
-            Ok(graph) => Some(graph),
+            Ok(graph) => graph,
             Err(error) => {
                 tracing::warn!(error = %error, journal = %journal.display(), manifest = %context.manifest_dir.display(), "could not re-derive the miss journal's unit graph; keeping its units");
-                return None;
+                return MemoMiss::Keep;
             }
         },
     };
     // A supervised re-derivation fills the memo under the build's own
     // key — the same function of the same inputs — so the next drain of
     // this key loads instead of re-deriving again.
-    if let (Some(graph), false) = (&expanded, expanded_cache_key.is_empty())
+    if !expanded_cache_key.is_empty()
         && let Err(error) =
-            crate::lockfile_graph_cache::store(config, expanded_cache_key, graph).await
+            crate::lockfile_graph_cache::store(config, expanded_cache_key, &expanded).await
     {
         tracing::warn!(error = %error, journal = %journal.display(), "could not fill the expanded-graph memo");
     }
-    expanded
+    MemoMiss::Derived(expanded)
 }
 
 /// Drains one `(rustc_version, expanded_cache_key)` group, returning the
@@ -848,7 +865,9 @@ async fn rederive_memoized_graph(
 /// function re-derived over unchanged inputs — and a journal line whose
 /// build recorded none (a wrapper-written line, or a key whose memo
 /// both missed and could not re-derive) cannot mint a real context, so
-/// its units stay journaled (stow#588).
+/// its units stay journaled (stow#588). A group the drain can prove
+/// will never mint — the project no longer hashes to the key its build
+/// recorded — is dropped instead of kept (stow#674).
 async fn drain_group(
     config: &StowConfig,
     journal: &Path,
@@ -888,16 +907,23 @@ async fn drain_group(
     if expanded.is_none()
         && let Some(context) = context
     {
-        expanded = rederive_memoized_graph(
+        match rederive_memoized_graph(
             config,
             journal,
             context,
-            expanded_cache_key,
+            key,
+            group.len(),
             consumer_target,
             consumer_spelled_target,
-            rustc_version,
         )
-        .await;
+        .await
+        {
+            MemoMiss::Derived(graph) => expanded = Some(graph),
+            // Dropped units neither post nor go back: no build will
+            // ever store the graph they mint off (stow#674).
+            MemoMiss::Drop => return Vec::new(),
+            MemoMiss::Keep => {}
+        }
     }
     let units: Vec<ObservedUnit> = group.iter().map(|entry| entry.unit.clone()).collect();
     let posted = match &expanded {
@@ -1004,6 +1030,8 @@ mod tests {
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db_pool: std::sync::Arc::default(),
             trust_material: std::sync::Arc::default(),
+            registry_http: std::sync::Arc::default(),
+            artifact_cache_staging: std::sync::Arc::default(),
         }
     }
 
@@ -1165,6 +1193,10 @@ mod tests {
                 target: "wasm32-unknown-unknown",
                 target_given: true,
                 rustc_version: "1.99.0",
+                // The same environment the drain's recompute sees —
+                // `cache_key` reads `vars_os` on the live path, so the
+                // memoized key must too (stow#617).
+                env: Box::leak(Box::new(std::env::vars_os().collect::<Vec<_>>())).as_slice(),
             },
         )
     }
@@ -1209,11 +1241,11 @@ mod tests {
     }
 
     /// The same journal whose project changed between build and drain
-    /// — its manifest no longer hashes to the recorded key — keeps its
-    /// units rather than minting subgraphs for units never built that
-    /// way (stow#588).
+    /// — its manifest no longer hashes to the recorded key — drops its
+    /// units: no build of the project as it now is will ever store a
+    /// graph under that key, so the group can never mint (stow#674).
     #[tokio::test]
-    async fn a_supervised_drain_keeps_units_when_the_project_changed() {
+    async fn a_supervised_drain_drops_units_when_the_project_changed() {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = test_config(dir.path());
         let (project, key_inputs) = keyed_project(dir.path());
@@ -1238,8 +1270,14 @@ mod tests {
 
         drain_journal(&config, &journal).await;
 
-        let contents = std::fs::read_to_string(&journal).expect("journal kept");
-        assert!(contents.contains("not a crate"));
+        assert!(
+            !journal.exists(),
+            "a group that can never mint is dropped, so the journal is gone"
+        );
+        assert!(
+            !context_path(&journal).exists(),
+            "a fully drained journal leaves no context sidecar"
+        );
         assert!(
             crate::lockfile_graph_cache::load(&config, &build_key)
                 .await
@@ -1247,6 +1285,90 @@ mod tests {
                 .is_none(),
             "a changed project must not fill the memo"
         );
+    }
+
+    /// A journal mixing a never-mintable group with a kept one: the
+    /// group whose recorded key the project no longer hashes to is
+    /// dropped, while a group whose graph could not be re-derived
+    /// stays journaled for a later drain (stow#674).
+    #[tokio::test]
+    async fn a_dropped_group_leaves_the_rest_of_the_journal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = test_config(dir.path());
+        let (project, key_inputs) = keyed_project(dir.path());
+        let build_key = crate::lockfile_graph_cache::key_of(&key_inputs).expect("key");
+        let journal = journal_path(dir.path(), "stow-1");
+        write_consumer_context(&journal, &project, Some(&key_inputs));
+        let dropped = JournalEntry {
+            expanded_cache_key: build_key.clone(),
+            ..entry("not a crate", "1.99.0")
+        };
+        // The kept group is a wrapper-shaped line (no recorded key):
+        // the manifest edit below breaks its re-derivation, so its
+        // units stay journaled exactly as they did before.
+        let postable = JournalEntry {
+            unit: ObservedUnit {
+                crate_name: "serde".to_owned(),
+                externs: Vec::new(),
+                ..unit("serde", Some("wasm32-unknown-unknown"))
+            },
+            ..entry("serde", "1.99.0")
+        };
+        append_lines(&journal, &[dropped, postable]).expect("write journal");
+        // The edited manifest no longer hashes to the recorded key and
+        // no longer parses, so the keyless group's re-derivation fails.
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\nbroken [[[",
+        )
+        .expect("edit manifest");
+
+        drain_journal(&config, &journal).await;
+
+        let contents = std::fs::read_to_string(&journal).expect("journal kept");
+        assert!(
+            !contents.contains("not a crate"),
+            "the unmintable group's units were dropped"
+        );
+        assert!(
+            contents.contains("\"serde\""),
+            "the group that could not re-derive stayed journaled"
+        );
+        assert!(
+            crate::lockfile_graph_cache::load(&config, &build_key)
+                .await
+                .expect("load")
+                .is_none(),
+            "a changed project must not fill the memo"
+        );
+    }
+
+    /// A group whose recorded key cannot be recomputed — the sidecar
+    /// carries no key inputs — is not proven unmintable: the units
+    /// stay journaled (stow#674).
+    #[tokio::test]
+    async fn a_group_whose_key_cannot_be_recomputed_is_kept() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = test_config(dir.path());
+        let (project, _key_inputs) = keyed_project(dir.path());
+        let journal = journal_path(dir.path(), "stow-1");
+        // A context sidecar without `cache_key` inputs: the drain
+        // cannot tell a changed project from an unchanged one.
+        write_consumer_context(&journal, &project, None);
+        append_lines(
+            &journal,
+            &[JournalEntry {
+                expanded_cache_key: "key-never-stored".to_owned(),
+                ..entry("serde", "1.99.0")
+            }],
+        )
+        .expect("write journal");
+
+        drain_journal(&config, &journal).await;
+
+        let contents = std::fs::read_to_string(&journal).expect("journal kept");
+        assert!(contents.contains("\"serde\""));
+        assert_eq!(finished_journals(dir.path()), vec![journal]);
     }
 
     /// A failed restore keeps the claim file — the next drain reclaims
