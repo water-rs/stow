@@ -18,7 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use futures_util::StreamExt;
 use stow_cli::build_consume::{self, ConsumeConfig, IndexSlice};
 use stow_types::api::BuildTaskPayload;
 use stow_types::index::ArtifactIndexRow;
@@ -26,6 +28,17 @@ use stow_types::public_cache::canonical_crate_name;
 
 use crate::capture;
 use crate::dep_scan;
+
+/// How many candidates are fetched, verified and staged at once.
+///
+/// Measured from a runner against the registry the builders pull from
+/// (stow#717, run 38482237026; bundles average about 2 MB): one in
+/// flight carried 400 bundles' worth at 73 ms each, eight at 10.9 ms,
+/// sixteen at 5.2 ms, and thirty-two, sixty-four and a hundred and
+/// twenty-eight stayed inside the noise of sixteen — the link is full
+/// there, and more in flight only makes each request longer. The
+/// registry refused nothing at any level.
+const PREFETCH_CONCURRENCY: usize = 16;
 
 /// What [`prefetch`] staged for the capture wrapper to serve: the read-only
 /// store the sandbox grant covers and how many verified bundles it holds.
@@ -151,13 +164,61 @@ async fn stage_candidates(
     let http = config.registry_http().await.map_err(unavailable)?;
     let session = registry.session(&http);
 
-    let mut staged = 0usize;
     let mut seen_compile_keys = BTreeSet::new();
+    let mut distinct = Vec::new();
     for (slice, row) in candidates {
-        if !seen_compile_keys.insert(row.compile_key.clone()) {
-            continue;
+        if seen_compile_keys.insert(row.compile_key.clone()) {
+            distinct.push((slice, row));
         }
-        match fetch_and_stage(&config, &session, slice, row, store_dir).await {
+    }
+    let candidate_count = distinct.len();
+
+    let started = Instant::now();
+    let staged = stage_all(distinct, |slice, row| {
+        fetch_and_stage(&config, &session, slice, row, store_dir)
+    })
+    .await?;
+
+    tracing::info!(
+        task_id = %task.task_id,
+        staged,
+        candidates = candidate_count,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "cache-consumption prefetch staged verified bundles"
+    );
+    Ok(Consumption {
+        store_dir: store_dir.to_path_buf(),
+        artifacts: staged,
+    })
+}
+
+/// Stage every candidate, `PREFETCH_CONCURRENCY` at a time, and count
+/// the ones that landed.
+///
+/// The candidates are independent — one round trip to the registry
+/// each, then checks on bytes already in hand — so serially the stage
+/// cost the sum of them, about two minutes for a five-hundred-candidate
+/// closure (stow#717). What a failure means is unchanged: a candidate
+/// that could not be fetched is logged and skipped and its unit
+/// compiles; one the signed index vouches for that did not verify fails
+/// the stage, and the candidates still in flight are dropped with it.
+async fn stage_all<'a, Stage, Staging>(
+    candidates: Vec<(&'a IndexSlice, &'a ArtifactIndexRow)>,
+    stage: Stage,
+) -> Result<usize, build_consume::StageFailure>
+where
+    Stage: Fn(&'a IndexSlice, &'a ArtifactIndexRow) -> Staging + Send + Sync,
+    Staging: Future<Output = Result<(), build_consume::StageFailure>> + Send,
+{
+    let mut staged = 0usize;
+    let mut in_flight = futures_util::stream::iter(candidates)
+        .map(|(slice, row)| {
+            let staging = stage(slice, row);
+            async move { (row, staging.await) }
+        })
+        .buffer_unordered(PREFETCH_CONCURRENCY);
+    while let Some((row, outcome)) = in_flight.next().await {
+        match outcome {
             Ok(()) => staged += 1,
             Err(build_consume::StageFailure::Unavailable(error)) => {
                 tracing::warn!(
@@ -173,6 +234,8 @@ async fn stage_candidates(
             // tampered publication into a slow build and nothing else,
             // on the one machine whose output every user installs.
             Err(build_consume::StageFailure::Unverifiable(error)) => {
+                // Returning drops the stream, which cancels the
+                // candidates still in flight.
                 return Err(build_consume::StageFailure::Unverifiable(
                     stow_types::stow_error!(
                         "the signed index vouches for `{}` {} (compile key {}) but its bundle did not verify: {error}",
@@ -184,17 +247,7 @@ async fn stage_candidates(
             }
         }
     }
-
-    tracing::info!(
-        task_id = %task.task_id,
-        staged,
-        candidates = seen_compile_keys.len(),
-        "cache-consumption prefetch staged verified bundles"
-    );
-    Ok(Consumption {
-        store_dir: store_dir.to_path_buf(),
-        artifacts: staged,
-    })
+    Ok(staged)
 }
 
 /// The `(slice, row)` pairs a build may serve: rows matching a unit of
@@ -302,7 +355,9 @@ async fn fetch_and_stage(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use stow_cli::build_consume::StageFailure;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
         CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
@@ -361,32 +416,19 @@ mod tests {
         host_row.unit_shape = Some(shape(UnitSide::Host));
         let mut target_row = index_row("windows-link", "0.2.1", "bbbbbbbbbbbbbbbb", &[], None);
         target_row.unit_shape = Some(shape(UnitSide::Target));
-        let slice = stow_cli::build_consume::IndexSlice {
-            manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
-            index: ArtifactIndex {
-                header: ArtifactIndexHeader {
-                    format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
-                    target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
-                    rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
-                    generated_at: String::new(),
-                    generation: 1,
-                    row_count: 5,
-                },
-                rows: vec![
-                    host_row,
-                    target_row,
-                    index_row("windows-link", "0.2.1", "cccccccccccccccc", &[], None),
-                    index_row("tokio", "1.53.2", "dddddddddddddddd", &["fs", "net"], None),
-                    index_row(
-                        "tokio",
-                        "1.53.2",
-                        "eeeeeeeeeeeeeeee",
-                        &["fs", "net", "windows-sys"],
-                        None,
-                    ),
-                ],
-            },
-        };
+        let slice = index_slice(vec![
+            host_row,
+            target_row,
+            index_row("windows-link", "0.2.1", "cccccccccccccccc", &[], None),
+            index_row("tokio", "1.53.2", "dddddddddddddddd", &["fs", "net"], None),
+            index_row(
+                "tokio",
+                "1.53.2",
+                "eeeeeeeeeeeeeeee",
+                &["fs", "net", "windows-sys"],
+                None,
+            ),
+        ]);
 
         let slices = [slice];
         let hits = super::candidates(&slices, &packages);
@@ -399,6 +441,152 @@ mod tests {
             BTreeSet::from(["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "dddddddddddddddd"]),
             "host-shaped and shapeless windows-link rows and the exactly-labelled tokio row stage; the target shape and the metadata-labelled row do not"
         );
+    }
+
+    /// stow#717: the candidates are independent round trips, so they
+    /// stage `PREFETCH_CONCURRENCY` at a time — the most ever in flight
+    /// reaches the bound exactly, never above it.
+    #[test]
+    fn candidates_are_staged_concurrently_under_the_bound() {
+        smol::block_on(async {
+            const COUNT: usize = 3 * super::PREFETCH_CONCURRENCY;
+            let slice = index_slice(
+                (0..COUNT)
+                    .map(|index| {
+                        index_row(
+                            &format!("crate-{index}"),
+                            "1.0.0",
+                            &format!("{index:016x}"),
+                            &[],
+                            None,
+                        )
+                    })
+                    .collect(),
+            );
+            let candidates = slice
+                .index
+                .rows
+                .iter()
+                .map(|row| (&slice, row))
+                .collect::<Vec<_>>();
+
+            let in_flight = AtomicUsize::new(0);
+            let most_in_flight = AtomicUsize::new(0);
+            let staged = super::stage_all(candidates, |_, _| {
+                let in_flight = &in_flight;
+                let most_in_flight = &most_in_flight;
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    most_in_flight.fetch_max(now, Ordering::SeqCst);
+                    for _ in 0..3 {
+                        futures_lite::future::yield_now().await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await
+            .expect("every candidate stages");
+
+            assert_eq!(staged, COUNT);
+            assert_eq!(
+                most_in_flight.load(Ordering::SeqCst),
+                super::PREFETCH_CONCURRENCY
+            );
+        });
+    }
+
+    /// A candidate that could not be fetched is logged and skipped — its
+    /// unit compiles — and the rest of the stage still lands.
+    #[test]
+    fn an_unfetchable_candidate_is_skipped_and_the_rest_are_staged() {
+        smol::block_on(async {
+            let slice = index_slice(vec![
+                index_row("absent", "1.0.0", "0000000000000001", &[], None),
+                index_row("present-a", "1.0.0", "0000000000000002", &[], None),
+                index_row("present-b", "1.0.0", "0000000000000003", &[], None),
+            ]);
+            let candidates = slice
+                .index
+                .rows
+                .iter()
+                .map(|row| (&slice, row))
+                .collect::<Vec<_>>();
+
+            let staged = super::stage_all(candidates, |_, row| async move {
+                if row.crate_name.as_str() == "absent" {
+                    Err(StageFailure::Unavailable(stow_types::stow_error!(
+                        "no such blob"
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .expect("a missing bundle does not fail the stage");
+
+            assert_eq!(staged, 2);
+        });
+    }
+
+    /// A bundle the signed index vouched for that did not verify fails
+    /// the whole stage — the row it names is in the error. The never-
+    /// resolving sibling stands in for the candidates still in flight,
+    /// which the return drops.
+    #[test]
+    fn an_unverifiable_candidate_fails_the_stage() {
+        smol::block_on(async {
+            let slice = index_slice(vec![
+                index_row("forged", "2.3.4", "0000000000000004", &[], None),
+                index_row("genuine", "1.0.0", "0000000000000005", &[], None),
+            ]);
+            let candidates = slice
+                .index
+                .rows
+                .iter()
+                .map(|row| (&slice, row))
+                .collect::<Vec<_>>();
+
+            let error = super::stage_all(candidates, |_, row| async move {
+                if row.crate_name.as_str() == "forged" {
+                    Err(StageFailure::Unverifiable(stow_types::stow_error!(
+                        "signature did not check out"
+                    )))
+                } else {
+                    futures_lite::future::pending::<()>().await;
+                    Ok(())
+                }
+            })
+            .await
+            .expect_err("an unverifiable candidate fails the stage");
+
+            let StageFailure::Unverifiable(error) = error else {
+                panic!("expected StageFailure::Unverifiable, got {error:?}");
+            };
+            let text = error.to_string();
+            assert!(text.contains("forged"), "the row's crate name: {text}");
+            assert!(text.contains("2.3.4"), "the row's version: {text}");
+            assert!(text.contains("did not verify"), "the verdict: {text}");
+        });
+    }
+
+    /// A one-slice fixture around `rows`: the target and rustc are the
+    /// ones the `candidates` matching tests exercise.
+    fn index_slice(rows: Vec<ArtifactIndexRow>) -> stow_cli::build_consume::IndexSlice {
+        stow_cli::build_consume::IndexSlice {
+            manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
+            index: ArtifactIndex {
+                header: ArtifactIndexHeader {
+                    format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
+                    target: TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap(),
+                    rustc_version: WireRustcVersion::parse("1.99.0").unwrap(),
+                    generated_at: String::new(),
+                    generation: 1,
+                    row_count: rows.len() as u64,
+                },
+                rows,
+            },
+        }
     }
 
     /// An index row fixture: `compile_key` hashes to `c_metadata`'s prefix

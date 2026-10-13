@@ -224,7 +224,12 @@ pub async fn stage_bundle_bytes(
     verify::verify_bundle_signature(&config.0, &bundle)
         .await
         .map_err(StageFailure::Unverifiable)?;
-    artifact_cache::store_bundle_entry_dir(entry_dir, &bundle)
+    // The store decodes and writes every output of the bundle, and the
+    // candidates stage concurrently on one async thread — run inline it
+    // made them take turns (stow#717).
+    let entry_dir = entry_dir.to_path_buf();
+    smol::unblock(move || artifact_cache::store_bundle_entry_dir(&entry_dir, &bundle))
+        .await
         .map_err(StageFailure::Unverifiable)?;
     Ok(())
 }
