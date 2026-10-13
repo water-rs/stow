@@ -4278,9 +4278,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         resolution_done.clone(),
         state_db.clone(),
     ));
-    let mut supervisor = tracing::debug_span!("stow.precargo.supervisor_start")
-        .in_scope(|| crate::supervisor::server::start(handler.clone(), in_flight))
-        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
+    let mut supervisor = start_supervisor(&handler, in_flight, &wrappers)?;
     command.envs(supervisor.env());
 
     let before = CoverageSnapshot::capture(config)
@@ -4352,6 +4350,27 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         tracing::warn!(%error, "could not remove the build scratch directory");
     }
     Ok(status)
+}
+
+/// The build's supervisor, bound beside the handler it shares the
+/// in-flight registry with (stow#618). The runtime executable the shims
+/// resolve to is passed in — the supervisor exports its identity to
+/// cargo so a facade running a different build refuses before a frame is
+/// sent (stow#645).
+fn start_supervisor(
+    handler: &std::sync::Arc<crate::BuildSupervisor>,
+    in_flight: crate::supervisor::server::InFlightUnits,
+    wrappers: &crate::commands::WrapperCommands,
+) -> stow_types::error::Result<crate::supervisor::server::Supervisor> {
+    tracing::debug_span!("stow.precargo.supervisor_start")
+        .in_scope(|| {
+            crate::supervisor::server::start(
+                std::sync::Arc::clone(handler),
+                in_flight,
+                &wrappers.runtime_executable,
+            )
+        })
+        .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))
 }
 
 /// The cargo invocation the build runs: the action, the build's mold
@@ -6191,6 +6210,7 @@ mod tests {
             cc_launcher: "/tools/stow-cc-launcher".to_owned(),
             cc_compiler: "/tools/stow-cc".to_owned(),
             cxx_compiler: "/tools/stow-cxx".to_owned(),
+            runtime_executable: PathBuf::from("/usr/local/bin/stow-cli"),
         };
         let plan = CargoRunPlan {
             project: &project,

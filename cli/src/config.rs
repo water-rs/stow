@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "mock-verify")]
 use sha2::Digest as _;
@@ -344,14 +344,35 @@ pub fn cache_dir() -> stow_types::error::Result<PathBuf> {
     resolve_cache_dir(file_config.as_ref())
 }
 
-/// The per-user directory `stow setup` installs the rustc/cc wrapper shims
-/// into (`~/Library/Application Support/stow/tools` on macOS,
-/// `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
-/// Windows). Unlike the previous `/tmp` location it survives a reboot, so
-/// the `rustc-wrapper` path written into the cargo config keeps
-/// resolving.
+/// The per-user tools directory (`~/Library/Application Support/stow/tools`
+/// on macOS, `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools`
+/// on Windows). The managed mold install lives under it; the wrapper shims
+/// moved to [`shims_dir`] — one directory per cargo home and stow binary —
+/// because one shared directory let any stow re-point every other's shims
+/// (stow#645).
 pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
     wrapper_shim::tools_dir()
+}
+
+/// The directory the rustc/cc wrapper shims are materialized into:
+/// `<cargo home>/stow/shims/<key>/`, where `<key>` is the first 16 hex
+/// characters of the blake3 of `runtime_executable`'s path bytes — the
+/// path exactly as the caller resolved it, not canonicalized.
+///
+/// One directory per (cargo home, stow binary) is what makes the shims
+/// safe to share a filesystem (stow#645):
+///
+/// - The path is stable across builds of the same binary in the same
+///   cargo home, so cargo's `target/.rustc_info.json` probe cache — which
+///   hashes the `RUSTC_WRAPPER` path into its key — holds. A per-build
+///   directory would re-run cargo's rustc probes on every build.
+/// - Two stow binaries never share a directory, so nothing re-points
+///   another binary's shims at itself mid-build.
+/// - A test that isolates `CARGO_HOME` isolates its shims with no further
+///   knob.
+pub fn shims_dir(cargo_home: &Path, runtime_executable: &Path) -> PathBuf {
+    let key = blake3::hash(runtime_executable.as_os_str().as_encoded_bytes()).to_hex();
+    cargo_home.join("stow").join("shims").join(&key[..16])
 }
 
 /// The directory cargo reads its user-level `config.toml` from: `$CARGO_HOME`
@@ -359,6 +380,21 @@ pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
 /// when neither source can produce a path.
 pub fn cargo_home() -> Option<PathBuf> {
     cargo_home_with(|key| std::env::var_os(key))
+}
+
+/// [`cargo_home`] or the error every caller that cannot proceed without a
+/// cargo home reports.
+///
+/// # Errors
+///
+/// `None` from [`cargo_home`] — neither `CARGO_HOME` nor a home directory
+/// is available.
+pub fn require_cargo_home() -> stow_types::error::Result<PathBuf> {
+    cargo_home().ok_or_else(|| {
+        stow_types::stow_error!(
+            "resolve the cargo home — neither $CARGO_HOME nor a home directory is available"
+        )
+    })
 }
 
 /// [`cargo_home`] with the environment injected, so a caller — or a test —
@@ -525,6 +561,39 @@ fn load_artifact_cache_max_bytes(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    #[test]
+    fn shims_dir_is_a_16_hex_key_under_the_cargo_home() {
+        let cargo_home = Path::new("/cargo/home");
+        let dir = super::shims_dir(cargo_home, Path::new("/usr/local/bin/stow-cli"));
+        assert_eq!(
+            dir.parent().expect("shims dir has a parent"),
+            cargo_home.join("stow").join("shims")
+        );
+        let key = dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("shims dir has a name");
+        assert_eq!(key.len(), 16);
+        assert!(
+            key.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "key {key} is not 16 lowercase hex characters"
+        );
+    }
+
+    #[test]
+    fn shims_dir_keys_the_executable_path() {
+        let cargo_home = Path::new("/cargo/home");
+        let one = super::shims_dir(cargo_home, Path::new("/a/stow-cli"));
+        let other = super::shims_dir(cargo_home, Path::new("/b/stow-cli"));
+        assert_ne!(one, other, "two binaries must not share a shim dir");
+        assert_eq!(
+            one,
+            super::shims_dir(cargo_home, Path::new("/a/stow-cli")),
+            "the same binary must land on the same shim dir"
+        );
+    }
 
     #[test]
     fn tools_dir_is_absolute_and_outside_the_system_temp_dir() {

@@ -98,10 +98,11 @@ invocation on the machine transparently routes through stow's `rustc`
 and `cc` wrappers. Run it once per machine; it's idempotent and
 preserves unrelated keys.
 
-The wrapper shims live under the per-user data directory —
-`~/Library/Application Support/stow/tools` on macOS,
-`~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
-Windows — so the paths written into `config.toml` survive reboots.
+The wrapper shims live inside the cargo home itself —
+`$CARGO_HOME/stow/shims/<key>/`, where `<key>` is derived from the
+stow binary's path — so the paths written into `config.toml` survive
+reboots, two stow installs never point the same shim at different
+binaries, and an isolated `CARGO_HOME` isolates its shims too.
 
 The `[env]` compiler entries are scoped the way the `cc` crate reads
 its toolchain variables: the shims are written under
@@ -117,8 +118,8 @@ environment applied to the child; nothing is persisted — no
 
 On Linux, `stow setup` also makes mold available: unless the
 configuration already selects a reachable mold, it downloads the pinned,
-checksummed mold release into the same tools directory and writes the
-linker wiring into `config.toml` — a `cfg(target_os = "linux")` table
+checksummed mold release into stow's per-user tools directory and
+writes the linker wiring into `config.toml` — a `cfg(target_os = "linux")` table
 whose rustflags carry `-fuse-ld=mold`, plus an `[env]` `COMPILER_PATH`
 entry pointing at the managed install so the compiler driver finds
 `ld.mold`. The install path travels in the environment, not in a
@@ -220,10 +221,10 @@ stats DB.
 
 ```
 config: ~/.cargo/config.toml
-rustc-wrapper: ~/.local/share/stow/tools/stow-rustc-wrapper
-cc: ~/.local/share/stow/tools/stow-cc
-cxx: ~/.local/share/stow/tools/stow-cxx
-cc-launcher: ~/.local/share/stow/tools/stow-cc-launcher
+rustc-wrapper: ~/.cargo/stow/shims/<key>/stow-rustc-wrapper
+cc: ~/.cargo/stow/shims/<key>/stow-cc
+cxx: ~/.cargo/stow/shims/<key>/stow-cxx
+cc-launcher: ~/.cargo/stow/shims/<key>/stow-cc-launcher
 edge-url: https://stow.waterui.dev
 rust-cache: hits=412 misses=87 errors=2
 cc-cache: hits=11 misses=3 errors=0

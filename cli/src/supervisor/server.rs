@@ -24,7 +24,7 @@ use super::protocol::{
     Answer, ArtifactNotifications, AwaitServeMap, Compiled, Observed, Plan, Request, read_frame,
     write_frame,
 };
-use super::{ENDPOINT_ENV, Endpoint, TOKEN_ENV};
+use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, Endpoint, TOKEN_ENV};
 
 /// What a supervisor does with the invocations its facades send.
 ///
@@ -100,6 +100,10 @@ const CONNECTION_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 pub struct Supervisor {
     endpoint: Endpoint,
     token: String,
+    /// The identity of the runtime executable this build's shims resolve
+    /// to — exported so a facade running a different build of the binary
+    /// refuses before it sends a frame (stow#645).
+    binary: BinaryIdentity,
     shutdown: Option<oneshot::Sender<()>>,
     /// The accept task: ends once it has stopped accepting *and* every
     /// connection it accepted has run to its end (stow#618).
@@ -113,12 +117,15 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    /// The environment a cargo invocation needs to reach this supervisor.
+    /// The environment a cargo invocation needs to reach this supervisor:
+    /// the endpoint and token the transport wants, and the binary
+    /// identity the facade's own executable must match.
     #[must_use]
-    pub fn env(&self) -> [(&'static str, String); 2] {
+    pub fn env(&self) -> [(&'static str, String); 3] {
         [
             (ENDPOINT_ENV, self.endpoint.encode()),
             (TOKEN_ENV, self.token.clone()),
+            (BINARY_ENV, self.binary.encode()),
         ]
     }
 
@@ -199,16 +206,24 @@ enum Ticket<P> {
 ///
 /// `in_flight` is the build's registry of locally compiling units — the
 /// caller shares it with the handler, whose post-compiles wait on it
-/// (stow#618).
+/// (stow#618). `runtime_executable` is the binary the build's shims
+/// resolve to: its identity goes to cargo so a facade running a different
+/// build of the binary refuses to connect (stow#645).
 ///
 /// # Errors
 ///
 /// Binding failures: a socket directory that cannot be created, a port
-/// that cannot be bound.
-pub fn start<H>(handler: Arc<H>, in_flight: InFlightUnits) -> Result<Supervisor, String>
+/// that cannot be bound, a runtime executable that cannot be statted.
+pub fn start<H>(
+    handler: Arc<H>,
+    in_flight: InFlightUnits,
+    runtime_executable: &std::path::Path,
+) -> Result<Supervisor, String>
 where
     H: Handler,
 {
+    let binary = BinaryIdentity::of(runtime_executable)
+        .map_err(|error| format!("identity of {}: {error}", runtime_executable.display()))?;
     let token = mint_token();
     let (tickets, ticket_rx) = mpsc::unbounded_channel::<Ticket<H::Pending>>();
     tokio::spawn(run_tickets(ticket_rx));
@@ -236,6 +251,7 @@ where
         Ok(Supervisor {
             endpoint,
             token,
+            binary,
             shutdown: Some(shutdown_tx),
             accept_task: Some(accept_task),
             connections,
@@ -259,6 +275,7 @@ where
         Ok(Supervisor {
             endpoint,
             token,
+            binary,
             shutdown: Some(shutdown_tx),
             accept_task: Some(accept_task),
             connections,
@@ -786,6 +803,12 @@ mod tests {
     use crate::supervisor::client::{Connection, Decision as ClientDecision};
     use crate::supervisor::protocol::ArtifactNotifications;
 
+    /// A real file for the supervisor's binary identity — any path
+    /// `BinaryIdentity::of` can stat answers.
+    fn test_executable() -> std::path::PathBuf {
+        std::env::current_exe().expect("current exe")
+    }
+
     /// Serves anything whose first argument is `--serve-me`, asks for a
     /// compile otherwise, and counts the reports it receives.
     struct Stub {
@@ -838,9 +861,13 @@ mod tests {
         let handler = Arc::new(Stub {
             reports: AtomicUsize::new(0),
         });
-        let supervisor = start(Arc::clone(&handler), super::InFlightUnits::default())
-            .expect("start the supervisor");
-        let [(_, endpoint), (_, token)] = supervisor.env();
+        let supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
 
         let mut connection = Connection::open(&endpoint, token)
@@ -973,9 +1000,13 @@ mod tests {
         let handler = Arc::new(Stub {
             reports: AtomicUsize::new(0),
         });
-        let supervisor = start(Arc::clone(&handler), super::InFlightUnits::default())
-            .expect("start the supervisor");
-        let [(_, endpoint), (_, token)] = supervisor.env();
+        let supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
 
         let mut connection = Connection::open(&endpoint, token)
@@ -999,9 +1030,9 @@ mod tests {
         let handler = Arc::new(Stub {
             reports: AtomicUsize::new(0),
         });
-        let supervisor =
-            start(handler, super::InFlightUnits::default()).expect("start the supervisor");
-        let [(_, endpoint), _] = supervisor.env();
+        let supervisor = start(handler, super::InFlightUnits::default(), &test_executable())
+            .expect("start the supervisor");
+        let [(_, endpoint), ..] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
 
         let mut connection = Connection::open(&endpoint, "not-the-token".to_owned())
@@ -1136,9 +1167,13 @@ mod tests {
             started: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
         });
-        let mut supervisor = start(Arc::clone(&handler), super::InFlightUnits::default())
-            .expect("start the supervisor");
-        let [(_, endpoint), (_, token)] = supervisor.env();
+        let mut supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
         let mut stream = connect_raw(&endpoint).await;
         send_report(&mut stream, &token).await;
@@ -1171,9 +1206,13 @@ mod tests {
             started: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
         });
-        let mut supervisor = start(Arc::clone(&handler), super::InFlightUnits::default())
-            .expect("start the supervisor");
-        let [(_, endpoint), (_, token)] = supervisor.env();
+        let mut supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
 
         // Connections that end without any bookkeeping in flight: they
@@ -1217,9 +1256,13 @@ mod tests {
             started: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
         });
-        let mut supervisor = start(Arc::clone(&handler), super::InFlightUnits::default())
-            .expect("start the supervisor");
-        let [(_, endpoint), (_, token)] = supervisor.env();
+        let mut supervisor = start(
+            Arc::clone(&handler),
+            super::InFlightUnits::default(),
+            &test_executable(),
+        )
+        .expect("start the supervisor");
+        let [(_, endpoint), (_, token), _] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
         let mut stream = connect_raw(&endpoint).await;
         send_report(&mut stream, &token).await;
