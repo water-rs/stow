@@ -116,8 +116,11 @@ jobs:
               ;;
             aarch64-unknown-linux-gnu)
               sudo apt-get update -qq
+              # The sysroot shims drive GCC 12 (stow#693); the runner image
+              # ships the native drivers and not the cross ones.
               sudo apt-get install -y --no-install-recommends \
-                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu mold
+                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu mold \
+                gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu
               # `-fuse-ld=mold` asks collect2 for `ld.mold` on the cross
               # toolchain's own search path, which /usr/bin does not reach
               # — link the apt install's `ld.mold` in where it looks.
