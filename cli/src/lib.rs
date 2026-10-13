@@ -59,6 +59,10 @@ pub use workspace_deps::{
     ExpandedDependencyGraph, expanded_dependency_graph, resolve_exact_dependency_graph,
 };
 
+/// What a supervisor exports beside its endpoint so a wrapper can tell
+/// it was started by its own build — the stub supervisors export it the
+/// way the real one does (stow#645).
+pub use supervisor::BinaryIdentity;
 /// The supervisor wire protocol, so a peer decoding frames — a stub
 /// supervisor standing in for the real one in integration tests — uses
 /// the product's own types instead of reimplementing the format.
