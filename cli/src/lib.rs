@@ -109,19 +109,13 @@ struct TracingGuard {
     _chrome: Option<tracing_chrome::FlushGuard>,
 }
 
-/// Entry point for all three stow binaries: installs tracing when the
-/// invocation allows it, builds a tokio runtime sized to the invocation
-/// kind, and runs [`async_main`].
-///
-/// Wrapper invocations (`stow rustc`, `stow cc`) get a `current_thread`
-/// runtime — they run hundreds of times per build with at most one
-/// concurrent network task, so worker-pool spin-up is wasted overhead.
-/// User-facing commands that can fan out get the multi-threaded runtime.
+/// Entry point for all three stow binaries: runs the fast paths that
+/// need no runtime, then [`run_command`].
 ///
 /// # Errors
 ///
-/// Returns an error when the tokio runtime cannot be built or when the
-/// selected subcommand fails.
+/// Returns an error when the selected subcommand fails before it can
+/// produce an exit status.
 pub fn run() -> stow_types::error::Result<()> {
     if let Some(status) = delegate_to_capture()? {
         std::process::exit(status);
@@ -134,6 +128,26 @@ pub fn run() -> stow_types::error::Result<()> {
     if let facade::FastPath::Handled(status) = facade::try_invocation()? {
         std::process::exit(status);
     }
+    let status = run_command()?;
+    // The one place a command's failure ends the process — `run_command`
+    // has returned, so everything the command owned — its mirror, its
+    // scratch directory, the runtime, the tracing guard — has been
+    // dropped before the exit (stow#652).
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Installs tracing when the invocation allows it, builds a tokio
+/// runtime sized to the invocation kind, runs [`async_main`] on the
+/// `stow-main` thread, and returns the command's exit status.
+///
+/// Wrapper invocations (`stow rustc`, `stow cc`) get a `current_thread`
+/// runtime — they run hundreds of times per build with at most one
+/// concurrent network task, so worker-pool spin-up is wasted overhead.
+/// User-facing commands that can fan out get the multi-threaded runtime.
+fn run_command() -> stow_types::error::Result<std::process::ExitStatus> {
     // `sigstore`'s `sigstore-trust-root` feature pulls `tough`, which depends
     // on `rustls` with default features — that compiles in `aws_lc_rs`
     // alongside the `ring` provider selected by `zenwave`, `sqlx`, and
@@ -291,15 +305,17 @@ fn should_install_tracing_for_args(
 }
 
 #[tracing::instrument(name = "stow.startup", skip_all, fields(subcommand))]
-async fn async_main() -> stow_types::error::Result<()> {
+async fn async_main() -> stow_types::error::Result<std::process::ExitStatus> {
     let args = process_args();
     let cli = parse_cli_or_exit(&args)?;
     let span = tracing::Span::current();
     span.record("subcommand", subcommand_name(&cli.command));
-    match cli.command {
-        CliCommand::Check(command) => Box::pin(cargo_cmd::run("check", command)).await,
-        CliCommand::Build(command) => Box::pin(cargo_cmd::run("build", command)).await,
-        CliCommand::Test(command) => Box::pin(cargo_cmd::run("test", command)).await,
+    // The cargo commands end with cargo's own exit status; every other
+    // command either fails or ends with success.
+    let done = match cli.command {
+        CliCommand::Check(command) => return Box::pin(cargo_cmd::run("check", command)).await,
+        CliCommand::Build(command) => return Box::pin(cargo_cmd::run("build", command)).await,
+        CliCommand::Test(command) => return Box::pin(cargo_cmd::run("test", command)).await,
         CliCommand::Predict(command) => cargo_cmd::predict(command).await,
         CliCommand::Setup(args) => commands::setup_project(args).await,
         CliCommand::Update => commands::update_self().await,
@@ -316,7 +332,8 @@ async fn async_main() -> stow_types::error::Result<()> {
         CliCommand::Cc(command) => run_cc_wrapper(command).await,
         CliCommand::PurgeCacheDir(command) => commands::purge_cache_dirs(command).await,
         CliCommand::DrainMisses(args) => miss_journal::drain(&args.target_dir).await,
-    }
+    };
+    done.map(|()| std::process::ExitStatus::default())
 }
 
 const fn subcommand_name(command: &CliCommand) -> &'static str {

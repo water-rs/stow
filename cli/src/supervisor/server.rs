@@ -137,9 +137,8 @@ impl Supervisor {
     /// connections abandoned rather than hanging the build. Returns that
     /// number — `0` is a clean drain.
     ///
-    /// The socket's directory is removed here rather than at drop: a
-    /// failing build leaves through `std::process::exit`, which runs no
-    /// destructors (stow#630).
+    /// The socket's directory is removed here rather than at drop: the
+    /// close reports a removal failure a drop would swallow (stow#630).
     pub async fn shutdown(&mut self) -> usize {
         let abandoned = self.shutdown_within(CONNECTION_DRAIN_BUDGET).await;
         #[cfg(unix)]

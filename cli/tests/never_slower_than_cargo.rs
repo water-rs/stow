@@ -489,14 +489,19 @@ fn a_successful_build_leaves_no_generated_files_behind() {
     assert!(leftovers.is_empty(), "the build left {leftovers:?}");
 }
 
-/// stow#630: a failing build leaves through `std::process::exit`, which
-/// runs no destructors — its directories are removed all the same.
+/// stow#630: a failing build's status ends the process only after the
+/// build's owners have dropped — its directories are removed all the
+/// same (stow#652).
 #[test]
 fn a_failing_build_leaves_no_generated_files_behind() {
     let (output, leftovers) = build_leftovers("fn main() { let _: u32 = \"not a number\"; }\n");
-    assert!(
-        !output.status.success(),
-        "a crate that does not compile built:\n{}",
+    // cargo's own exit code for a build that did not compile, carried
+    // out of the process unchanged (stow#652).
+    assert_eq!(
+        output.status.code(),
+        Some(101),
+        "a crate that does not compile ended with {}:\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
