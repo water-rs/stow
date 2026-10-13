@@ -3,7 +3,7 @@ use std::time::Instant;
 use futures_util::{StreamExt, stream};
 
 use crate::artifact_cache::{artifact_cache_key, filter_locally_cached_keys, prepare_local_cache};
-use crate::budget::CacheBudget;
+use crate::budget::{CacheBudget, MAX_BUDGET};
 use crate::config::StowConfig;
 use crate::fetch::{self, BundleRef, FetchError};
 use crate::verify;
@@ -161,8 +161,8 @@ async fn partition_local_requests(
     Ok((already_local, missing_local))
 }
 
-/// Run the per-artifact pulls under the shared pre-cargo budget's deadline.
-/// Artifacts that miss the deadline are fetched on demand by the per-rustc
+/// Run the per-artifact pulls with the trust root loading beside them.
+/// Pulls that miss the deadline are fetched on demand by the per-rustc
 /// wrapper instead, where the latency overlaps cargo's own compilation
 /// parallelism. The shared budget — not a private timer — is what keeps the
 /// resolver, graph analysis, and prefetch from outlasting the build they
@@ -177,7 +177,7 @@ async fn drain_prefetch(
     missing_count: usize,
     budget: &CacheBudget,
 ) -> stow_types::error::Result<PrefetchSummary> {
-    let mut results = stream::iter(missing_local.into_iter().map(|request| {
+    let pulls = stream::iter(missing_local.into_iter().map(|request| {
         process_prefetched_artifact(
             config.clone(),
             target.to_owned(),
@@ -187,8 +187,63 @@ async fn drain_prefetch(
     }))
     .buffer_unordered(PREFETCH_CONCURRENCY);
 
+    drain_pulls(
+        pulls,
+        async { verify::resolve_trust(config).await.map(|_| ()) },
+        missing_count,
+        budget,
+    )
+    .await
+}
+
+/// Drive `pulls` beside the trust root's load. The pulls start at once and
+/// the trust root loads beside their requests, so the wall time before the
+/// first verification is the slower of the two instead of their sum. The
+/// per-artifact allowance starts counting when the trust root is loaded:
+/// that load is a one-time cost unrelated to how many artifacts this build
+/// warms, and charging it to an allowance of 150ms per artifact spent the
+/// allowance on setup. A trust root that cannot be loaded ends the prefetch
+/// with its error, since no pull could be verified, and one that has not
+/// loaded within the budget's ceiling ends it the same way: the load is a
+/// network round trip, and nothing before cargo waits on one without a
+/// bound (stow#701).
+async fn drain_pulls<P, T>(
+    mut pulls: P,
+    trust: T,
+    missing_count: usize,
+    budget: &CacheBudget,
+) -> stow_types::error::Result<PrefetchSummary>
+where
+    P: futures_util::Stream<Item = stow_types::error::Result<PrefetchOutcome>> + Unpin,
+    T: std::future::Future<Output = stow_types::error::Result<()>>,
+{
+    let allowance = budget.remaining();
     let mut summary = PrefetchSummary::default();
-    let deadline = tokio::time::Instant::now() + budget.remaining();
+    tokio::pin!(trust);
+    let trust_deadline = tokio::time::sleep(MAX_BUDGET);
+    tokio::pin!(trust_deadline);
+    loop {
+        tokio::select! {
+            biased;
+            next = pulls.next() => match next {
+                Some(outcome) => record_pull(&mut summary, outcome),
+                // Every pull ended without the trust root: none of them had
+                // a signature to check, so nothing waits for it.
+                None => return Ok(summary),
+            },
+            loaded = &mut trust => {
+                loaded?;
+                break;
+            }
+            () = &mut trust_deadline => {
+                return Err(stow_types::stow_error!(
+                    "the Sigstore trust root did not load within {}s; no prefetched artifact could be verified",
+                    MAX_BUDGET.as_secs()
+                ));
+            }
+        }
+    }
+    let deadline = tokio::time::Instant::now() + allowance;
     loop {
         // Explicit clock check in addition to `timeout_at`: under sustained
         // CPU saturation (dozens of verify/unpack tasks) the timer wheel can
@@ -197,25 +252,8 @@ async fn drain_prefetch(
             warn_deadline(&summary, missing_count, budget);
             break;
         }
-        match tokio::time::timeout_at(deadline, results.next()).await {
-            Ok(Some(Ok(PrefetchOutcome::Stored(metrics)))) => {
-                tracing::debug!(
-                    crate_name = %metrics.crate_name,
-                    c_metadata = %metrics.c_metadata,
-                    "prefetched stow artifact stored locally"
-                );
-                summary.parse_ms += metrics.parse_ms;
-                summary.verify_ms += metrics.verify_ms;
-                summary.store_ms += metrics.store_ms;
-                summary.downloaded += 1;
-            }
-            Ok(Some(Ok(PrefetchOutcome::Absent))) => summary.misses += 1,
-            Ok(Some(Err(error))) => {
-                // Per artifact: `summary.failed` is what the driver warns
-                // with, once per build (stow#633).
-                tracing::debug!(error = %error, "prefetched stow artifact processing failed");
-                summary.failed += 1;
-            }
+        match tokio::time::timeout_at(deadline, pulls.next()).await {
+            Ok(Some(outcome)) => record_pull(&mut summary, outcome),
             Ok(None) => break,
             Err(_elapsed) => {
                 warn_deadline(&summary, missing_count, budget);
@@ -224,6 +262,30 @@ async fn drain_prefetch(
         }
     }
     Ok(summary)
+}
+
+/// Fold one finished pull into the prefetch summary.
+fn record_pull(summary: &mut PrefetchSummary, outcome: stow_types::error::Result<PrefetchOutcome>) {
+    match outcome {
+        Ok(PrefetchOutcome::Stored(metrics)) => {
+            tracing::debug!(
+                crate_name = %metrics.crate_name,
+                c_metadata = %metrics.c_metadata,
+                "prefetched stow artifact stored locally"
+            );
+            summary.parse_ms += metrics.parse_ms;
+            summary.verify_ms += metrics.verify_ms;
+            summary.store_ms += metrics.store_ms;
+            summary.downloaded += 1;
+        }
+        Ok(PrefetchOutcome::Absent) => summary.misses += 1,
+        Err(error) => {
+            // Per artifact: `summary.failed` is what the driver warns
+            // with, once per build (stow#633).
+            tracing::debug!(error = %error, "prefetched stow artifact processing failed");
+            summary.failed += 1;
+        }
+    }
 }
 
 /// Warn that the prefetch deadline cut the run short. `missing` is how many
@@ -358,4 +420,179 @@ async fn process_prefetched_artifact(
         verify_ms,
         store_ms,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::{StreamExt as _, stream};
+
+    use super::{
+        CacheBudget, MAX_BUDGET, PREFETCH_CONCURRENCY, PrefetchOutcome, PrefetchedArtifactMetrics,
+        drain_pulls,
+    };
+
+    type Pull =
+        futures_util::future::BoxFuture<'static, stow_types::error::Result<PrefetchOutcome>>;
+
+    fn stored(crate_name: &str) -> PrefetchOutcome {
+        PrefetchOutcome::Stored(PrefetchedArtifactMetrics {
+            crate_name: crate_name.to_owned(),
+            c_metadata: "0123456789abcdef".to_owned(),
+            parse_ms: 0,
+            verify_ms: 0,
+            store_ms: 0,
+        })
+    }
+
+    fn pull(after: Duration, outcome: stow_types::error::Result<PrefetchOutcome>) -> Pull {
+        Box::pin(async move {
+            tokio::time::sleep(after).await;
+            outcome
+        })
+    }
+
+    fn pulls(
+        pulls: Vec<Pull>,
+    ) -> impl futures_util::Stream<Item = stow_types::error::Result<PrefetchOutcome>> + Unpin {
+        stream::iter(pulls).buffer_unordered(PREFETCH_CONCURRENCY)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_pulls_never_touch_the_trust_root() {
+        let summary = drain_pulls(
+            pulls(Vec::new()),
+            async { panic!("the trust root was loaded for a prefetch that downloads nothing") },
+            0,
+            &CacheBudget::for_covered_units(0),
+        )
+        .await
+        .expect("an empty prefetch drains");
+        assert_eq!(summary.total(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pulls_that_need_no_trust_root_do_not_wait_for_it() {
+        let summary = drain_pulls(
+            pulls(vec![
+                pull(Duration::from_millis(50), Ok(PrefetchOutcome::Absent)),
+                pull(Duration::from_millis(50), Ok(PrefetchOutcome::Absent)),
+            ]),
+            std::future::pending(),
+            2,
+            &CacheBudget::for_covered_units(2),
+        )
+        .await
+        .expect("absent pulls drain");
+        assert_eq!(summary.misses, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_allowance_starts_when_the_trust_root_is_loaded() {
+        let summary = drain_pulls(
+            pulls(vec![pull(Duration::from_millis(1100), Ok(stored("demo")))]),
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            },
+            1,
+            &CacheBudget::for_covered_units(1),
+        )
+        .await
+        .expect("the pull inside the allowance drains");
+        assert_eq!(summary.downloaded, 1);
+    }
+
+    /// A pull the way a real one runs: its request takes 900ms, then its
+    /// verification waits for the trust root. One after the other, the two
+    /// would end at 1.9s.
+    #[tokio::test(start_paused = true)]
+    async fn pulls_run_while_the_trust_root_loads() {
+        let entered = tokio::time::Instant::now();
+        let loaded = std::sync::Arc::new(tokio::sync::Notify::new());
+        let verified = std::sync::Arc::clone(&loaded);
+        let requested_then_verified: Pull = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            verified.notified().await;
+            Ok(stored("demo"))
+        });
+        let summary = drain_pulls(
+            pulls(vec![requested_then_verified]),
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                loaded.notify_one();
+                Ok(())
+            },
+            1,
+            &CacheBudget::for_covered_units(1),
+        )
+        .await
+        .expect("the pull drains beside the trust load");
+        let elapsed = entered.elapsed();
+        assert_eq!(summary.downloaded, 1);
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "the driver returned at {elapsed:?}, before the trust root's 1s load"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1) + Duration::from_millis(150),
+            "the driver returned at {elapsed:?}, past the allowance after the trust load"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_past_the_allowance_is_left_to_the_wrappers() {
+        let entered = tokio::time::Instant::now();
+        let summary = drain_pulls(
+            pulls(vec![pull(Duration::from_secs(10), Ok(stored("demo")))]),
+            async { Ok(()) },
+            1,
+            &CacheBudget::for_covered_units(1),
+        )
+        .await
+        .expect("the deadline drains");
+        assert_eq!(summary.total(), 0);
+        assert!(
+            entered.elapsed() < Duration::from_secs(1),
+            "the driver waited on a pull past its allowance"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trust_root_that_never_loads_ends_the_prefetch_at_the_ceiling() {
+        let entered = tokio::time::Instant::now();
+        let error = drain_pulls(
+            pulls(vec![pull(Duration::from_secs(600), Ok(stored("demo")))]),
+            std::future::pending(),
+            1,
+            &CacheBudget::for_covered_units(1),
+        )
+        .await
+        .expect_err("a trust load without an answer ends the prefetch");
+        assert_eq!(entered.elapsed(), MAX_BUDGET);
+        assert!(
+            error.to_string().contains("did not load"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trust_root_that_cannot_load_ends_the_prefetch() {
+        let error = drain_pulls(
+            pulls(vec![pull(Duration::from_secs(10), Ok(stored("demo")))]),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Err(stow_types::stow_error!("no trust root"))
+            },
+            1,
+            &CacheBudget::for_covered_units(1),
+        )
+        .await
+        .expect_err("a failed trust load ends the prefetch");
+        assert!(
+            error.to_string().contains("no trust root"),
+            "unexpected error: {error}"
+        );
+    }
 }
