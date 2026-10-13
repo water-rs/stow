@@ -34,14 +34,10 @@ use super::{ENDPOINT_ENV, Endpoint, TOKEN_ENV};
 pub trait Handler: Send + Sync + 'static {
     /// Decide one invocation. `Answer::Compile`'s ticket is allocated by
     /// the server, so the handler returns the decision without one.
-    /// `build_script_out_dir` is the `OUT_DIR` the facade's invocation
-    /// environment carried — read it from the request, never this
-    /// process's environment.
     fn plan(
         self: &Arc<Self>,
         executable: std::ffi::OsString,
         args: Vec<std::ffi::OsString>,
-        build_script_out_dir: Option<std::ffi::OsString>,
     ) -> impl Future<Output = Decision<Self::Pending>> + Send;
 
     /// Finish the work that only exists after a real compile.
@@ -76,8 +72,6 @@ pub struct Observation {
     pub executable: std::ffi::OsString,
     /// Everything after the executable, in order.
     pub args: Vec<std::ffi::OsString>,
-    /// The `OUT_DIR` the facade's invocation environment carried.
-    pub build_script_out_dir: Option<std::ffi::OsString>,
     /// `None` marks the unit as compiling locally; `Some` reports how the
     /// finished compile exited.
     pub success: Option<bool>,
@@ -662,15 +656,14 @@ async fn answer_plan<H: Handler>(
             message: "supervisor token mismatch".to_owned(),
         };
     }
-    let (executable, args, build_script_out_dir) =
-        match (plan.executable(), plan.args(), plan.build_script_out_dir()) {
-            (Ok(executable), Ok(args), Ok(out_dir)) => (executable, args, out_dir),
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                return Answer::Failed { message: error };
-            }
-        };
+    let (executable, args) = match (plan.executable(), plan.args()) {
+        (Ok(executable), Ok(args)) => (executable, args),
+        (Err(error), _) | (_, Err(error)) => {
+            return Answer::Failed { message: error };
+        }
+    };
     let recordable_paths = recordable_output_paths(&args);
-    match handler.plan(executable, args, build_script_out_dir).await {
+    match handler.plan(executable, args).await {
         Decision::Served(notifications) => Answer::Served(notifications),
         Decision::Compile(pending) => {
             let (sender, allocated) = oneshot::channel();
@@ -711,11 +704,7 @@ async fn answer_observation<H: Handler>(
         tracing::warn!("supervisor observation with the wrong token dropped");
         return;
     }
-    let (Ok(executable), Ok(args), Ok(build_script_out_dir)) = (
-        observed.executable(),
-        observed.args(),
-        observed.build_script_out_dir(),
-    ) else {
+    let (Ok(executable), Ok(args)) = (observed.executable(), observed.args()) else {
         tracing::warn!("supervisor observation could not be decoded; dropped");
         return;
     };
@@ -742,7 +731,6 @@ async fn answer_observation<H: Handler>(
         .observed(Observation {
             executable,
             args,
-            build_script_out_dir,
             success: observed.success,
         })
         .await;
@@ -811,7 +799,6 @@ mod tests {
             self: &Arc<Self>,
             _executable: OsString,
             args: Vec<OsString>,
-            _build_script_out_dir: Option<OsString>,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
             std::future::ready(if args.first().is_some_and(|arg| arg == "--serve-me") {
                 Decision::Served(ArtifactNotifications::default())
@@ -863,7 +850,6 @@ mod tests {
             .plan(
                 std::ffi::OsStr::new("/usr/bin/rustc"),
                 &[OsString::from("--crate-name"), OsString::from("serde")],
-                None,
             )
             .await
             .expect("plan");
@@ -893,7 +879,6 @@ mod tests {
                 self: &Arc<Self>,
                 _executable: OsString,
                 _args: Vec<OsString>,
-                _build_script_out_dir: Option<OsString>,
             ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
                 std::future::ready(Decision::Served(ArtifactNotifications::default()))
             }
@@ -1000,7 +985,6 @@ mod tests {
             .plan(
                 std::ffi::OsStr::new("/usr/bin/rustc"),
                 &[OsString::from("--serve-me")],
-                Some(std::ffi::OsStr::new("/tmp/build/demo-aaa/out")),
             )
             .await
             .expect("plan");
@@ -1024,7 +1008,7 @@ mod tests {
             .await
             .expect("connect to the supervisor");
         let error = connection
-            .plan(std::ffi::OsStr::new("/usr/bin/rustc"), &[], None)
+            .plan(std::ffi::OsStr::new("/usr/bin/rustc"), &[])
             .await
             .expect_err("a wrong token must be refused");
         assert!(error.contains("token mismatch"), "{error}");
@@ -1046,7 +1030,6 @@ mod tests {
             self: &Arc<Self>,
             _executable: OsString,
             _args: Vec<OsString>,
-            _build_script_out_dir: Option<OsString>,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
             std::future::ready(Decision::Served(ArtifactNotifications::default()))
         }
@@ -1124,7 +1107,6 @@ mod tests {
                 OsString::from("--crate-type"),
                 OsString::from("lib"),
             ],
-            None,
             Some(true),
         );
         write_frame(&mut *stream, &Request::Observed(report))

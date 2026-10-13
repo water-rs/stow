@@ -22,7 +22,6 @@ CREATE TABLE IF NOT EXISTS artifact_cache_entries (
     verified_marker_version INTEGER,
     verified_marker_policy TEXT,
     provenance TEXT NOT NULL DEFAULT 'remote',
-    native_original_out_dir TEXT,
     PRIMARY KEY (rustc_version, cache_key)
 );
 
@@ -70,52 +69,6 @@ CREATE TABLE IF NOT EXISTS artifact_cache_sigstore_signatures (
         ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS artifact_cache_native_static_libs (
-    rustc_version TEXT NOT NULL,
-    cache_key TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    lib_name TEXT NOT NULL,
-    bytes_sha256 TEXT NOT NULL,
-    PRIMARY KEY (rustc_version, cache_key, ordinal),
-    FOREIGN KEY (rustc_version, cache_key)
-        REFERENCES artifact_cache_entries (rustc_version, cache_key)
-        ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS artifact_cache_native_directives (
-    rustc_version TEXT NOT NULL,
-    cache_key TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    directive TEXT NOT NULL,
-    PRIMARY KEY (rustc_version, cache_key, ordinal),
-    FOREIGN KEY (rustc_version, cache_key)
-        REFERENCES artifact_cache_entries (rustc_version, cache_key)
-        ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS artifact_cache_native_dep_env_vars (
-    rustc_version TEXT NOT NULL,
-    cache_key TEXT NOT NULL,
-    env_key TEXT NOT NULL,
-    env_value TEXT NOT NULL,
-    PRIMARY KEY (rustc_version, cache_key, env_key),
-    FOREIGN KEY (rustc_version, cache_key)
-        REFERENCES artifact_cache_entries (rustc_version, cache_key)
-        ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS artifact_cache_native_out_dir_files (
-    rustc_version TEXT NOT NULL,
-    cache_key TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    relative_path TEXT NOT NULL,
-    sha256 TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (rustc_version, cache_key, ordinal),
-    FOREIGN KEY (rustc_version, cache_key)
-        REFERENCES artifact_cache_entries (rustc_version, cache_key)
-        ON DELETE CASCADE
-);
-
 CREATE TABLE IF NOT EXISTS metadata_values (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -145,6 +98,15 @@ DROP TABLE IF EXISTS graph_cache_current_artifacts;
 DROP TABLE IF EXISTS graph_cache_analysis_features;
 DROP TABLE IF EXISTS graph_cache_analysis_entries;
 DROP TABLE IF EXISTS graph_cache_entries;
+
+-- stow#640: the consumer no longer stores a unit's build-script products —
+-- every unit is served inside a rustc invocation cargo issued, and cargo has
+-- already run the package's build script itself. Drop the native tables so
+-- existing state DBs shed them.
+DROP TABLE IF EXISTS artifact_cache_native_static_libs;
+DROP TABLE IF EXISTS artifact_cache_native_directives;
+DROP TABLE IF EXISTS artifact_cache_native_dep_env_vars;
+DROP TABLE IF EXISTS artifact_cache_native_out_dir_files;
 
 -- `glibc_refusals` counts lookups refused because the artifact's
 -- `min_glibc` exceeds the host's glibc — apart from misses, because the

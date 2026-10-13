@@ -6,7 +6,7 @@ use std::process::Stdio;
 use fs2::FileExt;
 use semver::Version;
 use sqlx::FromRow;
-use stow_types::artifact::{ArtifactKind, NativeArtifacts, NativeLib, OutDirFile, RustCrateType};
+use stow_types::artifact::{ArtifactKind, RustCrateType};
 use stow_types::bundle::{
     ArtifactBundleFile, STOW_BUNDLE_MANIFEST_PATH, STOW_DYLIB_MEDIA_TYPE,
     STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE, SigstoreSignature,
@@ -29,8 +29,6 @@ use crate::rustc_args::ParsedRustcArgs;
 use crate::state_db::{db_int, now_millis};
 
 const BUNDLES_DIR: &str = "bundles";
-const NATIVE_DIR: &str = "native";
-const NATIVE_OUT_DIR: &str = "native/out";
 const VERSION_LEASES_DIR: &str = "leases";
 /// `<version_dir>/staging/` — beside `bundles/` and `locks/` on the same
 /// filesystem, so a staged entry's rename into place stays atomic. One
@@ -99,11 +97,6 @@ pub struct LocalBuildArtifact {
     pub features_json: String,
     /// Canonical dependency `c_metadata` identities JSON.
     pub dependency_c_metadata_json: String,
-    /// The crate's own build-script `OUT_DIR` (cargo exports it on the
-    /// library's rustc invocation so `env!("OUT_DIR")` resolves in source),
-    /// when the crate has a build script. `links=` crates keep their native
-    /// products here — captured into the entry so a later hit replays them.
-    pub build_script_out_dir: Option<PathBuf>,
 }
 
 /// One locally-compiled registry unit as one build's rustc invocations
@@ -190,7 +183,6 @@ pub struct CachedArtifactBundle {
     pub kind: ArtifactKind,
     pub crate_types: Vec<RustCrateType>,
     pub outputs: Vec<ArtifactBundleFile>,
-    pub native: Option<NativeArtifacts>,
     pub sigstore_signatures: Vec<SigstoreSignature>,
     pub(crate) entry_dir: PathBuf,
     pub(crate) rustc_version: String,
@@ -294,33 +286,6 @@ pub async fn load_cached_bundle(
     let outputs = load_artifact_outputs(&connection, &rustc_version, &cache_key).await?;
     let sigstore_signatures =
         load_sigstore_signatures(&connection, &rustc_version, &cache_key).await?;
-    let native = match load_native_artifacts(
-        &connection,
-        &rustc_version,
-        &cache_key,
-        entry.native_original_out_dir.as_deref(),
-    )
-    .await?
-    {
-        LoadedNativeArtifacts::Absent => None,
-        LoadedNativeArtifacts::Ready(native) => Some(native),
-        LoadedNativeArtifacts::MissingOutDir => {
-            // Released CLIs wrote entries with native rows and no
-            // `native_original_out_dir`. The cache is regenerable, so the
-            // row is invalid data: evict it and miss rather than fail the
-            // invocation.
-            drop(lease_lock);
-            evict_invalid_entry(
-                &connection,
-                &version_dir,
-                &entry_dir,
-                &rustc_version,
-                &cache_key,
-            )
-            .await?;
-            return Ok(None);
-        }
-    };
     let shape = EntryShape::parse(&entry, &rustc_version, &cache_key)?;
     Ok(Some(CachedArtifactBundle {
         provenance: ArtifactProvenance::from_column(&entry.provenance)?,
@@ -340,7 +305,6 @@ pub async fn load_cached_bundle(
         kind: shape.kind,
         crate_types: shape.crate_types,
         outputs,
-        native,
         sigstore_signatures,
         entry_dir,
         rustc_version,
@@ -434,7 +398,7 @@ pub async fn load_cached_bundle_by_compile_key(
 }
 
 /// Store a verified bundle's contents into `entry_dir` — the same layout a
-/// local-cache entry has (`files/`, `oci/`, `manifest.json`, `native/`).
+/// local-cache entry has (`files/`, `oci/`, `manifest.json`).
 ///
 /// The CI build's consumption path keeps each verified bundle in a
 /// compile-key-addressed store the sandboxed phases mount read-only. The
@@ -497,7 +461,6 @@ pub fn load_bundle_entry_dir(
         kind: manifest.config.kind,
         crate_types: manifest.config.crate_types,
         outputs: manifest.config.outputs,
-        native: manifest.config.native,
         sigstore_signatures: manifest.sigstore_signatures,
         entry_dir: entry_dir.to_path_buf(),
         rustc_version: manifest.config.rustc_version.as_str().to_owned(),
@@ -786,7 +749,6 @@ fn cached_bundle_for_entry(
         kind: bundle.manifest.config.kind.clone(),
         crate_types: bundle.manifest.config.crate_types.clone(),
         outputs: bundle.manifest.config.outputs.clone(),
-        native: bundle.manifest.config.native.clone(),
         sigstore_signatures: bundle.manifest.sigstore_signatures.clone(),
         entry_dir,
         rustc_version,
@@ -878,17 +840,7 @@ pub async fn store_local_build_outputs(
     let written = tokio::task::spawn_blocking({
         let staging_dir = staging_dir.clone();
         let entry_dir = entry_dir.clone();
-        let crate_name = build.identity.crate_name.clone();
-        let native_out_dir = build.build_script_out_dir.clone();
-        move || {
-            write_local_build_entry_blocking(
-                staging_dir.path(),
-                &entry_dir,
-                &outputs,
-                &crate_name,
-                native_out_dir.as_deref(),
-            )
-        }
+        move || write_local_build_entry_blocking(staging_dir.path(), &entry_dir, &outputs)
     })
     .await
     .wrap_err("join store_local_build_outputs file task")??;
@@ -965,7 +917,6 @@ async fn record_local_entry_metadata(
             crate_types: &crate_types,
             outputs: &written.outputs,
             sigstore_signatures: &[],
-            native: written.native.as_ref(),
         },
     )
     .await
@@ -1476,9 +1427,6 @@ struct LocalBuildOutput {
 /// The files a local store captured into the staged entry, plus its size.
 struct LocalEntryWrite {
     outputs: Vec<ArtifactBundleFile>,
-    /// Build-script `OUT_DIR` products (`links=` crates), mirroring the
-    /// native layer a remote bundle carries.
-    native: Option<NativeArtifacts>,
     size_bytes: u64,
 }
 
@@ -1568,8 +1516,6 @@ fn write_local_build_entry_blocking(
     staging_dir: &Path,
     entry_dir: &Path,
     outputs: &[LocalBuildOutput],
-    crate_name: &str,
-    native_out_dir: Option<&Path>,
 ) -> stow_types::error::Result<LocalEntryWrite> {
     let entry_name = entry_dir
         .file_name()
@@ -1614,29 +1560,6 @@ fn write_local_build_entry_blocking(
         });
     }
 
-    // `links=` crates keep their build-script products under OUT_DIR. Capture
-    // and stage them exactly where a downloaded bundle's native layer lands,
-    // so the restore path is identical for both provenances.
-    let native = stow_types::native_capture::capture_native_artifacts(crate_name, native_out_dir)?;
-    if let (Some(native), Some(out_dir)) = (native.as_ref(), native_out_dir) {
-        let out_root = tempdir.path().join(NATIVE_OUT_DIR);
-        for file in &native.out_dir_files {
-            let source = out_dir.join(&file.relative_path);
-            let dest = join_relative_path(&out_root, &file.relative_path)?;
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .wrap_err_with(|| format!("create native cache parent {}", parent.display()))?;
-            }
-            reflink::reflink_or_copy(&source, &dest).wrap_err_with(|| {
-                format!(
-                    "materialize native out-dir file {} into local cache entry",
-                    source.display()
-                )
-            })?;
-            size_bytes = size_bytes.saturating_add(dest.metadata().map_or(0, |meta| meta.len()));
-        }
-    }
-
     if !entry_dir.exists() {
         std::fs::rename(tempdir.path(), entry_dir).wrap_err_with(|| {
             format!(
@@ -1648,7 +1571,6 @@ fn write_local_build_entry_blocking(
     }
     Ok(LocalEntryWrite {
         outputs: written_outputs,
-        native,
         size_bytes,
     })
 }
@@ -1876,7 +1798,7 @@ fn write_downloaded_bundle_to_entry(
         .collect::<BTreeMap<_, _>>();
     // `manifest.json` is what makes an entry loadable, so it is written
     // last. Anything that stops this function part-way — the disk filling
-    // up during the native unpack, the process dying — then leaves an
+    // up mid-write, the process dying — then leaves an
     // entry a reader skips rather than a torn one it loads and then fails
     // on a file that never arrived. A miss compiles the unit; a
     // half-written hit would kill the build.
@@ -1894,34 +1816,21 @@ fn write_downloaded_bundle_to_entry(
             .wrap_err_with(|| format!("write cached bundle file {}", path.display()))?;
         stow_types::error::Result::Ok(decoded.len() as u64)
     };
+    // The native archive is signature-covered bytes the fetch verified
+    // and nothing reads from an entry: it is not stored (stow#640).
+    let native_archive_path = bundle
+        .manifest
+        .config
+        .native_archive
+        .as_ref()
+        .map(|file| bundle_file_path(&file.file_name));
     for (relative_path, contents) in &bundle.files {
-        if relative_path == stow_types::bundle::STOW_BUNDLE_MANIFEST_PATH {
+        if relative_path == stow_types::bundle::STOW_BUNDLE_MANIFEST_PATH
+            || Some(relative_path) == native_archive_path.as_ref()
+        {
             continue;
         }
         total_bytes = total_bytes.saturating_add(write_entry_file(relative_path, contents)?);
-    }
-
-    if let Some(native) = bundle.manifest.config.native.as_ref() {
-        let archive_bytes = match bundle.manifest.config.native_archive.as_ref() {
-            Some(file) => {
-                let raw = bundle
-                    .files
-                    .get(&bundle_file_path(&file.file_name))
-                    .ok_or_else(|| {
-                        stow_types::stow_error!(
-                            "bundle is missing native archive {}",
-                            file.file_name
-                        )
-                    })?;
-                Some(decode_bundle_output_bytes(file, raw)?)
-            }
-            None => None,
-        };
-        total_bytes = total_bytes.saturating_add(write_native_cache_entry(
-            entry_dir,
-            native,
-            archive_bytes.as_deref(),
-        )?);
     }
 
     // `parse_bundle` lifts `manifest.json` into `bundle.manifest`, so it is
@@ -1931,83 +1840,6 @@ fn write_downloaded_bundle_to_entry(
     let manifest_json = serde_json::to_vec(&bundle.manifest)
         .wrap_err("serialize bundle manifest for the cache entry")?;
     total_bytes = total_bytes.saturating_add(write_entry_file(&manifest_path, &manifest_json)?);
-
-    Ok(total_bytes)
-}
-
-/// Unpack the bundle's native archive layer into the cache entry.
-///
-/// The archive is a tar of the build script's `OUT_DIR`, carried as its own
-/// zstd layer. Every file the signed config lists is extracted and checked
-/// against the digest recorded there, so a tampered or truncated archive
-/// cannot quietly produce a short `OUT_DIR`.
-fn write_native_cache_entry(
-    entry_dir: &Path,
-    native: &NativeArtifacts,
-    archive_bytes: Option<&[u8]>,
-) -> stow_types::error::Result<u64> {
-    let native_root = entry_dir.join(NATIVE_DIR);
-    let out_root = native_root.join("out");
-    std::fs::create_dir_all(&out_root)
-        .wrap_err_with(|| format!("create native cache root {}", native_root.display()))?;
-
-    if native.out_dir_files.is_empty() {
-        return Ok(0);
-    }
-    let Some(archive_bytes) = archive_bytes else {
-        return Err(stow_types::stow_error!(
-            "bundle declares {} native out-dir files but carries no native archive",
-            native.out_dir_files.len()
-        ));
-    };
-
-    let expected = native
-        .out_dir_files
-        .iter()
-        .map(|file| (file.relative_path.as_str(), file.sha256.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    let mut written = BTreeSet::new();
-    let mut total_bytes = 0u64;
-    let mut archive = tar::Archive::new(std::io::Cursor::new(archive_bytes));
-    for entry in archive.entries().wrap_err("read native archive entries")? {
-        let mut entry = entry.wrap_err("read native archive entry")?;
-        let relative_path = entry
-            .path()
-            .wrap_err("read native archive entry path")?
-            .to_string_lossy()
-            .into_owned();
-        let Some(expected_sha256) = expected.get(relative_path.as_str()) else {
-            return Err(stow_types::stow_error!(
-                "native archive contains {relative_path}, which the signed config does not list"
-            ));
-        };
-        let mut contents = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut contents)
-            .wrap_err_with(|| format!("read native archive entry {relative_path}"))?;
-        let actual_sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&contents));
-        if actual_sha256 != *expected_sha256 {
-            return Err(stow_types::stow_error!(
-                "native archive entry {relative_path} does not match its recorded digest"
-            ));
-        }
-        let path = join_relative_path(&out_root, &relative_path)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .wrap_err_with(|| format!("create native cache parent {}", parent.display()))?;
-        }
-        std::fs::write(&path, &contents)
-            .wrap_err_with(|| format!("write native cache file {}", path.display()))?;
-        total_bytes = total_bytes.saturating_add(contents.len() as u64);
-        written.insert(relative_path);
-    }
-
-    if written.len() != expected.len() {
-        return Err(stow_types::stow_error!(
-            "native archive carries {} of the {} out-dir files the signed config lists",
-            written.len(),
-            expected.len()
-        ));
-    }
 
     Ok(total_bytes)
 }
@@ -2397,9 +2229,6 @@ struct ArtifactCacheEntryRow {
     verified_marker_version: Option<i64>,
     verified_marker_policy: Option<String>,
     provenance: String,
-    /// The producing build's recorded `OUT_DIR`; NULL on entries with no
-    /// native artifacts and on rows written before the column existed.
-    native_original_out_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -2437,29 +2266,6 @@ struct SigstoreSignatureRow {
     rekor_bundle_json: Option<String>,
 }
 
-#[derive(Debug, Clone, FromRow)]
-struct NativeStaticLibRow {
-    lib_name: String,
-    bytes_sha256: String,
-}
-
-#[derive(Debug, Clone, FromRow)]
-struct NativeDirectiveRow {
-    directive: String,
-}
-
-#[derive(Debug, Clone, FromRow)]
-struct NativeDepEnvVarRow {
-    env_key: String,
-    env_value: String,
-}
-
-#[derive(Debug, Clone, FromRow)]
-struct NativeOutDirFileRow {
-    relative_path: String,
-    sha256: String,
-}
-
 async fn load_artifact_cache_entry(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
@@ -2470,7 +2276,7 @@ async fn load_artifact_cache_entry(
                 compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, \
                 compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
-                verified_marker_version, verified_marker_policy, provenance, native_original_out_dir \
+                verified_marker_version, verified_marker_policy, provenance \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND cache_key = ?",
     )
@@ -2591,107 +2397,6 @@ async fn load_sigstore_signatures(
         .collect())
 }
 
-/// What the native-artifact load found for one cache entry.
-enum LoadedNativeArtifacts {
-    /// The entry carries no native rows.
-    Absent,
-    /// Rows loaded; the recorded `OUT_DIR` anchors directive rewriting.
-    Ready(NativeArtifacts),
-    /// Rows exist but no `OUT_DIR` was recorded — an entry written before
-    /// the column existed; invalid data in a regenerable cache.
-    MissingOutDir,
-}
-
-async fn load_native_artifacts(
-    connection: &sqlx::SqlitePool,
-    rustc_version: &str,
-    cache_key: &str,
-    original_out_dir: Option<&str>,
-) -> stow_types::error::Result<LoadedNativeArtifacts> {
-    let static_lib_rows = sqlx::query_as::<_, NativeStaticLibRow>(
-        "SELECT lib_name, bytes_sha256 \
-         FROM artifact_cache_native_static_libs \
-         WHERE rustc_version = ? AND cache_key = ? \
-         ORDER BY ordinal",
-    )
-    .bind(rustc_version)
-    .bind(cache_key)
-    .fetch_all(connection)
-    .await?;
-    let directive_rows = sqlx::query_as::<_, NativeDirectiveRow>(
-        "SELECT directive \
-         FROM artifact_cache_native_directives \
-         WHERE rustc_version = ? AND cache_key = ? \
-         ORDER BY ordinal",
-    )
-    .bind(rustc_version)
-    .bind(cache_key)
-    .fetch_all(connection)
-    .await?;
-    let dep_env_rows = sqlx::query_as::<_, NativeDepEnvVarRow>(
-        "SELECT env_key, env_value \
-         FROM artifact_cache_native_dep_env_vars \
-         WHERE rustc_version = ? AND cache_key = ? \
-         ORDER BY env_key",
-    )
-    .bind(rustc_version)
-    .bind(cache_key)
-    .fetch_all(connection)
-    .await?;
-    let out_dir_rows = sqlx::query_as::<_, NativeOutDirFileRow>(
-        "SELECT relative_path, sha256 \
-         FROM artifact_cache_native_out_dir_files \
-         WHERE rustc_version = ? AND cache_key = ? \
-         ORDER BY ordinal",
-    )
-    .bind(rustc_version)
-    .bind(cache_key)
-    .fetch_all(connection)
-    .await?;
-
-    if static_lib_rows.is_empty()
-        && directive_rows.is_empty()
-        && dep_env_rows.is_empty()
-        && out_dir_rows.is_empty()
-    {
-        return Ok(LoadedNativeArtifacts::Absent);
-    }
-
-    let Some(original_out_dir) = original_out_dir else {
-        // An entry with native rows and no recorded OUT_DIR predates the
-        // column; without it directive rewriting has no anchor, so the row
-        // is unusable rather than merely incomplete. The caller evicts it
-        // and misses so the invocation rebuilds.
-        return Ok(LoadedNativeArtifacts::MissingOutDir);
-    };
-
-    Ok(LoadedNativeArtifacts::Ready(NativeArtifacts {
-        static_libs: static_lib_rows
-            .into_iter()
-            .map(|row| NativeLib {
-                name: row.lib_name,
-                bytes_sha256: row.bytes_sha256,
-            })
-            .collect(),
-        cargo_directives: directive_rows
-            .into_iter()
-            .map(|row| row.directive)
-            .collect(),
-        original_out_dir: std::path::PathBuf::from(original_out_dir),
-        dep_env_vars: dep_env_rows
-            .into_iter()
-            .map(|row| (row.env_key, row.env_value))
-            .collect(),
-        out_dir_files: out_dir_rows
-            .into_iter()
-            .map(|row| OutDirFile {
-                relative_path: row.relative_path,
-                sha256: row.sha256,
-            })
-            .collect(),
-    }))
-}
-
 /// The full row payload `artifact_cache_entries` plus its child tables store
 /// for one cached bundle — the same shape whether the bundle was fetched
 /// from the edge or produced by a local rustc build.
@@ -2715,7 +2420,6 @@ struct CacheEntryMetadata<'a> {
     crate_types: &'a [RustCrateType],
     outputs: &'a [ArtifactBundleFile],
     sigstore_signatures: &'a [SigstoreSignature],
-    native: Option<&'a NativeArtifacts>,
 }
 
 impl<'a> CacheEntryMetadata<'a> {
@@ -2740,7 +2444,6 @@ impl<'a> CacheEntryMetadata<'a> {
             crate_types: &bundle.manifest.config.crate_types,
             outputs: &bundle.manifest.config.outputs,
             sigstore_signatures: &bundle.manifest.sigstore_signatures,
-            native: bundle.manifest.config.native.as_ref(),
         }
     }
 }
@@ -2777,9 +2480,6 @@ async fn replace_artifact_cache_metadata(
         metadata.sigstore_signatures,
     )
     .await?;
-    if let Some(native) = metadata.native {
-        insert_artifact_cache_native(&mut transaction, rustc_version, cache_key, native).await?;
-    }
     transaction.commit().await?;
     Ok(())
 }
@@ -2796,19 +2496,10 @@ async fn insert_artifact_cache_entry(
     last_accessed_ms: u64,
     metadata: &CacheEntryMetadata<'_>,
 ) -> stow_types::error::Result<()> {
-    let native_original_out_dir = match metadata.native {
-        Some(native) => Some(native.original_out_dir.to_str().ok_or_else(|| {
-            stow_types::stow_error!(
-                "bundle's recorded OUT_DIR {} is not UTF-8",
-                native.original_out_dir.display()
-            )
-        })?),
-        None => None,
-    };
     sqlx::query(
         "INSERT OR REPLACE INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance, native_original_out_dir) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
     )
     .bind(rustc_version)
     .bind(cache_key)
@@ -2837,7 +2528,6 @@ async fn insert_artifact_cache_entry(
     .bind(serde_json::to_string(metadata.kind)?)
     .bind(serde_json::to_string(metadata.crate_types)?)
     .bind(metadata.provenance.as_column())
-    .bind(native_original_out_dir)
     .execute(connection)
     .await?;
     Ok(())
@@ -2889,71 +2579,6 @@ async fn insert_artifact_cache_sigstore_signatures(
         .bind(&material.signature)
         .bind(&material.certificate_pem)
         .bind(material.rekor_bundle_json.as_deref())
-        .execute(&mut *connection)
-        .await?;
-    }
-    Ok(())
-}
-
-/// Persist a `links=` crate's captured build-script products: static libs,
-/// cargo directives, dep env vars, and out-dir file digests.
-async fn insert_artifact_cache_native(
-    connection: &mut sqlx::SqliteConnection,
-    rustc_version: &str,
-    cache_key: &str,
-    native: &NativeArtifacts,
-) -> stow_types::error::Result<()> {
-    for (ordinal, lib) in native.static_libs.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO artifact_cache_native_static_libs \
-             (rustc_version, cache_key, ordinal, lib_name, bytes_sha256) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(rustc_version)
-        .bind(cache_key)
-        .bind(db_int::<_, i64>(ordinal, "native static lib ordinal")?)
-        .bind(&lib.name)
-        .bind(&lib.bytes_sha256)
-        .execute(&mut *connection)
-        .await?;
-    }
-    for (ordinal, directive) in native.cargo_directives.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO artifact_cache_native_directives \
-             (rustc_version, cache_key, ordinal, directive) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(rustc_version)
-        .bind(cache_key)
-        .bind(db_int::<_, i64>(ordinal, "native cargo directive ordinal")?)
-        .bind(directive)
-        .execute(&mut *connection)
-        .await?;
-    }
-    for (env_key, env_value) in &native.dep_env_vars {
-        sqlx::query(
-            "INSERT INTO artifact_cache_native_dep_env_vars \
-             (rustc_version, cache_key, env_key, env_value) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(rustc_version)
-        .bind(cache_key)
-        .bind(env_key)
-        .bind(env_value)
-        .execute(&mut *connection)
-        .await?;
-    }
-    for (ordinal, file) in native.out_dir_files.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO artifact_cache_native_out_dir_files \
-             (rustc_version, cache_key, ordinal, relative_path, sha256) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(rustc_version)
-        .bind(cache_key)
-        .bind(db_int::<_, i64>(ordinal, "native out-dir file ordinal")?)
-        .bind(&file.relative_path)
-        .bind(&file.sha256)
         .execute(&mut *connection)
         .await?;
     }
@@ -3029,48 +2654,6 @@ pub async fn persist_cached_bundle_trust_marker(
     Ok(())
 }
 
-/// Evict an entry that cannot be served — currently a row carrying native
-/// artifacts but no recorded `OUT_DIR`, written by a CLI that predates the
-/// column. Takes the exclusive entry lock like any other eviction; when a
-/// concurrent reader holds it the row survives for the next lookup to evict.
-async fn evict_invalid_entry(
-    connection: &sqlx::SqlitePool,
-    version_dir: &Path,
-    entry_dir: &Path,
-    rustc_version: &str,
-    cache_key: &str,
-) -> stow_types::error::Result<()> {
-    let Some(eviction_lock) = tokio::task::spawn_blocking({
-        let version_dir = version_dir.to_path_buf();
-        let cache_key = cache_key.to_owned();
-        move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
-    })
-    .await
-    .wrap_err("join evict_invalid_entry lock task")??
-    else {
-        return Ok(());
-    };
-    tracing::debug!(
-        cache_key,
-        rustc_version,
-        "artifact cache entry carries native artifacts but no recorded OUT_DIR; evicted and reporting a miss"
-    );
-    delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
-    if entry_dir.exists() {
-        tokio::task::spawn_blocking({
-            let entry_dir = entry_dir.to_path_buf();
-            move || {
-                std::fs::remove_dir_all(&entry_dir)
-                    .wrap_err_with(|| format!("evict artifact cache entry {}", entry_dir.display()))
-            }
-        })
-        .await
-        .wrap_err("join evict_invalid_entry remove_dir task")??;
-    }
-    drop(eviction_lock);
-    Ok(())
-}
-
 async fn delete_artifact_cache_entry(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
@@ -3087,7 +2670,7 @@ async fn delete_artifact_cache_entry(
 /// Batched "which of these artifacts are already materialized locally?".
 ///
 /// The prefetch pre-pass only needs a yes/no per artifact, but
-/// [`load_cached_bundle`] pays a file lock, an LRU `UPDATE` and five `SELECT`s
+/// [`load_cached_bundle`] pays a file lock, an LRU `UPDATE` and three `SELECT`s
 /// per entry — and the pre-pass runs them serially. On a warm cache that alone
 /// cost roughly 90 ms per artifact (over 10 s for a 115-crate graph, twice per
 /// build) before a single rustc ran. One indexed query plus one batched LRU
@@ -3585,20 +3168,7 @@ mod tests {
     fn metadata_replacement_rolls_back_children_and_verification_on_failure() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
-        let mut bundle = sample_bundle("aabbccddeeff0011", "libdemo-aabbccddeeff0011.rmeta");
-        bundle.manifest.config.native = Some(NativeArtifacts {
-            static_libs: vec![stow_types::artifact::NativeLib {
-                name: "demo".to_owned(),
-                bytes_sha256: "native-digest".to_owned(),
-            }],
-            cargo_directives: vec!["cargo:rustc-link-lib=static=demo".to_owned()],
-            dep_env_vars: BTreeMap::from([("DEP_DEMO_ROOT".to_owned(), "/build/out".to_owned())]),
-            out_dir_files: vec![stow_types::artifact::OutDirFile {
-                relative_path: "libdemo.a".to_owned(),
-                sha256: "native-digest".to_owned(),
-            }],
-            original_out_dir: PathBuf::from("/build/out"),
-        });
+        let bundle = sample_bundle("aabbccddeeff0011", "libdemo-aabbccddeeff0011.rmeta");
         run_async(async {
             let pool = config.state_db_pool().await.expect("state db");
             let original = super::CacheEntryMetadata::remote(&bundle);
@@ -3619,7 +3189,6 @@ mod tests {
                 .expect("inject output write failure");
             let mut replacement = super::CacheEntryMetadata::remote(&bundle);
             replacement.sigstore_signatures = &[];
-            replacement.native = None;
             let error = super::replace_artifact_cache_metadata(
                 &pool,
                 "1.91.1",
@@ -3640,7 +3209,7 @@ mod tests {
             assert_eq!(row.size_bytes, 100);
             assert_eq!(row.verified_marker_version, Some(2));
             assert_eq!(row.verified_marker_policy.as_deref(), Some("verified"));
-            assert_metadata_children(&pool, &row, &original).await;
+            assert_metadata_children(&pool, &original).await;
 
             sqlx::query("DROP TRIGGER reject_cache_output")
                 .execute(&pool)
@@ -3665,13 +3234,12 @@ mod tests {
             assert_eq!(row.size_bytes, 200);
             assert_eq!(row.verified_marker_version, None);
             assert_eq!(row.verified_marker_policy, None);
-            assert_metadata_children(&pool, &row, &replacement).await;
+            assert_metadata_children(&pool, &replacement).await;
         });
     }
 
     async fn assert_metadata_children(
         pool: &sqlx::SqlitePool,
-        row: &super::ArtifactCacheEntryRow,
         expected: &super::CacheEntryMetadata<'_>,
     ) {
         assert_eq!(
@@ -3687,22 +3255,6 @@ mod tests {
                 .len(),
             expected.sigstore_signatures.len()
         );
-        let native = super::load_native_artifacts(
-            pool,
-            "1.91.1",
-            "entry",
-            row.native_original_out_dir.as_deref(),
-        )
-        .await
-        .expect("native artifacts");
-        let native = match native {
-            super::LoadedNativeArtifacts::Ready(native) => Some(native),
-            super::LoadedNativeArtifacts::Absent => None,
-            super::LoadedNativeArtifacts::MissingOutDir => {
-                panic!("native OUT_DIR must be preserved")
-            }
-        };
-        assert_eq!(native.as_ref(), expected.native);
     }
 
     #[test]
@@ -3841,23 +3393,37 @@ mod tests {
         });
     }
 
-    /// An entry written before `native_original_out_dir` existed has
-    /// native rows and NULL in the column. The cache is regenerable, so
-    /// the lookup evicts it — row and directory — and reports a miss; the
-    /// invocation falls back to compiling instead of failing.
+    /// A bundle whose signed config declares a `native` block and a
+    /// `native_archive` member still stores, and the entry holds its
+    /// outputs alone: the archive is neither unpacked nor kept.
     #[test]
-    fn entry_without_recorded_out_dir_is_evicted_and_misses() {
+    fn a_bundle_with_a_native_archive_stores_only_its_outputs() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         let request = fetch_request("deadbeefcafe0001");
         let mut bundle = sample_bundle("deadbeefcafe0001", "libdemo-deadbeefcafe0001.rmeta");
+        let archive_bytes = b"native-archive-bytes".to_vec();
         bundle.manifest.config.native = Some(NativeArtifacts {
-            static_libs: Vec::new(),
-            cargo_directives: vec!["cargo:rustc-link-search=native=/build/out/lib".to_owned()],
-            dep_env_vars: BTreeMap::default(),
-            out_dir_files: Vec::new(),
+            static_libs: vec![stow_types::artifact::NativeLib {
+                name: "demo".to_owned(),
+                bytes_sha256: "native-digest".to_owned(),
+            }],
+            cargo_directives: vec!["cargo:rustc-link-lib=static=demo".to_owned()],
+            dep_env_vars: BTreeMap::from([("DEP_DEMO_ROOT".to_owned(), "/build/out".to_owned())]),
+            out_dir_files: vec![stow_types::artifact::OutDirFile {
+                relative_path: "libdemo.a".to_owned(),
+                sha256: "native-digest".to_owned(),
+            }],
             original_out_dir: PathBuf::from("/build/out"),
         });
+        bundle.manifest.config.native_archive = Some(ArtifactBundleFile {
+            file_name: "native.tar.zst".to_owned(),
+            media_type: "application/vnd.stow.native+tar".to_owned(),
+            sha256: hex::encode(sha2::Sha256::digest(&archive_bytes)),
+        });
+        bundle
+            .files
+            .insert(bundle_file_path("native.tar.zst"), archive_bytes);
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -3868,30 +3434,26 @@ mod tests {
                 .expect("store bundle");
             let entry_dir = stored.entry_dir.clone();
             assert!(entry_dir.exists());
+            assert!(
+                !entry_dir.join("native").exists(),
+                "the native archive is verified bytes, never unpacked into the entry"
+            );
+            assert!(
+                !entry_dir.join(bundle_file_path("native.tar.zst")).exists(),
+                "the native archive itself is not stored either"
+            );
             drop(stored);
 
-            // Simulate a row written before the column existed.
-            let connection = connect(&config.cache_dir).await.expect("connect state db");
-            sqlx::query("UPDATE artifact_cache_entries SET native_original_out_dir = NULL")
-                .execute(&connection)
+            let loaded = super::load_cached_bundle(&config, &request)
                 .await
-                .expect("null the recorded out dir");
-
-            assert!(
-                super::load_cached_bundle(&config, &request)
-                    .await
-                    .expect("load bundle")
-                    .is_none(),
-                "an entry without a recorded OUT_DIR misses so the invocation rebuilds"
+                .expect("load bundle")
+                .expect("cached bundle");
+            assert_eq!(loaded.outputs.len(), 1);
+            assert_eq!(
+                loaded.outputs[0].file_name,
+                "libdemo-deadbeefcafe0001.rmeta"
             );
-            assert!(!entry_dir.exists(), "evicted entry dir removed");
-            let remaining = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM artifact_cache_native_directives",
-            )
-            .fetch_one(&connection)
-            .await
-            .expect("count native directives");
-            assert_eq!(remaining, 0, "eviction cascades to native rows");
+            assert!(loaded.output_source_path(&loaded.outputs[0]).exists());
         });
     }
 
@@ -3959,7 +3521,6 @@ mod tests {
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             outputs: Vec::new(),
-            native: None,
             sigstore_signatures: Vec::new(),
             entry_dir: tempdir.path().join("entry"),
             rustc_version: "1.91.1".to_owned(),
@@ -4186,125 +3747,6 @@ mod tests {
                 .await
                 .expect("local entry verification is trusted by construction");
         });
-    }
-
-    #[test]
-    fn store_local_build_outputs_captures_native_out_dir() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let config = test_config(tempdir.path());
-        let out_dir = tempdir.path().join("deps");
-        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
-        let native_out_dir = native_out_dir_fixture(tempdir.path());
-
-        let stable_c_metadata = "cafebabefeedface";
-        let parsed = local_build_parsed(
-            "demo",
-            "cargo-meta-native",
-            out_dir,
-            &["dep-info", "metadata", "link"],
-        );
-        std::fs::write(
-            parsed.output_rlib_path().expect("rlib output path"),
-            b"native-rlib-bytes",
-        )
-        .expect("write rlib");
-        std::fs::write(
-            parsed.output_rmeta_path().expect("rmeta output path"),
-            b"native-rmeta-bytes",
-        )
-        .expect("write rmeta");
-        let mut build = local_build_artifact(stable_c_metadata);
-        build.build_script_out_dir = Some(native_out_dir.clone());
-
-        run_async(async {
-            prepare_local_cache(&config, "1.91.1")
-                .await
-                .expect("prepare cache");
-            assert!(
-                super::store_local_build_outputs(&config, &parsed, &build)
-                    .await
-                    .expect("store local build")
-            );
-
-            // OUT_DIR bytes land under the same `native/out/` layout a
-            // downloaded bundle's native layer uses.
-            let entry_dir = config
-                .artifact_cache_version_dir("1.91.1")
-                .join("bundles/v3/aarch64-apple-darwin")
-                .join(stable_c_metadata);
-            assert_eq!(
-                std::fs::read(entry_dir.join("native/out/libdemo.a"))
-                    .expect("read staged static lib"),
-                b"archive-bytes"
-            );
-            assert_eq!(
-                std::fs::read(entry_dir.join("native/out/gen/bindings.rs"))
-                    .expect("read staged generated file"),
-                b"pub fn demo() {}"
-            );
-
-            let request = fetch_request(stable_c_metadata);
-            let bundle = super::load_cached_bundle(&config, &request)
-                .await
-                .expect("load bundle")
-                .expect("local entry must load");
-            let native = bundle.native.as_ref().expect("native metadata");
-            // Rebuild hints and warnings are dropped; real directives kept.
-            assert_eq!(
-                native.cargo_directives,
-                vec![
-                    format!(
-                        "cargo:rustc-link-search=native={}",
-                        native_out_dir.display()
-                    ),
-                    "cargo:rustc-link-lib=static=demo".to_owned(),
-                ]
-            );
-            assert_eq!(
-                native
-                    .static_libs
-                    .iter()
-                    .map(|lib| lib.name.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["libdemo.a"]
-            );
-            assert_eq!(
-                native.static_libs[0].bytes_sha256,
-                hex::encode(sha2::Sha256::digest(b"archive-bytes"))
-            );
-            assert_eq!(
-                native
-                    .out_dir_files
-                    .iter()
-                    .map(|file| file.relative_path.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["gen/bindings.rs", "libdemo.a"]
-            );
-        });
-    }
-
-    /// A `links=` crate's build-script products under `root`: the `OUT_DIR`
-    /// tree (one static lib, one generated file) plus the sibling `output`
-    /// file of cargo directives. Returns the `OUT_DIR`.
-    fn native_out_dir_fixture(root: &Path) -> PathBuf {
-        let build_dir = root.join("build/demo-aaaa1111");
-        let out_dir = build_dir.join("out");
-        std::fs::create_dir_all(out_dir.join("gen")).expect("create OUT_DIR");
-        std::fs::write(out_dir.join("libdemo.a"), b"archive-bytes").expect("write static lib");
-        std::fs::write(out_dir.join("gen/bindings.rs"), b"pub fn demo() {}")
-            .expect("write generated file");
-        std::fs::write(
-            build_dir.join("output"),
-            format!(
-                "cargo:rerun-if-env-changed=DEMO\n\
-                 cargo:warning=ignored\n\
-                 cargo:rustc-link-search=native={}\n\
-                 cargo:rustc-link-lib=static=demo\n",
-                out_dir.display()
-            ),
-        )
-        .expect("write build script output");
-        out_dir
     }
 
     #[test]
@@ -4571,66 +4013,6 @@ mod tests {
     }
 
     #[test]
-    fn local_entry_size_counts_native_out_dir_bytes() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let config = test_config(tempdir.path());
-        let out_dir = tempdir.path().join("deps");
-        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
-        let native_out_dir = native_out_dir_fixture(tempdir.path());
-
-        let local_meta = "10ca1e7710ca1e79";
-        let parsed = local_build_parsed(
-            "demo",
-            "cargo-meta-ev3",
-            out_dir,
-            &["dep-info", "metadata", "link"],
-        );
-        std::fs::write(
-            parsed.output_rlib_path().expect("rlib output path"),
-            b"native-rlib-bytes",
-        )
-        .expect("write rlib");
-        std::fs::write(
-            parsed.output_rmeta_path().expect("rmeta output path"),
-            b"native-rmeta-bytes",
-        )
-        .expect("write rmeta");
-        let mut build = local_build_artifact(local_meta);
-        build.build_script_out_dir = Some(native_out_dir);
-
-        run_async(async {
-            prepare_local_cache(&config, "1.91.1")
-                .await
-                .expect("prepare cache");
-            assert!(
-                super::store_local_build_outputs(&config, &parsed, &build)
-                    .await
-                    .expect("store local build")
-            );
-
-            let size_bytes = list_artifact_cache_entries(
-                &connect(&config.cache_dir).await.expect("connect state db"),
-                "1.91.1",
-            )
-            .await
-            .expect("list entries")
-            .get(&super::artifact_cache_key(
-                "aarch64-apple-darwin",
-                local_meta,
-            ))
-            .expect("local entry")
-            .size_bytes;
-            // The eviction budget charges native OUT_DIR bytes, not just the
-            // rustc outputs.
-            let expected = (b"native-rlib-bytes".len()
-                + b"native-rmeta-bytes".len()
-                + b"archive-bytes".len()
-                + b"pub fn demo() {}".len()) as u64;
-            assert_eq!(size_bytes, expected);
-        });
-    }
-
-    #[test]
     fn join_relative_path_rejects_non_normal_components() {
         let root = Path::new("/cache-root");
         for path in ["", "..", "a/../b", "./a", "/a"] {
@@ -4838,7 +4220,6 @@ mod tests {
             },
             features_json: "[]".to_owned(),
             dependency_c_metadata_json: "[]".to_owned(),
-            build_script_out_dir: None,
         }
     }
 
@@ -4921,7 +4302,6 @@ mod tests {
             kind: artifact_bundle.manifest.config.kind.clone(),
             crate_types: artifact_bundle.manifest.config.crate_types.clone(),
             outputs: artifact_bundle.manifest.config.outputs.clone(),
-            native: artifact_bundle.manifest.config.native.clone(),
             sigstore_signatures: artifact_bundle.manifest.sigstore_signatures.clone(),
             entry_dir: temp_dir.join("bundle-entry"),
             rustc_version: artifact_bundle
