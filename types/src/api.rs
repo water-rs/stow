@@ -434,8 +434,9 @@ impl BuildTaskPayload {
 /// One artifact a trusted build published.
 ///
 /// The element of the `Vec<ArtifactRecord>` the publish stage serializes
-/// into the signed `records-<rustc>-<task_id hash>` GHCR artifact once the
-/// build, re-hash, validation, sign, and push have all succeeded. Nothing
+/// into the signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
+/// GHCR artifact once the build, re-hash, validation, sign, and push have
+/// all succeeded. Nothing
 /// POSTs it anywhere — `index sync` mirrors the verified records into the
 /// edge's D1 `artifacts` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -784,8 +785,8 @@ pub struct WorkflowRunComplete {
     /// the task id, so this string IS `BuildTaskPayload::task_id`.
     pub task_id: String,
     /// The run's `conclusion` mapped onto success: only a run that
-    /// finished green *and* whose records artifact exists in GHCR counts
-    /// as a completed build.
+    /// finished green *and* whose run's records artifact exists in GHCR
+    /// counts as a completed build.
     pub success: bool,
     /// Failure description when `success` is false — the conclusion and,
     /// on a missing records artifact, which tag the edge looked for.

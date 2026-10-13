@@ -346,11 +346,13 @@ crate with `contents: read` only — no secrets, no OIDC — and uploads
 its output directory as a workflow artifact. `publish` runs only when
 `build` succeeds: it downloads the output, validates it against the
 task and an independently resolved dependency closure, and only then
-pushes the bundle plus the task's `Vec<ArtifactRecord>` (as one signed
-OCI artifact tagged `records-<rustc>-<task_id hash>`) to GHCR, cosign-signing both
+pushes the bundle plus the build's `Vec<ArtifactRecord>` (as one signed
+OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`,
+one per run) to GHCR, cosign-signing both
 (keyless, `id-token: write`). The job never calls the edge — GitHub's
 `workflow_run` webhook delivery reports the outcome instead, and the
-edge checks the records artifact exists before completing the task. See
+edge checks the records artifact that run published exists before
+completing the task. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
 
@@ -430,7 +432,7 @@ in the repo settings:
 The route accepts a delivery only when the run is `completed` for
 `build-crate.yml` on `main`; it parses `display_title` into the run's
 rustc and task id and completes the task only after the records
-artifact for that task
+artifact that run published (tagged by run id and attempt)
 exists and verifies in GHCR, so a spoofed success cannot mint a catalog
 entry.
 

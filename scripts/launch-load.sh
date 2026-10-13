@@ -382,7 +382,9 @@ echo "[load] baseline report: $WORK_DIR/budget-report-before.json"
 # reaches GHCR before its `workflow_run` event does, so the edge's
 # records check must find it here too; without these the lane's
 # "completions" land as failures and flip the rows to `failed`, a
-# fixture state the launch shape never intended to measure.
+# fixture state the launch shape never intended to measure. The tag is
+# per-build — `records-<rustc>-<hash>-<run id>-<attempt>` — so each push
+# carries the row's index k as the run id the driver's callback names.
 FAILED_END=$((QUEUE_ROWS / 40 * 39))
 FIRST_DISPATCHED=2
 [ $((FAILED_END % 2)) -eq 0 ] || FIRST_DISPATCHED=1
@@ -393,6 +395,7 @@ for k in $(seq 0 14); do
         --records "$WORK_DIR/dispatched-records.json" \
         --task-id "$task_id" \
         --rustc-version "$RUSTC_VERSION" \
+        --run-id "$k" --run-attempt 1 \
         --registry-root "$WORK_DIR/mock-registry" \
         --private-key "$WORK_DIR/keys/private.pem" \
         || die "records artifact for $task_id failed"

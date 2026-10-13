@@ -273,7 +273,10 @@ fn sign_body(secret: &str, body: &[u8]) -> String {
 /// The signed `workflow_run` delivery for one seeded dispatched task —
 /// the pinned fields `authorized_run` checks: the trusted repo, the
 /// build workflow's path, `main`, `workflow_dispatch`, and a
-/// `<rustc>-<task_id>` title.
+/// `<rustc>-<task_id>` title. The `id`/`run_attempt` pair names the
+/// build whose records tag the edge looks up, so it is the fixture
+/// row's own index — the value `launch-load.sh` pushes each dispatched
+/// row's records artifact under.
 fn workflow_run_body(task_id: &str, rustc: &str, run_id: u64) -> String {
     serde_json::json!({
         "action": "completed",
@@ -288,6 +291,7 @@ fn workflow_run_body(task_id: &str, rustc: &str, run_id: u64) -> String {
             ),
             "conclusion": "success",
             "id": run_id,
+            "run_attempt": 1,
             "html_url": null,
             "head_repository": {
                 "full_name": stow_types::trusted_builder::REPOSITORY
@@ -544,7 +548,13 @@ async fn plan(
             rustc,
             queue_rows,
         } => {
-            let body = workflow_run_body(&dispatched_task_id(counter, *queue_rows), rustc, counter);
+            // The run id is the fixture row's own index, not the lane
+            // counter: `launch-load.sh` pushes each dispatched row's
+            // records artifact under run id k, and the records tag's
+            // per-build suffix is what the edge's existence check
+            // resolves the delivery to.
+            let k = counter % u64::from(FixtureShape::IN_FLIGHT_ROWS / 2);
+            let body = workflow_run_body(&dispatched_task_id(k, *queue_rows), rustc, k);
             let signature = sign_body(secret, body.as_bytes());
             Ok(Plan::PostBytes {
                 url: format!("{base}/api/v1/github/workflow-run"),

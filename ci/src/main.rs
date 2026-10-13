@@ -40,6 +40,8 @@ use stow_types::api::BuildTaskPayload;
 use tracing_subscriber::EnvFilter;
 
 const STOW_BUILD_TASK_JSON_ENV: &str = "STOW_BUILD_TASK_JSON";
+const GITHUB_RUN_ID_ENV: &str = "GITHUB_RUN_ID";
+const GITHUB_RUN_ATTEMPT_ENV: &str = "GITHUB_RUN_ATTEMPT";
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
@@ -187,13 +189,17 @@ async fn publish(
         &measure_glibc_floors(&output.plan)?,
     )?;
     // The records artifact is the only record the run writes: cosigned by
-    // this workflow's identity under `records-<rustc>-<task_id hash>`, where the
-    // webhook handler reads it back before marking the task done.
+    // this workflow's identity under
+    // `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` — the run
+    // identity makes the tag per-build, so a rebuilt task never
+    // overwrites an earlier build's rows — and the webhook handler reads
+    // this run's tag back before marking the task done.
     let records = stow_oci::push_records(
         &credentials,
         &http,
         task.rustc_version.as_str(),
         &task.task_id,
+        build_run_from_env()?,
         &artifact_records,
     )
     .await?;
@@ -273,6 +279,24 @@ fn load_task_payload() -> stow_types::error::Result<BuildTaskPayload> {
 
 fn env_required(name: &str) -> stow_types::error::Result<String> {
     std::env::var(name).map_err(|_| stow_types::stow_error!("missing required env var {name}"))
+}
+
+/// A required environment variable parsed as a number — a missing or
+/// non-numeric value errors naming the variable.
+fn env_required_number<T: std::str::FromStr>(name: &str) -> stow_types::error::Result<T> {
+    env_required(name)?
+        .parse()
+        .map_err(|_| stow_types::stow_error!("env var {name} must be a number"))
+}
+
+/// The Actions run identity the publish stage's records artifact tags
+/// itself with — `GITHUB_RUN_ID` and `GITHUB_RUN_ATTEMPT`, which the
+/// runner sets on every job.
+fn build_run_from_env() -> stow_types::error::Result<stow_types::records::BuildRun> {
+    Ok(stow_types::records::BuildRun {
+        run_id: env_required_number(GITHUB_RUN_ID_ENV)?,
+        run_attempt: env_required_number(GITHUB_RUN_ATTEMPT_ENV)?,
+    })
 }
 
 fn install_tracing() {
