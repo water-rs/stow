@@ -89,9 +89,19 @@ impl StateDb {
     ///
     /// Claiming the cell waits for an open that is in flight, so a
     /// connect racing the close is closed too; a handle that was never
-    /// opened becomes closed without opening anything.
+    /// opened becomes closed without opening anything. Before the pool
+    /// lets go, a WAL grown past [`WAL_RESET_BYTES`] is truncated — the
+    /// close is the one place a database whose processes are each its
+    /// only connection ever sheds it (stow#687).
     pub async fn close(&self) {
         if let Some(pool) = self.0.get_or_init(|| async { None }).await {
+            // Logged and not returned: the close runs after the
+            // command's result is decided, that result is the
+            // caller's, and the next close meets the same WAL and
+            // tries again.
+            if let Err(error) = reset_grown_wal(pool).await {
+                tracing::warn!(error = %error, "the state database's WAL was not reset");
+            }
             pool.close().await;
         }
     }
@@ -140,8 +150,9 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
 /// process that is the database's only connection, which a standalone
 /// wrapper is once per compiled unit. The close this leaves still
 /// unmaps `-shm` before it releases the file's locks, which is all the
-/// next opener needs (stow#682); the WAL is checkpointed where it
-/// always was, by the automatic checkpoint inside a commit.
+/// next opener needs (stow#682); the WAL it leaves is bounded by
+/// [`StateDb::close`], which truncates it once it reaches
+/// [`WAL_RESET_BYTES`].
 async fn keep_wal_on_close(connection: &mut sqlx::SqliteConnection) -> Result<(), sqlx::Error> {
     let mut handle = connection.lock_handle().await?;
     // SAFETY: `handle` is this live connection's `sqlite3*`, locked for
@@ -176,6 +187,85 @@ const SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE: std::ffi::c_int = 1006;
 // the two together. It moves to the crate's binding when that pin goes.
 unsafe extern "C" {
     fn sqlite3_db_config(db: *mut std::ffi::c_void, op: std::ffi::c_int, ...) -> std::ffi::c_int;
+}
+
+/// The WAL size at which a close truncates it.
+///
+/// A WAL that outlives every connection grows forever: since stow#682
+/// the last close leaves it in place, and across processes that are
+/// each the database's only connection nothing ever restarts it. The
+/// first connection to a WAL database takes `-shm` exclusively, wipes
+/// it and rebuilds the index by reading the whole WAL — and the count
+/// of frames already copied into the database lives in `-shm` and is
+/// lost with it, so the next writer appends instead of starting the
+/// file over. The automatic checkpoint inside a commit only copies
+/// frames; it never restarts the file either. And once the WAL is past
+/// that checkpoint's 1000 pages, every commit of every process runs it
+/// over the whole file again.
+///
+/// Measured over 1500 processes in a row on one database — open,
+/// schema, one transaction, close; run 38403129194 — the WAL reaches
+/// 22 MiB and each process slows with it, Windows from 14 ms to
+/// 42–46 ms and Linux from 2.7 ms to 9.1 ms (stow#687). The bound has
+/// to stay below the automatic checkpoint's 1000 pages, about 4 MiB,
+/// so that checkpoint is never the one that runs; truncating at 1 MiB
+/// keeps Windows at 13.9–14.6 ms and Linux at 2.8 ms with 21
+/// truncations in 1500 processes. A 4 MiB bound is slower
+/// (15.9–16.6 ms, 3.1 ms) because the automatic checkpoint is reached
+/// first, and 256 KiB costs the same as 1 MiB with four times the
+/// truncations.
+const WAL_RESET_BYTES: u64 = 1 << 20;
+
+/// The database's path with `-wal` appended — the file `SQLite` keeps
+/// the write-ahead log in.
+fn wal_path(database: &Path) -> PathBuf {
+    let mut wal = database.as_os_str().to_os_string();
+    wal.push("-wal");
+    PathBuf::from(wal)
+}
+
+/// Truncate the WAL if it has reached [`WAL_RESET_BYTES`], through a
+/// truncating checkpoint on one of the pool's connections.
+async fn reset_grown_wal(pool: &SqlitePool) -> stow_types::error::Result<()> {
+    // The database's path is the pool's own: the close has no cache
+    // directory to rebuild it from.
+    let wal = wal_path(pool.connect_options().get_filename());
+    let metadata = match async_fs::metadata(&wal).await {
+        Ok(metadata) => metadata,
+        // No WAL is nothing to reset.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).wrap_err_with(|| format!("stat {}", wal.display())),
+    };
+    if metadata.len() < WAL_RESET_BYTES {
+        return Ok(());
+    }
+
+    let mut connection = pool
+        .acquire()
+        .await
+        .wrap_err_with(|| format!("acquire a connection to reset {}", wal.display()))?;
+    // A truncating checkpoint waits for other connections' readers and
+    // writer through the busy handler; a process on its way out must
+    // not wait behind another one, and with no handler the checkpoint
+    // copies what it can and reports busy instead.
+    sqlx::query("PRAGMA busy_timeout = 0")
+        .execute(&mut *connection)
+        .await
+        .wrap_err_with(|| format!("disarm the busy timeout on {}", wal.display()))?;
+    let (busy, _log, _checkpointed): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut *connection)
+            .await
+            .wrap_err_with(|| format!("checkpoint {}", wal.display()))?;
+    if busy != 0 {
+        // Another connection held the WAL; it stays grown, and the
+        // next close meets it and tries again.
+        tracing::debug!(
+            wal_bytes = metadata.len(),
+            "the state database's WAL stayed grown"
+        );
+    }
+    Ok(())
 }
 
 /// Add every column `state-db-schema.sql` declares that the database on
@@ -355,7 +445,13 @@ where
 
 #[cfg(test)]
 mod handle_tests {
-    use super::{StateDb, state_db_path};
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection, SqlitePool};
+
+    use super::{StateDb, WAL_RESET_BYTES, state_db_path, wal_path};
 
     /// A handle that is born closed opens nothing either.
     #[tokio::test]
@@ -431,8 +527,7 @@ mod handle_tests {
             .expect("open the state database");
 
         state_db.close().await;
-        let mut wal = state_db_path(cache_dir.path()).into_os_string();
-        wal.push("-wal");
+        let wal = wal_path(&state_db_path(cache_dir.path()));
         let wal_len = std::fs::metadata(&wal)
             .expect("the close must leave the WAL file in place")
             .len();
@@ -470,6 +565,132 @@ mod handle_tests {
                 "unexpected error: {error}"
             ),
         }
+    }
+
+    /// Write at least `bytes` of WAL in one transaction — `wal_filler`
+    /// rows of a 64 KiB `randomblob` apiece — and return the row count.
+    async fn grow_wal(pool: &SqlitePool, bytes: u64) -> u64 {
+        let mut transaction = pool.begin().await.expect("begin the filler transaction");
+        sqlx::query("CREATE TABLE IF NOT EXISTS wal_filler (v BLOB NOT NULL)")
+            .execute(&mut *transaction)
+            .await
+            .expect("create the filler table");
+        let (mut written, mut rows) = (0, 0);
+        while written < bytes {
+            sqlx::query("INSERT INTO wal_filler (v) VALUES (randomblob(65536))")
+                .execute(&mut *transaction)
+                .await
+                .expect("insert a filler row");
+            written += 65536;
+            rows += 1;
+        }
+        transaction.commit().await.expect("commit the filler rows");
+        rows
+    }
+
+    /// A WAL past [`WAL_RESET_BYTES`] is truncated as the close lets go
+    /// of the database — and its frames reach the database first
+    /// (stow#687).
+    #[tokio::test]
+    async fn a_wal_past_the_bound_is_truncated_at_close() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let wal = wal_path(&state_db_path(cache_dir.path()));
+        let state_db = StateDb::default();
+        let pool = state_db
+            .pool(cache_dir.path())
+            .await
+            .expect("open the state database");
+        let rows = grow_wal(&pool, 2 * WAL_RESET_BYTES).await;
+        assert!(
+            std::fs::metadata(&wal).expect("the WAL exists").len() >= WAL_RESET_BYTES,
+            "the filler must grow the WAL past the bound"
+        );
+
+        state_db.close().await;
+        assert_eq!(
+            std::fs::metadata(&wal)
+                .expect("the truncated WAL exists")
+                .len(),
+            0,
+            "the close must truncate a grown WAL"
+        );
+
+        let reopened = StateDb::default();
+        let pool = reopened
+            .pool(cache_dir.path())
+            .await
+            .expect("reopen the state database");
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wal_filler")
+            .fetch_one(&pool)
+            .await
+            .expect("count the filler rows");
+        assert_eq!(
+            u64::try_from(count).expect("a row count is nonnegative"),
+            rows,
+            "the checkpoint must land the filler rows in the database"
+        );
+    }
+
+    /// Back-to-back sole connections keep the WAL under the bound plus
+    /// one round's writes (stow#687).
+    #[tokio::test]
+    async fn the_wal_stays_bounded_across_sole_connections() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let wal = wal_path(&state_db_path(cache_dir.path()));
+        for round in 0..40 {
+            let state_db = StateDb::default();
+            let pool = state_db
+                .pool(cache_dir.path())
+                .await
+                .expect("open the state database");
+            grow_wal(&pool, 128 * 1024).await;
+            state_db.close().await;
+
+            let len = std::fs::metadata(&wal).expect("the WAL exists").len();
+            assert!(
+                len < WAL_RESET_BYTES + 512 * 1024,
+                "round {round}: the WAL grew to {len} bytes"
+            );
+        }
+    }
+
+    /// A truncating checkpoint that meets another connection's read
+    /// reports busy instead of waiting on it: the close is a process on
+    /// its way out, and a read snapshot may outlive it (stow#687).
+    #[tokio::test]
+    async fn a_close_beside_another_connections_read_does_not_wait() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let state_db = StateDb::default();
+        let pool = state_db
+            .pool(cache_dir.path())
+            .await
+            .expect("open the state database");
+        grow_wal(&pool, 2 * WAL_RESET_BYTES).await;
+
+        let path = state_db_path(cache_dir.path());
+        let mut reader = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .expect("connect options for the same database")
+            .connect()
+            .await
+            .expect("a second connection to the same database");
+        sqlx::query("BEGIN")
+            .execute(&mut reader)
+            .await
+            .expect("begin the reader's transaction");
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wal_filler")
+            .fetch_one(&mut reader)
+            .await
+            .expect("hold a read snapshot on the filler table");
+
+        tokio::time::timeout(Duration::from_secs(2), state_db.close())
+            .await
+            .expect("the close must not wait behind another connection's read");
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut reader)
+            .await
+            .expect("end the reader's transaction");
+        reader.close().await.expect("close the second connection");
     }
 }
 
