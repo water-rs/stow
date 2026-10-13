@@ -108,7 +108,8 @@ impl ServeMap {
     /// `pending` map names nothing to wait on (stow#347). Local
     /// coverage does not wait on a cached unit graph: the lockfile's
     /// registry packages name the build's units when no graph is on
-    /// disk (stow#617).
+    /// disk (stow#617), and a lockfile cargo has not written yet names
+    /// none — the local half is then empty, not an error (stow#608).
     pub const fn is_empty(&self) -> bool {
         self.target.is_empty() && self.host.is_empty()
     }
@@ -347,7 +348,7 @@ fn await_serve_map_within(
 /// included — drops the waiter's connection the same way (stow#347).
 #[derive(Debug)]
 pub struct ServeMapSignal {
-    ready: tokio::sync::watch::Sender<bool>,
+    latch: crate::Latch,
 }
 
 impl ServeMapSignal {
@@ -355,7 +356,7 @@ impl ServeMapSignal {
     #[must_use]
     pub fn pending() -> Self {
         Self {
-            ready: tokio::sync::watch::channel(false).0,
+            latch: crate::Latch::pending(),
         }
     }
 
@@ -363,26 +364,23 @@ impl ServeMapSignal {
     /// pending map to wait on gives.
     #[must_use]
     pub fn settled() -> Self {
-        Self {
-            ready: tokio::sync::watch::channel(true).0,
-        }
+        let signal = Self::pending();
+        signal.complete();
+        signal
     }
 
     /// The final map has landed: release every waiter, the ones already
-    /// parked and the ones that have not asked yet. `send_replace`, not
-    /// `send`: the final write can land before the first facade asks,
-    /// and `send` stores nothing when nobody is subscribed.
+    /// parked and the ones that have not asked yet.
     pub fn complete(&self) {
-        self.ready.send_replace(true);
+        self.latch.complete();
     }
 
-    /// Wait for [`Self::complete`], or for the signal's own end: a
-    /// sender that is gone resolves the same wait a completed one does.
+    /// Wait for [`Self::complete`], whether the completion lands before
+    /// or after the wait starts. A signal nobody completes resolves
+    /// nothing — a dropped one drops the waiter's connection with it
+    /// (stow#347), so the latch need not resolve on its own.
     pub async fn wait(&self) {
-        let mut receiver = self.ready.subscribe();
-        if !*receiver.borrow() {
-            let _ = receiver.changed().await;
-        }
+        self.latch.wait().await;
     }
 }
 
@@ -790,5 +788,18 @@ mod tests {
             error.to_string().contains("supervisor token mismatch"),
             "{error}"
         );
+    }
+
+    /// stow#608: a completion that lands before anyone waits still
+    /// releases a waiter that arrives later — the latch stores its
+    /// state with `send_replace`, where `watch::Sender::send` would
+    /// have stored nothing for a receiver that was not yet subscribed.
+    #[tokio::test]
+    async fn a_late_waiter_sees_a_completed_serve_map() {
+        let signal = super::ServeMapSignal::pending();
+        signal.complete();
+        tokio::time::timeout(std::time::Duration::from_secs(5), signal.wait())
+            .await
+            .expect("a waiter after completion returns at once");
     }
 }

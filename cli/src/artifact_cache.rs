@@ -32,6 +32,11 @@ const BUNDLES_DIR: &str = "bundles";
 const NATIVE_DIR: &str = "native";
 const NATIVE_OUT_DIR: &str = "native/out";
 const VERSION_LEASES_DIR: &str = "leases";
+/// `<version_dir>/staging/` — beside `bundles/` and `locks/` on the same
+/// filesystem, so a staged entry's rename into place stays atomic. One
+/// subdirectory per storing process; `prepare_local_cache` sweeps the
+/// ones a dead process left.
+pub const STAGING_DIR: &str = "staging";
 const ARTIFACT_CACHE_LAYOUT_VERSION: &str = "v3";
 /// `oci_reference`/`oci_digest` placeholder for local entries: the columns
 /// are `NOT NULL` and describe the remote a remote bundle was fetched from,
@@ -701,12 +706,14 @@ pub async fn store_downloaded_bundle(
         remove_orphaned_entry_dir(entry_dir.clone()).await?;
     }
 
+    let staging_dir = config
+        .artifact_cache_staging_dir(&request.rustc_version)
+        .await?;
     let size_bytes = tokio::task::spawn_blocking({
-        let entry_parent = entry_parent.to_path_buf();
         let entry_dir = entry_dir.clone();
         let bundle = bundle.clone();
         let c_metadata = request.c_metadata.clone();
-        move || write_bundle_entry_blocking(&entry_parent, &entry_dir, &bundle, &c_metadata)
+        move || write_bundle_entry_blocking(staging_dir.path(), &entry_dir, &bundle, &c_metadata)
     })
     .await
     .wrap_err("join store_downloaded_bundle file task")??;
@@ -741,7 +748,27 @@ pub async fn store_downloaded_bundle(
         &cache_key,
     )
     .await?;
-    Ok(CachedArtifactBundle {
+    Ok(cached_bundle_for_entry(
+        &bundle,
+        entry_dir,
+        request.rustc_version,
+        cache_key,
+        size_bytes,
+        lease_lock,
+    ))
+}
+
+/// The `CachedArtifactBundle` a just-stored remote bundle serves from —
+/// every field lifted from the verified manifest the store just wrote.
+fn cached_bundle_for_entry(
+    bundle: &ArtifactBundle,
+    entry_dir: PathBuf,
+    rustc_version: String,
+    cache_key: String,
+    size_bytes: u64,
+    lease_lock: File,
+) -> CachedArtifactBundle {
+    CachedArtifactBundle {
         provenance: ArtifactProvenance::Remote,
         oci_reference: bundle.manifest.oci_reference.clone(),
         oci_digest: bundle.manifest.oci_digest.clone(),
@@ -762,12 +789,12 @@ pub async fn store_downloaded_bundle(
         native: bundle.manifest.config.native.clone(),
         sigstore_signatures: bundle.manifest.sigstore_signatures.clone(),
         entry_dir,
-        rustc_version: request.rustc_version,
+        rustc_version,
         cache_key,
         verified_marker_version: None,
         verified_marker_policy: None,
         _lease_lock: lease_lock,
-    })
+    }
 }
 
 /// Cache the outputs of a successful rustc passthrough build under the same
@@ -780,9 +807,9 @@ pub async fn store_downloaded_bundle(
 ///
 /// Only clean builds are stored: the caller gates on rustc exit 0 and every
 /// expected output must be present on disk. The entry is staged under a temp
-/// name in the same directory and renamed into place, so readers never see a
-/// half-written entry; concurrent writers serialize on the fs2 entry lock
-/// rather than double-storing.
+/// name inside the process's staging directory and renamed into place, so
+/// readers never see a half-written entry; concurrent writers serialize on
+/// the fs2 entry lock rather than double-storing.
 #[tracing::instrument(name = "stow.cache.store_local_build", skip_all, fields(crate_name = %parsed.crate_name))]
 pub async fn store_local_build_outputs(
     config: &StowConfig,
@@ -845,14 +872,17 @@ pub async fn store_local_build_outputs(
         remove_orphaned_entry_dir(entry_dir.clone()).await?;
     }
 
+    let staging_dir = config
+        .artifact_cache_staging_dir(&build.rustc_version)
+        .await?;
     let written = tokio::task::spawn_blocking({
-        let entry_parent = entry_parent.to_path_buf();
+        let staging_dir = staging_dir.clone();
         let entry_dir = entry_dir.clone();
         let crate_name = build.identity.crate_name.clone();
         let native_out_dir = build.build_script_out_dir.clone();
         move || {
             write_local_build_entry_blocking(
-                &entry_parent,
+                staging_dir.path(),
                 &entry_dir,
                 &outputs,
                 &crate_name,
@@ -1242,6 +1272,83 @@ pub async fn remove_cached_bundle(
     remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await
 }
 
+/// One process's staging directory inside a cache version's staging root:
+/// `<name>/` holds every entry the process is mid-store on, and the
+/// sibling `<name>.lock` carries the exclusive fs2 lock that marks the
+/// owner alive. `<name>` is the process id plus tempfile's random suffix.
+///
+/// The lock file is created under a temporary name, locked, then renamed
+/// to `<name>.lock`, so a `<name>.lock` a sweeper sees is always either
+/// held by its live owner or left by a dead one — never mid-acquisition.
+/// Dropping removes the directory and the lock file; a process that
+/// leaves through `std::process::exit` runs no destructor, which is what
+/// [`sweep_staging_locks`] covers.
+#[derive(Debug)]
+pub struct StagingDir {
+    rustc_version: String,
+    dir: PathBuf,
+    lock_path: PathBuf,
+    _lock_file: File,
+}
+
+impl StagingDir {
+    /// Create this process's staging directory under `staging_root`,
+    /// holding `<name>.lock` until the returned value drops.
+    pub fn acquire(staging_root: &Path, rustc_version: &str) -> stow_types::error::Result<Self> {
+        std::fs::create_dir_all(staging_root).wrap_err_with(|| {
+            format!(
+                "create artifact cache staging root {}",
+                staging_root.display()
+            )
+        })?;
+        let lock = tempfile::Builder::new()
+            .prefix(&format!("{}-", std::process::id()))
+            .tempfile_in(staging_root)
+            .wrap_err_with(|| format!("create staging lock in {}", staging_root.display()))?;
+        lock.as_file()
+            .lock_exclusive()
+            .wrap_err_with(|| format!("lock staging lock {}", lock.path().display()))?;
+        let name = lock
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| {
+                stow_types::stow_error!("staging lock {} has no UTF-8 name", lock.path().display())
+            })?
+            .to_owned();
+        let lock_path = staging_root.join(format!("{name}.lock"));
+        let lock_file = lock.persist_noclobber(&lock_path).map_err(|error| {
+            stow_types::stow_error!("persist staging lock {}: {error}", lock_path.display())
+        })?;
+        let dir = staging_root.join(&name);
+        std::fs::create_dir(&dir)
+            .wrap_err_with(|| format!("create staging dir {}", dir.display()))?;
+        Ok(Self {
+            rustc_version: rustc_version.to_owned(),
+            dir,
+            lock_path,
+            _lock_file: lock_file,
+        })
+    }
+
+    /// The `<name>/` directory stores stage their entries into.
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The cache version this staging directory belongs to.
+    pub fn rustc_version(&self) -> &str {
+        &self.rustc_version
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
 fn prepare_local_cache_blocking(
     artifact_cache_root: &Path,
     purge_root: &Path,
@@ -1273,9 +1380,18 @@ fn prepare_local_cache_blocking(
             version_dir.display()
         )
     })?;
+    std::fs::create_dir_all(version_dir.join(STAGING_DIR)).wrap_err_with(|| {
+        format!(
+            "create rustc artifact cache staging directory {}",
+            version_dir.display()
+        )
+    })?;
     let version_lease = RustcVersionLease {
         _file: acquire_version_shared_lock(&leases_root, rustc_version)?,
     };
+    // Under the version lease, so a concurrent stale-version purge cannot
+    // move this directory while its staging is being swept.
+    sweep_staging_locks(&version_dir.join(STAGING_DIR))?;
 
     if active_version_matches {
         return Ok(PreparedLocalCache {
@@ -1321,14 +1437,14 @@ fn prepare_local_cache_blocking(
 }
 
 fn write_bundle_entry_blocking(
-    entry_parent: &Path,
+    staging_dir: &Path,
     entry_dir: &Path,
     bundle: &ArtifactBundle,
     c_metadata: &str,
 ) -> stow_types::error::Result<u64> {
     let tempdir = tempfile::Builder::new()
         .prefix(&format!("{c_metadata}-"))
-        .tempdir_in(entry_parent)
+        .tempdir_in(staging_dir)
         .wrap_err_with(|| format!("create temp cache directory for {}", entry_dir.display()))?;
     let size_bytes = write_downloaded_bundle_to_entry(tempdir.path(), bundle)?;
     if !entry_dir.exists() {
@@ -1441,12 +1557,15 @@ fn local_build_output_specs(
     Ok(outputs)
 }
 
-/// Stage a locally-built entry under a temp name and rename it into place.
-/// Runs under the exclusive fs2 entry lock, so a partial stage never lands:
-/// a failed stage drops the `TempDir`, and a crash between rename and row
-/// insert leaves an orphan `entry_dir` the next store removes.
+/// Stage a locally-built entry under a temp name in the process's staging
+/// directory and rename it into place. Runs under the exclusive fs2 entry
+/// lock, so a partial stage never lands: a failed stage drops the
+/// `TempDir`, and a crash between rename and row insert leaves an orphan
+/// `entry_dir` the next store removes. A process killed mid-stage leaves
+/// the temp dir under `<version>/staging/<name>/`, which the
+/// `prepare_local_cache` sweep reclaims.
 fn write_local_build_entry_blocking(
-    entry_parent: &Path,
+    staging_dir: &Path,
     entry_dir: &Path,
     outputs: &[LocalBuildOutput],
     crate_name: &str,
@@ -1463,7 +1582,7 @@ fn write_local_build_entry_blocking(
         })?;
     let tempdir = tempfile::Builder::new()
         .prefix(&format!("{entry_name}-"))
-        .tempdir_in(entry_parent)
+        .tempdir_in(staging_dir)
         .wrap_err_with(|| {
             format!(
                 "create temp local cache directory for {}",
@@ -1964,6 +2083,77 @@ fn acquire_version_shared_lock(
 /// comparison goes through fs2's own contended-error value.
 fn is_lock_contended(error: &std::io::Error) -> bool {
     error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+/// Whether opening or removing a staging lock failed because another
+/// sweeper has removed it. On unix the file is simply gone. On Windows a file
+/// removed while a handle to it is still open — the sweeper holds its
+/// lock through the removal — stays listed in delete-pending state and
+/// refuses every open with access denied until that handle closes.
+fn is_being_reclaimed(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || (cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+/// Reclaim staging directories their owning process abandoned. A live
+/// store holds `<name>.lock` exclusively for the process's whole life, so
+/// an exclusive try-lock that succeeds names a dead process: its sibling
+/// `<name>/` and the lock file are removed. A contended lock is a live
+/// writer and is left alone. The cost is one listing of the staging root,
+/// whose size is the number of live and dead stow processes — never the
+/// number of cache entries.
+///
+/// Every stow process of a build sweeps, so several reach the same dead
+/// lock at once. The lock serializes them: the first removes the
+/// directory and the lock file, and a later one either cannot open the
+/// file any more or locks the unlinked file and has nothing left to
+/// remove.
+fn sweep_staging_locks(staging_root: &Path) -> stow_types::error::Result<()> {
+    for entry in std::fs::read_dir(staging_root)
+        .wrap_err_with(|| format!("read staging root {}", staging_root.display()))?
+    {
+        let lock_path = entry?.path();
+        if lock_path.extension() != Some(std::ffi::OsStr::new("lock")) {
+            continue;
+        }
+        let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if is_being_reclaimed(&error) => continue,
+            Err(error) => {
+                return Err(stow_types::stow_error!(
+                    "open staging lock {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if is_lock_contended(&error) => continue,
+            Err(error) => {
+                return Err(stow_types::stow_error!(
+                    "lock staging lease {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+        let staged_dir = lock_path.with_extension("");
+        if staged_dir.exists() {
+            std::fs::remove_dir_all(&staged_dir).wrap_err_with(|| {
+                format!("remove abandoned staging dir {}", staged_dir.display())
+            })?;
+        }
+        match std::fs::remove_file(&lock_path) {
+            Ok(()) => {}
+            Err(error) if is_being_reclaimed(&error) => {}
+            Err(error) => {
+                return Err(stow_types::stow_error!(
+                    "remove staging lock {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn try_acquire_version_exclusive_lock(
@@ -2860,7 +3050,7 @@ async fn evict_invalid_entry(
     else {
         return Ok(());
     };
-    tracing::warn!(
+    tracing::debug!(
         cache_key,
         rustc_version,
         "artifact cache entry carries native artifacts but no recorded OUT_DIR; evicted and reporting a miss"
@@ -2998,9 +3188,10 @@ mod tests {
     use stow_types::rustc::ParsedExternCrate;
 
     use super::{
-        cache_key, join_relative_path, list_artifact_cache_entries, load_bundle_entry_dir,
-        load_semantic_cached_bundle, prepare_local_cache, prepare_local_cache_blocking,
-        store_bundle_entry_dir, touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
+        STAGING_DIR, cache_key, join_relative_path, list_artifact_cache_entries,
+        load_bundle_entry_dir, load_semantic_cached_bundle, prepare_local_cache,
+        prepare_local_cache_blocking, store_bundle_entry_dir, touch_artifact_cache_entry,
+        write_downloaded_bundle_to_entry,
     };
     use crate::config::{StowConfig, VerifyMode};
     use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
@@ -3092,6 +3283,271 @@ mod tests {
         assert!(artifact_root.join("1.91.1").exists());
 
         drop(first.version_lease);
+    }
+
+    const STAGING_HELPER_ENV: &str = "STOW_TEST_STAGING_HELPER";
+    const STAGING_HELPER_ROOT_ENV: &str = "STOW_TEST_STAGING_ROOT";
+    const STAGING_HELPER_MARKER_ENV: &str = "STOW_TEST_STAGING_MARKER";
+    const STAGING_HELPER_TEST: &str = "artifact_cache::tests::staging_helper_process";
+
+    /// The child half of the staging-sweep tests: the parent re-executes
+    /// this test binary as `--exact <this test> --nocapture` with the
+    /// helper env vars set. In a normal `cargo test` run the gate is
+    /// unset and it is a no-op; armed, it acquires the process staging
+    /// directory through the production accessor, leaves a half-written
+    /// staged entry inside it, writes the readiness marker the parent
+    /// polls for, then blocks until killed.
+    #[test]
+    fn staging_helper_process() {
+        if std::env::var_os(STAGING_HELPER_ENV).is_none() {
+            return;
+        }
+        let root = PathBuf::from(
+            std::env::var_os(STAGING_HELPER_ROOT_ENV).expect("staging helper root env"),
+        );
+        let marker = PathBuf::from(
+            std::env::var_os(STAGING_HELPER_MARKER_ENV).expect("staging helper marker env"),
+        );
+        let config = test_config(&root);
+        run_async(async move {
+            let staging = config
+                .artifact_cache_staging_dir("1.91.1")
+                .await
+                .expect("acquire staging dir");
+            let staged = tempfile::Builder::new()
+                .prefix("entry-")
+                .tempdir_in(staging.path())
+                .expect("stage entry");
+            std::fs::write(staged.path().join("partial.txt"), b"partial")
+                .expect("write staged file");
+            let staged = staged.keep();
+            assert!(staged.join("partial.txt").exists());
+            std::fs::write(&marker, b"ready").expect("write readiness marker");
+            loop {
+                std::thread::park();
+            }
+        });
+    }
+
+    fn spawn_staging_helper(root: &Path, marker: &Path) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg(STAGING_HELPER_TEST)
+            .arg("--nocapture")
+            .env(STAGING_HELPER_ENV, "1")
+            .env(STAGING_HELPER_ROOT_ENV, root)
+            .env(STAGING_HELPER_MARKER_ENV, marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn staging helper process")
+    }
+
+    fn wait_for_staging_marker(marker: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staging helper never wrote its readiness marker"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Kills the helper on drop so a failed assertion cannot leak a
+    /// parked child.
+    struct KillOnDrop(std::process::Child);
+
+    impl KillOnDrop {
+        fn kill(&mut self) {
+            self.0.kill().expect("kill staging helper");
+            self.0.wait().expect("reap staging helper");
+        }
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A process killed mid-store leaves its staging dir and lock file;
+    /// the next `prepare_local_cache` sweep reclaims both.
+    #[test]
+    fn prepare_sweeps_dead_process_staging() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let marker = tempdir.path().join("helper-ready");
+        let mut child = KillOnDrop(spawn_staging_helper(tempdir.path(), &marker));
+        wait_for_staging_marker(&marker);
+        child.kill();
+
+        let config = test_config(tempdir.path());
+        let prepared = prepare_local_cache_blocking(
+            &config.artifact_cache_root(),
+            &config.artifact_cache_purge_root(),
+            "1.91.1",
+            true,
+        )
+        .expect("prepare cache");
+        let staging_root = config
+            .artifact_cache_version_dir("1.91.1")
+            .join(STAGING_DIR);
+        let leftovers = std::fs::read_dir(&staging_root)
+            .expect("read staging root")
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "the dead process's staging dir and lock must be swept"
+        );
+        drop(prepared.version_lease);
+    }
+
+    /// Every stow process of a build sweeps, so the same dead locks are
+    /// reached by several sweepers at once; none of them may fail on a
+    /// lock another one reclaimed first.
+    #[test]
+    fn concurrent_sweeps_reclaim_the_same_dead_staging() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let staging_root = tempdir.path().join(STAGING_DIR);
+        std::fs::create_dir_all(&staging_root).expect("create staging root");
+        for index in 0..64 {
+            let name = format!("{index}-dead");
+            std::fs::write(staging_root.join(format!("{name}.lock")), b"").expect("write lock");
+            std::fs::create_dir(staging_root.join(&name)).expect("create staging dir");
+            std::fs::write(staging_root.join(&name).join("partial.txt"), b"partial")
+                .expect("write staged file");
+        }
+
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let sweepers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        super::sweep_staging_locks(&staging_root)
+                    })
+                })
+                .collect::<Vec<_>>();
+            for sweeper in sweepers {
+                sweeper
+                    .join()
+                    .expect("join sweeper")
+                    .expect("a sweep must not fail on a lock another sweep reclaimed");
+            }
+        });
+        assert_eq!(
+            std::fs::read_dir(&staging_root)
+                .expect("read staging root")
+                .count(),
+            0
+        );
+    }
+
+    /// A live process's staging dir survives the sweep: its `<name>.lock`
+    /// is held, so `prepare_local_cache` leaves it and its staged files.
+    #[test]
+    fn prepare_leaves_live_process_staging() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let marker = tempdir.path().join("helper-ready");
+        let mut child = KillOnDrop(spawn_staging_helper(tempdir.path(), &marker));
+        wait_for_staging_marker(&marker);
+
+        let config = test_config(tempdir.path());
+        let prepared = prepare_local_cache_blocking(
+            &config.artifact_cache_root(),
+            &config.artifact_cache_purge_root(),
+            "1.91.1",
+            true,
+        )
+        .expect("prepare cache");
+        let staging_root = config
+            .artifact_cache_version_dir("1.91.1")
+            .join(STAGING_DIR);
+        let entries = std::fs::read_dir(&staging_root)
+            .expect("read staging root")
+            .map(|entry| entry.expect("staging root entry"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            2,
+            "a live process's lock file and staging dir must survive the sweep"
+        );
+        let process_dir = entries
+            .iter()
+            .map(std::fs::DirEntry::path)
+            .find(|path| path.is_dir())
+            .expect("process staging dir");
+        let staged = std::fs::read_dir(&process_dir)
+            .expect("read process staging dir")
+            .map(|entry| entry.expect("staged entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(staged.len(), 1);
+        assert!(staged[0].join("partial.txt").exists());
+        child.kill();
+        drop(prepared.version_lease);
+    }
+
+    /// A completed store renames its staged entry out of the process's
+    /// staging dir: `<name>/` is left empty and the entry is in place.
+    #[test]
+    fn store_leaves_process_staging_dir_empty() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        let stable_c_metadata = "0123456789abcdef";
+        let parsed = local_build_parsed(
+            "demo",
+            "cargo-meta-staging",
+            out_dir,
+            &["dep-info", "metadata", "link"],
+        );
+        std::fs::write(
+            parsed.output_rlib_path().expect("rlib output path"),
+            b"staged-rlib-bytes",
+        )
+        .expect("write rlib");
+        std::fs::write(
+            parsed.output_rmeta_path().expect("rmeta output path"),
+            b"staged-rmeta-bytes",
+        )
+        .expect("write rmeta");
+        let build = local_build_artifact(stable_c_metadata);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(
+                super::store_local_build_outputs(&config, &parsed, &build)
+                    .await
+                    .expect("store local build")
+            );
+
+            let staging = config
+                .artifact_cache_staging_dir("1.91.1")
+                .await
+                .expect("staging dir");
+            assert_eq!(
+                std::fs::read_dir(staging.path())
+                    .expect("read process staging dir")
+                    .count(),
+                0,
+                "the rename moves the staged entry out of <name>/"
+            );
+            let entry_dir = config
+                .artifact_cache_version_dir("1.91.1")
+                .join("bundles/v3/aarch64-apple-darwin")
+                .join(stable_c_metadata);
+            assert!(
+                entry_dir
+                    .join("files/libdemo-0123456789abcdef.rlib")
+                    .exists()
+            );
+        });
     }
 
     #[test]
@@ -4216,6 +4672,7 @@ mod tests {
             state_db_pool: StowConfig::default_state_db_pool(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
+            artifact_cache_staging: std::sync::Arc::default(),
         }
     }
 

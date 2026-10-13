@@ -9,11 +9,12 @@
 //! in-flight units its `--extern` set names — so the count is the whole
 //! set every time.
 
+mod build_fixture;
 mod support;
 
 use std::path::Path;
 
-use support::{refused_url, stow_build_in, stow_setup_in, write_fixture};
+use build_fixture::{refused_url, stow_build_in, stow_setup_in, write_fixture};
 
 /// The fixture's dependency list: the `proc-macro2`/`quote` pair — a
 /// dependent small enough to finish before its dependency's rustc exits
@@ -101,7 +102,7 @@ fn every_compiled_unit_is_stored_before_the_build_exits() {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             stored, expected,
-            "run {run}: the local store must hold every cacheable unit of the fixture"
+            "run {run}: the local store must hold every cacheable unit of the fixture:\n{stderr}"
         );
     }
 }

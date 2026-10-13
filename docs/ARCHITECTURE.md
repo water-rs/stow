@@ -577,9 +577,16 @@ profiles are both eligible.
 ### Store discipline
 
 A passthrough stores only clean builds: `rustc` exit 0 and every expected
-output present. Outputs are reflink-or-copied into a sibling temp dir,
-SHA-256 hashed from the staged bytes, then atomically renamed into the
-entry dir under the fs2 exclusive entry lock. For `links=` crates the same
+output present. Outputs are reflink-or-copied into a temp dir inside the
+process's staging directory — `<version>/staging/<name>/`, one `<name>`
+per storing process beside a `<name>.lock` it holds exclusively for its
+whole life — SHA-256 hashed from the staged bytes, then atomically
+renamed into the entry dir under the fs2 exclusive entry lock. A process
+that ends without dropping its handle — killed mid-store, or leaving
+through `std::process::exit` — leaves its `<name>/` and lock behind; the
+next `prepare_local_cache` sweeps the staging root, reclaiming every lock
+it can acquire (a dead owner) while leaving held locks (live writers)
+alone. For `links=` crates the same
 pass captures the build script's `OUT_DIR` (the `stow-types` capture shared
 with CI — `cargo:` directives minus `rerun-if-*`/`warning=`, every
 `OUT_DIR` file with its sha256, `.a`/`.lib` static libs) into `native/out/`

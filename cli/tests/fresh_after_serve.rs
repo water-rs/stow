@@ -18,6 +18,7 @@
 //! and that two touch-and-rebuild rounds recompile only the fixture's
 //! own package.
 
+mod build_fixture;
 mod support;
 
 use std::collections::BTreeMap;
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::SystemTime;
 
-use support::{refused_url, stow_build_in, stow_setup_in, write_fixture};
+use build_fixture::{refused_url, stow_build_in, stow_setup_in, write_fixture};
 
 /// Registry crates with build scripts that print `cargo:rerun-if-changed`
 /// / `cargo:rerun-if-env-changed` lines (`anyhow`, `libc`, `serde` — and
