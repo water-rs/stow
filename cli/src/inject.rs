@@ -845,7 +845,6 @@ mod tests {
             kind,
             crate_types,
             outputs: manifest.config.outputs,
-            native: manifest.config.native,
             sigstore_signatures: manifest.sigstore_signatures,
             entry_dir: cache_dir,
             rustc_version: "1.91.1".to_owned(),

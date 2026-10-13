@@ -585,17 +585,16 @@ that ends without dropping its handle — killed mid-store, or leaving
 through `std::process::exit` — leaves its `<name>/` and lock behind; the
 next `prepare_local_cache` sweeps the staging root, reclaiming every lock
 it can acquire (a dead owner) while leaving held locks (live writers)
-alone. For `links=` crates the same
-pass captures the build script's `OUT_DIR` (the `stow-types` capture shared
-with CI — `cargo:` directives minus `rerun-if-*`/`warning=`, every
-`OUT_DIR` file with its sha256, `.a`/`.lib` static libs) into `native/out/`
-so the remote and local restore paths are identical.
+alone. The store captures only the rustc outputs: a unit is always served
+inside a rustc invocation cargo issued, and cargo has already run the
+package's build script itself, so nothing on this path needs the script's
+`OUT_DIR` products.
 
 ### Eviction
 
 Local entries join the remote LRU: post-insert `evict_entries` runs against
 `artifact_cache_max_bytes`, `last_accessed_ms` bumps on every hit, and
-`size_bytes` charges native `OUT_DIR` bytes too. Eviction is
+`size_bytes` charges the staged entry's bytes. Eviction is
 provenance-agnostic.
 
 ### Trust
