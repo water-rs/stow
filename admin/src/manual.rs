@@ -1927,12 +1927,7 @@ async fn publish_and_wait(
         // serial for GitHub's secondary rate limits.
         let served: Vec<bool> = futures_util::stream::iter(slices.iter().map(|target| async {
             let rows = published_slice_rows(index, target, rustc_version).await?;
-            Ok::<_, stow_types::error::Error>(slice_serves_layer(
-                rows.as_deref(),
-                target,
-                layer,
-                nodes,
-            ))
+            slice_serves_layer(rows.as_deref(), target, rustc_version, layer, nodes)
         }))
         .buffered(SLICE_PULL_CONCURRENCY)
         .try_collect()
@@ -1958,54 +1953,30 @@ async fn publish_and_wait(
     }
 }
 
-/// Does `target`'s slice (`rows`) carry every done node of this layer
-/// that lives on `target`, at the shapes a dependent's edge requires?
-/// A node on another target is that target's slice's business: a layer
-/// spans every CI target, and no single slice holds them all.
+/// Does `target`'s slice (`rows`) serve every done node of this layer
+/// that lives on `target`? The slice's covered set is the same one the
+/// resume path marks nodes off — `covered_slice_nodes` — so a node is
+/// served when its own task id (context digest included) is in it: a
+/// unit the slice carries only under another dependency identity does
+/// not count, and a layer node whose own row has not landed yet keeps
+/// the publish wait open. A node on another target is that target's
+/// slice's business: a layer spans every CI target, and no single slice
+/// holds them all.
 fn slice_serves_layer(
     rows: Option<&[ArtifactIndexRow]>,
     target: &TargetTriple,
+    rustc_version: &WireRustcVersion,
     layer: &[String],
     nodes: &BTreeMap<String, NodeRun>,
-) -> bool {
-    let Some(rows) = rows else { return false };
-    let mut shapes: HashMap<(String, String, String), BTreeSet<_>> = HashMap::new();
-    for row in rows {
-        if let Some(shape) = row.unit_shape {
-            shapes
-                .entry((
-                    row.crate_name.as_str().to_owned(),
-                    row.version.to_string(),
-                    row.features_json.raw(),
-                ))
-                .or_default()
-                .insert(shape);
-        }
-    }
-    layer.iter().all(|id| {
+) -> stow_types::error::Result<bool> {
+    let Some(rows) = rows else {
+        return Ok(false);
+    };
+    let covered = covered_slice_nodes(rows, target, rustc_version)?;
+    Ok(layer.iter().all(|id| {
         let node = nodes.get(id).expect("layer node");
-        if !node.done || node.request.target != *target {
-            return true;
-        }
-        let request = &node.request;
-        let Some(served) = shapes.get(&(
-            request.crate_name.as_str().to_owned(),
-            request.version.to_string(),
-            request.features_json.raw(),
-        )) else {
-            return false;
-        };
-        let invocation = if stow_types::api::runner_family(request.target.as_str())
-            .is_some_and(|family| family.host_triple() == request.target.as_str())
-        {
-            UnitInvocation::Native
-        } else {
-            UnitInvocation::Target
-        };
-        required_unit_shapes(request.host_side, invocation)
-            .iter()
-            .all(|shape| served.contains(shape))
-    })
+        !node.done || node.request.target != *target || covered.contains(id)
+    }))
 }
 
 /// One `slices.json` entry's file pair.
@@ -3019,6 +2990,7 @@ mod tests {
     fn each_slice_serves_only_its_own_targets_nodes() {
         const HOST: &str = "x86_64-unknown-linux-gnu";
         const WASM: &str = "wasm32-unknown-unknown";
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
         let (mut nodes, _) = build_graph(vec![
             request("macro-dep", HOST, true, &[]),
             request("lib", WASM, false, &[]),
@@ -3040,11 +3012,60 @@ mod tests {
         let host_rows = rows_for("macro-dep", UnitInvocation::Native, true);
         let wasm_rows = rows_for("lib", UnitInvocation::Target, false);
 
-        assert!(slice_serves_layer(Some(&host_rows), &host, &layer, &nodes));
-        assert!(slice_serves_layer(Some(&wasm_rows), &wasm, &layer, &nodes));
+        assert!(slice_serves_layer(Some(&host_rows), &host, &rustc, &layer, &nodes).expect("host"));
+        assert!(slice_serves_layer(Some(&wasm_rows), &wasm, &rustc, &layer, &nodes).expect("wasm"));
         // A slice still missing one of its own nodes does not serve.
-        assert!(!slice_serves_layer(Some(&[]), &wasm, &layer, &nodes));
-        assert!(!slice_serves_layer(None, &host, &layer, &nodes));
+        assert!(!slice_serves_layer(Some(&[]), &wasm, &rustc, &layer, &nodes).expect("empty wasm"));
+        assert!(!slice_serves_layer(None, &host, &rustc, &layer, &nodes).expect("no host slice"));
+    }
+
+    /// stow#657: two nodes that differ only in dependency context can
+    /// publish the very same unit — one `c_metadata` at one
+    /// `unit_shape`, a row each. `covered_slice_nodes` covers both
+    /// nodes, and `slice_serves_layer` — answering through it — serves
+    /// the layer only once a node's own row is there, not when the
+    /// slice carries the same crate, version and features under the
+    /// other node's context.
+    #[test]
+    fn a_unit_published_by_two_contexts_serves_only_its_own_nodes() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let target = TargetTriple::parse(T).expect("target");
+        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
+        let left = request("parent", T, false, &[("left", T, false)]);
+        let right = request("parent", T, false, &[("right", T, false)]);
+        let left_id = left.task_id().expect("left id");
+        let right_id = right.task_id().expect("right id");
+        assert_ne!(left_id, right_id);
+        let rows_for = |request: &EnqueueRequest| {
+            required_unit_shapes(request.host_side, UnitInvocation::Native)
+                .into_iter()
+                .map(|shape| row_for(request, shape))
+                .collect::<Vec<_>>()
+        };
+        // The two nodes' rows name the same unit — `row_for` keys them
+        // on one `c_metadata` — under each node's own context.
+        let left_rows = rows_for(&left);
+        let right_rows = rows_for(&right);
+        let all_rows = [left_rows, right_rows.clone()].concat();
+
+        let covered = super::covered_slice_nodes(&all_rows, &target, &rustc).expect("coverage");
+        assert!(covered.contains(&left_id));
+        assert!(covered.contains(&right_id));
+
+        let (mut nodes, _) = build_graph(vec![left, right]).expect("valid graph");
+        nodes.get_mut(&left_id).expect("left node").done = true;
+        let layer = vec![left_id.clone()];
+        // The same crate, version and feature set under the other
+        // node's context alone does not serve this node.
+        assert!(
+            !slice_serves_layer(Some(&right_rows), &target, &rustc, &layer, &nodes)
+                .expect("other context")
+        );
+        // With its own row published, the slice serves it.
+        assert!(
+            slice_serves_layer(Some(&all_rows), &target, &rustc, &layer, &nodes)
+                .expect("own context")
+        );
     }
 
     fn request_by_name<'a>(name: &str, nodes: &'a BTreeMap<String, NodeRun>) -> &'a EnqueueRequest {
