@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use async_process::Command;
+use async_process::{Command, ExitStatus};
 use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 use serde::{Deserialize, Serialize};
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
@@ -43,7 +43,7 @@ use stow_types::versioning::is_semver_compatible_upgrade;
 use tracing::Instrument as _;
 
 #[tracing::instrument(name = "stow.cargo_cmd.run", skip_all, fields(cargo_command = command))]
-pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
+pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<ExitStatus> {
     Box::pin(run_inner(command, args)).await
 }
 
@@ -130,7 +130,7 @@ async fn begin_project(
     Ok((project, mold))
 }
 
-async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<()> {
+async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<ExitStatus> {
     let invocation = CargoInvocation::new(command, args);
     let config = tracing::debug_span!("stow.precargo.config_load").in_scope(load_stow_config);
     let (mut project, mold) = begin_project(config.as_ref(), &invocation).await?;
@@ -139,14 +139,14 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
         write_stdout(&format!("{message}\n"))?;
     }
 
-    if run_divergent_profile_passthrough(&project, &invocation)
+    if let Some(status) = run_divergent_profile_passthrough(&project, &invocation)
         .instrument(tracing::debug_span!("stow.precargo.profile_guard"))
         .await?
     {
-        return Ok(());
+        return Ok(status);
     }
 
-    if Box::pin(try_resolver_fast_path(
+    if let Some(status) = Box::pin(try_resolver_fast_path(
         config.as_ref(),
         &project,
         &invocation,
@@ -155,13 +155,13 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     .instrument(tracing::debug_span!("stow.precargo.resolver_fast_path"))
     .await
     {
-        return Ok(());
+        return Ok(status);
     }
 
     let maybe_analysis = analyze_or_warn(config.as_ref(), &project, &public_cache_mode)
         .instrument(tracing::debug_span!("stow.precargo.lite_analysis"))
         .await;
-    if run_uncovered_passthrough(
+    if let Some(status) = run_uncovered_passthrough(
         config.as_ref(),
         &project,
         &invocation,
@@ -170,7 +170,7 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
     .instrument(tracing::debug_span!("stow.precargo.uncovered_check"))
     .await?
     {
-        return Ok(());
+        return Ok(status);
     }
 
     // Load the Sigstore trust root before the clock starts. It is a
@@ -238,16 +238,16 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
 /// identity expresses, so no unit can ever hit. Detect that early, skip the
 /// entire resolver/analysis/prefetch machinery, and behave exactly like
 /// cargo. Every other profile knob is part of the compile identity and is
-/// served when the pool holds artifacts built under it. Returns `true`
-/// when the passthrough ran.
+/// served when the pool holds artifacts built under it. Returns
+/// `Some` with cargo's exit status when the passthrough ran.
 async fn run_divergent_profile_passthrough(
     project: &ProjectContext,
     invocation: &CargoInvocation,
-) -> stow_types::error::Result<bool> {
+) -> stow_types::error::Result<Option<ExitStatus>> {
     let Some(divergence) =
         crate::profile_guard::dev_profile_divergence(&project.workspace_root).await?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     tracing::info!(
         %divergence,
@@ -260,8 +260,8 @@ async fn run_divergent_profile_passthrough(
         &invocation.cargo_args,
         project.current_dir(),
     )
-    .await?;
-    Ok(true)
+    .await
+    .map(Some)
 }
 
 /// Phase 0: stow-resolver fast path. When `--no-stow-resolver` is NOT set
@@ -270,25 +270,24 @@ async fn run_divergent_profile_passthrough(
 /// dry-run inside `try_stow_resolver` is the correctness gate — cargo
 /// rejects anything semver/features-incompatible, and we fall back to the
 /// conservative "suggest `Cargo.toml` upgrades, let cargo resolve" flow.
-/// Returns `true` when the resolver path ran cargo and `run` is done.
+/// Returns `Some` with cargo's exit status when the resolver path ran
+/// cargo and `run` is done — `Some` even when that status is a failure.
 async fn try_resolver_fast_path(
     config: Option<&StowConfig>,
     project: &ProjectContext,
     invocation: &CargoInvocation,
     public_cache_mode: &PublicCacheMode,
-) -> bool {
+) -> Option<ExitStatus> {
     // The resolver path exists only where a `StowConfig` gives it a
     // cached slice to pin against, and only while the user has not opted
     // out with `--no-stow-resolver` (stow#608).
     if !public_cache_mode.is_enabled() || !invocation.use_stow_resolver {
-        return false;
+        return None;
     }
-    let Some(config) = config else {
-        return false;
-    };
+    let config = config?;
     match Box::pin(try_stow_resolver(config, project, invocation)).await {
         Ok(served) => {
-            if !served {
+            if served.is_none() {
                 tracing::info!(
                     "stow resolver could not produce a cargo-accepted lockfile; \
                      falling back to graph analysis of the workspace's own lockfile"
@@ -301,7 +300,7 @@ async fn try_resolver_fast_path(
                 %error,
                 "stow resolver path errored; falling back to cargo's own resolver"
             );
-            false
+            None
         }
     }
 }
@@ -366,14 +365,14 @@ async fn warn_when_no_index_covers_the_toolchain(config: &StowConfig, project: &
 /// lockfile cargo would also accept?". A workspace whose own lockfile is
 /// already fully covered is precisely the case where the resolver has
 /// nothing to improve, so treating its empty answer as "nothing is cached"
-/// turned the best case into a plain cargo run. Returns `true` when the
-/// passthrough ran.
+/// turned the best case into a plain cargo run. Returns `Some` with
+/// cargo's exit status when the passthrough ran.
 async fn run_uncovered_passthrough(
     config: Option<&StowConfig>,
     project: &ProjectContext,
     invocation: &CargoInvocation,
     analysis: Option<&WorkspacePrediction>,
-) -> stow_types::error::Result<bool> {
+) -> stow_types::error::Result<Option<ExitStatus>> {
     if invocation.silent_compatible_upgrades
         || analysis.is_some_and(|analysis| !analysis.prefetch_artifacts.is_empty())
         || config.is_some()
@@ -381,7 +380,7 @@ async fn run_uncovered_passthrough(
         // With a config the build runs under the supervisor even when
         // nothing is servable: the supervisor's compile observations are
         // the build's miss list, posted once cargo finishes (stow#317).
-        return Ok(false);
+        return Ok(None);
     }
     tracing::info!("no cached artifacts cover this dependency graph; running plain cargo");
     run_cargo_passthrough(
@@ -390,12 +389,12 @@ async fn run_uncovered_passthrough(
         &invocation.cargo_args,
         project.current_dir(),
     )
-    .await?;
-    Ok(true)
+    .await
+    .map(Some)
 }
 
 /// The no-upgrades path: cargo runs in the real workspace with the cache
-/// plan the analysis produced.
+/// plan the analysis produced. Returns cargo's own exit status.
 async fn run_original_workspace_build(
     config: Option<&StowConfig>,
     project: &ProjectContext,
@@ -403,7 +402,7 @@ async fn run_original_workspace_build(
     public_cache_mode: &PublicCacheMode,
     analysis: Option<WorkspacePrediction>,
     budget: &CacheBudget,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<ExitStatus> {
     let unit_nodes = analysis
         .as_ref()
         .and_then(|analysis| analysis.unit_nodes.clone());
@@ -442,8 +441,10 @@ async fn run_original_workspace_build(
         )
         .await
         {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+            // `Some` ends the command even on a failing status — see
+            // `try_run_top_crate_with_cached_dependencies`.
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -476,6 +477,7 @@ async fn run_original_workspace_build(
 
 /// The upgrades path: apply the selected upgrades inside a mirror
 /// workspace, re-analyze the upgraded graph, then run cargo there.
+/// Returns cargo's own exit status.
 async fn run_mirrored_upgrade_build(
     config: Option<&StowConfig>,
     project: &ProjectContext,
@@ -483,7 +485,7 @@ async fn run_mirrored_upgrade_build(
     public_cache_mode: &PublicCacheMode,
     budget: &CacheBudget,
     selected: &[CompatibleUpgrade],
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<ExitStatus> {
     let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
     apply_selected_upgrades(project, &mirror, selected).await?;
     let mirror_args = rewrite_args_for_mirror(&invocation.cargo_args, project, &mirror)?;
@@ -555,8 +557,10 @@ async fn run_mirrored_upgrade_build(
         )
         .await
         {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+            // `Some` ends the command even on a failing status — see
+            // `try_run_top_crate_with_cached_dependencies`.
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -2129,18 +2133,18 @@ async fn try_stow_resolver(
     config: &StowConfig,
     project: &ProjectContext,
     invocation: &CargoInvocation,
-) -> stow_types::error::Result<bool> {
+) -> stow_types::error::Result<Option<ExitStatus>> {
     let Some(stow_lockfile_toml) = synthesize_lockfile(config, project).await? else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     let Some(pinned) = prepare_pinned_mirror(project, invocation, &stow_lockfile_toml).await?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(mirror_analysis) = analyze_pinned_mirror(config, &pinned.project).await else {
-        return Ok(false);
+        return Ok(None);
     };
 
     run_pinned_mirror_build(
@@ -2304,7 +2308,8 @@ async fn analyze_pinned_mirror(
 
 /// Run cargo against a `PinnedMirror` whose analysis succeeded: the
 /// top-crate cached-deps fast path when it applies, otherwise cargo under
-/// the wrapper with the pinned graph's cache plan.
+/// the wrapper with the pinned graph's cache plan. `Some` carries cargo's
+/// own exit status — success or not (stow#652).
 async fn run_pinned_mirror_build(
     config: &StowConfig,
     project: &ProjectContext,
@@ -2312,7 +2317,7 @@ async fn run_pinned_mirror_build(
     pinned: &PinnedMirror,
     public_cache_mode: &PublicCacheMode,
     mirror_analysis: WorkspacePrediction,
-) -> stow_types::error::Result<bool> {
+) -> stow_types::error::Result<Option<ExitStatus>> {
     let mirror_unit_nodes = mirror_analysis.unit_nodes.clone();
     let mirror_prefetch = mirror_analysis.prefetch_artifacts.clone();
     let mirror_servable = mirror_analysis.servable_units.clone();
@@ -2346,8 +2351,10 @@ async fn run_pinned_mirror_build(
     )
     .await
     {
-        Ok(true) => return Ok(true),
-        Ok(false) => {
+        // `Some` ends the command even on a failing status — see
+        // `try_run_top_crate_with_cached_dependencies`.
+        Ok(Some(status)) => return Ok(Some(status)),
+        Ok(None) => {
             tracing::info!(
                 "top-crate cached-deps fast path not applicable; running cargo with wrapper injection"
             );
@@ -2378,8 +2385,8 @@ async fn run_pinned_mirror_build(
         extra_rustflags: &[],
         covered_units: mirror_prefetch.len(),
     })
-    .await?;
-    Ok(true)
+    .await
+    .map(Some)
 }
 
 async fn collect_user_direct_dependencies(
@@ -2673,6 +2680,11 @@ async fn validate_pinned_lockfile(
     Ok(false)
 }
 
+/// `Some` carries cargo's own exit status — success or not — because a
+/// path that ran cargo has finished the command: a failing status is
+/// the command's answer, never a "not served" that may fall through to
+/// a second cargo run (stow#652). `None` is the fast path declining to
+/// run cargo at all.
 async fn try_run_top_crate_with_cached_dependencies(
     config: &StowConfig,
     project: &ProjectContext,
@@ -2681,19 +2693,19 @@ async fn try_run_top_crate_with_cached_dependencies(
     cache_policy_entries: Option<&[CachePolicyEntry]>,
     prefetch_artifacts: Option<&[PrefetchArtifact]>,
     budget: &CacheBudget,
-) -> stow_types::error::Result<bool> {
+) -> stow_types::error::Result<Option<ExitStatus>> {
     let Some(shape) = cached_dependency_shape(action) else {
-        return Ok(false);
+        return Ok(None);
     };
     if !prebuilt_deps_path_enabled() {
-        return Ok(false);
+        return Ok(None);
     }
     if budget.is_exhausted() {
         tracing::info!(
             budget_ms = budget.total().as_millis(),
             "pre-cargo cache budget spent; handing over to cargo without the prebuilt-deps path"
         );
-        return Ok(false);
+        return Ok(None);
     }
     // Warm the local cache with one batched fetch before the closure walk:
     // the walk itself only reads locally, and filling it one artifact at a
@@ -2705,7 +2717,7 @@ async fn try_run_top_crate_with_cached_dependencies(
         // A cold local cache just means the closure walk below finds nothing
         // and this path declines; it must not fail the build.
         tracing::warn!(%error, "prefetch for the prebuilt-deps path failed");
-        return Ok(false);
+        return Ok(None);
     }
     // The selected packages' direct registry externs ride the same
     // `--unit-graph` resolve as the expanded graph (and its cache), so
@@ -2714,7 +2726,7 @@ async fn try_run_top_crate_with_cached_dependencies(
         .await?
         .direct_dependencies;
     if direct_dependencies.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let plan =
         resolve_cached_dependency_plan(config, project, &direct_dependencies, &shape).await?;
@@ -2755,8 +2767,8 @@ async fn try_run_top_crate_with_cached_dependencies(
         extra_rustflags: &rustflags,
         covered_units: plan.bundles.len(),
     })
-    .await?;
-    Ok(true)
+    .await
+    .map(Some)
 }
 
 /// Opt-in for the prebuilt-deps path, off by default.
@@ -3948,13 +3960,13 @@ fn relative_path(root: &Path, path: &Path) -> stow_types::error::Result<PathBuf>
 ///
 /// Used by the resolver-failed fast fallback so `stow check` cannot be slower
 /// than `cargo check` — which means it must look exactly like `cargo check`
-/// to the toolchain.
+/// to the toolchain. Returns cargo's own exit status, success or not (stow#652).
 async fn run_cargo_passthrough(
     project: &ProjectContext,
     action: &str,
     cargo_args: &[OsString],
     current_dir: &Path,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<ExitStatus> {
     let mut command = Command::new("cargo");
     command.arg(action);
     for config_arg in &project.mold_config_args {
@@ -3967,14 +3979,10 @@ async fn run_cargo_passthrough(
             project.workspace_root.join("target").into_os_string(),
         );
     }
-    let status = command
+    command
         .status()
         .await
-        .wrap_err_with(|| format!("run cargo {action} (passthrough)"))?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+        .wrap_err_with(|| format!("run cargo {action} (passthrough)"))
 }
 
 /// The launch plan for one cargo invocation under the stow wrapper: the
@@ -4014,7 +4022,11 @@ struct CargoRunPlan<'a> {
     covered_units: usize,
 }
 
-async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
+/// The build's cargo run under the wrapper. Returns cargo's own exit
+/// status, success or not — the status travels up to the caller that
+/// owns what the build leaves behind, and only the top of the command
+/// turns it into the process's exit (stow#652).
+async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitStatus> {
     let CargoRunPlan {
         project,
         config,
@@ -4160,15 +4172,12 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<()> {
     }
     // Nothing writes into the scratch directory any more — cargo has
     // exited, the analysis is gone and the supervisor has drained — so
-    // it is removed here rather than at drop: a failing build leaves
-    // through `std::process::exit`, which runs no destructors (stow#630).
+    // it is removed here rather than at drop: `close` reports a removal
+    // failure a `TempDir` drop would swallow (stow#630).
     if let Err(error) = scratch.close() {
         tracing::warn!(%error, "could not remove the build scratch directory");
     }
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+    Ok(status)
 }
 
 /// The cargo invocation the build runs: the action, the build's mold
@@ -5397,6 +5406,70 @@ mod tests {
         assert!(
             !stripped.contains("serde"),
             "mirror manifest lost its dependency table: {stripped}"
+        );
+    }
+
+    /// stow#652: a failing cargo hands its exit status back to the
+    /// mirror's owner instead of exiting inside it — the test process
+    /// surviving the call is the point, and the dropped mirror removes
+    /// its directory. The passthrough is the cargo run a unit test can
+    /// make without touching the per-user wrapper tools.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_cargo_returns_to_the_mirrors_owner() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let workspace = temp.path();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n",
+        )
+        .expect("write workspace manifest");
+        let member = workspace.join("member");
+        std::fs::create_dir(&member).expect("create member dir");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write member manifest");
+        let src = member.join("src");
+        std::fs::create_dir(&src).expect("create member src dir");
+        std::fs::write(src.join("lib.rs"), "pub fn f() -> u32 { \"x\" }\n")
+            .expect("write a lib that does not compile");
+
+        let project = ProjectContext {
+            action: "build".to_owned(),
+            workspace_root: workspace.to_path_buf(),
+            current_dir: member.clone(),
+            current_dir_relative: PathBuf::from("member"),
+            manifest_path: member.join("Cargo.toml"),
+            ..project_context()
+        };
+        let mirror = create_workspace_mirror(&project, &project.workspace_root)
+            .await
+            .expect("create workspace mirror");
+        let target_dir = tempfile::tempdir().expect("target dir");
+        let cargo_args = vec![
+            OsString::from("--target-dir"),
+            target_dir.path().as_os_str().to_os_string(),
+            OsString::from("--offline"),
+        ];
+        let status =
+            super::run_cargo_passthrough(&project, "build", &cargo_args, &mirror.current_dir())
+                .await
+                .expect("run cargo");
+        // 101 is cargo's own exit code for a build that did not compile:
+        // the status is cargo's, not a wrapper's or a spawn failure's.
+        assert_eq!(
+            status.code(),
+            Some(101),
+            "a lib that does not compile ended with {status}"
+        );
+        let mirror_root = mirror.root().to_path_buf();
+        drop(mirror);
+        assert!(
+            !mirror_root.exists(),
+            "the mirror's directory survived its owner: {}",
+            mirror_root.display()
         );
     }
 
