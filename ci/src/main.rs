@@ -27,6 +27,7 @@ mod consume;
 mod context_tests;
 mod dep_scan;
 mod local_server;
+mod object_arch;
 mod plan;
 mod stage;
 mod task;

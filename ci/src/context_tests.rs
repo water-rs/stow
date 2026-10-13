@@ -1293,7 +1293,7 @@ async fn capture_build_dep_keys(
         rustflags: "",
         consume_store: None,
     };
-    let msvc = task::MsvcToolchain::resolve();
+    let msvc = task::MsvcToolchain::resolve(task.target.as_str()).expect("MSVC toolchain");
     let sandbox = phase_sandbox(&setup, target_dir.path(), &msvc)
         .await
         .expect("phase sandbox");
