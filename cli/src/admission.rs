@@ -525,7 +525,7 @@ mod tests {
             artifact_cache_max_bytes: 1,
             index_refresh_interval: Duration::from_secs(1),
             verify_mode: VerifyMode::GithubCi,
-            state_db_pool: StowConfig::default_state_db_pool(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),

@@ -90,6 +90,7 @@ use crate::artifact_cache::{
 use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
+use crate::state_db::StateDb;
 use crate::supervisor::protocol::ArtifactNotifications;
 
 const STOW_EXPANDED_GRAPH_PATH_ENV: &str = "STOW_EXPANDED_GRAPH_PATH";
@@ -133,7 +134,8 @@ pub fn run() -> stow_types::error::Result<()> {
     // The one place a command's failure ends the process — `run_command`
     // has returned, so everything the command owned — its mirror, its
     // scratch directory, the runtime, the tracing guard — has been
-    // dropped before the exit (stow#652).
+    // dropped before the exit (stow#652). The state database was closed
+    // before that: `async_main` closes it ahead of returning (stow#682).
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -311,28 +313,52 @@ async fn async_main() -> stow_types::error::Result<std::process::ExitStatus> {
     let cli = parse_cli_or_exit(&args)?;
     let span = tracing::Span::current();
     span.record("subcommand", subcommand_name(&cli.command));
-    // The cargo commands end with cargo's own exit status; every other
-    // command either fails or ends with success.
+    // The process's one handle on the state database: every config the
+    // command loads shares it, so this is the only place that has to
+    // know what is open.
+    let state_db = StateDb::default();
+    let result = run_cli(cli, &state_db).await;
+    // Closed on every path, before the runtime goes away (stow#682).
+    state_db.close().await;
+    result
+}
+
+/// Run the parsed command and return the exit status the process owes
+/// its caller. Nothing below here ends the process: every path returns,
+/// so [`async_main`] closes the state database behind it (stow#682).
+async fn run_cli(
+    cli: Cli,
+    state_db: &StateDb,
+) -> stow_types::error::Result<std::process::ExitStatus> {
+    // The cargo commands end with cargo's own exit status and the
+    // wrapper roles with their compiler's; every other command either
+    // fails or ends with success.
     let done = match cli.command {
-        CliCommand::Check(command) => return Box::pin(cargo_cmd::run("check", command)).await,
-        CliCommand::Build(command) => return Box::pin(cargo_cmd::run("build", command)).await,
-        CliCommand::Test(command) => return Box::pin(cargo_cmd::run("test", command)).await,
-        CliCommand::Predict(command) => cargo_cmd::predict(command).await,
-        CliCommand::Setup(args) => commands::setup_project(args).await,
+        CliCommand::Check(command) => {
+            return Box::pin(cargo_cmd::run("check", command, state_db)).await;
+        }
+        CliCommand::Build(command) => {
+            return Box::pin(cargo_cmd::run("build", command, state_db)).await;
+        }
+        CliCommand::Test(command) => {
+            return Box::pin(cargo_cmd::run("test", command, state_db)).await;
+        }
+        CliCommand::Rustc(command) => return run_rustc_wrapper(command, state_db).await,
+        CliCommand::Cc(command) => return run_cc_wrapper(command, state_db).await,
+        CliCommand::Predict(command) => cargo_cmd::predict(command, state_db).await,
+        CliCommand::Setup(args) => commands::setup_project(args, state_db).await,
         CliCommand::Update => commands::update_self().await,
-        CliCommand::Status => commands::status_project().await,
-        CliCommand::Stats(args) => commands::stats_command(args).await,
+        CliCommand::Status => commands::status_project(state_db).await,
+        CliCommand::Stats(args) => commands::stats_command(args, state_db).await,
         CliCommand::Clean => commands::clean_project().await,
-        CliCommand::CheckArtifact(command) => commands::check_artifact(command).await,
-        CliCommand::FetchArtifact(command) => commands::fetch_artifact(command).await,
+        CliCommand::CheckArtifact(command) => commands::check_artifact(command, state_db).await,
+        CliCommand::FetchArtifact(command) => commands::fetch_artifact(command, state_db).await,
         CliCommand::Index(args) => match args.command {
-            cli_args::IndexCommand::Refresh(args) => commands::index_refresh(args).await,
-            cli_args::IndexCommand::Status => commands::index_status().await,
+            cli_args::IndexCommand::Refresh(args) => commands::index_refresh(args, state_db).await,
+            cli_args::IndexCommand::Status => commands::index_status(state_db).await,
         },
-        CliCommand::Rustc(command) => run_rustc_wrapper(command).await,
-        CliCommand::Cc(command) => run_cc_wrapper(command).await,
         CliCommand::PurgeCacheDir(command) => commands::purge_cache_dirs(command).await,
-        CliCommand::DrainMisses(args) => miss_journal::drain(&args.target_dir).await,
+        CliCommand::DrainMisses(args) => miss_journal::drain(&args.target_dir, state_db).await,
     };
     done.map(|()| std::process::ExitStatus::default())
 }
@@ -356,16 +382,6 @@ const fn subcommand_name(command: &CliCommand) -> &'static str {
         CliCommand::PurgeCacheDir(_) => "purge-cache-dir",
         CliCommand::DrainMisses(_) => "drain-misses",
     }
-}
-
-async fn run_passthrough(
-    executable: &OsString,
-    env: &[(OsString, OsString)],
-    wrapped_args: &[std::ffi::OsString],
-) -> stow_types::error::Result<()> {
-    let status = run_passthrough_status(executable, env, wrapped_args).await?;
-
-    std::process::exit(status.code().unwrap_or(1));
 }
 
 async fn run_passthrough_status(
@@ -929,7 +945,7 @@ pub(crate) fn prefetch_candidate_c_metadatas(
 /// rustc invocation actually used. `run_cargo` mints the build's misses
 /// from this list once cargo finishes — the observations are the build's
 /// own, in memory, and die with it (stow#317).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BuildSupervisor {
     /// The build-scoped wrapper environment memo — one config load,
     /// rustc probe pair and cache lease for the whole build.
@@ -952,16 +968,20 @@ impl BuildSupervisor {
     /// the driver computed before cargo spawned — the facts the lazy
     /// loader would have probed on the first facade's critical path —
     /// seeded into the env cache so `compiled` answers immediately
-    /// (stow#608).
+    /// (stow#608). `state_db` is the process's handle: a base the cache
+    /// has to load for a spelling the seed does not cover opens the same
+    /// database the driver's own config does (stow#682).
     pub(crate) fn new(
         ctx: BuildContext,
         base: Option<std::sync::Arc<WrapperEnvBase>>,
         resolution_done: ResolutionDone,
+        state_db: StateDb,
     ) -> Self {
         let supervisor = Self {
+            env_cache: WrapperEnvCache::new(state_db),
             ctx,
             resolution_done,
-            ..Self::default()
+            observations: std::sync::Mutex::default(),
         };
         if let Some(base) = base {
             supervisor.env_cache.seed(base);
@@ -1084,11 +1104,16 @@ impl supervisor::server::Handler for BuildSupervisor {
 /// The rustc facade.
 ///
 /// Parses the command line, asks the build's supervisor what to do with
-/// the invocation, and either exits or runs the real rustc. When there is
-/// no supervisor — a plain `cargo build` through the `RUSTC_WRAPPER` that
-/// `stow setup` writes — it decides in this process instead.
+/// the invocation, and either answers success or runs the real rustc.
+/// When there is no supervisor — a plain `cargo build` through the
+/// `RUSTC_WRAPPER` that `stow setup` writes — it decides in this process
+/// instead. Returns the status this process owes cargo: a served unit's
+/// success, or the real rustc's own.
 #[tracing::instrument(name = "stow.wrapper.invoke", skip_all, fields(crate_name, cache_hit))]
-async fn run_rustc_wrapper(mut command: WrapperCommandArgs) -> stow_types::error::Result<()> {
+async fn run_rustc_wrapper(
+    mut command: WrapperCommandArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<std::process::ExitStatus> {
     // The supervising run's extra rustc arguments (workspace path remap and
     // any flags it selected) arrive appended to the argv so the user's own
     // rustflags sources — env or config — keep their cargo semantics.
@@ -1100,7 +1125,7 @@ async fn run_rustc_wrapper(mut command: WrapperCommandArgs) -> stow_types::error
     // merely slow, which is the failure mode that hides.
     match supervisor::from_env().map_err(|error| stow_types::stow_error!("{error}"))? {
         Some((endpoint, token)) => delegate_to_supervisor(&endpoint, token, &command).await,
-        None => run_rustc_standalone(&command).await,
+        None => run_rustc_standalone(&command, state_db).await,
     }
 }
 
@@ -1109,7 +1134,7 @@ async fn delegate_to_supervisor(
     endpoint: &supervisor::Endpoint,
     token: String,
     command: &WrapperCommandArgs,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<std::process::ExitStatus> {
     let mut connection = supervisor::client::Connection::open(endpoint, token)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
@@ -1128,7 +1153,7 @@ async fn delegate_to_supervisor(
                 .await
                 .map_err(|error| stow_types::stow_error!("{error}"))?;
             write_served_artifact_notifications(&notifications)?;
-            std::process::exit(0)
+            return Ok(std::process::ExitStatus::default());
         }
         supervisor::client::Decision::Compile(ticket) => ticket,
     };
@@ -1141,12 +1166,15 @@ async fn delegate_to_supervisor(
         .close()
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
-    std::process::exit(status.code().unwrap_or(1));
+    Ok(status)
 }
 
 /// Decide and execute in this process: the configuration that has no
 /// supervisor to ask.
-async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error::Result<()> {
+async fn run_rustc_standalone(
+    command: &WrapperCommandArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<std::process::ExitStatus> {
     // Parse the argv once: the probe gate, the journal and the decision
     // all read the one `ParsedRustcArgs` (stow#608). A non-compile
     // invocation has nothing for the cache to decide and nothing to
@@ -1159,9 +1187,7 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
     let parsed = match classify_or_log(classified, &command.wrapped_args) {
         Some(parsed) if is_compile_unit(&parsed) => parsed,
         _ => {
-            let status =
-                run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
-            std::process::exit(status.code().unwrap_or(1));
+            return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
         }
     };
     // No supervising stow owns this build's misses: the wrappers
@@ -1172,22 +1198,20 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
         miss_journal::drain_finished_builds(out_dir);
         miss_journal::note_consumer_context(out_dir);
     }
-    let env_cache = WrapperEnvCache::default();
+    let env_cache = WrapperEnvCache::new(state_db.clone());
     let ctx = match BuildContext::from_env() {
         Ok(ctx) => ctx,
         Err(error) => {
             // Malformed driver wiring must not cost a compile: the same
             // parse failure used to bypass the identity step per call.
             tracing::warn!(error = %error, "failed to read the build context, compiling the unit as-is");
-            let status =
-                run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
-            std::process::exit(status.code().unwrap_or(1));
+            return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
         }
     };
     match decide_rustc_invocation(&command.executable, parsed, &env_cache, &ctx).await {
         Outcome::Served(notifications) => {
             write_served_artifact_notifications(&notifications)?;
-            std::process::exit(0)
+            Ok(std::process::ExitStatus::default())
         }
         Outcome::Compile(post) => {
             let status =
@@ -1204,7 +1228,7 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
                     &base.host_target,
                 );
             }
-            std::process::exit(status.code().unwrap_or(1));
+            Ok(status)
         }
     }
 }
@@ -1479,6 +1503,9 @@ pub(crate) struct WrapperEnvCache {
     /// The circuit's tripped state, read once for the build and kept in
     /// step by the build's own recordings.
     circuit_tripped: tokio::sync::OnceCell<std::sync::Mutex<bool>>,
+    /// The process's state-database handle, given to every config the
+    /// base loaders read (stow#682).
+    state_db: StateDb,
 }
 
 /// One memoized env-base cell per executable spelling a facade reports:
@@ -1499,19 +1526,6 @@ type MemoizedSliceMap = std::sync::Mutex<
         std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<SliceIndex>>>>,
     >,
 >;
-
-impl Default for WrapperEnvCache {
-    fn default() -> Self {
-        Self {
-            seeded: std::sync::Mutex::new(None),
-            env_bases: MemoizedBaseMap::default(),
-            local_bases: MemoizedBaseMap::default(),
-            path: std::env::var_os("PATH").unwrap_or_default(),
-            slices: MemoizedSliceMap::default(),
-            circuit_tripped: tokio::sync::OnceCell::new(),
-        }
-    }
-}
 
 /// Whether the facade's `spelling` and the seeded base's `target` rustc
 /// are the same file — bare names resolved through `path`, the
@@ -1536,6 +1550,20 @@ async fn resolves_to_same_file(spelling: &OsStr, target: &OsStr, path: &OsStr) -
 }
 
 impl WrapperEnvCache {
+    /// An empty memo reading this process's `PATH`, whose loaders hand
+    /// `state_db` to every config they read.
+    fn new(state_db: StateDb) -> Self {
+        Self {
+            seeded: std::sync::Mutex::new(None),
+            env_bases: MemoizedBaseMap::default(),
+            local_bases: MemoizedBaseMap::default(),
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            slices: MemoizedSliceMap::default(),
+            circuit_tripped: tokio::sync::OnceCell::new(),
+            state_db,
+        }
+    }
+
     /// Seed the build's base: the base the driver computed before cargo
     /// started, adopted by every spelling that resolves to the same file
     /// (stow#608).
@@ -1553,7 +1581,7 @@ impl WrapperEnvCache {
         &self,
         map: &MemoizedBaseMap,
         rustc: &OsStr,
-        load: impl Fn() -> stow_types::error::Result<StowConfig> + Send + Sync,
+        load: impl Fn(StateDb) -> stow_types::error::Result<StowConfig> + Send + Sync,
     ) -> Option<std::sync::Arc<WrapperEnvBase>> {
         let cell = map
             .lock()
@@ -1568,7 +1596,7 @@ impl WrapperEnvCache {
             {
                 return Some(seed);
             }
-            let config = match load() {
+            let config = match load(self.state_db.clone()) {
                 Ok(config) => config,
                 Err(error) => {
                     tracing::warn!(error = %error, "stow config unavailable, bypassing rust cache");
@@ -2309,36 +2337,41 @@ fn resolve_cc_compiler(executable: &OsString) -> cc::ResolvedCompiler {
     }
 }
 
+/// The C/C++ compiler facade. Returns the status this process owes its
+/// caller: success for a served object, else the real compiler's own.
 #[tracing::instrument(name = "stow.wrapper.cc_invoke", skip_all)]
-async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Result<()> {
+async fn run_cc_wrapper(
+    command: WrapperCommandArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<std::process::ExitStatus> {
     #[cfg(not(windows))]
     let compiler = resolve_cc_compiler(&command.executable);
     #[cfg(windows)]
     let compiler = resolve_cc_compiler(&command.executable)?;
     let compiler_args = &command.wrapped_args;
-    let config = match StowConfig::load_local() {
+    let config = match StowConfig::load_local(state_db.clone()) {
         Ok(config) => config,
         Err(error) => {
             tracing::warn!(error = %error, "stow local config unavailable, bypassing C/C++ cache");
-            return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
+            return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing C/C++ cache");
-        return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
+        return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
     }
 
     let outcome = match cc::try_compile(&config, &compiler, compiler_args).await {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(error = %error, "stow C/C++ cache failed, bypassing cache");
-            return run_passthrough(&compiler.program, &compiler.env, compiler_args).await;
+            return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
 
     match outcome {
         cc::CcOutcome::Passthrough => {
-            run_passthrough(&compiler.program, &compiler.env, compiler_args).await
+            run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await
         }
         cc::CcOutcome::Hit {
             cache_key,
@@ -2353,7 +2386,7 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
                 output_path = %output_path.display(),
                 "served C/C++ compilation from local stow cache"
             );
-            std::process::exit(0);
+            Ok(std::process::ExitStatus::default())
         }
         cc::CcOutcome::Miss {
             cache_key,
@@ -2371,7 +2404,7 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
                     "failed to record C/C++ cache error stats",
                     stats::record_error(&config, &format!("cc:{cache_key}")).await,
                 );
-                std::process::exit(compiler_status.code().unwrap_or(1));
+                return Ok(compiler_status);
             }
 
             if let Err(error) = cc::store_compiled_object(&cache_path, &output_path).await {
@@ -2385,7 +2418,7 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
                     "failed to record C/C++ cache error stats",
                     stats::record_error(&config, &format!("cc:{cache_key}")).await,
                 );
-                std::process::exit(0);
+                return Ok(std::process::ExitStatus::default());
             }
             log_nonfatal_result(
                 "failed to record C/C++ cache miss stats",
@@ -2396,7 +2429,7 @@ async fn run_cc_wrapper(command: WrapperCommandArgs) -> stow_types::error::Resul
                 output_path = %output_path.display(),
                 "stored C/C++ compilation in local stow cache"
             );
-            std::process::exit(0);
+            Ok(std::process::ExitStatus::default())
         }
     }
 }
@@ -4274,6 +4307,7 @@ mod tests {
             super::BuildContext::default(),
             None,
             resolution_done.clone(),
+            crate::state_db::StateDb::default(),
         ));
 
         let _ = crate::supervisor::server::Handler::plan(
@@ -4332,6 +4366,7 @@ mod tests {
             super::BuildContext::default(),
             None,
             resolution_done.clone(),
+            crate::state_db::StateDb::default(),
         ));
 
         crate::supervisor::server::Handler::observed(
@@ -4526,7 +4561,7 @@ mod tests {
             artifact_cache_max_bytes: 1,
             index_refresh_interval: std::time::Duration::from_secs(1),
             verify_mode: crate::config::VerifyMode::GithubCi,
-            state_db_pool: crate::config::StowConfig::default_state_db_pool(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
@@ -4554,6 +4589,7 @@ mod tests {
             path: path.to_os_string(),
             slices: super::MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),
+            state_db: crate::state_db::StateDb::default(),
         }
     }
 
@@ -4617,7 +4653,7 @@ mod tests {
         let counted = {
             let loads = loads.clone();
             let config = config.clone();
-            move || {
+            move |_state_db| {
                 loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(config.clone())
             }
@@ -4669,7 +4705,7 @@ mod tests {
         let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = {
             let loads = loads.clone();
-            move || {
+            move |_state_db| {
                 loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 unreachable!("the adopted seed never loads")
             }
@@ -4709,7 +4745,7 @@ mod tests {
         let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = {
             let loads = loads.clone();
-            move || {
+            move |_state_db| {
                 loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 unreachable!("the adopted seed never loads")
             }
@@ -4743,7 +4779,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             verify_mode: crate::config::VerifyMode::GithubCi,
-            state_db_pool: std::sync::Arc::default(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
@@ -4931,7 +4967,7 @@ mod tests {
                 artifact_cache_max_bytes: u64::MAX,
                 index_refresh_interval: Duration::ZERO,
                 verify_mode: crate::config::VerifyMode::GithubCi,
-                state_db_pool: std::sync::Arc::default(),
+                state_db: crate::state_db::StateDb::default(),
                 trust_material: std::sync::Arc::default(),
                 registry_http: std::sync::Arc::default(),
                 artifact_cache_staging: std::sync::Arc::default(),
@@ -5017,7 +5053,7 @@ mod tests {
                     .expect("prepare local cache"),
             });
             let in_flight = server::InFlightUnits::default();
-            let env_cache = crate::WrapperEnvCache::default();
+            let env_cache = crate::WrapperEnvCache::new(config.state_db.clone());
             env_cache
                 .local_bases
                 .lock()

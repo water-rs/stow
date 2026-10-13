@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use stow_types::error::Context;
+use tokio::sync::OnceCell;
 
 const STATE_DB_FILE_NAME: &str = "state-v3.sqlite3";
 
@@ -38,12 +40,69 @@ pub fn state_db_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(STATE_DB_FILE_NAME)
 }
 
-/// Lazy-init builder for the state `SQLite` pool. Prefer
-/// [`crate::config::StowConfig::state_db_pool`] in callers — it caches the
-/// pool for the lifetime of the process so the hot path doesn't pay schema
-/// migration costs per invocation.
+/// The process's one handle on the state database.
+///
+/// The command entry point creates it, every config the process loads
+/// carries a clone, and the entry point closes it once the command's
+/// future has finished. One handle, because a process that opened a pool
+/// per loaded config held connections nothing could enumerate, and a
+/// connection still open when the process exits breaks the next one on
+/// Windows: the next opener of a WAL database truncates its `-shm` file
+/// while the dying process still has it mapped, and `SQLite` answers
+/// `SQLITE_IOERR_TRUNCATE` — "disk I/O error" — where a process that
+/// closed its connection first never causes it (stow#682).
+///
+/// The cell holds `Some` once the pool is open and `None` once the handle
+/// is closed. Closing is final: a later [`Self::pool`] fails rather than
+/// reopen a database nothing is left to close.
+#[derive(Debug, Clone, Default)]
+pub struct StateDb(Arc<OnceCell<Option<SqlitePool>>>);
+
+impl StateDb {
+    /// A handle closed from the start, for a process that has no state
+    /// database: `stow-build` loads a config through
+    /// [`crate::build_consume`] to read the index and verify bundles,
+    /// never opens the database, and has no entry point here to close
+    /// one. A use fails the way a use after [`Self::close`] does, rather
+    /// than open a connection nothing would close (stow#682).
+    pub fn closed() -> Self {
+        Self(Arc::new(OnceCell::from(None)))
+    }
+
+    /// The pool, opened for `cache_dir` on the first call and shared by
+    /// every later one, so the hot path pays the connect and the schema
+    /// pass once per process.
+    ///
+    /// # Errors
+    ///
+    /// Whatever opening the database fails with, and any use after
+    /// [`Self::close`].
+    pub async fn pool(&self, cache_dir: &Path) -> stow_types::error::Result<SqlitePool> {
+        self.0
+            .get_or_try_init(|| async { connect_pool(cache_dir).await.map(Some) })
+            .await?
+            .clone()
+            .ok_or_else(|| stow_types::stow_error!("the state database was closed before this use"))
+    }
+
+    /// Close the pool and refuse every later [`Self::pool`].
+    ///
+    /// Claiming the cell waits for an open that is in flight, so a
+    /// connect racing the close is closed too; a handle that was never
+    /// opened becomes closed without opening anything.
+    pub async fn close(&self) {
+        if let Some(pool) = self.0.get_or_init(|| async { None }).await {
+            pool.close().await;
+        }
+    }
+}
+
+/// Open the state `SQLite` pool. Callers go through [`StateDb::pool`] —
+/// it opens once per process, so the hot path doesn't pay schema
+/// migration costs per invocation, and it is the handle the process
+/// closes.
 #[tracing::instrument(name = "stow.sqlite.connect", skip_all)]
-pub async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool> {
+async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool> {
     let path = state_db_path(cache_dir);
     if let Some(parent) = path.parent() {
         async_fs::create_dir_all(parent)
@@ -207,8 +266,8 @@ fn split_top_level(body: &str) -> Vec<&str> {
     parts
 }
 
-/// Thin test-only shim that calls [`connect_pool`] without the process-wide
-/// cache. Hot paths must go through `StowConfig::state_db_pool`.
+/// Thin test-only shim that calls [`connect_pool`] without the process's
+/// handle. Hot paths must go through [`StateDb::pool`].
 #[cfg(test)]
 pub async fn connect(cache_dir: &Path) -> stow_types::error::Result<SqlitePool> {
     connect_pool(cache_dir).await
@@ -244,6 +303,104 @@ where
             "{what} value {value} is out of range for its database representation"
         )
     })
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::{StateDb, state_db_path};
+
+    /// A handle that is born closed opens nothing either.
+    #[tokio::test]
+    async fn a_handle_born_closed_refuses_to_open() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let state_db = StateDb::closed();
+
+        let error = state_db
+            .pool(cache_dir.path())
+            .await
+            .expect_err("a handle born closed must not open the database");
+        assert!(
+            error.to_string().contains("closed before this use"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !state_db_path(cache_dir.path()).exists(),
+            "a handle born closed must not create the database file"
+        );
+        // Closing it again is the no-op the entry point's close would be.
+        state_db.close().await;
+    }
+
+    /// Closing is final even for a handle that never opened: the process
+    /// is past the point where anything would close what a late caller
+    /// opened, so the late caller gets an error and no database.
+    #[tokio::test]
+    async fn a_closed_handle_refuses_to_open() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let state_db = StateDb::default();
+        state_db.close().await;
+
+        let error = state_db
+            .pool(cache_dir.path())
+            .await
+            .expect_err("a closed handle must not open the database");
+        assert!(
+            error.to_string().contains("closed before this use"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !state_db_path(cache_dir.path()).exists(),
+            "a closed handle must not create the database file"
+        );
+    }
+
+    /// Every clone of the pool the handle gave out is the pool it closes.
+    #[tokio::test]
+    async fn closing_closes_the_pool() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let state_db = StateDb::default();
+        let pool = state_db
+            .pool(cache_dir.path())
+            .await
+            .expect("open the state database");
+        assert!(!pool.is_closed());
+
+        state_db.close().await;
+        assert!(pool.is_closed(), "the close must reach the pool's clones");
+    }
+
+    /// The regression the early connect makes possible (stow#682): an
+    /// open still in flight when the command ends is waited for and
+    /// closed, never left to finish after the close has returned.
+    #[tokio::test]
+    async fn a_close_waits_for_a_connect_in_flight() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let state_db = StateDb::default();
+        let opening = tokio::spawn({
+            let state_db = state_db.clone();
+            let cache_dir = cache_dir.path().to_path_buf();
+            async move { state_db.pool(&cache_dir).await }
+        });
+        // Let the spawned open claim the cell before the close asks for it.
+        tokio::task::yield_now().await;
+        let (opened, ()) = tokio::join!(opening, state_db.close());
+
+        let pool = opened
+            .expect("join the opening task")
+            .expect("the open that claimed the cell first completes");
+        assert!(
+            pool.is_closed(),
+            "the close must wait for the open in flight and close its pool"
+        );
+        // Whatever the cell holds now, it is nothing a caller can use.
+        match state_db.pool(cache_dir.path()).await {
+            Ok(pool) => assert!(pool.is_closed(), "a closed handle handed out a live pool"),
+            Err(error) => assert!(
+                error.to_string().contains("closed before this use"),
+                "unexpected error: {error}"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use sqlx::SqlitePool;
 use stow_types::error::Context;
 use tokio::sync::OnceCell;
 
+use crate::state_db::StateDb;
 use crate::wrapper_shim;
 
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
@@ -56,13 +57,16 @@ pub struct StowConfig {
     /// change. `STOW_INDEX_REFRESH_SECS` or `index_refresh_secs`.
     pub index_refresh_interval: Duration,
     pub verify_mode: VerifyMode,
-    /// Process-scoped lazy cache for the state `SQLite` pool. Reused across
-    /// every `artifact_cache` / circuit / stats call, so the
-    /// rustc-wrapper hot path does not pay the `SqliteConnectOptions` /
-    /// schema-migration cost on each invocation. Tests/fixtures should
-    /// initialize via [`StowConfig::default_state_db_pool`].
-    #[serde(skip, default = "Arc::default")]
-    pub state_db_pool: Arc<OnceCell<SqlitePool>>,
+    /// The process's handle on the state database, shared by every config
+    /// the process loads: the command entry point creates it, hands it to
+    /// each load, and closes it when the command ends (stow#682). Every
+    /// `artifact_cache` / circuit / stats call draws the one pool from
+    /// it, so the rustc-wrapper hot path does not pay the
+    /// `SqliteConnectOptions` / schema-migration cost on each invocation.
+    /// Never serialised — a config read back from `STOW_CONFIG_BLOB`
+    /// takes the reading process's handle.
+    #[serde(skip, default)]
+    pub state_db: StateDb,
     /// Lazily loaded Sigstore trust root, shared by every verification
     /// this process performs. Loading it costs well over a second; one
     /// signature check against it costs milliseconds, so rebuilding it per
@@ -87,13 +91,14 @@ pub struct StowConfig {
 }
 
 impl StowConfig {
-    /// Get (lazily initializing) the shared `SQLite` pool for this config.
+    /// Get (lazily opening) the process's `SQLite` pool for this config.
+    ///
+    /// # Errors
+    ///
+    /// Whatever opening the database fails with, and any use after the
+    /// process closed its handle.
     pub async fn state_db_pool(&self) -> stow_types::error::Result<SqlitePool> {
-        let pool = self
-            .state_db_pool
-            .get_or_try_init(|| crate::state_db::connect_pool(&self.cache_dir))
-            .await?;
-        Ok(pool.clone())
+        self.state_db.pool(&self.cache_dir).await
     }
 
     /// Get (lazily loading) the Sigstore trust root for this config.
@@ -167,14 +172,6 @@ impl StowConfig {
         }
         Ok(Arc::clone(staging))
     }
-
-    /// Build a fresh, uninitialized lazy cache for the state `SQLite` pool.
-    /// Tests/fixtures use this when constructing a `StowConfig` literal.
-    #[cfg(test)]
-    #[must_use]
-    pub fn default_state_db_pool() -> Arc<OnceCell<SqlitePool>> {
-        Arc::default()
-    }
 }
 
 /// How downloaded bundles are verified. The mock variant exists only in a
@@ -213,22 +210,24 @@ impl StowConfig {
     }
 
     /// Decode a previously-encoded `STOW_CONFIG_BLOB`, returning `None` when
-    /// the env var is unset.
-    fn from_env_blob() -> stow_types::error::Result<Option<Self>> {
+    /// the env var is unset. The blob carries no handle, so the decoded
+    /// config takes `state_db` — the process's own.
+    fn from_env_blob(state_db: &StateDb) -> stow_types::error::Result<Option<Self>> {
         let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) else {
             return Ok(None);
         };
         let raw = raw
             .into_string()
             .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
-        let config: Self = serde_json::from_str(&raw)
+        let mut config: Self = serde_json::from_str(&raw)
             .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
+        config.state_db = state_db.clone();
         Ok(Some(config))
     }
 
     #[tracing::instrument(name = "stow.config.load", skip_all)]
-    pub fn load() -> stow_types::error::Result<Self> {
-        if let Some(config) = Self::from_env_blob()? {
+    pub fn load(state_db: StateDb) -> stow_types::error::Result<Self> {
+        if let Some(config) = Self::from_env_blob(&state_db)? {
             tracing::Span::current().record("source", "env_blob");
             return Ok(config);
         }
@@ -266,15 +265,15 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             index_refresh_interval: load_index_refresh_interval(file_config.as_ref())?,
             verify_mode,
-            state_db_pool: Arc::default(),
+            state_db,
             trust_material: Arc::default(),
             registry_http: Arc::default(),
             artifact_cache_staging: Arc::default(),
         })
     }
 
-    pub fn load_local() -> stow_types::error::Result<Self> {
-        if let Some(config) = Self::from_env_blob()? {
+    pub fn load_local(state_db: StateDb) -> stow_types::error::Result<Self> {
+        if let Some(config) = Self::from_env_blob(&state_db)? {
             return Ok(config);
         }
         let file_config = load_user_config()?;
@@ -308,7 +307,7 @@ impl StowConfig {
             artifact_cache_max_bytes: load_artifact_cache_max_bytes(file_config.as_ref())?,
             index_refresh_interval: load_index_refresh_interval(file_config.as_ref())?,
             verify_mode,
-            state_db_pool: Arc::default(),
+            state_db,
             trust_material: Arc::default(),
             registry_http: Arc::default(),
             artifact_cache_staging: Arc::default(),
