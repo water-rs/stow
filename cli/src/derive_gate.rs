@@ -153,9 +153,22 @@ async fn list_pointers(gate_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// One stop exchange: read the pointer, connect — the connection
 /// itself is the stop request — and read until the drain closes,
 /// which it does only after its cargo child is dead and reaped. A
-/// pointer that cannot be read or parsed, or an endpoint that refuses
-/// the connection, belongs to a dead drain: remove it and move on.
+/// pointer whose drain is gone, that cannot be read or parsed, or
+/// whose endpoint refuses the connection belongs to a dead drain:
+/// remove it and move on.
 async fn stop_derivation(pointer: &Path) {
+    // The pointer is named after its drain's pid. A dead drain is never
+    // connected to: where the endpoint is a port, whoever listens there
+    // now is a stranger that would hold this command for the deadline.
+    let drain_alive = pointer
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse::<u32>().ok())
+        .is_some_and(crate::miss_journal::process_alive);
+    if !drain_alive {
+        remove_pointer(pointer).await;
+        return;
+    }
     let Some(endpoint) = read_pointer(pointer).await else {
         return;
     };
@@ -471,10 +484,11 @@ mod tests {
         let gate_dir = dir.path().join("gate");
         let derive = gate_dir.join(DERIVE_DIR);
         std::fs::create_dir_all(&derive).expect("derive dir");
-        // An endpoint nobody listens on: the listener is dropped as
-        // soon as the pointer is written.
+        // An endpoint nobody listens on, under the pid of a process
+        // that is alive — this one: the listener is dropped as soon as
+        // the pointer is written.
         let (listener, endpoint) = supervisor::bind("stow-derive-").expect("bind");
-        let pointer = derive.join("424242");
+        let pointer = derive.join(std::process::id().to_string());
         std::fs::write(&pointer, endpoint.encode()).expect("write pointer");
         drop(listener);
 
@@ -483,6 +497,31 @@ mod tests {
             !pointer.exists(),
             "a dead drain's pointer is removed by the sweep"
         );
+        hold.release();
+    }
+
+    /// A pointer left by a drain that no longer runs is removed
+    /// without a connection: whoever listens on its endpoint now is
+    /// not that drain.
+    #[tokio::test]
+    async fn a_gone_drains_endpoint_is_never_connected_to() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gate_dir = dir.path().join("gate");
+        let derive = gate_dir.join(DERIVE_DIR);
+        std::fs::create_dir_all(&derive).expect("derive dir");
+        // A listener that would hold a connection for the whole
+        // deadline, under the pid of a process that has exited.
+        let (_listener, endpoint) = supervisor::bind("stow-derive-").expect("bind");
+        let pointer = derive.join(crate::miss_journal::dead_pid().to_string());
+        std::fs::write(&pointer, endpoint.encode()).expect("write pointer");
+
+        let started = std::time::Instant::now();
+        let hold = ForegroundHold::enter(&gate_dir).await.expect("enter");
+        assert!(
+            started.elapsed() < STOP_DEADLINE,
+            "a gone drain's endpoint was waited on"
+        );
+        assert!(!pointer.exists(), "a gone drain's pointer is removed");
         hold.release();
     }
 
@@ -495,7 +534,11 @@ mod tests {
         let derive = gate_dir.join(DERIVE_DIR);
         std::fs::create_dir_all(&derive).expect("derive dir");
         let (listener, endpoint) = supervisor::bind("stow-derive-").expect("bind");
-        std::fs::write(derive.join("424242"), endpoint.encode()).expect("write pointer");
+        std::fs::write(
+            derive.join(std::process::id().to_string()),
+            endpoint.encode(),
+        )
+        .expect("write pointer");
         let _serving = tokio::spawn(async move {
             let accepted = match &listener {
                 #[cfg(unix)]

@@ -174,7 +174,7 @@ fn supervised_build() -> String {
 /// Anything unanswerable reads as alive too: draining a live writer's
 /// journal is worse than waiting one more build.
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return true;
     };
@@ -186,7 +186,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -207,8 +207,24 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn process_alive(_pid: u32) -> bool {
+pub fn process_alive(_pid: u32) -> bool {
     true
+}
+
+/// The pid a just-exited child leaves behind: guaranteed dead.
+#[cfg(test)]
+pub fn dead_pid() -> u32 {
+    #[cfg(unix)]
+    let mut command = std::process::Command::new("true");
+    #[cfg(windows)]
+    let mut command = {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "exit", "0"]);
+        cmd
+    };
+    let mut child = command.spawn().expect("spawn");
+    child.wait().expect("wait");
+    child.id()
 }
 
 /// Whether the journal's writing build has finished: a driver's `stow-*`
@@ -1179,21 +1195,6 @@ mod tests {
             expanded_cache_key: String::new(),
             unit,
         }
-    }
-
-    /// The pid a just-exited child leaves behind: guaranteed dead.
-    fn dead_pid() -> u32 {
-        #[cfg(unix)]
-        let mut command = std::process::Command::new("true");
-        #[cfg(windows)]
-        let mut command = {
-            let mut cmd = std::process::Command::new("cmd");
-            cmd.args(["/c", "exit", "0"]);
-            cmd
-        };
-        let mut child = command.spawn().expect("spawn");
-        child.wait().expect("wait");
-        child.id()
     }
 
     fn test_config(cache_dir: &Path) -> StowConfig {
