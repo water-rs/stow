@@ -67,7 +67,7 @@ jobs:
       # The build pins RUSTUP_TOOLCHAIN=<task.rustc_version>, which rustup
       # resolves as a distinct toolchain from `stable`; installing `stable`
       # here would leave the pinned toolchain without the target's std.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ fromJSON(inputs.task).rustc_version }}
           targets: ${{ fromJSON(inputs.task).target }}
@@ -244,7 +244,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
       # The publish stage re-resolves the task's closure under the pinned
       # toolchain (ci/src/closure.rs) and refuses a rustc that is not the pin.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: ${{ fromJSON(inputs.task).rustc_version }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
