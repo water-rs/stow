@@ -20,6 +20,7 @@ use crate::index;
 use crate::mold;
 use crate::resolve;
 use crate::rustc_args::{detect_rustc_host_target, detect_rustc_version};
+use crate::state_db::StateDb;
 use crate::stats;
 use crate::wrapper_shim;
 use crate::write_stdout;
@@ -29,9 +30,9 @@ use crate::write_stdout;
 /// on the machine routes through the stow rustc/cc wrappers; or, with
 /// `--github-env`, print the equivalent `KEY=VALUE` job-environment
 /// wiring on stdout.
-pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
+pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::error::Result<()> {
     if args.github_env {
-        return print_setup_env().await;
+        return print_setup_env(state_db).await;
     }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
     let cargo_home = config::cargo_home().ok_or_else(|| {
@@ -66,7 +67,7 @@ pub async fn setup_project(args: SetupArgs) -> stow_types::error::Result<()> {
         // is unavailable still configures cargo fully — the first build
         // resolves the link itself and reports live (stow#608). Only a
         // failure of the resolution itself is an error.
-        match StowConfig::load() {
+        match StowConfig::load(state_db.clone()) {
             Ok(stow_config) => {
                 mold::warm_global_link_cache(&cargo_home, &stow_config).await?;
             }
@@ -218,9 +219,9 @@ fn configure_document(
 /// `stow setup` writes into the cargo configuration, plus the resolved edge
 /// configuration, as `KEY=VALUE` lines. Consumers append it to `$GITHUB_ENV`
 /// so the wiring applies to the whole job instead of one project.
-async fn print_setup_env() -> stow_types::error::Result<()> {
+async fn print_setup_env(state_db: &StateDb) -> stow_types::error::Result<()> {
     let wrappers = detect_wrapper_commands()?;
-    let config = StowConfig::load()?;
+    let config = StowConfig::load(state_db.clone())?;
     let host_target = detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
         .await
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
@@ -313,7 +314,7 @@ fn setup_env_output(
 /// the global cargo config, any stale per-project wiring an older stow
 /// left in the ancestor `.cargo/config.toml` files, plus rolling
 /// cache-hit stats.
-pub async fn status_project() -> stow_types::error::Result<()> {
+pub async fn status_project(state_db: &StateDb) -> stow_types::error::Result<()> {
     let cargo_home = config::cargo_home().ok_or_else(|| {
         stow_types::stow_error!(
             "resolve the cargo home — neither $CARGO_HOME nor a home directory is available"
@@ -361,7 +362,7 @@ pub async fn status_project() -> stow_types::error::Result<()> {
     let cc_compiler = scoped("CC").unwrap_or_else(|| "<missing>".to_owned());
     let cxx_compiler = scoped("CXX").unwrap_or_else(|| "<missing>".to_owned());
     let cc_launcher = env_value(&document, "CMAKE_C_COMPILER_LAUNCHER").unwrap_or("<missing>");
-    let (edge_url, stats_summary) = match StowConfig::load() {
+    let (edge_url, stats_summary) = match StowConfig::load(state_db.clone()) {
         Ok(config) => {
             let edge_url = config.edge_url.clone();
             (
@@ -468,8 +469,8 @@ async fn update_with(mut updater: axoupdater::AxoUpdater) -> stow_types::error::
 /// from `stats.json`
 /// and the per-crate counters in the cache directory. Local-only: the
 /// command sends nothing.
-pub async fn stats_command(args: StatsArgs) -> stow_types::error::Result<()> {
-    let config = StowConfig::load()?;
+pub async fn stats_command(args: StatsArgs, state_db: &StateDb) -> stow_types::error::Result<()> {
+    let config = StowConfig::load(state_db.clone())?;
     let report = stats_report(&config).await?;
     if args.json {
         let body = serde_json::to_string(&report).wrap_err("serialize local stats")?;
@@ -588,8 +589,11 @@ pub async fn clean_project() -> stow_types::error::Result<()> {
 
 /// `stow check-artifact`: resolve `c_metadata` against the verified index
 /// slice and report the bundle digest the index pins for it.
-pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Result<()> {
-    let config = StowConfig::load()?;
+pub async fn check_artifact(
+    args: CheckArtifactArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<()> {
+    let config = StowConfig::load(state_db.clone())?;
     let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
 
     match resolve::find_exact_artifact(&slice.index.rows, &args.c_metadata) {
@@ -615,8 +619,11 @@ pub async fn check_artifact(args: CheckArtifactArgs) -> stow_types::error::Resul
 /// `stow fetch-artifact`: resolve `c_metadata` against the index slice,
 /// stream the bundle through the edge byte path (digest-checked against
 /// the index), and write it to disk.
-pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Result<()> {
-    let config = StowConfig::load()?;
+pub async fn fetch_artifact(
+    args: FetchArtifactArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<()> {
+    let config = StowConfig::load(state_db.clone())?;
     let slice = index::ensure_slice(&config, &args.target, &args.rustc_version).await?;
     let row =
         resolve::find_exact_artifact(&slice.index.rows, &args.c_metadata).ok_or_else(|| {
@@ -653,8 +660,11 @@ pub async fn fetch_artifact(args: FetchArtifactArgs) -> stow_types::error::Resul
 
 /// `stow index refresh`: force-fetch and verify the index slice for one
 /// toolchain — `--target`/`--rustc-version` override the `rustc` probe.
-pub async fn index_refresh(args: IndexRefreshArgs) -> stow_types::error::Result<()> {
-    let config = StowConfig::load()?;
+pub async fn index_refresh(
+    args: IndexRefreshArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<()> {
+    let config = StowConfig::load(state_db.clone())?;
     let target = resolve_index_target(args.target).await?;
     let rustc_version = resolve_index_rustc_version(args.rustc_version).await?;
     let slice = index::refresh_slice(&config, &target, &rustc_version).await?;
@@ -670,8 +680,8 @@ pub async fn index_refresh(args: IndexRefreshArgs) -> stow_types::error::Result<
 }
 
 /// `stow index status`: every verified index slice in the local cache.
-pub async fn index_status() -> stow_types::error::Result<()> {
-    let config = StowConfig::load()?;
+pub async fn index_status(state_db: &StateDb) -> stow_types::error::Result<()> {
+    let config = StowConfig::load(state_db.clone())?;
     let slices = index::cached_slices(&config).await?;
     if slices.is_empty() {
         write_stdout("no cached index slices\n")?;
@@ -1158,7 +1168,7 @@ mod tests {
             artifact_cache_max_bytes: 1024,
             index_refresh_interval: Duration::from_mins(5),
             verify_mode,
-            state_db_pool: StowConfig::default_state_db_pool(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),

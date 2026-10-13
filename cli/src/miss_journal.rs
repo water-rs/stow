@@ -20,6 +20,7 @@ use std::process::Stdio;
 use crate::artifact_cache::{LocalBuildArtifact, ObservedUnit};
 use crate::config::StowConfig;
 use crate::rustc_args::ParsedRustcArgs;
+use crate::state_db::StateDb;
 
 const JOURNAL_PREFIX: &str = "stow-misses.";
 const JOURNAL_SUFFIX: &str = ".jsonl";
@@ -496,8 +497,8 @@ pub fn drain_finished_builds(out_dir: &Path) {
 /// resolve each group's graph, deriving through the gate a stow command
 /// can stop — then, with the gate shut and the priority lowered, *post*
 /// (stow#667).
-pub async fn drain(target_dir: &Path) -> stow_types::error::Result<()> {
-    let config = StowConfig::load_local()?;
+pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::Result<()> {
+    let config = StowConfig::load_local(state_db.clone())?;
     let journals = finished_journals(target_dir);
     // The drain runs detached with stderr in `stow-drain.log`: one line
     // naming how many journals it found is what separates "the drain
@@ -1209,7 +1210,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             verify_mode: crate::config::VerifyMode::GithubCi,
-            state_db_pool: std::sync::Arc::default(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),

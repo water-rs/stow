@@ -1231,8 +1231,10 @@ pub async fn remove_cached_bundle(
 /// The lock file is created under a temporary name, locked, then renamed
 /// to `<name>.lock`, so a `<name>.lock` a sweeper sees is always either
 /// held by its live owner or left by a dead one — never mid-acquisition.
-/// Dropping removes the directory and the lock file; a process that
-/// leaves through `std::process::exit` runs no destructor, which is what
+/// Dropping removes the directory and the lock file. Every command
+/// returns to the entry point rather than exiting on the spot
+/// (stow#682), so the drop is the ordinary end; a process killed before
+/// it gets there runs no destructor, which is what
 /// [`sweep_staging_locks`] covers.
 #[derive(Debug)]
 pub struct StagingDir {
@@ -4051,7 +4053,7 @@ mod tests {
             artifact_cache_max_bytes: u64::MAX,
             index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,
-            state_db_pool: StowConfig::default_state_db_pool(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),

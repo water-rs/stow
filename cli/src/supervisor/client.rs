@@ -91,10 +91,13 @@ impl Connection {
     }
 
     /// End the conversation: send the stream's end and release the
-    /// connection. `std::process::exit` runs no destructor, and a process
-    /// that exits with the loopback connection still open resets it — the
-    /// supervisor then reads an error where the conversation simply
-    /// ended (stow#633).
+    /// connection. A process that exits with the loopback connection
+    /// still open resets it — the supervisor then reads an error where
+    /// the conversation simply ended (stow#633). No facade leaves through
+    /// `std::process::exit` with a connection in hand (stow#682), so a
+    /// drop releases it too; the close stays explicit because it ends the
+    /// stream in order and reports a shutdown that fails, where a drop
+    /// reports nothing.
     ///
     /// # Errors
     ///

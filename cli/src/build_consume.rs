@@ -15,6 +15,7 @@ use crate::inject;
 use crate::verify;
 
 use crate::config::StowConfig;
+use crate::state_db::StateDb;
 
 pub use crate::index::IndexSlice;
 pub use crate::supervisor::protocol::ArtifactNotifications;
@@ -58,11 +59,17 @@ pub struct ConsumeConfig(StowConfig);
 impl ConsumeConfig {
     /// Load the config from the environment exactly as the CLI does.
     ///
+    /// The consumption path reads the index, the registry and the trust
+    /// root and never the state database, and the builder's entry point
+    /// is not this crate's, so the config carries a handle that is
+    /// already closed: a state-database read added here fails instead of
+    /// leaving a connection open at the builder's exit (stow#682).
+    ///
     /// # Errors
     ///
     /// Returns an error when the environment config is invalid.
     pub fn load() -> stow_types::error::Result<Self> {
-        StowConfig::load().map(Self)
+        StowConfig::load(StateDb::closed()).map(Self)
     }
 
     /// The OCI registry base URL the config resolved — where the GHCR

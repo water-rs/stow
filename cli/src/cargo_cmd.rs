@@ -27,6 +27,7 @@ use crate::log_nonfatal_result;
 use crate::prefetch::{self, PrefetchArtifact};
 use crate::resolve;
 use crate::rustc_args::{self, STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV};
+use crate::state_db::StateDb;
 use crate::stats;
 use crate::workspace_deps::{
     self, ExpandedDependencyGraph, PackageKey, SelectedRegistryDependency,
@@ -43,8 +44,12 @@ use stow_types::versioning::is_semver_compatible_upgrade;
 use tracing::Instrument as _;
 
 #[tracing::instrument(name = "stow.cargo_cmd.run", skip_all, fields(cargo_command = command))]
-pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<ExitStatus> {
-    Box::pin(run_inner(command, args)).await
+pub async fn run(
+    command: &str,
+    args: CargoCommandArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<ExitStatus> {
+    Box::pin(run_inner(command, args, state_db)).await
 }
 
 /// mold is mandatory on Linux — provisioning starts the moment the
@@ -102,24 +107,23 @@ fn defer_mold_provision(pending: &PendingProjectContext) -> MoldSelection {
 }
 
 /// The invocation's stow config, if one is configured — with the state
-/// DB pool's open already started beside whatever runs next: the pool is
-/// a lazy `OnceCell` whose first query is the lite analysis's
+/// DB pool's open already started beside whatever runs next: the pool
+/// opens lazily and its first query is the lite analysis's
 /// expanded-graph read, so connecting now keeps it off the cargo spawn's
-/// critical path (stow#517).
-fn load_stow_config() -> Option<StowConfig> {
-    let config = match StowConfig::load() {
+/// critical path (stow#517). The open goes through the process's handle,
+/// so the close at the end of the command waits for it (stow#682).
+fn load_stow_config(state_db: &StateDb) -> Option<StowConfig> {
+    let config = match StowConfig::load(state_db.clone()) {
         Ok(config) => config,
         Err(error) => {
             tracing::debug!(%error, "stow config unavailable, skipping graph analysis");
             return None;
         }
     };
-    let state_db_pool = config.state_db_pool.clone();
+    let state_db = state_db.clone();
     let cache_dir = config.cache_dir.clone();
     tokio::spawn(async move {
-        let _ = state_db_pool
-            .get_or_try_init(|| crate::state_db::connect_pool(&cache_dir))
-            .await;
+        let _ = state_db.pool(&cache_dir).await;
     });
     Some(config)
 }
@@ -246,9 +250,14 @@ async fn enter_foreground_hold() -> stow_types::error::Result<crate::derive_gate
     crate::derive_gate::ForegroundHold::enter(&gate_dir).await
 }
 
-async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<ExitStatus> {
+async fn run_inner(
+    command: &str,
+    args: CargoCommandArgs,
+    state_db: &StateDb,
+) -> stow_types::error::Result<ExitStatus> {
     let invocation = CargoInvocation::new(command, args);
-    let config = tracing::debug_span!("stow.precargo.config_load").in_scope(load_stow_config);
+    let config =
+        tracing::debug_span!("stow.precargo.config_load").in_scope(|| load_stow_config(state_db));
     let project = begin_project(config.as_ref(), &invocation).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
@@ -331,6 +340,7 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
             &public_cache_mode,
             maybe_analysis,
             &budget,
+            state_db,
         )
         .await
     } else {
@@ -341,6 +351,7 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
             &public_cache_mode,
             &budget,
             &selected,
+            state_db,
         ))
         .await
     }
@@ -515,6 +526,7 @@ async fn run_original_workspace_build(
     public_cache_mode: &PublicCacheMode,
     analysis: Option<WorkspacePrediction>,
     budget: &CacheBudget,
+    state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
     let unit_nodes = analysis
         .as_ref()
@@ -569,6 +581,7 @@ async fn run_original_workspace_build(
     run_cargo(&CargoRunPlan {
         project,
         config,
+        state_db,
         action: &invocation.action,
         cargo_args: &invocation.cargo_args,
         source_root: &project.workspace_root,
@@ -598,6 +611,7 @@ async fn run_mirrored_upgrade_build(
     public_cache_mode: &PublicCacheMode,
     budget: &CacheBudget,
     selected: &[CompatibleUpgrade],
+    state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
     let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
     apply_selected_upgrades(project, &mirror, selected).await?;
@@ -687,6 +701,7 @@ async fn run_mirrored_upgrade_build(
     run_cargo(&CargoRunPlan {
         project,
         config,
+        state_db,
         action: &invocation.action,
         cargo_args: &mirror_args,
         source_root: mirror.root(),
@@ -742,8 +757,8 @@ fn build_mirror_project_context(
 ///
 /// Read-only, and that is the whole contract: the dependency graph never
 /// leaves the machine, nothing is posted, and nothing is enqueued.
-pub async fn predict(args: CargoCommandArgs) -> stow_types::error::Result<()> {
-    let Some(analysis) = analyze_for_prediction(args).await? else {
+pub async fn predict(args: CargoCommandArgs, state_db: &StateDb) -> stow_types::error::Result<()> {
+    let Some(analysis) = analyze_for_prediction(args, state_db).await? else {
         return Ok(());
     };
     write_stdout(&render_prediction_summary(&analysis))
@@ -754,6 +769,7 @@ pub async fn predict(args: CargoCommandArgs) -> stow_types::error::Result<()> {
 /// printed.
 async fn analyze_for_prediction(
     args: CargoCommandArgs,
+    state_db: &StateDb,
 ) -> stow_types::error::Result<Option<WorkspacePrediction>> {
     let invocation = CargoInvocation::new("predict", args);
     let project = ProjectContext::load(&invocation).await?;
@@ -766,7 +782,7 @@ async fn analyze_for_prediction(
     // Unlike `check`/`build`, `predict` has no cargo run to protect: an
     // analysis it cannot compute is the command failing, and callers rely
     // on the exit status saying so.
-    let config = StowConfig::load().map_err(|error| {
+    let config = StowConfig::load(state_db.clone()).map_err(|error| {
         stow_types::stow_error!(
             "stow predict is unavailable because stow is not configured.\nreason: {error}"
         )
@@ -2505,6 +2521,7 @@ async fn run_pinned_mirror_build(
     run_cargo(&CargoRunPlan {
         project,
         config: Some(config),
+        state_db: &config.state_db,
         action: &invocation.action,
         cargo_args: &pinned.args,
         source_root: pinned.mirror.root(),
@@ -2894,6 +2911,7 @@ async fn try_run_top_crate_with_cached_dependencies(
     run_cargo(&CargoRunPlan {
         project,
         config: Some(config),
+        state_db: &config.state_db,
         action,
         cargo_args: &mirror_args,
         source_root: &project.workspace_root,
@@ -4150,6 +4168,10 @@ async fn passthrough_command(
 struct CargoRunPlan<'a> {
     project: &'a ProjectContext,
     config: Option<&'a StowConfig>,
+    /// The process's state-database handle — `config`'s own when there
+    /// is one — for the configs the build's supervisor loads itself
+    /// (stow#682).
+    state_db: &'a StateDb,
     action: &'a str,
     cargo_args: &'a [OsString],
     source_root: &'a Path,
@@ -4189,6 +4211,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     let CargoRunPlan {
         project,
         config,
+        state_db,
         action,
         cargo_args,
         current_dir,
@@ -4273,6 +4296,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         },
         env_base,
         resolution_done.clone(),
+        state_db.clone(),
     ));
     let mut supervisor = tracing::debug_span!("stow.precargo.supervisor_start")
         .in_scope(|| crate::supervisor::server::start(handler.clone(), in_flight))
@@ -5225,7 +5249,7 @@ mod tests {
             artifact_cache_max_bytes: 0,
             index_refresh_interval: std::time::Duration::ZERO,
             verify_mode: crate::config::VerifyMode::GithubCi,
-            state_db_pool: std::sync::Arc::default(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
@@ -5710,6 +5734,7 @@ mod tests {
             let plan = CargoRunPlan {
                 project: &project,
                 config: None,
+                state_db: &crate::state_db::StateDb::default(),
                 action: "check",
                 cargo_args: &cargo_args,
                 source_root: &project.workspace_root,
@@ -6119,7 +6144,7 @@ mod tests {
             artifact_cache_max_bytes: 1,
             index_refresh_interval: std::time::Duration::from_secs(1),
             verify_mode: crate::config::VerifyMode::GithubCi,
-            state_db_pool: crate::config::StowConfig::default_state_db_pool(),
+            state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
@@ -6190,6 +6215,7 @@ mod tests {
         let plan = CargoRunPlan {
             project: &project,
             config: Some(&config),
+            state_db: &config.state_db,
             action: "check",
             cargo_args: &[],
             source_root: &project.workspace_root,
