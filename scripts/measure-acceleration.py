@@ -58,6 +58,7 @@ LINUX_TABLE = 'cfg(target_os = "linux")'
 # each of these changes what the build compiles or how, so none may leak
 # from the runner into an arm.
 SCRUBBED = (
+    "RUSTC",
     "RUSTC_WRAPPER",
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
