@@ -44,6 +44,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 
@@ -232,18 +233,27 @@ class Lab:
         stderr_path = self.logs / f"{name}.stderr"
         user_before, system_before = cpu_usec()
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            # The exit is waited for with a blocking wait under a timer, not
+            # `subprocess.run(timeout=…)`: that one polls for the exit with
+            # sleeps of up to 50 ms, and every wall time would carry the
+            # quantum.
+            overdue = threading.Event()
             started = time.monotonic_ns()
-            done = subprocess.run(
+            build = subprocess.Popen(
                 argv,
                 cwd=self.project,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout,
                 stderr=stderr,
-                timeout=BUILD_DEADLINE_S,
-                check=False,
             )
+            deadline = threading.Timer(BUILD_DEADLINE_S, lambda: (overdue.set(), build.kill()))
+            deadline.start()
+            exit_code = build.wait()
             ended = time.monotonic_ns()
+            deadline.cancel()
+        if overdue.is_set():
+            die(f"{name} was killed at its {BUILD_DEADLINE_S} s deadline")
         user_after, system_after = cpu_usec()
         settle_seconds, leftovers = settle()
         user_settled, system_settled = cpu_usec()
@@ -255,7 +265,7 @@ class Lab:
             "kind": kind,
             "round": round_number,
             "index": index,
-            "exit_code": done.returncode,
+            "exit_code": exit_code,
             "wall_ms": (ended - started) / 1e6,
             "cpu_user_ms": (user_after - user_before) / 1e3,
             "cpu_system_ms": (system_after - system_before) / 1e3,
@@ -270,9 +280,9 @@ class Lab:
         self.samples.flush()
         self.rows.append(row)
         print(json.dumps(row), flush=True)
-        if done.returncode != 0:
+        if exit_code != 0:
             sys.stderr.write(stderr_text[-4000:])
-            die(f"{name} failed with exit code {done.returncode}")
+            die(f"{name} failed with exit code {exit_code}")
         return row
 
     def full_then_incremental(self, arm, round_number, argv, env, increments):
