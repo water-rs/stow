@@ -50,17 +50,17 @@ pub async fn run(command: &str, args: CargoCommandArgs) -> stow_types::error::Re
 /// mold is mandatory on Linux — provisioning starts the moment the
 /// project's target is known and its linker probes run alongside the
 /// graph analysis in `run_inner` rather than in front of it (stow#347).
-/// The task joins before any cargo invocation, whatever path the build
-/// ends up taking through this driver. `check` is gated with `build`
-/// and `test`: a check still compiles proc-macro dependencies in full
-/// and compiles and runs build scripts, and both of those link. When
-/// the cargo config does not already select a reachable mold, the
-/// managed install is selected for this invocation only — `stow setup`
-/// is not required.
-fn spawn_mold_provision(
+/// The selection resolves before any cargo invocation, whatever path
+/// the build ends up taking through this driver. `check` is gated with
+/// `build` and `test`: a check still compiles proc-macro dependencies
+/// in full and compiles and runs build scripts, and both of those
+/// link. When the cargo config does not already select a reachable
+/// mold, the managed install is selected for this invocation only —
+/// `stow setup` is not required.
+fn mold_provision(
     pending: &PendingProjectContext,
     config: Option<&StowConfig>,
-) -> tokio::task::JoinHandle<stow_types::error::Result<Vec<String>>> {
+) -> impl std::future::Future<Output = stow_types::error::Result<Vec<String>>> + Send + 'static {
     let target = pending.target.clone();
     // The target cargo was given — `--target` or `CARGO_BUILD_TARGET`
     // or `build.target` — decides whether this build links for the
@@ -71,7 +71,7 @@ fn spawn_mold_provision(
     let rustc_vv = pending.rustc_vv.clone();
     let cargo_config = pending.cargo_config.clone();
     let build_rustc = pending.build_rustc.clone();
-    tokio::spawn(async move {
+    async move {
         crate::mold::provision(
             target,
             explicit_target.as_deref(),
@@ -83,7 +83,22 @@ fn spawn_mold_provision(
         )
         .instrument(tracing::debug_span!("stow.precargo.mold_provision"))
         .await
-    })
+    }
+}
+
+/// The selection a real build carries: provisioning runs beside the
+/// rest of the pre-cargo work exactly as it always has (stow#653).
+fn spawn_mold_provision(
+    pending: &PendingProjectContext,
+    config: Option<&StowConfig>,
+) -> MoldSelection {
+    MoldSelection::started(mold_provision(pending, config))
+}
+
+/// The selection a context that assembles no cargo build carries —
+/// provisioning with no reader is work nothing consumes (stow#653).
+fn defer_mold_provision(pending: &PendingProjectContext) -> MoldSelection {
+    MoldSelection::deferred(mold_provision(pending, None))
 }
 
 /// The invocation's stow config, if one is configured — with the state
@@ -109,31 +124,117 @@ fn load_stow_config() -> Option<StowConfig> {
     Some(config)
 }
 
-/// The mold provisioning task `run_inner` joins before any cargo
-/// invocation — see [`spawn_mold_provision`].
-type MoldProvision = tokio::task::JoinHandle<stow_types::error::Result<Vec<String>>>;
+/// The provisioning behind a [`MoldSelection`], shaped like
+/// [`SharedEnvBase`]: `Shared` so every clone of the context awaits
+/// the one resolution (stow#653).
+type MoldProvision =
+    Shared<BoxFuture<'static, Result<std::sync::Arc<[String]>, std::sync::Arc<String>>>>;
+
+/// The cargo `--config` values a build needs so its Linux units link
+/// with mold, still being resolved: the only way to read them is to
+/// await the provisioning, so no cargo build can be assembled before
+/// it has finished (stow#653). `Shared`, so a cloned `ProjectContext`
+/// — a mirror build — awaits the one resolution.
+#[derive(Clone)]
+pub struct MoldSelection(MoldProvision);
+
+impl std::fmt::Debug for MoldSelection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MoldSelection")
+    }
+}
+
+impl MoldSelection {
+    /// Provisioning spawned beside the rest of the pre-cargo work, so
+    /// the await in [`config_args`](Self::config_args) is a take rather
+    /// than a wait. A join error and a provisioning error both surface
+    /// as the `Err` every reader sees.
+    fn started(
+        provision: impl std::future::Future<Output = stow_types::error::Result<Vec<String>>>
+        + Send
+        + 'static,
+    ) -> Self {
+        let task = tokio::spawn(provision);
+        Self(
+            async move {
+                match task.await {
+                    Ok(args) => args
+                        .map(std::sync::Arc::<[String]>::from)
+                        .map_err(|error| std::sync::Arc::new(error.to_string())),
+                    Err(error) => Err(std::sync::Arc::new(format!(
+                        "join mold provisioning task: {error}"
+                    ))),
+                }
+            }
+            .boxed()
+            .shared(),
+        )
+    }
+
+    /// Provisioning that runs only when the selection is read — for a
+    /// context that assembles no cargo build, where spawning it would
+    /// be work nothing consumes.
+    fn deferred(
+        provision: impl std::future::Future<Output = stow_types::error::Result<Vec<String>>>
+        + Send
+        + 'static,
+    ) -> Self {
+        Self(
+            provision
+                .map(|args| {
+                    args.map(std::sync::Arc::<[String]>::from)
+                        .map_err(|error| std::sync::Arc::new(error.to_string()))
+                })
+                .boxed()
+                .shared(),
+        )
+    }
+
+    /// The resolved `--config` values — the await is the contract: a
+    /// caller holding them has the provisioning behind it (stow#653).
+    async fn config_args(&self) -> stow_types::error::Result<std::sync::Arc<[String]>> {
+        self.0
+            .clone()
+            .await
+            .map_err(|error| stow_types::stow_error!("provision mold for this build: {error}"))
+    }
+
+    /// An already-answered selection, for test fixtures — no
+    /// provisioning ran and none is needed.
+    #[cfg(test)]
+    pub fn resolved(args: Vec<String>) -> Self {
+        Self(
+            futures_util::future::ready(Ok::<_, std::sync::Arc<String>>(
+                std::sync::Arc::<[String]>::from(args),
+            ))
+            .boxed()
+            .shared(),
+        )
+    }
+}
 
 /// The workspace layout, rustc probes, mold provisioning and the
 /// supervisor env base of a build, started together so every independent
-/// probe runs beside the others (stow#608). Returns the finished context
-/// and the mold provisioning task.
+/// probe runs beside the others (stow#608). The finished context
+/// carries the mold selection — still resolving — so no cargo build
+/// can be assembled before it answers (stow#653).
 async fn begin_project(
     config: Option<&StowConfig>,
     invocation: &CargoInvocation,
-) -> stow_types::error::Result<(ProjectContext, MoldProvision)> {
+) -> stow_types::error::Result<ProjectContext> {
     let pending = tracing::debug_span!("stow.precargo.project_context")
         .in_scope(|| ProjectContext::begin(invocation))?;
     let mold = spawn_mold_provision(&pending, config);
     let env_base = spawn_env_base(config, &pending);
-    let mut project = pending.finish().await?;
+    let mut project = pending.finish(mold).await?;
     project.env_base = env_base;
-    Ok((project, mold))
+    Ok(project)
 }
 
 async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<ExitStatus> {
     let invocation = CargoInvocation::new(command, args);
     let config = tracing::debug_span!("stow.precargo.config_load").in_scope(load_stow_config);
-    let (mut project, mold) = begin_project(config.as_ref(), &invocation).await?;
+    let project = begin_project(config.as_ref(), &invocation).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
@@ -201,9 +302,6 @@ async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::
             .map_or(0, |analysis| analysis.prefetch_artifacts.len()),
     );
 
-    project.mold_config_args = mold
-        .await
-        .map_err(|error| stow_types::stow_error!("join mold provisioning task: {error}"))??;
     let selected = select_upgrades(
         maybe_analysis.as_ref(),
         invocation.silent_compatible_upgrades,
@@ -617,7 +715,7 @@ fn build_mirror_project_context(
         target: project.target.clone(),
         target_given: project.target_given,
         rustc_version: project.rustc_version.clone(),
-        mold_config_args: project.mold_config_args.clone(),
+        mold: project.mold.clone(),
         env_base: project.env_base.clone(),
         build_rustc: project.build_rustc.clone(),
     })
@@ -716,11 +814,12 @@ pub struct ProjectContext {
     /// The cargo `--config` values this build needs so its Linux units
     /// link with mold — empty on non-Linux, and empty when the cargo
     /// configuration already selects a reachable mold (the setup path).
-    /// Resolved once by [`crate::mold::provision`] and applied to every
-    /// cargo invocation as command-line overrides, so the effective
-    /// selection — and therefore the compile keys — is identical
-    /// whether it came from `--config` or from a written config file.
-    pub(crate) mold_config_args: Vec<String>,
+    /// Resolved once by [`crate::mold::provision`] and read by every
+    /// cargo build invocation through [`MoldSelection::config_args`],
+    /// so the effective selection — and therefore the compile keys — is
+    /// identical whether it came from `--config` or from a written
+    /// config file.
+    pub(crate) mold: MoldSelection,
     /// The supervisor's wrapper base, still computing while the driver's
     /// other work proceeds — `Shared` so every `run_cargo` the context
     /// reaches awaits the one task rather than letting the first
@@ -927,7 +1026,12 @@ impl ProjectContext {
 
     #[tracing::instrument(name = "stow.project.context", skip_all)]
     async fn load(invocation: &CargoInvocation) -> stow_types::error::Result<Self> {
-        Self::begin(invocation)?.finish().await
+        let pending = Self::begin(invocation)?;
+        // `predict` assembles no cargo build, so a started provisioning
+        // would be work nothing reads — the deferred selection runs
+        // only if something awaits it (stow#653).
+        let mold = defer_mold_provision(&pending);
+        pending.finish(mold).await
     }
 
     fn current_dir(&self) -> &Path {
@@ -936,8 +1040,10 @@ impl ProjectContext {
 }
 
 impl PendingProjectContext {
-    /// Join the probes `begin` spawned.
-    async fn finish(self) -> stow_types::error::Result<ProjectContext> {
+    /// Join the probes `begin` spawned; `mold` is the selection the
+    /// caller chose — started for a build, deferred for a context that
+    /// assembles no cargo build (stow#653).
+    async fn finish(self, mold: MoldSelection) -> stow_types::error::Result<ProjectContext> {
         let target = self
             .target
             .await
@@ -957,7 +1063,7 @@ impl PendingProjectContext {
             target,
             target_given: self.resolved_target.is_some(),
             rustc_version,
-            mold_config_args: Vec::new(),
+            mold,
             env_base: None,
             build_rustc: self.build_rustc,
         })
@@ -3967,9 +4073,27 @@ async fn run_cargo_passthrough(
     cargo_args: &[OsString],
     current_dir: &Path,
 ) -> stow_types::error::Result<ExitStatus> {
+    passthrough_command(project, action, cargo_args, current_dir)
+        .await?
+        .status()
+        .await
+        .wrap_err_with(|| format!("run cargo {action} (passthrough)"))
+}
+
+/// The passthrough's cargo invocation: the action, the build's mold
+/// selection as `--config` arguments — awaited before the command is
+/// built, so no cargo build assembles ahead of the provisioning
+/// (stow#653) — then the user's own arguments.
+async fn passthrough_command(
+    project: &ProjectContext,
+    action: &str,
+    cargo_args: &[OsString],
+    current_dir: &Path,
+) -> stow_types::error::Result<Command> {
+    let mold_args = project.mold.config_args().await?;
     let mut command = Command::new("cargo");
     command.arg(action);
-    for config_arg in &project.mold_config_args {
+    for config_arg in mold_args.iter() {
         command.arg("--config").arg(config_arg);
     }
     command.args(cargo_args).current_dir(current_dir);
@@ -3979,10 +4103,7 @@ async fn run_cargo_passthrough(
             project.workspace_root.join("target").into_os_string(),
         );
     }
-    command
-        .status()
-        .await
-        .wrap_err_with(|| format!("run cargo {action} (passthrough)"))
+    Ok(command)
 }
 
 /// The launch plan for one cargo invocation under the stow wrapper: the
@@ -4049,7 +4170,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         .wrap_err("create the build scratch directory")?;
     let wrappers =
         tracing::debug_span!("stow.precargo.detect_wrappers").in_scope(detect_wrapper_commands)?;
-    let mut command = cargo_command(plan);
+    let mut command = cargo_command(plan).await?;
 
     let cache_policy_path = seed_cache_policy(scratch.path(), cache_policy_entries)
         .instrument(tracing::debug_span!("stow.precargo.policy_dir"))
@@ -4181,15 +4302,18 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
 }
 
 /// The cargo invocation the build runs: the action, the build's mold
-/// selection as `--config` arguments, then the user's own arguments.
-fn cargo_command(plan: &CargoRunPlan<'_>) -> Command {
+/// selection as `--config` arguments — awaited, so the command cannot
+/// be assembled before the provisioning answers (stow#653) — then the
+/// user's own arguments.
+async fn cargo_command(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<Command> {
+    let mold_args = plan.project.mold.config_args().await?;
     let mut command = Command::new("cargo");
     command.arg(plan.action);
-    for config_arg in &plan.project.mold_config_args {
+    for config_arg in mold_args.iter() {
         command.arg("--config").arg(config_arg);
     }
     command.args(plan.cargo_args).current_dir(plan.current_dir);
-    command
+    Ok(command)
 }
 
 /// The cell the supervisor's plan path reads the analysis's facts from:
@@ -5015,8 +5139,8 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::build_serve_map;
     use super::{
-        CachedDependencyPlan, CargoRunPlan, MetadataArgs, ProjectContext, PublicCacheMode,
-        WorkspaceMirror, cached_dependency_profile, feature_references_dependency,
+        CachedDependencyPlan, CargoRunPlan, MetadataArgs, MoldSelection, ProjectContext,
+        PublicCacheMode, WorkspaceMirror, cached_dependency_profile, feature_references_dependency,
         native_requires_link_replay, relative_path, rewrite_args_for_mirror, rewrite_args_for_root,
         validate_top_crate_cached_native_support,
     };
@@ -5060,7 +5184,7 @@ mod tests {
             target: "aarch64-apple-darwin".to_owned(),
             target_given: false,
             rustc_version: "1.91.1".to_owned(),
-            mold_config_args: Vec::new(),
+            mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
         }
@@ -5369,7 +5493,7 @@ mod tests {
             target: "aarch64-apple-darwin".to_owned(),
             target_given: false,
             rustc_version: "1.91.1".to_owned(),
-            mold_config_args: Vec::new(),
+            mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
         };
@@ -5407,6 +5531,168 @@ mod tests {
             !stripped.contains("serde"),
             "mirror manifest lost its dependency table: {stripped}"
         );
+    }
+
+    /// A `MoldSelection` a test completes by hand: the provisioning is
+    /// the oneshot's send, so the reader waits exactly until the test
+    /// releases it.
+    fn hand_completed_selection() -> (tokio::sync::oneshot::Sender<Vec<String>>, MoldSelection) {
+        let (release, selected) = tokio::sync::oneshot::channel();
+        let selection = MoldSelection::deferred(async move {
+            selected.await.map_err(|error| {
+                stow_types::stow_error!("the test's mold selection channel closed: {error}")
+            })
+        });
+        (release, selection)
+    }
+
+    /// stow#653: the passthrough's cargo command cannot be assembled
+    /// before the mold selection resolves — the `--config` arguments
+    /// exist only behind the provisioning's await.
+    #[tokio::test]
+    async fn a_passthrough_command_waits_for_the_mold_selection() {
+        let (release, mold) = hand_completed_selection();
+        let project = ProjectContext {
+            mold,
+            ..project_context()
+        };
+        let cargo_args = vec![OsString::from("--offline")];
+        let command = tokio::spawn(async move {
+            super::passthrough_command(&project, "build", &cargo_args, project.current_dir()).await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !command.is_finished(),
+            "the passthrough command assembled before the mold selection resolved"
+        );
+        release
+            .send(vec![
+                "target.x86_64-unknown-linux-gnu.linker=\"clang\"".to_owned(),
+            ])
+            .expect("release the mold selection");
+        let command = command
+            .await
+            .expect("passthrough command task")
+            .expect("passthrough command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_str().expect("utf8 arg").to_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "build".to_owned(),
+                "--config".to_owned(),
+                "target.x86_64-unknown-linux-gnu.linker=\"clang\"".to_owned(),
+                "--offline".to_owned(),
+            ]
+        );
+    }
+
+    /// stow#653: the supervised path's cargo command waits on the same
+    /// selection — `cargo_command` reads it at assembly like the
+    /// passthrough does.
+    #[tokio::test]
+    async fn a_supervised_cargo_command_waits_for_the_mold_selection() {
+        let (release, mold) = hand_completed_selection();
+        let project = ProjectContext {
+            mold,
+            ..project_context()
+        };
+        let cargo_args = vec![OsString::from("--offline")];
+        let command = tokio::spawn(async move {
+            let plan = CargoRunPlan {
+                project: &project,
+                config: None,
+                action: "check",
+                cargo_args: &cargo_args,
+                source_root: &project.workspace_root,
+                current_dir: &project.current_dir,
+                cache_policy_entries: None,
+                public_cache_mode: &PublicCacheMode::Enabled,
+                unit_nodes: None,
+                prefetch_artifacts: None,
+                servable_units: None,
+                deferred_analysis: false,
+                semantic_fallback_enabled: false,
+                extra_rustflags: &[],
+                covered_units: 0,
+            };
+            super::cargo_command(&plan).await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !command.is_finished(),
+            "the supervised cargo command assembled before the mold selection resolved"
+        );
+        release
+            .send(vec![
+                "target.x86_64-unknown-linux-gnu.linker=\"clang\"".to_owned(),
+            ])
+            .expect("release the mold selection");
+        let command = command
+            .await
+            .expect("cargo command task")
+            .expect("cargo command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_str().expect("utf8 arg").to_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "check".to_owned(),
+                "--config".to_owned(),
+                "target.x86_64-unknown-linux-gnu.linker=\"clang\"".to_owned(),
+                "--offline".to_owned(),
+            ]
+        );
+    }
+
+    /// A selection that resolves to an error assembles no cargo
+    /// command: the build fails on the provisioning's error rather
+    /// than running without the linker selection (stow#653).
+    #[tokio::test]
+    async fn a_failed_provisioning_fails_the_command() {
+        let project = ProjectContext {
+            mold: MoldSelection::deferred(async {
+                Err(stow_types::stow_error!("mold is not installable here"))
+            }),
+            ..project_context()
+        };
+        let error = super::passthrough_command(&project, "build", &[], project.current_dir())
+            .await
+            .expect_err("a failed provisioning must not assemble a cargo command");
+        assert!(
+            error.to_string().contains("mold is not installable here"),
+            "the provisioning error is the command's error: {error}"
+        );
+    }
+
+    /// A deferred selection runs its provisioning only when read —
+    /// nothing polls it for a context that assembles no cargo build
+    /// (stow#653).
+    #[tokio::test]
+    async fn a_deferred_selection_runs_only_when_read() {
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = polled.clone();
+        let selection = MoldSelection::deferred(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec!["selected".to_owned()])
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::SeqCst),
+            "a deferred selection's provisioning ran without a reader"
+        );
+        selection.config_args().await.expect("read the selection");
+        assert!(polled.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// stow#652: a failing cargo hands its exit status back to the
