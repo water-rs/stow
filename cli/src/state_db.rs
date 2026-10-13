@@ -19,7 +19,9 @@ const STATE_DB_FILE_NAME: &str = "state-v3.sqlite3";
 /// was added to the schema and to no migration, so every database older
 /// than it answered `no such column: sha256` for the rest of its life and
 /// every bundle whose artifact had native out-dir files was downloaded,
-/// verified, and then thrown away.
+/// verified, and then thrown away. (The table has since been removed — the
+/// consumer no longer stores build-script products — but the mechanism it
+/// motivated remains the way columns reach existing databases.)
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaColumn<'a> {
     table: &'a str,
@@ -256,11 +258,11 @@ mod schema_tests {
         let schema = include_str!("state-db-schema.sql");
         let columns = declared_columns(schema);
         assert!(
-            columns.iter().any(
-                |column| column.table == "artifact_cache_native_out_dir_files"
-                    && column.name == "sha256"
-            ),
-            "the parser must see artifact_cache_native_out_dir_files.sha256"
+            columns
+                .iter()
+                .any(|column| column.table == "artifact_cache_entries"
+                    && column.name == "provenance"),
+            "the parser must see artifact_cache_entries.provenance"
         );
         assert!(
             columns
@@ -287,17 +289,35 @@ mod schema_tests {
         let path = super::state_db_path(cache_dir.path());
         std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
 
-        // A database from before `sha256` existed on that table.
+        // A database from before `provenance` existed on that table.
         let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
             .await
             .expect("open the old database");
         sqlx::query(
-            "CREATE TABLE artifact_cache_native_out_dir_files (\
+            "CREATE TABLE artifact_cache_entries (\
                  rustc_version TEXT NOT NULL, \
                  cache_key TEXT NOT NULL, \
-                 ordinal INTEGER NOT NULL, \
-                 relative_path TEXT NOT NULL, \
-                 PRIMARY KEY (rustc_version, cache_key, ordinal))",
+                 relative_dir TEXT NOT NULL, \
+                 size_bytes INTEGER NOT NULL, \
+                 last_accessed_ms INTEGER NOT NULL, \
+                 oci_reference TEXT NOT NULL, \
+                 oci_digest TEXT NOT NULL, \
+                 compile_key TEXT NOT NULL DEFAULT '', \
+                 crate_name TEXT NOT NULL DEFAULT '', \
+                 crate_version TEXT NOT NULL DEFAULT '', \
+                 c_metadata TEXT NOT NULL DEFAULT '', \
+                 features_json TEXT NOT NULL DEFAULT '', \
+                 dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]', \
+                 dependency_compile_keys_json TEXT NOT NULL DEFAULT '[]', \
+                 compile_millis INTEGER NOT NULL DEFAULT 0, \
+                 target TEXT NOT NULL DEFAULT '', \
+                 profile_json TEXT NOT NULL DEFAULT '{}', \
+                 emit_json TEXT NOT NULL DEFAULT '[]', \
+                 kind_json TEXT NOT NULL DEFAULT '\"Rlib\"', \
+                 crate_types_json TEXT NOT NULL DEFAULT '[]', \
+                 verified_marker_version INTEGER, \
+                 verified_marker_policy TEXT, \
+                 PRIMARY KEY (rustc_version, cache_key))",
         )
         .execute(&pool)
         .await
@@ -308,20 +328,65 @@ mod schema_tests {
             .await
             .expect("open the database through the migration");
         let columns = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM pragma_table_info('artifact_cache_native_out_dir_files')",
+            "SELECT name FROM pragma_table_info('artifact_cache_entries')",
         )
         .fetch_all(&pool)
         .await
         .expect("read the migrated columns");
         assert!(
-            columns.iter().any(|column| column == "sha256"),
+            columns.iter().any(|column| column == "provenance"),
             "the missing column must be added: {columns:?}"
         );
-        sqlx::query_scalar::<_, String>(
-            "SELECT relative_path FROM artifact_cache_native_out_dir_files LIMIT 1",
-        )
-        .fetch_optional(&pool)
-        .await
-        .expect("the table stays usable after the migration");
+        sqlx::query_scalar::<_, String>("SELECT relative_dir FROM artifact_cache_entries LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .expect("the table stays usable after the migration");
+    }
+
+    /// The four `artifact_cache_native_*` tables are gone from the schema
+    /// (stow#640) — a database carrying them sheds them on open.
+    #[tokio::test]
+    async fn opening_a_database_drops_the_native_tables() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let path = super::state_db_path(cache_dir.path());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("open the old database");
+        for table in [
+            "artifact_cache_native_static_libs",
+            "artifact_cache_native_directives",
+            "artifact_cache_native_dep_env_vars",
+            "artifact_cache_native_out_dir_files",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TABLE {table} (marker TEXT)"
+            )))
+            .execute(&pool)
+            .await
+            .expect("create an old native table");
+        }
+        pool.close().await;
+
+        let pool = connect_pool(cache_dir.path())
+            .await
+            .expect("open the database through the schema");
+        let tables =
+            sqlx::query_scalar::<_, String>("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&pool)
+                .await
+                .expect("list tables");
+        for table in [
+            "artifact_cache_native_static_libs",
+            "artifact_cache_native_directives",
+            "artifact_cache_native_dep_env_vars",
+            "artifact_cache_native_out_dir_files",
+        ] {
+            assert!(
+                !tables.iter().any(|name| name == table),
+                "{table} must be dropped: {tables:?}"
+            );
+        }
     }
 }

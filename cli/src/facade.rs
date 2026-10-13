@@ -240,36 +240,21 @@ fn run_uncovered(
     executable: &OsString,
     wrapped_args: &[OsString],
 ) -> stow_types::error::Result<i32> {
-    let out_dir = std::env::var_os("OUT_DIR");
     let mut wire = connect(endpoint).map_err(|error| stow_types::stow_error!("{error}"))?;
     // The mark a `Compile` decision writes before rustc runs: dependents
     // plan only after this unit's metadata lands, so the file is on disk
     // before the frame that could consult it. (stow's own identity is
     // insensitive to provenance; an artifact compiled against CI's copy of
     // a locally-built crate links against the wrong copy.)
-    write_observed(
-        &mut wire,
-        token,
-        executable,
-        wrapped_args,
-        out_dir.as_deref(),
-        None,
-    )
-    .map_err(|error| stow_types::stow_error!("{error}"))?;
+    write_observed(&mut wire, token, executable, wrapped_args, None)
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
     let status = std::process::Command::new(executable)
         .args(wrapped_args)
         .status()
         .wrap_err("failed to spawn wrapped compiler")?;
     let success = status.success();
-    write_observed(
-        &mut wire,
-        token,
-        executable,
-        wrapped_args,
-        out_dir.as_deref(),
-        Some(success),
-    )
-    .map_err(|error| stow_types::stow_error!("{error}"))?;
+    write_observed(&mut wire, token, executable, wrapped_args, Some(success))
+        .map_err(|error| stow_types::stow_error!("{error}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -528,14 +513,12 @@ fn write_observed(
     token: &str,
     executable: &OsString,
     wrapped_args: &[OsString],
-    out_dir: Option<&std::ffi::OsStr>,
     success: Option<bool>,
 ) -> std::io::Result<()> {
     let request = Request::Observed(Observed::new(
         token.to_owned(),
         executable,
         wrapped_args,
-        out_dir,
         success,
     ));
     write_request(wire, &request)

@@ -7,7 +7,7 @@ use std::time::Instant;
 use async_process::{Command, ExitStatus};
 use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 use serde::{Deserialize, Serialize};
-use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
+use stow_types::artifact::{ArtifactKind, RustCrateType};
 use stow_types::bundle::{STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE};
 use stow_types::error::Context;
 use stow_types::platform::{PanicStrategy, Profile};
@@ -2828,18 +2828,25 @@ async fn try_run_top_crate_with_cached_dependencies(
     // The selected packages' direct registry externs ride the same
     // `--unit-graph` resolve as the expanded graph (and its cache), so
     // the top-crate path pays no second resolution.
-    let direct_dependencies = expanded_graph(config, project, &project.manifest_path, None)
-        .await?
-        .direct_dependencies;
-    if direct_dependencies.is_empty() {
+    let expanded = expanded_graph(config, project, &project.manifest_path, None).await?;
+    if expanded.direct_dependencies.is_empty() {
         return Ok(None);
     }
+    // Host-side units mint at the runner family's host triple — the same
+    // platform `expanded_graph` resolves with.
+    let host_triple = stow_types::api::runner_family(&project.target)
+        .map_or(project.target.as_str(), |family| family.host_triple());
+    let build_script_packages = build_script_packages(&expanded.task_units(
+        project.target_given.then_some(project.target.as_str()),
+        host_triple,
+    )?);
     let plan =
-        resolve_cached_dependency_plan(config, project, &direct_dependencies, &shape).await?;
+        resolve_cached_dependency_plan(config, project, &expanded.direct_dependencies, &shape)
+            .await?;
 
     let target_dir = resolved_target_dir(project, cargo_args, &project.current_dir);
     let prebuilt_dir = target_dir.join("stow-prebuilt").join(action).join("deps");
-    validate_top_crate_cached_native_support(action, &plan)?;
+    refuse_build_script_dependencies(action, &plan, &build_script_packages)?;
     materialize_cached_dependency_plan(&prebuilt_dir, &plan).await?;
     // Every bundle in the plan replaces one dependency compilation; make the
     // acceleration visible in `stow status` exactly like wrapper-level hits.
@@ -2887,7 +2894,9 @@ async fn try_run_top_crate_with_cached_dependencies(
 /// puts the same crate in both cargo's `deps` directory and the prebuilt one,
 /// so rustc reports "multiple candidates for rlib dependency". Getting it
 /// right needs exact control of rustc's search path for the whole transitive
-/// closure, not just the direct externs.
+/// closure, not just the direct externs. A `build` against it refuses any
+/// cached dependency whose package has a build script, since this path runs
+/// none.
 ///
 /// The per-rustc wrapper reaches the same artifacts without any of that: it
 /// serves each unit in place, under cargo's own unit graph. On the twelve
@@ -3142,21 +3151,35 @@ async fn materialize_cached_dependency_plan(
     Ok(())
 }
 
-fn validate_top_crate_cached_native_support(
+/// The `(crate name, version)` of every package in the unit graph that has
+/// a build script — a `RunBuildScript` unit exists exactly for those.
+fn build_script_packages(units: &[stow_types::unit_graph::TaskUnit]) -> BTreeSet<(String, String)> {
+    units
+        .iter()
+        .filter(|unit| unit.key.kind == stow_types::unit_graph::TaskUnitKind::RunBuildScript)
+        .map(|unit| (unit.name.clone(), unit.version.clone()))
+        .collect()
+}
+
+/// The prebuilt-deps path compiles the top crate alone and runs no build
+/// script at all, so `build` cannot use a cached dependency whose package
+/// has one — its `cargo:` directives and `OUT_DIR` products would never be
+/// produced. `check` links nothing, so the set does not apply there.
+fn refuse_build_script_dependencies(
     action: &str,
     plan: &CachedDependencyPlan,
+    build_script_packages: &BTreeSet<(String, String)>,
 ) -> stow_types::error::Result<()> {
     if action != "build" {
         return Ok(());
     }
 
     for bundle in plan.bundles.values() {
-        let Some(native) = bundle.native.as_ref() else {
-            continue;
-        };
-        if native_requires_link_replay(native) {
+        if build_script_packages
+            .contains(&(bundle.crate_name.clone(), bundle.crate_version.clone()))
+        {
             return Err(stow_types::stow_error!(
-                "top-crate-only cached dependency build does not support replaying native link directives yet: {} {}",
+                "the prebuilt-deps path cannot build against {} {}: the crate has a build script, and this path runs none",
                 bundle.crate_name,
                 bundle.crate_version
             ));
@@ -3164,24 +3187,6 @@ fn validate_top_crate_cached_native_support(
     }
 
     Ok(())
-}
-
-fn native_requires_link_replay(native: &NativeArtifacts) -> bool {
-    !native.static_libs.is_empty()
-        || native
-            .cargo_directives
-            .iter()
-            .any(|directive| cargo_directive_key(directive).is_some_and(is_native_link_directive))
-}
-
-fn cargo_directive_key(directive: &str) -> Option<&str> {
-    directive
-        .strip_prefix("cargo::")
-        .or_else(|| directive.strip_prefix("cargo:"))
-}
-
-fn is_native_link_directive(key: &str) -> bool {
-    key.starts_with("rustc-link-")
 }
 
 fn top_crate_rustflags(
@@ -5140,18 +5145,16 @@ mod tests {
     use super::build_serve_map;
     use super::{
         CachedDependencyPlan, CargoRunPlan, MetadataArgs, MoldSelection, ProjectContext,
-        PublicCacheMode, WorkspaceMirror, cached_dependency_profile, feature_references_dependency,
-        native_requires_link_replay, relative_path, rewrite_args_for_mirror, rewrite_args_for_root,
-        validate_top_crate_cached_native_support,
+        PublicCacheMode, WorkspaceMirror, build_script_packages, cached_dependency_profile,
+        feature_references_dependency, refuse_build_script_dependencies, relative_path,
+        rewrite_args_for_mirror, rewrite_args_for_root,
     };
     #[cfg(unix)]
     use super::{create_workspace_mirror, strip_selected_manifest_dependencies};
     use crate::prefetch::PrefetchArtifact;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-
-    use stow_types::artifact::NativeArtifacts;
 
     fn test_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
@@ -5384,11 +5387,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn top_crate_check_accepts_cached_dependency_native_metadata() {
-        let plan = CachedDependencyPlan {
+    /// A plan whose only bundle is a `serde` cached artifact.
+    fn single_serde_bundle_plan() -> CachedDependencyPlan {
+        CachedDependencyPlan {
             bundles: [(
-                "native-meta".to_owned(),
+                "build-script-dep".to_owned(),
                 crate::artifact_cache::CachedArtifactBundle {
                     provenance: crate::artifact_cache::ArtifactProvenance::Remote,
                     oci_reference: String::new(),
@@ -5396,7 +5399,7 @@ mod tests {
                     compile_key: String::new(),
                     crate_name: "serde".to_owned(),
                     crate_version: "1.0.228".to_owned(),
-                    c_metadata: "native-meta".to_owned(),
+                    c_metadata: "build-script-dep".to_owned(),
                     features_json: String::new(),
                     dependency_c_metadata_json: "[]".to_owned(),
                     dependency_compile_keys_json: "[]".to_owned(),
@@ -5407,15 +5410,6 @@ mod tests {
                     kind: stow_types::artifact::ArtifactKind::Rlib,
                     crate_types: vec![stow_types::artifact::RustCrateType::Lib],
                     outputs: Vec::new(),
-                    native: Some(NativeArtifacts {
-                        static_libs: Vec::new(),
-                        cargo_directives: vec![
-                            "cargo:rustc-cfg=if_docsrs_then_no_serde_core".to_owned(),
-                        ],
-                        dep_env_vars: BTreeMap::default(),
-                        out_dir_files: Vec::new(),
-                        original_out_dir: std::path::PathBuf::from("/original/build/out"),
-                    }),
                     sigstore_signatures: Vec::new(),
                     entry_dir: PathBuf::new(),
                     rustc_version: "1.91.1".to_owned(),
@@ -5427,22 +5421,73 @@ mod tests {
             )]
             .into(),
             direct_externs: Vec::new(),
-        };
-
-        validate_top_crate_cached_native_support("check", &plan).expect("check supports metadata");
+        }
     }
 
     #[test]
-    fn top_crate_build_rejects_cached_dependency_native_link_replay() {
-        let native = NativeArtifacts {
-            static_libs: Vec::new(),
-            cargo_directives: vec!["cargo:rustc-link-lib=static=ring-core".to_owned()],
-            dep_env_vars: BTreeMap::default(),
-            out_dir_files: Vec::new(),
-            original_out_dir: std::path::PathBuf::from("/original/build/out"),
-        };
+    fn top_crate_check_accepts_a_build_script_dependency() {
+        let plan = single_serde_bundle_plan();
+        let build_script_packages = BTreeSet::from([("serde".to_owned(), "1.0.228".to_owned())]);
 
-        assert!(native_requires_link_replay(&native));
+        refuse_build_script_dependencies("check", &plan, &build_script_packages)
+            .expect("check links nothing, so a build-script dependency is fine");
+    }
+
+    #[test]
+    fn top_crate_build_refuses_a_build_script_dependency() {
+        let plan = single_serde_bundle_plan();
+        let build_script_packages = BTreeSet::from([("serde".to_owned(), "1.0.228".to_owned())]);
+
+        let error = refuse_build_script_dependencies("build", &plan, &build_script_packages)
+            .expect_err("build must refuse a dependency whose package has a build script");
+        assert!(error.to_string().contains("serde 1.0.228"), "{error}");
+
+        refuse_build_script_dependencies("build", &plan, &BTreeSet::new())
+            .expect("no build-script packages means nothing to refuse");
+    }
+
+    #[test]
+    fn build_script_packages_names_run_build_script_packages() {
+        let unit = |kind: stow_types::unit_graph::TaskUnitKind, name: &str, version: &str| {
+            stow_types::unit_graph::TaskUnit {
+                key: stow_types::unit_graph::TaskUnitKey {
+                    pkg: format!(
+                        "registry+https://github.com/rust-lang/crates.io-index#{name}@{version}"
+                    ),
+                    platform: "aarch64-apple-darwin".to_owned(),
+                    side: stow_types::unit_graph::TaskUnitSide::Target,
+                    kind,
+                },
+                name: name.to_owned(),
+                version: version.to_owned(),
+                features: Vec::new(),
+                is_crates_io: true,
+                deps: Vec::new(),
+            }
+        };
+        let units = vec![
+            unit(
+                stow_types::unit_graph::TaskUnitKind::Lib,
+                "serde",
+                "1.0.228",
+            ),
+            unit(
+                stow_types::unit_graph::TaskUnitKind::BuildScript,
+                "serde",
+                "1.0.228",
+            ),
+            unit(
+                stow_types::unit_graph::TaskUnitKind::RunBuildScript,
+                "serde",
+                "1.0.228",
+            ),
+        ];
+
+        assert_eq!(
+            build_script_packages(&units),
+            BTreeSet::from([("serde".to_owned(), "1.0.228".to_owned())])
+        );
+        assert!(build_script_packages(&units[..2]).is_empty());
     }
 
     #[test]

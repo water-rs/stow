@@ -600,18 +600,9 @@ enum UnparseableInvocation {
 
 fn classify_invocation(
     args: &[OsString],
-    build_script_out_dir: Option<PathBuf>,
 ) -> Result<rustc_args::ParsedRustcArgs, UnparseableInvocation> {
     match rustc_args::ParsedRustcArgs::parse(args) {
-        Ok(mut parsed) => {
-            // Cargo exports OUT_DIR on the rustc invocation of a crate with a
-            // build script; native artifact restore writes the script's
-            // outputs exactly there (inject.rs). It arrives as a parameter —
-            // under a supervisor the deciding process never sees the
-            // invocation's environment.
-            parsed.build_script_out_dir = build_script_out_dir;
-            Ok(parsed)
-        }
+        Ok(parsed) => Ok(parsed),
         Err(error) if error.contains("missing --crate-name") => {
             Err(UnparseableInvocation::Probe(error))
         }
@@ -1015,10 +1006,8 @@ impl supervisor::server::Handler for BuildSupervisor {
         self: &std::sync::Arc<Self>,
         executable: OsString,
         args: Vec<OsString>,
-        build_script_out_dir: Option<OsString>,
     ) -> supervisor::server::Decision<Self::Pending> {
-        let out_dir = build_script_out_dir.map(PathBuf::from);
-        let classified = classify_invocation(&args, out_dir);
+        let classified = classify_invocation(&args);
         if !self.resolution_done.has_completed() && describes_compile_unit(&classified) {
             self.resolution_done.complete();
         }
@@ -1042,10 +1031,7 @@ impl supervisor::server::Handler for BuildSupervisor {
     }
 
     async fn observed(self: &std::sync::Arc<Self>, observation: supervisor::server::Observation) {
-        let Ok(parsed) = classify_invocation(
-            &observation.args,
-            observation.build_script_out_dir.map(PathBuf::from),
-        ) else {
+        let Ok(parsed) = classify_invocation(&observation.args) else {
             // The facade only sends invocations it parsed — one that
             // fails here is a wiring bug, not a compile.
             tracing::warn!("supervisor observation carried an unparseable invocation; dropped");
@@ -1127,11 +1113,7 @@ async fn delegate_to_supervisor(
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     let decision = connection
-        .plan(
-            &command.executable,
-            &command.wrapped_args,
-            std::env::var_os("OUT_DIR").as_deref(),
-        )
+        .plan(&command.executable, &command.wrapped_args)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     tracing::debug!(
@@ -1172,10 +1154,7 @@ async fn run_rustc_standalone(command: &WrapperCommandArgs) -> stow_types::error
     // `--crate-name`), and cargo's `___` probe crate is no real unit:
     // run rustc and return its result rather than loading the wrapper
     // base and opening the state DB for an answer that is never used.
-    let classified = classify_invocation(
-        &command.wrapped_args,
-        std::env::var_os("OUT_DIR").map(PathBuf::from),
-    );
+    let classified = classify_invocation(&command.wrapped_args);
     let parsed = match classify_or_log(classified, &command.wrapped_args) {
         Some(parsed) if is_compile_unit(&parsed) => parsed,
         _ => {
@@ -3715,7 +3694,6 @@ async fn resolve_local_build_artifact(
             identity,
             features_json,
             dependency_c_metadata_json,
-            build_script_out_dir: parsed.build_script_out_dir.clone(),
         },
     )))
 }
@@ -4263,10 +4241,12 @@ mod tests {
     fn unparseable_rustc_invocation_passes_through_instead_of_failing() {
         // A flag stow does not model must never fail the unit: the
         // invocation goes to the real rustc verbatim.
-        let invocation = classify_invocation(
-            &args(&["--crate-name", "itoa", "-Z", "embed-metadata=banana"]),
-            None,
-        );
+        let invocation = classify_invocation(&args(&[
+            "--crate-name",
+            "itoa",
+            "-Z",
+            "embed-metadata=banana",
+        ]));
 
         assert!(
             matches!(invocation, Err(UnparseableInvocation::Passthrough(_))),
@@ -4277,48 +4257,9 @@ mod tests {
     #[test]
     fn crate_name_less_probe_stays_a_quiet_passthrough() {
         assert!(matches!(
-            classify_invocation(&args(&["-vV"]), None),
+            classify_invocation(&args(&["-vV"])),
             Err(UnparseableInvocation::Probe(_))
         ));
-    }
-
-    /// cargo exports `OUT_DIR` on the rustc call of a crate with a build
-    /// script, and it belongs to the invocation, not the process that
-    /// decides. The supervisor's own environment carries no `OUT_DIR`
-    /// (this process's does not either), so the parsed invocation must
-    /// hold exactly the value the plan carried.
-    #[tokio::test]
-    async fn the_plan_carries_the_invocations_out_dir() {
-        let handler = std::sync::Arc::new(super::BuildSupervisor::default());
-        let decision = crate::supervisor::server::Handler::plan(
-            &handler,
-            OsString::from("rustc"),
-            args(&[
-                "--crate-name",
-                "demo",
-                "--crate-type",
-                "lib",
-                "--out-dir",
-                "/tmp/out",
-                "--emit",
-                "dep-info,metadata,link",
-                "-C",
-                "metadata=abc123",
-            ]),
-            Some(OsString::from("/tmp/build/demo-aaa/out")),
-        )
-        .await;
-
-        let crate::supervisor::server::Decision::Compile(post) = decision else {
-            panic!("an unserved cacheable invocation decides to compile");
-        };
-        assert_eq!(
-            post.parsed
-                .expect("parsed invocation")
-                .build_script_out_dir
-                .as_deref(),
-            Some(std::path::Path::new("/tmp/build/demo-aaa/out")),
-        );
     }
 
     /// Cargo's probes reach the supervisor as `Plan` frames — `rustc -vV`
@@ -4338,7 +4279,6 @@ mod tests {
             &handler,
             OsString::from("rustc"),
             args(&["-vV"]),
-            None,
         )
         .await;
         assert!(!resolution_done.has_completed());
@@ -4354,7 +4294,6 @@ mod tests {
                 "--print",
                 "file-names",
             ]),
-            None,
         )
         .await;
         assert!(!resolution_done.has_completed());
@@ -4374,7 +4313,6 @@ mod tests {
                 "-C",
                 "metadata=abc123",
             ]),
-            None,
         )
         .await;
         assert!(resolution_done.has_completed());
@@ -4400,7 +4338,6 @@ mod tests {
             crate::supervisor::server::Observation {
                 executable: OsString::from("rustc"),
                 args: args(&["-vV"]),
-                build_script_out_dir: None,
                 success: None,
             },
         )
@@ -4423,7 +4360,6 @@ mod tests {
                     "-C",
                     "metadata=abc123",
                 ]),
-                build_script_out_dir: None,
                 success: None,
             },
         )
@@ -5141,7 +5077,7 @@ mod tests {
         ) where
             S: tokio::io::AsyncWrite + Unpin + Send,
         {
-            let frame = Observed::new(token.to_owned(), OsStr::new("rustc"), args, None, success);
+            let frame = Observed::new(token.to_owned(), OsStr::new("rustc"), args, success);
             write_frame(&mut *stream, &Request::Observed(frame))
                 .await
                 .expect("write the observation frame");
