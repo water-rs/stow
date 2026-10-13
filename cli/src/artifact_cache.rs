@@ -2758,7 +2758,7 @@ pub fn artifact_cache_key(target: &str, c_metadata: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -4068,7 +4068,7 @@ mod tests {
         }
     }
 
-    fn sample_bundle(c_metadata: &str, file_name: &str) -> ArtifactBundle {
+    pub fn sample_bundle(c_metadata: &str, file_name: &str) -> ArtifactBundle {
         let file_contents = b"demo-artifact".to_vec();
         let compression_level = *zstd::compression_level_range().end();
         let stored_contents = zstd::bulk::compress(&file_contents, compression_level)
