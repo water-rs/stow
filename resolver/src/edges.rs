@@ -5,9 +5,9 @@
 //! Cargo's [`FeatureResolver::resolve`] reports *feature* activations
 //! only — `activated_dependencies` records optional-dep activations, not
 //! the graph — so the edges are derived here from the same rules
-//! `FeatureResolver::deps` applies: platform-gated edges are filtered
-//! against the requested kinds, and an optional dep is an edge only when
-//! it was activated under the applied feature key.
+//! `FeatureResolver::deps` applies: a platform-gated edge records where
+//! its `[target.…]` condition holds, and an optional dep is an edge only
+//! when it was activated under the applied feature key.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -23,6 +23,20 @@ use cargo::core::resolver::features::{
 };
 use cargo::core::{Dependency, PackageId, PackageSet, Workspace};
 
+use crate::units::StowSide;
+
+/// Where a dependency's `[target.…]` condition holds, for the two compile
+/// kinds a unit carrying the edge's feature key can be built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgePlatform {
+    /// On the host.
+    pub host: bool,
+    /// On the side the feature key names: the requested targets under
+    /// `NormalOrDev`, the artifact target under `ArtifactDep`, the host
+    /// under `HostDep`.
+    pub keyed: bool,
+}
+
 /// One resolved dependency edge out of a `(package, side)` node, as
 /// decided by [`deps`]. `to` is the dep's own `(package, side)` key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +49,25 @@ pub struct SideEdge {
     /// deps compile for the host platform regardless of the parent's
     /// platform.
     pub proc_macro: bool,
+    /// Where the dep's `[target.…]` condition holds — `true`/`true` when
+    /// the dep carries no platform.
+    pub platform: EdgePlatform,
+}
+
+impl SideEdge {
+    /// Whether cargo compiles this edge out of a unit on `side`. Cargo
+    /// gates a platform dependency on the compile kind of the unit that
+    /// declares it, and a build dependency is always a host compile — so
+    /// the host decides for a build dependency and for every dependency of
+    /// a host unit, whatever feature key that unit carries: a
+    /// `resolver = "1"` graph keys its host units `NormalOrDev` (stow#697).
+    pub fn compiled_from(&self, side: StowSide) -> bool {
+        if self.dep_kind == DepKind::Build || side == StowSide::Host {
+            self.platform.host
+        } else {
+            self.platform.keyed
+        }
+    }
 }
 
 /// Orders a package's dependencies on one other package in manifest
@@ -105,30 +138,38 @@ impl EdgeOpts {
     }
 }
 
-/// Helper for determining if a platform is activated — verbatim from
-/// `FeatureResolver::deps`.
-fn platform_activated(
+/// Where `dep`'s platform condition holds — `FeatureResolver::deps`'s
+/// `platform_activated` evaluated for the host alongside the side `fk`
+/// names, because a unit carrying `fk` can be built on either (a
+/// `resolver = "1"` host unit shares the `NormalOrDev` key with its
+/// target sibling). A dep with no platform holds everywhere.
+fn edge_platform(
     dep: &Dependency,
     fk: FeaturesFor,
     target_data: &RustcTargetData<'_>,
     requested_targets: &[CompileKind],
-) -> bool {
+) -> EdgePlatform {
+    if dep.platform().is_none() {
+        return EdgePlatform {
+            host: true,
+            keyed: true,
+        };
+    }
     // We always count platforms as activated if the target stems from an
     // artifact dependency's target specification. This triggers in
     // conjunction with `[target.'cfg(…)'.dependencies]` manifest sections.
-    match (dep.is_build(), fk) {
-        (true, _) | (_, FeaturesFor::HostDep) => {
-            // We always care about build-dependencies, and they are always
-            // Host. If we are computing dependencies "for a build script",
-            // even normal dependencies are host-only.
-            target_data.dep_platform_activated(dep, CompileKind::Host)
-        }
-        (_, FeaturesFor::NormalOrDev) => requested_targets
+    let keyed = match fk {
+        FeaturesFor::HostDep => target_data.dep_platform_activated(dep, CompileKind::Host),
+        FeaturesFor::NormalOrDev => requested_targets
             .iter()
             .any(|kind| target_data.dep_platform_activated(dep, *kind)),
-        (_, FeaturesFor::ArtifactDep(target)) => {
+        FeaturesFor::ArtifactDep(target) => {
             target_data.dep_platform_activated(dep, CompileKind::Target(target))
         }
+    };
+    EdgePlatform {
+        host: target_data.dep_platform_activated(dep, CompileKind::Host),
+        keyed,
     }
 }
 
@@ -205,8 +246,9 @@ fn artifact_features_for(
 }
 
 /// What [`deps`] returns per node: each activated dep with the
-/// `FeaturesFor` sides it compiles under.
-type DepEdgeList<'a> = Vec<(PackageId, Vec<(&'a Dependency, FeaturesFor)>)>;
+/// `FeaturesFor` sides it compiles under and where its platform
+/// condition holds.
+type DepEdgeList<'a> = Vec<(PackageId, Vec<(&'a Dependency, FeaturesFor, EdgePlatform)>)>;
 
 /// The dependencies of one `(package, side)` node — `FeatureResolver::deps`
 /// verbatim except the platform gate, which `unit_dependencies` applies
@@ -230,9 +272,12 @@ fn deps<'a>(
     let unstable_json_spec = ws.gctx().cli_unstable().json_target_spec;
     let mut out = Vec::new();
     for (dep_id, deps) in resolve.deps(pkg_id) {
-        let mut deps: Vec<&'a Dependency> = deps
+        let mut deps: Vec<(&'a Dependency, EdgePlatform)> = deps
             .iter()
-            .filter(|dep| {
+            .filter_map(|dep| {
+                if opts.decouple_dev_deps && dep.kind() == DepKind::Development {
+                    return None;
+                }
                 // The compile-time edge set is `unit_dependencies`'s,
                 // not the feature resolver's: upstream it evaluates
                 // `dep_platform_activated` per unit kind
@@ -240,23 +285,24 @@ fn deps<'a>(
                 // the same check on `ignore_inactive_targets` — a flag
                 // a V1 workspace or a ForceAllTargets::Yes lane never
                 // sets. Edges must spell what cargo builds, so the
-                // platform gate applies always (stow#588 — a
-                // cfg(windows) dep of a registry crate reached a Linux
-                // task's children through the unfiltered lane).
-                if dep.platform().is_some()
-                    && !platform_activated(dep, fk, target_data, requested_targets)
-                {
-                    return false;
+                // gate still applies unconditionally — per unit side
+                // through `SideEdge::compiled_from`, once the emitting
+                // unit's side is known; an edge no side compiles is
+                // dropped here (stow#588 — a cfg(windows) dep of a
+                // registry crate reached a Linux task's children
+                // through the unfiltered lane; stow#697 — a resolver-1
+                // host unit keyed `NormalOrDev` needs the host's
+                // answer).
+                let platform = edge_platform(dep, fk, target_data, requested_targets);
+                if dep.platform().is_some() && !platform.host && !platform.keyed {
+                    return None;
                 }
-                if opts.decouple_dev_deps && dep.kind() == DepKind::Development {
-                    return false;
-                }
-                true
+                Some((dep, platform))
             })
             .collect();
-        deps.sort_by(|a, b| manifest_order(a, b));
+        deps.sort_by(|a, b| manifest_order(a.0, b.0));
         let mut dep_results = Vec::new();
-        for dep in deps {
+        for (dep, platform) in deps {
             // Each `dep`endency can be built for multiple targets. For one,
             // it may be a library target which is built as initially
             // configured by `fk`. If it appears as build dependency, it
@@ -284,7 +330,7 @@ fn deps<'a>(
                     unstable_json_spec,
                 )?
                 .into_iter()
-                .map(move |dep_fk| (dep, dep_fk)),
+                .map(move |dep_fk| (dep, dep_fk, platform)),
             );
         }
         if !dep_results.is_empty() {
@@ -297,10 +343,12 @@ fn deps<'a>(
 /// Every `(pkg, fk)` side the feature resolver activated, mapped to the
 /// deps it saw for that side — the port of the vendored
 /// `FeatureResolver::edges`. A dep edge is emitted exactly when cargo
-/// would compile it: platform-gated edges are filtered inside [`deps`],
-/// and an optional dep is included only if it was activated for that
-/// side (`ResolvedFeatures::is_dep_activated` applies the feature
-/// namespace's opts internally).
+/// would compile it: [`deps`] drops a platform-gated edge no unit side
+/// compiles and records where each surviving edge's condition holds —
+/// `SideEdge::compiled_from` applies the gate per unit side at
+/// emission — and an optional dep is included only if it was activated
+/// for that side (`ResolvedFeatures::is_dep_activated` applies the
+/// feature namespace's opts internally).
 pub fn edges<'a>(
     ws: &Workspace<'_>,
     target_data: &mut RustcTargetData<'_>,
@@ -342,7 +390,7 @@ pub fn edges<'a>(
             computed
         };
         for (dep_id, deps) in &dep_list {
-            for (dep, dep_fk) in deps {
+            for (dep, dep_fk, platform) in deps {
                 if dep.is_optional()
                     && !resolved_features.is_dep_activated(pkg_id, fk, dep.name_in_toml())
                 {
@@ -352,6 +400,7 @@ pub fn edges<'a>(
                     to: (*dep_id, *dep_fk),
                     dep_kind: dep.kind(),
                     proc_macro: has_proc_macro_lib(package_set, *dep_id),
+                    platform: *platform,
                 };
                 edges.entry((pkg_id, fk)).or_default().push(edge);
             }

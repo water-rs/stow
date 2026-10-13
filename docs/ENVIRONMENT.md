@@ -23,7 +23,7 @@ default, and the purpose.
 | `STOW_PUBLIC_CACHE_RUSTC_VERSION` | unset | Set by the parent `stow check` so the per-rustc wrapper does not reprobe `rustc -vV`. |
 | `STOW_PUBLIC_CACHE_TARGET` | unset | Same as above for the target triple. |
 | `STOW_CONFIG_BLOB` | unset | JSON-encoded resolved `StowConfig`. The parent `stow check` writes this so each rustc-wrapper child skips re-parsing the user config file. |
-| `STOW_TRACE_FILE` | unset | When set, stow writes a Chrome-format trace covering every `stow.*` span. Open in chrome://tracing or perfetto.dev. |
+| `STOW_TRACE_FILE` | unset | When set, stow writes a Chrome-format trace holding every span and event of stow's own crates whatever `RUST_LOG` is — that variable selects only what the terminal prints. Open in chrome://tracing or perfetto.dev. |
 | `STOW_TRACE_WRAPPED_COMPILERS` | unset | When set, the wrapper emits tracing for every wrapped `rustc` / `cc` invocation (verbose). |
 | `STOW_IDENTITY_TRACE` | unset | Directory the wrapper writes one JSON identity record per `rustc` invocation into (`IdentityTraceRecord`: the parsed inputs — target, rustc, emit, crate types, profile, features, dependency `c_metadata` chain — plus the computed compile key and `c_metadata`). The answer to "why did this unit miss" — diff the record for the missing unit against the index row it should have hit. Inert when unset. |
 | `STOW_ENABLE_SEMANTIC_FALLBACK` | wired by parent `stow check` | When `1`, the per-rustc wrapper falls back to a semver-relaxed lookup in the cached index slice after an exact-key miss. |

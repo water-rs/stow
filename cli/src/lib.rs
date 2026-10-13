@@ -77,9 +77,9 @@ use stow_types::public_cache::{
     detect_registry_crate_version as shared_detect_registry_crate_version,
     normalized_cache_profile, stable_registry_artifact_identity,
 };
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer as _};
 
 use crate::artifact_cache::{
     DependencyCMetadataResolution, load_cached_bundle, load_cached_bundle_by_compile_key,
@@ -99,9 +99,9 @@ pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC
 pub(crate) const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
 /// When set to a path, stow writes a Chrome-trace JSON to that file describing
 /// every instrumented span (`stow.startup`, `stow.project.context`,
-/// `stow.edge.graph.query`, `stow.wrapper.invoke`, ...). Open the file with
-/// <chrome://tracing> or perfetto.dev for a flame waterfall. Used to drive P1
-/// performance work — see plan P0.1.
+/// `stow.edge.graph.query`, `stow.wrapper.invoke`, ...). The trace records
+/// every span and event of stow's own crates regardless of `RUST_LOG`. Open
+/// the file with <chrome://tracing> or perfetto.dev for a flame waterfall.
 const STOW_TRACE_FILE_ENV: &str = "STOW_TRACE_FILE";
 
 /// Holds the tracing-chrome flush guard, if a Chrome trace was requested.
@@ -1084,11 +1084,12 @@ impl supervisor::server::Handler for BuildSupervisor {
             return;
         };
         if parsed.is_cacheable() {
-            record_miss(
+            record_unit_outcome(
                 &local_base.config,
                 &parsed,
                 &target,
                 &local_base.rustc_version,
+                UnitOutcome::Miss,
             )
             .await;
         }
@@ -1310,9 +1311,9 @@ async fn decide_rustc_invocation(
     serve_or_compile(rustc, &parsed, &env, ctx, exact_public_cache_allowed).await
 }
 
-/// The serve-and-compile tail of the decision: local entries, then the
-/// remote serves a keyed or semantic request could hit, and on a miss
-/// the compile the build records.
+/// The serve-and-compile tail of the decision: the lookup chain, the one
+/// outcome it comes to, and on anything but a serve the compile the build
+/// records.
 async fn serve_or_compile(
     rustc: &OsString,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -1320,15 +1321,56 @@ async fn serve_or_compile(
     ctx: &BuildContext,
     exact_public_cache_allowed: bool,
 ) -> Outcome {
+    // The stages only note what they saw; the one outcome the invocation
+    // contributes is recorded here, where the chain ends (stow#696).
+    let mut tally = LookupTally::default();
+    let (served, refused) =
+        match lookup_chain(parsed, env, ctx, exact_public_cache_allowed, &mut tally).await {
+            RemoteServe::Served(notifications) => (Some(notifications), false),
+            RemoteServe::Refused => (None, true),
+            RemoteServe::Bypass | RemoteServe::Miss => (None, false),
+        };
+    record_unit_outcome(
+        &env.env_base.config,
+        parsed,
+        &env.target,
+        &env.rustc_version,
+        UnitOutcome::of(served.is_some(), &tally, refused),
+    )
+    .await;
+    match served {
+        Some(notifications) => Outcome::Served(notifications),
+        None => {
+            compile(
+                rustc,
+                parsed,
+                Some(env.target.as_str()),
+                ctx.policy_dir.as_deref(),
+            )
+            .await
+        }
+    }
+}
+
+/// The lookup chain for one invocation: local entries, then the remote
+/// serves a keyed or semantic request could hit. A local serve ends it
+/// the way a remote one does.
+async fn lookup_chain(
+    parsed: &rustc_args::ParsedRustcArgs,
+    env: &WrapperEnvironment<'_>,
+    ctx: &BuildContext,
+    exact_public_cache_allowed: bool,
+    tally: &mut LookupTally,
+) -> RemoteServe {
     let request = FetchRequest {
         target: &env.target,
         rustc_version: &env.rustc_version,
         c_metadata: env.request_c_metadata.as_str(),
     };
     if let Some(notifications) =
-        try_serve_local_cached_bundle(&env.env_base.config, parsed, &request).await
+        try_serve_local_cached_bundle(&env.env_base.config, parsed, &request, tally).await
     {
-        return Outcome::Served(notifications);
+        return RemoteServe::Served(notifications);
     }
     if let Some(notifications) = try_serve_local_prefetched_graph_bundle(
         &env.env_base.config,
@@ -1336,57 +1378,24 @@ async fn serve_or_compile(
         &env.target,
         &env.rustc_version,
         ctx,
+        tally,
     )
     .await
     {
-        return Outcome::Served(notifications);
+        return RemoteServe::Served(notifications);
     }
     if let Some(semantic_request) = env.semantic_request.as_ref()
-        && let Some(notifications) =
-            try_serve_local_semantic_cached_bundle(&env.env_base.config, parsed, semantic_request)
-                .await
+        && let Some(notifications) = try_serve_local_semantic_cached_bundle(
+            &env.env_base.config,
+            parsed,
+            semantic_request,
+            tally,
+        )
+        .await
     {
-        return Outcome::Served(notifications);
+        return RemoteServe::Served(notifications);
     }
-
-    match try_remote_serves(env, parsed, &request, exact_public_cache_allowed).await {
-        RemoteServe::Served(notifications) => return Outcome::Served(notifications),
-        RemoteServe::Bypass => {
-            return compile(
-                rustc,
-                parsed,
-                Some(env.target.as_str()),
-                ctx.policy_dir.as_deref(),
-            )
-            .await;
-        }
-        RemoteServe::Refused => {
-            record_glibc_refusal(&env.env_base.config, parsed).await;
-            return compile(
-                rustc,
-                parsed,
-                Some(env.target.as_str()),
-                ctx.policy_dir.as_deref(),
-            )
-            .await;
-        }
-        RemoteServe::Miss => {}
-    }
-
-    record_miss(
-        &env.env_base.config,
-        parsed,
-        &env.target,
-        &env.rustc_version,
-    )
-    .await;
-    compile(
-        rustc,
-        parsed,
-        Some(env.target.as_str()),
-        ctx.policy_dir.as_deref(),
-    )
-    .await
+    try_remote_serves(env, parsed, &request, exact_public_cache_allowed, tally).await
 }
 
 /// Everything the cache path needs once every bypass-capable preparation
@@ -1910,6 +1919,7 @@ async fn try_remote_serves(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     exact_public_cache_allowed: bool,
+    tally: &mut LookupTally,
 ) -> RemoteServe {
     if env.circuit_tripped {
         return RemoteServe::Miss;
@@ -1948,14 +1958,16 @@ async fn try_remote_serves(
     // `Refused` outranks `Miss` in the merge.
     let mut refused = false;
     if exact_public_cache_allowed {
-        match try_remote_exact_serve(env, parsed, request, &slice).await {
+        match try_remote_exact_serve(env, parsed, request, &slice, tally).await {
             RemoteServe::Miss => {}
             RemoteServe::Refused => refused = true,
             outcome => return outcome,
         }
     }
     if let Some(semantic_request) = env.semantic_request.as_ref() {
-        return match try_remote_semantic_serve(env, parsed, semantic_request, &slice.slice).await {
+        return match try_remote_semantic_serve(env, parsed, semantic_request, &slice.slice, tally)
+            .await
+        {
             RemoteServe::Miss | RemoteServe::Refused if refused => RemoteServe::Refused,
             outcome => outcome,
         };
@@ -1976,6 +1988,7 @@ async fn try_remote_exact_serve(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     slice: &SliceIndex,
+    tally: &mut LookupTally,
 ) -> RemoteServe {
     let negative_cache_hit = match circuit::negative_cache_contains(
         &env.env_base.config,
@@ -2012,7 +2025,7 @@ async fn try_remote_exact_serve(
     }
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
     match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
-        Ok(bundle) => try_serve_downloaded_bundle(env, parsed, request, &bundle)
+        Ok(bundle) => try_serve_downloaded_bundle(env, parsed, request, &bundle, tally)
             .await
             .map_or(RemoteServe::Bypass, RemoteServe::Served),
         // The index is ahead of the catalog: the edge pruned the row (a
@@ -2029,7 +2042,7 @@ async fn try_remote_exact_serve(
             env.env_cache
                 .record_circuit_failure(&env.env_base.config)
                 .await;
-            record_lookup_error(&env.env_base.config, parsed).await;
+            tally.failed = true;
             tracing::debug!(
                 crate_name = %parsed.crate_name,
                 target = %env.target,
@@ -2050,6 +2063,7 @@ async fn try_remote_semantic_serve(
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
     slice: &index::IndexSlice,
+    tally: &mut LookupTally,
 ) -> RemoteServe {
     let row = match resolve::find_semantic_artifact(
         &slice.index.rows,
@@ -2089,15 +2103,17 @@ async fn try_remote_semantic_serve(
     };
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
     match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
-        Ok(bundle) => try_serve_semantic_downloaded_bundle(env, parsed, semantic_request, &bundle)
-            .await
-            .map_or(RemoteServe::Bypass, RemoteServe::Served),
+        Ok(bundle) => {
+            try_serve_semantic_downloaded_bundle(env, parsed, semantic_request, &bundle, tally)
+                .await
+                .map_or(RemoteServe::Bypass, RemoteServe::Served)
+        }
         Err(fetch::FetchError::NotFound) => RemoteServe::Miss,
         Err(error) => {
             env.env_cache
                 .record_circuit_failure(&env.env_base.config)
                 .await;
-            record_lookup_error(&env.env_base.config, parsed).await;
+            tally.failed = true;
             tracing::debug!(
                 crate_name = %parsed.crate_name,
                 semantic_crate_name = %semantic_request.crate_name,
@@ -2113,49 +2129,90 @@ async fn try_remote_semantic_serve(
     }
 }
 
-/// Count a glibc-floor refusal against the per-crate stats, without
-/// failing the invocation. Kept out of `record_miss` deliberately: the
-/// artifact exists, so counting it as a miss would enqueue a build whose
-/// product cannot serve this host either.
-async fn record_glibc_refusal(config: &StowConfig, parsed: &rustc_args::ParsedRustcArgs) {
-    log_nonfatal_result(
-        "failed to record rust glibc refusal stats",
-        stats::record_glibc_refusal(config, &parsed.crate_name).await,
-    );
+/// What the lookup chain saw for one rustc invocation. The stages only
+/// note it here; the outcome is counted once, when the chain has ended
+/// (stow#696).
+#[derive(Debug, Default)]
+struct LookupTally {
+    /// A stage that should have worked did not: an entry that could not
+    /// be read, verified or materialized, or a fetch that failed.
+    failed: bool,
 }
 
-/// Record a public-cache miss for a registry crate, then run the real rustc.
-/// Only a registry package can be a miss: a workspace member is first-party
-/// code the public cache never carries, so counting it would report the
-/// project's own crates as failures and make a healthy build look broken in
-/// the post-build summary.
-async fn record_miss(
+/// The one outcome an invocation contributes to the build's counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitOutcome {
+    Hit,
+    Error,
+    GlibcRefusal,
+    Miss,
+}
+
+impl UnitOutcome {
+    /// Served wins: a unit that was served is a hit whatever failed on
+    /// the way. Otherwise a failure outranks a refusal, and a refusal a
+    /// miss.
+    const fn of(served: bool, tally: &LookupTally, refused: bool) -> Self {
+        if served {
+            Self::Hit
+        } else if tally.failed {
+            Self::Error
+        } else if refused {
+            Self::GlibcRefusal
+        } else {
+            Self::Miss
+        }
+    }
+}
+
+/// Write the one outcome a rustc invocation contributes to the build's
+/// counts. The lookup chain's stages report into a [`LookupTally`] and
+/// only the end of the chain calls this, so an invocation whose lookup
+/// visited several stages is still counted exactly once (stow#696). A
+/// stats write never fails the invocation — it is not worth a missed
+/// compile.
+///
+/// Only a registry package can be a miss: a workspace member is
+/// first-party code the public cache never carries, so counting it
+/// would report the project's own crates as failures and make a healthy
+/// build look broken in the post-build summary. A glibc refusal is not
+/// a miss either: the artifact exists, so counting it as one would
+/// enqueue a build whose product cannot serve this host either.
+async fn record_unit_outcome(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     target: &str,
     rustc_version: &str,
+    outcome: UnitOutcome,
 ) {
-    if detect_registry_crate_version(parsed).is_ok_and(|version| version.is_some()) {
-        log_nonfatal_result(
-            "failed to record rust cache miss stats",
-            stats::record_miss(config, &parsed.crate_name).await,
-        );
-        tracing::debug!(
-            crate_name = %parsed.crate_name,
-            target,
-            rustc_version,
-            "stow cache miss, falling back to rustc"
-        );
+    match outcome {
+        UnitOutcome::Hit => log_nonfatal_result(
+            "failed to record rust cache hit stats",
+            stats::record_hit(config, &parsed.crate_name).await,
+        ),
+        UnitOutcome::Error => log_nonfatal_result(
+            "failed to record rust cache error stats",
+            stats::record_error(config, &parsed.crate_name).await,
+        ),
+        UnitOutcome::GlibcRefusal => log_nonfatal_result(
+            "failed to record rust glibc refusal stats",
+            stats::record_glibc_refusal(config, &parsed.crate_name).await,
+        ),
+        UnitOutcome::Miss => {
+            if detect_registry_crate_version(parsed).is_ok_and(|version| version.is_some()) {
+                log_nonfatal_result(
+                    "failed to record rust cache miss stats",
+                    stats::record_miss(config, &parsed.crate_name).await,
+                );
+                tracing::debug!(
+                    crate_name = %parsed.crate_name,
+                    target,
+                    rustc_version,
+                    "stow cache miss, falling back to rustc"
+                );
+            }
+        }
     }
-}
-
-/// Count a failed rust cache lookup as an error stat without failing the
-/// invocation — a stats write is not worth a missed compile.
-async fn record_lookup_error(config: &StowConfig, parsed: &rustc_args::ParsedRustcArgs) {
-    log_nonfatal_result(
-        "failed to record rust cache error stats",
-        stats::record_error(config, &parsed.crate_name).await,
-    );
 }
 
 /// Remember a profile divergence so the build summary can explain a build
@@ -2168,14 +2225,6 @@ async fn record_profile_divergence(config: &StowConfig, mismatch: &BundleMismatc
     log_nonfatal_result(
         "failed to record the cache profile divergence",
         stats::record_profile_divergence(config, cached, wanted).await,
-    );
-}
-
-/// Count a served rust cache lookup as a hit stat.
-async fn record_lookup_hit(config: &StowConfig, parsed: &rustc_args::ParsedRustcArgs) {
-    log_nonfatal_result(
-        "failed to record rust cache hit stats",
-        stats::record_hit(config, &parsed.crate_name).await,
     );
 }
 
@@ -2264,9 +2313,24 @@ async fn decide_local_only(
             rustc_version: &local_base.rustc_version,
             c_metadata: identity.c_metadata.as_str(),
         };
-        if let Some(notifications) =
-            try_serve_local_cached_bundle(&local_base.config, parsed, &request).await
-        {
+        let mut tally = LookupTally::default();
+        let served =
+            try_serve_local_cached_bundle(&local_base.config, parsed, &request, &mut tally).await;
+        // A miss is never counted here: this path serves units the
+        // public cache does not carry, so an unmet local lookup means
+        // nothing was promised. A serve and a failed lookup are the
+        // only outcomes.
+        if served.is_some() || tally.failed {
+            record_unit_outcome(
+                &local_base.config,
+                parsed,
+                &target,
+                &local_base.rustc_version,
+                UnitOutcome::of(served.is_some(), &tally, false),
+            )
+            .await;
+        }
+        if let Some(notifications) = served {
             return Outcome::Served(notifications);
         }
     }
@@ -2438,6 +2502,7 @@ async fn try_serve_local_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let cached_bundle = match load_cached_bundle(config, request).await {
         Ok(bundle) => bundle,
@@ -2449,10 +2514,7 @@ async fn try_serve_local_cached_bundle(
                 rustc_version = %request.rustc_version,
                 "failed to read local stow artifact cache entry"
             );
-            log_nonfatal_result(
-                "failed to record rust cache error stats",
-                stats::record_error(config, &parsed.crate_name).await,
-            );
+            tally.failed = true;
             return None;
         }
     };
@@ -2463,6 +2525,7 @@ async fn try_serve_local_cached_bundle(
         request,
         EntryOrigin::ExactKey,
         cached_bundle,
+        tally,
     )
     .await
 }
@@ -2473,6 +2536,7 @@ async fn try_serve_local_prefetched_graph_bundle(
     target: &str,
     rustc_version: &str,
     ctx: &BuildContext,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     // `Ok(None)` is the non-registry case, which can match no published
     // bundle.
@@ -2549,6 +2613,7 @@ async fn try_serve_local_prefetched_graph_bundle(
             &request,
             EntryOrigin::GraphCandidate,
             cached_bundle,
+            tally,
         )
         .await
         {
@@ -2580,6 +2645,7 @@ async fn try_serve_loaded_local_cached_bundle(
     request: &FetchRequest<'_>,
     origin: EntryOrigin,
     cached_bundle: artifact_cache::CachedArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     if let Some(mismatch) = bundle_mismatch(
         parsed,
@@ -2618,7 +2684,7 @@ async fn try_serve_loaded_local_cached_bundle(
             "failed to evict local stow artifact cache entry with semantic mismatch",
         )
         .await;
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
 
@@ -2638,7 +2704,7 @@ async fn try_serve_loaded_local_cached_bundle(
             "failed to evict untrusted local stow artifact cache entry",
         )
         .await;
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
 
@@ -2652,11 +2718,11 @@ async fn try_serve_loaded_local_cached_bundle(
             rustc_version = %request.rustc_version,
             "failed to materialize dependency closure aliases for local stow artifact cache entry"
         );
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
 
-    materialize_local_cached_bundle(config, parsed, request, cached_bundle).await
+    materialize_local_cached_bundle(config, parsed, request, cached_bundle, tally).await
 }
 
 /// Write a verified local cache entry's artifacts into the target dir.
@@ -2667,10 +2733,11 @@ async fn materialize_local_cached_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
-        Ok(()) => finish_local_serve(config, parsed, request, cached_bundle).await,
+        Ok(()) => finish_local_serve(config, parsed, request, cached_bundle, tally).await,
         Err(error) => {
             tracing::debug!(
                 error = %error,
@@ -2687,7 +2754,7 @@ async fn materialize_local_cached_bundle(
                 "failed to evict broken local stow artifact cache entry",
             )
             .await;
-            record_lookup_error(config, parsed).await;
+            tally.failed = true;
             None
         }
     }
@@ -2696,12 +2763,13 @@ async fn materialize_local_cached_bundle(
 /// The bookkeeping that turns written artifacts into a served hit: record
 /// what was materialized, compute the artifact notifications the unit
 /// owes cargo — the process cargo spawned prints them at its `exit(0)`
-/// (stow#633) — then count the hit.
+/// (stow#633). The chain's end counts the hit itself (stow#696).
 async fn finish_local_serve(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
         tracing::debug!(
@@ -2711,7 +2779,7 @@ async fn finish_local_serve(
             rustc_version = %request.rustc_version,
             "failed to record materialized local stow artifact outputs"
         );
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
     let notifications = match cached_rustc_artifact_notifications(parsed) {
@@ -2732,11 +2800,10 @@ async fn finish_local_serve(
                 "failed to evict local stow artifact cache entry missing rustc artifact notifications",
             )
             .await;
-            record_lookup_error(config, parsed).await;
+            tally.failed = true;
             return None;
         }
     };
-    record_lookup_hit(config, parsed).await;
     log_nonfatal_result(
         "failed to record local usage statistics",
         stats::record_served_bundle(
@@ -2998,6 +3065,7 @@ async fn try_serve_downloaded_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     bundle: &fetch::ArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let config = &env.env_base.config;
     // The bundle's `crate_name` is the package name — compare against the
@@ -3025,10 +3093,6 @@ async fn try_serve_downloaded_bundle(
         // in, and every remaining crate in the build then bypassed the cache
         // for the full reset window. Only transport and materialization
         // failures say the cache path itself is unhealthy.
-        log_nonfatal_result(
-            "failed to record rust cache miss stats",
-            stats::record_miss(config, &parsed.crate_name).await,
-        );
         return None;
     }
     if let Some(mismatch) = bundle_mismatch(
@@ -3054,19 +3118,16 @@ async fn try_serve_downloaded_bundle(
         // in, and every remaining crate in the build then bypassed the cache
         // for the full reset window. Only transport and materialization
         // failures say the cache path itself is unhealthy.
-        log_nonfatal_result(
-            "failed to record rust cache miss stats",
-            stats::record_miss(config, &parsed.crate_name).await,
-        );
         return None;
     }
-    try_serve_verified_downloaded_bundle(env, parsed, request, bundle).await
+    try_serve_verified_downloaded_bundle(env, parsed, request, bundle, tally).await
 }
 
 async fn try_serve_local_semantic_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let cached_bundle = match load_semantic_cached_bundle(config, semantic_request).await {
         Ok(bundle) => bundle,
@@ -3080,7 +3141,7 @@ async fn try_serve_local_semantic_cached_bundle(
                 rustc_version = %semantic_request.rustc_version,
                 "failed to read local semantic stow artifact cache entry"
             );
-            record_lookup_error(config, parsed).await;
+            tally.failed = true;
             return None;
         }
     };
@@ -3104,7 +3165,6 @@ async fn try_serve_local_semantic_cached_bundle(
             cached_c_metadata = %cached_bundle.c_metadata,
             "local semantic stow artifact cache entry semantic mismatch"
         );
-        record_lookup_error(config, parsed).await;
         return None;
     }
     if let Err(error) = verify::verify_cached_bundle_signature(config, &cached_bundle).await {
@@ -3118,7 +3178,7 @@ async fn try_serve_local_semantic_cached_bundle(
             cached_c_metadata = %cached_bundle.c_metadata,
             "local semantic stow artifact cache entry failed verification"
         );
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
     let request = FetchRequest {
@@ -3140,11 +3200,11 @@ async fn try_serve_local_semantic_cached_bundle(
             cached_c_metadata = %cached_bundle.c_metadata,
             "failed to materialize dependency closure aliases for local semantic stow artifact cache entry"
         );
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
 
-    materialize_semantic_cached_bundle(config, parsed, semantic_request, cached_bundle).await
+    materialize_semantic_cached_bundle(config, parsed, semantic_request, cached_bundle, tally).await
 }
 
 /// Write a verified semantic cache entry's artifacts into the target dir and
@@ -3156,6 +3216,7 @@ async fn materialize_semantic_cached_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
     cached_bundle: artifact_cache::CachedArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     if let Err(error) =
         inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
@@ -3170,7 +3231,7 @@ async fn materialize_semantic_cached_bundle(
             cached_c_metadata = %cached_bundle.c_metadata,
             "failed to materialize local semantic stow artifact cache entry"
         );
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
     if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
@@ -3184,7 +3245,7 @@ async fn materialize_semantic_cached_bundle(
             cached_c_metadata = %cached_bundle.c_metadata,
             "failed to record materialized local semantic stow artifact outputs"
         );
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
     let notifications = match cached_rustc_artifact_notifications(parsed) {
@@ -3200,11 +3261,10 @@ async fn materialize_semantic_cached_bundle(
                 cached_c_metadata = %cached_bundle.c_metadata,
                 "failed to compute rustc artifact notifications for local semantic stow artifact cache entry"
             );
-            record_lookup_error(config, parsed).await;
+            tally.failed = true;
             return None;
         }
     };
-    record_lookup_hit(config, parsed).await;
     log_nonfatal_result(
         "failed to record local usage statistics",
         stats::record_served_bundle(
@@ -3232,8 +3292,8 @@ async fn try_serve_semantic_downloaded_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
     bundle: &fetch::ArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    let config = &env.env_base.config;
     if let Err(error) = fetch::validate_semantic_bundle_identity(bundle, semantic_request) {
         tracing::debug!(
             error = %error,
@@ -3251,10 +3311,6 @@ async fn try_serve_semantic_downloaded_bundle(
         // in, and every remaining crate in the build then bypassed the cache
         // for the full reset window. Only transport and materialization
         // failures say the cache path itself is unhealthy.
-        log_nonfatal_result(
-            "failed to record rust cache miss stats",
-            stats::record_miss(config, &parsed.crate_name).await,
-        );
         return None;
     }
 
@@ -3263,7 +3319,7 @@ async fn try_serve_semantic_downloaded_bundle(
         rustc_version: bundle.manifest.config.rustc_version.as_str(),
         c_metadata: bundle.manifest.config.c_metadata.as_str(),
     };
-    try_serve_verified_downloaded_bundle(env, parsed, &request, bundle).await
+    try_serve_verified_downloaded_bundle(env, parsed, &request, bundle, tally).await
 }
 
 async fn try_serve_verified_downloaded_bundle(
@@ -3271,6 +3327,7 @@ async fn try_serve_verified_downloaded_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     bundle: &fetch::ArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let config = &env.env_base.config;
     let cached_bundle = match cache_verified_downloaded_bundle(config, request, bundle).await {
@@ -3284,7 +3341,7 @@ async fn try_serve_verified_downloaded_bundle(
                 "failed to cache verified stow bundle"
             );
             env.env_cache.record_circuit_failure(config).await;
-            record_lookup_error(config, parsed).await;
+            tally.failed = true;
             return None;
         }
     };
@@ -3308,11 +3365,11 @@ async fn try_serve_verified_downloaded_bundle(
         )
         .await;
         env.env_cache.record_circuit_failure(config).await;
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
 
-    materialize_downloaded_bundle(env, parsed, request, cached_bundle).await
+    materialize_downloaded_bundle(env, parsed, request, cached_bundle, tally).await
 }
 
 /// Write a verified downloaded bundle's artifacts into the target dir.
@@ -3323,11 +3380,12 @@ async fn materialize_downloaded_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let config = &env.env_base.config;
     match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
     {
-        Ok(()) => finish_downloaded_serve(env, parsed, request, cached_bundle).await,
+        Ok(()) => finish_downloaded_serve(env, parsed, request, cached_bundle, tally).await,
         Err(error) => {
             tracing::debug!(
                 error = %error,
@@ -3345,7 +3403,7 @@ async fn materialize_downloaded_bundle(
             )
             .await;
             env.env_cache.record_circuit_failure(config).await;
-            record_lookup_error(config, parsed).await;
+            tally.failed = true;
             None
         }
     }
@@ -3354,12 +3412,14 @@ async fn materialize_downloaded_bundle(
 /// The bookkeeping that turns a materialized downloaded bundle into a served
 /// hit: record outputs, compute the artifact notifications the unit owes
 /// cargo — the process cargo spawned prints them at its `exit(0)`
-/// (stow#633) — then count the circuit success and the lookup hit.
+/// (stow#633) — then count the circuit success. The chain's end counts the
+/// hit itself (stow#696).
 async fn finish_downloaded_serve(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
+    tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let config = &env.env_base.config;
     if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
@@ -3379,7 +3439,7 @@ async fn finish_downloaded_serve(
         )
         .await;
         env.env_cache.record_circuit_failure(config).await;
-        record_lookup_error(config, parsed).await;
+        tally.failed = true;
         return None;
     }
     let notifications = match cached_rustc_artifact_notifications(parsed) {
@@ -3401,12 +3461,11 @@ async fn finish_downloaded_serve(
             )
             .await;
             env.env_cache.record_circuit_failure(config).await;
-            record_lookup_error(config, parsed).await;
+            tally.failed = true;
             return None;
         }
     };
     env.env_cache.record_circuit_success(config).await;
-    record_lookup_hit(config, parsed).await;
     log_nonfatal_result(
         "failed to record local usage statistics",
         stats::record_served_bundle(
@@ -4101,11 +4160,25 @@ pub(crate) fn write_stdout(message: &str) -> stow_types::error::Result<()> {
     Ok(())
 }
 
-fn install_tracing() -> TracingGuard {
+/// The subscriber [`install_tracing`] installs, built from the values the
+/// environment supplied.
+fn tracing_subscriber_for<W>(
+    rust_log: Option<&str>,
+    trace_file: Option<PathBuf>,
+    terminal: W,
+) -> (
+    impl tracing::Subscriber + Send + Sync + 'static,
+    TracingGuard,
+)
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
     // `warn` by default: what reaches the terminal without `RUST_LOG` is
     // a once-per-condition signal — the per-unit and per-attempt detail
     // lives at `debug` (stow#633).
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let terminal_filter = rust_log
+        .and_then(|value| EnvFilter::try_new(value).ok())
+        .unwrap_or_else(|| EnvFilter::new("warn"));
     // stderr, never stdout: `run()` also serves the `rustc` / `cc` wrapper
     // subcommands, whose stdout must stay byte-identical to the wrapped
     // compiler's. Cargo hashes `rustc -vV` stdout into every unit's
@@ -4113,31 +4186,52 @@ fn install_tracing() -> TracingGuard {
     // every crate in the build on every invocation.
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
-        .with_writer(std::io::stderr);
+        .with_writer(terminal)
+        .with_filter(terminal_filter);
 
-    let chrome = std::env::var_os(STOW_TRACE_FILE_ENV).map(|path| {
-        tracing_chrome::ChromeLayerBuilder::new()
-            .file(PathBuf::from(path))
-            .include_args(true)
-            .build()
-    });
+    // The trace is an explicit request for stow's own spans, most of
+    // them recorded at `debug`; one filter for both outputs wrote an
+    // empty trace (stow#698), and a filter `RUST_LOG` could narrow
+    // would do it again. The layer sees stow's crates at `trace` and
+    // nothing else.
+    let (chrome_layer, chrome_guard) = trace_file
+        .map(|path| {
+            let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                .file(path)
+                .include_args(true)
+                .build();
+            (
+                Some(
+                    layer.with_filter(
+                        tracing_subscriber::filter::Targets::new()
+                            .with_target("stow_", tracing::Level::TRACE),
+                    ),
+                ),
+                Some(guard),
+            )
+        })
+        .unwrap_or_default();
 
-    if let Some((chrome_layer, chrome_guard)) = chrome {
-        let _ = tracing_subscriber::registry()
-            .with(filter)
+    (
+        tracing_subscriber::registry()
             .with(fmt_layer)
-            .with(chrome_layer)
-            .try_init();
+            .with(chrome_layer),
         TracingGuard {
-            _chrome: Some(chrome_guard),
-        }
-    } else {
-        let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .try_init();
-        TracingGuard { _chrome: None }
-    }
+            _chrome: chrome_guard,
+        },
+    )
+}
+
+fn install_tracing() -> TracingGuard {
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let trace_file = std::env::var_os(STOW_TRACE_FILE_ENV).map(PathBuf::from);
+    let (subscriber, guard) =
+        tracing_subscriber_for(rust_log.as_deref(), trace_file, std::io::stderr);
+    // `try_init` installs the global default and — `tracing-subscriber`'s
+    // `tracing-log` feature is on — the `LogTracer` bridge routing `log`
+    // records into tracing; the already-set error stays ignored.
+    let _ = subscriber.try_init();
+    guard
 }
 
 #[cfg(test)]
@@ -4148,6 +4242,7 @@ mod tests {
     use super::{
         UnparseableInvocation, cached_rustc_artifact_notifications, classify_invocation,
         expand_wrapper_role, should_install_tracing_for_args, strip_cargo_subcommand_word,
+        tracing_subscriber_for,
     };
     use crate::rustc_args::ParsedRustcArgs;
 
@@ -4545,6 +4640,141 @@ mod tests {
         ]))
         .expect("parse rustc args");
         assert_eq!(super::expected_bundle_crate_name(&parsed), None);
+    }
+
+    /// stow#696: a unit that was served is a hit even when a stage
+    /// failed earlier in the chain — the tally never turns a serve
+    /// into an error.
+    #[test]
+    fn a_served_unit_is_a_hit_whatever_failed_on_the_way() {
+        let mut tally = super::LookupTally::default();
+        assert_eq!(
+            super::UnitOutcome::of(true, &tally, false),
+            super::UnitOutcome::Hit
+        );
+        tally.failed = true;
+        assert_eq!(
+            super::UnitOutcome::of(true, &tally, true),
+            super::UnitOutcome::Hit
+        );
+    }
+
+    /// stow#696: an unserved unit whose chain saw a failure is an error
+    /// — outranking both the refusal and the plain miss.
+    #[test]
+    fn a_failure_outranks_a_refusal_and_a_miss() {
+        let tally = super::LookupTally { failed: true };
+        assert_eq!(
+            super::UnitOutcome::of(false, &tally, false),
+            super::UnitOutcome::Error
+        );
+        assert_eq!(
+            super::UnitOutcome::of(false, &tally, true),
+            super::UnitOutcome::Error
+        );
+    }
+
+    /// stow#696: a glibc refusal is still a refusal, not a miss — the
+    /// artifact exists, no build can change it.
+    #[test]
+    fn a_refusal_outranks_a_miss() {
+        let tally = super::LookupTally::default();
+        assert_eq!(
+            super::UnitOutcome::of(false, &tally, true),
+            super::UnitOutcome::GlibcRefusal
+        );
+    }
+
+    /// stow#696: a chain that served nothing and failed nothing is the
+    /// plain miss the build enqueues.
+    #[test]
+    fn nothing_seen_is_a_miss() {
+        let tally = super::LookupTally::default();
+        assert_eq!(
+            super::UnitOutcome::of(false, &tally, false),
+            super::UnitOutcome::Miss
+        );
+    }
+
+    /// stow#696: a semantic lookup that returns the entry of another
+    /// version has found no entry for this invocation — it is not a
+    /// failure, and nothing is counted. The regression counted it an
+    /// error, after which a later stage's serve counted the same
+    /// invocation a hit: one invocation, two outcomes.
+    #[tokio::test]
+    async fn a_semantic_entry_of_another_version_is_not_a_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = env_base_test_config(&dir);
+        config.artifact_cache_max_bytes = u64::MAX;
+        let mut bundle = crate::artifact_cache::tests::sample_bundle(
+            "aaaabbbbccccdddd",
+            "libanyhow-aaaabbbbccccdddd.rmeta",
+        );
+        bundle.manifest.config.crate_name =
+            stow_types::identity::CrateName::parse("anyhow").unwrap();
+        bundle.manifest.config.crate_version =
+            stow_types::identity::CrateVersion::new(semver::Version::parse("1.0.104").unwrap());
+
+        crate::artifact_cache::prepare_local_cache(&config, "1.91.1")
+            .await
+            .expect("prepare cache");
+        let request = crate::fetch::FetchRequest {
+            target: "aarch64-apple-darwin",
+            rustc_version: "1.91.1",
+            c_metadata: "aaaabbbbccccdddd",
+        };
+        let stored = crate::artifact_cache::store_downloaded_bundle(&config, &request, &bundle)
+            .await
+            .expect("store bundle");
+        drop(stored);
+
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "anyhow",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "metadata",
+            "-C",
+            "metadata=bbbbccccddddeeee",
+            "/root/.cargo/registry/src/index.crates.io-0123abcd/anyhow-1.0.103/src/lib.rs",
+        ]))
+        .expect("parse rustc args");
+        let semantic_request = crate::fetch::SemanticFetchRequest {
+            crate_name: "anyhow".to_owned(),
+            version: "1.0.103".to_owned(),
+            features_json: bundle.manifest.config.features_json.raw(),
+            dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+            profile: bundle.manifest.config.profile.clone(),
+            emit: bundle.manifest.config.emit.clone(),
+            kind: bundle.manifest.config.kind.clone(),
+            crate_types: bundle.manifest.config.crate_types.clone(),
+        };
+
+        let mut tally = super::LookupTally::default();
+        let served = super::try_serve_local_semantic_cached_bundle(
+            &config,
+            &parsed,
+            &semantic_request,
+            &mut tally,
+        )
+        .await;
+        assert!(served.is_none(), "another version's entry cannot serve");
+        assert!(
+            !tally.failed,
+            "finding no entry for this invocation is not a failure"
+        );
+
+        let summary = crate::stats::read_summary(&config)
+            .await
+            .expect("read the stats summary");
+        assert_eq!(
+            summary.rust_lookups(),
+            0,
+            "an entry of another version records no outcome for the crate"
+        );
     }
 
     /// A `StowConfig` whose every path and endpoint is a throwaway — the
@@ -5398,5 +5628,126 @@ mod tests {
                 "a never-cacheable unit logs no warn:\n{captured}"
             );
         }
+    }
+
+    /// An in-memory stderr for the `tracing_subscriber_for` tests — a
+    /// shared byte buffer the fmt layer writes through `MakeWriter`.
+    #[derive(Clone, Default)]
+    struct Terminal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Terminal {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("terminal buffer").clone())
+                .expect("fmt output is UTF-8")
+        }
+    }
+
+    impl std::io::Write for Terminal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("terminal buffer").write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().expect("terminal buffer").flush()
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Terminal {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The two outputs are filtered separately: the terminal keeps the
+    /// `warn` default (stow#633) while the trace — an explicit request —
+    /// records every span and event of stow's own crates, including the
+    /// `debug` spans it exists to show (stow#698).
+    #[test]
+    fn the_trace_file_records_what_the_terminal_does_not_print() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace = dir.path().join("trace.json");
+        let terminal = Terminal::default();
+        let (subscriber, guard) =
+            tracing_subscriber_for(None, Some(trace.clone()), terminal.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!("stow.test.span");
+            let _entered = span.enter();
+            tracing::info!("an info line");
+            tracing::warn!("a warn line");
+            tracing::warn!(target: "hyper", "a foreign line");
+        });
+        // Dropping the guard flushes the trace writer's queue to disk.
+        drop(guard);
+
+        let trace_text = std::fs::read_to_string(&trace).expect("read the trace file");
+        assert!(
+            trace_text.contains("stow.test.span"),
+            "the trace records the debug span: {trace_text}"
+        );
+        assert!(
+            trace_text.contains("an info line"),
+            "the trace records stow's own events below warn: {trace_text}"
+        );
+        assert!(
+            !trace_text.contains("a foreign line"),
+            "the trace ignores non-stow targets: {trace_text}"
+        );
+
+        let terminal_text = terminal.text();
+        assert!(
+            terminal_text.contains("a warn line"),
+            "the terminal prints warn events: {terminal_text}"
+        );
+        assert!(
+            terminal_text.contains("a foreign line"),
+            "the terminal's warn default covers foreign targets: {terminal_text}"
+        );
+        assert!(
+            !terminal_text.contains("an info line"),
+            "the terminal does not print info: {terminal_text}"
+        );
+    }
+
+    /// `RUST_LOG` selects the terminal's level only — a restrictive
+    /// value must not write an empty trace (stow#698).
+    #[test]
+    fn rust_log_does_not_narrow_the_trace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace = dir.path().join("trace.json");
+        let terminal = Terminal::default();
+        let (subscriber, guard) =
+            tracing_subscriber_for(Some("error"), Some(trace.clone()), terminal.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!("stow.test.span");
+            let _entered = span.enter();
+            tracing::info!("an info line");
+            tracing::warn!("a warn line");
+            tracing::warn!(target: "hyper", "a foreign line");
+        });
+        drop(guard);
+
+        let trace_text = std::fs::read_to_string(&trace).expect("read the trace file");
+        assert!(
+            trace_text.contains("stow.test.span"),
+            "RUST_LOG does not narrow the trace: {trace_text}"
+        );
+        assert!(
+            !trace_text.contains("a foreign line"),
+            "the trace ignores non-stow targets: {trace_text}"
+        );
+
+        let terminal_text = terminal.text();
+        assert!(
+            !terminal_text.contains("a warn line"),
+            "RUST_LOG=error hides warn on the terminal: {terminal_text}"
+        );
+        assert!(
+            !terminal_text.contains("an info line"),
+            "RUST_LOG=error hides info on the terminal: {terminal_text}"
+        );
     }
 }
