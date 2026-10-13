@@ -77,9 +77,9 @@ use stow_types::public_cache::{
     detect_registry_crate_version as shared_detect_registry_crate_version,
     normalized_cache_profile, stable_registry_artifact_identity,
 };
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer as _};
 
 use crate::artifact_cache::{
     DependencyCMetadataResolution, load_cached_bundle, load_cached_bundle_by_compile_key,
@@ -99,9 +99,9 @@ pub(crate) const STOW_ENABLE_SEMANTIC_FALLBACK_ENV: &str = "STOW_ENABLE_SEMANTIC
 pub(crate) const STOW_TRACE_WRAPPED_COMPILERS_ENV: &str = "STOW_TRACE_WRAPPED_COMPILERS";
 /// When set to a path, stow writes a Chrome-trace JSON to that file describing
 /// every instrumented span (`stow.startup`, `stow.project.context`,
-/// `stow.edge.graph.query`, `stow.wrapper.invoke`, ...). Open the file with
-/// <chrome://tracing> or perfetto.dev for a flame waterfall. Used to drive P1
-/// performance work — see plan P0.1.
+/// `stow.edge.graph.query`, `stow.wrapper.invoke`, ...). The trace records
+/// every span and event of stow's own crates regardless of `RUST_LOG`. Open
+/// the file with <chrome://tracing> or perfetto.dev for a flame waterfall.
 const STOW_TRACE_FILE_ENV: &str = "STOW_TRACE_FILE";
 
 /// Holds the tracing-chrome flush guard, if a Chrome trace was requested.
@@ -4160,11 +4160,25 @@ pub(crate) fn write_stdout(message: &str) -> stow_types::error::Result<()> {
     Ok(())
 }
 
-fn install_tracing() -> TracingGuard {
+/// The subscriber [`install_tracing`] installs, built from the values the
+/// environment supplied.
+fn tracing_subscriber_for<W>(
+    rust_log: Option<&str>,
+    trace_file: Option<PathBuf>,
+    terminal: W,
+) -> (
+    impl tracing::Subscriber + Send + Sync + 'static,
+    TracingGuard,
+)
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
     // `warn` by default: what reaches the terminal without `RUST_LOG` is
     // a once-per-condition signal — the per-unit and per-attempt detail
     // lives at `debug` (stow#633).
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let terminal_filter = rust_log
+        .and_then(|value| EnvFilter::try_new(value).ok())
+        .unwrap_or_else(|| EnvFilter::new("warn"));
     // stderr, never stdout: `run()` also serves the `rustc` / `cc` wrapper
     // subcommands, whose stdout must stay byte-identical to the wrapped
     // compiler's. Cargo hashes `rustc -vV` stdout into every unit's
@@ -4172,31 +4186,52 @@ fn install_tracing() -> TracingGuard {
     // every crate in the build on every invocation.
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
-        .with_writer(std::io::stderr);
+        .with_writer(terminal)
+        .with_filter(terminal_filter);
 
-    let chrome = std::env::var_os(STOW_TRACE_FILE_ENV).map(|path| {
-        tracing_chrome::ChromeLayerBuilder::new()
-            .file(PathBuf::from(path))
-            .include_args(true)
-            .build()
-    });
+    // The trace is an explicit request for stow's own spans, most of
+    // them recorded at `debug`; one filter for both outputs wrote an
+    // empty trace (stow#698), and a filter `RUST_LOG` could narrow
+    // would do it again. The layer sees stow's crates at `trace` and
+    // nothing else.
+    let (chrome_layer, chrome_guard) = trace_file
+        .map(|path| {
+            let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                .file(path)
+                .include_args(true)
+                .build();
+            (
+                Some(
+                    layer.with_filter(
+                        tracing_subscriber::filter::Targets::new()
+                            .with_target("stow_", tracing::Level::TRACE),
+                    ),
+                ),
+                Some(guard),
+            )
+        })
+        .unwrap_or_default();
 
-    if let Some((chrome_layer, chrome_guard)) = chrome {
-        let _ = tracing_subscriber::registry()
-            .with(filter)
+    (
+        tracing_subscriber::registry()
             .with(fmt_layer)
-            .with(chrome_layer)
-            .try_init();
+            .with(chrome_layer),
         TracingGuard {
-            _chrome: Some(chrome_guard),
-        }
-    } else {
-        let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .try_init();
-        TracingGuard { _chrome: None }
-    }
+            _chrome: chrome_guard,
+        },
+    )
+}
+
+fn install_tracing() -> TracingGuard {
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let trace_file = std::env::var_os(STOW_TRACE_FILE_ENV).map(PathBuf::from);
+    let (subscriber, guard) =
+        tracing_subscriber_for(rust_log.as_deref(), trace_file, std::io::stderr);
+    // `try_init` installs the global default and — `tracing-subscriber`'s
+    // `tracing-log` feature is on — the `LogTracer` bridge routing `log`
+    // records into tracing; the already-set error stays ignored.
+    let _ = subscriber.try_init();
+    guard
 }
 
 #[cfg(test)]
@@ -4207,6 +4242,7 @@ mod tests {
     use super::{
         UnparseableInvocation, cached_rustc_artifact_notifications, classify_invocation,
         expand_wrapper_role, should_install_tracing_for_args, strip_cargo_subcommand_word,
+        tracing_subscriber_for,
     };
     use crate::rustc_args::ParsedRustcArgs;
 
@@ -5592,5 +5628,126 @@ mod tests {
                 "a never-cacheable unit logs no warn:\n{captured}"
             );
         }
+    }
+
+    /// An in-memory stderr for the `tracing_subscriber_for` tests — a
+    /// shared byte buffer the fmt layer writes through `MakeWriter`.
+    #[derive(Clone, Default)]
+    struct Terminal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Terminal {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("terminal buffer").clone())
+                .expect("fmt output is UTF-8")
+        }
+    }
+
+    impl std::io::Write for Terminal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("terminal buffer").write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().expect("terminal buffer").flush()
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Terminal {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The two outputs are filtered separately: the terminal keeps the
+    /// `warn` default (stow#633) while the trace — an explicit request —
+    /// records every span and event of stow's own crates, including the
+    /// `debug` spans it exists to show (stow#698).
+    #[test]
+    fn the_trace_file_records_what_the_terminal_does_not_print() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace = dir.path().join("trace.json");
+        let terminal = Terminal::default();
+        let (subscriber, guard) =
+            tracing_subscriber_for(None, Some(trace.clone()), terminal.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!("stow.test.span");
+            let _entered = span.enter();
+            tracing::info!("an info line");
+            tracing::warn!("a warn line");
+            tracing::warn!(target: "hyper", "a foreign line");
+        });
+        // Dropping the guard flushes the trace writer's queue to disk.
+        drop(guard);
+
+        let trace_text = std::fs::read_to_string(&trace).expect("read the trace file");
+        assert!(
+            trace_text.contains("stow.test.span"),
+            "the trace records the debug span: {trace_text}"
+        );
+        assert!(
+            trace_text.contains("an info line"),
+            "the trace records stow's own events below warn: {trace_text}"
+        );
+        assert!(
+            !trace_text.contains("a foreign line"),
+            "the trace ignores non-stow targets: {trace_text}"
+        );
+
+        let terminal_text = terminal.text();
+        assert!(
+            terminal_text.contains("a warn line"),
+            "the terminal prints warn events: {terminal_text}"
+        );
+        assert!(
+            terminal_text.contains("a foreign line"),
+            "the terminal's warn default covers foreign targets: {terminal_text}"
+        );
+        assert!(
+            !terminal_text.contains("an info line"),
+            "the terminal does not print info: {terminal_text}"
+        );
+    }
+
+    /// `RUST_LOG` selects the terminal's level only — a restrictive
+    /// value must not write an empty trace (stow#698).
+    #[test]
+    fn rust_log_does_not_narrow_the_trace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace = dir.path().join("trace.json");
+        let terminal = Terminal::default();
+        let (subscriber, guard) =
+            tracing_subscriber_for(Some("error"), Some(trace.clone()), terminal.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!("stow.test.span");
+            let _entered = span.enter();
+            tracing::info!("an info line");
+            tracing::warn!("a warn line");
+            tracing::warn!(target: "hyper", "a foreign line");
+        });
+        drop(guard);
+
+        let trace_text = std::fs::read_to_string(&trace).expect("read the trace file");
+        assert!(
+            trace_text.contains("stow.test.span"),
+            "RUST_LOG does not narrow the trace: {trace_text}"
+        );
+        assert!(
+            !trace_text.contains("a foreign line"),
+            "the trace ignores non-stow targets: {trace_text}"
+        );
+
+        let terminal_text = terminal.text();
+        assert!(
+            !terminal_text.contains("a warn line"),
+            "RUST_LOG=error hides warn on the terminal: {terminal_text}"
+        );
+        assert!(
+            !terminal_text.contains("an info line"),
+            "RUST_LOG=error hides info on the terminal: {terminal_text}"
+        );
     }
 }

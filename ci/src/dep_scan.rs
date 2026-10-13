@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use async_process::Command;
@@ -371,10 +372,12 @@ fn select_captured_artifact(
     // and a split unit graph captures the host and requested-target
     // halves into sibling `deps` dirs — or a forged replay.
     // `same_captured_unit` is the proof of "same unit";
-    // anything else is a collision and aborts the scan.
+    // anything else is a collision and aborts the scan, with both
+    // records in the error so the field that tells them apart is on
+    // the page.
     if !same_captured_unit(&existing.captured, &candidate.captured) {
         return Err(stow_types::stow_error!(
-            "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record",
+            "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record:\n{}\n{}",
             candidate.captured.crate_name,
             candidate
                 .captured
@@ -382,7 +385,9 @@ fn select_captured_artifact(
                 .as_deref()
                 .unwrap_or("<unknown>"),
             candidate.captured.c_metadata,
-            candidate.captured.emit
+            candidate.captured.emit,
+            serde_json::to_string(&existing.captured)?,
+            serde_json::to_string(&candidate.captured)?
         ));
     }
     // The first capture survives: both records carry the same stable
@@ -412,12 +417,14 @@ fn select_captured_artifact(
 ///
 /// A legitimate repeat is told from a forgery by what the record itself
 /// carries: `out_dir`, `target_dir`, `build_script_out_dir`, the output
-/// and dependency paths, and the snapshots are entitled to differ — they
-/// are where the unit happened to be written this time. Everything that
-/// identifies the unit — the full compile key, target, profile, crate
-/// types, version, extra filename and dependency identities — must be
-/// equal, and the outputs must be the same files modulo the directory
-/// they were written to. Anything else is a collision.
+/// and dependency paths, the snapshots and the alias's file name are
+/// entitled to differ — they are where the unit happened to be written
+/// this time, and under what invocation-specific hash cargo asked for
+/// the output. Everything that identifies the unit — the full compile
+/// key, target, profile, crate types, version, extra filename and
+/// dependency identities — must be equal, and the outputs must be the
+/// same files modulo the directory they were written to and, for the
+/// alias, modulo the name cargo asked for. Anything else is a collision.
 ///
 /// No byte comparison is needed on top of that: the compile key already
 /// blake3s the whole invocation, so records agreeing on it and the rest
@@ -459,23 +466,28 @@ fn same_dependency_identities(
 }
 
 /// Whether two records describe the same outputs written to different
-/// directories: the same kind and file name per output. rlib and rmeta
-/// carry nothing path-dependent, so their recorded digests must match
-/// outright; a dynamic library is exempt because the linker writes the
-/// path it was produced at into the file (the Mach-O install name, and
-/// on MSVC the sibling .pdb path in the PE debug directory), so the same
-/// module legitimately hashes differently per output directory.
+/// directories: the same kind per output, and the same file name for the
+/// stable-named outputs — the alias cargo originally asked for is
+/// compared by kind and digest alone, since its name is cargo's
+/// per-invocation unit hash rather than the unit's (stow#692). rlib and
+/// rmeta carry nothing path-dependent, so their recorded digests must
+/// match outright; a dynamic library is exempt because the linker writes
+/// the path it was produced at into the file (the Mach-O install name,
+/// and on MSVC the sibling .pdb path in the PE debug directory), so the
+/// same module legitimately hashes differently per output directory.
 /// Snapshot paths are excluded — they are per-capture temp names.
 fn captured_outputs_match(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
-    let mut left_outputs = left.outputs.iter().collect::<Vec<_>>();
-    let mut right_outputs = right.outputs.iter().collect::<Vec<_>>();
-    let by_kind_and_name = |a: &&CapturedRustcOutput, b: &&CapturedRustcOutput| {
-        a.kind
-            .cmp(&b.kind)
-            .then(a.path.file_name().cmp(&b.path.file_name()))
-    };
-    left_outputs.sort_by(by_kind_and_name);
-    right_outputs.sort_by(by_kind_and_name);
+    fn by_kind_and_stable_name(record: &CapturedRustcArtifact) -> Vec<&CapturedRustcOutput> {
+        let mut outputs = record.outputs.iter().collect::<Vec<_>>();
+        outputs.sort_by(|a, b| {
+            a.kind
+                .cmp(&b.kind)
+                .then(stable_output_name(record, a).cmp(&stable_output_name(record, b)))
+        });
+        outputs
+    }
+    let left_outputs = by_kind_and_stable_name(left);
+    let right_outputs = by_kind_and_stable_name(right);
     if left_outputs.len() != right_outputs.len() {
         return false;
     }
@@ -484,10 +496,32 @@ fn captured_outputs_match(left: &CapturedRustcArtifact, right: &CapturedRustcArt
         .zip(&right_outputs)
         .all(|(output, peer)| {
             output.kind == peer.kind
-                && output.path.file_name() == peer.path.file_name()
+                && stable_output_name(left, output) == stable_output_name(right, peer)
                 && (output.kind == CapturedRustcOutputKind::DynamicLibrary
                     || output.sha256 == peer.sha256)
         })
+}
+
+/// An output's file name when it is the unit's own stable name, `None`
+/// for the alias cargo originally asked for. The alias's name identifies
+/// nothing: it carries cargo's unit hash for this invocation, which
+/// covers the profiles of the unit's whole dependency chain as that
+/// invocation resolved them and so differs between two phases compiling
+/// one and the same unit (stow#692).
+fn stable_output_name<'a>(
+    record: &CapturedRustcArtifact,
+    output: &'a CapturedRustcOutput,
+) -> Option<&'a OsStr> {
+    if !record.extra_filename.is_empty()
+        && output
+            .path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().ends_with(&record.extra_filename))
+    {
+        output.path.file_name()
+    } else {
+        None
+    }
 }
 
 /// The build's half of the graph contract: this task compiles its own
@@ -1614,6 +1648,11 @@ mod tests {
         let error = select_captured_artifact(&mut selected, key, second)
             .expect_err("different outputs under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
+        // Both records travel in the error: which field tells them apart
+        // is the whole diagnosis (stow#692).
+        let surviving_digest = &selected.values().next().expect("first").captured.outputs[0].sha256;
+        assert!(error.to_string().contains(surviving_digest), "{error}");
+        assert!(error.to_string().contains(&"ff".repeat(32)), "{error}");
     }
 
     /// The `x86_64-pc-windows-msvc` production collision this fix is scoped
@@ -1742,6 +1781,155 @@ mod tests {
         let error = select_captured_artifact(&mut selected, key, second)
             .expect_err("a different compile key under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
+    }
+
+    /// stow#692: two captures of one host-side unit — the `psm 0.1.24`
+    /// build dependency compiled by `cargo check` and `cargo build`
+    /// under the native spelling — differ only in the name of the alias
+    /// cargo originally asked for, which carries each invocation's own
+    /// unit hash. The stable-named outputs pair by name, the aliases by
+    /// kind and digest, and the records merge.
+    #[test]
+    fn captures_differing_only_in_the_alias_name_are_one_unit() {
+        let key = psm_key();
+        let mut selected = BTreeMap::new();
+        let first = psm_selection(psm_capture(
+            "/tmp/workspace/target-check-native",
+            "8e5bdc87bc91e8f0",
+        ));
+        let second = psm_selection(psm_capture(
+            "/tmp/workspace/target-build-native",
+            "a40c71aa8d26bf90",
+        ));
+
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        let merged = select_captured_artifact(&mut selected, key.clone(), second)
+            .expect("captures differing only in the alias name are one unit");
+        assert!(merged, "the second capture merges into the first");
+
+        let stored = selected.get(&key).expect("selected capture");
+        assert!(
+            stored.dependency_aliases.contains(&PathBuf::from(
+                "/tmp/workspace/target-build-native/debug/deps/libpsm-a40c71aa8d26bf90.rlib"
+            )),
+            "the dropped half's alias paths stay resolvable"
+        );
+    }
+
+    /// The alias is compared by kind and digest, so the same two captures
+    /// colliding on genuinely different alias bytes is a forged or
+    /// colliding record — never a merge.
+    #[test]
+    fn an_alias_with_different_bytes_is_still_a_collision() {
+        let key = psm_key();
+        let mut selected = BTreeMap::new();
+        let first = psm_selection(psm_capture(
+            "/tmp/workspace/target-check-native",
+            "8e5bdc87bc91e8f0",
+        ));
+        let mut build_capture =
+            psm_capture("/tmp/workspace/target-build-native", "a40c71aa8d26bf90");
+        build_capture.outputs[2].sha256 = "ff".repeat(32);
+        let second = psm_selection(build_capture);
+
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second)
+            .expect_err("different alias bytes under one key must fail");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
+    }
+
+    /// Renaming a stable-named output does not turn it into an alias: a
+    /// second record whose stable rlib carries a foreign hash falls out
+    /// of the stable-name pairing and collides, because the stable name
+    /// is the unit's identity.
+    #[test]
+    fn a_stable_output_under_another_name_is_still_a_collision() {
+        let key = psm_key();
+        let mut selected = BTreeMap::new();
+        let first = psm_selection(psm_capture(
+            "/tmp/workspace/target-check-native",
+            "8e5bdc87bc91e8f0",
+        ));
+        let mut build_capture =
+            psm_capture("/tmp/workspace/target-build-native", "a40c71aa8d26bf90");
+        build_capture.outputs[0].path = PathBuf::from(
+            "/tmp/workspace/target-build-native/debug/deps/libpsm-ffffffffffffffff.rlib",
+        );
+        let second = psm_selection(build_capture);
+
+        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second)
+            .expect_err("a stable output under another name must fail");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
+    }
+
+    /// The selection key the `psm 0.1.24` host-side captures share.
+    fn psm_key() -> (String, String, String, String, Option<UnitInvocation>) {
+        (
+            "psm".to_owned(),
+            "cc065d16221ef4be".to_owned(),
+            ArtifactKind::Rlib.as_str().to_owned(),
+            "[\"dep-info\",\"link\"]".to_owned(),
+            Some(UnitInvocation::Native),
+        )
+    }
+
+    /// One `psm 0.1.24` capture as a selection candidate.
+    fn psm_selection(captured: CapturedRustcArtifact) -> SelectedCapturedArtifact {
+        SelectedCapturedArtifact {
+            package: IndexedPackage {
+                name: "psm".to_owned(),
+                version: semver::Version::parse("0.1.24").expect("version"),
+                lib_target_name: "psm".to_owned(),
+                crate_types: vec![RustCrateType::Rlib],
+                registry: true,
+            },
+            artifact_kind: ArtifactKind::Rlib,
+            captured,
+            dependency_aliases: Vec::new(),
+        }
+    }
+
+    /// A capture of the `psm 0.1.24` host-side unit: the stable-named
+    /// rlib and rmeta plus the same bytes under the alias cargo
+    /// originally asked for, the alias named with this invocation's own
+    /// unit hash (`alias_hash`) which differs between phases (stow#692).
+    fn psm_capture(target_dir: &str, alias_hash: &str) -> CapturedRustcArtifact {
+        let out_dir = format!("{target_dir}/debug/deps");
+        let mut capture = captured("psm", "cc065d16221ef4be", &out_dir);
+        capture.crate_version = Some("0.1.24".to_owned());
+        capture.invocation = Some(UnitInvocation::Native);
+        capture.target_dir = PathBuf::from(target_dir);
+        let output =
+            |kind: CapturedRustcOutputKind, name: String, sha256: &str| CapturedRustcOutput {
+                kind,
+                path: PathBuf::from(format!("{out_dir}/{name}")),
+                snapshot_path: None,
+                sha256: sha256.to_owned(),
+            };
+        capture.outputs = vec![
+            output(
+                CapturedRustcOutputKind::Rlib,
+                "libpsm-cc065d16221ef4be.rlib".to_owned(),
+                &"aa".repeat(32),
+            ),
+            output(
+                CapturedRustcOutputKind::Rmeta,
+                "libpsm-cc065d16221ef4be.rmeta".to_owned(),
+                &"bb".repeat(32),
+            ),
+            output(
+                CapturedRustcOutputKind::Rlib,
+                format!("libpsm-{alias_hash}.rlib"),
+                &"aa".repeat(32),
+            ),
+            output(
+                CapturedRustcOutputKind::Rmeta,
+                format!("libpsm-{alias_hash}.rmeta"),
+                &"bb".repeat(32),
+            ),
+        ];
+        capture
     }
 
     /// A host-side task runs every phase under both invocation spellings
