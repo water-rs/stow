@@ -199,6 +199,31 @@ pub async fn resolve_exact_dependency_graph(
     host_triple: &str,
     rustc_version: &stow_types::identity::WireRustcVersion,
 ) -> stow_types::error::Result<ExpandedDependencyGraph> {
+    let (mut unit_graph, subcommand) =
+        unit_graph_command(manifest_path, action, cargo_args, current_dir).await?;
+    let unit_graph_output = unit_graph
+        .output()
+        .await
+        .wrap_err("spawn cargo --unit-graph")?;
+    expand_unit_graph_output(
+        unit_graph_output,
+        subcommand,
+        target,
+        host_triple,
+        rustc_version,
+    )
+    .await
+}
+
+/// The command half of [`resolve_exact_dependency_graph`]: the `cargo
+/// <subcommand> --unit-graph` invocation, built but not yet spawned,
+/// and the subcommand name the failure's error text uses (stow#667).
+async fn unit_graph_command(
+    manifest_path: &Path,
+    action: &str,
+    cargo_args: &[OsString],
+    current_dir: &Path,
+) -> stow_types::error::Result<(Command, &'static str)> {
     let subcommand = unit_graph_subcommand(action)?;
     let mut unit_graph = Command::new("cargo");
     unit_graph
@@ -241,22 +266,28 @@ pub async fn resolve_exact_dependency_graph(
         unit_graph.arg("--manifest-path").arg(manifest_path);
     }
     unit_graph.args(cargo_args);
+    Ok((unit_graph, subcommand))
+}
 
-    let unit_graph_output = unit_graph
-        .output()
-        .await
-        .wrap_err("spawn cargo --unit-graph")?;
-    if !unit_graph_output.status.success() {
+/// The read half of [`resolve_exact_dependency_graph`]'s run: the
+/// status check, then the parse and the expansion, which walk cargo's
+/// whole unit table — input that grows with the workspace — on a
+/// blocking thread (stow#624).
+async fn expand_unit_graph_output(
+    output: async_process::Output,
+    subcommand: &str,
+    target: Option<&str>,
+    host_triple: &str,
+    rustc_version: &stow_types::identity::WireRustcVersion,
+) -> stow_types::error::Result<ExpandedDependencyGraph> {
+    if !output.status.success() {
         return Err(stow_types::stow_error!(
             "cargo {subcommand} --unit-graph failed on toolchain {}: {}",
             rustc_version.as_str(),
-            String::from_utf8_lossy(&unit_graph_output.stderr).trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    // The parse and the expansion walk cargo's whole unit table — input
-    // that grows with the workspace — so they run on a blocking thread
-    // (stow#624).
-    let stdout = unit_graph_output.stdout;
+    let stdout = output.stdout;
     let target = target.map(str::to_owned);
     let host_triple = host_triple.to_owned();
     let rustc_version = rustc_version.clone();
@@ -267,6 +298,84 @@ pub async fn resolve_exact_dependency_graph(
         Ok(graph)
     })
     .await
+}
+
+/// [`resolve_exact_dependency_graph`] under the drain's derivation
+/// gate: a stow command connecting to the slot's listener kills the
+/// cargo child — killed and reaped before the requester's connection
+/// closes, so a released command never queues behind a drain cargo
+/// that still holds the package-cache lock (stow#667). `Ok(None)` is
+/// the stopped run: the drain keeps the units journaled.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_exact_dependency_graph_stoppable(
+    manifest_path: &Path,
+    action: &str,
+    cargo_args: &[OsString],
+    target: Option<&str>,
+    current_dir: &Path,
+    host_triple: &str,
+    rustc_version: &stow_types::identity::WireRustcVersion,
+    slot: &mut crate::derive_gate::DerivationSlot,
+) -> stow_types::error::Result<Option<ExpandedDependencyGraph>> {
+    let (mut unit_graph, subcommand) =
+        unit_graph_command(manifest_path, action, cargo_args, current_dir).await?;
+    unit_graph
+        .stdout(async_process::Stdio::piped())
+        .stderr(async_process::Stdio::piped());
+    let mut child = unit_graph.spawn().wrap_err("spawn cargo --unit-graph")?;
+    match run_stoppable_child(&mut child, slot).await? {
+        Some(output) => {
+            expand_unit_graph_output(output, subcommand, target, host_triple, rustc_version)
+                .await
+                .map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Drive `child` to its end — both pipes read concurrently so the
+/// child never stalls on a full one — or kill it when a stow command
+/// connects to the slot's listener (stow#667). The kill is explicit
+/// and awaited, not `kill_on_drop`'s: the slot keeps the requester
+/// parked on the connection until the child is reaped, so the
+/// requester is released only once the child holds no package-cache
+/// lock.
+///
+/// `Ok(None)` is the stopped run.
+async fn run_stoppable_child(
+    child: &mut async_process::Child,
+    slot: &mut crate::derive_gate::DerivationSlot,
+) -> stow_types::error::Result<Option<async_process::Output>> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| stow_types::stow_error!("the stoppable child's stdout pipe is missing"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| stow_types::stow_error!("the stoppable child's stderr pipe is missing"))?;
+    let pipes = async move {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        futures_lite::future::try_zip(
+            futures_lite::AsyncReadExt::read_to_end(&mut stdout, &mut out),
+            futures_lite::AsyncReadExt::read_to_end(&mut stderr, &mut err),
+        )
+        .await?;
+        std::io::Result::Ok((out, err))
+    };
+    tokio::select! {
+        output = pipes => {
+            let (stdout, stderr) = output.wrap_err("read the stoppable child's pipes")?;
+            let status = child.status().await.wrap_err("await the stoppable child's exit")?;
+            Ok(Some(async_process::Output { status, stdout, stderr }))
+        }
+        () = slot.stop_requested() => {
+            child.kill().wrap_err("kill the stoppable child")?;
+            child.status().await.wrap_err("await the stopped child's exit")?;
+            Ok(None)
+        }
+    }
 }
 
 /// The read half of [`resolve_exact_dependency_graph`].
@@ -315,10 +424,11 @@ pub fn expanded_dependency_graph(
 /// The cargo subcommand whose unit graph each wrapped action compiles;
 /// `predict` answers what `check` compiles. Only the actions stow
 /// wraps (`check`, `build`, `test`, `predict`) reach this mapping.
-fn unit_graph_subcommand(action: &str) -> stow_types::error::Result<&str> {
+fn unit_graph_subcommand(action: &str) -> stow_types::error::Result<&'static str> {
     Ok(match action {
         "check" | "predict" => "check",
-        "build" | "test" => action,
+        "build" => "build",
+        "test" => "test",
         other => {
             return Err(stow_types::stow_error!(
                 "stow action `{other}` has no cargo unit-graph subcommand"
@@ -3327,5 +3437,60 @@ mod unit_graph_tests {
             vec![("a", false), ("h", true)],
             "the unselected platform's units are excluded, host units kept"
         );
+    }
+}
+/// stow#667: the gated run's stop path — the drain's cargo child is
+/// killed and reaped before the stopping command is released.
+#[cfg(all(test, unix))]
+mod stoppable_child_tests {
+    use super::{Command, run_stoppable_child};
+    use crate::derive_gate::{DerivationGate, ForegroundHold};
+
+    /// The requester parks on the slot's connection until the child is
+    /// dead *and* reaped: when the helper answers "stopped", the
+    /// child's pid already names no live process.
+    #[tokio::test]
+    async fn a_stop_kills_the_child_before_the_requester_is_released() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gate_dir = dir.path().join("gate");
+        let mut gate = DerivationGate::unopened(gate_dir.clone());
+        let enter = {
+            let slot = gate
+                .slot()
+                .await
+                .expect("the gate opens with no command present");
+            let mut command = Command::new("sleep");
+            command
+                .arg("30")
+                .stdout(async_process::Stdio::piped())
+                .stderr(async_process::Stdio::piped());
+            let mut child = command.spawn().expect("spawn sleep");
+            let pid = child.id();
+            let enter = tokio::spawn({
+                let gate_dir = gate_dir.clone();
+                async move { ForegroundHold::enter(&gate_dir).await }
+            });
+            let outcome = run_stoppable_child(&mut child, slot)
+                .await
+                .expect("run the gated child");
+            assert!(outcome.is_none(), "the run reports stopped");
+            // Reaped, not merely signaled: `ESRCH` is the answer a
+            // dead pid gives.
+            let pid = i32::try_from(pid).expect("pid fits i32");
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH),
+                "the stopped child's pid is dead when the helper returns"
+            );
+            assert!(
+                !enter.is_finished(),
+                "the command still waits on the open stop connection"
+            );
+            enter
+        };
+        gate.shut().await;
+        let hold = enter.await.expect("enter task").expect("enter");
+        hold.release();
     }
 }

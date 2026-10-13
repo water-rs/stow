@@ -1913,7 +1913,7 @@ fn acquire_version_shared_lock(
 /// lock. The platform error differs (`EWOULDBLOCK` on Unix,
 /// `ERROR_LOCK_VIOLATION` on Windows, which maps to no `ErrorKind`), so the
 /// comparison goes through fs2's own contended-error value.
-fn is_lock_contended(error: &std::io::Error) -> bool {
+pub fn is_lock_contended(error: &std::io::Error) -> bool {
     error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 

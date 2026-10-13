@@ -226,9 +226,24 @@ async fn begin_project(
         .in_scope(|| ProjectContext::begin(invocation))?;
     let mold = spawn_mold_provision(&pending, config);
     let env_base = spawn_env_base(config, &pending);
-    let mut project = pending.finish(mold).await?;
+    let mut project = pending.finish(mold, enter_foreground_hold()).await?;
     project.env_base = env_base;
     Ok(project)
+}
+
+/// The command's claim on the package-cache lock's next holder: while
+/// it is held, no miss drain starts a derivation cargo of its own, and
+/// entering stops every derivation already running (stow#667). The
+/// gate directory is the cargo home's, because the lock is.
+async fn enter_foreground_hold() -> stow_types::error::Result<crate::derive_gate::ForegroundHold> {
+    let gate_dir = crate::config::cargo_home()
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "resolve the cargo home — neither $CARGO_HOME nor a home directory is available"
+            )
+        })?
+        .join("stow");
+    crate::derive_gate::ForegroundHold::enter(&gate_dir).await
 }
 
 async fn run_inner(command: &str, args: CargoCommandArgs) -> stow_types::error::Result<ExitStatus> {
@@ -718,6 +733,7 @@ fn build_mirror_project_context(
         mold: project.mold.clone(),
         env_base: project.env_base.clone(),
         build_rustc: project.build_rustc.clone(),
+        foreground: project.foreground.clone(),
     })
 }
 
@@ -831,6 +847,11 @@ pub struct ProjectContext {
     /// set, else the toolchain's — the executable every driver-side
     /// probe names (stow#608).
     pub(crate) build_rustc: rustc_args::BuildRustc,
+    /// The hold keeping miss drains' derivation cargo off the
+    /// package-cache lock while this command's cargo may need it —
+    /// taken where the context is begun, released once cargo's
+    /// resolution is over (stow#667).
+    pub(crate) foreground: crate::derive_gate::ForegroundHold,
 }
 
 /// The build's target triple while rustc is still answering: `Shared` so
@@ -1031,7 +1052,7 @@ impl ProjectContext {
         // would be work nothing reads — the deferred selection runs
         // only if something awaits it (stow#653).
         let mold = defer_mold_provision(&pending);
-        pending.finish(mold).await
+        pending.finish(mold, enter_foreground_hold()).await
     }
 
     fn current_dir(&self) -> &Path {
@@ -1040,18 +1061,24 @@ impl ProjectContext {
 }
 
 impl PendingProjectContext {
-    /// Join the probes `begin` spawned; `mold` is the selection the
-    /// caller chose — started for a build, deferred for a context that
-    /// assembles no cargo build (stow#653).
-    async fn finish(self, mold: MoldSelection) -> stow_types::error::Result<ProjectContext> {
-        let target = self
-            .target
-            .await
-            .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
-        let rustc_version = self
-            .rustc_version
-            .await
+    /// Join the probes `begin` spawned and the foreground hold being
+    /// taken beside them; `mold` is the selection the caller chose —
+    /// started for a build, deferred for a context that assembles no
+    /// cargo build (stow#653).
+    async fn finish(
+        self,
+        mold: MoldSelection,
+        foreground: impl std::future::Future<
+            Output = stow_types::error::Result<crate::derive_gate::ForegroundHold>,
+        >,
+    ) -> stow_types::error::Result<ProjectContext> {
+        let (target, rustc_version, foreground) =
+            tokio::join!(self.target, self.rustc_version, foreground);
+        let target =
+            target.map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+        let rustc_version = rustc_version
             .map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
+        let foreground = foreground?;
         Ok(ProjectContext {
             action: self.action,
             cargo_args: self.cargo_args,
@@ -1066,6 +1093,7 @@ impl PendingProjectContext {
             mold,
             env_base: None,
             build_rustc: self.build_rustc,
+            foreground,
         })
     }
 }
@@ -2253,14 +2281,14 @@ async fn try_stow_resolver(
         return Ok(None);
     };
 
-    run_pinned_mirror_build(
+    Box::pin(run_pinned_mirror_build(
         config,
         project,
         invocation,
         &pinned,
         &public_cache_mode,
         mirror_analysis,
-    )
+    ))
     .await
 }
 
@@ -4078,11 +4106,16 @@ async fn run_cargo_passthrough(
     cargo_args: &[OsString],
     current_dir: &Path,
 ) -> stow_types::error::Result<ExitStatus> {
-    passthrough_command(project, action, cargo_args, current_dir)
+    let status = passthrough_command(project, action, cargo_args, current_dir)
         .await?
         .status()
         .await
-        .wrap_err_with(|| format!("run cargo {action} (passthrough)"))
+        .wrap_err_with(|| format!("run cargo {action} (passthrough)"))?;
+    // Cargo's status is back, so its resolution — the only stretch that
+    // needs the package-cache lock exclusively — is over: drains may
+    // derive again (stow#667).
+    project.foreground.release();
+    Ok(status)
 }
 
 /// The passthrough's cargo invocation: the action, the build's mold
@@ -4219,6 +4252,12 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // over — so the package-cache lock always goes to the real build
     // first (stow#608).
     let resolution_done = crate::ResolutionDone::pending();
+    // The foreground hold's release task: `ResolutionDone` is the
+    // moment cargo holds the package-cache lock only shared, so a
+    // drain's cargo can no longer make this build wait — and a `stow
+    // run` that stays up for hours must not keep every drain shut
+    // (stow#667). It is stopped with cargo below.
+    let release_hold = spawn_hold_release(resolution_done.clone(), project.foreground.clone());
     // The supervisor and the handler share the build's in-flight unit
     // registry: the server marks and completes flights, the post-compiles
     // wait on them before resolving dependency identities (stow#618).
@@ -4275,10 +4314,12 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // The analysis stops with cargo, whichever way cargo ended: its
     // future is dropped here — and with it the `kill_on_drop` cargo
     // children it may still be driving — before anything else runs
-    // (stow#624).
+    // (stow#624). The release task stops too — a hold released after
+    // this build ends would open the gate on a lie.
     if let Some(enricher) = enricher {
-        stop_build_enrichment(enricher).await;
+        stop_build_task(enricher).await;
     }
+    stop_build_task(release_hold).await;
     let status = status.wrap_err_with(|| format!("run cargo {action}"))?;
     // Cargo has exited, so every facade has: stop accepting and drain the
     // last connections' post-compile bookkeeping before the runtime goes
@@ -4293,7 +4334,10 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         // — a failed build's units are real misses too, whatever its
         // last unit did. They land in the same journal a plain-cargo
         // wrapper writes, and a detached drain posts the admission —
-        // this command returns as soon as cargo does.
+        // this command returns as soon as cargo does. The hold is
+        // given up first: the drain this build spawns must find the
+        // gate open (stow#667).
+        project.foreground.release();
         journal_and_drain_misses(project, cargo_args, current_dir, &handler.observations());
     }
     // Nothing writes into the scratch directory any more — cargo has
@@ -4381,12 +4425,25 @@ async fn seed_cache_policy(
     }
 }
 
-/// Abort the in-build analysis and return once its future is gone, so
-/// nothing of it outlives the build: no write into the scratch
-/// directory, no cargo child. A panic inside it is the build's panic.
-async fn stop_build_enrichment(enricher: tokio::task::JoinHandle<()>) {
-    enricher.abort();
-    match enricher.await {
+/// The task `run_cargo` stops with cargo: release the foreground hold
+/// the moment `resolution_done` fires (stow#667).
+fn spawn_hold_release(
+    resolution_done: crate::ResolutionDone,
+    foreground: crate::derive_gate::ForegroundHold,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        resolution_done.wait().await;
+        foreground.release();
+    })
+}
+
+/// Abort a build-scoped task — the in-build analysis, the foreground
+/// hold's release — and return once its future is gone, so nothing of
+/// it outlives the build: no write into the scratch directory, no
+/// cargo child. A panic inside it is the build's panic.
+async fn stop_build_task(task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    match task.await {
         Ok(()) => {}
         Err(error) if error.is_cancelled() => {}
         Err(error) => std::panic::resume_unwind(error.into_panic()),
@@ -4593,7 +4650,7 @@ struct BuildEnrichment {
 /// the plan path keeps its conservative defaults.
 fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
-        if let Err(error) = run_build_enrichment(work).await {
+        if let Err(error) = Box::pin(run_build_enrichment(work)).await {
             tracing::warn!(
                 error = %error,
                 "background build analysis failed; the build keeps its filesystem-only plan"
@@ -5190,6 +5247,7 @@ mod tests {
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
+            foreground: crate::derive_gate::ForegroundHold::detached(),
         }
     }
 
@@ -5541,6 +5599,7 @@ mod tests {
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
+            foreground: crate::derive_gate::ForegroundHold::detached(),
         };
         let mirror = create_workspace_mirror(&project, &project.workspace_root)
             .await

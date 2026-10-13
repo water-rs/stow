@@ -30,6 +30,7 @@ mod circuit;
 mod cli_args;
 mod commands;
 mod config;
+mod derive_gate;
 mod edge_client;
 mod facade;
 mod fetch;
