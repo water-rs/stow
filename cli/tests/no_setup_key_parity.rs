@@ -33,13 +33,15 @@ fn dead_edge_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-fn write_probe_project(dir: &Path) {
+/// `extra_manifest` follows the `[dependencies]` table: the tables a
+/// test adds to the probe's manifest, such as a profile.
+fn write_probe_project(dir: &Path, extra_manifest: &str) {
     std::fs::create_dir_all(dir.join("src")).expect("create src dir");
     std::fs::write(
         dir.join("Cargo.toml"),
         format!(
             "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\n{PROBE_PACKAGE} = \"={PROBE_DEP_VERSION}\"\n"
+             [dependencies]\n{PROBE_PACKAGE} = \"={PROBE_DEP_VERSION}\"\n{extra_manifest}"
         ),
     )
     .expect("write manifest");
@@ -138,7 +140,7 @@ fn a_setup_free_build_keys_like_the_setup_path() {
     }
     let root = tempfile::tempdir().expect("temp dir");
     let project = root.path().join("project");
-    write_probe_project(&project);
+    write_probe_project(&project, "");
     let edge_url = dead_edge_url();
     let cache_dir = root.path().join("stow-cache");
 
@@ -183,5 +185,40 @@ fn a_setup_free_build_keys_like_the_setup_path() {
         compile_key_of(&setup_argv),
         compile_key_of(&no_setup_argv),
         "the no-setup `--config` selection keys differently from the written config"
+    );
+}
+
+/// Linux only — mold provisioning is the Linux half of the contract.
+///
+/// stow#653: a workspace whose dev profile enables `lto` takes the
+/// divergent-profile passthrough — one of the early returns that ran
+/// cargo before the mold provisioning was joined. The passthrough is
+/// still a cargo build, so on Linux it must carry the provisioned
+/// linker selection.
+#[test]
+fn a_passthrough_build_links_with_mold_without_setup() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let root = tempfile::tempdir().expect("temp dir");
+    let project = root.path().join("project");
+    write_probe_project(&project, "\n[profile.dev]\nlto = true\n");
+    let edge_url = dead_edge_url();
+    let cache_dir = root.path().join("stow-cache");
+
+    let bare_home: PathBuf = root.path().join("bare-cargo-home");
+    let argv = rustc_argv_for(
+        &verbose_build(&project, &bare_home, &edge_url, &cache_dir),
+        PROBE_CRATE,
+    );
+
+    // The probe is a proc-macro, so cargo links it on this path too.
+    let parsed = ParsedRustcArgs::parse(&argv).expect("parse rustc argv");
+    let link_options = parsed.link_options_reaching_the_linker();
+    assert!(
+        link_options
+            .iter()
+            .any(|option| option.contains("fuse-ld=mold")),
+        "passthrough invocation reaches the linker without selecting mold: {link_options:?}"
     );
 }

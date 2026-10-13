@@ -296,7 +296,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{cache_key, normalized_args};
-    use crate::cargo_cmd::{MetadataArgs, ProjectContext};
+    use crate::cargo_cmd::{MetadataArgs, MoldSelection, ProjectContext};
     use crate::workspace_deps::ExpandedDependencyGraph;
 
     fn project(dir: &std::path::Path, manifest: &std::path::Path) -> ProjectContext {
@@ -311,7 +311,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".to_owned(),
             target_given: false,
             rustc_version: "1.99.0".to_owned(),
-            mold_config_args: Vec::new(),
+            mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
             build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
         }
