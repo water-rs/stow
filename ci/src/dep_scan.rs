@@ -371,10 +371,12 @@ fn select_captured_artifact(
     // and a split unit graph captures the host and requested-target
     // halves into sibling `deps` dirs — or a forged replay.
     // `same_captured_unit` is the proof of "same unit";
-    // anything else is a collision and aborts the scan.
+    // anything else is a collision and aborts the scan, with both
+    // records in the error so the field that tells them apart is on
+    // the page.
     if !same_captured_unit(&existing.captured, &candidate.captured) {
         return Err(stow_types::stow_error!(
-            "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record",
+            "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record:\n{}\n{}",
             candidate.captured.crate_name,
             candidate
                 .captured
@@ -382,7 +384,9 @@ fn select_captured_artifact(
                 .as_deref()
                 .unwrap_or("<unknown>"),
             candidate.captured.c_metadata,
-            candidate.captured.emit
+            candidate.captured.emit,
+            serde_json::to_string(&existing.captured)?,
+            serde_json::to_string(&candidate.captured)?
         ));
     }
     // The first capture survives: both records carry the same stable
@@ -1614,6 +1618,11 @@ mod tests {
         let error = select_captured_artifact(&mut selected, key, second)
             .expect_err("different outputs under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
+        // Both records travel in the error: which field tells them apart
+        // is the whole diagnosis (stow#692).
+        let surviving_digest = &selected.values().next().expect("first").captured.outputs[0].sha256;
+        assert!(error.to_string().contains(surviving_digest), "{error}");
+        assert!(error.to_string().contains(&"ff".repeat(32)), "{error}");
     }
 
     /// The `x86_64-pc-windows-msvc` production collision this fix is scoped
