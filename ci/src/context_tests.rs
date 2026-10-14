@@ -60,6 +60,21 @@ fn publish_targeted(
         &'static [&'static str],
     )],
 ) -> String {
+    publish_manifest(reg, fixture, &fixture_manifest(fixture, target_deps))
+}
+
+/// The manifest `publish_targeted` writes for `fixture` — separate so a
+/// test can adjust the package table (say, `build = false`) before
+/// publishing.
+fn fixture_manifest(
+    fixture: &Fixture,
+    target_deps: &[(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+    )],
+) -> Value {
     let features: serde_json::Map<String, Value> = fixture
         .features
         .iter()
@@ -89,49 +104,72 @@ fn publish_targeted(
         manifest["target"][platform]["dependencies"][name] =
             json!({ "version": req, "features": feats });
     }
-    let mut lib = String::new();
     if fixture.proc_macro {
         manifest["lib"] = json!({ "proc-macro": true });
+    }
+    manifest
+}
+
+/// Pack `manifest` into the fixture's `.crate` and append its sparse-index
+/// line. The tarball ships a build script only when the manifest compiles
+/// one: `build = false` keeps declared `[build-dependencies]` resolved
+/// into the lockfile but never built — the `derive_more-impl 2.1.1`
+/// shape (stow#726).
+fn publish_manifest(reg: &Path, fixture: &Fixture, manifest: &Value) -> String {
+    let mut lib = String::new();
+    if fixture.proc_macro {
         lib.push_str("extern crate proc_macro;\n");
     }
-    let cksum = write_crate_tarball(reg, fixture, &manifest, &lib);
+    let build_script =
+        !fixture.build_deps.is_empty() && manifest["package"]["build"] != json!(false);
+    let cksum = write_crate_tarball(reg, fixture, manifest, &lib, build_script);
 
-    let dep_line = |deps: &[(&'static str, &'static str, &'static [&'static str])], kind: &str| {
-        deps.iter()
-            .map(|(name, req, feats)| {
-                json!({
-                    "name": name,
-                    "req": format!("^{req}"),
-                    "features": feats,
-                    "optional": false,
-                    "default_features": true,
-                    "target": null,
-                    "kind": kind,
-                })
-            })
+    // The index line's deps are the manifest's own tables, so the two
+    // can never disagree: a `req` is the declared `version` made exact,
+    // everything else is fixed.
+    let index_dep = |name: &str, spec: &Value, target: &Value, kind: &str| {
+        json!({
+            "name": name,
+            "req": format!("^{}", spec["version"].as_str().expect("dep version")),
+            "features": spec["features"],
+            "optional": false,
+            "default_features": true,
+            "target": target,
+            "kind": kind,
+        })
+    };
+    let table_deps = |table: &str, kind: &str| {
+        manifest[table]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, spec)| index_dep(name, spec, &Value::Null, kind))
             .collect::<Vec<_>>()
     };
-    let deps = dep_line(&fixture.deps, "normal")
+    let deps = table_deps("dependencies", "normal")
         .into_iter()
-        .chain(dep_line(&fixture.build_deps, "build"))
-        .chain(target_deps.iter().map(|(platform, name, req, feats)| {
-            json!({
-                "name": name,
-                "req": format!("^{req}"),
-                "features": feats,
-                "optional": false,
-                "default_features": true,
-                "target": platform,
-                "kind": "normal",
-            })
-        }))
+        .chain(table_deps("build-dependencies", "build"))
+        .chain(
+            manifest["target"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .flat_map(|(platform, targets)| {
+                    targets["dependencies"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .map(|(name, spec)| index_dep(name, spec, &json!(platform), "normal"))
+                        .collect::<Vec<_>>()
+                }),
+        )
         .collect::<Vec<_>>();
     let mut line = serde_json::to_string(&json!({
         "name": fixture.name,
         "vers": fixture.version,
         "deps": deps,
         "cksum": cksum,
-        "features": features,
+        "features": manifest["features"],
         "yanked": false,
     }))
     .expect("index line");
@@ -155,10 +193,17 @@ fn publish_targeted(
 }
 
 /// Write `<name>-<version>.crate` under `reg` with the given manifest and
-/// lib source, returning its sha256 hex (the index line's `cksum`). A
-/// crate with build-dependencies also carries the build script cargo
-/// needs to compile them.
-fn write_crate_tarball(reg: &Path, fixture: &Fixture, manifest: &Value, lib: &str) -> String {
+/// lib source, returning its sha256 hex (the index line's `cksum`).
+/// `build_script` appends the `build.rs` cargo needs to compile the
+/// manifest's build-dependencies — a crate whose manifest sets
+/// `build = false` ships none.
+fn write_crate_tarball(
+    reg: &Path,
+    fixture: &Fixture,
+    manifest: &Value,
+    lib: &str,
+    build_script: bool,
+) -> String {
     let tarball = reg.join(format!("{}-{}.crate", fixture.name, fixture.version));
     let file = std::fs::File::create(&tarball).expect("create crate tarball");
     let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -181,7 +226,7 @@ fn write_crate_tarball(reg: &Path, fixture: &Fixture, manifest: &Value, lib: &st
         format!("{}-{}/src/lib.rs", fixture.name, fixture.version),
         lib.to_owned(),
     );
-    if !fixture.build_deps.is_empty() {
+    if build_script {
         append(
             format!("{}-{}/build.rs", fixture.name, fixture.version),
             "fn main() {}\n".to_owned(),
@@ -1462,6 +1507,93 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
                 resolver_graph.task_id(resolver_parent),
                 cargo_graph.task_id(cargo_parent),
                 "{target}: resolver mints a different task id than cargo --unit-graph"
+            );
+        }
+    });
+}
+
+/// stow#726 end to end: `derive_more-impl 2.1.1` publishes `build =
+/// false` beside `[build-dependencies] rustc_version`, so cargo plans no
+/// unit for `rustc_version` at all. The closure the real unit graphs
+/// produce for `derive_more`'s target-side task demands `derive_more`
+/// and `derive_more-impl` — and neither admits nor demands
+/// `rustc_version`.
+#[test]
+fn a_build_edge_out_of_a_scriptless_package_mints_no_units() {
+    let _env = env_guard();
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "rustc_version",
+            version: "0.4.1",
+            deps: vec![],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: false,
+        },
+    );
+    // The `build = false` manifest: `[build-dependencies]` resolves into
+    // the lockfile but compiles nothing.
+    let impl_fixture = Fixture {
+        name: "derive_more-impl",
+        version: "2.1.1",
+        deps: vec![],
+        build_deps: vec![("rustc_version", "0.4", &[])],
+        features: &[],
+        proc_macro: false,
+    };
+    let mut impl_manifest = fixture_manifest(&impl_fixture, &[]);
+    impl_manifest["package"]["build"] = json!(false);
+    publish_manifest(&reg, &impl_fixture, &impl_manifest);
+    publish(
+        &reg,
+        &Fixture {
+            name: "derive_more",
+            version: "2.1.1",
+            deps: vec![("derive_more-impl", "2", &[])],
+            build_deps: vec![],
+            features: &[("default", &[])],
+            proc_macro: false,
+        },
+    );
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "derive_more": { "version": "2.1.1", "features": ["default"] } }),
+        &json!({}),
+    );
+    let requests = resolve_requests(cargo_home.path(), &manifest);
+    let task = payload_for(&request_for(&requests, "derive_more"));
+    assert!(!task.host_side, "derive_more's task is target-side");
+    assert_eq!(
+        task.features_json.raw(),
+        "[\"default\"]",
+        "a plain dependency resolves at default features"
+    );
+
+    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
+    smol::block_on(async {
+        let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+        task::fetch_workspace_dependencies(&task, &workspace)
+            .await
+            .expect("fetch deps");
+        let graphs = task::phase_unit_graphs(&task, &workspace, CargoSubcommand::Build)
+            .await
+            .expect("phase unit graphs");
+        task::verify_dependency_context(&task, &graphs).expect("the dispatched context verifies");
+        let (packages, lib_packages) =
+            crate::closure::package_sets(&task, &graphs).expect("closure");
+        for demanded in ["derive_more", "derive_more-impl"] {
+            assert!(
+                lib_packages.iter().any(|(name, _)| name == demanded),
+                "{demanded} is compiled and must be covered: {lib_packages:?}"
+            );
+        }
+        for set in [&packages, &lib_packages] {
+            assert!(
+                !set.iter().any(|(name, _)| name == "rustc_version"),
+                "cargo plans no rustc_version unit: {set:?}"
             );
         }
     });
