@@ -1787,14 +1787,17 @@ fn targets_android(target: &str) -> bool {
 /// out of `names` — the caller passes the parent environment's names at
 /// sandbox-build time, and the task's `target` decides which apply.
 ///
-/// Exact names cover the compiler drivers the `cc` crate and rustc invoke,
-/// the SDK roots those tools locate their install trees through, and
-/// pkg-config's sysroot wiring. The Android SDK/NDK roots
-/// (`ANDROID_ROOT_VARS`) count only for a task that targets Android; the
-/// runner image exports them whatever the job builds. The prefixed forms
-/// are the `cc` crate's per-target overrides (`CC_<target>`,
-/// `AR_<target>`, `CFLAGS_<target>`) plus cargo's per-target configuration
-/// (`CARGO_TARGET_<TRIPLE>_LINKER`, `_AR`, `_RUNNER`, `_RUSTFLAGS`).
+/// Exact names cover the compiler drivers the `cc` crate and rustc invoke
+/// and the SDK roots those tools locate their install trees through. The
+/// Android SDK/NDK roots (`ANDROID_ROOT_VARS`) count only for a task that
+/// targets Android; the runner image exports them whatever the job
+/// builds. The prefixed forms are the `cc` crate's per-target overrides
+/// (`CC_<target>`, `AR_<target>`, `CFLAGS_<target>`), cargo's per-target
+/// configuration (`CARGO_TARGET_<TRIPLE>_LINKER`, `_AR`, `_RUNNER`,
+/// `_RUSTFLAGS`), and the `pkg-config` crate's configuration in both its
+/// plain and its per-target spelling — the aarch64 job names its cross
+/// pkg-config in `PKG_CONFIG_aarch64_unknown_linux_gnu`, so a build
+/// script compiling for the host keeps the native one (stow#729).
 /// `CARGO_TARGET_DIR` is deliberately not a prefix match here —
 /// `CARGO_TARGET_DIR` is set explicitly per phase.
 fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec<String> {
@@ -1809,10 +1812,6 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "LDFLAGS",
         "SDKROOT",
         "DEVELOPER_DIR",
-        "PKG_CONFIG_PATH",
-        "PKG_CONFIG_LIBDIR",
-        "PKG_CONFIG_SYSROOT_DIR",
-        "PKG_CONFIG_ALLOW_CROSS",
         // The glibc sysroot root the Linux build job installs:
         // passthrough is what `toolchain_grant_dirs` keys on to grant
         // the whole tree (its bin/ holds the PATH-resolved driver shims).
@@ -1843,6 +1842,7 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "CXXFLAGS_",
         "CPPFLAGS_",
         "LDFLAGS_",
+        "PKG_CONFIG_",
     ];
     let android = targets_android(target);
     names
@@ -3537,6 +3537,18 @@ checksum = "33"
             ["CC_aarch64_linux_android".to_owned()].into_iter(),
         );
         assert_eq!(passed, ["CC_aarch64_linux_android"]);
+        let passed = toolchain_env_names(
+            "aarch64-unknown-linux-gnu",
+            [
+                "PKG_CONFIG_aarch64_unknown_linux_gnu".to_owned(),
+                "PKG_CONFIG_PATH".to_owned(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            passed,
+            ["PKG_CONFIG_aarch64_unknown_linux_gnu", "PKG_CONFIG_PATH"]
+        );
         for target in ["x86_64-unknown-linux-gnu", "aarch64-linux-android"] {
             assert!(
                 toolchain_env_names(target, ["CARGO_TARGET_DIR".to_owned()].into_iter()).is_empty(),
