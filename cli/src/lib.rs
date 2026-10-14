@@ -708,9 +708,12 @@ pub(crate) struct BuildContext {
     /// ledger: semantic fallback off, no candidates.
     pub(crate) analysis: std::sync::Arc<std::sync::OnceLock<AnalysisFacts>>,
     /// The "the serve map is final" signal `AwaitServeMap` frames wait
-    /// on: `run_cargo` shares the enrichment's with the supervisor, the
-    /// standalone wrapper's settles by construction — a driver with no
-    /// pending map answers at once (stow#347).
+    /// on — and the "the build's slice fetch has settled" signal the
+    /// slice memo's missing-slice read waits on (stow#735): `run_cargo`
+    /// shares the enrichment's with the supervisor and completes it
+    /// itself when no fetch is in flight; the standalone wrapper's
+    /// settles by construction — a driver with no pending map answers
+    /// at once (stow#347).
     pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
     /// The build's in-flight local compiles, shared with the supervisor:
     /// a post-compile waits on the ones its `--extern` set names before
@@ -1399,7 +1402,15 @@ async fn lookup_chain(
     {
         return RemoteServe::Served(notifications);
     }
-    try_remote_serves(env, parsed, &request, exact_public_cache_allowed, tally).await
+    try_remote_serves(
+        env,
+        parsed,
+        &request,
+        ctx,
+        exact_public_cache_allowed,
+        tally,
+    )
+    .await
 }
 
 /// Everything the cache path needs once every bypass-capable preparation
@@ -1508,10 +1519,11 @@ pub(crate) struct WrapperEnvCache {
     /// construction so the cache reads the environment the build
     /// invoked the wrapper with.
     path: OsString,
-    /// The verified index slices this build's lookups read — the driver
-    /// fetched them before cargo started, so each is decoded and keyed
-    /// once per `(target, rustc)` instead of once per rustc invocation
-    /// (stow#347).
+    /// The verified index slices this build's lookups read — the driver's
+    /// fetch can still be in flight when cargo starts, so a miss waits
+    /// on `serve_map_ready` before its answer is memoized (stow#735);
+    /// each slice is decoded and keyed once per `(target, rustc)`
+    /// instead of once per rustc invocation (stow#347).
     slices: MemoizedSliceMap,
     /// The circuit's tripped state, read once for the build and kept in
     /// step by the build's own recordings.
@@ -1635,14 +1647,17 @@ impl WrapperEnvCache {
 
     /// The decoded index slice for `(target, rustc)` — read, decompressed
     /// and keyed by `c_metadata` once per build rather than per
-    /// invocation. A missing slice is memoized (the driver fetched what
-    /// the build uses before cargo started); an error is not — it keeps
-    /// today's retry-and-warn semantics for a transient read failure.
+    /// invocation. A missing slice may still be in flight — the driver's
+    /// fetch runs beside cargo's build, not before it — so absence is
+    /// memoized only after `serve_map_ready` says the build's fetch has
+    /// settled (stow#735); an error is not — it keeps today's
+    /// retry-and-warn semantics for a transient read failure.
     async fn slice(
         &self,
         config: &StowConfig,
         target: &str,
         rustc_version: &str,
+        serve_map_ready: &crate::facade::ServeMapSignal,
     ) -> stow_types::error::Result<Option<std::sync::Arc<SliceIndex>>> {
         let key = (target.to_owned(), rustc_version.to_owned());
         let cell = self
@@ -1653,8 +1668,27 @@ impl WrapperEnvCache {
             .or_default()
             .clone();
         cell.get_or_try_init(|| async {
-            let Some(slice) = index::cached_slice(config, target, rustc_version).await? else {
-                return Ok(None);
+            let slice = if let Some(slice) =
+                index::cached_slice(config, target, rustc_version).await?
+            {
+                slice
+            } else {
+                // The fetch can still be in flight when cargo starts:
+                // wait out the build's `serve_map_ready`, then let the
+                // cache's second answer be the memoized one — only then
+                // is absence final for this build (stow#735).
+                let waited = std::time::Instant::now();
+                serve_map_ready.wait().await;
+                tracing::debug!(
+                    target = %target,
+                    rustc_version = %rustc_version,
+                    waited_ms = waited.elapsed().as_millis(),
+                    "index slice lookup waited for the build's fetch to settle"
+                );
+                let Some(slice) = index::cached_slice(config, target, rustc_version).await? else {
+                    return Ok(None);
+                };
+                slice
             };
             // The lookup table is one entry per row the slice publishes,
             // so it is built on a blocking thread like the decode behind
@@ -1922,6 +1956,7 @@ async fn try_remote_serves(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
+    ctx: &BuildContext,
     exact_public_cache_allowed: bool,
     tally: &mut LookupTally,
 ) -> RemoteServe {
@@ -1930,11 +1965,17 @@ async fn try_remote_serves(
     }
     // The slice read is cache-only: the driver's `ensure_slice` owns
     // freshness, and a registry round trip on every rustc invocation is
-    // exactly the cost the local index exists to remove. Absence is a miss,
-    // not an outage.
+    // exactly the cost the local index exists to remove. Absence is a
+    // miss — but only once `serve_map_ready` says the build's fetch has
+    // settled (stow#735); an in-flight one is waited out first.
     let slice = match env
         .env_cache
-        .slice(&env.env_base.config, &env.target, &env.rustc_version)
+        .slice(
+            &env.env_base.config,
+            &env.target,
+            &env.rustc_version,
+            &ctx.serve_map_ready,
+        )
         .await
     {
         Ok(Some(slice)) => slice,
@@ -4990,6 +5031,99 @@ mod tests {
             .expect("the bare spelling adopts the seed");
         assert!(std::sync::Arc::ptr_eq(&base, &seeded));
         assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// An empty index under the fixture header — the slice-memo tests
+    /// need a cached slice's presence, not its rows (stow#735).
+    fn empty_test_index(target: &str, rustc: &str) -> stow_types::index::ArtifactIndex {
+        stow_types::index::ArtifactIndex {
+            header: stow_types::index::ArtifactIndexHeader {
+                format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
+                target: stow_types::identity::TargetTriple::parse(target).expect("target"),
+                rustc_version: stow_types::identity::WireRustcVersion::parse(rustc)
+                    .expect("rustc version"),
+                generated_at: "2026-10-14T00:00:00Z".to_owned(),
+                generation: 1,
+                row_count: 0,
+            },
+            rows: Vec::new(),
+        }
+    }
+
+    /// stow#735: a slice the build is still fetching is not "absent"
+    /// yet — the first lookup parks on `serve_map_ready`, reads the
+    /// cache once more when the fetch settles, and that second answer
+    /// is what the memo keeps.
+    #[tokio::test]
+    async fn a_missing_slice_waits_for_the_builds_fetch() {
+        const TARGET: &str = "x86_64-unknown-linux-gnu";
+        const RUSTC: &str = "1.91.1";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = env_base_test_config(&dir);
+        let cache = test_cache(std::ffi::OsStr::new(""));
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
+
+        // The lookup starts while the slice is still absent: it must
+        // not answer before the build's fetch has settled.
+        let mut lookup = std::pin::pin!(cache.slice(&config, TARGET, RUSTC, &signal));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut lookup)
+                .await
+                .is_err(),
+            "the lookup answered while the build's fetch was still in flight"
+        );
+        let digest = crate::index::write_cached_test_slice(
+            &config,
+            TARGET,
+            RUSTC,
+            &empty_test_index(TARGET, RUSTC),
+        )
+        .await
+        .expect("write the slice the fetch landed");
+        signal.complete();
+        let slice = lookup
+            .await
+            .expect("read the cached slice")
+            .expect("the slice the fetch landed is served");
+        assert_eq!(slice.slice.manifest_digest, digest);
+    }
+
+    /// stow#735: once the build's fetch has settled, absence is final —
+    /// the memoized `None` answers every later lookup for the build,
+    /// even after a slice lands.
+    #[tokio::test]
+    async fn a_settled_absence_is_memoized_for_the_build() {
+        const TARGET: &str = "x86_64-unknown-linux-gnu";
+        const RUSTC: &str = "1.91.1";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = env_base_test_config(&dir);
+        let cache = test_cache(std::ffi::OsStr::new(""));
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::settled());
+
+        assert!(
+            cache
+                .slice(&config, TARGET, RUSTC, &signal)
+                .await
+                .expect("read the cached slice")
+                .is_none(),
+            "no slice once the fetch has settled reads as absent"
+        );
+        crate::index::write_cached_test_slice(
+            &config,
+            TARGET,
+            RUSTC,
+            &empty_test_index(TARGET, RUSTC),
+        )
+        .await
+        .expect("write a slice after the settled answer");
+        assert!(
+            cache
+                .slice(&config, TARGET, RUSTC, &signal)
+                .await
+                .expect("read the cached slice")
+                .is_none(),
+            "the settled absence is memoized for the rest of the build"
+        );
     }
 
     /// stow#615: the consumer's compile key is computed over the command
