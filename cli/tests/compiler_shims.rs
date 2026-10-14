@@ -70,6 +70,31 @@ fn resolved_cc(config: &toml::Value) -> String {
     }
 }
 
+/// The shims live under the cargo home that was configured — one
+/// directory per stow binary — so an isolated `CARGO_HOME` isolates its
+/// shims and no second install re-points them (stow#645).
+#[test]
+fn the_shims_live_under_the_cargo_home() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cargo_home = dir.path().join("cargo-home");
+    let config = setup_in(dir.path());
+    let rustc_wrapper = config
+        .get("build")
+        .and_then(|build| build.get("rustc-wrapper"))
+        .and_then(toml::Value::as_str)
+        .expect("generated config has no rustc-wrapper");
+    let shims_dir = cargo_home.join("stow").join("shims");
+    assert!(
+        Path::new(rustc_wrapper).starts_with(&shims_dir),
+        "rustc-wrapper {rustc_wrapper} is not under {}",
+        shims_dir.display()
+    );
+    assert!(
+        Path::new(rustc_wrapper).exists(),
+        "the rustc-wrapper shim {rustc_wrapper} does not exist"
+    );
+}
+
 #[test]
 fn cc_is_invoked_with_compiler_arguments_only() {
     let dir = tempfile::tempdir().expect("temp dir");

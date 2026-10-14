@@ -9,11 +9,13 @@ use stow_types::bundle::{
     STOW_RMETA_MEDIA_TYPE,
 };
 use stow_types::crate_info::{CrateId, FeatureSet};
+use stow_types::error::Context;
 use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
     DependencyCompileKeyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
 };
 use stow_types::platform::{Profile, RustcVersion, Target};
+use stow_types::public_cache::UnitSide;
 use stow_types::registry::oci_reference;
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
 
@@ -21,6 +23,7 @@ use crate::dep_scan::{
     ConsumedArtifact, ParsedFileKind, ScannedArtifact, ScannedArtifactDependency,
     ScannedArtifactOutput,
 };
+use crate::object_arch::{self, ExpectedArch};
 
 pub async fn build_upload_plan(
     scanned: &[ScannedArtifact],
@@ -55,6 +58,12 @@ pub async fn build_upload_plan(
             &artifact.kind,
         )?;
 
+        // The machine this artifact's objects must be for — the host's
+        // for a host-side unit, the task target's for a target-side one
+        // — computed only when it has files to check: every output's
+        // bytes and every `OUT_DIR` file are refused when a compiler for
+        // another machine produced them (stow#708).
+        let expected = expected_object_arch(artifact)?;
         let plan = PlannedArtifact {
             dependency_identity: dependency_identity.clone(),
             compile_key: artifact.captured_compile_key.clone(),
@@ -74,10 +83,14 @@ pub async fn build_upload_plan(
             crate_types: artifact.crate_types.clone(),
             artifact_size: artifact.artifact_size,
             compile_millis: artifact.compile_millis,
-            outputs: build_outputs(&artifact.outputs, &artifact.kind).await?,
+            outputs: build_outputs(&artifact.outputs, &artifact.kind, expected)
+                .await
+                .wrap_err_with(|| format!("artifact {}", artifact.crate_name))?,
             unit_shape: artifact.unit_shape,
             native: artifact.native.clone(),
-            native_archive: build_native_archive(artifact).await?,
+            native_archive: build_native_archive(artifact, expected)
+                .await
+                .wrap_err_with(|| format!("artifact {}", artifact.crate_name))?,
         };
         let dedup_key = (
             plan.compile_key.clone(),
@@ -346,6 +359,34 @@ fn bundle_files_match(left: &ArtifactBundleFile, right: &ArtifactBundleFile) -> 
         && left.sha256 == right.sha256
 }
 
+/// The machine this artifact's objects must be for, when it has any to
+/// check: the builder's own for a host-side unit, the artifact's target
+/// for a target-side one. `unit_shape` is the only fact that names the
+/// side, so an artifact holding files with no shape is a defect in the
+/// scan, not a pass.
+fn expected_object_arch(
+    artifact: &ScannedArtifact,
+) -> stow_types::error::Result<Option<ExpectedArch>> {
+    let has_files = !artifact.outputs.is_empty()
+        || artifact
+            .native
+            .as_ref()
+            .is_some_and(|native| !native.out_dir_files.is_empty());
+    if !has_files {
+        return Ok(None);
+    }
+    let shape = artifact.unit_shape.ok_or_else(|| {
+        stow_types::stow_error!(
+            "artifact {} has no unit shape to tell its objects' machine by",
+            artifact.crate_name
+        )
+    })?;
+    Ok(Some(match shape.side {
+        UnitSide::Host => ExpectedArch::of_host()?,
+        UnitSide::Target => ExpectedArch::of_triple(&artifact.target)?,
+    }))
+}
+
 /// Pack the build script's `OUT_DIR` into a tar beside the artifact's output
 /// snapshots, so it travels as a normal zstd-compressed OCI layer.
 ///
@@ -355,6 +396,7 @@ fn bundle_files_match(left: &ArtifactBundleFile, right: &ArtifactBundleFile) -> 
 /// the compiled output of fd's entire dependency graph.
 async fn build_native_archive(
     artifact: &ScannedArtifact,
+    expected: Option<ExpectedArch>,
 ) -> stow_types::error::Result<Option<PlannedArtifactOutput>> {
     let (Some(native), Some(out_dir)) = (
         artifact.native.as_ref(),
@@ -397,6 +439,21 @@ async fn build_native_archive(
             let mut file = std::fs::File::open(&source).map_err(|error| {
                 stow_types::stow_error!("read native out dir file {}: {error}", source.display())
             })?;
+            // What a consumer links out of an `OUT_DIR` is its static
+            // libraries; loose objects and helper programs beside them
+            // are never on a link line, and a build script may build
+            // those for the host.
+            if let Some(expected) = expected
+                && stow_types::native_capture::is_static_library(Path::new(relative_path))
+            {
+                let contents = std::fs::read(&source).map_err(|error| {
+                    stow_types::stow_error!(
+                        "read native out dir file {}: {error}",
+                        source.display()
+                    )
+                })?;
+                object_arch::check(&contents, relative_path, expected)?;
+            }
             builder
                 .append_file(relative_path, &mut file)
                 .map_err(|error| {
@@ -435,6 +492,7 @@ async fn build_native_archive(
 async fn build_outputs(
     outputs: &[ScannedArtifactOutput],
     artifact_kind: &ArtifactKind,
+    expected: Option<ExpectedArch>,
 ) -> stow_types::error::Result<Vec<PlannedArtifactOutput>> {
     let mut planned = Vec::with_capacity(outputs.len());
     let mut seen_file_names = BTreeSet::new();
@@ -447,6 +505,9 @@ async fn build_outputs(
             ));
         }
         let bytes = async_fs::read(&output.source_path).await?;
+        if let Some(expected) = expected {
+            object_arch::check(&bytes, &file_name, expected)?;
+        }
         let digest = hex::encode(Sha256::digest(&bytes));
         planned.push(PlannedArtifactOutput {
             path: output.source_path.clone(),
@@ -547,6 +608,8 @@ fn parse_rustc_version(raw: &str) -> stow_types::error::Result<RustcVersion> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    use sha2::{Digest, Sha256};
 
     use super::build_upload_plan;
     use crate::dep_scan::{
@@ -664,7 +727,11 @@ mod tests {
                 "link".to_owned(),
                 "metadata".to_owned(),
             ],
-            unit_shape: None,
+            unit_shape: Some(stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Target,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            }),
             features_json: "[]".to_owned(),
             dependencies: Vec::new(),
             artifact_size,
@@ -818,5 +885,57 @@ mod tests {
         );
 
         fs::remove_file(parent_output_path).expect("remove parent artifact bytes");
+    }
+
+    /// stow#708's gate: a build script that compiled C for the wrong
+    /// machine is refused at plan time — an `OUT_DIR` static library
+    /// takes the same check the published outputs take.
+    #[tokio::test]
+    async fn a_unit_is_refused_when_its_objects_are_for_another_machine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out_dir = dir.path().join("out");
+        fs::create_dir_all(&out_dir).expect("out dir");
+        let object_bytes = crate::object_arch::relocatable_object(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+        );
+        let library_bytes = crate::object_arch::gnu_archive(&[("probe.o", &object_bytes)]);
+        fs::write(out_dir.join("probe.lib"), &library_bytes).expect("write probe library");
+        let output_path = dir.path().join("libwinarm_probe-0123456789abcdef.rlib");
+        fs::write(&output_path, b"winarm-probe-artifact").expect("write artifact bytes");
+
+        let mut artifact = scanned_lib_artifact(
+            "winarm-probe",
+            "1.0.0",
+            "captured-winarm-probe",
+            "0123456789abcdef",
+            20,
+            output_path,
+        );
+        artifact.target = "aarch64-pc-windows-msvc".to_owned();
+        artifact.build_script_out_dir = Some(out_dir.clone());
+        artifact.native = Some(stow_types::artifact::NativeArtifacts {
+            static_libs: Vec::new(),
+            cargo_directives: Vec::new(),
+            dep_env_vars: std::collections::BTreeMap::new(),
+            out_dir_files: vec![stow_types::artifact::OutDirFile {
+                relative_path: "probe.lib".to_owned(),
+                sha256: hex::encode(Sha256::digest(&library_bytes)),
+            }],
+            original_out_dir: out_dir,
+        });
+
+        let error = build_upload_plan(&[artifact], &[], &dependency_identity())
+            .await
+            .expect_err("an x86-64 object must not publish under an arm64 task");
+        let message = error.to_string();
+        assert!(
+            message.contains("winarm-probe"),
+            "names the crate: {message}"
+        );
+        assert!(
+            message.contains("probe.lib(probe.o)"),
+            "names the library and its member: {message}"
+        );
     }
 }

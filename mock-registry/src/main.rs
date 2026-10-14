@@ -474,22 +474,23 @@ fn registry_app_with_probe(
             token_realm: format!("http://{listen}/token"),
             tokens: Arc::new(Mutex::new(TokenState::default())),
             requests: probe.as_ref().map(|probe| Arc::clone(&probe.requests)),
-            rate_limits: probe.as_ref().map(|probe| Arc::clone(&probe.rate_limits)),
+            refusals: probe.as_ref().map(|probe| Arc::clone(&probe.refusals)),
             toggles: probe.as_ref().map(|probe| Arc::clone(&probe.toggles)),
             demand_fixtures,
         })
 }
 
 /// A test's handle into a running mock registry: the ordered request log
-/// and the scripted `429`s still owed. Production `serve` runs without one
-/// — [`MockRegistryState::requests`] is `None` and nothing is recorded.
+/// and the scripted refusals still owed. Production `serve` runs without
+/// one — [`MockRegistryState::requests`] is `None` and nothing is
+/// recorded.
 #[derive(Clone)]
 struct RegistryProbe {
     /// Read only by `forge_manifest`, so absent from production builds.
     #[cfg(test)]
     registry_root: PathBuf,
     requests: Arc<Mutex<Vec<RequestRecord>>>,
-    rate_limits: Arc<Mutex<Vec<RateLimitRule>>>,
+    refusals: Arc<Mutex<Vec<RefusalRule>>>,
     toggles: Arc<ProbeToggles>,
 }
 
@@ -501,7 +502,7 @@ impl RegistryProbe {
         let probe = Self {
             registry_root,
             requests: Arc::new(Mutex::new(Vec::new())),
-            rate_limits: Arc::new(Mutex::new(Vec::new())),
+            refusals: Arc::new(Mutex::new(Vec::new())),
             toggles: Arc::new(ProbeToggles::new()),
         };
         let root = probe.registry_root.clone();
@@ -517,19 +518,62 @@ impl RegistryProbe {
         self.requests.lock().expect("request log poisoned").clone()
     }
 
+    /// Answer the next `remaining` requests whose method and path match
+    /// with `status` carrying the OCI error envelope `body`.
+    #[cfg(test)]
+    fn refuse(
+        &self,
+        method: Method,
+        path_substr: &str,
+        remaining: usize,
+        status: StatusCode,
+        body: serde_json::Value,
+    ) {
+        self.refusals
+            .lock()
+            .expect("refusal rules poisoned")
+            .push(RefusalRule {
+                method,
+                path_substr: path_substr.to_owned(),
+                remaining,
+                status,
+                body: body.to_string(),
+            });
+    }
+
     /// Refuse the next `remaining` requests whose method and path match with
     /// GHCR's rate-limit shape: `429 TOOMANYREQUESTS` carrying a
     /// `retry-after:` value inside the OCI error body.
     #[cfg(test)]
     fn rate_limit(&self, method: Method, path_substr: &str, remaining: usize) {
-        self.rate_limits
-            .lock()
-            .expect("rate-limit rules poisoned")
-            .push(RateLimitRule {
-                method,
-                path_substr: path_substr.to_owned(),
-                remaining,
-            });
+        self.refuse(
+            method,
+            path_substr,
+            remaining,
+            StatusCode::TOO_MANY_REQUESTS,
+            serde_json::json!({
+                "errors": [{
+                    "code": "TOOMANYREQUESTS",
+                    "message": "retry-after: 100ms, allowed: 2000/minute",
+                }],
+            }),
+        );
+    }
+
+    /// Answer the next `remaining` matching requests `404` carrying the
+    /// OCI `MANIFEST_UNKNOWN` envelope — a registry that has not caught up
+    /// to a tag its push already returned (stow#709).
+    #[cfg(test)]
+    fn manifest_unknown(&self, method: Method, path_substr: &str, remaining: usize) {
+        self.refuse(
+            method,
+            path_substr,
+            remaining,
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "errors": [{"code": "MANIFEST_UNKNOWN", "message": "manifest unknown"}],
+            }),
+        );
     }
 
     /// Behave like a registry without single-`POST` upload support: every
@@ -580,12 +624,15 @@ struct RequestRecord {
 }
 
 /// One scripted refusal: the next `remaining` requests matching `method`
-/// and containing `path_substr` get `429` — drained one per request.
+/// and containing `path_substr` get `status` with the OCI error envelope
+/// `body` — drained one per request.
 #[derive(Debug)]
-struct RateLimitRule {
+struct RefusalRule {
     method: Method,
     path_substr: String,
     remaining: usize,
+    status: StatusCode,
+    body: String,
 }
 
 /// Registry behaviors a test can switch off to exercise the client's
@@ -1444,8 +1491,9 @@ struct MockRegistryState {
     tokens: Arc<Mutex<TokenState>>,
     /// The probe's request log — `Some` only when a test attached one.
     requests: Option<Arc<Mutex<Vec<RequestRecord>>>>,
-    /// The probe's scripted `429`s — `Some` only when a test attached one.
-    rate_limits: Option<Arc<Mutex<Vec<RateLimitRule>>>>,
+    /// The probe's scripted refusals — `Some` only when a test attached
+    /// one.
+    refusals: Option<Arc<Mutex<Vec<RefusalRule>>>>,
     /// The probe's behavior toggles — `None` means the well-behaved
     /// registry: single `POST` uploads, digest headers, honest serving.
     toggles: Option<Arc<ProbeToggles>>,
@@ -1518,7 +1566,7 @@ async fn serve_v2(
 ) -> Result<Response<Body>, StatusCode> {
     let path = format!("/v2/{rest}");
     state.record(&method, &path);
-    if let Some(refusal) = state.rate_limited(&method, &path) {
+    if let Some(refusal) = state.scripted_refusal(&method, &path) {
         return Ok(refusal);
     }
     let asset = parse_registry_asset(&rest).map_err(|error| {
@@ -2118,25 +2166,18 @@ impl MockRegistryState {
         }
     }
 
-    /// GHCR's refusal shape for a matching scripted rule: `429` carrying
-    /// `retry-after: <duration>` inside the OCI error body — the value the
-    /// client's backoff honours. `None` when no rule has hits left for
-    /// this request.
-    fn rate_limited(&self, method: &Method, path: &str) -> Option<Response<Body>> {
-        let rate_limits = self.rate_limits.as_ref()?;
-        let mut rules = rate_limits.lock().expect("rate-limit rules poisoned");
+    /// The scripted refusal a matching rule still owes — drained one
+    /// `remaining` per answer. `None` when no rule has hits left for this
+    /// request.
+    fn scripted_refusal(&self, method: &Method, path: &str) -> Option<Response<Body>> {
+        let refusals = self.refusals.as_ref()?;
+        let mut rules = refusals.lock().expect("refusal rules poisoned");
         let rule = rules.iter_mut().find(|rule| {
             rule.remaining > 0 && rule.method == *method && path.contains(&rule.path_substr)
         })?;
         rule.remaining -= 1;
-        let body = serde_json::json!({
-            "errors": [{
-                "code": "TOOMANYREQUESTS",
-                "message": "retry-after: 100ms, allowed: 2000/minute",
-            }],
-        });
-        let mut response = Response::new(Body::from(body.to_string()));
-        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        let mut response = Response::new(Body::from(rule.body.clone()));
+        *response.status_mut() = rule.status;
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
@@ -2279,7 +2320,9 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{Method, Request, StatusCode, header};
     use stow_types::artifact::{ArtifactKind, RustCrateType};
-    use stow_types::bundle::{ArtifactBundleFile, STOW_BUNDLE_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE};
+    use stow_types::bundle::{
+        ArtifactBundleFile, STOW_BUNDLE_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, sigstore_signature_tag,
+    };
     use stow_types::identity::{CMetadata, CrateName, DependencyCMetadataJson, FeaturesJson};
     use stow_types::index::{
         ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
@@ -2965,6 +3008,130 @@ mod tests {
         }
     }
 
+    // ---- stow#709 pushed-signature read-back tests ----
+
+    /// How many `GET /manifests/{signature_tag}` requests the served
+    /// registry saw — the pulls a signature read made.
+    fn signature_manifest_pulls(probe: &RegistryProbe, signature_tag: &str) -> usize {
+        let path = format!("/v2/{GHCR_REPOSITORY}/manifests/{signature_tag}");
+        probe
+            .request_log()
+            .iter()
+            .filter(|record| record.method == Method::GET && record.path == path)
+            .count()
+    }
+
+    /// The registry may not show a `.sig` tag the instant cosign's push
+    /// returned — the read-back of a just-pushed signature retries the
+    /// `MANIFEST_UNKNOWN` and reads it on a later attempt.
+    #[tokio::test]
+    async fn a_pushed_signature_the_registry_does_not_show_yet_is_read_on_a_later_attempt() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let signer = SigningScheme::ECDSA_P256_SHA256_ASN1
+            .create_signer()
+            .expect("mock signer");
+        let digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
+        write_mock_signature(root.path(), &signer, &format!("{GHCR_BASE}:{tag}"), digest)
+            .await
+            .expect("mock signature");
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        let signature_tag = sigstore_signature_tag(digest);
+        probe.manifest_unknown(Method::GET, &format!("/manifests/{signature_tag}"), 1);
+
+        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
+            .expect("registry base");
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
+        let reference = base.reference(tag).expect("reference");
+        let materials = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
+            .await
+            .expect("the registry catches up within the bound");
+        assert_eq!(materials.len(), 1, "the one simple-signing layer");
+        assert_eq!(
+            signature_manifest_pulls(&probe, &signature_tag),
+            2,
+            "a MANIFEST_UNKNOWN, then the manifest"
+        );
+    }
+
+    /// A `.sig` tag that never appears fails after exactly
+    /// `PUSHED_READ_MAX_ATTEMPTS` pulls and the error names the signature
+    /// reference — the publish fails rather than waiting on a push that
+    /// never landed.
+    #[tokio::test]
+    async fn a_pushed_signature_that_never_appears_fails_at_the_bound() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let signature_tag = sigstore_signature_tag(digest);
+        probe.manifest_unknown(
+            Method::GET,
+            &format!("/manifests/{signature_tag}"),
+            usize::MAX,
+        );
+
+        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
+            .expect("registry base");
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = push_session(&listen, &http);
+        let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
+        let reference = base.reference(tag).expect("reference");
+        let error = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
+            .await
+            .expect_err("a signature that never lands fails at the bound");
+        assert_eq!(
+            signature_manifest_pulls(&probe, &signature_tag),
+            5,
+            "the first pull plus its four retries"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{GHCR_REPOSITORY}:{signature_tag}")),
+            "the error names the signature reference: {error}"
+        );
+    }
+
+    /// A signature nobody pushed is absent, not retryable — the plain
+    /// read asks once and takes the `404` as the answer.
+    #[tokio::test]
+    async fn a_published_signature_that_is_absent_is_not_retried() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        let digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let signature_tag = sigstore_signature_tag(digest);
+        probe.manifest_unknown(
+            Method::GET,
+            &format!("/manifests/{signature_tag}"),
+            usize::MAX,
+        );
+
+        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
+            .expect("registry base");
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let session = base.session(&http);
+        let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
+        let reference = base.reference(tag).expect("reference");
+        let error = stow_oci::pull_signature_materials(&session, &reference, digest)
+            .await
+            .expect_err("an absent signature is the answer, not a retry");
+        assert_eq!(
+            signature_manifest_pulls(&probe, &signature_tag),
+            1,
+            "one pull and the 404 is final"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{GHCR_REPOSITORY}:{signature_tag}")),
+            "the error names the signature reference: {error}"
+        );
+    }
+
     // ---- stow#523 demand-fixture provider tests ----
 
     /// The checked-in `edge/templates/demand_feed.sql` rendered at a
@@ -3074,7 +3241,7 @@ mod tests {
             token_realm: "http://127.0.0.1/token".to_owned(),
             tokens: Arc::new(Mutex::new(TokenState::default())),
             requests: None,
-            rate_limits: None,
+            refusals: None,
             toggles: None,
             demand_fixtures: Some(fixtures),
         };

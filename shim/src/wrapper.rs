@@ -135,17 +135,24 @@ pub struct WrapperShimPaths {
     pub cxx_compiler: PathBuf,
 }
 
-/// The durable per-user directory the wrapper tools are installed into.
+/// The durable per-user directory stow's tools — the managed mold
+/// install — are installed into.
+///
+/// The wrapper shims no longer live here: one shared directory let any
+/// stow binary re-point every other's wrappers, so the CLI materializes
+/// them under the cargo home instead — one directory per stow binary
+/// (stow#645). The CI runner still places its sandbox's own shims here;
+/// its grants name this directory.
 ///
 /// Resolves to `dirs::data_local_dir()/stow/tools`:
 /// `~/Library/Application Support/stow/tools` on macOS,
 /// `~/.local/share/stow/tools` on Linux, `%LOCALAPPDATA%\stow\tools` on
 /// Windows.
 ///
-/// The tools dir must outlive a reboot: `stow setup` writes its paths into
-/// `.cargo/config.toml` and the job environment, and a base under the system
-/// temp directory is purged by the OS, leaving every cargo invocation
-/// pointing at a wrapper that no longer exists.
+/// The tools dir must outlive a reboot: `stow setup` writes the mold
+/// install's paths into `.cargo/config.toml` and the job environment, and
+/// a base under the system temp directory is purged by the OS, leaving
+/// every cargo invocation pointing at a tool that no longer exists.
 ///
 /// # Errors
 /// Returns an error when the platform has no per-user local data directory.
@@ -156,9 +163,12 @@ pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
     Ok(base.join("stow").join("tools"))
 }
 
-/// Idempotently materialize the rustc / cc wrappers under `tools_dir` (see
-/// [`tools_dir`] for the standard location), and point them at the supplied
-/// runtime / capture executables.
+/// Idempotently materialize the rustc / cc wrappers under `tools_dir`,
+/// pointing them at the supplied runtime / capture executables.
+///
+/// The directory is the caller's own: the CLI passes its per-(cargo
+/// home, binary) shim dir, the CI runner its runner-scoped
+/// [`tools_dir`].
 ///
 /// Every replacement is a temp-file-plus-rename, so a wrapper that cargo is
 /// executing concurrently resolves to either the old or the new runtime,
@@ -271,6 +281,10 @@ fn materialize_in(
 
 /// Put `executable` at `<base>/<name>.exe`, leaving an identical file alone.
 /// `source_bytes` caches the source read across placements of one executable.
+/// A byte copy is stamped with the source's modification time before it is
+/// renamed into place: the identity a wrapper compares against its
+/// supervisor's is the source's `(len, modified)` — a hard link shares it,
+/// a copy must be given it (stow#645).
 #[cfg(windows)]
 fn place_executable(
     base: &Path,
@@ -284,13 +298,7 @@ fn place_executable(
     }
     let temp_path = staging_path(&destination)?;
     if let Err(link_error) = fs::hard_link(executable, &temp_path) {
-        fs::copy(executable, &temp_path).wrap_err_with(|| {
-            format!(
-                "copy {} to {} (hard link failed: {link_error})",
-                executable.display(),
-                temp_path.display()
-            )
-        })?;
+        copy_for_placement(executable, &temp_path, &link_error)?;
     }
     fs::rename(&temp_path, &destination).map_err(|error| {
         let _ = fs::remove_file(&temp_path);
@@ -300,6 +308,43 @@ fn place_executable(
         )
     })?;
     Ok(destination)
+}
+
+/// The byte-copy half of a placement. `fs::copy` gives the staged file its
+/// own write's modification time, so it is re-stamped with the source's —
+/// every placed wrapper carries the source's `(len, modified)`, the
+/// identity a wrapper compares (stow#645).
+#[cfg(windows)]
+fn copy_for_placement(
+    executable: &Path,
+    temp_path: &Path,
+    link_error: &std::io::Error,
+) -> stow_types::error::Result<()> {
+    fs::copy(executable, temp_path).wrap_err_with(|| {
+        format!(
+            "copy {} to {} (hard link failed: {link_error})",
+            executable.display(),
+            temp_path.display()
+        )
+    })?;
+    let modified = fs::metadata(executable)
+        .and_then(|meta| meta.modified())
+        .wrap_err_with(|| {
+            format!(
+                "read modification time of {} for its copy",
+                executable.display()
+            )
+        })?;
+    fs::File::options()
+        .write(true)
+        .open(temp_path)
+        .and_then(|file| file.set_modified(modified))
+        .wrap_err_with(|| {
+            format!(
+                "stamp {} with its source's modification time",
+                temp_path.display()
+            )
+        })
 }
 
 /// Whether `destination` already holds the bytes of `source`. A missing
@@ -447,6 +492,41 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<OsString> {
         parts.iter().map(OsString::from).collect()
+    }
+
+    /// A byte-copied wrapper has no inode to share its source's metadata
+    /// through, so the placement re-stamps it: the identity a wrapper
+    /// compares — the source's `(len, modified)` — must survive the copy
+    /// (stow#645).
+    #[cfg(windows)]
+    #[test]
+    fn a_byte_copied_wrapper_carries_the_sources_stamp() {
+        let base = std::env::temp_dir().join(format!("stow-shim-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("create the test tool dir");
+        let source = base.join("runtime-executable.exe");
+        std::fs::write(&source, b"runtime").expect("write the source executable");
+        // A stamp old enough that the copy's own write time provably
+        // differs from it.
+        let stamped =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .and_then(|file| file.set_modified(stamped))
+            .expect("stamp the source");
+        let staged = base.join("staged.exe");
+        let link_error = std::io::Error::other("forced byte copy");
+        super::copy_for_placement(&source, &staged, &link_error).expect("place by byte copy");
+        assert_eq!(
+            std::fs::metadata(&staged)
+                .and_then(|meta| meta.modified())
+                .expect("staged mtime"),
+            std::fs::metadata(&source)
+                .and_then(|meta| meta.modified())
+                .expect("source mtime"),
+            "the copy does not carry the source's modification time"
+        );
+        std::fs::remove_dir_all(&base).expect("remove the test tool dir");
     }
 
     #[test]

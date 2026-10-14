@@ -5341,6 +5341,9 @@ version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
+ "crc32fast",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.2",
  "memchr",
 ]
 
@@ -7869,10 +7872,12 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-lite",
+ "futures-util",
  "heel",
  "hex",
  "hmac 0.13.0",
  "http",
+ "object 0.39.1",
  "reflink",
  "rustls",
  "semver",

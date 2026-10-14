@@ -59,6 +59,10 @@ pub use workspace_deps::{
     ExpandedDependencyGraph, expanded_dependency_graph, resolve_exact_dependency_graph,
 };
 
+/// What a supervisor exports beside its endpoint so a wrapper can tell
+/// it was started by its own build — the stub supervisors export it the
+/// way the real one does (stow#645).
+pub use supervisor::BinaryIdentity;
 /// The supervisor wire protocol, so a peer decoding frames — a stub
 /// supervisor standing in for the real one in integration tests — uses
 /// the product's own types instead of reimplementing the format.
@@ -5408,8 +5412,13 @@ mod tests {
             let registry_src = tempdir.path().join("cargo_home/registry/src");
 
             let (config, in_flight, handler) = fixture(tempdir.path()).await;
-            let supervisor = server::start(handler, in_flight).expect("start supervisor");
-            let [(_, endpoint), (_, token)] = supervisor.env();
+            let supervisor = server::start(
+                handler,
+                in_flight,
+                &std::env::current_exe().expect("current exe"),
+            )
+            .expect("start supervisor");
+            let [(_, endpoint), (_, token), _] = supervisor.env();
             let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
 
             let dep_args = unit_args(&registry_src, &out_dir, "dep", "1.0.0", "depmeta", &[]);
@@ -5482,8 +5491,13 @@ mod tests {
             let registry_src = tempdir.path().join("cargo_home/registry/src");
 
             let (config, in_flight, handler) = fixture(tempdir.path()).await;
-            let supervisor = server::start(handler, in_flight).expect("start supervisor");
-            let [(_, endpoint), (_, token)] = supervisor.env();
+            let supervisor = server::start(
+                handler,
+                in_flight,
+                &std::env::current_exe().expect("current exe"),
+            )
+            .expect("start supervisor");
+            let [(_, endpoint), (_, token), _] = supervisor.env();
             let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
 
             let dep_args = unit_args(&registry_src, &out_dir, "dep2", "1.0.0", "dep2meta", &[]);
@@ -5558,8 +5572,13 @@ mod tests {
             let registry_src = tempdir.path().join("cargo_home/registry/src");
 
             let (config, in_flight, handler) = fixture(tempdir.path()).await;
-            let supervisor = server::start(handler, in_flight).expect("start supervisor");
-            let [(_, endpoint), (_, token)] = supervisor.env();
+            let supervisor = server::start(
+                handler,
+                in_flight,
+                &std::env::current_exe().expect("current exe"),
+            )
+            .expect("start supervisor");
+            let [(_, endpoint), (_, token), _] = supervisor.env();
             let endpoint = Endpoint::parse(&endpoint).expect("endpoint");
 
             // The extern the build-script unit was compiled against is

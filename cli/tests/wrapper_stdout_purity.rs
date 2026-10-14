@@ -38,6 +38,44 @@ fn wrapper_version_output(env: &[(&str, &str)]) -> Vec<u8> {
     output.stdout
 }
 
+/// A supervised endpoint naming a different build's binary identity is
+/// refused before any connection: the shim resolves to whatever binary
+/// sits at its path now, and the supervisor's export must match the
+/// wrapper's own (stow#645). The endpoint points at nothing, so a
+/// wrapper that connected before checking could only fail differently —
+/// the refusal text proves the order.
+#[test]
+fn a_foreign_supervisor_is_refused_before_any_connection() {
+    let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+        .arg("rustc")
+        .arg(rustc_path())
+        .arg("-vV")
+        .env("STOW_SUPERVISOR_ENDPOINT", supervisor_endpoint())
+        .env("STOW_SUPERVISOR_TOKEN", "a-token")
+        .env("STOW_SUPERVISOR_BINARY", "1:1")
+        .output()
+        .expect("run the wrapper under a foreign supervisor");
+    assert!(
+        !output.status.success(),
+        "a foreign supervisor was not refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("replaced while the build was running"),
+        "stderr carries no refusal text:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+const fn supervisor_endpoint() -> &'static str {
+    "unix:/nonexistent/stow-test.sock"
+}
+
+#[cfg(not(unix))]
+const fn supervisor_endpoint() -> &'static str {
+    "tcp:9"
+}
+
 #[test]
 fn rustc_probe_stdout_is_never_polluted_by_logging() {
     let expected = plain_version_output();

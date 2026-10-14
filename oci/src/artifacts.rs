@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_fs::read;
 use oci_client::Reference;
@@ -15,8 +16,9 @@ use stow_types::bundle_schema::validate_bundle_schema;
 use stow_types::registry::{bundle_oci_reference, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput, PublishedArtifact};
 
-use crate::client::{RegistryHttp, RegistrySession, canonical_manifest_bytes};
+use crate::client::{RegistryError, RegistryHttp, RegistrySession, canonical_manifest_bytes};
 use crate::registry::RegistryCredentials;
+use crate::retry::retry_with_backoff;
 use crate::sign;
 
 /// What [`push_artifacts`] did: the published coordinates of every plan.
@@ -140,7 +142,7 @@ where
         "pushed and signed OCI artifact on GHCR"
     );
 
-    let signatures = pull_signature_materials(session, &reference, &oci_digest).await?;
+    let signatures = pull_pushed_signature_materials(session, &reference, &oci_digest).await?;
 
     let (bundle_digest, bundle_size) = push_bundle(
         session,
@@ -239,6 +241,10 @@ async fn push_bundle(
 /// signature, certificate, and the Rekor bundle when cosign uploaded one.
 /// Shared by the bundle republish path and the CLI's index verification.
 ///
+/// This is the read for a signature published earlier or by someone else:
+/// a `404` is the answer — the signature does not exist. For a signature
+/// this publish just pushed, use [`pull_pushed_signature_materials`].
+///
 /// # Errors
 ///
 /// Returns an error when the signature manifest or a layer cannot be pulled
@@ -248,13 +254,7 @@ pub async fn pull_signature_materials(
     reference: &Reference,
     oci_digest: &str,
 ) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
-    let signature_reference: Reference = format!(
-        "{}/{}:{}",
-        reference.registry(),
-        reference.repository(),
-        sigstore_signature_tag(oci_digest)
-    )
-    .parse()?;
+    let signature_reference = signature_reference(reference, oci_digest)?;
     let (manifest_bytes, _) =
         session
             .pull_manifest(&signature_reference)
@@ -262,7 +262,91 @@ pub async fn pull_signature_materials(
             .map_err(|error| {
                 stow_types::stow_error!("pull signature manifest {signature_reference}: {error}")
             })?;
-    let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+    // `Box::pin` keeps the shared tail's future out of the callers' — the
+    // CLI's `run_cli` tree measures these reads inside one large future.
+    Box::pin(signature_materials(
+        session,
+        &signature_reference,
+        &manifest_bytes,
+    ))
+    .await
+}
+
+/// How many times the read-back of a signature this publish just pushed
+/// runs before its absence is final. The registry may not show a tag the
+/// instant its push returned — run 38377192790 read the `.sig` tag 70 ms
+/// after cosign's push and got `MANIFEST_UNKNOWN` — and a tag this
+/// process pushed cannot legitimately be absent, so the bound is what
+/// separates a registry catching up from a push that never landed
+/// (stow#709).
+const PUSHED_READ_MAX_ATTEMPTS: u32 = 5;
+
+/// The first retry's delay; doubling across the attempts yields 200, 400,
+/// 800 and 1600 ms — three seconds in all.
+const PUSHED_READ_INITIAL_DELAY: Duration = Duration::from_millis(200);
+
+/// Pull every `sha256-<hex>.sig` signature layer for a manifest this
+/// publish has just signed and pushed.
+///
+/// The registry may not show a tag the instant its push returned, so the
+/// manifest pull retries a `404` within [`PUSHED_READ_MAX_ATTEMPTS`]
+/// before its absence is final. Use this only right after pushing the
+/// signature in the same publish; every other read goes through
+/// [`pull_signature_materials`], where a `404` is the answer.
+///
+/// # Errors
+///
+/// Same as [`pull_signature_materials`].
+pub async fn pull_pushed_signature_materials(
+    session: &RegistrySession,
+    reference: &Reference,
+    oci_digest: &str,
+) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
+    let signature_reference = signature_reference(reference, oci_digest)?;
+    let (manifest_bytes, _) = retry_with_backoff(
+        "read back the pushed signature",
+        PUSHED_READ_MAX_ATTEMPTS,
+        PUSHED_READ_INITIAL_DELAY,
+        || session.pull_manifest(&signature_reference),
+        RegistryError::is_not_found,
+    )
+    .await
+    .map_err(|error| {
+        stow_types::stow_error!("pull signature manifest {signature_reference}: {error}")
+    })?;
+    Box::pin(signature_materials(
+        session,
+        &signature_reference,
+        &manifest_bytes,
+    ))
+    .await
+}
+
+/// The `sha256-<hex>.sig` reference `oci_digest`'s signature manifest
+/// sits under in `reference`'s registry and repository.
+fn signature_reference(
+    reference: &Reference,
+    oci_digest: &str,
+) -> stow_types::error::Result<Reference> {
+    Ok(format!(
+        "{}/{}:{}",
+        reference.registry(),
+        reference.repository(),
+        sigstore_signature_tag(oci_digest)
+    )
+    .parse()?)
+}
+
+/// The materials of the signature manifest `signature_reference` pulled —
+/// the part of the read [`pull_signature_materials`] and
+/// [`pull_pushed_signature_materials`] share once the manifest bytes are
+/// in hand.
+async fn signature_materials(
+    session: &RegistrySession,
+    signature_reference: &Reference,
+    manifest_bytes: &[u8],
+) -> stow_types::error::Result<Vec<BundleSignatureMaterial>> {
+    let manifest: OciImageManifest = serde_json::from_slice(manifest_bytes).map_err(|error| {
         stow_types::stow_error!("parse signature manifest {signature_reference}: {error}")
     })?;
     let mut materials = Vec::new();
