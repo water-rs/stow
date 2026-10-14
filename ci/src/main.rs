@@ -29,6 +29,7 @@ mod dep_scan;
 mod local_server;
 mod object_arch;
 mod plan;
+mod rlib_members;
 mod stage;
 mod task;
 mod validate;
