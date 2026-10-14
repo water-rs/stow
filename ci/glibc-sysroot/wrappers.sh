@@ -59,6 +59,33 @@
 # belongs on it: the compiler's own headers, asked of the
 # driver when the shim is written, then the sysroot's.
 #
+# Everything else a build compiles against is the runner's: a
+# -sys crate links a system library through pkg-config
+# (openssl-sys, alsa-sys), and the sysroot ships glibc and the
+# gcc-8 runtime alone. So after the sysroot's directories the
+# shim searches the runner's in the same order — the multiarch
+# include directory, then /usr/include, since Ubuntu keeps
+# openssl/opensslconf.h apart from the rest of the OpenSSL
+# headers (stow#729) — and puts /usr/lib/<triple> last on the
+# link path. The sysroot's library directories are named with
+# -L ahead of argv as well: a -L in argv — that fallback, or
+# the one rustc forwards from a build script's pkg-config
+# probe — is searched before the -B directories, and the link
+# then took the runner's libc and its GLIBC_2.34 symbols. The
+# runner's libraries need the runner's glibc in turn, which an
+# executable link — a build script, a test — checks against
+# the sysroot's 2.28 and refuses; the shim leaves those
+# symbols to the loader (--allow-shlib-undefined, which a
+# shared-object link does already), and that loader is the
+# runner's, where they resolve. The cost of building against
+# the runner's libraries is that a row carries their version:
+# openssl-sys turns the OpenSSL release into cfg flags
+# (ossl300, …) that are part of the compile key, so its rows
+# serve only consumers whose library yields the same flags —
+# the others miss and compile locally — and a linked output
+# names the runner's sonames in NEEDED, as a local build
+# against the same library would.
+#
 # Deterministic — written every run so a cache-restored
 # sysroot and a fresh extract wire the same way. The native
 # GCC 12 pair is required — a missing driver used to mean no
