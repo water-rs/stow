@@ -1291,6 +1291,7 @@ async fn capture_build_dep_keys(
         capture_command: &capture_command,
         audit_log: &audit_log,
         rustflags: "",
+        target: task.target.as_str(),
         consume_store: None,
     };
     let msvc = task::MsvcToolchain::resolve(task.target.as_str()).expect("MSVC toolchain");
