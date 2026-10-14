@@ -534,7 +534,7 @@ fn optional_shadow_preserves_package_source() {
         ),
         "middle",
         "1.0.0",
-        &["native"],
+        &[],
         true,
         vec![],
     );
