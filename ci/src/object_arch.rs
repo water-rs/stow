@@ -141,28 +141,54 @@ pub fn relocatable_object(format: object::BinaryFormat, architecture: Architectu
 /// because no archive-writer crate is in the tree.
 #[cfg(test)]
 pub fn gnu_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+    // A name too long for the 16-byte header field goes through the `//`
+    // names-table member — each long name one `name/\n` entry — and the
+    // member's header names it by byte offset, `/<offset>`.
+    let mut names_table = Vec::new();
+    let rendered: Vec<String> = members
+        .iter()
+        .map(|(name, _)| {
+            if name.len() < 16 {
+                format!("{name}/")
+            } else {
+                let offset = names_table.len();
+                names_table.extend_from_slice(name.as_bytes());
+                names_table.extend_from_slice(b"/\n");
+                format!("/{offset}")
+            }
+        })
+        .collect();
     let mut archive = b"!<arch>\n".to_vec();
-    for (name, data) in members {
-        // The 60-byte member header: name(16) mtime(12) uid(6)
-        // gid(6) mode(8) size(10) then the `\x60\n` trailer.
-        archive.extend_from_slice(
-            format!(
-                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-                format!("{name}/"),
-                0,
-                0,
-                0,
-                "100644",
-                data.len()
-            )
-            .as_bytes(),
-        );
-        archive.extend_from_slice(data);
-        if data.len() % 2 == 1 {
-            archive.push(b'\n');
-        }
+    if !names_table.is_empty() {
+        write_archive_member(&mut archive, "//", &names_table);
+    }
+    for ((_, data), name) in members.iter().zip(&rendered) {
+        write_archive_member(&mut archive, name, data);
     }
     archive
+}
+
+/// Append one `ar` member to `archive`: the 60-byte header — name(16)
+/// mtime(12) uid(6) gid(6) mode(8) size(10), then the `\x60\n` trailer —
+/// then the data, padded to even.
+#[cfg(test)]
+fn write_archive_member(archive: &mut Vec<u8>, name: &str, data: &[u8]) {
+    archive.extend_from_slice(
+        format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            name,
+            0,
+            0,
+            0,
+            "100644",
+            data.len()
+        )
+        .as_bytes(),
+    );
+    archive.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        archive.push(b'\n');
+    }
 }
 
 #[cfg(test)]

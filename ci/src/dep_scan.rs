@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use async_process::Command;
 use cargo_metadata::{Metadata, Package, Target, TargetKind};
+use futures_util::StreamExt;
 use sha2::Digest as _;
 use stow_types::api::{BuildTaskPayload, ResolvedDependencyGraphEntry};
 use stow_types::artifact::{ArtifactKind, NativeArtifacts, RustCrateType};
@@ -100,6 +101,10 @@ pub async fn scan_artifacts(
         .count();
 
     let selected = select_captured_artifacts(&package_index, captured_artifacts)?;
+    // Merges whose rlib digests differed are not settled yet: the
+    // archives must agree on what rustc wrote before the merged halves
+    // can be treated as one unit's captures.
+    verify_rlib_pairs_agree(&selected.rlib_pairs).await?;
     reject_foreign_compiled_units(task, &selected.artifacts)?;
     let plan_eligible_captures = restorable_captures - selected.absorbed_duplicates;
     let selected = selected.artifacts;
@@ -234,25 +239,84 @@ async fn verify_output_digests<'a>(
     for artifact in records {
         for output in &artifact.outputs {
             let source_path = output.snapshot_path.as_ref().unwrap_or(&output.path);
-            let bytes = async_fs::read(source_path).await.map_err(|error| {
-                stow_types::stow_error!(
-                    "read captured output {} for digest verification: {error}",
-                    source_path.display()
-                )
-            })?;
-            let actual = hex::encode(sha2::Sha256::digest(&bytes));
-            if actual != output.sha256 {
-                return Err(stow_types::stow_error!(
-                    "captured output {} for {} changed after rustc exited: recorded sha256 {}, actual sha256 {}",
-                    source_path.display(),
-                    artifact.crate_name,
-                    output.sha256,
-                    actual
-                ));
-            }
+            read_verified_output(source_path, &output.sha256, &artifact.crate_name).await?;
         }
     }
     Ok(())
+}
+
+/// Read one recorded output's file and require its sha256 to equal
+/// `recorded`, the digest the wrapper froze at rustc exit — the check
+/// [`verify_output_digests`] runs per output, lifted so
+/// [`verify_rlib_pairs_agree`] applies the same rule to the merged-away
+/// halves no record still owns. Returns the verified bytes.
+async fn read_verified_output(
+    source_path: &Path,
+    recorded: &str,
+    crate_name: &str,
+) -> stow_types::error::Result<Vec<u8>> {
+    let bytes = async_fs::read(source_path).await.map_err(|error| {
+        stow_types::stow_error!(
+            "read captured output {} for digest verification: {error}",
+            source_path.display()
+        )
+    })?;
+    let actual = hex::encode(sha2::Sha256::digest(&bytes));
+    if actual != recorded {
+        return Err(stow_types::stow_error!(
+            "captured output {} for {} changed after rustc exited: recorded sha256 {}, actual sha256 {}",
+            source_path.display(),
+            crate_name,
+            recorded,
+            actual
+        ));
+    }
+    Ok(bytes)
+}
+
+/// How many rlib pairs' files the member-agreement check reads at once.
+/// A pair only exists when a merged capture's rlib digests differed —
+/// rare beside the merges that prove identical at record level — and
+/// each task is two file reads.
+const RLIB_PAIR_CONCURRENCY: usize = 8;
+
+/// Settle what selection deferred: every rlib pair whose recorded
+/// digests differed between two captures merged as one unit. Each file
+/// must still match its recorded digest — a rewritten file fails with
+/// the same error [`verify_output_digests`] produces — and the archives
+/// must agree on what rustc wrote (`lib.rmeta` and every `*.rcgu.o`, in
+/// order) and on how many members the build script's native objects
+/// contributed, whose names and bytes are free to differ because they
+/// record where and when their own compiler ran (stow#719). A pair
+/// that disagrees was never one unit: the merge fails as the duplicate
+/// identity it is.
+async fn verify_rlib_pairs_agree(pairs: &[RlibPair]) -> stow_types::error::Result<()> {
+    let mut checks = futures_util::stream::iter(pairs)
+        .map(verify_rlib_pair)
+        .buffer_unordered(RLIB_PAIR_CONCURRENCY);
+    while let Some(outcome) = checks.next().await {
+        outcome?;
+    }
+    Ok(())
+}
+
+/// One pair: re-verify both files against their recorded digests, then
+/// compare the archives member by member.
+async fn verify_rlib_pair(pair: &RlibPair) -> stow_types::error::Result<()> {
+    let (left, right) = futures_util::future::try_join(
+        read_verified_output(&pair.left_path, &pair.left_sha256, &pair.crate_name),
+        read_verified_output(&pair.right_path, &pair.right_sha256, &pair.crate_name),
+    )
+    .await?;
+    crate::rlib_members::same_rustc_members(&left, &right).map_err(|disagreement| {
+        stow_types::stow_error!(
+            "dep_scan captured two different restorable artifacts for {} — rlib {} and rlib {} disagree: {} — a duplicate identity means a forged or colliding record",
+            pair.crate_name,
+            pair.left_path.display(),
+            pair.right_path.display(),
+            disagreement
+        )
+    })
 }
 
 /// Attribute every restorable record to a package and a kind, keyed for
@@ -260,9 +324,10 @@ async fn verify_output_digests<'a>(
 /// every unattributable path is fatal because anything less lets a lost or
 /// tampered record shrink the plan.
 ///
-/// Returns the selected artifacts plus the count of restorable records that
-/// merged into an earlier one as proven-identical captures of the same unit
-/// in another phase.
+/// Returns the selected artifacts, the count of restorable records that
+/// merged into an earlier one as captures of the same unit in another
+/// phase, and the rlib output pairs whose digests differed at those
+/// merges — still owed to [`verify_rlib_pairs_agree`].
 fn select_captured_artifacts(
     package_index: &PackageIndex,
     captured_artifacts: &[CapturedRustcArtifact],
@@ -278,6 +343,7 @@ fn select_captured_artifacts(
         SelectedCapturedArtifact,
     >::new();
     let mut absorbed_duplicates = 0usize;
+    let mut rlib_pairs = Vec::new();
     for captured in captured_artifacts {
         // Observed units (build-script compiles, binaries, probes) exist so a
         // forged record collides with them; they carry no artifacts to plan.
@@ -317,28 +383,72 @@ fn select_captured_artifacts(
             captured: captured.clone(),
             dependency_aliases: Vec::new(),
         };
-        if select_captured_artifact(&mut selected, key, candidate)? {
-            absorbed_duplicates += 1;
+        match select_captured_artifact(&mut selected, key, candidate)? {
+            Selection::Selected => {}
+            Selection::Merged(pairs) => {
+                absorbed_duplicates += 1;
+                rlib_pairs.extend(pairs);
+            }
         }
     }
     Ok(SelectedCaptures {
         artifacts: selected.into_values().collect(),
         absorbed_duplicates,
+        rlib_pairs,
     })
 }
 
 /// The output of [`select_captured_artifacts`]: the artifacts the upload
-/// plan may carry plus how many restorable records merged into an earlier
-/// one as proven-identical captures of the same unit in another phase.
+/// plan may carry, how many restorable records merged into an earlier
+/// one as captures of the same unit in another phase, and the rlib
+/// pairs those merges left pending.
 #[derive(Debug)]
 struct SelectedCaptures {
     artifacts: Vec<SelectedCapturedArtifact>,
     absorbed_duplicates: usize,
+    /// rlib output pairs whose recorded digests differed between two
+    /// captures merged as one unit — a build script's native objects
+    /// record where and when their compiler ran, so the digest cannot
+    /// rule (stow#719); [`verify_rlib_pairs_agree`] compares what rustc
+    /// itself wrote into the archives.
+    rlib_pairs: Vec<RlibPair>,
+}
+
+/// One pair of rlib outputs — one file per capture — whose recorded
+/// digests differed between two records merged as the same unit.
+/// [`verify_rlib_pairs_agree`] settles the pair on what rustc itself
+/// wrote into the archives.
+#[derive(Debug)]
+struct RlibPair {
+    /// The crate both records claim, for errors.
+    crate_name: String,
+    /// The earlier record's file to read — the snapshot when the
+    /// wrapper froze one, else the live output.
+    left_path: PathBuf,
+    /// The sha256 the earlier record recorded for that file.
+    left_sha256: String,
+    /// The merged record's file to read, by the same snapshot rule.
+    right_path: PathBuf,
+    /// The sha256 the merged record recorded for it.
+    right_sha256: String,
+}
+
+/// What [`select_captured_artifact`] decided for one candidate.
+#[derive(Debug)]
+enum Selection {
+    /// No record held the key — the candidate was selected as-is.
+    Selected,
+    /// The candidate is another capture of the unit already selected
+    /// under the key; the carried rlib pairs' digests differed and the
+    /// member-level check still has to prove them the same unit's.
+    Merged(Vec<RlibPair>),
 }
 
 /// Insert `candidate` under `key`, or absorb it into the record already
-/// there when the two are provably captures of the same rustc unit.
-/// Returns `true` when the candidate was merged rather than inserted.
+/// there when the two are provably captures of the same rustc unit —
+/// where "provably" reaches only as far as the records carry it: an rlib
+/// whose digests differ defers to the member-level check the returned
+/// [`Selection::Merged`] still owes.
 fn select_captured_artifact(
     selected: &mut BTreeMap<
         (
@@ -358,10 +468,10 @@ fn select_captured_artifact(
         Option<stow_types::public_cache::UnitInvocation>,
     ),
     candidate: SelectedCapturedArtifact,
-) -> stow_types::error::Result<bool> {
+) -> stow_types::error::Result<Selection> {
     let Some(existing) = selected.get_mut(&key) else {
         selected.insert(key, candidate);
-        return Ok(false);
+        return Ok(Selection::Selected);
     };
     // Two restorable records under one selection key are a duplicate: the
     // key already carries every identity dimension (crate, stable
@@ -375,7 +485,7 @@ fn select_captured_artifact(
     // anything else is a collision and aborts the scan, with both
     // records in the error so the field that tells them apart is on
     // the page.
-    if !same_captured_unit(&existing.captured, &candidate.captured) {
+    let Some(rlib_pairs) = same_captured_unit(&existing.captured, &candidate.captured) else {
         return Err(stow_types::stow_error!(
             "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record:\n{}\n{}",
             candidate.captured.crate_name,
@@ -389,13 +499,14 @@ fn select_captured_artifact(
             serde_json::to_string(&existing.captured)?,
             serde_json::to_string(&candidate.captured)?
         ));
-    }
+    };
     // The first capture survives: both records carry the same stable
-    // identity a client resolves the crate by, and the same outputs modulo
-    // directory, so either half is the artifact a lookup asks for. The
-    // dropped half's output paths stay resolvable as aliases, so a
-    // dependent whose `--extern` names the other phase's `deps` dir still
-    // finds its owner.
+    // identity a client resolves the crate by, and outputs that are the
+    // same modulo directory — modulo, for rlib pairs the check still
+    // owes, the native members a build script's compile wrote
+    // per-phase. The dropped half's output paths stay resolvable as
+    // aliases, so a dependent whose `--extern` names the other phase's
+    // `deps` dir still finds its owner.
     let dropped_output_paths = candidate
         .captured
         .outputs
@@ -408,7 +519,7 @@ fn select_captured_artifact(
             .cloned()
             .chain(dropped_output_paths),
     );
-    Ok(true)
+    Ok(Selection::Merged(rlib_pairs))
 }
 
 /// Whether two records are captures of the same rustc unit — the same
@@ -426,21 +537,31 @@ fn select_captured_artifact(
 /// same files modulo the directory they were written to and, for the
 /// alias, modulo the name cargo asked for. Anything else is a collision.
 ///
-/// No byte comparison is needed on top of that: the compile key already
-/// blake3s the whole invocation, so records agreeing on it and the rest
-/// of the identity are the same unit by construction, and
-/// `verify_output_digests` re-hashes the surviving record's outputs
-/// before anything is planned — integrity of what ships is covered
-/// there, while the dropped half is discarded.
-fn same_captured_unit(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
-    left.crate_version == right.crate_version
+/// All of that is record-level; the one thing a record cannot vouch for
+/// is an rlib's bytes. The archive bundles the build script's native
+/// objects, and those record where and when their own compiler ran
+/// (stow#719), so the same unit honestly produces different rlib
+/// digests per phase — a digest mismatch defers rather than rules. What
+/// proves the unit is the archives' agreement on what rustc itself
+/// wrote, so the function hands back the pairs whose digests differed
+/// for [`verify_rlib_pairs_agree`] to settle, while
+/// `verify_output_digests` still re-hashes the surviving record's
+/// outputs before anything is planned.
+fn same_captured_unit(
+    left: &CapturedRustcArtifact,
+    right: &CapturedRustcArtifact,
+) -> Option<Vec<RlibPair>> {
+    let same_unit = left.crate_version == right.crate_version
         && left.crate_types == right.crate_types
         && left.target == right.target
         && left.compile_key == right.compile_key
         && left.extra_filename == right.extra_filename
         && left.profile == right.profile
-        && same_dependency_identities(&left.dependencies, &right.dependencies)
-        && captured_outputs_match(left, right)
+        && same_dependency_identities(&left.dependencies, &right.dependencies);
+    if !same_unit {
+        return None;
+    }
+    captured_outputs_match(left, right)
 }
 
 /// Dependency identities equal modulo the directory each capture's
@@ -469,14 +590,26 @@ fn same_dependency_identities(
 /// directories: the same kind per output, and the same file name for the
 /// stable-named outputs — the alias cargo originally asked for is
 /// compared by kind and digest alone, since its name is cargo's
-/// per-invocation unit hash rather than the unit's (stow#692). rlib and
-/// rmeta carry nothing path-dependent, so their recorded digests must
-/// match outright; a dynamic library is exempt because the linker writes
-/// the path it was produced at into the file (the Mach-O install name,
-/// and on MSVC the sibling .pdb path in the PE debug directory), so the
-/// same module legitimately hashes differently per output directory.
-/// Snapshot paths are excluded — they are per-capture temp names.
-fn captured_outputs_match(left: &CapturedRustcArtifact, right: &CapturedRustcArtifact) -> bool {
+/// per-invocation unit hash rather than the unit's (stow#692). An rmeta's
+/// recorded digest must match outright — metadata carries nothing
+/// path-dependent — while a dynamic library is exempt entirely, because
+/// the linker writes the path it was produced at into the file (the
+/// Mach-O install name, and on MSVC the sibling .pdb path in the PE
+/// debug directory), so the same module legitimately hashes differently
+/// per output directory. An rlib sits between those poles: the archive
+/// bundles the build script's native objects, and those record where
+/// and when their own compiler ran (stow#719), so a differing rlib
+/// digest is deferred, not ruled on — the pair is returned for the
+/// member-level check to settle. Snapshot paths are excluded — they are
+/// per-capture temp names.
+///
+/// Returns `None` when the records are different units by what they
+/// carry, else one [`RlibPair`] per rlib output pair whose recorded
+/// digests differ — empty when every digest matched.
+fn captured_outputs_match(
+    left: &CapturedRustcArtifact,
+    right: &CapturedRustcArtifact,
+) -> Option<Vec<RlibPair>> {
     fn by_kind_and_stable_name(record: &CapturedRustcArtifact) -> Vec<&CapturedRustcOutput> {
         let mut outputs = record.outputs.iter().collect::<Vec<_>>();
         outputs.sort_by(|a, b| {
@@ -489,17 +622,41 @@ fn captured_outputs_match(left: &CapturedRustcArtifact, right: &CapturedRustcArt
     let left_outputs = by_kind_and_stable_name(left);
     let right_outputs = by_kind_and_stable_name(right);
     if left_outputs.len() != right_outputs.len() {
-        return false;
+        return None;
     }
-    left_outputs
-        .iter()
-        .zip(&right_outputs)
-        .all(|(output, peer)| {
-            output.kind == peer.kind
-                && stable_output_name(left, output) == stable_output_name(right, peer)
-                && (output.kind == CapturedRustcOutputKind::DynamicLibrary
-                    || output.sha256 == peer.sha256)
-        })
+    let mut rlib_pairs = Vec::new();
+    for (output, peer) in left_outputs.iter().zip(&right_outputs) {
+        if output.kind != peer.kind
+            || stable_output_name(left, output) != stable_output_name(right, peer)
+        {
+            return None;
+        }
+        match output.kind {
+            // The linker wrote the output path into the file; digest
+            // equality is not the rule.
+            CapturedRustcOutputKind::DynamicLibrary => {}
+            // The digest can only differ through the native members a
+            // build script archived — the member-level check decides.
+            CapturedRustcOutputKind::Rlib if output.sha256 != peer.sha256 => {
+                rlib_pairs.push(RlibPair {
+                    crate_name: left.crate_name.clone(),
+                    left_path: output
+                        .snapshot_path
+                        .clone()
+                        .unwrap_or_else(|| output.path.clone()),
+                    left_sha256: output.sha256.clone(),
+                    right_path: peer
+                        .snapshot_path
+                        .clone()
+                        .unwrap_or_else(|| peer.path.clone()),
+                    right_sha256: peer.sha256.clone(),
+                });
+            }
+            _ if output.sha256 != peer.sha256 => return None,
+            _ => {}
+        }
+    }
+    Some(rlib_pairs)
 }
 
 /// An output's file name when it is the unit's own stable name, `None`
@@ -1443,8 +1600,8 @@ mod tests {
     use stow_types::public_cache::UnitInvocation;
 
     use super::{
-        IndexedPackage, ResolvedArtifact, SelectedCapturedArtifact, output_owner_index,
-        resolve_artifact, select_captured_artifact, select_captured_artifacts,
+        IndexedPackage, ResolvedArtifact, RlibPair, SelectedCapturedArtifact, Selection,
+        output_owner_index, resolve_artifact, select_captured_artifact, select_captured_artifacts,
     };
     use stow_types::capture::{
         CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput,
@@ -1455,10 +1612,10 @@ mod tests {
     fn same_unit_rlib_captures_from_different_phase_dirs_merge() {
         // The legitimate same-key case: one build-dependency unit captured
         // once per cargo phase, into each phase's own target dir. The
-        // output set is identical modulo directory — rlib and rmeta carry
-        // nothing path-dependent, so their digests match — and the second
-        // record merges its dependency aliases plus the paths of the
-        // outputs it drops instead of colliding.
+        // output set is identical modulo directory — this fixture's
+        // rmeta carries nothing path-dependent, so its digest matches —
+        // and the second record merges its dependency aliases plus the
+        // paths of the outputs it drops instead of colliding.
         let key = (
             "aho_corasick".to_owned(),
             "ef4a079a8dc04c32".to_owned(),
@@ -1655,17 +1812,17 @@ mod tests {
         assert!(error.to_string().contains(&"ff".repeat(32)), "{error}");
     }
 
-    /// The `x86_64-pc-windows-msvc` production collision this fix is scoped
-    /// to: a build-dependency unit captured by `cargo check` and `cargo
-    /// build` under the `--target` spelling — same invocation, same stable
-    /// `c_metadata`, same `["dep-info","link","metadata"]` emit — whose rlib
-    /// digest differed only by a phase-dir path embedded in its COFF
-    /// members' `CodeView` `S_OBJNAME`. That embed is fixed at the source (the
-    /// wrapper now appends the target-dir remap the rustflag boundary
-    /// drops), so genuinely different bytes under one key must still read
-    /// as a forged or colliding record.
+    /// An rlib digest difference under one selection key is not a
+    /// verdict of its own: an rlib archiving a build script's native
+    /// objects honestly differs between phases, because those objects
+    /// record where and when their own compiler ran (stow#719). A
+    /// build-dependency unit captured by `cargo check` and `cargo build`
+    /// under the `--target` spelling — same invocation, same stable
+    /// `c_metadata`, same `["dep-info","link","metadata"]` emit — merges
+    /// with the differing pair pending the member-level check instead of
+    /// failing at the record level.
     #[test]
-    fn same_invocation_records_with_different_rlib_bytes_still_fail() {
+    fn differing_rlib_bytes_under_one_key_defer_to_the_member_check() {
         let key = (
             "unicode_ident".to_owned(),
             "788c0f768456711f".to_owned(),
@@ -1694,8 +1851,11 @@ mod tests {
         ];
         check_capture.outputs.push(CapturedRustcOutput {
             kind: CapturedRustcOutputKind::Rlib,
+            // A `/` before the file name — the shape `Path::join` gives
+            // the sibling rmeta on this host — keeps the stable-name
+            // pairing working where `\` is not a separator.
             path: PathBuf::from(
-                "C:\\run\\target-check-target\\debug\\deps\\libunicode_ident-788c0f768456711f.rlib",
+                "C:\\run\\target-check-target\\debug\\deps/libunicode_ident-788c0f768456711f.rlib",
             ),
             snapshot_path: None,
             sha256: "aa".repeat(32),
@@ -1711,10 +1871,9 @@ mod tests {
                     .replace("target-check-target", "target-build-target"),
             );
         });
-        // The rlib's .obj members embedded the phase's real CARGO_TARGET_DIR
-        // (S_OBJNAME), so the build phase's rlib hashes differently even
-        // though the unit is identical; the rmeta carried nothing
-        // path-dependent and keeps its digest.
+        // The second phase's rlib hashes differently — its archived
+        // native objects recorded that phase's own paths — while the
+        // rmeta carries nothing path-dependent and keeps its digest.
         build_capture.outputs[1].sha256 = "bb".repeat(32);
         let first = SelectedCapturedArtifact {
             package: package.clone(),
@@ -1730,9 +1889,28 @@ mod tests {
         };
 
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let error = select_captured_artifact(&mut selected, key, second)
-            .expect_err("different rlib bytes under one key must fail");
-        assert!(error.to_string().contains("duplicate identity"), "{error}");
+        let outcome = select_captured_artifact(&mut selected, key, second)
+            .expect("differing rlib digests defer to the member check");
+        let Selection::Merged(pairs) = outcome else {
+            panic!("the second capture merges: {outcome:?}");
+        };
+        assert_eq!(pairs.len(), 1, "exactly the differing rlib pair pends");
+        let pair = &pairs[0];
+        assert_eq!(pair.crate_name, "unicode_ident");
+        assert_eq!(
+            pair.left_path,
+            PathBuf::from(
+                "C:\\run\\target-check-target\\debug\\deps/libunicode_ident-788c0f768456711f.rlib"
+            )
+        );
+        assert_eq!(pair.left_sha256, "aa".repeat(32));
+        assert_eq!(
+            pair.right_path,
+            PathBuf::from(
+                "C:\\run\\target-build-target\\debug\\deps/libunicode_ident-788c0f768456711f.rlib"
+            )
+        );
+        assert_eq!(pair.right_sha256, "bb".repeat(32));
     }
 
     /// A second record under one key whose compile key differs is a
@@ -1805,7 +1983,10 @@ mod tests {
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
         let merged = select_captured_artifact(&mut selected, key.clone(), second)
             .expect("captures differing only in the alias name are one unit");
-        assert!(merged, "the second capture merges into the first");
+        let Selection::Merged(pairs) = merged else {
+            panic!("the second capture merges into the first");
+        };
+        assert!(pairs.is_empty(), "no rlib pair is left pending: {pairs:?}");
 
         let stored = selected.get(&key).expect("selected capture");
         assert!(
@@ -1816,11 +1997,12 @@ mod tests {
         );
     }
 
-    /// The alias is compared by kind and digest, so the same two captures
-    /// colliding on genuinely different alias bytes is a forged or
-    /// colliding record — never a merge.
+    /// The alias is an rlib, so differing alias bytes are one more case
+    /// the record level cannot rule on: the pair defers to the
+    /// member-level check, where archives of different units collide on
+    /// the rustc members they carry.
     #[test]
-    fn an_alias_with_different_bytes_is_still_a_collision() {
+    fn an_alias_with_different_bytes_defers_to_the_member_check() {
         let key = psm_key();
         let mut selected = BTreeMap::new();
         let first = psm_selection(psm_capture(
@@ -1833,9 +2015,28 @@ mod tests {
         let second = psm_selection(build_capture);
 
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let error = select_captured_artifact(&mut selected, key, second)
-            .expect_err("different alias bytes under one key must fail");
-        assert!(error.to_string().contains("duplicate identity"), "{error}");
+        let outcome = select_captured_artifact(&mut selected, key, second)
+            .expect("differing alias bytes defer to the member check");
+        let Selection::Merged(pairs) = outcome else {
+            panic!("the second capture merges: {outcome:?}");
+        };
+        assert_eq!(pairs.len(), 1, "exactly the differing alias pair pends");
+        let pair = &pairs[0];
+        assert_eq!(pair.crate_name, "psm");
+        assert_eq!(
+            pair.left_path,
+            PathBuf::from(
+                "/tmp/workspace/target-check-native/debug/deps/libpsm-8e5bdc87bc91e8f0.rlib"
+            )
+        );
+        assert_eq!(pair.left_sha256, "aa".repeat(32));
+        assert_eq!(
+            pair.right_path,
+            PathBuf::from(
+                "/tmp/workspace/target-build-native/debug/deps/libpsm-a40c71aa8d26bf90.rlib"
+            )
+        );
+        assert_eq!(pair.right_sha256, "ff".repeat(32));
     }
 
     /// Renaming a stable-named output does not turn it into an alias: a
@@ -2681,6 +2882,126 @@ mod tests {
             super::verify_output_digests(selected.iter().map(|s| &s.captured))
                 .await
                 .expect("snapshot bytes match the recorded digest");
+        });
+    }
+
+    /// An [`RlibPair`] over real files: each side's recorded sha256 is
+    /// the digest of its bytes, as the wrapper recorded it.
+    fn rlib_pair(
+        crate_name: &str,
+        left: &Path,
+        left_bytes: &[u8],
+        right: &Path,
+        right_bytes: &[u8],
+    ) -> RlibPair {
+        RlibPair {
+            crate_name: crate_name.to_owned(),
+            left_path: left.to_path_buf(),
+            left_sha256: hex::encode(sha2::Sha256::digest(left_bytes)),
+            right_path: right.to_path_buf(),
+            right_sha256: hex::encode(sha2::Sha256::digest(right_bytes)),
+        }
+    }
+
+    /// stow#719: two captures of one unit's rlib whose archives differ
+    /// only in the native member a build script bundled — different
+    /// bytes and a different name, as a second phase's `OUT_DIR`
+    /// produces — verify as the same unit.
+    #[test]
+    fn rlib_pairs_differing_only_in_native_members_verify() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let left = tempdir.path().join("libpsm-check.rlib");
+            let right = tempdir.path().join("libpsm-build.rlib");
+            let left_bytes = crate::object_arch::gnu_archive(&[
+                ("lib.rmeta", b"metadata"),
+                ("psm-cc065d16221ef4be.psm.0.rcgu.o", b"codegen object"),
+                ("/tmp/one/out/psm.o", b"native object one"),
+            ]);
+            let right_bytes = crate::object_arch::gnu_archive(&[
+                ("lib.rmeta", b"metadata"),
+                ("psm-cc065d16221ef4be.psm.0.rcgu.o", b"codegen object"),
+                ("/tmp/two/out/psm.o", b"native object two"),
+            ]);
+            std::fs::write(&left, &left_bytes).expect("write left rlib");
+            std::fs::write(&right, &right_bytes).expect("write right rlib");
+
+            super::verify_rlib_pairs_agree(&[rlib_pair(
+                "psm",
+                &left,
+                &left_bytes,
+                &right,
+                &right_bytes,
+            )])
+            .await
+            .expect("archives differing only in a native member agree");
+        });
+    }
+
+    /// A pair whose `.rcgu.o` member differs is not one unit: the error
+    /// names the crate and the rustc member that disagreed.
+    #[test]
+    fn rlib_pairs_with_different_rustc_members_fail() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let left = tempdir.path().join("libpsm-check.rlib");
+            let right = tempdir.path().join("libpsm-build.rlib");
+            let left_bytes = crate::object_arch::gnu_archive(&[
+                ("lib.rmeta", b"metadata"),
+                ("psm-cc065d16221ef4be.psm.0.rcgu.o", b"codegen left"),
+            ]);
+            let right_bytes = crate::object_arch::gnu_archive(&[
+                ("lib.rmeta", b"metadata"),
+                ("psm-cc065d16221ef4be.psm.0.rcgu.o", b"codegen right"),
+            ]);
+            std::fs::write(&left, &left_bytes).expect("write left rlib");
+            std::fs::write(&right, &right_bytes).expect("write right rlib");
+
+            let error = super::verify_rlib_pairs_agree(&[rlib_pair(
+                "psm",
+                &left,
+                &left_bytes,
+                &right,
+                &right_bytes,
+            )])
+            .await
+            .expect_err("a differing codegen member is a different unit");
+            let message = error.to_string();
+            assert!(message.contains("psm"), "names the crate: {message}");
+            assert!(
+                message.contains("psm-cc065d16221ef4be.psm.0.rcgu.o"),
+                "names the member: {message}"
+            );
+        });
+    }
+
+    /// A pair member whose bytes no longer match its recorded digest
+    /// fails the way `verify_output_digests` does — something rewrote
+    /// the file after rustc exited.
+    #[test]
+    fn an_rlib_pair_member_changed_after_capture_fails() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let left = tempdir.path().join("libpsm-check.rlib");
+            let right = tempdir.path().join("libpsm-build.rlib");
+            let left_bytes = crate::object_arch::gnu_archive(&[("lib.rmeta", b"metadata")]);
+            let right_bytes = crate::object_arch::gnu_archive(&[("lib.rmeta", b"metadata")]);
+            std::fs::write(&left, &left_bytes).expect("write left rlib");
+            std::fs::write(&right, b"rewritten after capture").expect("write right rlib");
+
+            let error = super::verify_rlib_pairs_agree(&[rlib_pair(
+                "psm",
+                &left,
+                &left_bytes,
+                &right,
+                &right_bytes,
+            )])
+            .await
+            .expect_err("a file past its recorded digest must fail");
+            assert!(
+                error.to_string().contains("changed after rustc exited"),
+                "{error}"
+            );
         });
     }
 
