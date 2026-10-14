@@ -1007,6 +1007,7 @@ pub async fn build(
         capture_command: &capture_command,
         audit_log: &audit_log,
         rustflags: &rustflags,
+        target: task.target.as_str(),
         consume_store: consume_store.as_deref(),
     };
     // One sandbox carries every phase and invocation. On Windows building
@@ -1162,6 +1163,9 @@ pub struct PhaseSetup<'a> {
     pub capture_command: &'a StowCaptureCommand,
     pub audit_log: &'a heel::NetworkAuditLog,
     pub rustflags: &'a str,
+    /// The task's target triple: which cross toolchain's variables and
+    /// install trees the sandbox is given.
+    pub target: &'a str,
     /// The prefetch-staged verified bundle store, when consumption staged
     /// anything: granted read-only to every phase.
     pub consume_store: Option<&'a Path>,
@@ -1431,6 +1435,7 @@ pub async fn phase_sandbox(
         capture_wrapper,
         capture_command,
         audit_log,
+        target,
         consume_store,
         ..
     } = setup;
@@ -1453,10 +1458,15 @@ pub async fn phase_sandbox(
         // Toolchain configuration for cross builds: `CARGO_TARGET_*_LINKER`
         // points cargo at the NDK/GNU cross linker, the `cc`-crate `CC_*`/
         // `AR_*`/`CFLAGS_*` forms pick its compiler, and the SDK/NDK root
-        // variables let tools locate their own install trees. These carry
-        // paths and flags only — the filesystem grants below still decide
-        // what a build script can actually read or exec.
-        .env_passthroughs(toolchain_env_names());
+        // variables let tools locate their own install trees — the Android
+        // ones only when the task's target is Android, since a runner image
+        // exports them whatever it builds. These carry paths and flags only
+        // — the filesystem grants below still decide what a build script
+        // can actually read or exec.
+        .env_passthroughs(toolchain_env_names(
+            target,
+            std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+        ));
 
     for (path, access, reason) in sandbox_grants(
         workspace,
@@ -1465,6 +1475,7 @@ pub async fn phase_sandbox(
         runtime_wrapper,
         msvc,
         *consume_store,
+        target,
     )? {
         tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
         builder = builder.grant(path, access);
@@ -1489,6 +1500,7 @@ fn sandbox_grants(
     runtime_wrapper: &Path,
     msvc: &MsvcToolchain,
     consume_store: Option<&Path>,
+    target: &str,
 ) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
     let cargo_home = cargo_home()?;
     let rustup_home = rustup_home()?;
@@ -1550,7 +1562,7 @@ fn sandbox_grants(
         ));
     }
 
-    conditional_grants(&cargo_home, &rustup_home, &mut grants);
+    conditional_grants(&cargo_home, &rustup_home, target, &mut grants);
 
     grants.extend(compiler_search_grants());
     grants.extend(msvc.grants());
@@ -1590,6 +1602,7 @@ fn in_windows_system_tree(path: &Path) -> bool {
 fn conditional_grants(
     cargo_home: &Path,
     rustup_home: &Path,
+    target: &str,
     grants: &mut Vec<(PathBuf, Access, &'static str)>,
 ) {
     if cargo_home.join("git").exists() {
@@ -1648,7 +1661,7 @@ fn conditional_grants(
     // an NDK under `~/Library/Android` or `/opt`, a sysroot a `SDKROOT`
     // points at. Where the runner image puts them under `/usr` these
     // duplicate heel's system grants and cost nothing.
-    for dir in toolchain_grant_dirs() {
+    for dir in toolchain_grant_dirs(target, std::env::vars_os()) {
         grants.push((
             dir,
             Access::READ | Access::EXEC,
@@ -1739,17 +1752,46 @@ fn ensure_package_cache_lock(cargo_home: &Path) -> stow_types::error::Result<()>
     Ok(())
 }
 
-/// Environment variable names that configure the cross toolchain, gathered
-/// from the parent environment at sandbox-build time.
+/// The Android SDK and NDK roots. A runner image exports these whatever
+/// it is about to build, so they are passed through and their trees
+/// granted only to a task that targets Android: granting them to
+/// every task made each Windows build rewrite the access control list
+/// of the whole SDK, and of each NDK inside it again — minutes per
+/// build for a tree no Windows task reads (stow#718).
+const ANDROID_ROOT_VARS: &[&str] = &[
+    "ANDROID_HOME",
+    "ANDROID_SDK_ROOT",
+    "ANDROID_NDK",
+    "ANDROID_NDK_HOME",
+    "ANDROID_NDK_ROOT",
+    "ANDROID_NDK_LATEST_HOME",
+];
+
+/// Whether `target` builds for Android — a triple whose operating-system
+/// component starts with `android` (`aarch64-linux-android`,
+/// `armv7-linux-androideabi`, `x86_64-linux-android`, `i686-linux-android`).
+fn targets_android(target: &str) -> bool {
+    target
+        .rsplit('-')
+        .next()
+        .is_some_and(|os| os.starts_with("android"))
+}
+
+/// Environment variable names that configure the cross toolchain, selected
+/// out of `names` — the caller passes the parent environment's names at
+/// sandbox-build time, and the task's `target` decides which apply.
 ///
 /// Exact names cover the compiler drivers the `cc` crate and rustc invoke,
 /// the SDK roots those tools locate their install trees through, and
-/// pkg-config's sysroot wiring. The prefixed forms are the `cc` crate's
-/// per-target overrides (`CC_<target>`, `AR_<target>`, `CFLAGS_<target>`)
-/// plus cargo's per-target configuration (`CARGO_TARGET_<TRIPLE>_LINKER`,
-/// `_AR`, `_RUNNER`, `_RUSTFLAGS`). `CARGO_TARGET_DIR` is deliberately not a
-/// prefix match here — `CARGO_TARGET_DIR` is set explicitly per phase.
-fn toolchain_env_names() -> Vec<String> {
+/// pkg-config's sysroot wiring. The Android SDK/NDK roots
+/// (`ANDROID_ROOT_VARS`) count only for a task that targets Android; the
+/// runner image exports them whatever the job builds. The prefixed forms
+/// are the `cc` crate's per-target overrides (`CC_<target>`,
+/// `AR_<target>`, `CFLAGS_<target>`) plus cargo's per-target configuration
+/// (`CARGO_TARGET_<TRIPLE>_LINKER`, `_AR`, `_RUNNER`, `_RUSTFLAGS`).
+/// `CARGO_TARGET_DIR` is deliberately not a prefix match here —
+/// `CARGO_TARGET_DIR` is set explicitly per phase.
+fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec<String> {
     const EXACT: &[&str] = &[
         "CC",
         "CXX",
@@ -1761,12 +1803,6 @@ fn toolchain_env_names() -> Vec<String> {
         "LDFLAGS",
         "SDKROOT",
         "DEVELOPER_DIR",
-        "ANDROID_HOME",
-        "ANDROID_SDK_ROOT",
-        "ANDROID_NDK",
-        "ANDROID_NDK_HOME",
-        "ANDROID_NDK_ROOT",
-        "ANDROID_NDK_LATEST_HOME",
         "PKG_CONFIG_PATH",
         "PKG_CONFIG_LIBDIR",
         "PKG_CONFIG_SYSROOT_DIR",
@@ -1802,43 +1838,46 @@ fn toolchain_env_names() -> Vec<String> {
         "CPPFLAGS_",
         "LDFLAGS_",
     ];
-    std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
+    let android = targets_android(target);
+    names
         .filter(|name| {
             name != "CARGO_TARGET_DIR"
                 && (EXACT.contains(&name.as_str())
+                    || (android && ANDROID_ROOT_VARS.contains(&name.as_str()))
                     || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
         })
         .collect()
 }
 
-/// Directories a cross toolchain lives under, gathered from the same
-/// environment. The SDK/NDK roots name whole install trees; linker and
-/// compiler variables name executables, whose parent directory is granted
-/// the way `resolve_on_path` grants the `cargo`/`rustc` directory. On Linux
-/// runners these resolve under `/usr` — already covered by heel's system
-/// rules — so the grants matter where the toolchain lives in a user-owned
-/// location, like the macOS `~/Library/Android` SDK.
-fn toolchain_grant_dirs() -> Vec<PathBuf> {
+/// Directories a cross toolchain lives under, selected out of `vars` — the
+/// same environment `toolchain_env_names` filters for names, with the
+/// task's `target` deciding which roots apply. The SDK roots name whole
+/// install trees (`ANDROID_ROOT_VARS` only for a task that targets
+/// Android); linker and compiler variables name executables, whose parent
+/// directory is granted the way `resolve_on_path` grants the
+/// `cargo`/`rustc` directory. On Linux runners these resolve under `/usr`
+/// — already covered by heel's system rules — so the grants matter where
+/// the toolchain lives in a user-owned location, like the macOS
+/// `~/Library/Android` SDK an Android task builds against.
+fn toolchain_grant_dirs(
+    target: &str,
+    vars: impl Iterator<Item = (OsString, OsString)>,
+) -> Vec<PathBuf> {
     const TOOLCHAIN_ROOT_VARS: &[&str] = &[
         "SDKROOT",
         "DEVELOPER_DIR",
-        "ANDROID_HOME",
-        "ANDROID_SDK_ROOT",
-        "ANDROID_NDK",
-        "ANDROID_NDK_HOME",
-        "ANDROID_NDK_ROOT",
-        "ANDROID_NDK_LATEST_HOME",
         // The glibc-2.28 sysroot the Linux build job extracts under the
         // runner's home: sandboxed compiles read its headers and link
         // inputs through it.
         "STOW_GLIBC_SYSROOT",
     ];
     const TOOLCHAIN_EXE_PREFIXES: &[&str] = &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_"];
-    let mut dirs: Vec<PathBuf> = std::env::vars_os()
+    let android = targets_android(target);
+    let mut dirs: Vec<PathBuf> = vars
         .filter_map(|(name, value)| {
             let name = name.to_str()?;
-            if TOOLCHAIN_ROOT_VARS.contains(&name) {
+            if TOOLCHAIN_ROOT_VARS.contains(&name) || (android && ANDROID_ROOT_VARS.contains(&name))
+            {
                 return Some(PathBuf::from(value));
             }
             if TOOLCHAIN_EXE_PREFIXES
@@ -2403,6 +2442,7 @@ pub fn unpack_crate_archive(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
@@ -2417,7 +2457,8 @@ mod tests {
     use super::{
         BuildWorkspace, CargoInvocation, CargoSubcommand, STOW_PROBE_FORBIDDEN_PATH_ENV,
         cargo_home, phase_invocations, phase_target_dir, pin_alias, sandbox_grants,
-        unpack_crate_archive, verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
+        targets_android, toolchain_env_names, toolchain_grant_dirs, unpack_crate_archive,
+        verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
     };
 
     #[test]
@@ -3064,6 +3105,7 @@ checksum = "33"
         root: &Path,
         target_dir: &Path,
         msvc: &super::MsvcToolchain,
+        target: &str,
         extra_env: &[(String, String)],
     ) {
         let capture_dir = root.join(".stow-rustc-capture");
@@ -3095,6 +3137,7 @@ checksum = "33"
             capture_command: &capture_command,
             audit_log: &audit_log,
             rustflags: "",
+            target,
             consume_store: None,
         };
         let sandbox = super::phase_sandbox(&setup, target_dir, msvc)
@@ -3168,8 +3211,9 @@ checksum = "33"
             .expect("write build script");
 
             let target_dir = TempDir::new().expect("target dir");
-            let msvc = super::MsvcToolchain::resolve(&host_triple()).expect("MSVC toolchain");
-            cargo_build_probe(root, target_dir.path(), &msvc, &[]).await;
+            let host = host_triple();
+            let msvc = super::MsvcToolchain::resolve(&host).expect("MSVC toolchain");
+            cargo_build_probe(root, target_dir.path(), &msvc, &host, &[]).await;
         });
     }
 
@@ -3245,6 +3289,7 @@ checksum = "33"
                 root,
                 target_dir.path(),
                 &msvc,
+                "aarch64-pc-windows-msvc",
                 &[(
                     "STOW_PROBE_OBJECT".to_owned(),
                     super::path_arg(&probe_object).expect("utf8 probe path"),
@@ -3273,18 +3318,17 @@ checksum = "33"
             const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
 
             let workspace_root = TempDir::new().expect("workspace root");
-            let capture_dir = workspace_root.path().join(".stow-rustc-capture");
             let target_dir = TempDir::new().expect("target dir");
             let tools_dir = TempDir::new().expect("tools dir");
-            std::fs::create_dir_all(&capture_dir).expect("capture dir");
 
             let workspace = BuildWorkspace {
                 _tempdir: None,
                 manifest_path: workspace_root.path().join("Cargo.toml"),
                 workspace_root: workspace_root.path().to_path_buf(),
-                capture_dir,
+                capture_dir: workspace_root.path().join(".stow-rustc-capture"),
                 bundled_lockfile: None,
             };
+            std::fs::create_dir_all(workspace.capture_dir()).expect("capture dir");
             let exe = std::env::consts::EXE_SUFFIX;
             let wrappers = stow_shim::WrapperShimPaths {
                 rustc_wrapper: tools_dir.path().join(format!("stow-rustc-wrapper{exe}")),
@@ -3299,7 +3343,8 @@ checksum = "33"
             // must reach the sandboxed phases, read-only so a build script
             // cannot rewrite another crate's source.
             let cargo_home = cargo_home().expect("cargo home");
-            let msvc = super::MsvcToolchain::resolve(&host_triple()).expect("MSVC toolchain");
+            let host = host_triple();
+            let msvc = super::MsvcToolchain::resolve(&host).expect("MSVC toolchain");
             let grants = sandbox_grants(
                 &workspace,
                 target_dir.path(),
@@ -3307,12 +3352,11 @@ checksum = "33"
                 &wrapper,
                 &msvc,
                 None,
+                &host,
             )
             .expect("sandbox grants");
             for dir in ["registry", "git"] {
-                let grant = grants
-                    .iter()
-                    .find(|(path, _, _)| *path == cargo_home.join(dir));
+                let grant = grants.iter().find(|(p, _, _)| *p == cargo_home.join(dir));
                 assert_eq!(
                     grant.map(|(_, access, _)| *access),
                     Some(heel::Access::READ),
@@ -3342,6 +3386,7 @@ checksum = "33"
                 capture_command: &capture_command,
                 audit_log: &audit_log,
                 rustflags: "",
+                target: &host,
                 consume_store: None,
             };
             let sandbox = super::phase_sandbox(&setup, target_dir.path(), &msvc)
@@ -3387,5 +3432,132 @@ checksum = "33"
                 std::env::remove_var(STOW_PROBE_FORBIDDEN_PATH_ENV);
             }
         });
+    }
+
+    /// A runner image exports the Android SDK/NDK roots whatever the job
+    /// builds; their trees reach the grant set only when the task's target
+    /// is Android — a Windows task must not pay the ACL rewrite of a tree
+    /// it never reads (stow#718).
+    #[test]
+    fn an_android_root_is_granted_only_to_an_android_task() {
+        let sdk = TempDir::new().expect("sdk dir");
+        let ndk = TempDir::new().expect("ndk dir");
+        let vars = || {
+            [
+                (
+                    OsString::from("ANDROID_HOME"),
+                    sdk.path().as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("ANDROID_NDK_HOME"),
+                    ndk.path().as_os_str().to_owned(),
+                ),
+            ]
+            .into_iter()
+        };
+
+        assert!(
+            toolchain_grant_dirs("x86_64-pc-windows-msvc", vars()).is_empty(),
+            "a Windows task must not be granted the runner image's Android trees"
+        );
+        let dirs = toolchain_grant_dirs("aarch64-linux-android", vars());
+        assert_eq!(dirs.len(), 2);
+        for dir in [sdk.path(), ndk.path()] {
+            assert!(
+                dirs.contains(&dir.to_path_buf()),
+                "an Android task must be granted {}",
+                dir.display()
+            );
+        }
+    }
+
+    /// The same gate on the environment side: the Android variables pass
+    /// into a sandboxed phase only when the task targets Android.
+    #[test]
+    fn an_android_variable_is_passed_only_to_an_android_task() {
+        let names = || ["ANDROID_HOME", "ANDROID_NDK_LATEST_HOME"].map(str::to_owned);
+
+        assert!(
+            toolchain_env_names("x86_64-pc-windows-msvc", names().into_iter()).is_empty(),
+            "a Windows task must not see the runner image's Android variables"
+        );
+        let passed = toolchain_env_names("aarch64-linux-android", names().into_iter());
+        assert_eq!(passed, ["ANDROID_HOME", "ANDROID_NDK_LATEST_HOME"]);
+    }
+
+    /// The toolchain variables the build job exports for the task's own
+    /// target are not Android-gated: `STOW_GLIBC_SYSROOT` and `SDKROOT`
+    /// grant their trees to every task, a `CARGO_TARGET_<TRIPLE>_*`
+    /// executable grants its parent directory, and `CC_<target>` passes
+    /// through — while `CARGO_TARGET_DIR`, which the phases set
+    /// themselves, never does.
+    #[test]
+    fn the_job_s_own_toolchain_variables_reach_every_task() {
+        let sysroot = TempDir::new().expect("sysroot dir");
+        let sdkroot = TempDir::new().expect("sdkroot dir");
+        let linker_dir = TempDir::new().expect("linker dir");
+        let linker = linker_dir.path().join("aarch64-linux-gnu-ld");
+        std::fs::write(&linker, b"#!/bin/sh\n").expect("linker file");
+
+        let vars = || {
+            [
+                (
+                    OsString::from("STOW_GLIBC_SYSROOT"),
+                    sysroot.path().as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("SDKROOT"),
+                    sdkroot.path().as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"),
+                    linker.as_os_str().to_owned(),
+                ),
+            ]
+            .into_iter()
+        };
+        let dirs = toolchain_grant_dirs("x86_64-unknown-linux-gnu", vars());
+        for dir in [sysroot.path(), sdkroot.path(), linker_dir.path()] {
+            assert!(
+                dirs.contains(&dir.to_path_buf()),
+                "{} must be granted to a non-Android task",
+                dir.display()
+            );
+        }
+
+        let passed = toolchain_env_names(
+            "aarch64-linux-android",
+            ["CC_aarch64_linux_android".to_owned()].into_iter(),
+        );
+        assert_eq!(passed, ["CC_aarch64_linux_android"]);
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-linux-android"] {
+            assert!(
+                toolchain_env_names(target, ["CARGO_TARGET_DIR".to_owned()].into_iter()).is_empty(),
+                "CARGO_TARGET_DIR must never pass through ({target})"
+            );
+        }
+    }
+
+    /// `targets_android` reads the triple's operating-system component:
+    /// Android triples end in `android`/`androideabi`, every other CI
+    /// target does not.
+    #[test]
+    fn only_an_android_triple_targets_android() {
+        for target in [
+            "aarch64-linux-android",
+            "armv7-linux-androideabi",
+            "x86_64-linux-android",
+            "i686-linux-android",
+        ] {
+            assert!(targets_android(target), "{target} must target Android");
+        }
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-ios",
+            "wasm32-unknown-unknown",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert!(!targets_android(target), "{target} must not target Android");
+        }
     }
 }
