@@ -457,12 +457,12 @@ attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
   records for it;
 - every planned artifact's `target` and `rustc_version` equal the task's;
 - every planned artifact's `(crate, version)` is in the dependency closure the
-  publisher resolves itself from a fresh crates.io download with
-  `cargo metadata` (which never executes crate code): the crates reachable
-  from the task crate over normal and build edges on the task's platform.
-  Dev-dependencies and other platforms' dependencies are never compiled by
-  the pipeline, so a plan entry for one of them is a fabrication and is
-  rejected;
+  publisher reads itself from a fresh crates.io download with
+  `cargo --unit-graph` (which plans compilation and never executes crate
+  code): the units cargo's `check` and `build` phases compile on the task's
+  platform. Dev-dependencies and other platforms' dependencies are never
+  compiled by the pipeline, so a plan entry for one of them is a fabrication
+  and is rejected;
 - every `oci_reference` equals the reference the artifact's own identity
   fields produce, so a plan cannot push under another artifact's name.
 

@@ -965,16 +965,7 @@ fn phase_feature_sets(
     task: &BuildTaskPayload,
     built: &BuiltWorkspace,
 ) -> stow_types::error::Result<BTreeMap<PathBuf, PhaseFeatureSets>> {
-    let host_triple = stow_types::api::runner_family(task.target.as_str())
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "task {} {} targets {} — no runner family names its host triple",
-                task.crate_name.as_str(),
-                task.version,
-                task.target
-            )
-        })?
-        .host_triple();
+    let host_triple = crate::task::runner_host_triple(task)?;
     let mut phases = BTreeMap::new();
     for graph in built.unit_graphs() {
         let units = graph.task_units(host_triple).map_err(|error| {
@@ -1345,21 +1336,10 @@ fn package_for_capture<'a>(
     }
 }
 
-/// The task feature set `indexed_package`/`package_has_library_target`
-/// evaluate `required-features` against.
-pub fn task_feature_set(task: &BuildTaskPayload) -> BTreeSet<String> {
+/// The task feature set `indexed_package` evaluates `required-features`
+/// against.
+fn task_feature_set(task: &BuildTaskPayload) -> BTreeSet<String> {
     task.features_json.features().iter().cloned().collect()
-}
-
-/// The package's library target under the task's feature set, if it has one
-/// the trusted pipeline would compile.
-pub fn package_has_library_target(package: &Package, task_features: &BTreeSet<String>) -> bool {
-    package
-        .targets
-        .iter()
-        .find_map(|target| preferred_target(package, target, task_features))
-        .or_else(|| package.targets.iter().find_map(candidate_target))
-        .is_some()
 }
 
 fn indexed_package(package: &Package, task: &BuildTaskPayload) -> Option<IndexedPackage> {
