@@ -97,7 +97,6 @@ struct VersionMetadata {
 
 #[derive(Debug, serde::Deserialize)]
 struct ContainerMetadata {
-    #[serde(default)]
     tags: Vec<String>,
 }
 
@@ -639,7 +638,13 @@ async fn gather(
         let rustc = rustc.to_owned();
         async move {
             let pulled = stow_oci::pull_index(session, base, &target, &rustc).await?;
-            let decoded = pulled.and_then(|pulled| ArtifactIndex::decode(&pulled.bytes).ok());
+            // Another format is garbage by rule; any other decode failure is
+            // a corrupt current slice, which gc must not quietly delete.
+            let decoded = match pulled.map(|pulled| ArtifactIndex::decode(&pulled.bytes)) {
+                None | Some(Err(stow_types::index::IndexDecodeError::Format { .. })) => None,
+                Some(Ok(index)) => Some(index),
+                Some(Err(error)) => return Err(stow_error!("decode slice {tag}: {error}")),
+            };
             Ok::<_, stow_types::error::Error>((tag.clone(), decoded))
         }
     }))
@@ -740,18 +745,29 @@ async fn pull_records_facts(
     let bytes = stow_oci::pull_blob_verified(session, descriptor).await?;
     let records = serde_json::from_slice::<Vec<ArtifactRecord>>(&bytes)
         .map_err(|error| format!("decode records layer of {reference}: {error}"));
-    Ok(records.map(|records| {
-        records
-            .iter()
-            .map(|record| RecordFact {
+    let records = match records {
+        Ok(records) => records,
+        Err(message) => return Ok(Err(message)),
+    };
+    // A decoded record names its artifact by tag; one that does not would
+    // leave its `.bundle` manifest unreachable, so it stops the run.
+    let facts = records
+        .iter()
+        .map(|record| {
+            let artifact_tag = oci_reference_tag(&record.oci_reference).ok_or_else(|| {
+                stow_error!(
+                    "{reference}: record oci_reference {} carries no tag",
+                    record.oci_reference
+                )
+            })?;
+            Ok(RecordFact {
                 oci_digest: record.oci_digest.clone(),
-                artifact_tag: oci_reference_tag(&record.oci_reference)
-                    .unwrap_or_default()
-                    .to_owned(),
+                artifact_tag: artifact_tag.to_owned(),
                 bundle_digest: record.bundle_digest.clone(),
             })
-            .collect()
-    }))
+        })
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    Ok(Ok(facts))
 }
 
 #[cfg(test)]
