@@ -337,8 +337,7 @@ impl ArtifactIndex {
                 expected: ARTIFACT_INDEX_FORMAT_VERSION,
             });
         }
-        let index: Self =
-            serde_json::from_slice(&json).map_err(IndexDecodeError::Deserialize)?;
+        let index: Self = serde_json::from_slice(&json).map_err(IndexDecodeError::Deserialize)?;
         let actual = index.rows.len() as u64;
         if index.header.row_count != actual {
             return Err(IndexDecodeError::RowCountMismatch {

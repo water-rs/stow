@@ -4851,8 +4851,9 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
     // above the committed one, then the writer dies before the flip.
     db.query(
         "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity) \
-             VALUES (?, ?, 2, 'stale', '1.0.0', '[]', 'd0deadbeef')",
+             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, \
+              unit_side, unit_invocation, unit_linked) \
+             VALUES (?, ?, 2, 'stale', '1.0.0', '[]', 'd0deadbeef', 0, 0, 1)",
     )
     .bind(TARGET.to_owned())
     .bind(RUSTC.to_owned())
@@ -6450,7 +6451,7 @@ const fn wide_claim_settings() -> SchedulerSettings {
 /// Enqueue then claim `count` tasks on `target`, then complete each
 /// one — `Some((error, run_id))` fails it, `None` succeeds —
 /// leaving `count` outcomes counted in `attempt_outcome_buckets`
-/// (and `count` raw rows in `attempt_outcomes` when all fail).
+/// (and `count` raw rows in `attempt_outcomes_v2` when all fail).
 async fn seed_outcomes(
     db: &DurableDb,
     batch: u32,
@@ -6554,7 +6555,7 @@ async fn freeze_gates_dispatch_but_not_enqueue_and_clear_resumes() {
     assert_eq!(claimed.len(), 1, "the freeze-queued miss dispatches");
 }
 
-/// The trip decision reads `attempt_outcomes`, not live queue rows —
+/// The trip decision reads `attempt_outcomes_v2`, not live queue rows —
 /// a retried task keeps every failed attempt inside the window.
 #[tokio::test]
 async fn evaluate_freeze_trip_reads_attempt_outcomes() {

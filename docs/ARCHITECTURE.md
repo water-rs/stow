@@ -409,9 +409,8 @@ ever assembles, buffers or inspects it. The publish stage validated the tar
 | `sigstore/payload-<n>.json` | Cosign simple-signing payloads, one per signature layer |
 | `files/<name>` | One entry per layer in manifest order: `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, the native archive |
 
-A record whose artifact predates bundle publishing carries an empty
-`bundle_digest`; the index export omits it — a row with no pullable
-digest is not coverage.
+A record always carries its pushed bundle's digest — the publish
+writes it — so every record maps to one index row.
 
 Constants (media types, paths) are defined in `types/src/bundle.rs`.
 

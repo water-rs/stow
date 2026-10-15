@@ -556,15 +556,13 @@ where
     for ((_, _, tag), records) in missing.iter().zip(per_tag) {
         // The tag joins the folded set of every slice its records name;
         // a records artifact is immutable per build, so the tag is never
-        // pulled again once marked — including an artifact whose rows
-        // are all still unbundled.
+        // pulled again once marked.
         let mut named = BTreeSet::new();
         for record in &records {
             let key = (record.target.clone(), record.rustc_version.clone());
             named.insert(key.clone());
-            if let Some(row) = record_to_index_row(record) {
-                fold_row(new_rows.entry(key).or_default(), row);
-            }
+            let row = record_to_index_row(record);
+            fold_row(new_rows.entry(key).or_default(), row);
         }
         for key in named {
             new_folded.entry(key).or_default().insert((*tag).to_owned());
@@ -1262,10 +1260,7 @@ mod tests {
         let folded_tag_name = folded_tag(TARGET, RUSTC);
         let prior = [record("aaaa1111"), record("bbbb2222")];
         let new = [record("cccc3333"), record("dddd4444")];
-        let prev_rows: Vec<ArtifactIndexRow> = prior
-            .iter()
-            .map(|record| record_to_index_row(record).expect("bundled record"))
-            .collect();
+        let prev_rows: Vec<ArtifactIndexRow> = prior.iter().map(record_to_index_row).collect();
         let pulled = Mutex::new(Vec::<String>::new());
         // The tag's digest is one-way — the registry answers records by
         // task id (its manifest annotation), which the test models with
@@ -1481,10 +1476,7 @@ mod tests {
         let mut second = record("aaaa1111");
         second.bundle_size = 2;
         let prev = PrevSlice {
-            index: prev_index(
-                vec![record_to_index_row(&first).expect("bundled record")],
-                7,
-            ),
+            index: prev_index(vec![record_to_index_row(&first)], 7),
             folded: [records_tag(RUSTC, "aaaa1111", build(1))].into(),
         };
         let pull_prev = {
@@ -1720,15 +1712,15 @@ mod tests {
         .expect("export pass");
         let rows = &target_slice(&pass).index.rows;
         assert_eq!(rows.len(), 2);
-        let left_identity = left.dependency_identity.clone();
-        let right_identity = right.dependency_identity.clone();
         let identities: Vec<_> = rows
             .iter()
             .map(|row| row.dependency_identity.clone())
             .collect();
         assert_eq!(
             identities.iter().collect::<BTreeSet<_>>(),
-            [&left_identity, &right_identity].into_iter().collect(),
+            [&left.dependency_identity, &right.dependency_identity]
+                .into_iter()
+                .collect(),
             "both nodes keep a row"
         );
         assert!(
@@ -1746,8 +1738,8 @@ mod tests {
         let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
         let left = shared_unit_record(&["dep-left"]);
         let right = shared_unit_record(&["dep-right"]);
-        let left_row = record_to_index_row(&left).expect("left row");
-        let right_row = record_to_index_row(&right).expect("right row");
+        let left_row = record_to_index_row(&left);
+        let right_row = record_to_index_row(&right);
         let prev = prev_index(vec![left_row.clone()], 7);
         let tags = vec![
             folded_tag(TARGET, RUSTC),
@@ -1775,8 +1767,8 @@ mod tests {
     /// membership like the first's, not a duplicate.
     #[test]
     fn semantic_rows_reports_each_node_of_a_shared_unit() {
-        let left = record_to_index_row(&shared_unit_record(&["dep-left"])).expect("left row");
-        let right = record_to_index_row(&shared_unit_record(&["dep-right"])).expect("right row");
+        let left = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let right = record_to_index_row(&shared_unit_record(&["dep-right"]));
         let index = prev_index(vec![left.clone(), right.clone()], 3);
         let rows = semantic_rows(&index);
         assert_eq!(rows.len(), 2);
@@ -1794,8 +1786,8 @@ mod tests {
     /// and retires nothing.
     #[test]
     fn a_second_nodes_row_reports_as_a_pure_addition() {
-        let left = record_to_index_row(&shared_unit_record(&["dep-left"])).expect("left row");
-        let right = record_to_index_row(&shared_unit_record(&["dep-right"])).expect("right row");
+        let left = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let right = record_to_index_row(&shared_unit_record(&["dep-right"]));
         let right_identity = right.dependency_identity.clone();
         let previous = semantic_rows(&prev_index(vec![left.clone()], 7));
         let current = semantic_rows(&prev_index(vec![left, right], 8));

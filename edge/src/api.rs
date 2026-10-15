@@ -1669,12 +1669,13 @@ async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
             return;
         }
     };
-    // Historical rows carry no stored subgraph — they drained as an
-    // explicit skip, counted here, never re-minted (stow#588).
+    // A row whose stored subgraph fails the drain's checks was
+    // consumed as an explicit skip, counted here, never re-minted
+    // (stow#588).
     if drain.skipped > 0 {
         tracing::info!(
             skipped = drain.skipped,
-            "miss drain skipped rows with no stored context"
+            "miss drain skipped rows it could not re-mint"
         );
     }
     let drained = drain.requests;

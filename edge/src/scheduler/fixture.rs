@@ -334,6 +334,7 @@ fn seq_sql(lo: u32, hi: u32) -> String {
 /// same list (`task_id` is the conflict key, never an update target).
 const QUEUE_SEED_COLUMNS: &[&str] = &[
     "task_id",
+    "dependency_identity",
     "crate_name",
     "version",
     "features_json",
@@ -484,6 +485,7 @@ fn queue_seed_insert_sql(
         "WITH RECURSIVE seq(n) AS ({seq_source}) \
          {verb} INTO queue ({columns}) \
          SELECT {task_id}, \
+                {task_id}, \
                 'crate' || (n / {CRATE_NAME_ROWS}), \
                 '1.' || (n / 20000) || '.' || (n % 500), \
                 '[]', \

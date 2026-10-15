@@ -209,14 +209,13 @@ async fn fetch_slice(
     if !force
         && let Some(pointer) = &pointer
         && now_secs().saturating_sub(pointer.fetched_at) < config.index_refresh_interval.as_secs()
+        && let Some(slice) = load_cached(&dir, pointer).await?
     {
-        if let Some(slice) = load_cached(&dir, pointer).await? {
-            return Ok(slice);
-        }
-        // A cached blob of another index format is exactly a stale slice:
-        // a format bump republishes every slice, so the tag's manifest
-        // digest has moved and the revalidation below picks the new one.
+        return Ok(slice);
     }
+    // A cached blob of another index format is exactly a stale slice: a
+    // format bump republishes every slice, so the tag's manifest digest
+    // has moved and the revalidation below picks the new one.
 
     let tag = index_tag(target, rustc_version);
     let base = stow_oci::RegistryBase::parse(&config.registry_base_url)?;

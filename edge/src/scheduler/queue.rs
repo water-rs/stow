@@ -1705,7 +1705,7 @@ const OUTCOME_BUCKET_SECS: i64 = 300;
 /// what aged out. The read set of a completion is constant in traffic:
 /// the `UPDATE … RETURNING target` in `complete` names the row's target,
 /// one bucket upsert counts it, and — for failures — one raw
-/// `attempt_outcomes` row keeps the trip alert's class and run-id
+/// `attempt_outcomes_v2` row keeps the trip alert's class and run-id
 /// evidence; successes never land a raw row at all. Both expiry deletes
 /// bound on `window_minutes` (the same horizon the trip check reads), so
 /// each insert removes at most what just aged out — the tables never
@@ -1748,12 +1748,6 @@ async fn record_attempt_outcome(
         .await
         .map_err(|error| format!("record attempt failure evidence: {error}"))?;
     }
-    let window = format!("-{window_minutes} minutes");
-    db.query("DELETE FROM attempt_outcomes WHERE finished_at < datetime('now', ?)")
-        .bind(window)
-        .execute()
-        .await
-        .map_err(|error| format!("expire old attempt outcome rows: {error}"))?;
     db.query("DELETE FROM attempt_outcomes_v2 WHERE finished_at < datetime('now', ?)")
         .bind(format!("-{window_minutes} minutes"))
         .execute()
@@ -4948,11 +4942,7 @@ pub async fn evaluate_freeze_trip(
     let window = format!("-{} minutes", settings.window_minutes);
     let class_rows = db
         .query(
-            "SELECT failure_class, count(*) AS count FROM ( \
-                 SELECT failure_class, finished_at FROM attempt_outcomes \
-                 UNION ALL \
-                 SELECT failure_class, finished_at FROM attempt_outcomes_v2 \
-             ) \
+            "SELECT failure_class, count(*) AS count FROM attempt_outcomes_v2 \
              WHERE finished_at >= datetime('now', ?) \
              GROUP BY failure_class ORDER BY count DESC, failure_class",
         )
@@ -4969,11 +4959,7 @@ pub async fn evaluate_freeze_trip(
     }
     let example_run_ids = db
         .query(
-            "SELECT github_run_id FROM ( \
-                 SELECT github_run_id, finished_at FROM attempt_outcomes \
-                 UNION ALL \
-                 SELECT github_run_id, finished_at FROM attempt_outcomes_v2 \
-             ) \
+            "SELECT github_run_id FROM attempt_outcomes_v2 \
              WHERE github_run_id IS NOT NULL \
                AND finished_at >= datetime('now', ?) \
              GROUP BY github_run_id ORDER BY MAX(finished_at) DESC LIMIT ?",

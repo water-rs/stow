@@ -139,7 +139,6 @@ impl<'de> serde::Deserialize<'de> for GlibcVersion {
 #[cfg(not(target_arch = "wasm32"))]
 mod measure {
     use object::read::elf::{ElfFile, FileHeader};
-    use std::io::Read as _;
 
     use super::GlibcVersion;
     use crate::error::Result;
@@ -200,49 +199,10 @@ mod measure {
         }
         Ok(floor)
     }
-
-    /// Highest `GLIBC_x.y` across a stored bundle's `files/` members.
-    ///
-    /// The same floor publish measures on the outputs themselves, read
-    /// back for rows that predate the field. Bundle members under
-    /// `files/` are zstd-compressed payloads; every other member (the
-    /// manifests, the signature envelopes) is JSON and never an ELF.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the tar or a compressed member cannot be
-    /// read — a bundle that cannot be measured cannot be trusted to keep
-    /// its row's floor honest.
-    pub fn min_glibc_of_bundle(bundle_bytes: &[u8]) -> Result<Option<GlibcVersion>> {
-        let mut archive = tar::Archive::new(bundle_bytes);
-        let mut floor = None;
-        for entry in archive
-            .entries()
-            .map_err(|error| stow_error!("read bundle tar: {error}"))?
-        {
-            let mut entry = entry.map_err(|error| stow_error!("read bundle entry: {error}"))?;
-            // Owned so the mutable `read_to_end` borrow below is free.
-            let path = entry.path_bytes().into_owned();
-            if !path.starts_with(b"files/") {
-                continue;
-            }
-            let mut compressed = Vec::new();
-            entry.read_to_end(&mut compressed).map_err(|error| {
-                stow_error!(
-                    "read bundle member {}: {error}",
-                    String::from_utf8_lossy(&path)
-                )
-            })?;
-            let bytes =
-                zstd::stream::decode_all(std::io::Cursor::new(&compressed)).unwrap_or(compressed);
-            floor = floor.max(min_glibc_of_elf_bytes(&bytes)?);
-        }
-        Ok(floor)
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use measure::{min_glibc_of_bundle, min_glibc_of_elf_bytes};
+pub use measure::min_glibc_of_elf_bytes;
 
 #[cfg(test)]
 mod tests {

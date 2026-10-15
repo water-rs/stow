@@ -39,10 +39,8 @@ CREATE TABLE IF NOT EXISTS queue (
     -- same crate legitimately exists at both sides of one triple.
     host_side INTEGER NOT NULL DEFAULT 0,
     -- The Merkle dependency digest the task's subtree commits to
-    -- (stow#588); every enqueued task carries one. The column stays
-    -- nullable for the v15 rebuild's migrated rows, which it is a
-    -- dedup operand for and nothing else reads.
-    dependency_identity TEXT,
+    -- (stow#588); every enqueued task carries one.
+    dependency_identity TEXT NOT NULL,
     -- Repair latch: 1 once a `completed` row has been re-queued because a
     -- dependent's edge required unit shapes its published rows never
     -- covered. The re-queue is at most once — the rebuild republishes
@@ -631,48 +629,28 @@ CREATE TABLE IF NOT EXISTS attempt_outcome_buckets (
     PRIMARY KEY (target, bucket)
 );
 
--- Raw outcome rows are kept for failures only — the class and
--- example-run evidence the trip alert prints is read once, when the
--- check trips, so successes never land here and failures expire with
--- the window (the completion insert deletes what aged out).
-CREATE TABLE IF NOT EXISTS attempt_outcomes (
-    task_id TEXT NOT NULL,
-    attempt INTEGER NOT NULL,
-    -- Compilation target — the breaker's per-target trip streams group
-    -- on it.
-    target TEXT NOT NULL,
-    -- 'build' | 'publish' | 'register' — the pipeline step the old CI
-    -- completion report carried. Never written since the route's
-    -- removal; kept for the rows that predate it.
-    failure_step TEXT,
-    -- The failure's error first line (or `unknown`) — what the trip
-    -- alert groups failures by.
-    failure_class TEXT,
-    github_run_id TEXT,
-    finished_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (task_id, attempt)
-);
-
--- The trip evidence reads and the expiry delete both bound on
--- finished_at — the index keeps those scans off the row payload.
-CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_finished
-ON attempt_outcomes (finished_at);
-
--- Generation-keyed failure evidence. This table is additive so an older
--- Worker may continue inserting the legacy attempt_outcomes columns while
--- the new code rolls out; freeze evidence reads both tables.
+-- Generation-keyed failure evidence: raw outcome rows kept for
+-- failures only — the class and example-run evidence the trip alert
+-- prints is read once, when the check trips, so successes never land
+-- here and failures expire with the window (the completion insert
+-- deletes what aged out).
 CREATE TABLE IF NOT EXISTS attempt_outcomes_v2 (
     task_id TEXT NOT NULL,
     generation_id TEXT NOT NULL,
     attempt INTEGER NOT NULL,
+    -- Compilation target — the breaker's per-target trip streams group
+    -- on it.
     target TEXT NOT NULL,
-    failure_step TEXT,
+    -- The failure's error first line (or `unknown`) — what the trip
+    -- alert groups failures by.
     failure_class TEXT,
     github_run_id TEXT,
     finished_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, generation_id)
 );
 
+-- The trip evidence reads and the expiry delete both bound on
+-- finished_at — the index keeps those scans off the row payload.
 CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_v2_finished
 ON attempt_outcomes_v2 (finished_at);
 

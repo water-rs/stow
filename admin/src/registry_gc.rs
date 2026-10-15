@@ -126,7 +126,7 @@ enum TagClass<'a> {
 
 impl TagClass<'_> {
     /// The report's class label.
-    fn name(&self) -> &'static str {
+    const fn name(&self) -> &'static str {
         match self {
             Self::Slice { .. } => "slice",
             Self::Folded { .. } => "folded",
@@ -266,7 +266,45 @@ fn evaluate(
         unknown.dedup();
         return Err(unknown);
     }
+    let (keep, records_errors) = keep_set(versions, keep_rustc, facts);
 
+    let mut classes: BTreeMap<&'static str, [u64; 3]> = BTreeMap::new();
+    let mut delete = Vec::new();
+    for version in versions {
+        let class = version.tags.first().map_or("untagged", |tag| {
+            classify_tag(tag).expect("classified").name()
+        });
+        let fate = if keep.contains(&version.digest) {
+            Fate::Kept
+        } else if version.too_young {
+            Fate::TooYoung
+        } else {
+            Fate::Garbage
+        };
+        classes.entry(class).or_default()[fate as usize] += 1;
+        if fate == Fate::Garbage {
+            delete.push((
+                version.id,
+                format!("{} ({})", version.digest, version.tags.join(", ")),
+            ));
+        }
+    }
+    Ok(Evaluation {
+        keep,
+        classes,
+        records_errors,
+        delete,
+    })
+}
+
+/// The keep set the rules compute: the manifest digests the kept
+/// toolchains' published state reaches, plus the decode errors the
+/// garbage records artifacts returned grouped by message.
+fn keep_set(
+    versions: &[Version],
+    keep_rustc: &BTreeSet<String>,
+    facts: &Facts,
+) -> (BTreeSet<String>, BTreeMap<String, u64>) {
     let mut keep: BTreeSet<String> = BTreeSet::new();
     // Folded tags whose sibling slice decoded — `folded.<t>.<R>` for each
     // live `index.<t>.<R>`.
@@ -365,36 +403,7 @@ fn evaluate(
             }
         }
     }
-
-    let mut classes: BTreeMap<&'static str, [u64; 3]> = BTreeMap::new();
-    let mut delete = Vec::new();
-    for version in versions {
-        let class = version
-            .tags
-            .first()
-            .map(|tag| classify_tag(tag).expect("classified").name())
-            .unwrap_or("untagged");
-        let fate = if keep.contains(&version.digest) {
-            Fate::Kept
-        } else if version.too_young {
-            Fate::TooYoung
-        } else {
-            Fate::Garbage
-        };
-        classes.entry(class).or_default()[fate as usize] += 1;
-        if fate == Fate::Garbage {
-            delete.push((
-                version.id,
-                format!("{} ({})", version.digest, version.tags.join(", ")),
-            ));
-        }
-    }
-    Ok(Evaluation {
-        keep,
-        classes,
-        records_errors,
-        delete,
-    })
+    (keep, records_errors)
 }
 
 /// The gc report's plan half — serializable for `--json`.
@@ -428,19 +437,15 @@ struct GcOutcome {
     failed: Vec<String>,
 }
 
-async fn gc(token: &str, args: GcArgs, output: Output) -> stow_types::error::Result<()> {
-    let mut keep_rustc = BTreeSet::new();
-    for rustc in &args.keep_rustc {
-        keep_rustc.insert(
-            WireRustcVersion::parse(rustc)
-                .map_err(|error| stow_error!("--keep-rustc {rustc}: {error}"))?
-                .as_str()
-                .to_owned(),
-        );
-    }
-    let (org, package) = GHCR_REPOSITORY
-        .split_once('/')
-        .expect("GHCR_REPOSITORY is org/package");
+/// List the package's versions and distill each to the fields the keep
+/// rules read, stamping the age guard's verdict from the newer of its
+/// two timestamps.
+async fn list_versions(
+    token: &str,
+    org: &str,
+    package: &str,
+    min_age_hours: u64,
+) -> stow_types::error::Result<Vec<Version>> {
     let versions: Vec<PackageVersion> = github::get_pages(
         token,
         &format!("/orgs/{org}/packages/container/{package}/versions{VERSIONS_PAGE}"),
@@ -448,7 +453,7 @@ async fn gc(token: &str, args: GcArgs, output: Output) -> stow_types::error::Res
     .await?;
 
     let now = OffsetDateTime::now_utc();
-    let min_age = time::Duration::hours(i64::try_from(args.min_age_hours).unwrap_or(i64::MAX));
+    let min_age = time::Duration::hours(i64::try_from(min_age_hours).unwrap_or(i64::MAX));
     let mut distilled = Vec::with_capacity(versions.len());
     for version in versions {
         let touched = [&version.created_at, &version.updated_at]
@@ -468,6 +473,23 @@ async fn gc(token: &str, args: GcArgs, output: Output) -> stow_types::error::Res
             too_young: now - touched < min_age,
         });
     }
+    Ok(distilled)
+}
+
+async fn gc(token: &str, args: GcArgs, output: Output) -> stow_types::error::Result<()> {
+    let mut keep_rustc = BTreeSet::new();
+    for rustc in &args.keep_rustc {
+        keep_rustc.insert(
+            WireRustcVersion::parse(rustc)
+                .map_err(|error| stow_error!("--keep-rustc {rustc}: {error}"))?
+                .as_str()
+                .to_owned(),
+        );
+    }
+    let (org, package) = GHCR_REPOSITORY
+        .split_once('/')
+        .expect("GHCR_REPOSITORY is org/package");
+    let distilled = list_versions(token, org, package, args.min_age_hours).await?;
 
     let base = crate::index_cmd::registry_base()?;
     let http = stow_oci::RegistryHttp::new().await?;
@@ -513,11 +535,10 @@ async fn gc(token: &str, args: GcArgs, output: Output) -> stow_types::error::Res
         delete_ids: evaluation.delete.iter().map(|(id, _)| *id).collect(),
     };
 
-    let mut outcome = None;
-    if args.delete {
+    let outcome = if args.delete {
         let mut deleted = 0_u64;
         let mut failed = Vec::new();
-        let deletes = futures_util::stream::iter(plan.delete_ids.iter().map(|id| async move {
+        let results = futures_util::stream::iter(plan.delete_ids.iter().map(|id| async move {
             github::delete_path(
                 token,
                 &format!("/orgs/{org}/packages/container/{package}/versions/{id}"),
@@ -527,14 +548,16 @@ async fn gc(token: &str, args: GcArgs, output: Output) -> stow_types::error::Res
         }))
         .buffered(GC_CONCURRENCY)
         .collect::<Vec<_>>();
-        for result in deletes.await {
+        for result in results.await {
             match result {
                 Ok(()) => deleted += 1,
                 Err(error) => failed.push(error),
             }
         }
-        outcome = Some(GcOutcome { deleted, failed });
-    }
+        Some(GcOutcome { deleted, failed })
+    } else {
+        None
+    };
 
     let envelope = render::Planned {
         dry_run: !args.delete,
@@ -546,7 +569,7 @@ async fn gc(token: &str, args: GcArgs, output: Output) -> stow_types::error::Res
         .as_ref()
         .map(|outcome| outcome.failed.clone())
         .unwrap_or_default();
-    render::emit(output, &envelope, |envelope| human(envelope))?;
+    render::emit(output, &envelope, human)?;
     if failed.is_empty() {
         Ok(())
     } else {
@@ -914,7 +937,7 @@ mod tests {
         for v in &versions {
             assert!(evaluation.keep.contains(&v.digest), "id {}", v.id);
         }
-        assert!(evaluation.delete.is_empty());
+        assert_eq!(evaluation.delete, Vec::<(u64, String)>::new());
     }
 
     /// A records artifact that does not decode is garbage, its decode
