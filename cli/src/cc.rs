@@ -596,7 +596,7 @@ mod tests {
     fn test_config(cache_dir: PathBuf) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
-            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache-2".to_owned(),
             cache_dir,
             request_timeout: Duration::from_secs(15),
             negative_cache_ttl: Duration::from_mins(5),

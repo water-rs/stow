@@ -1989,7 +1989,7 @@ impl MockRegistryState {
 
 /// `401` carrying the Bearer challenge the edge's token exchange parses:
 /// realm is this server's `/token`, scope is the single repository's
-/// `repository:water-rs/stow-cache:pull`.
+/// `repository:water-rs/stow-cache-2:pull`.
 fn unauthorized(realm: &str) -> Response<Body> {
     let repository = stow_types::registry::GHCR_REPOSITORY;
     let challenge = format!(
@@ -2023,11 +2023,11 @@ fn manifest_file_name(reference: &str) -> String {
     }
 }
 
-/// `/v2/water-rs/stow-cache/(manifests|blobs)/<id>` — the mock serves the
-/// single `water-rs/stow-cache` repository: manifests addressed by tag and
+/// `/v2/water-rs/stow-cache-2/(manifests|blobs)/<id>` — the mock serves the
+/// single `water-rs/stow-cache-2` repository: manifests addressed by tag and
 /// blobs by digest, nothing else. Only the upload endpoint's own trailing
 /// slash is allowed to leave an empty segment: GHCR answers any other empty
-/// segment (`stow-cache//blobs/…`) with a `301` to the canonical path,
+/// segment (`stow-cache-2//blobs/…`) with a `301` to the canonical path,
 /// which turns a `POST` into a refused `GET`, so the mock refuses it too.
 fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> {
     let segments = rest
@@ -2117,7 +2117,7 @@ mod tests {
         write_public_key,
     };
 
-    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache/manifests/latest";
+    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-2/manifests/latest";
 
     fn manifest_request() -> Request<Body> {
         Request::builder()
@@ -2131,10 +2131,10 @@ mod tests {
     #[tokio::test]
     async fn challenge_exchange_then_served() {
         let root = tempfile::tempdir().expect("registry root");
-        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache"))
+        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache-2"))
             .expect("manifest dir");
         std::fs::write(
-            root.path().join("manifests/water-rs/stow-cache/latest"),
+            root.path().join("manifests/water-rs/stow-cache-2/latest"),
             b"{\"schemaVersion\":2}",
         )
         .expect("manifest file");
@@ -2161,7 +2161,7 @@ mod tests {
                 .to_owned();
             assert_eq!(
                 challenge,
-                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache:pull\""
+                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache-2:pull\""
             );
         }
 
@@ -2170,7 +2170,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache:pull")
+                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-2:pull")
                     .body(Body::empty())
                     .expect("token request builds"),
             )

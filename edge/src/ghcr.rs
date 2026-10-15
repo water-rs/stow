@@ -56,7 +56,7 @@ pub async fn open_manifest(
 }
 
 /// Accept header for the manifest GET — the OCI image manifest media type
-/// every stow-cache tag resolves to.
+/// every stow-cache-2 tag resolves to.
 const OCI_MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// `GET url` through the registry token exchange.

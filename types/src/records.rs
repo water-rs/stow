@@ -2,7 +2,7 @@
 //!
 //! The trusted publish stage pushes each build's `Vec<ArtifactRecord>` as
 //! one signed artifact — the `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
-//! tag in the same `water-rs/stow-cache` namespace the bundles use —
+//! tag in the same `water-rs/stow-cache-2` namespace the bundles use —
 //! instead of posting records to the edge. The tag names the Actions run
 //! that published it, so a second build of the same task lands on a new
 //! tag rather than overwriting the first's rows (stow#655). The index

@@ -215,7 +215,7 @@ isolated_env() {
 stow_cli() {
     isolated_env \
         STOW_EDGE_URL="$EDGE_URL" \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
@@ -944,7 +944,7 @@ fi
     # isolated stow cache, never GHCR or the developer's ~/.stow.
     [ -z "$SYSROOT" ] || eval "$("$REPO_ROOT/ci/glibc-sysroot/env.sh" "$SYSROOT")"
     exec env "${ISOLATED_ENV[@]}" \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
         SCHEDULER_URL="$SCHEDULER_URL" \
@@ -1006,7 +1006,7 @@ done
 # delegates each slice's signed push to `stow-mock-registry
 # publish-index`, which writes the same layout the GHCR path produces.
 isolated_env \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     "$BIN/stow-admin" index export \
     --out-dir "$WORK_DIR/index-export" \
@@ -1068,7 +1068,7 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # (same-file), so the wave lands in two layers.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
 isolated_env \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
@@ -1087,11 +1087,11 @@ isolated_env \
 # The mock registry, like GHCR, serves /v2 only to an anonymous bearer
 # minted by its token endpoint.
 registry_token="$(curl -fsS --max-time 10 \
-    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache:pull" \
+    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache-2:pull" \
     | jq -er .token)" \
     || die "mock registry token exchange failed"
 curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
-    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
+    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
     -o /dev/null \
     || die "index slice index.${HOST_TARGET}.${RUSTC_VERSION} missing after the manual wave"
 

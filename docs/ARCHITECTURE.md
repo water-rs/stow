@@ -373,14 +373,15 @@ alone — nothing reads an older shape of a store.
 
 ## OCI bundle layout
 
-Every artifact is a tag of the single GHCR package
-`ghcr.io/water-rs/stow-cache`, referenced as
-`ghcr.io/water-rs/stow-cache:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
+Every artifact is a tag of the current generation's GHCR package
+`ghcr.io/water-rs/stow-cache-2`, referenced as
+`ghcr.io/water-rs/stow-cache-2:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
 (see `types/src/registry.rs`). The crate name is the tag's first
 `.`-separated segment — crates.io names never contain `.`, so the split is
 unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). One
-package means one GHCR visibility flip covers the whole cache: GHCR
-creates packages private and has no API to change that.
+package per generation means one GHCR visibility flip covers the whole
+cache: GHCR creates packages private and has no API to change that, so
+each generation is made public once by hand.
 
 Each artifact is two OCI images on that package. The signed image is the
 tag above: its config is the `ArtifactBlobConfig` and it carries one
@@ -419,7 +420,7 @@ Constants (media types, paths) are defined in `types/src/bundle.rs`.
 Every servable artifact row is additionally published as a signed,
 per-slice index so a client resolves cache coverage locally instead of
 querying the edge (#188). One index exists per `(target, rustc_version)`
-pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache`
+pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-2`
 (`stow_types::index::index_tag`) names a single-layer OCI artifact whose
 layer is the zstd-compressed JSON `ArtifactIndex` (media type
 `application/vnd.stow.index.v1+zstd`; config
@@ -454,23 +455,16 @@ never churns the tag. Pushed indexes are cosign-signed keyless under
 (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), the same
 Fulcio chain the CLI verifies for artifact bundles.
 
-Every publish leaves superseded manifests in the `stow-cache` package —
-an index republish untags the previous manifest, a rebuilt task's older
+Every publish leaves superseded manifests in the package — an index
+republish untags the previous manifest, a rebuilt task's older
 `records-*` artifacts stay tagged, and each `sha256-<digest>[.sig]`
-signature manifest accumulates under no retention of its own.
-`stow-admin registry gc --keep-rustc <R> [--min-age-hours N] [--delete]`
-collects them: it lists the package's versions through the GitHub
-packages API, classifies each by tag shape (slice, folded set, records,
-signature/referrer, bundle pair, untagged — an unrecognized tag fails
-the run before anything is deleted), pulls the kept toolchains' slices,
-folded sets and records through the anonymous OCI session, and deletes
-every version no kept slice reaches, except versions younger than
-`--min-age-hours` (a build pushes its bundle before its records, so a
-fresh bundle is legitimately unreferenced). `.github/workflows/
-registry-gc.yml` runs it dispatch-only on `main`. After an index-format
-change the order is: ship the release, `registry gc --keep-rustc R
---delete`, `index export --full` for R, then `registry gc` again to
-collect what the old format's manifests held.
+signature manifest accumulates under no retention of its own. GitHub's
+package-versions API cannot enumerate a package at the cache's size, so
+stow never deletes single versions: a purge is a new package generation —
+the repository literal in `types/src/registry.rs` moves to the next name
+(`stow-cache` was the retired first generation), the cache rebuilds into
+the fresh package from empty, and the abandoned generation is deleted
+whole. `docs/DEPLOYMENT.md` carries the procedure.
 
 ## Trust boundaries
 
@@ -545,7 +539,7 @@ What each hop is allowed to do:
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-2`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
 rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,

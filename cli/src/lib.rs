@@ -4865,7 +4865,7 @@ mod tests {
     fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
         crate::config::StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
-            registry_base_url: "http://127.0.0.1:9/v2/water-rs/stow-cache".to_owned(),
+            registry_base_url: "http://127.0.0.1:9/v2/water-rs/stow-cache-2".to_owned(),
             cache_dir: dir.path().join("cache"),
             request_timeout: std::time::Duration::from_millis(50),
             negative_cache_ttl: std::time::Duration::from_secs(1),

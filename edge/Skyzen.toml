@@ -8,7 +8,7 @@ workers_dev = false
 GITHUB_APP_ID = "4985635"
 GITHUB_APP_INSTALLATION_ID = "162649982"
 GITHUB_REPO = "water-rs/stow"
-GHCR_BASE_URL = "https://ghcr.io/v2/water-rs/stow-cache"
+GHCR_BASE_URL = "https://ghcr.io/v2/water-rs/stow-cache-2"
 STOW_DISPATCH_MIN_AGE_MINUTES = "5"
 # Dispatch ceilings against the org's 60 GitHub-hosted runners (20 of them
 # macOS): 45 total leaves 15 runners for the repo's own CI, and the macOS
