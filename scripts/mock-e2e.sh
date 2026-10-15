@@ -1212,7 +1212,8 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 version: $version,
                 features: [],
                 dependencies: [],
-                dependency_subgraph: {n: []}
+                dependency_subgraph: {n: []},
+                explicit_spelling: "keys-as-native"
             }]
         }')")"
 [ "$(jq -r 'length' <<<"$admissions")" = "0" ] \
@@ -1235,7 +1236,8 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 version: "0.2.177",
                 features: ["default"],
                 dependencies: [],
-                dependency_subgraph: {n: []}
+                dependency_subgraph: {n: []},
+                explicit_spelling: "keys-as-native"
             }]
         }')")"
 [ "$(jq -r 'length' <<<"$admissions")" = "1" ] \
