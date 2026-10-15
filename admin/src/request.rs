@@ -197,7 +197,22 @@ async fn plan_request(
         base: &base,
         trust: &trust,
     };
-    let covered_ids = crate::manual::covered_nodes(&catalog, &targets, &rustc_version).await?;
+    // The flag each resolved node carries decides the shapes its
+    // coverage demands — a `KeysApart` node's index membership is
+    // complete only under the four-shape set (stow#736).
+    let mut spellings = std::collections::BTreeMap::new();
+    for (_, target_parts) in &parts {
+        for (index, node) in target_parts.graph.nodes().iter().enumerate() {
+            let task_id = target_parts
+                .graph
+                .task_id(index)
+                .ok_or_else(|| stow_error!("resolved graph has no task id for node {index}"))?
+                .to_owned();
+            spellings.insert(task_id, node.explicit_spelling);
+        }
+    }
+    let covered_ids =
+        crate::manual::covered_nodes(&catalog, &targets, &rustc_version, &spellings).await?;
 
     assemble_plan(parts, &covered_ids, dispatch.max_closure)
 }
@@ -425,6 +440,7 @@ mod tests {
                 rustc_version: WireRustcVersion::parse("1.99.0").expect("rustc"),
                 host_side,
             },
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: vec![],
         }
     }

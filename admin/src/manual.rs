@@ -407,7 +407,11 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
     let adopt_since = args.adopt_since.unwrap_or_else(|| {
         time::OffsetDateTime::now_utc() - time::Duration::hours(ADOPT_SINCE_DEFAULT_HOURS)
     });
-    let covered = covered_nodes(&catalog, &targets, &rustc_version).await?;
+    let spellings = nodes
+        .iter()
+        .map(|(id, node)| (id.clone(), node.request.explicit_spelling))
+        .collect();
+    let covered = covered_nodes(&catalog, &targets, &rustc_version, &spellings).await?;
     let wave_covered = mark_covered_done(&mut nodes, &covered);
     tracing::info!(
         covered = covered.len(),
@@ -1018,6 +1022,7 @@ pub async fn covered_nodes(
     index: &Index<'_>,
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
+    spellings: &BTreeMap<String, stow_types::public_cache::ExplicitSpelling>,
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let mut covered = BTreeSet::new();
     // Slice pulls are reads — fan them out under the bounded
@@ -1032,7 +1037,12 @@ pub async fn covered_nodes(
     .await?;
     for (target, rows) in targets.iter().zip(rows_per_target) {
         let Some(rows) = rows else { continue };
-        covered.extend(covered_slice_nodes(&rows, target, rustc_version)?);
+        covered.extend(covered_slice_nodes(
+            &rows,
+            target,
+            rustc_version,
+            spellings,
+        )?);
     }
     Ok(covered)
 }
@@ -1041,6 +1051,7 @@ fn covered_slice_nodes(
     rows: &[ArtifactIndexRow],
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
+    spellings: &BTreeMap<String, stow_types::public_cache::ExplicitSpelling>,
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let mut shapes = HashMap::<_, BTreeSet<_>>::new();
     for row in rows {
@@ -1070,8 +1081,14 @@ fn covered_slice_nodes(
     };
     Ok(shapes
         .into_iter()
-        .filter(|((identity, _), served)| {
-            required_unit_shapes(identity.host_side, invocation)
+        .filter(|((identity, context), served)| {
+            // The flag the node's own request carries — rows for nodes
+            // nothing asked about answer the historical two-shape rule.
+            let spelling = spellings
+                .get(&identity.task_id(context))
+                .copied()
+                .unwrap_or_default();
+            required_unit_shapes(identity.host_side, invocation, spelling)
                 .iter()
                 .all(|shape| served.contains(shape))
         })
@@ -1082,6 +1099,7 @@ fn covered_slice_nodes(
 pub async fn contextual_coverage(
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
+    spellings: &BTreeMap<String, stow_types::public_cache::ExplicitSpelling>,
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let base = crate::index_cmd::registry_base()?;
     let http = stow_oci::RegistryHttp::new().await?;
@@ -1095,6 +1113,7 @@ pub async fn contextual_coverage(
         },
         targets,
         rustc_version,
+        spellings,
     )
     .await
 }
@@ -1236,6 +1255,7 @@ fn task_payload(task_id: &str, request: &EnqueueRequest) -> BuildTaskPayload {
         rustc_version: request.rustc_version.clone(),
         preserve_lockfile: request.preserve_lockfile,
         host_side: request.host_side,
+        explicit_spelling: request.explicit_spelling,
         // The resolver emitted this node's whole transitive dependency
         // closure on the request — covered nodes included — so the
         // dispatched payload reproduces the context the folded graph
@@ -1972,7 +1992,11 @@ fn slice_serves_layer(
     let Some(rows) = rows else {
         return Ok(false);
     };
-    let covered = covered_slice_nodes(rows, target, rustc_version)?;
+    let spellings = nodes
+        .iter()
+        .map(|(id, node)| (id.clone(), node.request.explicit_spelling))
+        .collect();
+    let covered = covered_slice_nodes(rows, target, rustc_version, &spellings)?;
     Ok(layer.iter().all(|id| {
         let node = nodes.get(id).expect("layer node");
         !node.done || node.request.target != *target || covered.contains(id)
@@ -2778,6 +2802,7 @@ mod tests {
                 target: TargetTriple::parse(*dep_target).expect("dep target"),
                 rustc_version: WireRustcVersion::parse("1.99.0").expect("dep rustc"),
                 host_side: *dep_host,
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 dependency_identity: stow_types::identity::DependencyIdentity::leaf()
                     .expect("leaf identity"),
             })
@@ -2791,6 +2816,7 @@ mod tests {
                     version: dep.version.clone(),
                     features_json: dep.features_json.clone(),
                     host_side: dep.host_side,
+                    keys_apart: false,
                     deps: Vec::new(),
                 })
                 .collect(),
@@ -2807,6 +2833,7 @@ mod tests {
             dependency_subgraph,
             preserve_lockfile: false,
             host_side,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
@@ -2828,6 +2855,7 @@ mod tests {
                 version: CrateVersion(semver::Version::new(1, 0, 0)),
                 features_json: stow_types::identity::FeaturesJson::default(),
                 host_side: false,
+                keys_apart: false,
                 deps: Vec::new(),
             });
         top.dependency_subgraph.nodes[0].deps = vec![1];
@@ -2930,20 +2958,25 @@ mod tests {
         let target = TargetTriple::parse(T).expect("target");
         let left = request("parent", T, false, &[("left", T, false)]);
         let right = request("parent", T, false, &[("right", T, false)]);
-        let shapes = required_unit_shapes(false, UnitInvocation::Target);
+        let shapes = required_unit_shapes(
+            false,
+            UnitInvocation::Target,
+            stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        );
         let rows = shapes
             .iter()
             .map(|shape| row_for(&left, *shape))
             .collect::<Vec<_>>();
         let covered =
-            super::covered_slice_nodes(&rows, &target, &left.rustc_version).expect("coverage");
+            super::covered_slice_nodes(&rows, &target, &left.rustc_version, &BTreeMap::new())
+                .expect("coverage");
         assert!(covered.contains(&left.task_id().expect("left id")));
         assert!(!covered.contains(&right.task_id().expect("right id")));
 
         let mut mixed = rows;
         mixed[0].dependency_identity = right.dependency_identity().expect("right digest");
         assert!(
-            super::covered_slice_nodes(&mixed, &target, &left.rustc_version)
+            super::covered_slice_nodes(&mixed, &target, &left.rustc_version, &BTreeMap::new())
                 .expect("mixed coverage")
                 .is_empty()
         );
@@ -2954,23 +2987,28 @@ mod tests {
         const T: &str = "x86_64-unknown-linux-gnu";
         let target = TargetTriple::parse(T).expect("target");
         let host = request("helper", T, true, &[]);
-        let rows = required_unit_shapes(true, UnitInvocation::Native)
-            .into_iter()
-            .map(|shape| row_for(&host, shape))
-            .collect::<Vec<_>>();
+        let rows = required_unit_shapes(
+            true,
+            UnitInvocation::Native,
+            stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        )
+        .into_iter()
+        .map(|shape| row_for(&host, shape))
+        .collect::<Vec<_>>();
         assert!(
             rows.iter()
                 .any(|row| row.unit_shape.invocation == UnitInvocation::Target)
         );
         let complete =
-            super::covered_slice_nodes(&rows, &target, &host.rustc_version).expect("host coverage");
+            super::covered_slice_nodes(&rows, &target, &host.rustc_version, &BTreeMap::new())
+                .expect("host coverage");
         assert!(complete.contains(&host.task_id().expect("host id")));
         let partial = rows
             .into_iter()
             .filter(|row| row.unit_shape.invocation == UnitInvocation::Native)
             .collect::<Vec<_>>();
         assert!(
-            super::covered_slice_nodes(&partial, &target, &host.rustc_version)
+            super::covered_slice_nodes(&partial, &target, &host.rustc_version, &BTreeMap::new())
                 .expect("partial host coverage")
                 .is_empty()
         );
@@ -3026,7 +3064,7 @@ mod tests {
         let wasm = TargetTriple::parse(WASM).expect("wasm");
         let rows_for = |name: &str, invocation: UnitInvocation, host_side: bool| {
             let request = request_by_name(name, &nodes);
-            required_unit_shapes(host_side, invocation)
+            required_unit_shapes(host_side, invocation, request.explicit_spelling)
                 .into_iter()
                 .map(|shape| row_for(request, shape))
                 .collect::<Vec<_>>()
@@ -3059,10 +3097,14 @@ mod tests {
         let right_id = right.task_id().expect("right id");
         assert_ne!(left_id, right_id);
         let rows_for = |request: &EnqueueRequest| {
-            required_unit_shapes(request.host_side, UnitInvocation::Native)
-                .into_iter()
-                .map(|shape| row_for(request, shape))
-                .collect::<Vec<_>>()
+            required_unit_shapes(
+                request.host_side,
+                UnitInvocation::Native,
+                request.explicit_spelling,
+            )
+            .into_iter()
+            .map(|shape| row_for(request, shape))
+            .collect::<Vec<_>>()
         };
         // The two nodes' rows name the same unit — `row_for` keys them
         // on one `c_metadata` — under each node's own context.
@@ -3070,7 +3112,8 @@ mod tests {
         let right_rows = rows_for(&right);
         let all_rows = [left_rows, right_rows.clone()].concat();
 
-        let covered = super::covered_slice_nodes(&all_rows, &target, &rustc).expect("coverage");
+        let covered = super::covered_slice_nodes(&all_rows, &target, &rustc, &BTreeMap::new())
+            .expect("coverage");
         assert!(covered.contains(&left_id));
         assert!(covered.contains(&right_id));
 
@@ -4234,5 +4277,53 @@ mod tests {
         .to_string();
         assert!(message.contains(&id), "{message}");
         assert!(message.contains(&unresolved[0]), "{message}");
+    }
+    /// stow#736: a `KeysApart` node published before the flag existed
+    /// carries only its native shapes — its explicit `--target`
+    /// spellings never shipped — so the index-rooted resume must not
+    /// call it done: it dispatches again under the same task id.
+    #[test]
+    fn a_flagged_node_published_native_only_is_not_covered() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let target = TargetTriple::parse(T).expect("target");
+        let mut flagged = request("lib", T, false, &[]);
+        flagged.explicit_spelling = stow_types::public_cache::ExplicitSpelling::KeysApart;
+        let id = flagged.task_id().expect("task id");
+        // The flag is semantic data, never identity — the same node
+        // mints the same task id either way.
+        let plain = request("lib", T, false, &[]);
+        assert_eq!(id, plain.task_id().expect("task id"));
+        let spellings = BTreeMap::from([(
+            id.clone(),
+            stow_types::public_cache::ExplicitSpelling::KeysApart,
+        )]);
+        let native_only = required_unit_shapes(
+            false,
+            UnitInvocation::Native,
+            stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        )
+        .into_iter()
+        .map(|shape| row_for(&flagged, shape))
+        .collect::<Vec<_>>();
+        assert!(
+            super::covered_slice_nodes(&native_only, &target, &flagged.rustc_version, &spellings)
+                .expect("coverage")
+                .is_empty(),
+            "a KeysApart node with only its native shapes is not done"
+        );
+        let all = required_unit_shapes(
+            false,
+            UnitInvocation::Native,
+            stow_types::public_cache::ExplicitSpelling::KeysApart,
+        )
+        .into_iter()
+        .map(|shape| row_for(&flagged, shape))
+        .collect::<Vec<_>>();
+        assert!(
+            super::covered_slice_nodes(&all, &target, &flagged.rustc_version, &spellings)
+                .expect("coverage")
+                .contains(&id),
+            "all four shapes published is done"
+        );
     }
 }

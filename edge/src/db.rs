@@ -20,6 +20,8 @@ struct QueuedDependencyGraphMissRow {
     target: String,
     rustc_version: String,
     host_side: i64,
+    /// The node's explicit-spelling flag (stow#736).
+    explicit_spelling: i64,
     seen_count: u64,
     subgraph_json: String,
     task_id: String,
@@ -836,7 +838,8 @@ async fn covered_batch(
             .map_or(UnitInvocation::Target, |family| {
                 UnitInvocation::for_task(identity.target.as_str(), family.host_triple())
             });
-        let required = required_unit_shapes(identity.host_side, invocation);
+        let required =
+            required_unit_shapes(identity.host_side, invocation, identity.explicit_spelling);
         let covered_all = required.iter().all(|shape| {
             shapes_by_identity
                 .get(&(
@@ -897,7 +900,7 @@ pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissD
     // channel for unadmitted misses.
     let rows = db
         .query(
-            "SELECT crate_name, version, features_json, target, rustc_version, host_side, seen_count, subgraph_json, task_id \
+            "SELECT crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, seen_count, subgraph_json, task_id \
              FROM dependency_graph_misses \
              WHERE queued_at IS NULL \
              ORDER BY seen_count DESC, last_seen_at DESC, first_seen_at ASC \
@@ -982,6 +985,11 @@ fn miss_request(row: &QueuedDependencyGraphMissRow) -> Result<Option<EnqueueRequ
         dependency_subgraph,
         preserve_lockfile: false,
         host_side: row.host_side != 0,
+        explicit_spelling: if row.explicit_spelling != 0 {
+            stow_types::public_cache::ExplicitSpelling::KeysApart
+        } else {
+            stow_types::public_cache::ExplicitSpelling::KeysAsNative
+        },
     };
     let derived_task_id = request
         .task_id()
@@ -1049,14 +1057,15 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
         .map_err(|error| format!("derive admitted miss task id: {error}"))?;
     db.query(
         "INSERT INTO dependency_graph_misses \
-         (crate_name, version, features_json, target, rustc_version, host_side, depends_on_json, subgraph_json, task_id, seen_count, first_seen_at, last_seen_at, admitted_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
+         (crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, depends_on_json, subgraph_json, task_id, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
          ON CONFLICT(crate_name, version, features_json, target, rustc_version, host_side) \
          DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), \
              depends_on_json = CASE WHEN excluded.depends_on_json IN ('', '[]') \
                  THEN dependency_graph_misses.depends_on_json \
                  ELSE excluded.depends_on_json END, \
-             subgraph_json = excluded.subgraph_json, task_id = excluded.task_id",
+             subgraph_json = excluded.subgraph_json, task_id = excluded.task_id, \
+             explicit_spelling = excluded.explicit_spelling",
     )
     .bind(request.crate_name.as_str())
     .bind(request.version.to_string())
@@ -1064,6 +1073,9 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
     .bind(request.target.as_str())
     .bind(request.rustc_version.as_str())
     .bind(i64::from(request.host_side))
+    .bind(i64::from(
+        request.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart,
+    ))
     .bind(depends_on_json)
     .bind(subgraph_json)
     .bind(task_id)
@@ -1194,6 +1206,7 @@ mod sqlite_tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
@@ -1227,6 +1240,7 @@ mod sqlite_tests {
                 features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
                     .expect("dep features"),
                 host_side: false,
+                keys_apart: false,
                 deps: Vec::new(),
             }],
         };
@@ -1345,6 +1359,7 @@ mod sqlite_tests {
                 version: CrateVersion::new(semver::Version::parse("0.5.0").expect("dep version")),
                 features_json: FeaturesJson::canonicalize(Vec::new()).expect("dep features"),
                 host_side: true,
+                keys_apart: false,
                 deps: Vec::new(),
             }],
         };
@@ -1421,6 +1436,7 @@ mod sqlite_tests {
             target: target.to_owned(),
             rustc_version: RUSTC.to_owned(),
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         };
         let exact = identity(&record.features_json.raw(), TARGET);
         let other_features = identity("[\"extra\"]", TARGET);
@@ -1451,6 +1467,7 @@ mod sqlite_tests {
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
             host_side: true,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         };
 
         let base = artifact_record(FIRST_DIGEST);
@@ -1636,6 +1653,7 @@ mod sqlite_tests {
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
@@ -1885,6 +1903,7 @@ mod coverage_concurrency_tests {
             target: "x86_64-unknown-linux-gnu".to_owned(),
             rustc_version: "1.85.0".to_owned(),
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 

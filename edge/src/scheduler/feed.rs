@@ -955,6 +955,7 @@ mod tests {
                 source: EnqueueSource::CacheMiss,
                 preserve_lockfile: false,
                 host_side: false,
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             }],
             &settings(),
         )

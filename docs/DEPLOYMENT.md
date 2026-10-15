@@ -284,10 +284,12 @@ The `prepare` job uploads the new Worker version without deploying it —
 declared `[[secret]]` values travel in the same upload through
 `--secrets-file` — then adds it to the deployment at `0%` so that
 version overrides reach it, then
-fires the synthetic suite through the same override — 50 requests on the
-candidate interleaved with 50 on the baseline across the site, crate
-lookup, artifact HEAD, stats and scheduler status paths, the floor the
-verdict's `--min-requests-per-version` expects on each side — and
+fires the synthetic suite through the same override — 250 requests on the
+candidate interleaved with 250 on the baseline across the site, crate
+lookup, artifact HEAD, stats and scheduler status paths, each with a
+query string unique to the probe so the zone cache cannot answer it;
+the verdict's `--min-requests-per-version` floor is 200 on each side,
+below the suite count because Workers analytics is sampled — and
 finally shifts `canary_share`% of traffic onto it.
 
 Promotion is gated on two verdict phases of

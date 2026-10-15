@@ -41,6 +41,7 @@ const ADMISSIONS_RESPONSE: &str = r#"[{
         "downloads": 0,
         "source": "CacheMiss",
         "dependency_subgraph": {"n": []},
+        "explicit_spelling": "keys-as-native",
         "preserve_lockfile": false
     }
 }]"#;

@@ -78,6 +78,7 @@ CREATE TABLE dependency_graph_misses (
     target TEXT NOT NULL,
     rustc_version TEXT NOT NULL,
     host_side INTEGER NOT NULL DEFAULT 0,
+    explicit_spelling INTEGER NOT NULL,
     seen_count INTEGER NOT NULL DEFAULT 0,
     first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),

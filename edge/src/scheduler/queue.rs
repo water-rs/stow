@@ -25,6 +25,10 @@ pub struct SemanticTaskIdentity {
     pub target: String,
     pub rustc_version: String,
     pub host_side: bool,
+    /// The node's explicit-spelling flag (stow#736): semantic data,
+    /// not identity — two catalog memberships of one node differ only
+    /// in the shape set they require, never in the node's task id.
+    pub explicit_spelling: stow_types::public_cache::ExplicitSpelling,
 }
 
 /// Answers, for a batch of pending crates.io tasks, which of them the
@@ -59,6 +63,10 @@ pub struct QueuedTask {
     /// through to `BuildTaskPayload` so the CI builder shapes the
     /// wrapper package's dependency as the unit's consumers compile it.
     pub host_side: bool,
+    /// The task's explicit-spelling flag (stow#736) — passed through to
+    /// `BuildTaskPayload` so a target-side task at the runner's host
+    /// triple builds and publishes both invocation spellings.
+    pub explicit_spelling: stow_types::public_cache::ExplicitSpelling,
     pub preserve_lockfile: bool,
     /// The task's dependency subgraph at claim time, rebuilt from its
     /// `queue_dependencies` rows (stow#588). Dispatch carries it to
@@ -68,6 +76,17 @@ pub struct QueuedTask {
     /// subgraph node lands as a leaf; the scheduler's storage rework is
     /// owned by a follow-up task.
     pub dependency_subgraph: stow_types::api::TaskSubgraph,
+}
+
+/// Decode a stored `explicit_spelling` integer — the queue and
+/// node-store columns carry 0 for `KeysAsNative`, 1 for `KeysApart`
+/// (stow#736).
+pub const fn spelling_of(stored: i64) -> stow_types::public_cache::ExplicitSpelling {
+    if stored != 0 {
+        stow_types::public_cache::ExplicitSpelling::KeysApart
+    } else {
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative
+    }
 }
 
 // Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
@@ -292,6 +311,10 @@ struct BatchedUpdate {
     downloads: i64,
     redispatch: u8,
     human: u8,
+    /// Any occurrence's explicit-spelling flag (stow#736): the flag
+    /// upgrades a row the request proves `KeysApart` — the UPDATE
+    /// writes the max while the row is uncommitted or redispatching.
+    explicit: u8,
 }
 
 /// A first-occurrence row for the bulk `INSERT INTO queue`.
@@ -304,6 +327,7 @@ struct BatchedInsert {
     target: String,
     rustc_version: String,
     host_side: u8,
+    explicit_spelling: u8,
     dependency_identity: String,
     downloads: i64,
     priority: i64,
@@ -323,6 +347,7 @@ struct BatchedNodeRow {
     target: String,
     rustc_version: String,
     host_side: u8,
+    explicit_spelling: u8,
     dependency_identity: String,
     children_json: String,
 }
@@ -542,7 +567,11 @@ async fn apply_batched_updates(
                      THEN {wake} ELSE wake_at END, \
                  updated_at = datetime('now'), \
                  lane = {next_lane}, \
-                 dispatch_eligible = {eligible} \
+                 dispatch_eligible = {eligible}, \
+                 explicit_spelling = CASE \
+                     WHEN status NOT IN ('dispatched', 'running') OR e ->> 'redispatch' = 1 \
+                     THEN MAX(explicit_spelling, e ->> 'explicit') \
+                     ELSE explicit_spelling END \
              FROM (SELECT value AS e FROM json_each(?)) AS j \
              WHERE queue.task_id = j.e ->> 'task_id'",
             deps_met = deps_met_sql("queue.task_id"),
@@ -676,9 +705,9 @@ async fn apply_batched_inserts(
         let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, dependency_identity, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, dependency_identity, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
-                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'dependency_identity', e ->> 'downloads', \
+                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'explicit_spelling', e ->> 'dependency_identity', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
                         1, lower(hex(randomblob(16))), e ->> 'first_requested_at', \
                         e ->> 'created_at', \
@@ -763,21 +792,31 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
 }
 
 /// Upsert every resolved-subgraph node into `task_nodes` — the
-/// submit-side half of the node store (stow#588). `INSERT OR IGNORE`:
-/// a task id is a content address, so a node another request already
-/// wrote is identical by construction and skipped. Batched by JSON
-/// like every enqueue write; the per-node payload is fixed-width plus
-/// one `children_json` array.
+/// submit-side half of the node store (stow#588). `INSERT` with an
+/// `ON CONFLICT` that only lifts `explicit_spelling`: a task id is a
+/// content address, so a node another request already wrote is
+/// identical by construction — except the flag, which two subgraphs
+/// minting the same id can disagree on (it derives from the unit
+/// graph, a finer input than the task-id digest commits to). A
+/// flagged resubmission upgrades the stored row's `KeysAsNative` so
+/// the next dispatch payload and edge requirement see the real
+/// contract; `KeysApart` never lowers. The `WHERE` confines the
+/// write to a real upgrade — `MAX` would leave the value unchanged
+/// otherwise, and an unchanged row is not an event worth billing.
 async fn upsert_task_nodes(db: &DurableDb, rows: &[BatchedNodeRow]) -> Result<(), QueueError> {
     for chunk in rows.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(
-            "INSERT OR IGNORE INTO task_nodes \
-             (task_id, crate_name, version, features_json, target, rustc_version, host_side, dependency_identity, children_json) \
+            "INSERT INTO task_nodes \
+             (task_id, crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, dependency_identity, children_json) \
              SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', \
                     e ->> 'features_json', e ->> 'target', e ->> 'rustc_version', \
-                    e ->> 'host_side', e ->> 'dependency_identity', \
+                    e ->> 'host_side', e ->> 'explicit_spelling', e ->> 'dependency_identity', \
                     e ->> 'children_json' \
-             FROM (SELECT value AS e FROM json_each(?)) e",
+             FROM (SELECT value AS e FROM json_each(?)) e \
+             WHERE TRUE \
+             ON CONFLICT(task_id) DO UPDATE SET \
+                explicit_spelling = excluded.explicit_spelling \
+             WHERE excluded.explicit_spelling > task_nodes.explicit_spelling",
         )
         .bind(enqueue_json(chunk)?)
         .execute()
@@ -1093,6 +1132,7 @@ pub async fn submit_task_ids(
             dependency_subgraph,
             preserve_lockfile: false,
             host_side: root.host_side != 0,
+            explicit_spelling: spelling_of(root.explicit_spelling),
         };
         // The rebuilt context must re-derive the submitted id exactly —
         // a store that produces anything else is corrupt, never
@@ -1177,6 +1217,9 @@ fn node_store_rows(
             target: node.identity.target.as_str().to_owned(),
             rustc_version: node.identity.rustc_version.as_str().to_owned(),
             host_side: u8::from(node.identity.host_side),
+            explicit_spelling: u8::from(
+                node.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart,
+            ),
             dependency_identity,
             children_json: serde_json::to_string(&children)
                 .map_err(|error| QueueError::Sql(format!("encode node children json: {error}")))?,
@@ -1197,30 +1240,47 @@ struct EnqueuePlan {
     edge_inserts: BTreeMap<String, Vec<BatchedDepEdge>>,
 }
 
+/// One existence probe's answer for a chunk task id: the row's status
+/// and the explicit-spelling flag it stored (stow#736). The flag is
+/// what a `KeysApart` resubmission resurrects a `KeysAsNative`
+/// `completed` row against — the row's published native-only set
+/// cannot serve the consumers the flag describes.
+#[derive(Debug)]
+struct TaskStatusProbe {
+    status: String,
+    explicit_spelling: i64,
+}
+
 /// One existence probe for the chunk, over every task id it can
 /// touch. `task_id` is the queue's primary key, so this answers every
 /// existence check the row-at-a-time loop ran.
 async fn probe_task_statuses(
     db: &DurableDb,
     prepared: &[Prepared<'_>],
-) -> Result<BTreeMap<String, String>, QueueError> {
+) -> Result<BTreeMap<String, TaskStatusProbe>, QueueError> {
     let probe_ids: Vec<&str> = prepared
         .iter()
         .map(|entry| entry.task_id.as_str())
         .collect();
-    let mut statuses: BTreeMap<String, String> = BTreeMap::new();
+    let mut statuses: BTreeMap<String, TaskStatusProbe> = BTreeMap::new();
     for chunk in probe_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         let rows = db
             .query(
-                "SELECT task_id, status FROM queue \
+                "SELECT task_id, status, explicit_spelling FROM queue \
                  WHERE task_id IN (SELECT value FROM json_each(?))",
             )
             .bind(enqueue_json(chunk)?)
-            .fetch_all::<TaskIdRow>()
+            .fetch_all::<TaskStatusRow>()
             .await
             .map_err(|error| format!("select existing tasks: {error}"))?;
         for row in rows {
-            statuses.insert(row.task_id, row.status);
+            statuses.insert(
+                row.task_id,
+                TaskStatusProbe {
+                    status: row.status,
+                    explicit_spelling: row.explicit_spelling,
+                },
+            );
         }
     }
     Ok(statuses)
@@ -1236,12 +1296,17 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
         // The gate needs every required unit shape of the dep's
         // semantic identity — the shapes the dependent's own build
         // compiles the dep's units at. The mask and the pair count go
-        // on the edge so the gate SQL stays a row-count compare.
+        // on the edge so the gate SQL stays a row-count compare; the
+        // dep's explicit-spelling flag is the fourth input — a
+        // `KeysApart` dep owes its explicit `Native`-spelling shapes
+        // too (stow#736).
         let (dep_invocations, dep_shapes) = dep_edge_requirements(
             entry.request.target.as_str(),
             entry.request.host_side,
+            entry.request.explicit_spelling,
             dependency.target.as_str(),
             dependency.host_side,
+            dependency.explicit_spelling,
         );
         if *dep_task_id == entry.task_id {
             return Err(QueueError::Sql(format!(
@@ -1277,7 +1342,7 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
 /// occurrence leaves.
 fn plan_enqueue(
     prepared: &[Prepared<'_>],
-    statuses: &mut BTreeMap<String, String>,
+    statuses: &mut BTreeMap<String, TaskStatusProbe>,
 ) -> Result<EnqueuePlan, QueueError> {
     let mut updates: BTreeMap<String, BatchedUpdate> = BTreeMap::new();
     let mut plan = EnqueuePlan {
@@ -1288,8 +1353,22 @@ fn plan_enqueue(
     for entry in prepared {
         let lane = request_lane(entry.request.source);
         let downloads = u64_to_i64(entry.request.downloads, "downloads")?;
-        if let Some(status) = statuses.get(&entry.task_id) {
-            let redispatch = resurrects(status.as_str(), lane);
+        let request_explicit = u8::from(
+            entry.request.explicit_spelling
+                == stow_types::public_cache::ExplicitSpelling::KeysApart,
+        );
+        if let Some(probe) = statuses.get(&entry.task_id) {
+            // Beyond the lane resurrection: a request proving the node
+            // `KeysApart` against a row stored `KeysAsNative` resurrects
+            // a `completed` row on any lane — its published native-only
+            // shapes cannot serve the explicit-spelling consumers the
+            // flag describes (stow#736). `failed` still never revives,
+            // and the claim's coverage retirement applies the same
+            // requirement to rows that never complete again.
+            let flaggap = probe.status == "completed"
+                && request_explicit == 1
+                && probe.explicit_spelling == 0;
+            let redispatch = resurrects(probe.status.as_str(), lane) || flaggap;
             let update = updates
                 .entry(entry.task_id.clone())
                 .or_insert_with(|| BatchedUpdate {
@@ -1298,13 +1377,29 @@ fn plan_enqueue(
                     downloads,
                     redispatch: 0,
                     human: 0,
+                    explicit: 0,
                 });
             update.occurrences += 1;
             update.downloads = update.downloads.max(downloads);
             update.redispatch |= u8::from(redispatch);
             update.human |= u8::from(lane == TaskLane::Human);
+            update.explicit |= request_explicit;
             if redispatch {
-                statuses.insert(entry.task_id.clone(), "pending".to_owned());
+                statuses.insert(
+                    entry.task_id.clone(),
+                    TaskStatusProbe {
+                        status: "pending".to_owned(),
+                        explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
+                    },
+                );
+            } else {
+                statuses.insert(
+                    entry.task_id.clone(),
+                    TaskStatusProbe {
+                        status: probe.status.clone(),
+                        explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
+                    },
+                );
             }
         } else {
             plan.inserts.push(BatchedInsert {
@@ -1315,13 +1410,20 @@ fn plan_enqueue(
                 target: entry.identity.target.clone(),
                 rustc_version: entry.identity.rustc_version.clone(),
                 host_side: u8::from(entry.identity.host_side),
+                explicit_spelling: request_explicit,
                 dependency_identity: entry.root_dependency_identity.clone(),
                 downloads,
                 priority: compute_priority(entry.request.downloads, 0)?,
                 preserve_lockfile: u8::from(entry.request.preserve_lockfile),
                 lane: lane.as_str(),
             });
-            statuses.insert(entry.task_id.clone(), "pending".to_owned());
+            statuses.insert(
+                entry.task_id.clone(),
+                TaskStatusProbe {
+                    status: "pending".to_owned(),
+                    explicit_spelling: i64::from(request_explicit),
+                },
+            );
             // A task id commits to its whole dependency subgraph, so a
             // task's edge set is a function of the id (stow#588): edges
             // are written only for the row this request inserts — a
@@ -3955,6 +4057,7 @@ async fn claim_dispatchable_row(
         target: row.target,
         rustc_version: row.rustc_version,
         host_side: row.host_side != 0,
+        explicit_spelling: spelling_of(row.explicit_spelling),
         preserve_lockfile: row.preserve_lockfile != 0,
         dependency_subgraph: stow_types::api::TaskSubgraph {
             root_deps: Vec::new(),
@@ -4076,6 +4179,7 @@ struct TaskNodeRow {
     target: String,
     rustc_version: String,
     host_side: i64,
+    explicit_spelling: i64,
     children_json: String,
 }
 
@@ -4313,7 +4417,7 @@ async fn fetch_task_nodes(
     task_ids: &[String],
 ) -> Result<Vec<TaskNodeRow>, QueueError> {
     db.query(
-        "SELECT task_id, crate_name, version, features_json, target, rustc_version, host_side, children_json \
+        "SELECT task_id, crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, children_json \
          FROM task_nodes \
          WHERE task_id IN (SELECT value FROM json_each(?))",
     )
@@ -4355,6 +4459,7 @@ fn subgraph_node_from_store(
         )
         .map_err(|error| format!("node {}: invalid features: {error}", row.task_id))?,
         host_side: row.host_side != 0,
+        keys_apart: row.explicit_spelling != 0,
         deps: children
             .iter()
             .map(|id| {
@@ -4387,6 +4492,7 @@ async fn retire_covered_rows(
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
             host_side: row.host_side != 0,
+            explicit_spelling: spelling_of(row.explicit_spelling),
         })
         .collect::<Vec<_>>();
     if identities.is_empty() {
@@ -4405,6 +4511,7 @@ async fn retire_covered_rows(
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
             host_side: row.host_side != 0,
+            explicit_spelling: spelling_of(row.explicit_spelling),
         };
         if row.preserve_lockfile == 0 && covered.contains(&identity) {
             let result = db
@@ -4517,7 +4624,7 @@ async fn select_dispatchable_page(
     page_rows: i64,
 ) -> Result<Vec<TaskRow>, QueueError> {
     let sql = dispatchable_page_sql(
-        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key",
+        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.explicit_spelling, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key",
         full_family,
     );
     let cutoff = dispatch_cutoff_modifier(settings.dispatch_min_age_minutes);
@@ -5783,10 +5890,20 @@ async fn earliest_active_lease_expiry_ms(
 /// The invocation-spelling mask a dependent's edges carry: the cargo
 /// invocations its own build compiles the dep's units under. A
 /// host-side task runs every phase both natively and under `--target`
-/// (its deps are host units under either spelling); a target-side task
-/// runs the one spelling its target implies.
-pub fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
-    if owner_host_side {
+/// (its deps are host units under either spelling); so does a
+/// `KeysApart` target-side task at the host triple, which compiles its
+/// deps under both spellings too (stow#736); any other target-side
+/// task runs the one spelling its target implies.
+pub fn dep_invocation_mask(
+    owner_target: &str,
+    owner_host_side: bool,
+    owner_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
+) -> i64 {
+    let runs_both_spellings = owner_host_side
+        || (owner_explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
+            && stow_types::api::runner_family(owner_target)
+                .is_some_and(|family| family.host_triple() == owner_target));
+    if runs_both_spellings {
         return 0b11;
     }
     match stow_types::api::runner_family(owner_target) {
@@ -5802,19 +5919,31 @@ pub fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
 /// needs the linked row under each spelling the owner compiles — host
 /// units always link, so the check phase publishes the same shape the
 /// build does. A target-side dep edge needs both kinds at the dep
-/// node's own invocation spelling — the only one a target task
-/// produces.
+/// node's own invocation spelling — except a `KeysApart` dep invoked
+/// `Native`, which owes the four shapes of both spellings (stow#736).
 pub fn dep_edge_requirements(
     owner_target: &str,
     owner_host_side: bool,
+    owner_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
     dep_target: &str,
     dep_host_side: bool,
+    dep_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
 ) -> (i64, i64) {
     if dep_host_side {
-        let mask = dep_invocation_mask(owner_target, owner_host_side);
+        let mask = dep_invocation_mask(owner_target, owner_host_side, owner_explicit_spelling);
         return (mask, i64::from(mask.count_ones()));
     }
-    (dep_invocation_mask(dep_target, false), 2)
+    let mask = dep_invocation_mask(
+        dep_target,
+        false,
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+    );
+    if mask == 0b01
+        && dep_explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
+    {
+        return (0b11, 4);
+    }
+    (mask, 2)
 }
 
 /// Record what one published index slice serves — the semantic identities
@@ -6833,10 +6962,13 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
     u32::try_from(value).map_err(|_| QueueError::Overflow { field, value })
 }
 
+/// The enqueue probe's per-row answer — status plus the stored
+/// explicit-spelling flag (stow#736).
 #[derive(Debug, skyzen::FromRow)]
-struct TaskIdRow {
+struct TaskStatusRow {
     task_id: String,
     status: String,
+    explicit_spelling: i64,
 }
 
 /// One `GROUP BY status, lane, blocked` aggregate row from [`status`].
@@ -6858,6 +6990,7 @@ struct TaskRow {
     target: String,
     rustc_version: String,
     host_side: i64,
+    explicit_spelling: i64,
     preserve_lockfile: i64,
     dispatch_key: String,
 }

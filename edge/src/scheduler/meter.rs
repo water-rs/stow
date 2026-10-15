@@ -453,8 +453,8 @@ mod tests {
     async fn metered_statements_fold_into_the_day_row() {
         let (db, meter) = metered().await.expect("db");
         // A handful of real statements through the wrapped handle.
-        db.query("INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version, dependency_identity) \
-                  VALUES ('t1', 'serde', '1.0.0', '[]', 'x86_64-unknown-linux-gnu', '1.98.1', 'd1')")
+        db.query("INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version, dependency_identity, explicit_spelling) \
+                  VALUES ('t1', 'serde', '1.0.0', '[]', 'x86_64-unknown-linux-gnu', '1.98.1', 'd1', 0)")
             .execute()
             .await
             .expect("insert");
@@ -489,8 +489,8 @@ mod tests {
         // A burst of writes through the wrapped handle; a tiny
         // multiplier puts the write budget under the burst.
         for index in 0..8 {
-            db.query("INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version, dependency_identity) \
-                      VALUES (?, ?, '1.0.0', '[]', 'x86_64-unknown-linux-gnu', '1.98.1', 'd1')")
+            db.query("INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version, dependency_identity, explicit_spelling) \
+                      VALUES (?, ?, '1.0.0', '[]', 'x86_64-unknown-linux-gnu', '1.98.1', 'd1', 0)")
                 .bind(format!("t{index}"))
                 .bind(format!("serde-{index}"))
                 .execute()

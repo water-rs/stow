@@ -1280,6 +1280,7 @@ mod tests {
                         host_side: false,
                     }],
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
@@ -1288,6 +1289,7 @@ mod tests {
                     host_side: false,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 },
             ],
         )
@@ -1602,6 +1604,7 @@ mod tests {
                     host_side: false,
                 }],
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
@@ -1610,6 +1613,7 @@ mod tests {
                 host_side: false,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: missing.crate_name.clone(),
@@ -1618,6 +1622,7 @@ mod tests {
                 host_side: false,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
         ];
         let analysis =
@@ -1791,6 +1796,7 @@ mod tests {
                     host_side: false,
                 }],
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
@@ -1799,6 +1805,7 @@ mod tests {
                 host_side: false,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
         ];
         let host = Some(GlibcVersion {

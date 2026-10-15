@@ -35,6 +35,11 @@ fn toml_document(value: &Value) -> String {
 /// Pack `fixture` into `{reg}/{name}-{version}.crate` and append its
 /// index line, returning the sha256 the index records.
 fn publish(reg: &Path, fixture: &Fixture) -> String {
+    publish_with_build_deps(reg, fixture, &[])
+}
+
+/// The manifest `publish_with_build_deps` writes for `fixture`.
+fn fixture_manifest(fixture: &Fixture, build_deps: &[(&'static str, &'static str)]) -> Value {
     let features: serde_json::Map<String, Value> = fixture
         .features
         .iter()
@@ -51,6 +56,14 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
             })
             .collect::<serde_json::Map<_, _>>(),
     });
+    if !build_deps.is_empty() {
+        manifest["build-dependencies"] = json!(
+            build_deps
+                .iter()
+                .map(|(name, req)| ((*name).to_owned(), json!(req)))
+                .collect::<serde_json::Map<_, _>>()
+        );
+    }
     if !fixture.target_deps.is_empty() {
         let mut target = serde_json::Map::new();
         for (cfg, name, req) in &fixture.target_deps {
@@ -64,6 +77,19 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     if fixture.proc_macro {
         manifest["lib"] = json!({ "proc-macro": true });
     }
+    manifest
+}
+
+/// `publish`, plus `[build-dependencies]` `(name, req)` entries and a
+/// `build.rs`, so cargo emits the build-script units the build-dep
+/// edges ride on (a build dep without a build script never emits).
+fn publish_with_build_deps(
+    reg: &Path,
+    fixture: &Fixture,
+    build_deps: &[(&'static str, &'static str)],
+) -> String {
+    let manifest = fixture_manifest(fixture, build_deps);
+    let features = manifest["features"].clone();
     let lib = if fixture.proc_macro {
         "extern crate proc_macro;\n"
     } else {
@@ -76,7 +102,7 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
         file,
         flate2::Compression::fast(),
     ));
-    for (path, contents) in [
+    let mut entries = vec![
         (
             format!("{}-{}/Cargo.toml", fixture.name, fixture.version),
             toml_document(&manifest),
@@ -85,7 +111,14 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
             format!("{}-{}/src/lib.rs", fixture.name, fixture.version),
             lib.to_owned(),
         ),
-    ] {
+    ];
+    if !build_deps.is_empty() {
+        entries.push((
+            format!("{}-{}/build.rs", fixture.name, fixture.version),
+            "fn main() {}".to_owned(),
+        ));
+    }
+    for (path, contents) in entries {
         let mut header = tar::Header::new_gnu();
         header.set_mode(0o644);
         header.set_size(u64::try_from(contents.len()).unwrap());
@@ -96,7 +129,7 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     tar.into_inner().unwrap().finish().unwrap();
     let cksum = format!("{:x}", Sha256::digest(std::fs::read(&tarball).unwrap()));
 
-    let deps = index_deps(fixture);
+    let deps = index_deps(fixture, build_deps);
     let mut line = serde_json::to_string(&json!({
         "name": fixture.name,
         "vers": fixture.version,
@@ -127,9 +160,10 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     cksum
 }
 
-/// `fixture`'s ordinary and target-gated deps as index-line entries.
-fn index_deps(fixture: &Fixture) -> Vec<Value> {
-    let entry = |name: &str, req: &str, features: &Value, target: &Value| {
+/// `fixture`'s ordinary, build and target-gated deps as index-line
+/// entries.
+fn index_deps(fixture: &Fixture, build_deps: &[(&'static str, &'static str)]) -> Vec<Value> {
+    let entry = |name: &str, req: &str, features: &Value, target: &Value, kind: &str| {
         json!({
             "name": name,
             "req": format!("^{req}"),
@@ -137,18 +171,23 @@ fn index_deps(fixture: &Fixture) -> Vec<Value> {
             "optional": false,
             "default_features": true,
             "target": target,
-            "kind": "normal",
+            "kind": kind,
         })
     };
     fixture
         .deps
         .iter()
-        .map(|(name, req, features)| entry(name, req, &json!(features), &Value::Null))
+        .map(|(name, req, features)| entry(name, req, &json!(features), &Value::Null, "normal"))
         .chain(
             fixture
                 .target_deps
                 .iter()
-                .map(|(cfg, name, req)| entry(name, req, &json!([]), &json!(cfg))),
+                .map(|(cfg, name, req)| entry(name, req, &json!([]), &json!(cfg), "normal")),
+        )
+        .chain(
+            build_deps
+                .iter()
+                .map(|(name, req)| entry(name, req, &json!([]), &Value::Null, "build")),
         )
         .collect()
 }
@@ -2769,4 +2808,127 @@ fn merkle_context_propagates_from_offline_resolve() {
         "the dependency subgraphs differ, so the digests differ"
     );
     assert_ne!(plain_id, unsafe_id);
+}
+/// A resolved node's explicit-spelling flag by crate name — the test
+/// asserts on the flag `resolved_task_graph` stamped on it.
+fn node_spelling(
+    graph: &stow_types::task_graph::ResolvedTaskGraph,
+    crate_name: &str,
+) -> stow_types::public_cache::ExplicitSpelling {
+    let index = graph
+        .nodes()
+        .iter()
+        .position(|node| node.identity.crate_name == crate_name)
+        .unwrap_or_else(|| panic!("{crate_name} is a node"));
+    graph.nodes()[index].explicit_spelling
+}
+
+/// stow#736's flag over a real resolve: a lib with a proc-macro in its
+/// `--extern` is `KeysApart`, so is every target-side lib above it; a
+/// lib with only build-deps and the proc-macro subtree itself stay
+/// `KeysAsNative`.
+#[test]
+fn explicit_spelling_marks_proc_macro_closures() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    let plain = |name| Fixture {
+        name,
+        version: "1.0.0",
+        deps: vec![],
+        target_deps: vec![],
+        features: &[],
+        yanked: false,
+        proc_macro: false,
+    };
+    publish(&reg, &plain("hostlib"));
+    publish(&reg, &plain("pm-dep"));
+    publish(
+        &reg,
+        &Fixture {
+            name: "pm",
+            deps: vec![("pm-dep", "1", &[])],
+            proc_macro: true,
+            ..plain("pm")
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "mid",
+            deps: vec![("pm", "1", &[])],
+            ..plain("mid")
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "top",
+            deps: vec![("mid", "1", &[])],
+            ..plain("top")
+        },
+    );
+    // `bs` builds against `hostlib` only — a build-dep edge that never
+    // reaches its lib's `--extern`.
+    publish_with_build_deps(&reg, &plain("bs"), &[("hostlib", "1")]);
+    let manifest = project(&work.path().join("root"), &json!({ "top": "1", "bs": "1" }));
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve(
+            &manifest,
+            &ResolveOptions::default(),
+            &["aarch64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+    let graph =
+        stow_resolver::resolved_task_graph(&out[0].1.units, pinned_rustc_version()).unwrap();
+    let apart = stow_types::public_cache::ExplicitSpelling::KeysApart;
+    let native = stow_types::public_cache::ExplicitSpelling::KeysAsNative;
+    assert_eq!(
+        node_spelling(&graph, "mid"),
+        apart,
+        "a direct proc-macro dep flags"
+    );
+    assert_eq!(
+        node_spelling(&graph, "top"),
+        apart,
+        "the flag propagates through target-side deps"
+    );
+    assert_eq!(
+        node_spelling(&graph, "pm"),
+        native,
+        "a host-side node is never flagged"
+    );
+    assert_eq!(
+        node_spelling(&graph, "pm-dep"),
+        native,
+        "a proc-macro's own dep subtree is never flagged"
+    );
+    assert_eq!(
+        node_spelling(&graph, "bs"),
+        native,
+        "a build-dep-only lib is never flagged"
+    );
+    assert_eq!(node_spelling(&graph, "hostlib"), native);
+
+    // The flag rides `depends_on`'s dep edges the same way.
+    let (requests, _uncovered) = stow_resolver::enqueue_requests_inner(
+        &graph,
+        &std::collections::BTreeSet::new(),
+        stow_types::api::EnqueueSource::CrateUpdate,
+        0,
+    )
+    .unwrap();
+    let top_request = requests
+        .iter()
+        .find(|request| request.crate_name.as_str() == "top")
+        .expect("top mints a request");
+    assert_eq!(top_request.explicit_spelling, apart);
+    let dep_flags: Vec<_> = top_request
+        .depends_on()
+        .expect("derived dep edges")
+        .iter()
+        .map(|dep| (dep.crate_name.as_str().to_owned(), dep.explicit_spelling))
+        .collect();
+    assert_eq!(dep_flags, vec![("mid".to_owned(), apart)]);
 }

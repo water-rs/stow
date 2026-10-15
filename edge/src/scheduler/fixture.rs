@@ -93,7 +93,11 @@ fn target_mask_case(expr: &str) -> String {
         let _ = write!(
             arms,
             "WHEN {index} THEN {} ",
-            crate::scheduler::queue::dep_invocation_mask(target, false)
+            crate::scheduler::queue::dep_invocation_mask(
+                target,
+                false,
+                stow_types::public_cache::ExplicitSpelling::KeysAsNative
+            )
         );
     }
     format!("CASE ({expr}) % {} {arms}END", target_count())
@@ -352,6 +356,7 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
     "host_side",
+    "explicit_spelling",
     "preserve_lockfile",
     "attempt",
     "shape_requeue",
@@ -367,6 +372,28 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "dispatch_eligible",
     "demand",
 ];
+
+/// The seed's `lane` expression over `n`.
+///
+/// The human lane inside the pending range is the pin window alone:
+/// a pending row parked `dispatch_eligible = 0` must be miss-lane,
+/// because the lane exemption (`lane = 'human' OR value >= floor`)
+/// recomputes a human row to eligible under EVERY admission floor —
+/// a below-floor stored flag is only a stable state for a miss row.
+/// Keeping the parked bulk miss-lane also keeps the pin window the
+/// first rows the claim walks at any floor: humans order ahead of
+/// every miss row in `dispatch_key`, so the claimed set is the pin
+/// — and its pooled closure — even after a floor change flips some
+/// parked rows back to eligible. Rows outside the pending range
+/// keep the upstream lane split (their lane never prices a claim).
+fn fixture_lane_case_sql(pending_end: u32, human_pin: u32, human_end: u32) -> String {
+    format!(
+        "CASE WHEN n <= {pending_end} \
+              THEN CASE WHEN n > {human_pin} AND n <= {human_end} \
+                        THEN 'human' ELSE 'miss' END \
+              ELSE CASE WHEN n <= {human_end} THEN 'human' ELSE 'miss' END END"
+    )
+}
 
 /// Build the seed's queue statement over an arbitrary `seq` source:
 /// identity and scheduling columns are functions of `n`, including the `dispatch_key`
@@ -399,23 +426,7 @@ fn queue_seed_insert_sql(
     let target_case = target_case_sql("n");
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
-    // The human lane inside the pending range is the pin window alone:
-    // a pending row parked `dispatch_eligible = 0` must be miss-lane,
-    // because the lane exemption (`lane = 'human' OR value >= floor`)
-    // recomputes a human row to eligible under EVERY admission floor —
-    // a below-floor stored flag is only a stable state for a miss row.
-    // Keeping the parked bulk miss-lane also keeps the pin window the
-    // first rows the claim walks at any floor: humans order ahead of
-    // every miss row in `dispatch_key`, so the claimed set is the pin
-    // — and its pooled closure — even after a floor change flips some
-    // parked rows back to eligible. Rows outside the pending range
-    // keep the upstream lane split (their lane never prices a claim).
-    let lane_case = &format!(
-        "CASE WHEN n <= {pending_end} \
-              THEN CASE WHEN n > {human_pin} AND n <= {human_end} \
-                        THEN 'human' ELSE 'miss' END \
-              ELSE CASE WHEN n <= {human_end} THEN 'human' ELSE 'miss' END END"
-    );
+    let lane_case = &fixture_lane_case_sql(pending_end, human_pin, human_end);
     let first_at = "datetime('now', '-' || (n % 2880) || ' minutes')";
     let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
     // The claimable set is exactly the planted window (the human-lane
@@ -505,6 +516,7 @@ fn queue_seed_insert_sql(
                 {first_at}, \
                 {updated_at}, \
                 CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
+                0, \
                 0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
                 CASE WHEN n > {failed_end} THEN 'run-' || n ELSE NULL END, \
                 lower(hex(randomblob(16))), \
@@ -753,7 +765,7 @@ async fn seed_nodes_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), QueueE
         "WITH RECURSIVE seq(n) AS ({seq}) \
          INSERT OR IGNORE INTO task_nodes \
              (task_id, crate_name, version, features_json, target, rustc_version, \
-              host_side, dependency_identity, children_json) \
+              host_side, explicit_spelling, dependency_identity, children_json) \
          SELECT printf('%064x', n), \
                 'crate' || (n / {CRATE_NAME_ROWS}), \
                 '1.' || (n / 20000) || '.' || (n % 500), \
@@ -761,6 +773,7 @@ async fn seed_nodes_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), QueueE
                 {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
                 CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
+                0, \
                 printf('%064x', n), \
                 COALESCE( \
                     (SELECT json_group_array(d.depends_on_task_id) \
@@ -2013,8 +2026,10 @@ mod tests {
     struct EdgeRequirement {
         owner_target: String,
         owner_side: i64,
+        owner_spelling: i64,
         dep_target: String,
         dep_side: i64,
+        dep_spelling: i64,
         stored_side: i64,
         invocations: i64,
         shapes: i64,
@@ -2024,6 +2039,7 @@ mod tests {
     struct SliceMembership {
         target: String,
         host_side: i64,
+        explicit_spelling: i64,
         unit_side: i64,
         unit_invocation: i64,
         unit_linked: i64,
@@ -2088,7 +2104,9 @@ mod tests {
         let edges = db
             .query(
                 "SELECT o.target AS owner_target, o.host_side AS owner_side, \
+                        o.explicit_spelling AS owner_spelling, \
                         d.target AS dep_target, d.host_side AS dep_side, \
+                        d.explicit_spelling AS dep_spelling, \
                         e.dep_host_side AS stored_side, \
                         e.dep_invocations AS invocations, e.dep_shapes AS shapes \
                  FROM queue_dependencies e \
@@ -2106,8 +2124,10 @@ mod tests {
                 crate::scheduler::queue::dep_edge_requirements(
                     &edge.owner_target,
                     edge.owner_side != 0,
+                    crate::scheduler::queue::spelling_of(edge.owner_spelling),
                     &edge.dep_target,
                     edge.dep_side != 0,
+                    crate::scheduler::queue::spelling_of(edge.dep_spelling),
                 ),
                 "{label}: requirements for {} dep {} (owner {})",
                 edge.dep_side,
@@ -2125,6 +2145,7 @@ mod tests {
         let membership = db
             .query(
                 "SELECT s.target AS target, q.host_side AS host_side, \
+                        q.explicit_spelling AS explicit_spelling, \
                         s.unit_side AS unit_side, s.unit_invocation AS unit_invocation, \
                         s.unit_linked AS unit_linked \
                  FROM published_slice_rows s \
@@ -2138,14 +2159,17 @@ mod tests {
         assert!(!membership.is_empty(), "{label}: no slice rows joined");
         for row in &membership {
             let invocation = node_invocation(&row.target);
-            let covered =
-                stow_types::public_cache::required_unit_shapes(row.host_side != 0, invocation)
-                    .iter()
-                    .any(|shape| {
-                        shape.side.to_int() == row.unit_side
-                            && shape.invocation.to_int() == row.unit_invocation
-                            && shape.kind.to_int() == row.unit_linked
-                    });
+            let covered = stow_types::public_cache::required_unit_shapes(
+                row.host_side != 0,
+                invocation,
+                crate::scheduler::queue::spelling_of(row.explicit_spelling),
+            )
+            .iter()
+            .any(|shape| {
+                shape.side.to_int() == row.unit_side
+                    && shape.invocation.to_int() == row.unit_invocation
+                    && shape.kind.to_int() == row.unit_linked
+            });
             assert!(
                 covered,
                 "{label}: slice row ({},{},{}) of {} (host_side={}) is no required shape",
