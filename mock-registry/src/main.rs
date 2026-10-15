@@ -25,7 +25,6 @@ use sha2::Digest;
 use sigstore::cosign::payload::SimpleSigning;
 use sigstore::crypto::signing_key::SigStoreKeyPair;
 use sigstore::crypto::{SigStoreSigner, SigningScheme};
-use stow_shim::schema as artifact_table_schema;
 use stow_types::api::{ArtifactRecord, DemandFeedHour};
 use stow_types::bundle::{
     ArtifactBlobConfig, BundleArtifactConfig, BundleLayer, BundleParts, BundleSignatureMaterial,
@@ -1054,17 +1053,39 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
     smol::unblock(move || -> stow_types::error::Result<()> {
         let mut connection = Connection::open(&sqlite_path)
             .map_err(|error| stow_types::stow_error!("open sqlite {}: {error}", sqlite_path.display()))?;
-        connection
-            .execute_batch(include_str!("../../edge/migrations/0001_schema.sql"))
-            .map_err(|error| stow_types::stow_error!("ensure sqlite schema {}: {error}", sqlite_path.display()))?;
-        ensure_artifact_table_columns(&connection, &sqlite_path)?;
-        // Mirror the edge's post-0005 schema: `dependency_count` is gone.
-        connection
-            .execute_batch(include_str!(
-                "../../edge/migrations/0006_drop_dependency_count.sql"
-            ))
+        // The mirror tracks the edge's one schema — recreate it the way
+        // an operator resets the real store: drop every object
+        // `sqlite_master` reports, then execute the schema file.
+        let objects = connection
+            .prepare(
+                "SELECT type, name FROM sqlite_master \
+                 WHERE type IN ('table', 'index', 'trigger', 'view') \
+                   AND name NOT GLOB 'sqlite_*'",
+            )
             .map_err(|error| {
-                stow_types::stow_error!("drop dependency_count in {}: {error}", sqlite_path.display())
+                stow_types::stow_error!("list sqlite objects {}: {error}", sqlite_path.display())
+            })?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                stow_types::stow_error!("query sqlite_master {}: {error}", sqlite_path.display())
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                stow_types::stow_error!("read sqlite_master row {}: {error}", sqlite_path.display())
+            })?;
+        for (kind, name) in &objects {
+            connection
+                .execute_batch(&format!("DROP {} IF EXISTS {name}", kind.to_uppercase()))
+                .map_err(|error| {
+                    stow_types::stow_error!("drop {kind} {name} in {}: {error}", sqlite_path.display())
+                })?;
+        }
+        connection
+            .execute_batch(include_str!("../../edge/schema.sql"))
+            .map_err(|error| {
+                stow_types::stow_error!("apply sqlite schema {}: {error}", sqlite_path.display())
             })?;
         let transaction = connection
             .transaction()
@@ -1112,74 +1133,6 @@ async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::e
         Ok(())
     })
     .await
-}
-
-fn ensure_artifact_table_columns(
-    connection: &Connection,
-    sqlite_path: &Path,
-) -> stow_types::error::Result<()> {
-    let mut statement = connection
-        .prepare("PRAGMA table_info(artifacts)")
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "prepare table_info query {}: {error}",
-                sqlite_path.display()
-            )
-        })?;
-    let existing_columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| {
-            stow_types::stow_error!("query table_info {}: {error}", sqlite_path.display())
-        })?
-        .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(|error| {
-            stow_types::stow_error!("read table_info row {}: {error}", sqlite_path.display())
-        })?;
-    drop(statement);
-
-    for column in artifact_table_schema::REQUIRED_ARTIFACT_COLUMNS {
-        if existing_columns.contains(column.name) {
-            continue;
-        }
-        connection.execute_batch(column.add_sql).map_err(|error| {
-            stow_types::stow_error!(
-                "migrate sqlite artifacts add column {} in {}: {error}",
-                column.name,
-                sqlite_path.display()
-            )
-        })?;
-    }
-
-    connection
-        .execute(
-            "DELETE FROM artifacts WHERE compile_key = '' OR compile_key IS NULL",
-            [],
-        )
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "delete sqlite artifacts with empty compile_key in {}: {error}",
-                sqlite_path.display()
-            )
-        })?;
-
-    // Rows under the retired per-crate layout point at unreachable private
-    // packages; the edge applied this cleanup to D1 as a one-time sweep.
-    connection
-        .execute(
-            &format!(
-                "DELETE FROM artifacts WHERE oci_reference NOT GLOB '{}:*'",
-                stow_types::registry::GHCR_BASE
-            ),
-            [],
-        )
-        .map_err(|error| {
-            stow_types::stow_error!(
-                "delete sqlite artifacts with legacy per-crate oci_reference in {}: {error}",
-                sqlite_path.display()
-            )
-        })?;
-
-    Ok(())
 }
 
 async fn write_blob(root: &Path, digest: &str, bytes: &[u8]) -> stow_types::error::Result<()> {
@@ -1442,7 +1395,7 @@ struct PopulateArgs {
     registry_root: PathBuf,
     /// Optional artifacts-table mirror — nothing reads it since the edge
     /// stopped serving artifact lookups, but it keeps the fixture's schema
-    /// exercised against the real migrations.
+    /// exercised against the real schema file.
     #[arg(long = "sqlite")]
     sqlite_path: Option<PathBuf>,
     #[arg(long = "private-key")]

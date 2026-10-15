@@ -38,10 +38,11 @@ STOW_HUMAN_DAILY_TASK_BUDGET = "2000"
 # being built. The human lane is exempt by contract. Decimal text: the
 # floor can exceed the JS-safe integer range, and the DO parses it as a
 # typed i64 when its settings initialize — overflow or a negative value
-# fails then, not a clamp. The floor is applied by the operator
-# migration (`stow-admin scheduler migrate`), which stamps it into the
-# queue's persisted eligibility flag — changing this binding changes
-# nothing until that pass runs. Unset means "0", admit everything.
+# fails then, not a clamp. The operator reset (`stow-admin scheduler
+# reset --yes`) stamps the configured value into the queue's
+# `settings.min_dispatch_value` row that every writer's eligibility
+# expression reads — changing this binding changes nothing until that
+# pass runs. Unset means "0", admit everything.
 # STOW_MIN_DISPATCH_VALUE = "0"
 # Public Turnstile site key (invisible widget) rendered by the request page
 # on stow.waterui.dev; the matching secret is a Worker secret below.
@@ -88,19 +89,6 @@ STOW_COST_BUDGET_MULTIPLIER = "1.0"
 binding = "STOW_DB"
 database_name = "stow-prod"
 database_id = "b2fefa0a-828a-4681-b6f1-4d491d5dff5e"
-
-# `wrangler d1 migrations apply` reads `migrations_dir` relative to the
-# config file, which skyzen generates into `edge/.skyzen/gen/`, so the
-# default `migrations/` would resolve next to the generated file instead of
-# to `edge/migrations`. Skyzen models no `migrations_dir` on a D1 database
-# (`CfD1Database` denies unknown fields), so the whole entry is restated
-# here: `[cloudflare.raw]` replaces the rendered `d1_databases` array
-# wholesale, and the three keys above must stay in sync with it.
-[[cloudflare.raw.d1_databases]]
-binding = "STOW_DB"
-database_name = "stow-prod"
-database_id = "b2fefa0a-828a-4681-b6f1-4d491d5dff5e"
-migrations_dir = "../../migrations"
 
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"

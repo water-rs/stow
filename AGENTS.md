@@ -1,319 +1,39 @@
 # AGENTS.md
 
-This file is the single source of repository instructions. `CLAUDE.md` is a
-symlink to it — edit this file, never the link.
+The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 
-This repository builds a public Rust artifact cache pipeline around a trusted GitHub-based build path.
+## Model
 
-## The model
+- stow is a graph of library and macro crates. A node is one crate at one identity: crate, version, feature set, target, rustc, profile, side, and the digest of its resolved dependency subgraph. Binaries, projects and workspaces are never nodes; they only name crates.
+- Every source of work names crates; the resolver (`stow-resolver`, run in the lanes, never the edge) turns names into nodes at the identities consumers compile. Edges are build order: a build compiles its own node and is served the rest, and compiling anything else is a defect.
+- A node's identity is the one a real consumer's build computes. Versions converge on the latest semver-compatible release; feature sets are never forced.
+- Deduplication is node identity; no mechanism is added on top of it.
 
-stow is a graph whose nodes are library and macro crates, each at one identity:
-crate, version, feature set, target, rustc, profile, side, and the digest of
-its resolved dependency subgraph. Nothing else is a node. A binary is not a node, a project is not a node, a workspace is not a
-node. The side is which half of a target's unit graph the node is: a crate
-a consumer links (`--extern`, the target side) and the same crate a
-consumer's proc-macro or build script links (the host side) compile as
-different units at different keys, so they are different nodes.
+## Trust
 
-Nodes enter the graph from four sources, none of them privileged and none owning a
-task shape of its own:
+- GitHub-hosted CI is the only builder and crates.io the only metadata source. The build path never calls the edge.
+- GHCR records signed by the pinned builder identity are the only record store; every other store is a mirror of them, and every reader verifies the signature before trusting a row.
+- The edge is untrusted serving infrastructure.
 
-- the top binary crates on crates.io, ranked by downloads,
-- popular projects, ranked by stars,
-- users, through the request lane and through the misses their own builds admit,
-- admin operations.
+## Rules
 
-Every source does the same thing: it names crates, and cargo's own resolver
-(`stow-resolver`, run inside the lanes — the `stow-admin` preheat paths and
-the `resolve-request.yml` job — never the edge) turns those names into nodes
-at the identities their consumers compile. Edges are dependency
-edges, and they are the build order — a node's dependencies are built before it, so
-each build compiles one crate and is served the rest. A build that compiles any
-node other than its own is a defect: either a dependency was dispatched before it was
-servable, or the build is producing something no node owns.
+- Every residual cost is the product: remove a cost before presenting it as a trade-off, and never narrow a feature to avoid one.
+- Fail fast on inconsistent identity or schema; no fallbacks.
+- The repository carries no migration or compatibility code. Each store has one schema and the code is written against it alone; a schema change is an operator reset of the store, refilled from the signed records or the next wave.
+- Request code and the alarm never create, alter or backfill anything. Their cost scales with the event, never with stored data; idle cost is zero; independent outbound calls run concurrently under a stated bound; no runner is held by waiting. Each scheduler route and the alarm has a drive in `edge/src/scheduler/drives.rs`, gated by `scripts/scheduler-budget.sh`, and a change on those paths states its cost.
+- Use a native Cloudflare or GitHub feature before building infrastructure, and name the ones checked when none fits.
+- On Linux, mold is the linker on both sides of the cache, with no fallback. Never state which linker a target uses by default.
+- A performance claim is measured on what the developer pays repeatedly, on a project large enough for the effect to exist, and is not generalized past what was measured.
+- A fix that names a defect class finds and lists every other instance in the same PR.
+- `CI_TARGET_TRIPLES` is never expanded for one project.
+- Every alert, breaker trip and watchdog report sends an email from `alerts@stow.waterui.dev` and keeps an `incident`-labelled issue; either channel failing never stops the other.
 
-CI consumes the graph and produces the cache. The published index is the graph's
-built nodes, serialized per target and rustc. A cache miss is a node a user needs
-that nobody has built yet, which is why a miss is also an injection point.
+## Documents
 
-Everything else in this file follows from that sentence. Deduplication is node
-identity. The build order is the edges. The unit rule is what may be a node.
+- `README.md` is for users only; operator material lives in `docs/`.
+- A document names only commands, flags and variables that exist, and `docs/ENVIRONMENT.md` lists every variable stow reads.
 
-## Trust model
-- Trust GitHub-hosted CI as the builder.
-- Trust crates.io as the canonical upstream for crate metadata and dependency graph information.
-- The build path never calls the edge: `build-crate.yml` stamps its `run-name` `<rustc>-<task_id>` and pushes each task's bundle and `Vec<ArtifactRecord>` to GHCR as one cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifact under the pinned builder identity, and GitHub's `workflow_run` webhook (HMAC-verified at `POST /api/v1/github/workflow-run`) reports completion; the same webhook drives request-lane run updates — `resolve-request.yml` stamps `run-name` `resolve-a<attempt>-<request_id>` and its `in_progress`/`completed` deliveries advance the request record. `resolve-request.yml` is a submit lane, not the build path: like the preheat lanes it posts its outcome to the trusted scheduler route under its job's OIDC identity and writes no artifact records. GHCR plus cosign is the only record store; the edge's D1 `artifacts` table is a mirror `index sync` fills from those verified records.
-- Edge workers are untrusted-by-default serving infrastructure: index exports and webhook completion both verify the records artifact's cosign signature against the `build-crate.yml` identity before trusting a row, and every CLI fetch verifies cosign signatures, so a polluted record cannot be used to inject malicious code (the consumer sees a 404 or a digest failure and compiles locally). The bound on what a build may write is enforced where the trust lives — `stow-build publish` validates the plan against its self-resolved dependency closure (`ci/src/closure.rs`, `ci/src/validate.rs`) and only then signs the records artifact — so the edge checks the signature and the task-id annotation and does not re-resolve or re-bind the record set.
+## Validation
 
-## Architecture map
-- `cli/`: end-user CLI and runtime wrappers.
-  - `cargo_cmd.rs`: `stow check` / `predict` orchestration.
-  - `index.rs`: signed artifact-index fetch/verify/cache (`stow index refresh|status`); the resolver reads the cached slice.
-  - `resolve.rs`: local coverage analysis — exact, semantic, and expanded-graph matching against index rows; the dependency graph never leaves the machine for lookups.
-  - `lockfile_resolver.rs`: lockfile-driven exact resolution for `cargo fetch`/predict paths.
-  - `cache_policy.rs`: controls whether a rustc invocation is allowed to use public cache.
-  - `inject.rs`: writes cached outputs back into Cargo target dirs.
-  - `prefetch.rs`: concurrent edge byte-path prefetch of the index's covered bundles, each digest-checked against the index row's `bundle_digest`.
-- `edge/`: Cloudflare Worker + Durable Object scheduler. The edge streams bundle bytes (`GET /api/v1/bundles/{digest}`, Workers Cache in front of the GHCR blob — no catalog lookup) and mints miss admissions (`POST /api/v1/admissions`); it no longer resolves graphs or answers semantic/batch lookups — the CLI resolves every key against its local signed index.
-  - `api.rs`: digest-addressed byte-path GET, `/api/v1/admissions` minting, `/api/v1/requests` Turnstile admission (hands the request to the scheduler, which dispatches `resolve-request.yml` — the edge resolves nothing), trusted admin/scheduler routes.
-  - `dependency_resolver.rs`: the edge's remaining crates.io reads — the admissions coverage diff, the request route's version/rustc lookups, and the site pickers (search/versions/features).
-  - `db.rs`: D1 schema helpers and artifact-catalog queries.
-  - `scheduler/`: Durable Object queue, dispatch, miss draining, and request records (`requests` table — admit + `resolve-request.yml` dispatch on `POST /requests`, task submit on `/requests/{id}/outcome`, webhook-driven `run-update`).
-- `ci/`: trusted build runner (`stow-build`), two stages that never share a job or a credential.
-  - `stow-build build` (untrusted job, `contents: read`, no secrets/OIDC): builds the crate, scans artifacts, writes task + plan + content-addressed blobs to an output directory (`stage.rs`).
-  - `stow-build publish` (trusted job): re-hashes the blobs, validates the plan against the dispatched task and a self-resolved dependency closure (`closure.rs`, `validate.rs`), then pushes the bundle and the signed records artifact to GHCR. GitHub's `workflow_run` webhook — not the runner — reports completion to the edge.
-  - The scheduler dispatches `workflow_dispatch` of `build-crate.yml` on `main`; the trusted identity lives in `types/src/trusted_builder.rs`.
-- `oci/`: shared OCI push/sign/pull machinery (`stow-oci`) — bundle publish for `stow-build`, index publish for `stow-admin`, digest pulls for the CLI.
-- `mock-registry/`: local mock OCI registry for simulation and tests (`populate`, `publish-index`, `index-from-records`, `serve`; speaks GHCR's anonymous bearer exchange).
-- `types/`: shared API and artifact key types (`index.rs` carries the signed `ArtifactIndex` wire format).
-- `resolver/`: native graph resolver (`stow-resolver`) on the published `cargo` crate — materializes a fetched source (project tree or `.crate`), runs cargo's own `resolve_ws_with_opts`/`FeatureResolver` per CI target with the toolchain's real rustc facts, and emits the per-target unit set (package, feature set, dependency edges, host/target side) plus the `EnqueueRequest` conversion the lanes share.
-- `admin/`: operations CLI for preheating the cache and publishing index slices (`index export|publish|sync`). Every lane resolves in-process with `stow-resolver` (`resolve::RESOLVE_CONCURRENCY` worker threads); `preheat manual` drives a whole wave with no edge at all — in-process resolve, topological layering, `workflow_dispatch` through the operator's GitHub token, index-rooted resume. `request resolve` is the request lane's Actions half (`resolve-request.yml` runs it): resolves the dispatched request across `CI_TARGET_TRIPLES`, prunes against the published index slices, and posts the outcome to the scheduler.
-
-## Important repo assumptions
-- water-rs Actions capacity is 60 concurrent runners (20 on macOS) — a full `CI_TARGET_TRIPLES` request wave dispatches in one window; wall clock is set by the slowest (Windows) leg.
-- Production graph expansion should continue using crates.io.
-- Mock GHCR / mock local CI are valid for local simulation.
-- Local Wrangler/workerd dev runtime may be unstable; if local edge validation fails in dev mode, distinguish repo bugs from local runtime bugs before changing architecture.
-
-## The unit of build and cache is one library or macro crate
-
-One build task builds one crate, and the cache stores what that crate compiles to:
-an rlib, a dylib, or a proc-macro. `ArtifactKind` is `Rlib | Dylib | ProcMacro` and
-`RustCrateType` carries no `Bin` variant — the rule is expressed in types and stays
-that way. A host-side unit keys differently from the same crate's target-side
-unit: cargo compiles the host half of a unit graph under the build-override
-profile, and whether the invocation spells `--target` at all changes the
-flags it hands that half — a native consumer and a `--target` consumer
-compute different keys for the same host dep. A host-side node's build
-therefore compiles its crate as a wrapper `[build-dependencies]` unit and
-runs each phase under both invocation spellings, publishing both shapes;
-the gate serves a dependent's host edge only when the side it needs has
-published.
-
-A binary or an application project is never a build unit. Its value is that it names
-crates worth caching: read its `Cargo.lock`, take the crates.io entries, and enqueue
-each one as an ordinary crate task. The project is not cloned, its own code is never
-compiled, and whether it builds on any of our targets is irrelevant.
-
-Deduplication is a consequence of the unit being minimal, not a mechanism added on
-top. `task_id` spells the identity tuple plus a Merkle digest of the unit's resolved
-dependency subgraph, so two projects that need the same crate at the same identity
-land on the same task and it is built once — nobody
-arranged that. Make the unit coarser and no key design recovers it: ripgrep and fd
-overlap across nearly their whole dependency trees and overlap in nothing as tasks,
-because a task that means "ripgrep" is equal to no other task in the system. Every
-shared crate is then recompiled once per project that names it.
-
-A task's identity is the identity a real consumer's build computes: crate, version,
-feature set, target, rustc, profile. An artifact built at an identity nobody compiles
-is not a cheaper artifact, it is a useless one. Two projects that resolve the same
-crate to different features resolve it to different artifacts, so they are two tasks;
-when the identities match, the task deduplicates by itself, which is all
-deduplication ever is.
-
-Where the identity is forced rather than observed, it has to be forced toward an
-identity consumers converge on anyway.
-
-Versions are the one place convergence may be forced, and there it is right. Within a
-semver-compatible range the latest version is unique and is a strict improvement —
-the same API with fewer bugs — and a project pinned below it can take it, because
-that is exactly what semver promises. So every task builds at the latest
-semver-compatible version: the bundled lockfile is dropped unless `preserve_lockfile`
-is set (`ci/src/task.rs:239`), and a project contributes crate names and feature
-sets, never version pins — though the dropped lockfile's pins still admit the
-yanked registry versions they name, and its git entries still lock git
-dependencies to the sha they record, as cargo's own lockfile handling does.
-
-Feature sets are not like that and may never be forced. `A` with `{c, d}` and `A`
-with `{c}` are two legitimate artifacts with no ordering between them; neither
-substitutes for the other, and picking one caches something the other's users cannot
-use. A task derived from a project therefore carries that project's resolved feature
-set, read from `cargo metadata`'s resolve for the target.
-
-Anything that would make a task mean "a checkout" or "a workspace" rather than "a
-crate" is the rule leaking, and it belongs in the resolution step that produces the
-task list, never in the task itself.
-
-## mold is the linker on Linux, and it is mandatory
-
-stow links with mold on Linux, on both sides of the cache. `stow setup` installs it
-when it is absent and writes the linker selection into the user's global cargo
-configuration (`$CARGO_HOME/config.toml`); a `stow` build without setup provisions
-the same install and selects it for that invocation only. A build on Linux without
-mold does not start. There is no fallback to
-another linker, because a fallback produces artifacts keyed for a linker the cache
-does not publish — the user would get a slower build and a colder cache at once,
-which is the failure stow exists to prevent.
-
-Measured on zed: against `rust-lld`, mold is level on a full build and saves about six
-seconds on every incremental re-link. The full build is where compilation dominates
-and the link vanishes into it; the incremental loop is the cost a developer pays over
-and over. The two features multiply — serving removes dependency compile time, so
-stow raises the link's share of what is left, and mold's saving is a larger fraction
-of a warm round than of a cold one. Measuring either alone hides the effect, and
-measuring a small project hides it entirely.
-
-The public cache publishes only the mold variant of units that invoke the linker —
-proc-macro, dylib, cdylib. They are a small fraction of any tree, they do not
-recompile in an incremental loop, and their cost is one-time where the gain is per
-round.
-
-This is why the compile key carries a grid for link-affecting options rather than
-refusing to cache when it sees them. The grid applies only where the unit links: an
-rlib's key is unchanged, because rustc never runs the linker to produce one and the
-options are provably inert there. `-C link-arg` carries arbitrary text, so the grid
-holds the normalized option set, not a linker name — a build that adds `-L` or
-`-Wl,-rpath=` is a different point in that space and misses for a real reason.
-
-Never state in code, copy or comments which linker a target uses by default. It is
-target- and version-dependent: rustc has selected `rust-lld` on
-`x86_64-unknown-linux-gnu` since 1.90, while `aarch64-unknown-linux-gnu` still
-defaults to GNU ld. The builders pin their linker rather than inheriting the runner's,
-so the recorded value is one we chose and not an observation.
-
-## What stow is for, and how that decides things
-
-The impression stow has to leave is that a build is fast — not competitive, not
-improved. Every residual cost is the product, because the user never reads the
-paragraph explaining why the cost was acceptable; they only feel the build.
-
-So when you find a cost, the first question is what removes it, never what limits its
-blast radius. A trade-off is worth presenting only when both sides are genuinely
-irreducible and you can show why. These are the shapes that keep turning out not to
-be constraints at all:
-
-- **A missing field is not a constraint.** The compile key could not express which
-  linker produced an artifact, so linked units were refused. The answer was to add the
-  field, not to narrow what the cache accepts.
-- **A tool without a flag is not a constraint.** cargo has no "build only the
-  dependencies" mode, but `cargo metadata` already reports exactly which packages a
-  project resolves. Reaching for `--lib` or a source-stubbing trick was working around
-  a wall that was not there.
-- **Salvage is not a fix.** A failed build discards the dependencies it compiled, and
-  the reflex is to recover them. The better question was why a binary we never publish
-  was being built at all.
-- **An internal metric is not a goal.** Deduplication, coverage counts and queue
-  depth are bookkeeping. What the user experiences is whether their build hit, and
-  no bookkeeping number is worth a miss.
-- **Narrowing a feature is not a fix.** A measurement showed mold winning little, and
-  the reflex was to stop recommending it. The real answer was to build the cache with
-  mold so the conflict could not arise.
-
-Do not invent a requirement to justify a decision. A name was once argued for on the
-grounds that the generated package might one day need a build script or feature
-forwarding; it will not, because its entire content is one dependency declaration by
-construction. Designing for a need that does not exist is over-engineering even when
-the design it produces looks careful.
-
-## Operator notifications
-
-Every alert, incident, breaker trip and watchdog report does two things.
-
-- **Email notification** through Cloudflare Email Service **Email Sending**:
-  - sent from `alerts@stow.waterui.dev` (the onboarded sending domain) to the operator;
-  - one mail when the incident opens, one when it clears, and at most an hourly digest in between;
-  - the Worker uses the `send_email` binding;
-  - everything else uses the REST API, `POST /accounts/{account_id}/email/sending/send`, with `CLOUDFLARE_API_TOKEN`.
-- **Issue record**: a GitHub issue labelled `incident`:
-  - opened when the incident starts, updated at most hourly, closed when it clears;
-  - deduplicated by label and title prefix.
-
-If one channel fails, the other still happens, and the failure is recorded.
-
-## Platform-native first
-
-Before building any infrastructure mechanism, search Cloudflare's and GitHub's documentation for a native feature and use it when it fits. Examples: a kill switch, rate limiting, alerting, a canary, logging, queues, scheduling, merge gating. Cloudflare offers WAF custom and rate-limiting rules, the Workers rate-limiting binding, usage and budget notifications, Workers Logs, gradual deployments, Queues, Workflows, cron triggers and Analytics Engine. GitHub offers rulesets, merge queues, concurrency groups and environments. The panic switch reimplemented WAF custom rules inside the Worker and cost a Worker invocation and a Durable Object read on every request it shed. The issue or pull request that builds such a mechanism names the native options it checked and why none fits.
-
-## Resources are spent deliberately
-
-Everything stow runs on is metered or scarce: Durable Object rows, duration and requests, D1 rows, Worker CPU, R2 operations, runner slots, GitHub API quota. Stow is a service whose whole purpose is saving other people's compute, and wasting its own is the same failure.
-
-- **Per-event cost.** An operation costs what the event it handles touches, never what the stored data holds. A request that reads rows in proportion to a table is a defect even when the table is small today.
-- **Idle cost is zero.** Once its work is done, a Durable Object holds no timers, background promises, `waitUntil` tasks or open connections, so it hibernates at the platform minimum. An alarm is armed only while there is work pending.
-- **Independent outbound calls run concurrently** under a stated bound, so billed wall time is the slowest call rather than the sum.
-- **Runner slots are never held by waiting.** No job occupies a runner to poll, idle or stay resident.
-- **Every change states its cost.** A pull request that adds or changes a component on a request, alarm or scheduled path states its per-event and idle cost in its description, and the cost gate measures it.
-
-## Measuring a performance claim
-
-Measure what the developer pays repeatedly, on a project large enough for the effect
-to exist. A clean full build is dominated by compilation and hides everything else; a
-small project hides link cost entirely, because a binary of a few hundred objects
-re-links in a fraction of a second whatever links it. An incremental round on a large
-workspace is the number that decides.
-
-A measurement on one small project is not evidence about large ones, and a conclusion
-drawn from it that would change a default for every user is not a conclusion. Say what
-was measured and on what, and do not generalize past it.
-
-## Who each document is for
-
-`README.md` is the user's document. It says what stow does, how to install and use
-it, what is in the cache and why they should trust it. Nothing in it is addressed to
-whoever runs the cache: no `stow-admin` invocations, no deployment steps, no
-maintenance procedure. A reader who will never operate stow must be able to read it
-end to end without skipping anything.
-
-`docs/` is where operator and maintainer material lives — `USAGE.md`, `DEPLOYMENT.md`,
-`ARCHITECTURE.md`, `ENVIRONMENT.md`, `TROUBLESHOOTING.md` and the rest. Operator
-content that has drifted into the README is deleted rather than corrected, because
-`docs/` already carries it and two copies is how it drifted.
-
-`AGENTS.md` is this file, addressed to agents, and `CLAUDE.md` is a symlink to it.
-
-A document that names a command, a flag or an environment variable names one that
-exists, in both directions: a knob the code reads and the documentation omits is a
-knob nobody can find, and one the documentation describes and the code has removed is
-worse, because a reader will set it and believe it did something. `docs/ENVIRONMENT.md`
-claims to list every variable stow reads, so that claim is checkable and has to hold.
-
-## Development priorities
-1. Keep semantic identity correct:
-   - crate name
-   - version
-   - features_json
-   - target
-   - rustc_version
-2. Fast-fail on inconsistent cache identity or schema state.
-3. Prefer fixing root-cause identity/schema issues instead of adding fallbacks.
-4. Preserve the trusted CI → signed GHCR records path; D1 is a mirror `index sync` fills from verified records.
-
-## Current implementation notes
-- Scheduler queue identity must include `rustc_version` as well as `(crate, version, features_json, target)`.
-- Artifact lookups are local: the CLI resolves the dependency graph against a verified `index.<target>.<rustc>` slice pulled from the OCI registry (`STOW_REGISTRY_BASE_URL` overrides it for mocks). The only graph that leaves the machine is the miss set posted to `POST /api/v1/admissions` — it mints `EnqueueAdmission`s carrying HMAC challenges, and the client redeems them at `/api/v1/enqueue` with a blake3 proof-of-work. Verified redemptions stamp `admitted_at`; the admissions handler then drains a batch of admitted, previously-failed misses into scheduler enqueue requests (best-effort, marker-restoring).
-- The capture wrapper's stable-identity rewrite is unconditional; captured records carry the full 64-hex blake3 `compile_key` with `c_metadata` as its 16-hex prefix. Per-phase (check vs build) keys legitimately differ because `emit` participates.
-- Scheduler dispatch is tunable via `STOW_MAX_CONCURRENT_JOBS` / `STOW_STALE_DISPATCH_MINUTES` / `STOW_DISPATCH_MIN_AGE_MINUTES` bindings; failed dispatches back off exponentially, and a dependent is dispatchable only once every dependency is contained in the latest published `index.<target>.<rustc>` slice for the dependency's own target — the `index-publish` path reports each slice's membership to the edge after it lands.
-- `edge/` is split by target: pure cache/scheduler logic compiles and unit-tests on the host (edge is in workspace default-members), while Cloudflare-bound modules are `wasm32`-gated. crates.io access goes through the `dependency_resolver::CratesIo` trait (`crates_io::CfCratesIo` in production).
-- The CLI binds bundle identity to the cosign signature by requiring `manifest.json`'s config to equal the signature-covered `oci/config.json`.
-- `stow-cli predict` was sped up by removing `cargo metadata` from the CLI dependency parsing path.
-- Cache policy checks were optimized away from full JSON parse per rustc invocation to marker-file existence checks.
-- `POST /api/v1/requests` is the Turnstile-admitted human lane: the scheduler `queue.lane` column orders `human` ahead of `miss` (FIFO within a lane, min-age exempt, promotion only ever `miss -> human`), tasks enqueue `EnqueueSource::HumanRequest` for the crate's dependency closure across `stow_types::api::CI_TARGET_TRIPLES`, and `rustc_version` comes from the stable channel manifest cached in the Worker's Cache API (`edge/src/rust_channel.rs`, 60-minute TTL).
-
-## Validation guidance
-- First preference: `cargo check -q` for repo-wide type safety.
-- Lint on stable (`cargo +stable clippy`); CI does, and clippy differs by channel.
-- `stow-edge` compiles for two targets and CI lints both: `cargo +stable clippy -p stow-edge --all-targets -- -D warnings` and `cargo +stable clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings`. The host lane alone is not a gate — host-only test modules keep otherwise-dead functions alive there, and wasm32 then fails `dead_code`. Such a function is dead in production: move it into the test module or delete it.
-- For CLI latency work, benchmark `stow-cli predict --manifest-path /tmp/tokei/Cargo.toml` on stable toolchain.
-- For local simulation:
-  - mock GHCR: `stow-mock-registry`
-  - mock edge: `edge/Skyzen.mock.toml`
-  - note that local Wrangler dev runtime can fail independently of repo logic.
-- When debugging edge graph issues, verify whether failure is in:
-  - crates.io lookup
-  - D1 schema/query path
-  - scheduler forward path
-  - local Wrangler/runtime
-
-## Per-request cost on the edge
-
-A Worker route, a Durable Object handler and the scheduler alarm run on every request, so their cost is multiplied by traffic and by table size. Each scheduler route and the alarm pass is a drive in `edge/src/scheduler/drives.rs`, measured by `scripts/scheduler-budget.sh` with workerd's billed `rowsRead`/`rowsWritten` at two fixture sizes: a drive fails when its cost grows with the stored bulk (more than 10% + 50 rows between the sizes) or exceeds its absolute budget, and a route without a drive fails the gate. A cost legitimately bounded by something other than the event (human-lane depth, the dispatch cap, a day's completions) names that bound beside its drive. Schema changes are operations work: request code and the alarm never create, alter, index or backfill anything, and never check the schema. Migrations run only through the operator migrate route, which the deploy pipeline calls right after the new version goes live, and they are additive so the running code keeps working while they apply. When a fix names a defect class, the same PR searches for every other instance of that class and lists them.
-
-## What to avoid
-- Do not replace crates.io as the production dependency graph source.
-- Do not weaken the GitHub-trusted CI model.
-- Do not add fallbacks that hide cache identity bugs.
-- Do not make a build task mean anything other than one library or macro crate; binaries are names, never units.
-- Do not state which linker a target uses by default; it is target- and version-dependent.
-- Do not present a residual cost as a trade-off before trying to remove it.
-- Do not expand `CI_TARGET_TRIPLES` for any individual project; the matrix multiplies every crate in every wave.
-- Do not treat local Wrangler runtime failures as proof that repo logic is wrong without evidence.
+- Lint on stable. `stow-edge` is linted for the host and for `wasm32-unknown-unknown`; a function alive only through host tests is dead and is removed.
+- Local Wrangler failures are not evidence against repository logic without proof.

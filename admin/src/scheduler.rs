@@ -1,12 +1,13 @@
 //! `stow-admin scheduler …` — the scheduler Durable Object's operations
-//! surface. Migrations live here because they are operations work, not
-//! request work: the deploy pipeline calls `scheduler migrate` right
-//! after `skyzen deploy`, and the route it posts to is the only code
-//! that may issue DDL on the queue database.
+//! surface. The reset lives here because it is operations work, not
+//! request work: an operator runs `scheduler reset --yes` to create the
+//! store's schema (or destroy and recreate it after a schema change),
+//! and the route it posts to is the only code that may issue DDL on
+//! the queue database.
 
 use clap::{Args, Subcommand};
 use stow_types::api::{
-    SchedulerBudgetReport, SchedulerBudgetRequest, SchedulerSeedReport, SchemaMigrationReport,
+    SchedulerBudgetReport, SchedulerBudgetRequest, SchedulerResetReport, SchedulerSeedReport,
 };
 
 use crate::Edge;
@@ -26,10 +27,16 @@ pub struct SchedulerArgs {
 
 #[derive(Subcommand)]
 pub enum SchedulerCommand {
-    /// Run the pending queue schema migration and print the stored
-    /// version before and after. Equal numbers mean the queue was
-    /// already current.
-    Migrate,
+    /// Reset the scheduler store: drop every table, index and trigger
+    /// and re-execute `schema.sql`. This destroys the queue and every
+    /// recorded slice — they refill from the lanes that feed them —
+    /// so the command refuses to run without `--yes`. It is also how a
+    /// store that was never initialized gets its schema.
+    Reset {
+        /// Confirm the destructive reset.
+        #[arg(long)]
+        yes: bool,
+    },
     /// The workerd cost probe — drives every scheduler route and the
     /// alarm pass on a seeded fixture and reports the real
     /// `rowsRead`/`rowsWritten` the Durable Object bills. The route
@@ -76,7 +83,7 @@ pub async fn run(
     output: Output,
 ) -> stow_types::error::Result<()> {
     match args.command {
-        SchedulerCommand::Migrate => migrate(edge, output).await,
+        SchedulerCommand::Reset { yes } => reset(edge, yes, output).await,
         SchedulerCommand::Budget {
             queue_rows,
             reset,
@@ -89,12 +96,19 @@ pub async fn run(
     }
 }
 
-async fn migrate(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
-    let report: SchemaMigrationReport = edge
-        .post_json("/api/v1/admin/scheduler/migrate", &serde_json::json!({}))
+async fn reset(edge: &Edge, yes: bool, output: Output) -> stow_types::error::Result<()> {
+    if !yes {
+        return Err(stow_types::error::Error::msg(
+            "scheduler reset drops every table, index and trigger in the store \
+             and recreates `schema.sql` — the queue and recorded slices are \
+             destroyed and refill from the lanes that feed them; re-run with --yes",
+        ));
+    }
+    let report: SchedulerResetReport = edge
+        .post_json("/api/v1/admin/scheduler/reset", &serde_json::json!({}))
         .await?;
     render::emit(output, &report, |report| {
-        format!("scheduler schema {} → {}", report.before, report.after)
+        format!("scheduler store reset — {} objects dropped", report.dropped)
     })
 }
 
@@ -189,10 +203,7 @@ async fn budget(
 /// breach, and `SLOW` on a wall-budget breach — reported, never gated
 /// (stow#567).
 fn render_budget_table(report: &SchedulerBudgetReport) -> String {
-    let mut out = format!(
-        "scheduler budget (queue rows {}, schema v{}):\n",
-        report.queue_rows, report.schema_version
-    );
+    let mut out = format!("scheduler budget (queue rows {}):\n", report.queue_rows);
     for row in &report.rows {
         let marker = format!(
             "{}{}",

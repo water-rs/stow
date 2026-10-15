@@ -63,8 +63,8 @@ const ACTIONS_ID_TOKEN_REQUEST_URL_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
 /// Pinned verbatim onto every edge call as the
 /// `Cloudflare-Workers-Version-Overrides` header when set — the deploy
-/// workflow uses it to aim `scheduler migrate` (and any other trusted
-/// call) at the uploaded candidate version before traffic shifts.
+/// workflow uses it to aim trusted calls at the uploaded candidate
+/// version before traffic shifts.
 const STOW_EDGE_VERSION_OVERRIDE_ENV: &str = "STOW_EDGE_VERSION_OVERRIDE";
 /// The header `STOW_EDGE_VERSION_OVERRIDE` fills.
 const VERSION_OVERRIDES_HEADER: &str = "Cloudflare-Workers-Version-Overrides";
@@ -92,8 +92,8 @@ enum Command {
     Status,
     /// Inspect and mutate scheduler queue rows.
     Queue(queue::QueueArgs),
-    /// Scheduler operations — the schema migration route and anything
-    /// else that runs on operator cadence, not per request.
+    /// Scheduler operations — the store reset and anything else that
+    /// runs on operator cadence, not per request.
     Scheduler(scheduler::SchedulerArgs),
     /// Per-target servable identities for one crate.
     Coverage(coverage::CoverageArgs),

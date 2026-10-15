@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use skyzen_cloudflare::CfD1;
 use skyzen_services::Db;
-use stow_types::api::SchemaMigrationReport;
+use stow_types::api::SchedulerResetReport;
 
 use crate::db;
 use crate::errors::QueueError;
@@ -183,7 +183,7 @@ impl DurableObject for Scheduler {
             "/status".at(status),
             "/admin/status".at(admin_status),
             "/index/published".post(record_published_index),
-            "/migrate".post(migrate_scheduler),
+            "/reset".post(reset_scheduler),
             // The workerd budget probe — gated on the
             // `STOW_SCHEDULER_BUDGET` deploy var, which only mock stacks
             // carry; production requests hit the guard and 404.
@@ -219,20 +219,19 @@ impl DurableObject for Scheduler {
     }
 }
 
-/// `POST /migrate` — the only endpoint that may issue DDL on the queue
-/// database. Reached from `POST /api/v1/admin/scheduler/migrate`, which
-/// `deploy-edge.yml` calls right after `skyzen deploy` and `stow-admin
-/// scheduler migrate` calls manually. Runs the full migration pass and
-/// returns the schema version before and after.
-async fn migrate_scheduler(env: WasmEnv, db: DurableDb) -> Result<Json<SchemaMigrationReport>> {
-    let report = queue::migrate(&db, &scheduler_settings(&env)?)
+/// `POST /reset` — the only endpoint that may issue DDL on the queue
+/// database. Reached from `POST /api/v1/admin/scheduler/reset`, which
+/// `stow-admin scheduler reset --yes` invokes. Drops every store object
+/// and re-executes `schema.sql`, then stamps the configured dispatch
+/// floor — on the empty queue its conditional backfill is a zero-row
+/// pass.
+async fn reset_scheduler(env: WasmEnv, db: DurableDb) -> Result<Json<SchedulerResetReport>> {
+    let settings = scheduler_settings(&env)?;
+    let report = queue::reset(&db).await.map_err(to_error)?;
+    queue::apply_dispatch_floor(&db, &settings)
         .await
         .map_err(to_error)?;
-    tracing::warn!(
-        before = report.before,
-        after = report.after,
-        "scheduler schema migrated"
-    );
+    tracing::warn!(dropped = report.dropped, "scheduler store reset");
     Ok(Json(report))
 }
 
