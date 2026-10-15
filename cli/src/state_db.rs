@@ -131,12 +131,27 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
         .connect_with(options)
         .await
         .wrap_err_with(|| format!("open state db {}", path.display()))?;
+    match ensure_schema(&pool, &path).await {
+        Ok(()) => Ok(pool),
+        Err(error) => {
+            // A dropped pool closes its connection in the background, and
+            // until it does Windows refuses to delete the file `stow clean`
+            // is about to remove.
+            pool.close().await;
+            Err(error)
+        }
+    }
+}
+
+/// Accepts a database stamped with this build's schema identity, creates
+/// the schema in an empty one, and refuses anything else.
+async fn ensure_schema(pool: &SqlitePool, path: &Path) -> stow_types::error::Result<()> {
     let stamped: i32 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .wrap_err_with(|| format!("read schema identity of {}", path.display()))?;
     if stamped == schema_identity() {
-        return Ok(pool);
+        return Ok(());
     }
     // Wrappers of one cold build open a fresh database at once: the
     // check and the creation share one write transaction, so a second
@@ -154,7 +169,7 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
             .commit()
             .await
             .wrap_err_with(|| format!("release state db {}", path.display()))?;
-        return Ok(pool);
+        return Ok(());
     }
     let user_tables: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM sqlite_master \
@@ -185,7 +200,7 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
         .commit()
         .await
         .wrap_err_with(|| format!("commit state db schema {}", path.display()))?;
-    Ok(pool)
+    Ok(())
 }
 
 /// Tell `SQLite` not to checkpoint the WAL when this connection is the
