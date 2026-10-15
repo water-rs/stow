@@ -8,7 +8,7 @@
 //! only existed in one of them would be an unmeasured request path.
 //!
 //! Every entry is a cold-start measure — the drives deliberately skip
-//! `migrate`, which is operations work, never request code.
+//! `reset`, which is operations work, never request code.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeSet;
@@ -1213,7 +1213,7 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // One real dispatch pass over a *floored* queue (stow#525):
         // the setup stamps `min_dispatch_value` at one band through the
-        // operator migrate path — unmetered, setup is not the event —
+        // operator floor path — unmetered, setup is not the event —
         // so the persisted flags put the under-floor miss bulk outside
         // the eligible index span while the human lane and the one-band
         // windows family stay ready. The metered pass then pays the
@@ -1233,8 +1233,8 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(async move {
                 // The floor application's DML half — the same stored-
                 // floor read, conditional backfill and stamp the
-                // operator migrate runs — no index DDL, which belongs
-                // to the migrate route alone.
+                // operator reset runs — no index DDL, which belongs
+                // to the reset route alone.
                 queue::apply_dispatch_floor(
                     db,
                     &queue::SchedulerSettings {
@@ -3169,7 +3169,7 @@ mod lifecycle_tests {
     impl Rig {
         async fn open(syncs: Vec<Result<(), String>>) -> Self {
             let (db, events) = scripted_sync_db(syncs).await.expect("scripted db");
-            // Construction runs migrate + the permit gate — the log
+            // Construction runs reset + the permit gate — the log
             // the tests assert on starts at the drive itself.
             events.lock().expect("events").clear();
             Self {

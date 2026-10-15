@@ -1,13 +1,16 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
-import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
+import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
 // The real workerd build — the bundle `skyzen build --provider cloudflare
 // --manifest edge/Skyzen.mock.toml` emits — not a reimplementation. The
 // generated wrangler config carries the mock vars (STOW_LOCAL_CI_URL,
 // STOW_STALE_DISPATCH_MINUTES=10, …) the production deploy inputs mirror.
-const migrations = await readD1Migrations(
-	path.resolve(import.meta.dirname, "../../migrations"),
+// The D1 catalog has one schema — the same file an operator applies.
+const d1Schema = readFileSync(
+	path.resolve(import.meta.dirname, "../../schema.sql"),
+	"utf8",
 );
 
 // The dispatch stub stands in for the local-CI server the build
@@ -43,7 +46,7 @@ export default defineConfig({
 				),
 			},
 			miniflare: {
-				bindings: { TEST_MIGRATIONS: migrations },
+				bindings: { TEST_D1_SCHEMA: d1Schema },
 				outboundService: "dispatch-stub",
 				workers: [
 					{

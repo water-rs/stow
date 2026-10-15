@@ -422,24 +422,24 @@ pub async fn admin_status(
     Ok(Json(scheduler_client::admin_status(&scheduler).await?))
 }
 
-/// `POST /api/v1/admin/scheduler/migrate`
+/// `POST /api/v1/admin/scheduler/reset`
 ///
-/// Run the scheduler Durable Object's schema migration — the only code
-/// path that may issue DDL on its database. `deploy-edge.yml` calls it
-/// right after `skyzen deploy` (migrations are additive, so the previous
-/// build keeps serving while they apply); `stow-admin scheduler
-/// migrate` is the manual path. Reports the schema version before and
-/// after.
-pub async fn admin_scheduler_migrate(
+/// Reset the scheduler Durable Object's store — the only code path that
+/// may issue DDL on its database, and the only way the schema lands:
+/// every table, index and trigger is dropped and `schema.sql`
+/// re-executed, destroying the queue and the recorded slices; the
+/// queues refill from the lanes that feed them. `stow-admin scheduler
+/// reset --yes` is the manual path, which a fresh deployment's
+/// operator runs once to create the schema.
+pub async fn admin_scheduler_reset(
     SchedulerCaller(caller): SchedulerCaller,
     State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::SchemaMigrationReport>, GetArtifactError> {
-    let report = scheduler_client::migrate_scheduler(&scheduler).await?;
+) -> Result<Json<stow_types::api::SchedulerResetReport>, GetArtifactError> {
+    let report = scheduler_client::reset_scheduler(&scheduler).await?;
     tracing::warn!(
-        before = report.before,
-        after = report.after,
+        dropped = report.dropped,
         %caller,
-        "scheduler schema migrated via admin endpoint"
+        "scheduler store reset via admin endpoint"
     );
     Ok(Json(report))
 }

@@ -284,7 +284,7 @@ mod tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         db
     }
 

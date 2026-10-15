@@ -788,7 +788,7 @@ async fn claimed_names(db: &DurableDb, settings: &SchedulerSettings) -> Vec<Stri
 }
 
 /// Write the authoritative floor the writers' eligibility
-/// expression reads — the `settings` row the operator migrate
+/// expression reads — the `settings` row the operator reset
 /// stamps (stow#525 I10).
 async fn set_floor(db: &DurableDb, floor: i64) {
     db.query(
@@ -1150,15 +1150,14 @@ async fn retry_preserves_the_eligibility_flag() {
     assert_eq!(claimed_names(&db, &claim_settings()).await, ["win"]);
 }
 
-/// The operator floor move: `migrate` stamps the configured value
-/// into `settings` and backfills `dispatch_eligible` — under-floor
-/// rows lose the flag, the boundary and the exempt lane keep it,
-/// and the stamped row is the value every writer reads from then
-/// on (stow#525 I10).
+/// The operator floor move: the reset route's floor pass stamps the
+/// configured value into `settings` and backfills `dispatch_eligible`
+/// — under-floor rows lose the flag, the boundary and the exempt lane
+/// keep it, and the stamped row is the value every writer reads from
+/// then on (stow#525 I10).
 #[tokio::test]
 async fn operator_floor_change_backfills_eligibility() {
-    let db = memory_db_raw().await.expect("raw memory db");
-    super::migrate(&db, &settings()).await.expect("migrate");
+    let db = memory_db().await.expect("memory db");
     enqueue(
         &db,
         &[
@@ -1180,7 +1179,7 @@ async fn operator_floor_change_backfills_eligibility() {
     };
     // Raise the floor to one band: the Linux miss drops out, the
     // band row sits exactly at the floor, the human row is exempt.
-    super::migrate_dispatch_eligible(&db, &floor(super::VALUE_BAND))
+    super::apply_dispatch_floor(&db, &floor(super::VALUE_BAND))
         .await
         .expect("apply floor");
     assert_eq!(flag_of(&db, "lin").await, 0);
@@ -1188,24 +1187,29 @@ async fn operator_floor_change_backfills_eligibility() {
     assert_eq!(flag_of(&db, "human").await, 1);
     // A second pass with the same floor is a no-op — and a higher
     // floor floors the band too while the human stays.
-    super::migrate_dispatch_eligible(&db, &floor(super::VALUE_BAND))
+    super::apply_dispatch_floor(&db, &floor(super::VALUE_BAND))
         .await
         .expect("idempotent pass");
-    super::migrate_dispatch_eligible(&db, &floor(super::VALUE_BAND + 1))
+    super::apply_dispatch_floor(&db, &floor(super::VALUE_BAND + 1))
         .await
         .expect("raise floor");
     assert_eq!(flag_of(&db, "win").await, 0);
     assert_eq!(flag_of(&db, "human").await, 1);
 }
 
-/// A caught mid-pass failure leaves no stamp, so a retried
-/// operator migrate at the same floor still repairs: the backfill
+/// A caught mid-pass failure leaves no stamp, so a retried floor
+/// application at the same floor still repairs: the backfill
 /// must not have committed flags against a floor the settings row
 /// was allowed to skip (stow#525 I10).
 #[tokio::test]
 async fn failed_backfill_retries_under_the_same_floor() {
+    // The permit stays open: the failure-injection trigger below is
+    // fixture DDL.
     let db = memory_db_raw().await.expect("raw memory db");
-    super::migrate(&db, &settings()).await.expect("migrate");
+    super::reset(&db).await.expect("reset");
+    super::apply_dispatch_floor(&db, &settings())
+        .await
+        .expect("initial floor stamp");
     enqueue(
         &db,
         &[request("lin", &[]), request_on("win", WINDOWS_TARGET, &[])],
@@ -1225,12 +1229,12 @@ async fn failed_backfill_retries_under_the_same_floor() {
         min_dispatch_value: 1,
         ..settings()
     };
-    super::migrate_dispatch_eligible(&db, &floored)
+    super::apply_dispatch_floor(&db, &floored)
         .await
         .expect_err("injected failure must abort the pass");
     // The pass recorded no stamp for the floor it was applying —
-    // the last-applied floor ("0", from the schema-building
-    // migrate) survives, so a retry still sees floor 1 as
+    // the last-applied floor ("0", from the store's reset-time
+    // application) survives, so a retry still sees floor 1 as
     // unapplied rather than skipping the backfill over stale flags.
     let stamped: Option<String> = db
         .query("SELECT value FROM settings WHERE key = 'min_dispatch_value'")
@@ -1248,9 +1252,9 @@ async fn failed_backfill_retries_under_the_same_floor() {
         .expect("remove failure trigger");
     // Same-floor retry converges: backfill repairs flags, then the
     // stamp lands.
-    super::migrate_dispatch_eligible(&db, &floored)
+    super::apply_dispatch_floor(&db, &floored)
         .await
-        .expect("retried migrate");
+        .expect("retried pass");
     assert_eq!(flag_of(&db, "lin").await, 0);
     assert_eq!(flag_of(&db, "win").await, 1);
     let stamped: Option<String> = db
@@ -1259,63 +1263,6 @@ async fn failed_backfill_retries_under_the_same_floor() {
         .await
         .expect("read stamped floor");
     assert_eq!(stamped.as_deref(), Some("1"));
-}
-
-/// A queue at the prior schema version — `dispatch_eligible`
-/// missing and the floor-blind index names live — gains the
-/// column, the eligible-aware indexes and the stamped floor in one
-/// operator pass (stow#525 I10).
-#[tokio::test]
-async fn migrate_recovers_the_prior_schema() {
-    let db = memory_db_raw().await.expect("raw memory db");
-    super::migrate(&db, &settings()).await.expect("migrate");
-    enqueue(
-        &db,
-        &[request("lin", &[]), request_on("win", WINDOWS_TARGET, &[])],
-    )
-    .await
-    .expect("enqueue");
-    // Roll the database back to the pre-12 shape: no column, the
-    // old index names on their old column lists, the old stamp.
-    for statement in [
-        "DROP INDEX idx_queue_claim",
-        "DROP INDEX idx_queue_wake",
-        // The pre-13 trigger carried no eligibility write — drop
-        // it rather than leave a definition that references the
-        // column being removed.
-        "DROP TRIGGER demand_fold",
-        "ALTER TABLE queue DROP COLUMN dispatch_eligible",
-        "CREATE INDEX idx_queue_dispatch ON queue \
-             (status, deps_met, dispatch_key, dispatch_family, lane, first_requested_at, not_before)",
-        "CREATE INDEX idx_queue_wake_eligible ON queue \
-             (status, deps_met, dispatch_family, wake_at)",
-        "UPDATE scheduler_schema_version SET version = 11",
-    ] {
-        db.query(statement)
-            .execute()
-            .await
-            .expect("stage the prior schema");
-    }
-    let floored = SchedulerSettings {
-        min_dispatch_value: 1,
-        ..settings()
-    };
-    let report = super::migrate(&db, &floored).await.expect("migrate");
-    assert_eq!((report.before, report.after), (11, super::SCHEMA_VERSION));
-    assert_eq!(flag_of(&db, "lin").await, 0);
-    assert_eq!(flag_of(&db, "win").await, 1);
-    let names = db
-        .query(
-            "SELECT name FROM sqlite_master WHERE type = 'index' \
-                 AND name LIKE 'idx_queue_%'",
-        )
-        .fetch_scalars::<String>()
-        .await
-        .expect("index names");
-    assert!(names.iter().any(|name| name == "idx_queue_claim"));
-    assert!(names.iter().any(|name| name == "idx_queue_wake"));
-    assert!(!names.iter().any(|name| name == "idx_queue_dispatch"));
-    assert!(!names.iter().any(|name| name == "idx_queue_wake_eligible"));
 }
 
 /// `QueueTask.value` is the column's exact decimal text — adjacent
@@ -1370,68 +1317,6 @@ async fn list_tasks_reports_value_as_exact_decimal() {
     assert!(
         serialized.contains("\"value\":\"36893574046765007\""),
         "the score serializes as decimal text: {serialized}"
-    );
-}
-
-/// A row migrated from a pre-`value` queue (the column still at its
-/// ALTER default, the key in any older form) backfills to exactly
-/// the formula a fresh insert writes — migrated and fresh rows
-/// agree (stow#442 I6).
-#[tokio::test]
-async fn migrate_backfills_value_to_match_fresh_rows() {
-    let db = memory_db_raw().await.expect("raw memory db");
-    super::migrate(&db, &settings())
-        .await
-        .expect("first migrate");
-    enqueue(
-        &db,
-        &[
-            EnqueueRequest {
-                source: EnqueueSource::HumanRequest,
-                ..request("human", &[])
-            },
-            request_on("win", WINDOWS_TARGET, &[]),
-            request("lin", &[]),
-        ],
-    )
-    .await
-    .expect("enqueue");
-    // Simulate the ALTER's untouched state: `value` at its 0
-    // default and the key in an obsolete form.
-    db.query("UPDATE queue SET value = 0, dispatch_key = '0|0|1970|x|1970|0'")
-        .execute()
-        .await
-        .expect("simulate migrated rows");
-
-    super::migrate(&db, &settings()).await.expect("migrate");
-
-    let drifted = db
-        .query(super::RANK_SOURCE_SELECT)
-        .fetch_all::<super::RankSourceRow>()
-        .await
-        .expect("load migrated rows")
-        .iter()
-        .map(|row| row.checked().expect("checked rank row"))
-        .filter(|row| {
-            let family = crate::scheduler::rank::dispatch_family(&row.target);
-            family != row.dispatch_family
-                || crate::scheduler::rank::raw_value(&row.lane, family, row.priority, row.demand)
-                    != row.value
-                || crate::scheduler::rank::dispatch_key(&crate::scheduler::rank::KeyOperands {
-                    lane: &row.lane,
-                    family,
-                    priority: row.priority,
-                    demand: row.demand,
-                    cost_ms: row.cost_ms,
-                    first_requested_at: &row.first_requested_at,
-                    created_at: &row.created_at,
-                    task_id: &row.task_id,
-                }) != row.dispatch_key
-        })
-        .count();
-    assert_eq!(
-        drifted, 0,
-        "every row carries the shared abstraction's pair"
     );
 }
 
@@ -2414,10 +2299,10 @@ async fn demand_stages_large_closures_in_bounded_chunks() {
 async fn demand_multi_chunk_closure_is_atomic_end_to_end() {
     // 30k real queue tasks, one dependency chain — the closure
     // from the root touches all of them through the unmet-edge
-    // walk, with the queue's own 64-hex task ids. The migration
+    // walk, with the queue's own 64-hex task ids. The DDL
     // permit stays open on this database: the failure-injection
     // trigger below is the same class of schema DDL the operator
-    // migrate path issues — installing it is fixture preparation,
+    // reset path issues — installing it is fixture preparation,
     // while every production statement the test drives is DML.
     const CHAIN: usize = 30_000;
     let (db, _log) = counting_memory_db_raw().await.expect("counting db");
@@ -3041,8 +2926,8 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
         .execute()
         .await
         .expect("fail published dep");
-    // The migration's spelling for an edge whose required side it
-    // could not derive — seeded directly so the owner below is
+    // The fail-closed spelling of an edge whose required side was
+    // never established — seeded directly so the owner below is
     // born carrying it (its empty `depends_on` means the resync
     // never deletes the row).
     db.query(
@@ -5029,7 +4914,7 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
     assert_eq!(claimed[0].crate_name, "fresh-dep");
 }
 
-/// An edge the migration could not backfill keeps `''` for the
+/// An edge whose dep identity never resolved keeps `''` for the
 /// dependency's semantic identity — it can never resolve to a
 /// published row, so the dependent is blocked rather than pending
 /// forever, and the report says why.
@@ -5044,10 +4929,8 @@ async fn an_unresolvable_dependency_edge_reports_blocked_with_unknown_identity()
         .execute()
         .await
         .expect("erase dep identity");
-    // The persisted `blocked` flag answers at write time: the only
-    // production writer of an unresolved identity is the dev-era
-    // migration backfill, which recomputes the flag itself — replay
-    // that owner refresh here.
+    // The persisted `blocked` flag answers at write time: replay the
+    // owner refresh that recomputes it.
     super::refresh_deps_met_tasks(&db, &[task_id_with("parent", TARGET, &[dependency("dep")])])
         .await
         .expect("recompute blocked after identity erase");
@@ -6204,405 +6087,10 @@ async fn admin_status_reports_lanes_in_flight_and_targets() {
     assert_eq!(target.failed_24h, 0);
 }
 
-/// The dev-era DDL — `queue` without `host_side`/`shape_requeue`,
-/// `queue_dependencies` carrying the dep_* identity columns but none
-/// of the shape-gate columns — is what production ran before
-/// host-side nodes.
-const DEV_ERA_QUEUE: &str = "CREATE TABLE queue (
-        task_id TEXT PRIMARY KEY,
-        crate_name TEXT NOT NULL,
-        version TEXT NOT NULL,
-        features_json TEXT NOT NULL,
-        target TEXT NOT NULL,
-        rustc_version TEXT NOT NULL,
-        downloads INTEGER NOT NULL DEFAULT 0,
-        miss_count INTEGER NOT NULL DEFAULT 0,
-        request_count INTEGER NOT NULL DEFAULT 1,
-        priority INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'pending',
-        error_msg TEXT,
-        preserve_lockfile INTEGER NOT NULL DEFAULT 0,
-        lane TEXT NOT NULL DEFAULT 'miss' CHECK (lane IN ('miss', 'human')),
-        dispatch_attempts INTEGER NOT NULL DEFAULT 0,
-        attempt INTEGER NOT NULL DEFAULT 1,
-        not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
-        first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-        github_run_id TEXT,
-        UNIQUE(crate_name, version, features_json, target, rustc_version)
-    )";
-const DEV_ERA_DEPENDENCIES: &str = "CREATE TABLE queue_dependencies (
-        task_id TEXT NOT NULL,
-        depends_on_task_id TEXT NOT NULL,
-        dep_crate_name TEXT NOT NULL DEFAULT '',
-        dep_version TEXT NOT NULL DEFAULT '',
-        dep_features_json TEXT NOT NULL DEFAULT '',
-        dep_target TEXT NOT NULL DEFAULT '',
-        dep_rustc_version TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (task_id, depends_on_task_id)
-    )";
-
-/// The objects a pre-`host_side` queue carried on top of
-/// `DEV_ERA_QUEUE`: the counter triggers and the status index. On
-/// `ALTER TABLE queue RENAME TO queue_migrated` `SQLite` moves them
-/// with the table, so a rebuild that recreates the table and drops
-/// the copy without re-running the include afterwards loses them
-/// all — the regression `migrate_rebuilds_queue_triggers_and_indexes`
-/// covers (stow#433).
-const DEV_ERA_QUEUE_OBJECTS: &[&str] = &[
-    "CREATE TABLE queue_status_counts (
-            status TEXT NOT NULL,
-            lane TEXT NOT NULL,
-            n INTEGER NOT NULL,
-            PRIMARY KEY (status, lane)
-        )",
-    "CREATE TRIGGER queue_counts_on_insert AFTER INSERT ON queue
-         BEGIN
-             INSERT INTO queue_status_counts (status, lane, n)
-                 VALUES (NEW.status, NEW.lane, 1)
-             ON CONFLICT (status, lane) DO UPDATE SET n = n + 1;
-         END",
-    "CREATE TRIGGER queue_counts_on_delete AFTER DELETE ON queue
-         BEGIN
-             INSERT INTO queue_status_counts (status, lane, n)
-                 VALUES (OLD.status, OLD.lane, -1)
-             ON CONFLICT (status, lane) DO UPDATE SET n = n - 1;
-         END",
-    "CREATE TRIGGER queue_counts_on_move
-             AFTER UPDATE OF status, lane ON queue
-             WHEN OLD.status != NEW.status OR OLD.lane != NEW.lane
-         BEGIN
-             INSERT INTO queue_status_counts (status, lane, n)
-                 VALUES (OLD.status, OLD.lane, -1)
-             ON CONFLICT (status, lane) DO UPDATE SET n = n - 1;
-             INSERT INTO queue_status_counts (status, lane, n)
-                 VALUES (NEW.status, NEW.lane, 1)
-             ON CONFLICT (status, lane) DO UPDATE SET n = n + 1;
-         END",
-    "CREATE INDEX idx_queue_status_updated ON queue (status, updated_at)",
-];
-
-/// `migrate` must migrate a dev-era schema in any column order
-/// and still backfill every pre-existing edge's mask: the backfill
-/// joins `queue.host_side`, so it must run after the host-side
-/// rebuild and must not depend on whether the ALTER columns it fills
-/// were just added (stow#367).
-#[derive(skyzen::FromRow)]
-struct MigratedClaimRow {
-    task_id: String,
-    status: String,
-    host_side: i64,
-    shape_requeue: i64,
-    attempt: i64,
-    dispatch_attempts: i64,
-    generation_id: String,
-    github_run_id: Option<String>,
-    not_before: String,
-    wake_at: String,
-}
-
-async fn seed_legacy_inflight_claims(db: &DurableDb, owner: &str, dep: &str) {
-    for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
-        db.query(statement).execute().await.expect("dev-era ddl");
-    }
-    db.query(
-        "CREATE TABLE attempt_outcomes (
-                task_id TEXT NOT NULL,
-                attempt INTEGER NOT NULL,
-                target TEXT NOT NULL,
-                failure_step TEXT,
-                failure_class TEXT,
-                github_run_id TEXT,
-                finished_at TEXT NOT NULL DEFAULT (datetime('now')),
-                PRIMARY KEY (task_id, attempt)
-            )",
-    )
-    .execute()
-    .await
-    .expect("legacy outcome ddl");
-    db.query(
-        "INSERT INTO attempt_outcomes \
-             (task_id, attempt, target, failure_class, github_run_id) \
-             VALUES ('legacy-before-migrate', 1, ?, 'legacy', 'run-legacy')",
-    )
-    .bind(TARGET)
-    .execute()
-    .await
-    .expect("legacy outcome row");
-    db.query(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version)
-             VALUES (?, 'dep', '1.0.0', '[]', ?, '1.85.0'),
-                    (?, 'parent', '1.0.0', '[]', ?, '1.85.0')",
-    )
-    .bind(dep.to_owned())
-    .bind(TARGET)
-    .bind(owner.to_owned())
-    .bind(TARGET)
-    .execute()
-    .await
-    .expect("dev-era queue rows");
-    db.query(
-            "INSERT INTO queue_dependencies
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version)
-             VALUES (?, ?, 'dep', '1.0.0', '[]', ?, '1.85.0')",
-        )
-        .bind(owner.to_owned())
-        .bind(dep.to_owned())
-        .bind(TARGET)
-        .execute()
-        .await
-        .expect("dev-era edge row");
-    db.query("UPDATE queue SET dispatch_attempts = 2, attempt = 3")
-        .execute()
-        .await
-        .expect("seed legacy attempt counters");
-    db.query("UPDATE queue SET status = 'dispatched' WHERE task_id = ?")
-        .bind(dep.to_owned())
-        .execute()
-        .await
-        .expect("seed unbound legacy dispatch");
-    db.query("UPDATE queue SET status = 'running', github_run_id = ? WHERE task_id = ?")
-        .bind("legacy-run")
-        .bind(owner.to_owned())
-        .execute()
-        .await
-        .expect("seed bound legacy dispatch");
-}
-
-async fn assert_migrated_edge_masks(db: &DurableDb) {
-    #[derive(skyzen::FromRow)]
-    struct EdgeRow {
-        side: i64,
-        invocations: i64,
-        shapes: i64,
-    }
-    let edge = db
-        .query(
-            "SELECT dep_host_side AS side, dep_invocations AS invocations, dep_shapes AS shapes \
-                 FROM queue_dependencies",
-        )
-        .fetch_one::<EdgeRow>()
-        .await
-        .expect("edge row");
-    // Owner and dep both mint on the family host triple, so the
-    // dev-era edge's required side is ambiguous — the derivation
-    // marks it -1 (unestablished) rather than trusting a target-side
-    // 0 it cannot prove; `p.unit_side = -1` matches no published row
-    // so the gate holds the dependent until a resync rewrites it.
-    assert_eq!(edge.side, -1);
-    // The mask is moot on a -1 edge — `p.unit_side = -1` matches no
-    // published row — but it is written non-zero so the edge stays
-    // out of the unbackfilled-0 marker class.
-    assert_eq!(edge.invocations, 1);
-    assert_eq!(edge.shapes, 2);
-}
-
-async fn assert_migrated_claims(
-    db: &DurableDb,
-    owner: &str,
-    dep: &str,
-    before_retry: MigratedClaimRow,
-) {
-    let rows = db
-        .query(
-            "SELECT task_id, status, host_side, shape_requeue, attempt, dispatch_attempts, \
-                    generation_id, github_run_id, not_before, wake_at \
-                 FROM queue",
-        )
-        .fetch_all::<MigratedClaimRow>()
-        .await
-        .expect("queue rows");
-    assert_eq!(rows.len(), 2, "the rebuild keeps every queue row");
-    assert!(
-        rows.iter()
-            .all(|row| row.host_side == 0 && row.shape_requeue == 0)
-    );
-    let abandoned = rows
-        .iter()
-        .find(|row| row.task_id == dep)
-        .expect("abandoned row");
-    assert_eq!(abandoned.status, "pending");
-    assert_eq!(abandoned.attempt, 3);
-    assert_eq!(abandoned.dispatch_attempts, 2);
-    assert_ne!(abandoned.not_before, "1970-01-01 00:00:00");
-    assert_ne!(abandoned.wake_at, "1970-01-01 00:00:00");
-    assert_ne!(abandoned.generation_id, "");
-    assert_eq!(abandoned.github_run_id, None);
-    assert_eq!(
-        (
-            abandoned.status.clone(),
-            abandoned.attempt,
-            abandoned.dispatch_attempts,
-            abandoned.generation_id.clone(),
-            abandoned.not_before.clone(),
-            abandoned.wake_at.clone(),
-        ),
-        (
-            before_retry.status,
-            before_retry.attempt,
-            before_retry.dispatch_attempts,
-            before_retry.generation_id,
-            before_retry.not_before,
-            before_retry.wake_at,
-        ),
-        "rerunning migration leaves the requeued claim unchanged"
-    );
-    let preserved = rows
-        .iter()
-        .find(|row| row.task_id == owner)
-        .expect("bound row");
-    assert_eq!(preserved.status, "running");
-    assert_ne!(preserved.generation_id, "");
-    assert_eq!(preserved.github_run_id.as_deref(), Some("legacy-run"));
-}
-
-async fn assert_migrated_outcome_history(db: &DurableDb) {
-    assert_eq!(
-        db.query(
-            "SELECT count(*) FROM attempt_outcomes \
-                 WHERE task_id = 'legacy-before-migrate'",
-        )
-        .fetch_scalar::<i64>()
-        .await
-        .expect("read preserved legacy outcome history"),
-        1,
-        "migration keeps legacy outcome evidence"
-    );
-
-    assert_eq!(
-        super::stored_schema_version(db)
-            .await
-            .expect("schema version"),
-        super::SCHEMA_VERSION,
-        "a migrated queue is stamped at the current schema version"
-    );
-    db.query(
-        "INSERT INTO attempt_outcomes \
-             (task_id, attempt, target, failure_class, github_run_id) \
-             VALUES ('legacy-after-migrate', 1, ?, 'legacy', 'run-legacy-2')",
-    )
-    .bind(TARGET)
-    .execute()
-    .await
-    .expect("old writer remains compatible");
-    let generation_columns = db
-        .query("PRAGMA table_info(attempt_outcomes_v2)")
-        .fetch_all::<super::QueueTableInfoRow>()
-        .await
-        .expect("generation outcome table");
-    assert!(
-        generation_columns
-            .iter()
-            .any(|column| column.name == "generation_id")
-    );
-}
-
-#[tokio::test]
-async fn migrate_migrates_a_dev_era_queue_and_backfills_edge_masks() {
-    let db = memory_db_raw().await.expect("raw memory db");
-    let owner = task_id_with("parent", TARGET, &[dependency("dep")]);
-    let dep = task_id_on("dep", TARGET);
-    seed_legacy_inflight_claims(&db, &owner, &dep).await;
-
-    let report = super::migrate(&db, &settings()).await.expect("migrate");
-    assert_eq!(
-        (report.before, report.after),
-        (0, super::SCHEMA_VERSION),
-        "a pre-versioned queue reports 0 → SCHEMA_VERSION"
-    );
-    let before_retry = db
-        .query(
-            "SELECT task_id, status, host_side, shape_requeue, attempt, dispatch_attempts, \
-                    generation_id, github_run_id, not_before, wake_at \
-                 FROM queue WHERE task_id = ?",
-        )
-        .bind(dep.clone())
-        .fetch_one::<MigratedClaimRow>()
-        .await
-        .expect("read requeued row before migration retry");
-    let stale = super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&dep, false, "legacy-run"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect_err("legacy unbound completion cannot settle requeued work");
-    assert!(matches!(stale, QueueError::StaleCompletion { .. }));
-
-    // A second pass must be a no-op, not a failure — deploy retries.
-    let retry = super::migrate(&db, &settings())
-        .await
-        .expect("migrate retry");
-    assert_eq!(
-        (retry.before, retry.after),
-        (super::SCHEMA_VERSION, super::SCHEMA_VERSION)
-    );
-
-    assert_migrated_edge_masks(&db).await;
-
-    assert_migrated_claims(&db, &owner, &dep, before_retry).await;
-    let stale_bound = super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&owner, false, "older-run"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect_err("an old run cannot settle a preserved bound claim");
-    assert!(matches!(stale_bound, QueueError::StaleCompletion { .. }));
-    assert_migrated_outcome_history(&db).await;
-}
-
-/// A queue carrying the retired `rust_stable_channel` cache table
-/// loses it in the same pass that stamps the version — `IF EXISTS`
-/// makes the step idempotent, so the version bump's retry test is
-/// also the cover for the table never having existed.
-#[tokio::test]
-async fn migration_drops_the_retired_channel_cache_table() {
-    let db = memory_db_raw().await.expect("raw memory db");
-    db.query(
-        "CREATE TABLE rust_stable_channel (\
-             id INTEGER PRIMARY KEY CHECK (id = 1),\
-             version TEXT NOT NULL,\
-             fetched_at TEXT NOT NULL DEFAULT (datetime('now')))",
-    )
-    .execute()
-    .await
-    .expect("create retired table");
-
-    super::migrate(&db, &settings()).await.expect("migrate");
-
-    let columns = db
-        .query("PRAGMA table_info(rust_stable_channel)")
-        .fetch_all::<super::QueueTableInfoRow>()
-        .await
-        .expect("table_info");
-    assert!(columns.is_empty(), "the retired table is gone");
-}
-
-/// A fresh database runs the migration pass and ends stamped at
-/// `SCHEMA_VERSION` — production's pre-versioned queues take the
-/// same path exactly once, through the operator route.
-#[tokio::test]
-async fn a_fresh_database_migrates_and_is_stamped() {
-    let db = memory_db_raw().await.expect("raw memory db");
-    let report = super::migrate(&db, &settings()).await.expect("migrate");
-    assert_eq!((report.before, report.after), (0, super::SCHEMA_VERSION));
-    assert_eq!(
-        super::stored_schema_version(&db)
-            .await
-            .expect("schema version"),
-        super::SCHEMA_VERSION
-    );
-}
-
 /// The ops rule's cost bound (stow#432): request code runs no
-/// schema work at all — no version read, no `PRAGMA`, no DDL — so
+/// schema work at all — no `PRAGMA`, no DDL — so
 /// the cheapest request path issues exactly its own statement. The
-/// backend's migration permit already refuses anything else; this
+/// backend's DDL permit already refuses anything else; this
 /// names what the permit is for.
 #[tokio::test]
 async fn a_request_path_issues_no_schema_statements() {
@@ -6622,41 +6110,14 @@ async fn a_request_path_issues_no_schema_statements() {
     );
 }
 
-/// A queue stamped newer than this build's `SCHEMA_VERSION` was
-/// migrated by newer code — `migrate` fails fast rather than letting
-/// old code read a schema it does not understand.
-#[tokio::test]
-async fn migrate_refuses_a_newer_schema() {
-    // The migrate path's fixture: `migrate` runs only behind the
-    // operator route, where schema probes are permitted.
-    let db = memory_db_raw().await.expect("raw memory db");
-    super::migrate(&db, &settings())
-        .await
-        .expect("first migrate");
-    db.query(&format!(
-        "UPDATE scheduler_schema_version SET version = {}",
-        super::SCHEMA_VERSION + 1
-    ))
-    .execute()
-    .await
-    .expect("stamp newer version");
-    let error = super::migrate(&db, &settings())
-        .await
-        .expect_err("a newer schema version must fail fast");
-    assert!(
-        error.to_string().contains("newer"),
-        "the error names the version skew, got: {error}"
-    );
-}
-
 /// The host backend enforces both halves of the ops rule (stow#432):
 /// a request-path database refuses every `PRAGMA` — including the
 /// documented ones, since request code must never probe the schema —
-/// and every DDL head, while the migrate path's fixture still applies
+/// and every DDL head, while the reset path's fixture still applies
 /// the Durable Object authorizer's pragma allowlist (`user_version`
 /// refused, `table_info` allowed) on top of permitting the DDL.
 #[tokio::test]
-async fn the_test_backend_refuses_schema_work_outside_migrate() {
+async fn the_test_backend_refuses_schema_work_outside_reset() {
     let db = memory_db().await.expect("memory db");
     for sql in [
         "PRAGMA user_version",
@@ -6672,236 +6133,21 @@ async fn the_test_backend_refuses_schema_work_outside_migrate() {
     }
     let db = memory_db_raw().await.expect("raw memory db");
     db.query("PRAGMA table_info(queue)")
-        .fetch_all::<super::QueueTableInfoRow>()
+        .execute()
         .await
-        .expect("the documented pragma the migrations rely on");
+        .expect("the documented pragma the reset path may probe");
     db.query("CREATE TABLE tmp_marker (id INTEGER)")
         .execute()
         .await
-        .expect("DDL on the migrate path's database");
+        .expect("DDL on the reset path's database");
     let error = db
         .query("PRAGMA user_version")
         .execute()
         .await
-        .expect_err("the DO authorizer refuses it even under migrate");
+        .expect_err("the DO authorizer refuses it even under reset");
     assert!(
         error.to_string().contains("user_version"),
         "the rejection names the pragma, got: {error}"
-    );
-}
-
-/// The side derivation each dev-era edge takes: a dep on the family
-/// host triple under a cross owner is provably host, a dep on the
-/// owner's own target off the host triple is provably target, and a
-/// dep on the host triple under an owner on the same triple — or on
-/// neither — stays unestablished (-1).
-#[tokio::test]
-async fn migrate_derives_dev_era_edge_sides_from_triples() {
-    #[derive(skyzen::FromRow)]
-    struct EdgeRow {
-        side: i64,
-    }
-    const CROSS: &str = "aarch64-unknown-linux-gnu";
-    const WASM: &str = "wasm32-unknown-unknown";
-    let db = memory_db_raw().await.expect("raw memory db");
-    for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
-        db.query(statement).execute().await.expect("dev-era ddl");
-    }
-    // (owner target, dep target, expected side)
-    let cases: [(&str, &str); 4] = [
-        (CROSS, TARGET),
-        (CROSS, CROSS),
-        (TARGET, TARGET),
-        (WASM, WASM),
-    ];
-    for (index, (owner_target, dep_target)) in cases.iter().enumerate() {
-        let owner = format!("owner{index}");
-        let dep = format!("dep{index}");
-        let owner_id = task_id_on(&owner, owner_target);
-        let dep_id = task_id_on(&dep, dep_target);
-        db.query(
-                "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version) \
-                 VALUES (?, ?, '1.0.0', '[]', ?, '1.85.0'), (?, ?, '1.0.0', '[]', ?, '1.85.0')",
-            )
-            .bind(owner_id.clone())
-            .bind(owner)
-            .bind(*owner_target)
-            .bind(dep_id.clone())
-            .bind(dep)
-            .bind(*dep_target)
-            .execute()
-            .await
-            .expect("dev-era queue rows");
-        db.query(
-                "INSERT INTO queue_dependencies \
-                 (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version) \
-                 VALUES (?, ?, ?, '1.0.0', '[]', ?, '1.85.0')",
-            )
-            .bind(owner_id)
-            .bind(dep_id)
-            .bind(format!("dep{index}"))
-            .bind(*dep_target)
-            .execute()
-            .await
-            .expect("dev-era edge row");
-    }
-
-    super::migrate(&db, &settings()).await.expect("migrate");
-    super::migrate(&db, &settings())
-        .await
-        .expect("migrate retry is a no-op");
-
-    let rows = db
-        .query(
-            "SELECT dep_host_side AS side FROM queue_dependencies \
-                 ORDER BY task_id",
-        )
-        .fetch_all::<EdgeRow>()
-        .await
-        .expect("edge rows");
-    assert_eq!(rows.len(), 4);
-    // task_ids hash, so order is not the insert order — compare the
-    // side multiset: one unestablished, two provably target, one
-    // provably host.
-    let mut sides: Vec<i64> = rows.iter().map(|row| row.side).collect();
-    sides.sort_unstable();
-    assert_eq!(sides, vec![-1, 0, 0, 1]);
-}
-
-/// The human-lane position count must drive from the covering
-/// `(status, lane, dispatch_key)` index — a plain status scan would
-/// walk every pending miss row to reach a human lane's prefix.
-async fn assert_human_position_plan(db: &DurableDb) {
-    #[derive(Debug, skyzen::FromRow)]
-    struct PlanRow {
-        detail: String,
-    }
-    let plan = db
-        .query(
-            "EXPLAIN QUERY PLAN \
-                 SELECT count(*) FROM queue \
-                 WHERE status = 'pending' AND lane = 'human' AND dispatch_key < ?",
-        )
-        .bind("9999999999999999999")
-        .fetch_all::<PlanRow>()
-        .await
-        .expect("human position query plan");
-    assert!(
-        plan.iter().any(|row| row
-            .detail
-            .contains("USING COVERING INDEX idx_queue_human_position")),
-        "human position must use the covering lane/key index: {plan:?}"
-    );
-}
-
-/// The `host_side` rebuild renames `queue` aside, recreates it, copies
-/// the rows and drops the copy — and `SQLite` moves the old table's
-/// named indexes and triggers onto `queue_migrated` with the rename,
-/// so the include that recreates them must run after the drop or the
-/// rebuilt queue keeps neither. Start from a pre-`host_side` queue
-/// carrying the era's counter triggers and one index, migrate, and
-/// assert every `queue` index and trigger `schema.sql` declares
-/// exists afterwards — and that the counters still track a write.
-#[tokio::test]
-async fn migrate_rebuilds_queue_triggers_and_indexes() {
-    #[derive(skyzen::FromRow)]
-    struct ObjectRow {
-        name: String,
-    }
-    let db = memory_db_raw().await.expect("raw memory db");
-    // The era's objects on the dev-era queue: counter triggers and
-    // the status index. Without the post-drop include the rename
-    // moves them to `queue_migrated` and the drop deletes them.
-    for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES]
-        .into_iter()
-        .chain(DEV_ERA_QUEUE_OBJECTS.iter().copied())
-    {
-        db.query(statement).execute().await.expect("dev-era ddl");
-    }
-    db.query(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version)
-             VALUES (?, 'dep', '1.0.0', '[]', ?, '1.85.0')",
-    )
-    .bind(task_id_on("dep", TARGET))
-    .bind(TARGET)
-    .execute()
-    .await
-    .expect("dev-era queue row");
-
-    super::migrate(&db, &settings()).await.expect("migrate");
-
-    // Every index and trigger schema.sql declares on `queue` must
-    // exist on the rebuilt table.
-    let mut expected = Vec::new();
-    for statement in include_str!("schema.sql").split(';') {
-        let normalized = statement.replace('\n', " ");
-        let is_queue_object = normalized.contains("ON queue ")
-            && (normalized.contains("INDEX") || normalized.contains("TRIGGER"));
-        if !is_queue_object {
-            continue;
-        }
-        let name = normalized
-            .split_whitespace()
-            .skip_while(|token| *token != "EXISTS")
-            .nth(1)
-            .expect("object name after IF NOT EXISTS");
-        expected.push(name.to_owned());
-    }
-    assert!(!expected.is_empty(), "schema.sql declares queue objects");
-    let present: BTreeSet<String> = db
-        .query(
-            "SELECT name FROM sqlite_master \
-                 WHERE tbl_name = 'queue' AND type IN ('index', 'trigger')",
-        )
-        .fetch_all::<ObjectRow>()
-        .await
-        .expect("sqlite_master")
-        .into_iter()
-        .map(|row| row.name)
-        .collect();
-    let missing: Vec<String> = expected
-        .iter()
-        .filter(|name| !present.contains(*name))
-        .cloned()
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "the rebuild dropped queue objects: {missing:?}"
-    );
-
-    assert_human_position_plan(&db).await;
-
-    // And the counters must track a write made after the migration —
-    // the defect's other half is triggers that exist but never fire.
-    let before: Option<i64> = db
-        .query(
-            "SELECT n FROM queue_status_counts \
-                 WHERE status = 'pending' AND lane = 'miss'",
-        )
-        .fetch_scalar_optional::<i64>()
-        .await
-        .expect("counter row");
-    db.query(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version)
-             VALUES (?, 'post', '1.0.0', '[]', ?, '1.85.0')",
-    )
-    .bind(task_id_on("post", TARGET))
-    .bind(TARGET)
-    .execute()
-    .await
-    .expect("post-migration insert");
-    let after: Option<i64> = db
-        .query(
-            "SELECT n FROM queue_status_counts \
-                 WHERE status = 'pending' AND lane = 'miss'",
-        )
-        .fetch_scalar_optional::<i64>()
-        .await
-        .expect("counter row after insert");
-    assert_eq!(
-        after,
-        Some(before.unwrap_or(0) + 1),
-        "the counter trigger tracks a write made after the migration"
     );
 }
 
@@ -7013,115 +6259,6 @@ async fn a_small_slot_pass_reads_one_page_not_the_frontier() {
         asked, 6,
         "the coverage lookup is sized to the page (2 × slots), not the frontier"
     );
-}
-
-/// A dependent behind an unestablished edge (`dep_host_side = -1`)
-/// stays held even when its dep publishes every shape it owns:
-/// `p.unit_side = -1` matches no row, so nothing published can
-/// satisfy it — only the resolver's resync rewrites the edge with a
-/// real side, which is what a re-request carrying `depends_on` does.
-#[tokio::test]
-async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
-    let db = memory_db().await.expect("memory db");
-    // Owner on iOS, dep on the macOS family's host triple — the
-    // unambiguous case `derive_edge_side` resolves to a host unit.
-    let dep = host_dependency_on("aarch64-apple-ios", "dep");
-    let host_target = dep.target.as_str().to_owned();
-    enqueue(&db, std::slice::from_ref(&dep))
-        .await
-        .expect("enqueue dep");
-    enqueue(
-        &db,
-        &[request_on(
-            "parent",
-            "aarch64-apple-ios",
-            std::slice::from_ref(&dep),
-        )],
-    )
-    .await
-    .expect("enqueue parent");
-    // The spelling the migration writes on an edge whose required
-    // side it could not derive.
-    db.query("UPDATE queue_dependencies SET dep_host_side = -1")
-        .execute()
-        .await
-        .expect("stamp unestablished edge");
-
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim dep");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].crate_name, "dep");
-    super::complete(
-        &db,
-        &claim_settings(),
-        &report(
-            &claimed[0].task_id,
-            &claimed[0].generation_id,
-            claimed[0].attempt,
-            true,
-        ),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("complete dep");
-    publish_shapes(
-        &db,
-        "dep",
-        &host_target,
-        &[
-            shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
-            shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
-            shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
-            shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
-        ],
-    )
-    .await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim with unestablished edge");
-    assert!(claimed.is_empty(), "a -1 edge satisfies no published row");
-
-    // The request path never rewrites edges: a task id's edge set is a
-    // function of the id (stow#588), so a resubmit of the same id
-    // carries nothing new — the failing-closed row is the migration's
-    // job, and it stamps `dep_side_known = 0` to mark that.
-    db.query("UPDATE queue_dependencies SET dep_side_known = 0")
-        .execute()
-        .await
-        .expect("stamp edge side unknown");
-    enqueue(
-        &db,
-        &[request_on(
-            "parent",
-            "aarch64-apple-ios",
-            std::slice::from_ref(&dep),
-        )],
-    )
-    .await
-    .expect("re-request parent leaves the edge alone");
-    let side = db
-        .query("SELECT dep_host_side FROM queue_dependencies")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("edge side");
-    assert_eq!(side, -1, "the request path does not repair edges");
-
-    super::derive_dev_era_edge_sides(&db)
-        .await
-        .expect("migration derives the edge side");
-    let side = db
-        .query("SELECT dep_host_side FROM queue_dependencies")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("edge side");
-    assert_eq!(side, 1);
-
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim after migration resync");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].crate_name, "parent");
 }
 
 /// A dependency reported `completed` whose published rows never
@@ -8828,684 +7965,17 @@ async fn refresh_writer_preserves_exactness_beyond_f64() {
     assert!(plain < priced, "the larger exact ratio claims first");
 }
 
-/// The additive migration grows `claimed_at` and the build-cost
-/// tables on a dev-era queue — the operator route's only schema
-/// work — while rows migrated before the column carry no claim
-/// stamp and sample nothing.
-#[tokio::test]
-async fn migration_adds_claim_stamp_and_cost_tables() {
-    let db = memory_db_raw().await.expect("raw memory db");
-    for statement in [DEV_ERA_QUEUE, DEV_ERA_DEPENDENCIES] {
-        db.query(statement).execute().await.expect("dev-era schema");
-    }
-    super::migrate(&db, &settings()).await.expect("migrate");
-    let queue_columns = db
-        .query("PRAGMA table_info(queue)")
-        .fetch_all::<super::QueueTableInfoRow>()
-        .await
-        .expect("queue columns")
-        .into_iter()
-        .map(|column| column.name)
-        .collect::<Vec<_>>();
-    assert!(queue_columns.iter().any(|name| name == "claimed_at"));
-    for table in ["crate_build_samples", "crate_build_stats"] {
-        let columns = db
-            .query(&format!("PRAGMA table_info({table})"))
-            .fetch_all::<super::QueueTableInfoRow>()
-            .await
-            .expect("cost table columns");
-        assert!(!columns.is_empty(), "{table} exists");
-    }
-}
-
-// ==================== stow#588: identity rebuild + node-store dispatch walk ====================
-
-/// The version-14 `queue` table: every column the identity copy carries,
-/// minus `dependency_identity`, under the six-field UNIQUE that could
-/// merge two contexts sharing an identity tuple.
-const V14_QUEUE_DDL: &str = "CREATE TABLE queue (
-    task_id TEXT PRIMARY KEY,
-    crate_name TEXT NOT NULL, version TEXT NOT NULL, features_json TEXT NOT NULL,
-    target TEXT NOT NULL, rustc_version TEXT NOT NULL,
-    downloads INTEGER NOT NULL DEFAULT 0, miss_count INTEGER NOT NULL DEFAULT 0,
-    request_count INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'pending', error_msg TEXT,
-    preserve_lockfile INTEGER NOT NULL DEFAULT 0,
-    lane TEXT NOT NULL DEFAULT 'miss',
-    dispatch_attempts INTEGER NOT NULL DEFAULT 0, attempt INTEGER NOT NULL DEFAULT 1,
-    generation_id TEXT NOT NULL DEFAULT '',
-    not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
-    first_requested_at TEXT NOT NULL DEFAULT (datetime('now')),
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    github_run_id TEXT, host_side INTEGER NOT NULL DEFAULT 0,
-    shape_requeue INTEGER NOT NULL DEFAULT 0, unpublished_deps INTEGER NOT NULL DEFAULT 0,
-    deps_met INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0,
-    wake_at TEXT NOT NULL DEFAULT '1970-01-01 00:00:00',
-    dispatch_family TEXT NOT NULL DEFAULT '', value INTEGER NOT NULL DEFAULT 0,
-    demand INTEGER NOT NULL DEFAULT 0, dispatch_key TEXT NOT NULL DEFAULT '',
-    claimed_at TEXT, dispatch_eligible INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(crate_name, version, features_json, target, rustc_version, host_side)
-)";
-
-/// The version-14 edge table — every current column minus
-/// `dep_dependency_identity`, which only the rebuild's ALTER adds.
-const V14_DEPS_DDL: &str = "CREATE TABLE queue_dependencies (
-    task_id TEXT NOT NULL, depends_on_task_id TEXT NOT NULL,
-    dep_crate_name TEXT NOT NULL DEFAULT '', dep_version TEXT NOT NULL DEFAULT '',
-    dep_features_json TEXT NOT NULL DEFAULT '', dep_target TEXT NOT NULL DEFAULT '',
-    dep_rustc_version TEXT NOT NULL DEFAULT '',
-    dep_host_side INTEGER NOT NULL DEFAULT 0,
-    dep_invocations INTEGER NOT NULL DEFAULT 0, dep_shapes INTEGER NOT NULL DEFAULT 0,
-    dep_met INTEGER NOT NULL DEFAULT 0, dep_side_known INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (task_id, depends_on_task_id)
-)";
-
-/// The version-14 slice-membership table — the nine immutable membership
-/// columns, primary key carrying no `dependency_identity`.
-const V14_SLICE_ROWS_DDL: &str = "CREATE TABLE published_slice_rows (
-    target TEXT NOT NULL, rustc_version TEXT NOT NULL, generation INTEGER NOT NULL,
-    crate_name TEXT NOT NULL, version TEXT NOT NULL, features_json TEXT NOT NULL,
-    unit_side INTEGER NOT NULL DEFAULT -1, unit_invocation INTEGER NOT NULL DEFAULT -1,
-    unit_linked INTEGER NOT NULL DEFAULT -1,
-    PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json,
-                 unit_side, unit_invocation, unit_linked)
-)";
-
-/// Build a version-14 database: current schema for the untouched tables,
-/// the three rebuilt tables in their legacy shapes, the version stamp
-/// at 14.
-async fn seed_v14_db() -> DurableDb {
-    let db = memory_db_raw().await.expect("raw memory db");
-    for statement in [
-        include_str!("schema.sql"),
-        "DROP TABLE queue",
-        "DROP TABLE queue_dependencies",
-        "DROP TABLE published_slice_rows",
-        V14_QUEUE_DDL,
-        V14_DEPS_DDL,
-        V14_SLICE_ROWS_DDL,
-        "INSERT INTO scheduler_schema_version (id, version) VALUES (1, 14)",
-    ] {
-        db.query(statement)
-            .execute()
-            .await
-            .unwrap_or_else(|error| panic!("v14 seed step failed: {error}\n{statement}"));
-    }
-    db
-}
-
-/// Insert one legacy queue row of the given status carrying a value in
-/// every preserved column; `seq` keeps task ids distinct and ordered.
-async fn seed_v14_row(db: &DurableDb, seq: i64, status: &str, extra: &str) {
-    db.query(&format!(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
-            rustc_version, downloads, miss_count, request_count, priority, status,
-            error_msg, preserve_lockfile, lane, dispatch_attempts, attempt,
-            generation_id, not_before, first_requested_at, created_at, updated_at,
-            github_run_id, host_side, shape_requeue, unpublished_deps, deps_met,
-            blocked, wake_at, dispatch_family, value, demand, dispatch_key,
-            claimed_at, dispatch_eligible)
-         VALUES ('v14-task-{seq:05}', 'crate{seq}', '1.0.0', '[\"default\"]',
-            'x86_64-unknown-linux-gnu', '1.85.0', 10 + {seq}, {seq}, 2, {seq},
-            '{status}', {extra}, 0, 'miss', 1, 3, 'gen-{seq}',
-            '2024-01-01 00:00:00', '2024-01-02 00:00:00', '2024-01-03 00:00:00',
-            '2024-01-04 00:00:00', 'run-{seq}', 0, 1, 2, 0, 1,
-            '2024-01-05 00:00:00', 'linux', 100 + {seq}, 5, 'key-{seq}',
-            '2024-01-06 00:00:00', 0)"
-    ))
-    .execute()
-    .await
-    .expect("seed v14 row");
-}
-
-/// Rows of every queue status, one dependency edge and one slice row —
-/// the preservation matrix the rebuild must carry verbatim.
-#[derive(skyzen::FromRow)]
-struct Migrated {
-    status: String,
-    downloads: i64,
-    miss_count: i64,
-    request_count: i64,
-    priority: i64,
-    attempt: i64,
-    generation_id: String,
-    github_run_id: Option<String>,
-    lane: String,
-    demand: i64,
-    claimed_at: Option<String>,
-    not_before: String,
-    dependency_identity: Option<String>,
-    error_msg: Option<String>,
-}
-
-/// Every immutable column the copy must carry, asserted per seeded row.
-/// `demand` is the demand association; the derived rank columns (`value`,
-/// `dispatch_key`, `wake_at`, …) are legitimately recomputed by the gate
-/// backfill, never carried — they are not asserted.
-fn assert_v14_row(row: &Migrated, seq: i64) {
-    assert_eq!(row.downloads, 10 + seq, "downloads preserved");
-    assert_eq!(row.miss_count, seq, "miss_count preserved");
-    assert_eq!(row.request_count, 2);
-    assert_eq!(row.priority, seq);
-    assert_eq!(row.attempt, 3, "attempt preserved");
-    assert_eq!(row.generation_id, format!("gen-{seq}"));
-    let run_id = format!("run-{seq}");
-    assert_eq!(row.github_run_id.as_deref(), Some(run_id.as_str()));
-    assert_eq!(row.lane, "miss");
-    assert_eq!(row.demand, 5, "demand association preserved");
-    assert_eq!(row.claimed_at.as_deref(), Some("2024-01-06 00:00:00"));
-    assert_eq!(row.not_before, "2024-01-01 00:00:00");
-    assert_eq!(
-        row.dependency_identity, None,
-        "historical context stays NULL, never guessed"
-    );
-    assert_eq!(row.error_msg.as_deref(), Some("seeded-error"));
-}
-
-#[tokio::test]
-async fn migration_from_a_v14_database_preserves_every_row_edge_and_null_context() {
-    let db = seed_v14_db().await;
-    for (seq, status) in ["pending", "dispatched", "running", "completed", "failed"]
-        .iter()
-        .enumerate()
-    {
-        seed_v14_row(
-            &db,
-            i64::try_from(seq).expect("seq") + 1,
-            status,
-            "'seeded-error'",
-        )
-        .await;
-    }
-    db.query(
-        "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_crate_name)
-         VALUES ('v14-task-00001', 'v14-task-00002', 'crate2')",
-    )
-    .execute()
-    .await
-    .expect("seed v14 edge");
-    db.query(
-        "INSERT INTO published_slice_rows
-            (target, rustc_version, generation, crate_name, version, features_json,
-             unit_side, unit_invocation, unit_linked)
-         VALUES ('x86_64-unknown-linux-gnu', '1.85.0', 7, 'crate2', '1.0.0',
-             '[\"default\"]', 1, 2, 0)",
-    )
-    .execute()
-    .await
-    .expect("seed v14 slice row");
-
-    let report = super::migrate(&db, &settings()).await.expect("migrate");
-    assert_eq!(
-        (report.before, report.after),
-        (14, super::SCHEMA_VERSION),
-        "v14 → SCHEMA_VERSION in one pass under the small fixture"
-    );
-
-    // Every status row landed with every immutable column verbatim and
-    // context NULL — never guessed.
-    let rows = db
-        .query(
-            "SELECT status, downloads, miss_count, request_count, priority, attempt,
-                generation_id, github_run_id, lane, demand,
-                claimed_at, not_before, dependency_identity, error_msg FROM queue ORDER BY task_id",
-        )
-        .fetch_all::<Migrated>()
-        .await
-        .expect("read migrated rows");
-    assert_eq!(rows.len(), 5, "every legacy row survived the copy");
-    let mut statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
-    statuses.sort_unstable();
-    assert_eq!(
-        statuses,
-        ["completed", "dispatched", "failed", "pending", "running"]
-    );
-    for (index, row) in rows.iter().enumerate() {
-        assert_v14_row(row, i64::try_from(index + 1).expect("seq"));
-    }
-    // The edge row carried through unchanged; the slice row dropped at
-    // the swap — `published_slice_rows.dependency_identity` is NOT NULL
-    // post-v15, and a context-free row satisfies no coverage clause.
-    let edge = db
-        .query("SELECT COUNT(*) FROM queue_dependencies WHERE task_id = 'v14-task-00001' AND depends_on_task_id = 'v14-task-00002' AND dep_dependency_identity IS NULL")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("edge row");
-    assert_eq!(edge, 1, "dependency edge preserved, context NULL");
-    let slice = db
-        .query("SELECT COUNT(*) FROM published_slice_rows")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("slice rows");
-    assert_eq!(slice, 0, "context-free slice rows drop at the swap");
-    // Status counters repopulated by the copy's inserts.
-    let pending = db
-        .query("SELECT n FROM queue_status_counts WHERE status = 'pending'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("pending count");
-    assert_eq!(pending, 1);
-}
-
-/// A migrate call's bounded copy leaves the rest for the next call: an
-/// interrupted run keeps the live `queue` untouched (old code keeps
-/// reading and writing the real table at every moment — the shadow
-/// `queue_v15` is a mirror, never a serving table), the cursor resumes,
-/// and `after` answers `SCHEMA_VERSION` only once the shadow verified
-/// and swapped in. Writes that land between batches — a fresh submit,
-/// status updates on rows both sides of the cursor, a completion, a
-/// delete — are mirrored by the copy's triggers and survive the swap
-/// with their latest values.
-#[tokio::test]
-async fn migration_identity_copy_resumes_after_an_interrupted_batch_run() {
-    let db = seed_v14_db().await;
-    // One call moves at most IDENTITY_COPY_BATCHES_PER_CALL × 1000 rows;
-    // seed one row over that so the first call cannot finish.
-    let rows = super::IDENTITY_COPY_BATCH_ROWS
-        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
-        + 1;
-    db.query(&format!(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
-            rustc_version, status, lane)
-         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
-            '[\"default\"]', 'x86_64-unknown-linux-gnu', '1.85.0',
-            CASE x % 5 WHEN 0 THEN 'pending' WHEN 1 THEN 'completed'
-             WHEN 2 THEN 'failed' WHEN 3 THEN 'dispatched' ELSE 'running' END,
-            'miss'
-         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
-               SELECT x FROM n) AS g"
-    ))
-    .execute()
-    .await
-    .expect("seed bulk v14 rows");
-
-    let first = super::migrate(&db, &settings())
-        .await
-        .expect("first migrate");
-    assert_eq!(
-        (first.before, first.after),
-        (14, 14),
-        "an incomplete copy must not report SCHEMA_VERSION: {first:?}"
-    );
-    // The live table keeps its name and full row count mid-copy —
-    // nothing was renamed aside — and the shadow holds the copied
-    // prefix beside it.
-    let live_rows = db
-        .query("SELECT COUNT(*) FROM queue")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("live count");
-    assert_eq!(live_rows, rows, "live queue untouched during the copy");
-    let shadow_rows = db
-        .query("SELECT COUNT(*) FROM queue_v15")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("shadow count");
-    assert!(
-        0 < shadow_rows && shadow_rows < rows,
-        "partial copy in the shadow"
-    );
-
-    // Live writes land between the batches — the mirror triggers make
-    // each shadow row the newest write.
-    // A fresh submit whose id sorts below the cursor: only the mirror
-    // can carry it across (the cursor never walks back).
-    db.query(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
-            rustc_version, status, lane)
-         VALUES ('aaa-live-insert', 'livecrate', '2.0.0', '[]',
-            'aarch64-apple-darwin', '1.85.0', 'pending', 'miss')",
-    )
-    .execute()
-    .await
-    .expect("live insert mid-copy");
-    // A status update on an already-copied row must overwrite the
-    // shadow's stale copy (`failed`: a terminal status no migrate step
-    // rewrites).
-    db.query("UPDATE queue SET status = 'failed', attempt = 9 WHERE task_id = 'bulk-000001'")
-        .execute()
-        .await
-        .expect("update copied row");
-    // A completion touching a task the cursor has not reached: the
-    // mirror writes it before the copy's IGNORE can see it.
-    db.query(
-        "UPDATE queue SET status = 'completed', github_run_id = 'run-late', \
-            miss_count = 77 WHERE task_id = 'bulk-008001'",
-    )
-    .execute()
-    .await
-    .expect("complete uncopied row");
-    // A delete on an already-copied row must retire its shadow row too.
-    db.query("DELETE FROM queue WHERE task_id = 'bulk-000002'")
-        .execute()
-        .await
-        .expect("delete copied row");
-
-    // Retry finishes the copy and swaps the shadow in.
-    let second = super::migrate(&db, &settings())
-        .await
-        .expect("migrate retry");
-    assert_eq!((second.before, second.after), (14, super::SCHEMA_VERSION));
-    let total = db
-        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("count migrated rows");
-    assert_eq!(
-        total, rows,
-        "insert+delete cancel, every row has NULL context"
-    );
-    let shadow_gone = db
-        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v15'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("shadow probe");
-    assert_eq!(shadow_gone, 0, "swap drops the shadow tables");
-    let mirror_gone = db
-        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'v15_%_mirror_%'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("mirror probe");
-    assert_eq!(mirror_gone, 0, "swap drops the mirror triggers");
-    assert_interleaved_writes_survived(&db, rows).await;
-
-    // Already migrated: a third pass is a pure no-op.
-    let third = super::migrate(&db, &settings())
-        .await
-        .expect("idempotent migrate");
-    assert_eq!(
-        (third.before, third.after),
-        (super::SCHEMA_VERSION, super::SCHEMA_VERSION)
-    );
-}
-
-/// Every interleaved write survived the swap with its latest value:
-/// mirrored rows always beat the copy's stale reads.
-async fn assert_interleaved_writes_survived(db: &DurableDb, rows: i64) {
-    let fresh = db
-        .query(
-            "SELECT COUNT(*) FROM queue WHERE task_id = 'aaa-live-insert' AND status = 'pending'",
-        )
-        .fetch_scalar::<i64>()
-        .await
-        .expect("mirrored insert");
-    assert_eq!(fresh, 1, "live insert below the cursor mirrored in");
-    let updated = db
-        .query("SELECT status || ':' || attempt FROM queue WHERE task_id = 'bulk-000001'")
-        .fetch_scalar::<String>()
-        .await
-        .expect("updated row");
-    assert_eq!(
-        updated, "failed:9",
-        "update on a copied row beats the stale copy"
-    );
-    let completed = db
-        .query(
-            "SELECT status || ':' || miss_count || ':' || github_run_id \
-                FROM queue WHERE task_id = 'bulk-008001'",
-        )
-        .fetch_scalar::<String>()
-        .await
-        .expect("completed row");
-    assert_eq!(
-        completed, "completed:77:run-late",
-        "completion on a not-yet-copied row survives the swap"
-    );
-    let deleted = db
-        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000002'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("deleted row");
-    assert_eq!(deleted, 0, "delete on a copied row retires its shadow");
-    // Status counters recomputed on the swapped table: 1601 seeded
-    // `completed` rows (x % 5 == 1 over x = 1..8001) minus the one the
-    // update moved to `failed`; the not-yet-copied completion stays
-    // `completed`, and the delete hit another `failed` row.
-    let completed_count = db
-        .query("SELECT n FROM queue_status_counts WHERE status = 'completed'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("completed count");
-    assert_eq!(completed_count, rows / 5, "counts recomputed post-swap");
-}
-
-/// A live write that lands inside a range a copy batch has already
-/// verified stays invisible to the swap: the mirror triggers keep the
-/// verified range equal on both sides, so the final tick's tail-only
-/// verify still sees no difference and the swap completes.
-#[tokio::test]
-async fn migration_swap_tolerates_writes_into_an_already_verified_range() {
-    let db = seed_v14_db().await;
-    let rows = super::IDENTITY_COPY_BATCH_ROWS
-        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
-        + 1;
-    db.query(&format!(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
-            rustc_version, status, lane)
-         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
-            '[]', 'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss'
-         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
-               SELECT x FROM n) AS g"
-    ))
-    .execute()
-    .await
-    .expect("seed v14 rows");
-
-    // The first call copies and verifies every range up to
-    // 'bulk-008000' and leaves the copy in flight.
-    let first = super::migrate(&db, &settings())
-        .await
-        .expect("first migrate");
-    assert_eq!((first.before, first.after), (14, 14), "copy in flight");
-
-    // Writes land inside the first batch's range — verified ticks ago:
-    // an update, a fresh insert that sorts below the cursor, and a
-    // delete. The mirror, not a re-verify, keeps the range equal.
-    db.query("UPDATE queue SET status = 'failed', attempt = 4 WHERE task_id = 'bulk-000500'")
-        .execute()
-        .await
-        .expect("update inside verified range");
-    db.query(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
-            rustc_version, status, lane)
-         VALUES ('bulk-000500a', 'latecrate', '3.0.0', '[]',
-            'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss')",
-    )
-    .execute()
-    .await
-    .expect("insert inside verified range");
-    db.query("DELETE FROM queue WHERE task_id = 'bulk-000501'")
-        .execute()
-        .await
-        .expect("delete inside verified range");
-
-    // The swap sees no difference and completes.
-    let second = super::migrate(&db, &settings())
-        .await
-        .expect("swap migrate");
-    assert_eq!((second.before, second.after), (14, super::SCHEMA_VERSION));
-    let status = db
-        .query("SELECT status || '/' || attempt FROM queue WHERE task_id = 'bulk-000500'")
-        .fetch_scalar::<String>()
-        .await
-        .expect("updated row");
-    assert_eq!(status, "failed/4");
-    let inserted = db
-        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000500a' AND status = 'pending'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("inserted row");
-    assert_eq!(inserted, 1, "insert mirrored into the verified range");
-    let deleted = db
-        .query("SELECT COUNT(*) FROM queue WHERE task_id = 'bulk-000501'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("deleted row");
-    assert_eq!(deleted, 0, "delete mirrored out of the verified range");
-}
-
-/// Drive the queue copy's remaining batches to exhaustion with the same
-/// bound probe, copy statement and cursor write the migrate loop runs —
-/// the state a crash leaves when it dies after its last batch commit
-/// but before the verify+swap tick: copy complete, live `queue` intact.
-async fn drain_queue_identity_copy(db: &DurableDb) {
-    loop {
-        let cursor = db
-            .query("SELECT value FROM settings WHERE key = 'migrate_queue_identity_cursor'")
-            .fetch_scalar_optional::<String>()
-            .await
-            .expect("read cursor")
-            .unwrap_or_default();
-        let bound: Option<String> = db
-            .query(
-                "SELECT MAX(task_id) FROM ( \
-                     SELECT task_id FROM queue \
-                     WHERE task_id > ? ORDER BY task_id LIMIT ?)",
-            )
-            .bind(cursor.clone())
-            .bind(super::IDENTITY_COPY_BATCH_ROWS)
-            .fetch_scalar::<Option<String>>()
-            .await
-            .expect("bound probe");
-        let Some(bound) = bound else {
-            break;
-        };
-        db.query(include_str!("copy_queue_dependency_identity.sql"))
-            .bind(cursor.clone())
-            .bind(super::IDENTITY_COPY_BATCH_ROWS)
-            .execute()
-            .await
-            .expect("drain batch");
-        // The drain replays what the migrate loop ran before the
-        // crash: the copied range verified in the same step.
-        let mut verify = db.query(include_str!("verify_queue_dependency_identity.sql"));
-        for _ in 0..5 {
-            verify = verify
-                .bind(cursor.clone())
-                .bind(bound.clone())
-                .bind(bound.clone());
-        }
-        assert_eq!(
-            verify.fetch_scalar::<i64>().await.expect("drain verify"),
-            0,
-            "drained range verifies equal"
-        );
-        db.query(
-            "INSERT INTO settings (key, value) \
-             VALUES ('migrate_queue_identity_cursor', ?) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(bound)
-        .execute()
-        .await
-        .expect("advance cursor");
-    }
-}
-
-/// Seed enough v14 rows that one migrate call leaves the copy in
-/// flight, then drain the rest so the next migrate call owns the
-/// verify+swap tail alone.
-async fn seed_and_drain_queue_copy(db: &DurableDb) -> i64 {
-    let rows = super::IDENTITY_COPY_BATCH_ROWS
-        * i64::try_from(super::IDENTITY_COPY_BATCHES_PER_CALL).expect("batches")
-        + 1;
-    db.query(&format!(
-        "INSERT INTO queue (task_id, crate_name, version, features_json, target,
-            rustc_version, status, lane)
-         SELECT 'bulk-' || printf('%06d', x), 'crate' || x, '1.0.0',
-            '[]', 'x86_64-unknown-linux-gnu', '1.85.0', 'pending', 'miss'
-         FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {rows})
-               SELECT x FROM n) AS g"
-    ))
-    .execute()
-    .await
-    .expect("seed v14 rows");
-    let report = super::migrate(db, &settings())
-        .await
-        .expect("first migrate");
-    assert_eq!((report.before, report.after), (14, 14), "copy in flight");
-    drain_queue_identity_copy(db).await;
-    rows
-}
-
-/// A call that dies after the copy's last batch but inside the
-/// verify+swap tick commits nothing on the Durable Object (the tick is
-/// the atomic unit): the live `queue` stays intact and serving, and the
-/// next migrate call re-verifies and completes the swap.
-#[tokio::test]
-async fn migration_swap_crash_after_copy_leaves_live_and_recovers() {
-    let db = seed_v14_db().await;
-    let rows = seed_and_drain_queue_copy(&db).await;
-
-    // "Between verify and swap" is the uncommitted crash: nothing wrote,
-    // so the live table is still the serving table.
-    let live = db
-        .query("SELECT COUNT(*) FROM queue")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("live intact");
-    assert_eq!(live, rows, "live queue still serving every row");
-
-    let report = super::migrate(&db, &settings())
-        .await
-        .expect("migrate completes");
-    assert_eq!((report.before, report.after), (14, super::SCHEMA_VERSION));
-    let migrated = db
-        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("count post-swap");
-    assert_eq!(migrated, rows);
-}
-
-/// The deeper crash: the swap's `DROP TABLE queue` committed (eager
-/// backend) and the call died before the rename. `queue` absent with
-/// `queue_v15` present is the one resumable state — the next migrate
-/// call finishes the tail rather than wedging.
-#[tokio::test]
-async fn migration_swap_crash_between_drop_and_rename_resumes() {
-    let db = seed_v14_db().await;
-    let rows = seed_and_drain_queue_copy(&db).await;
-
-    // Simulate the committed prefix of the swap tick.
-    db.query("DROP TABLE queue")
-        .execute()
-        .await
-        .expect("crash prefix: drop live queue");
-
-    let report = super::migrate(&db, &settings())
-        .await
-        .expect("migrate resumes the swap tail");
-    assert_eq!((report.before, report.after), (14, super::SCHEMA_VERSION));
-    let migrated = db
-        .query("SELECT COUNT(*) FROM queue WHERE dependency_identity IS NULL")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("count post-resume");
-    assert_eq!(migrated, rows, "swap tail restores every copied row");
-    let shadow_gone = db
-        .query("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v15'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("shadow probe");
-    assert_eq!(shadow_gone, 0);
-}
-
-/// One `sqlite_master` row for the schema-parity assertion.
-#[derive(skyzen::FromRow)]
+/// One `sqlite_master` row the reset test asserts on.
+#[derive(Debug, skyzen::FromRow)]
 struct SchemaObject {
     kind: String,
     name: String,
-    tbl_name: String,
-    sql: Option<String>,
 }
 
 /// The database's full `sqlite_master` listing, minus SQLite internals.
 async fn schema_objects(db: &DurableDb) -> Vec<SchemaObject> {
     db.query(
-        "SELECT type AS kind, name, tbl_name, sql FROM sqlite_master \
+        "SELECT type AS kind, name FROM sqlite_master \
          WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
     )
     .fetch_all::<SchemaObject>()
@@ -9513,70 +7983,65 @@ async fn schema_objects(db: &DurableDb) -> Vec<SchemaObject> {
     .expect("schema dump")
 }
 
-/// The swapped database's schema must equal what `schema.sql` builds on
-/// a fresh database: same tables, indexes and triggers, same column
-/// lists — and for the two swapped tables byte-equal `sqlite_master`
-/// definitions once name and quoting normalize.
+/// `reset` is the whole schema lifecycle: a populated store drops
+/// every object `sqlite_master` reports — including tables `schema.sql`
+/// never declared — recreates the schema empty, and accepts writes
+/// again. It reads no row data.
 #[tokio::test]
-async fn migration_swapped_schema_matches_a_fresh_database() {
-    let db = seed_v14_db().await;
-    seed_v14_row(&db, 1, "pending", "NULL").await;
-    super::migrate(&db, &settings()).await.expect("migrate");
-    let fresh = memory_db_raw().await.expect("fresh db");
-    super::migrate(&fresh, &settings())
+async fn reset_empties_the_store_and_recreates_the_schema() {
+    // The permit stays open: the foreign table below is fixture DDL.
+    let db = memory_db_raw().await.expect("raw memory db");
+    super::reset(&db).await.expect("first reset");
+    super::apply_dispatch_floor(&db, &settings())
         .await
-        .expect("fresh migrate");
+        .expect("floor stamp");
+    enqueue(&db, &[request("seeded", &[])])
+        .await
+        .expect("enqueue");
+    db.query("CREATE TABLE foreign_table (id INTEGER)")
+        .execute()
+        .await
+        .expect("create foreign table");
+    db.query("INSERT INTO foreign_table (id) VALUES (1)")
+        .execute()
+        .await
+        .expect("populate foreign table");
 
-    let migrated = schema_objects(&db).await;
-    let reference = schema_objects(&fresh).await;
-    let shape = |rows: &[SchemaObject]| {
-        rows.iter()
-            .map(|row| (row.kind.clone(), row.name.clone(), row.tbl_name.clone()))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        shape(&migrated),
-        shape(&reference),
-        "same tables, indexes and triggers as a fresh database"
+    let report = super::reset(&db).await.expect("reset");
+    assert!(report.dropped > 0, "reset reports what it dropped");
+
+    let objects = schema_objects(&db).await;
+    assert!(
+        objects.iter().all(|object| object.name != "foreign_table"),
+        "a table `schema.sql` does not declare is gone: {objects:?}"
     );
-    // `ALTER`-appended columns (e.g. queue_dependencies' identity
-    // column) legitimately sit at different positions in the stored
-    // DDL; compare column sets instead of text for non-swapped tables.
-    for table in ["queue", "published_slice_rows", "queue_dependencies"] {
-        assert_eq!(
-            super::table_columns(&db, table).await.expect("table_info"),
-            super::table_columns(&fresh, table)
-                .await
-                .expect("table_info"),
-            "{table} column set equals a fresh database's"
+    for expected in [
+        ("table", "queue"),
+        ("table", "queue_dependencies"),
+        ("table", "settings"),
+        ("index", "idx_queue_claim"),
+        ("trigger", "demand_fold"),
+    ] {
+        assert!(
+            objects
+                .iter()
+                .any(|object| object.kind == expected.0 && object.name == expected.1),
+            "{} {} exists after reset",
+            expected.0,
+            expected.1,
         );
     }
-    // The swapped tables' stored DDL is byte-equal modulo the shadow
-    // rename's quoting: same column order, same constraints.
-    let normalize = |sql: &str| {
-        sql.replace('"', "")
-            .replace("IF NOT EXISTS", "")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    for table in ["queue", "published_slice_rows"] {
-        let got = migrated
-            .iter()
-            .find(|row| row.kind == "table" && row.name == table)
-            .and_then(|row| row.sql.as_deref())
-            .expect("migrated table ddl");
-        let want = reference
-            .iter()
-            .find(|row| row.kind == "table" && row.name == table)
-            .and_then(|row| row.sql.as_deref())
-            .expect("fresh table ddl");
-        assert_eq!(
-            normalize(got),
-            normalize(want),
-            "{table} stored DDL matches schema.sql"
-        );
+    for table in ["queue", "queue_dependencies", "settings", "demand_batches"] {
+        let n: i64 = db
+            .query(&format!("SELECT count(*) FROM {table}"))
+            .fetch_scalar::<i64>()
+            .await
+            .unwrap_or_else(|error| panic!("{table} exists and is readable: {error}"));
+        assert_eq!(n, 0, "{table} is empty after reset");
     }
+    enqueue(&db, &[request("fresh", &[])])
+        .await
+        .expect("insert after reset");
 }
 
 /// Two tasks whose dependency closures meet at a shared grandchild

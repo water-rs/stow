@@ -1523,10 +1523,10 @@ const SEED_TABLES: &[&str] = &[
 ];
 
 /// `POST /budget/seed` — load the fixture through the operator path,
-/// one cursor step per call. The schema is the operator migrate
+/// one cursor step per call. The schema is the operator reset
 /// route's product — the harness runs it before seeding, and request
-/// code neither issues DDL nor re-checks the migration's queue-wide
-/// passes (a `queue::migrate` inside every chunk call walked the
+/// code neither issues DDL nor walks the queue to check the schema
+/// (a queue-wide pass inside every chunk call walked the
 /// growing queue for a no-op `!=` guard — the linear request cost that
 /// outlived the dev proxy's reply window at 1M rows). `reset` restarts
 /// the cursor and clears the fixture's tables chunk by chunk. Callers

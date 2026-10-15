@@ -263,11 +263,6 @@ pub async fn run(
     )
     .await?;
     let queue_rows = fixture::count_rows(db, "queue").await?;
-    let schema_version: i64 = db
-        .query("SELECT version FROM scheduler_schema_version WHERE id = 1")
-        .fetch_scalar::<i64>()
-        .await
-        .map_err(|error| QueueError::Sql(format!("schema version: {error}")))?;
     // The drives address rows positionally inside the layout the fixture
     // wrote — `running_row`, `dep_row`, `completed_row` and friends are
     // arithmetic on that shape. A queue that has been churned since
@@ -303,7 +298,6 @@ pub async fn run(
     fixture::record_probe_claimed(db, &ctx.claimed_ids()).await?;
     Ok(SchedulerBudgetReport {
         queue_rows,
-        schema_version,
         dispatch_limit,
         claimed_tasks: ctx.claims(),
         rows,

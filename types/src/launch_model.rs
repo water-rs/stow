@@ -71,7 +71,7 @@ pub struct LaunchRates {
     /// Analytics Engine `stow_cache_misses`, one point per uncovered
     /// node. This is the denominator of [`LaunchRatios::builds_per_miss`].
     pub miss_node: f64,
-    /// Operator work (`stow-admin` reads, queue mutations, migrations,
+    /// Operator work (`stow-admin` reads, queue mutations, store resets,
     /// trusted submits) — a flat daily cadence, not install-scaled. The
     /// window's own operations show a handful a day; fifty leaves the
     /// launch fleet room and stays well under any allowance line.

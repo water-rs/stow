@@ -13,9 +13,9 @@
 //! Besides the numeric budgets, two mechanical rules hold on the
 //! statement log of every drive:
 //!
-//! * no `CREATE`/`ALTER`/`DROP`/`PRAGMA` — migrations and schema checks
-//!   are operations work (stow#432), so a route whose log contains one
-//!   fails even when it fits its budget;
+//! * no `CREATE`/`ALTER`/`DROP`/`PRAGMA` — schema work is operations
+//!   work (stow#432), so a route whose log contains one fails even when
+//!   it fits its budget;
 //! * every logged statement is replayed under `EXPLAIN QUERY PLAN`, and
 //!   a `SCAN` of `queue`, `queue_dependencies`, `published_slices` or
 //!   `published_slice_rows` — under the table's name or any alias the
@@ -50,10 +50,6 @@ struct RouteBudget {
     /// `EXPLAIN QUERY PLAN` detail substrings allowed to scan —
     /// every entry carries a comment naming its reason.
     scan_allowlist: &'static [&'static str],
-    /// The migrate route is the one place DDL/PRAGMA is legal (the
-    /// ops-only migration contract, stow#432); every other entry's log
-    /// must clear the head check.
-    ddl_permitted: bool,
 }
 
 /// The budget table — one entry per [`drives::DRIVES`] entry. Measured on
@@ -70,7 +66,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 60,
         rows_written: 0,
         scan_allowlist: &["SCAN queue_dependencies USING INDEX idx_queue_dependencies_unresolved"],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /admin/status",
@@ -78,7 +73,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 200,
         rows_written: 0,
         scan_allowlist: &["SCAN queue_dependencies USING INDEX idx_queue_dependencies_unresolved"],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /tasks",
@@ -89,7 +83,6 @@ const BUDGETS: &[RouteBudget] = &[
         // `idx_queue_updated_at` and stops at the page's LIMIT — the
         // plan prints SCAN but reads only the newest page.
         scan_allowlist: &["SCAN queue USING INDEX idx_queue_updated_at"],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /tasks?status=failed",
@@ -99,7 +92,6 @@ const BUDGETS: &[RouteBudget] = &[
         // The status equality bounds the walk to the failed group of
         // `idx_queue_status_updated`; the LIMIT stops it at a page.
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /tasks?status=pending",
@@ -109,7 +101,6 @@ const BUDGETS: &[RouteBudget] = &[
         // `status = 'pending'` lands `idx_queue_status_updated` on the
         // pending group; `blocked` is filtered out by the residual.
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /tasks?status=blocked",
@@ -120,7 +111,6 @@ const BUDGETS: &[RouteBudget] = &[
         // `idx_queue_pending_live` partial index, whose (blocked,
         // updated_at) key bounds the walk to the blocked group.
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /tasks?target=…",
@@ -130,7 +120,6 @@ const BUDGETS: &[RouteBudget] = &[
         // `idx_queue_target_updated` bounds the walk to the target's
         // own group.
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /tasks?crate=…",
@@ -139,7 +128,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_written: 0,
         // `idx_queue_crate_updated` bounds the walk to the crate's rows.
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /tasks?older_than=86400",
@@ -149,7 +137,6 @@ const BUDGETS: &[RouteBudget] = &[
         // `updated_at < now - older_than` is a range probe on
         // `idx_queue_updated_at`, not a scan.
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "GET /tasks?task_ids=…",
@@ -158,7 +145,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_written: 0,
         // Explicit ids: primary-key lookups, no walk.
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     // Mutation routes — one keyed statement each against a bounded
     // selector.
@@ -174,7 +160,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 120,
         rows_written: 60,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /tasks/complete-run (failure)",
@@ -182,7 +167,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 80,
         rows_written: 20,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /tasks/retry",
@@ -190,7 +174,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 10,
         rows_written: 4,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // Row 5 is a dependent's `blocked` flip: failing a task that
@@ -201,7 +184,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 10,
         rows_written: 5,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /tasks/promote",
@@ -209,7 +191,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 10,
         rows_written: 4,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /tasks/purge",
@@ -217,7 +198,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 10,
         rows_written: 8,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     // The request lane — point reads and writes on `requests`, a table
     // that never grows past the live request set.
@@ -227,7 +207,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 40,
         rows_written: 0,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /requests",
@@ -235,7 +214,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 20,
         rows_written: 6,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /requests/{id}/run-update (in_progress)",
@@ -243,7 +221,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 10,
         rows_written: 4,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /requests/{id}/outcome",
@@ -251,7 +228,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 60,
         rows_written: 40,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /requests/{id}/run-update (completed)",
@@ -259,7 +235,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 10,
         rows_written: 4,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     // Submit paths: a batch of three requests (one resync, one fresh,
     // one human). The untrusted route refuses on a pinned-zero pending
@@ -272,7 +247,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 40,
         rows_written: 4,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // The same batch past the cap: pending-count read, the
@@ -282,7 +256,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 300,
         rows_written: 100,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /admin/enqueue (trusted)",
@@ -290,7 +263,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 120,
         rows_written: 70,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     // The submit-by-id promote lane (stow#588): the trusted enqueue's
     // resync path plus the node-store walk — one root lookup per id and
@@ -302,7 +274,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 200,
         rows_written: 20,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     // The same batch submitted again: writes collapse to the task
     // upserts and the budget charge — the edge set is identical, so
@@ -313,7 +284,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 120,
         rows_written: 12,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         name: "POST /demand",
@@ -323,7 +293,6 @@ const BUDGETS: &[RouteBudget] = &[
         // The recursive walk's working table and the json_each payload
         // scan are keyed-by-construction, not table scans.
         scan_allowlist: &["SCAN walk", "SCAN json_each"],
-        ddl_permitted: false,
     },
     // The explicit full report — first publish and `index report --full`
     // resyncs — whose server-side diff reads the live slice (a
@@ -334,7 +303,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 500,
         rows_written: 150,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     // A report whose membership moved by DELTA_ROWS: the gate writes
     // touch only the changed rows' matched edges and their owners'
@@ -346,7 +314,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 60,
         rows_written: 200,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     // The alarm's dispatch pass on a warm queue: the claim pages at
     // `2 × open slots` candidate rows and claims them, so the pass's
@@ -362,7 +329,6 @@ const BUDGETS: &[RouteBudget] = &[
         // walk a SCAN but it covers only completed rows a prior pass
         // already flagged for repair: a ~0-entry set on a warm queue.
         scan_allowlist: &["idx_queue_shape_requeue"],
-        ddl_permitted: false,
     },
     RouteBudget {
         // The pass's fixed floor under paused dispatch: recovery probes
@@ -372,7 +338,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 80,
         rows_written: 4,
         scan_allowlist: &["idx_queue_shape_requeue"],
-        ddl_permitted: false,
     },
     RouteBudget {
         // One real dispatch pass over the floored queue — the same
@@ -384,7 +349,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 500,
         rows_written: 150,
         scan_allowlist: &["idx_queue_shape_requeue"],
-        ddl_permitted: false,
     },
     // Every demand-feed cap below is PROVISIONAL: host-measured on the
     // 10k gate, pending actual workerd billed measurements — host
@@ -401,7 +365,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 0,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // Fresh open: closed-hour check, watermark guard, header
@@ -411,7 +374,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 3,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // Restart with real debris: the same guarded path plus the
@@ -422,7 +384,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 520,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // One staged page: header probe, ordering/generation guard,
@@ -432,7 +393,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 3,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // Same-bytes replay: the guards plus the stored-hash
@@ -442,7 +402,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 0,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // Completion barrier, populated hour: manifest verification
@@ -452,7 +411,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 3,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // The same barrier with an empty generation — verification
@@ -462,7 +420,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 3,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // One page-apply delivery at the protocol's maximum
@@ -475,7 +432,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 1300,
         rows_written: 650,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // The terminal call — transition-only: every page already
@@ -486,7 +442,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 40,
         rows_written: 4,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // Delivered-hour replay: the header `delivered` early-out
@@ -496,7 +451,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 30,
         rows_written: 0,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // One full retirable chunk: header read, `DELETE … LIMIT
@@ -506,7 +460,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 260,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
     RouteBudget {
         // The retire probe on an all-live generation: header read,
@@ -516,7 +469,6 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 8,
         rows_written: 2,
         scan_allowlist: &[],
-        ddl_permitted: false,
     },
 ];
 
@@ -773,15 +725,13 @@ async fn check(db: &DurableDb, budget: &RouteBudget, measurement: &Measurement) 
         measurement.rows_written,
         budget.rows_written,
     );
-    if !budget.ddl_permitted {
-        for statement in &measurement.statements {
-            assert!(
-                !has_schema_head(&statement.sql),
-                "{} issued DDL/PRAGMA on a request path: {}",
-                budget.name,
-                statement.sql,
-            );
-        }
+    for statement in &measurement.statements {
+        assert!(
+            !has_schema_head(&statement.sql),
+            "{} issued DDL/PRAGMA on a request path: {}",
+            budget.name,
+            statement.sql,
+        );
     }
     let mut scans = Vec::new();
     for statement in &measurement.statements {
@@ -1002,23 +952,18 @@ async fn per_request_cost_gate() {
     let ctx = drives::DriveContext::host();
     run_drives(&db, shape, &settings, &ctx, &log).await;
 
-    // The migrate route is the only DDL path — it runs on the same seeded
+    // The reset route is the only DDL path — it runs on the same seeded
     // fixture under the raw (permit-open) counting backend.
     let (raw_db, raw_log) = counting_memory_db_raw().await.expect("raw counting db");
     fixture::seed_production_shape(&raw_db, &fixture::GATE, settings.dispatch_min_age_minutes)
         .await
         .expect("seed fixture");
     let base = raw_log.lock().expect("statement log").len();
-    queue::migrate(&raw_db, &SchedulerSettings::default())
-        .await
-        .expect("migrate");
+    queue::reset(&raw_db).await.expect("reset");
     let measurement = Measurement::of(raw_log.lock().expect("statement log")[base..].to_vec());
     eprintln!(
         "BUDGET {:<34} statements={:<4} rows_read={:<7} rows_written={:<7}",
-        "POST /migrate",
-        measurement.statement_count,
-        measurement.rows_read,
-        measurement.rows_written,
+        "POST /reset", measurement.statement_count, measurement.rows_read, measurement.rows_written,
     );
 }
 

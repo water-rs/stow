@@ -22,7 +22,7 @@ users only ever talk to the edge. Detailed trust analysis lives in
 
 The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
 declares the `STOW_DB` D1 database, the `Scheduler` Durable Object with its
-`v1` migration, the five runtime `[[secret]]` names (never values), the
+`v1` class declaration, the five runtime `[[secret]]` names (never values), the
 non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 `[cloudflare.raw]` routes.
 
@@ -34,7 +34,20 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen provision --provider cloudflare --manifest edge/Skyzen.toml
    ```
 
-2. Set the Worker secrets. Each name must be declared in `[[secret]]`
+2. Create the D1 schema. The store has one schema —
+   [`edge/schema.sql`](../edge/schema.sql); the Worker assumes it
+   exists:
+
+   ```sh
+   wrangler d1 execute stow-prod --remote --file edge/schema.sql
+   ```
+
+   To change the schema later, reset the store instead: drop the
+   tables, re-execute the same file, then resync the mirror from the
+   signed records — `stow-admin index export --out-dir <dir> --full`
+   followed by `stow-admin index sync --file <dir>/new-records.json`.
+
+3. Set the Worker secrets. Each name must be declared in `[[secret]]`
    first, which the manifest already does:
 
    ```sh
@@ -59,11 +72,24 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    identity, never a shared token (see
    [Trusted-endpoint authentication](#trusted-endpoint-authentication)).
 
-3. Deploys run from GitHub Actions — see below. The first deploy also
+4. Deploys run from GitHub Actions — see below. The first deploy also
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-4. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
+5. Initialize the scheduler store. The scheduler Durable Object's
+   schema exists only through the operator reset route — once the first
+   deploy is live:
+
+   ```sh
+   stow-admin scheduler reset --yes
+   ```
+
+   The same pass is how a schema change lands: it drops every table,
+   index and trigger in the store and re-executes
+   `edge/src/scheduler/schema.sql`; the queue and recorded slices are
+   destroyed and refill from the lanes that feed them.
+
+6. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
    to the `stow_cache_misses` Analytics Engine dataset. In the Cloudflare
    dashboard (*My Profile → API Tokens → Create Custom Token*) create a
    token with *Account → Account Analytics → Read* on this account, store
@@ -71,7 +97,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `CF_ACCOUNT_ID` repository variable to the account ID shown on any
    dashboard overview page.
 
-5. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
+7. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
    the two endpoints an anonymous client can use to consume CI, and
    `/api/v1/admissions` runs the miss-derivation pass over the artifact
    catalog — but enumerating paths would leave the other anonymous
@@ -181,7 +207,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `/api/v1/bundles/`, 60 requests per 10 seconds per IP, block for
    10 seconds.
 
-6. **Maintenance rules (the breaker, stow#453).** Three WAF custom
+8. **Maintenance rules (the breaker, stow#453).** Three WAF custom
    rules live on the zone's `http_request_firewall_custom` phase and are
    the anonymous-traffic breaker — a blocked request never invokes the
    Worker, so the shed costs nothing and a broken edge cannot keep it
@@ -257,10 +283,7 @@ The `prepare` job uploads the new Worker version without deploying it —
 `skyzen deploy --upload-only` plans `wrangler versions upload`, and the
 declared `[[secret]]` values travel in the same upload through
 `--secrets-file` — then adds it to the deployment at `0%` so that
-version overrides reach it, runs `stow-admin scheduler migrate` against
-the candidate via the `Cloudflare-Workers-Version-Overrides` header
-(the scheduler schema version stamp must equal the candidate's own
-`SCHEMA_VERSION`, else the deploy fails before any traffic shifts),
+version overrides reach it, then
 fires the synthetic suite through the same override — 50 requests on the
 candidate interleaved with 50 on the baseline across the site, crate
 lookup, artifact HEAD, stats and scheduler status paths, the floor the
