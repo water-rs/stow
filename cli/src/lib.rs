@@ -486,7 +486,13 @@ async fn compile(
     if let Some(target) = mark_target {
         log_nonfatal_result(
             "failed to record a locally built crate for this build",
-            provenance::record_local_build(policy_dir, target, &parsed.crate_name).await,
+            provenance::record_local_build(
+                policy_dir,
+                target,
+                &parsed.crate_name,
+                &parsed.extra_filename,
+            )
+            .await,
         );
     }
     Outcome::Compile(Box::new(PostCompile {
@@ -1082,6 +1088,7 @@ impl supervisor::server::Handler for BuildSupervisor {
                     self.ctx.policy_dir.as_deref(),
                     &target,
                     &parsed.crate_name,
+                    &parsed.extra_filename,
                 )
                 .await,
             );
@@ -1304,6 +1311,14 @@ async fn decide_rustc_invocation(
         .await;
     };
     if must_build_locally(&parsed, &env.target, ctx.policy_dir.as_deref()) {
+        record_unit_outcome(
+            &env.env_base.config,
+            &parsed,
+            &env.target,
+            &env.rustc_version,
+            UnitOutcome::LocalDependencyBuild,
+        )
+        .await;
         return compile(
             rustc,
             &parsed,
@@ -2150,6 +2165,11 @@ enum UnitOutcome {
     Error,
     GlibcRefusal,
     Miss,
+    /// The unit never reached a lookup: a dependency cargo hands it was
+    /// compiled locally in this build, so its cached copy — compiled
+    /// against CI's copy of that dependency — could not serve it
+    /// (stow#734).
+    LocalDependencyBuild,
 }
 
 impl UnitOutcome {
@@ -2181,7 +2201,9 @@ impl UnitOutcome {
 /// would report the project's own crates as failures and make a healthy
 /// build look broken in the post-build summary. A glibc refusal is not
 /// a miss either: the artifact exists, so counting it as one would
-/// enqueue a build whose product cannot serve this host either.
+/// enqueue a build whose product cannot serve this host either. The
+/// registry gate covers the local-dependency outcome the same way: a
+/// non-registry unit could never have been served, so it joins no count.
 async fn record_unit_outcome(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -2213,6 +2235,14 @@ async fn record_unit_outcome(
                     target,
                     rustc_version,
                     "stow cache miss, falling back to rustc"
+                );
+            }
+        }
+        UnitOutcome::LocalDependencyBuild => {
+            if detect_registry_crate_version(parsed).is_ok_and(|version| version.is_some()) {
+                log_nonfatal_result(
+                    "failed to record rust local-dependency build stats",
+                    stats::record_local_dependency_build(config, &parsed.crate_name).await,
                 );
             }
         }
@@ -2303,6 +2333,14 @@ async fn decide_local_only(
         }
     };
     if must_build_locally(parsed, &target, ctx.policy_dir.as_deref()) {
+        record_unit_outcome(
+            &local_base.config,
+            parsed,
+            &target,
+            &local_base.rustc_version,
+            UnitOutcome::LocalDependencyBuild,
+        )
+        .await;
         return compile(
             rustc,
             parsed,
