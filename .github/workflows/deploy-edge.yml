@@ -250,6 +250,10 @@ jobs:
       # in the same window — organic traffic is never required. The
       # bundle probe is a well-formed digest miss (an all-zero digest
       # nobody published, so 404 is fine — it is not an error).
+      # The zone cache sits in front of the Worker (a Custom Domain) and its
+      # key ignores the override header, so every probe carries a query
+      # string unique to the run and probe: a cached response would
+      # invoke neither version (stow#749).
       - name: Synthetic suite against the candidate and baseline
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
@@ -259,6 +263,7 @@ jobs:
           cand="stow-edge=\"$CANDIDATE_VERSION\""
           base="stow-edge=\"$BASELINE_VERSION\""
           probes=$((SUITE_REQUESTS / 5))
+          probe=0
           for _ in $(seq "$probes"); do
             for url in "/" \
               "/api/v1/crates/serde/versions" \
@@ -266,9 +271,10 @@ jobs:
               "/api/v1/stats" \
               "/api/v1/scheduler/status"; do
               for override in "$cand" "$base"; do
+                probe=$((probe + 1))
                 code=$(curl -sS -o /dev/null -w '%{http_code}' --retry 2 \
                   -H "Cloudflare-Workers-Version-Overrides: $override" \
-                  "$STOW_EDGE_URL$url")
+                  "$STOW_EDGE_URL$url?deploy-suite=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$probe")
                 case "$code" in
                   2*|404) ;;
                   *) echo "::error::suite probe $url answered $code" >&2; exit 1 ;;
