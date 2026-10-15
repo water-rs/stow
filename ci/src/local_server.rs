@@ -569,7 +569,6 @@ async fn populate_mock_registry(
     workflow_run_id: u64,
     layout: &DispatchLayout,
 ) -> stow_types::error::Result<()> {
-    let registry_sqlite = layout.task_root.join("mock-registry.sqlite");
     let mock_registry_exe = exe
         .parent()
         .ok_or_else(|| {
@@ -591,8 +590,6 @@ async fn populate_mock_registry(
         .arg(&layout.upload_plan_path)
         .arg("--registry-root")
         .arg(PathBuf::from(&state.mock_registry_root))
-        .arg("--sqlite")
-        .arg(&registry_sqlite)
         .arg("--private-key")
         .arg(PathBuf::from(&state.mock_private_key_path))
         .arg("--public-key")

@@ -476,7 +476,7 @@ expect_unfinished() { # hour state staged_pages
 expect_query_delta() { # expected_new_queries hour
     local count
     count="$(query_count)"
-    [ "$count" = "$1" ] || die "provider query count is $count, expected $1"
+    [ "$count" -eq "$1" ] || die "provider query count is $count, expected $1"
     [ "$(jq -r '.hour' "$QUERY_LOG" | tail -1)" = "$2" ] \
         || die "last provider query was not for $2"
 }
