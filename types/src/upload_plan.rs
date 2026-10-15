@@ -61,8 +61,7 @@ pub struct PlannedArtifact {
     /// The unit shape the builder recorded for this artifact — which side
     /// of the host/target boundary it serves, the cargo invocation
     /// spelling that produced it, and whether it links.
-    #[serde(default)]
-    pub unit_shape: Option<crate::public_cache::UnitShape>,
+    pub unit_shape: crate::public_cache::UnitShape,
     /// Optional native (C/C++) artifacts captured from the build script.
     pub native: Option<NativeArtifacts>,
     /// The packed `OUT_DIR` tree for `native`, pushed as an extra OCI layer
@@ -141,7 +140,7 @@ pub fn build_artifact_records(
             version: plan.crate_version.clone(),
             features_json: plan.features_json.clone(),
             dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
-            dependency_identity: Some(plan.dependency_identity.clone()),
+            dependency_identity: plan.dependency_identity.clone(),
             oci_reference: plan.oci_reference.clone(),
             oci_digest: published.oci_digest.clone(),
             has_native: plan.native.is_some(),

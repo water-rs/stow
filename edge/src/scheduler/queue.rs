@@ -329,8 +329,7 @@ struct BatchedNodeRow {
 
 /// One stored edge's readiness as probed for an insert chunk: whether
 /// the dep's required publication is missing (`unpub`) and whether that
-/// edge also blocks (`blocker` — the dep failed, names no crate, or
-/// carries an unresolved legacy side).
+/// edge also blocks (`blocker` — the dep failed).
 #[derive(Debug, skyzen::FromRow)]
 struct EdgeFlag {
     owner: String,
@@ -656,8 +655,7 @@ async fn apply_batched_inserts(
             .query(&format!(
                 "SELECT d.task_id AS owner, \
                         CASE WHEN {unpub} THEN 1 ELSE 0 END AS unpub, \
-                        CASE WHEN bdep.status = 'failed' OR d.dep_crate_name = '' \
-                                  OR d.dep_host_side < 0 \
+                        CASE WHEN bdep.status = 'failed' \
                              THEN 1 ELSE 0 END AS blocker \
                  FROM queue_dependencies d \
                  LEFT JOIN queue bdep ON bdep.task_id = d.depends_on_task_id \
@@ -1327,9 +1325,7 @@ fn plan_enqueue(
             // A task id commits to its whole dependency subgraph, so a
             // task's edge set is a function of the id (stow#588): edges
             // are written only for the row this request inserts — a
-            // re-enqueue of an existing id can carry nothing new, and
-            // pre-v15 `dep_side_known != 1` rows are the migration's
-            // job, never the request path's.
+            // re-enqueue of an existing id can carry nothing new.
             if !entry.deps.is_empty() {
                 let edges = dep_edges(entry)?;
                 plan.edge_inserts.insert(entry.task_id.clone(), edges);
@@ -2804,10 +2800,7 @@ async fn request_record_status(
 ///   dependent — which compiles deps under both spellings — both.
 ///
 /// `p.unit_invocation + 1` maps the stored invocation (0 = native,
-/// 1 = `--target`) onto its bit. Rows reported before the unit-shape
-/// columns existed carry `-1` legs: they match no clause, so a
-/// shapeless dep stays gated until the node republishes — legacy rows
-/// are unreachable under this lookup, never migrated into it.
+/// 1 = `--target`) onto its bit.
 pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
     // The live generation is a scalar lookup on the slice marker's
     // primary key `(target, rustc_version)`, so each edge probes one
@@ -2828,13 +2821,10 @@ pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
 /// one caller that already knows it: the slice-commit gate delta, where
 /// a correlated probe would re-seek the same marker row once per edge.
 fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
-    // Keep legacy -1 shape legs out of coverage. The integer enums are
-    // stored as 0/1 and legacy rows as -1, so BETWEEN is equivalent to
-    // the accepted domain while letting SQLite retain a bounded suffix
-    // range on the published-row primary key.
+    // The BETWEEN bounds are the enum domains phrased so SQLite keeps a
+    // bounded suffix range on the published-row primary key.
     format!(
-        "({dep}.dep_shapes = 0 \
-         OR (SELECT count(*) \
+        "(SELECT count(*) \
              FROM published_slice_rows p \
              WHERE p.target = {dep}.dep_target \
                AND p.rustc_version = {dep}.dep_rustc_version \
@@ -2848,7 +2838,7 @@ fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
                AND p.unit_linked BETWEEN 0 AND 1 \
                AND ({dep}.dep_host_side = 0 OR p.unit_linked = 1) \
                AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
-            ) < {dep}.dep_shapes)"
+            ) < {dep}.dep_shapes"
     )
 }
 
@@ -2894,8 +2884,7 @@ pub(super) fn deps_met_sql(owner_task: &str) -> String {
 }
 
 /// `blocked` as a SQL expression over the owner's row: `1` while a
-/// pending row owns an edge whose dep failed or was never resolved
-/// (`dep_crate_name = ''`, `dep_host_side < 0`) AND whose required units
+/// pending row owns an edge whose dep failed AND whose required units
 /// the live published slice does not serve — exactly the predicate the
 /// derived `blocked` status evaluated per row on every read before the
 /// flag existed. Written wherever `deps_met` is, and refreshed on the
@@ -2908,8 +2897,7 @@ pub(super) fn blocked_sql(owner_task: &str) -> String {
             SELECT 1 FROM queue_dependencies bd \
             LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = {owner_task} \
-              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' \
-                   OR bd.dep_host_side < 0) \
+              AND bdep.status = 'failed' \
               AND bd.dep_met = 0 \
         ) THEN 1 ELSE 0 END"
     )
@@ -4006,17 +3994,15 @@ fn effective_status_sql() -> String {
 }
 
 /// The first blocking edge a pending row names — the `blocked_by`
-/// companion to [`effective_status_sql`]. A failed dependency reports
-/// its task id; an edge whose identity was never resolved reports
-/// `unknown dependency identity`, since no task names it.
+/// companion to [`effective_status_sql`]: the failed dependency's task
+/// id.
 fn blocked_by_sql() -> String {
     "CASE WHEN queue.status = 'pending' AND queue.blocked != 0 THEN ( \
-        SELECT CASE WHEN bd.dep_crate_name = '' THEN 'unknown dependency identity' \
-                    ELSE bd.depends_on_task_id END \
+        SELECT bd.depends_on_task_id \
             FROM queue_dependencies bd \
-            LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = queue.task_id \
-              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' OR bd.dep_host_side < 0) \
+              AND bdep.status = 'failed' \
               AND bd.dep_met = 0 \
             ORDER BY bd.depends_on_task_id LIMIT 1 \
     ) END"
@@ -5991,19 +5977,17 @@ struct GateIdentity {
     crate_name: String,
     version: String,
     features_json: String,
-    dependency_identity: Option<String>,
+    dependency_identity: String,
     unit_side: i64,
     kind: Option<SliceChangeKind>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct NormalizedGateRow {
     crate_name: String,
     version: String,
     features_json: String,
-    /// `None` serializes as JSON null — the match join's `=` never
-    /// binds it, so a context-free row flips no edge (stow#588).
-    dependency_identity: Option<String>,
+    dependency_identity: String,
     unit_side: i64,
     invocations: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6049,23 +6033,35 @@ fn slice_row_key(row: &SliceRowJson) -> (String, String, String, String, i64, i6
     )
 }
 
+/// Fold changed slice rows into the gate's per-`(crate identity,
+/// side)` invocation masks. A stored leg outside its enum — a `-1`
+/// included — is corruption (stow#730): the decode fails loudly rather
+/// than dropping the row from the edge-refresh set. A host-side row
+/// that does not link is a real but useless shape — the gate never
+/// requires it — so it folds to nothing.
 fn normalize_gate_rows(
     rows: impl IntoIterator<Item = (SliceRowJson, Option<SliceChangeKind>)>,
-) -> Vec<NormalizedGateRow> {
+) -> Result<Vec<NormalizedGateRow>, QueueError> {
     let mut normalized = std::collections::BTreeMap::<GateIdentity, i64>::new();
     for (row, kind) in rows {
+        let invalid = |leg: &str, value: i64| {
+            QueueError::Invariant(format!(
+                "published slice row {}/{}/{}: {leg} = {value} is off-enum",
+                row.crate_name, row.version, row.features_json
+            ))
+        };
         let Some(invocation) =
             stow_types::public_cache::UnitInvocation::from_int(row.unit_invocation)
         else {
-            continue;
+            return Err(invalid("unit_invocation", row.unit_invocation));
         };
         let Some(side) = stow_types::public_cache::UnitSide::from_int(row.unit_side) else {
-            continue;
+            return Err(invalid("unit_side", row.unit_side));
         };
         let linked = match row.unit_linked {
             0 => false,
             1 => true,
-            _ => continue,
+            _ => return Err(invalid("unit_linked", row.unit_linked)),
         };
         if side == stow_types::public_cache::UnitSide::Host && !linked {
             continue;
@@ -6074,14 +6070,14 @@ fn normalize_gate_rows(
             crate_name: row.crate_name,
             version: row.version,
             features_json: row.features_json,
-            dependency_identity: Some(row.dependency_identity),
+            dependency_identity: row.dependency_identity,
             unit_side: side.to_int(),
             kind,
         };
         let bit = 1_i64 << invocation.to_int();
         *normalized.entry(identity).or_default() |= bit;
     }
-    normalized
+    Ok(normalized
         .into_iter()
         .map(|(identity, invocations)| NormalizedGateRow {
             crate_name: identity.crate_name,
@@ -6092,13 +6088,13 @@ fn normalize_gate_rows(
             invocations,
             kind: identity.kind,
         })
-        .collect()
+        .collect())
 }
 
 fn normalized_gate_json(
     rows: impl IntoIterator<Item = (SliceRowJson, Option<SliceChangeKind>)>,
 ) -> Result<Option<String>, QueueError> {
-    let normalized = normalize_gate_rows(rows);
+    let normalized = normalize_gate_rows(rows)?;
     if normalized.is_empty() {
         return Ok(None);
     }
@@ -6242,10 +6238,9 @@ struct LiveSliceRow {
 }
 
 /// Map report rows onto the stored 6-column identity — `rowid` zeroes
-/// out (only live-read rows carry one) and a missing unit shape writes
-/// the `-1` legs that satisfy no coverage clause. Every report row
-/// carries a digest: `PublishedSliceRow.dependency_identity` is
-/// required on the wire, so this map cannot fail on identity.
+/// out (only live-read rows carry one). Every report row carries a
+/// digest and a unit shape: both are required on the wire, so this map
+/// cannot fail.
 fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
     rows.iter()
         .map(|row| SliceRowJson {
@@ -6253,9 +6248,9 @@ fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
             version: row.version.to_string(),
             features_json: row.features_json.raw(),
             dependency_identity: row.dependency_identity.to_string(),
-            unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
-            unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
-            unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
+            unit_side: row.unit_shape.side.to_int(),
+            unit_invocation: row.unit_shape.invocation.to_int(),
+            unit_linked: row.unit_shape.kind.to_int(),
             rowid: 0,
         })
         .collect()
@@ -6602,9 +6597,7 @@ async fn apply_slice_gate_delta(
              WHERE queue_dependencies.rowid = answers.rid \
                AND answers.old_met != answers.new_met \
              RETURNING queue_dependencies.task_id, queue_dependencies.dep_met, \
-                       CASE WHEN queue_dependencies.dep_crate_name = '' \
-                                  OR queue_dependencies.dep_host_side < 0 \
-                                  OR EXISTS ( \
+                       CASE WHEN EXISTS ( \
                                       SELECT 1 FROM queue bdep \
                                       WHERE bdep.task_id = queue_dependencies.depends_on_task_id \
                                         AND bdep.status = 'failed' \
@@ -6676,7 +6669,7 @@ async fn apply_slice_gate_delta(
 /// migration right after `skyzen deploy`, while the previous build may
 /// still be serving requests, so nothing the running code reads may
 /// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// The version-4 queue step on top of #470's version-3 tables: the
 /// persisted dispatch-gate forms — `deps_met` (the dependency gate's
@@ -6853,7 +6846,7 @@ pub async fn migrate(
         });
     }
     migrate_queue_dependencies_columns(db).await?;
-    migrate_published_slice_row_shape(db).await?;
+    drop_shapeless_slice_rows(db).await?;
     migrate_published_slice_columns(db).await?;
     migrate_dispatch_gate(db, settings).await?;
     migrate_generation_identity(db, settings).await?;
@@ -7802,26 +7795,14 @@ async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
     Ok(())
 }
 
-/// A `queue_dependencies` edge whose shape mask was never written —
-/// joined to its owner task's identity so the migration can recompute
-/// the same values the enqueue's dependency resync writes.
-#[derive(Debug, skyzen::FromRow)]
-struct UnmaskedEdge {
-    task_id: String,
-    depends_on_task_id: String,
-    owner_target: Option<String>,
-    owner_host_side: Option<i64>,
-    dep_target: String,
-    dep_host_side: i64,
-}
-
 /// Columns added to `queue_dependencies` after the table first shipped:
 /// the dependency's semantic identity, denormalized so the published-slice
-/// gate reads it without the dependency's queue row. Rows written before
-/// the columns existed backfill from the queue row their
-/// `depends_on_task_id` still points at; an edge whose dependency left
-/// the queue keeps '' and never satisfies the gate. `dep_host_side`
-/// defaults to the target-side requirement the gate always applied.
+/// gate reads it without the dependency's queue row. Edges written before
+/// the columns existed are invalid under stow#730 — every current writer
+/// supplies the resolved identity, the side, the shape mask and the
+/// digest — so instead of healing them the migration audits for their
+/// markers and fails: the store's owner resets it rather than carry rows
+/// whose gate answers were computed under the old model.
 async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueError> {
     let columns = db
         .query("PRAGMA table_info(queue_dependencies)")
@@ -7853,25 +7834,6 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
             .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
         }
     }
-    // The identity backfill is gated on the never-written marker rather
-    // than on whether the ALTERs just ran: an edge whose dep resolves
-    // but whose `dep_crate_name` is still '' was missed by a pass that
-    // died mid-block, while an already-backfilled edge always carries a
-    // real name and an unresolved one fails the EXISTS — so re-running
-    // costs the unresolved set, once, and the pass stays idempotent.
-    db.query(
-        "UPDATE queue_dependencies SET \
-            dep_crate_name = (SELECT crate_name FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_version = (SELECT version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_features_json = (SELECT features_json FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_target = (SELECT target FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_rustc_version = (SELECT rustc_version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id) \
-         WHERE dep_crate_name = '' \
-           AND EXISTS (SELECT 1 FROM queue WHERE task_id = queue_dependencies.depends_on_task_id)",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("backfill queue_dependencies identity columns: {error}"))?;
     if !columns.contains("dep_host_side") {
         db.query(
             "ALTER TABLE queue_dependencies ADD COLUMN dep_host_side INTEGER NOT NULL DEFAULT 0",
@@ -7900,9 +7862,9 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
                 .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
         }
     }
-    // The dep's contextual digest (stow#588): nullable on purpose —
-    // edges written before the identity model carry NULL, and NULL
-    // satisfies no coverage clause.
+    // The dep's contextual digest (stow#588): the ALTER stays nullable
+    // because SQLite cannot add a NOT NULL column without a default;
+    // the audit below rejects any NULL it leaves behind.
     if !columns.contains("dep_dependency_identity") {
         db.query("ALTER TABLE queue_dependencies ADD COLUMN dep_dependency_identity TEXT")
             .execute()
@@ -7926,34 +7888,52 @@ async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueE
             .map_err(|error| format!("add queue_dependencies.dep_met column: {error}"))?;
     }
     migrate_queue_dependencies_indexes(db).await?;
-    derive_dev_era_edge_sides(db).await?;
-    backfill_dev_era_edge_masks(db).await
+    audit_edge_identity_columns(db).await
+}
+
+/// The stow#730 contract: every stored edge carries its dep's semantic
+/// identity, resolved side, invocation mask and Merkle digest. The
+/// markers the retired derivations wrote or left — `''` name, `-1`
+/// side, `0` mask, NULL digest, unmarked side — mean the row predates
+/// the model; rather than guess its values the migration refuses the
+/// store, since the gate cannot answer for an edge it cannot read.
+async fn audit_edge_identity_columns(db: &DurableDb) -> Result<(), QueueError> {
+    let invalid = db
+        .query(
+            "SELECT COUNT(*) FROM queue_dependencies \
+             WHERE dep_crate_name = '' OR dep_host_side < 0 OR dep_invocations = 0 \
+                OR dep_dependency_identity IS NULL OR dep_side_known = 0",
+        )
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("audit queue_dependencies identity columns: {error}"))?;
+    if invalid != 0 {
+        return Err(QueueError::Invariant(format!(
+            "queue_dependencies holds {invalid} edges that predate the dep identity/side \
+             model (stow#730) — the store must be reset, not read"
+        )));
+    }
+    Ok(())
 }
 
 /// The indexes this migration's columns make possible — kept out of
 /// `schema.sql` because a dev-era edges table only gains the columns
-/// here. The two marker selects (`dep_side_known = 0`,
-/// `dep_invocations = 0`) scanned every edge in the queue without them
-/// (stow#432); the unresolved-edge and slice probes serve the request
-/// paths that read them, and `dep_match` bounds the publish delta's
-/// dependent refresh to the rows a report actually changed.
+/// here. The marker indexes the retired derivations scanned through
+/// (`dep_side_known = 0`, `dep_invocations = 0`, unresolved edges) have
+/// no reader left, so they drop; the slice and `dep_match` probes serve
+/// the request paths that read them.
 async fn migrate_queue_dependencies_indexes(db: &DurableDb) -> Result<(), QueueError> {
+    for index in [
+        "idx_queue_dependencies_side_unknown",
+        "idx_queue_dependencies_unmasked",
+        "idx_queue_dependencies_unresolved",
+    ] {
+        db.query(&format!("DROP INDEX IF EXISTS {index}"))
+            .execute()
+            .await
+            .map_err(|error| format!("drop retired edge index {index}: {error}"))?;
+    }
     for (statement, error) in [
-        (
-            "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_side_unknown \
-             ON queue_dependencies(task_id) WHERE dep_side_known = 0",
-            "index edges with an unknown side",
-        ),
-        (
-            "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_unmasked \
-             ON queue_dependencies(task_id) WHERE dep_invocations = 0",
-            "index edges without a shape mask",
-        ),
-        (
-            "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_unresolved \
-             ON queue_dependencies(task_id) WHERE dep_crate_name = '' OR dep_host_side < 0",
-            "index unresolved dependency edges",
-        ),
         (
             "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_slice \
              ON queue_dependencies(dep_target, dep_rustc_version, task_id)",
@@ -7971,150 +7951,6 @@ async fn migrate_queue_dependencies_indexes(db: &DurableDb) -> Result<(), QueueE
             .map_err(|e| format!("{error}: {e}"))?;
     }
     Ok(())
-}
-
-/// Edges written before the columns carried no required-shape set:
-/// recompute each one's mask from its owner task's identity — the
-/// same values the enqueue's dependency resync writes.
-/// `dep_invocations = 0` marks an unbackfilled edge (every mask
-/// `dep_edge_requirements` produces is non-zero), so the backfill
-/// stands on the rows themselves rather than on which ALTERs just
-/// ran: a retry after a migration that committed the column adds but
-/// failed mid-backfill heals here instead of gating dependents on a
-/// permanently-zero mask.
-async fn backfill_dev_era_edge_masks(db: &DurableDb) -> Result<(), QueueError> {
-    let edges = db
-        .query(
-            "SELECT d.task_id, d.depends_on_task_id, \
-                    q.target AS owner_target, q.host_side AS owner_host_side, \
-                    d.dep_target, d.dep_host_side \
-             FROM queue_dependencies d \
-             LEFT JOIN queue q ON q.task_id = d.task_id \
-             WHERE d.dep_invocations = 0",
-        )
-        .fetch_all::<UnmaskedEdge>()
-        .await
-        .map_err(|error| format!("load unmasked dependency edges: {error}"))?;
-    for edge in edges {
-        // An edge whose owner row is gone takes the requirement
-        // for a masked-off owner — moot on a task that no longer
-        // exists.
-        let (mask, shapes) = dep_edge_requirements(
-            edge.owner_target.as_deref().unwrap_or(""),
-            edge.owner_host_side.unwrap_or(0) != 0,
-            edge.dep_target.as_str(),
-            edge.dep_host_side != 0,
-        );
-        db.query(
-            "UPDATE queue_dependencies \
-             SET dep_invocations = ?, dep_shapes = ? \
-             WHERE task_id = ? AND depends_on_task_id = ?",
-        )
-        .bind(mask)
-        .bind(shapes)
-        .bind(edge.task_id)
-        .bind(edge.depends_on_task_id)
-        .execute()
-        .await
-        .map_err(|error| format!("backfill dependency edge shape mask: {error}"))?;
-    }
-    Ok(())
-}
-
-/// Edges written before the side model carry `dep_host_side = 0` — the
-/// wire could not name a side, so the required side is derived from the
-/// only honest signal left: where the dep's task minted relative to the
-/// owner's target and the family's host triple. `dep_side_known` runs
-/// the derivation exactly once — resolver-written edges carry 1.
-async fn derive_dev_era_edge_sides(db: &DurableDb) -> Result<(), QueueError> {
-    let side_edges = db
-        .query(
-            "SELECT d.task_id, d.depends_on_task_id, \
-                    q.target AS owner_target, q.host_side AS owner_host_side, \
-                    d.dep_target, d.dep_host_side \
-             FROM queue_dependencies d \
-             LEFT JOIN queue q ON q.task_id = d.task_id \
-             WHERE d.dep_side_known = 0",
-        )
-        .fetch_all::<UnmaskedEdge>()
-        .await
-        .map_err(|error| format!("load unestablished dependency edges: {error}"))?;
-    for edge in &side_edges {
-        let owner_target = edge.owner_target.as_deref().unwrap_or("");
-        let owner_host_side = edge.owner_host_side.unwrap_or(0) != 0;
-        let side = derive_edge_side(owner_target, owner_host_side, &edge.dep_target);
-        // The mask is moot on a -1 edge — `p.unit_side = -1` matches no
-        // published row — but a non-zero shape count keeps the edge out
-        // of the unbackfilled-0 marker class.
-        let (mask, shapes) =
-            dep_edge_requirements(owner_target, owner_host_side, &edge.dep_target, side > 0);
-        db.query(
-            "UPDATE queue_dependencies \
-             SET dep_host_side = ?, dep_invocations = ?, dep_shapes = ?, dep_side_known = 1 \
-             WHERE task_id = ? AND depends_on_task_id = ?",
-        )
-        .bind(side)
-        .bind(mask)
-        .bind(shapes)
-        .bind(edge.task_id.clone())
-        .bind(edge.depends_on_task_id.clone())
-        .execute()
-        .await
-        .map_err(|error| format!("derive dependency edge side: {error}"))?;
-        // `dep_met` is a stored answer the request path only writes at
-        // edge insert — nothing else re-evaluates a derived edge until
-        // a slice delta happens to touch it, so recount it here with
-        // the same EXISTS the insert evaluates (a second statement:
-        // a SET expression sees the row's old values).
-        db.query(&format!(
-            "UPDATE queue_dependencies \
-             SET dep_met = CASE WHEN {unpub} THEN 0 ELSE 1 END \
-             WHERE task_id = ? AND depends_on_task_id = ?",
-            unpub = dep_edge_unpublished_sql("queue_dependencies"),
-        ))
-        .bind(edge.task_id.clone())
-        .bind(edge.depends_on_task_id.clone())
-        .execute()
-        .await
-        .map_err(|error| format!("recount derived edge coverage: {error}"))?;
-    }
-    // The owners' stored counters (`unpublished_deps`/`deps_met`/
-    // `blocked`) follow from the edges just rewritten — recount them
-    // on exactly those rows.
-    let owner_ids: Vec<String> = side_edges.iter().map(|edge| edge.task_id.clone()).collect();
-    refresh_deps_met_tasks(db, &owner_ids).await?;
-    Ok(())
-}
-
-/// The required side a pre-side-model edge left derivable: the dep's own
-/// target says which task minted it — a host dep mints on the owner
-/// family's host triple, a target dep on the owner's target. Where the
-/// two coincide nothing in the row distinguishes them, so the edge's
-/// side stays unestablished (-1) until the resolver rewrites it.
-fn derive_edge_side(owner_target: &str, owner_host_side: bool, dep_target: &str) -> i64 {
-    if owner_host_side {
-        // A host-side node's whole dependency subtree compiles host-side.
-        return 1;
-    }
-    let host_triple = stow_types::api::runner_family(owner_target)
-        .map_or(owner_target, |family| family.host_triple());
-    if dep_target == host_triple && dep_target != owner_target {
-        // A cross owner's dep on the family host triple can only be a
-        // host unit — its target deps mint on its own target.
-        1
-    } else if dep_target == owner_target && dep_target != host_triple {
-        // A dep on the owner's own target off the family host triple
-        // can only be a target unit.
-        0
-    } else {
-        // dep_target == owner_target == host_triple is ambiguous — a
-        // lib's target dep and a proc-macro's host dep mint alike — and
-        // a dep matching neither is a corrupt edge. Either way the side
-        // was never established; -1 satisfies no gate clause, so the
-        // dependent waits for the resolver to rewrite the edge rather
-        // than dispatching on a guess.
-        -1
-    }
 }
 
 /// `host_side` is part of the queue's `UNIQUE` identity — `SQLite` cannot
@@ -8169,47 +8005,21 @@ async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
     Ok(())
 }
 
-/// `unit_side`/`unit_invocation`/`unit_linked` key each row's unit
-/// shape — a crate legitimately serves one row per shape its consumers
-/// compile — so the table is rebuilt the same way `host_side` rebuilt
-/// the queue. Rows copy back with `-1` legs — shapeless: a row reported
-/// before the columns existed covers nothing under the gate, so a
-/// dependent behind one waits for the slice's next publish rather than
-/// releasing on membership alone.
-async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueError> {
-    let columns = db
-        .query("PRAGMA table_info(published_slice_rows)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load published_slice_rows table_info: {error}"))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-    if columns.is_empty() || columns.contains("unit_side") {
-        return Ok(());
-    }
-    tracing::warn!("migrating scheduler published_slice_rows: adding the unit-shape key");
-    db.query("ALTER TABLE published_slice_rows RENAME TO published_slice_rows_migrated")
-        .execute()
-        .await
-        .map_err(|error| format!("rename published_slice_rows for shape migration: {error}"))?;
-    db.query(include_str!("schema.sql"))
-        .execute()
-        .await
-        .map_err(|error| format!("recreate published_slice_rows with shape key: {error}"))?;
+/// Drop `published_slice_rows` whose shape legs fall outside the enum
+/// domains — `-1` included. Reports since stow#368 carry a real shape,
+/// so such a row predates it and is invalid under stow#730; deleting is
+/// exact rather than lossy because an off-enum leg already matched no
+/// coverage clause, and the next report rewrites membership anyway.
+async fn drop_shapeless_slice_rows(db: &DurableDb) -> Result<(), QueueError> {
     db.query(
-        "INSERT INTO published_slice_rows \
-         (target, rustc_version, generation, crate_name, version, features_json) \
-         SELECT target, rustc_version, generation, crate_name, version, features_json \
-         FROM published_slice_rows_migrated",
+        "DELETE FROM published_slice_rows \
+         WHERE unit_side NOT BETWEEN 0 AND 1 \
+            OR unit_invocation NOT BETWEEN 0 AND 1 \
+            OR unit_linked NOT BETWEEN 0 AND 1",
     )
     .execute()
     .await
-    .map_err(|error| format!("copy slice rows for shape migration: {error}"))?;
-    db.query("DROP TABLE published_slice_rows_migrated")
-        .execute()
-        .await
-        .map_err(|error| format!("drop migrated slice-row copy: {error}"))?;
+    .map_err(|error| format!("drop off-enum published_slice_rows: {error}"))?;
     Ok(())
 }
 
@@ -8359,7 +8169,6 @@ async fn requeue_incomplete_shape_deps(
            AND EXISTS ( \
                SELECT 1 FROM queue_dependencies d \
                WHERE d.depends_on_task_id = queue.task_id \
-                 AND d.dep_crate_name != '' AND d.dep_host_side >= 0 \
                  AND d.dep_met = 0 \
            ) \
          RETURNING task_id",
@@ -8541,7 +8350,7 @@ struct GitHubAppTokenRow {
 mod tests {
     use super::{
         AlarmInputs, AlarmPlan, DispatchCapacity, SliceChangeKind, SliceRowJson,
-        normalize_gate_rows, normalized_gate_json, plan_alarm, seconds_until_utc_midnight,
+        normalize_gate_rows, plan_alarm, seconds_until_utc_midnight,
     };
     const NOW_MS: i64 = 1_000_000;
 
@@ -8573,10 +8382,8 @@ mod tests {
             (row(1, 0, 0), Some(SliceChangeKind::Added)),
             (row(1, 0, 1), Some(SliceChangeKind::Added)),
             (row(1, 1, 1), Some(SliceChangeKind::Added)),
-            (row(-1, 0, 1), Some(SliceChangeKind::Added)),
-            (row(0, -1, 1), Some(SliceChangeKind::Added)),
         ];
-        let normalized = normalize_gate_rows(added);
+        let normalized = normalize_gate_rows(added).expect("normalize valid rows");
         let shapes = normalized
             .iter()
             .map(|row| (row.unit_side, row.invocations, row.kind))
@@ -8589,7 +8396,9 @@ mod tests {
             ]
         );
 
-        let retired = normalize_gate_rows([(row(0, 0, 1), Some(SliceChangeKind::Retired))]);
+        let retired =
+            normalize_gate_rows([(row(0, 0, 1), Some(SliceChangeKind::Retired))])
+                .expect("normalize retired row");
         assert_eq!(
             retired
                 .iter()
@@ -8598,17 +8407,21 @@ mod tests {
             vec![(0, 1, Some(SliceChangeKind::Retired))]
         );
 
-        let full = normalize_gate_rows([(row(0, 0, 0), None), (row(0, 1, 1), None)]);
+        let full =
+            normalize_gate_rows([(row(0, 0, 0), None), (row(0, 1, 1), None)]).expect("normalize");
         assert_eq!(
             full.iter()
                 .map(|row| (row.unit_side, row.invocations, row.kind))
                 .collect::<Vec<_>>(),
             vec![(0, 3, None)]
         );
-        assert_eq!(
-            normalized_gate_json([(row(-1, -1, -1), None)]).expect("normalize legacy rows"),
-            None
-        );
+        // Off-enum legs are corrupt storage (stow#730): an invariant
+        // error, not a skipped row.
+        for bad in [(-1, 0, 1), (0, -1, 1), (0, 0, 9)] {
+            let error = normalize_gate_rows([(row(bad.0, bad.1, bad.2), None)])
+                .expect_err("off-enum legs are an invariant failure");
+            assert!(error.to_string().contains("off-enum"), "{error}");
+        }
     }
 
     #[test]

@@ -318,7 +318,8 @@ mod tests {
         ArtifactBlobConfig {
             compile_key: "df1c5df8d44a9ede068e852b56a99270d4d6b905ee849e7f4861e2c13699f43e"
                 .to_owned(),
-            dependency_identity: None,
+            dependency_identity: crate::identity::DependencyIdentity::leaf()
+                .expect("leaf identity"),
             crate_name: CrateName::parse("proc-macro2").unwrap(),
             crate_version: "1.0.106".parse().unwrap(),
             c_metadata: CMetadata::parse("df1c5df8d44a9ede").unwrap(),

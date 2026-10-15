@@ -150,6 +150,7 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
         .bind(record.version.to_string())
         .bind(record.features_json.raw())
         .bind(record.dependency_c_metadata_json.raw())
+        .bind(record.dependency_identity.as_str())
         .bind(record.oci_reference.as_str())
         .bind(record.oci_digest.as_str())
         .bind(i32::from(record.has_native))
@@ -161,13 +162,9 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
         .bind(record.bundle_digest.as_str())
         .bind(bundle_size)
         .bind(compile_millis)
-        .bind(record.unit_shape.map_or(-1, |shape| shape.side.to_int()))
-        .bind(
-            record
-                .unit_shape
-                .map_or(-1, |shape| shape.invocation.to_int()),
-        )
-        .bind(record.unit_shape.map_or(-1, |shape| shape.kind.to_int()))
+        .bind(record.unit_shape.side.to_int())
+        .bind(record.unit_shape.invocation.to_int())
+        .bind(record.unit_shape.kind.to_int())
         .bind(min_glibc.as_str()))
 }
 
@@ -219,8 +216,11 @@ struct FullArtifactRow {
     bundle_digest: String,
     bundle_size: u64,
     compile_millis: u64,
-    /// The builder-recorded unit shape — `-1` on a row registered
-    /// before the columns existed.
+    /// The Merkle dependency digest the artifact was built under —
+    /// NULL on a row written before the column existed, which the
+    /// operator's resync removes rather than a read tolerating it
+    /// (stow#730).
+    dependency_identity: Option<String>,
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
@@ -262,34 +262,47 @@ struct DecodedArtifactColumns {
     emit: Vec<String>,
 }
 
-/// The stored unit-shape triplet decoded back to a [`UnitShape`]:
-/// `-1` on all three legs is the legacy marker — a row registered
-/// before the columns existed is shapeless and covers nothing.
-/// Anything else off-enum, or `-1` mixed with real values, is a corrupt
-/// row — an invariant violation, not a quiet miss.
+/// The stored unit-shape triplet decoded back to a [`UnitShape`]: any
+/// leg off-enum — a `-1` included — is a corrupt row, an invariant
+/// violation rather than a quiet miss (stow#730).
 ///
 /// # Errors
 ///
 /// Returns an invariant message for any corrupt triplet.
-fn decode_unit_shape(side: i64, invocation: i64, linked: i64) -> Result<Option<UnitShape>, String> {
-    if (side, invocation, linked) == (-1, -1, -1) {
-        return Ok(None);
-    }
+pub(crate) fn decode_unit_shape(
+    side: i64,
+    invocation: i64,
+    linked: i64,
+) -> Result<UnitShape, String> {
     match (
         UnitSide::from_int(side),
         UnitInvocation::from_int(invocation),
         stow_types::public_cache::UnitKind::from_int(linked),
     ) {
-        (Some(side), Some(invocation), Some(kind)) => Ok(Some(UnitShape {
+        (Some(side), Some(invocation), Some(kind)) => Ok(UnitShape {
             side,
             invocation,
             kind,
-        })),
+        }),
         _ => Err(format!(
-            "corrupt unit shape ({side}, {invocation}, {linked}): -1 is the \
-             legacy marker and must appear on all three legs or none"
+            "corrupt unit shape ({side}, {invocation}, {linked})"
         )),
     }
+}
+
+/// The stored dependency-identity string decoded back to the typed
+/// digest: NULL is a row written before the column existed — invalid
+/// under stow#730, which the operator's resync removes.
+///
+/// # Errors
+///
+/// Returns an invariant message on NULL or an invalid digest.
+fn decode_dependency_identity(
+    raw: Option<&str>,
+) -> Result<stow_types::identity::DependencyIdentity, String> {
+    let raw = raw.ok_or_else(|| "NULL dependency_identity".to_owned())?;
+    stow_types::identity::DependencyIdentity::parse(raw)
+        .map_err(|error| format!("invalid dependency_identity `{raw}`: {error}"))
 }
 
 /// Decode the identity and JSON columns every row read shares, so
@@ -380,10 +393,10 @@ impl FullArtifactRow {
             version: decoded.version,
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
-            // stow#588: the artifacts table stores no digest column —
-            // a row decoded here is the archive's older shape, so its
-            // contextual coverage answer is `None`.
-            dependency_identity: None,
+            dependency_identity: decode_dependency_identity(
+                self.dependency_identity.as_deref(),
+            )
+            .map_err(|error| invalid("dependency_identity", error))?,
             oci_reference: self.oci_reference,
             oci_digest: self.oci_digest,
             has_native: self.has_native != 0,
@@ -436,8 +449,9 @@ struct IndexArtifactRow {
     crate_types_json: String,
     profile_json: String,
     emit_json: String,
-    /// The builder-recorded unit shape — `-1` on a row registered
-    /// before the columns existed.
+    /// NULL on a row written before the column existed — invalid under
+    /// stow#730, which the operator's resync removes.
+    dependency_identity: Option<String>,
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
@@ -468,8 +482,15 @@ impl IndexArtifactRow {
             version: decoded.version,
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
-            // stow#588: same archive row shape — no digest column.
-            dependency_identity: None,
+            dependency_identity: decode_dependency_identity(
+                self.dependency_identity.as_deref(),
+            )
+            .map_err(|error| {
+                DbError::Invariant(format!(
+                    "artifact row {}/{}/{}: dependency_identity: {error}",
+                    self.c_metadata, self.target, self.rustc_version
+                ))
+            })?,
             c_metadata: decoded.c_metadata,
             compile_key: self.compile_key,
             bundle_digest: self.bundle_digest,
@@ -531,7 +552,7 @@ pub async fn artifact_index_page(
         .query(
             "SELECT crate_name, version, features_json, dependency_c_metadata_json, c_metadata, \
                     compile_key, target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
-                    crate_types_json, profile_json, emit_json, unit_side, unit_invocation, unit_linked, \
+                    crate_types_json, profile_json, emit_json, dependency_identity, unit_side, unit_invocation, unit_linked, \
                     min_glibc \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
@@ -558,7 +579,7 @@ const FULL_ARTIFACT_COLUMNS: &str = "compile_key, c_metadata, extra_filename, ta
      rustc_version, crate_name, version, features_json, dependency_c_metadata_json, \
      oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, \
      profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, \
-     unit_side, unit_invocation, unit_linked, min_glibc";
+     dependency_identity, unit_side, unit_invocation, unit_linked, min_glibc";
 
 /// How many bundled rows in one `(target, rustc_version)` slice still
 /// have no measured floor — the rows the index page's `min_glibc IS NOT
@@ -764,9 +785,6 @@ pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<
 /// pending rebuild that exists to replace it must not be retired as
 /// covered. Floors compare as `GlibcVersion`, never as text (`'2.4'`
 /// sorts above `'2.28'`); an unmeasured (NULL) row covers as before.
-/// Rows registered before the unit shape columns existed carry `-1` —
-/// shapeless, they match no required shape and the identity stays
-/// uncovered until the node rebuilds and re-registers.
 pub async fn covered_semantic_identities(
     db: &Db,
     identities: &[SemanticTaskIdentity],
@@ -836,25 +854,23 @@ async fn covered_batch(
         if floor.is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE) {
             continue;
         }
-        if let Some(shape) = decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
+        let shape = decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
             .map_err(|error| {
                 DbError::Invariant(format!(
                     "artifact row {}/{}: {error}",
                     row.target, row.rustc_version
                 ))
-            })?
-        {
-            shapes_by_identity
-                .entry((
-                    row.crate_name,
-                    row.version,
-                    row.features_json,
-                    row.target,
-                    row.rustc_version,
-                ))
-                .or_default()
-                .insert(shape);
-        }
+            })?;
+        shapes_by_identity
+            .entry((
+                row.crate_name,
+                row.version,
+                row.features_json,
+                row.target,
+                row.rustc_version,
+            ))
+            .or_default()
+            .insert(shape);
     }
     let mut covered = BTreeSet::new();
     for identity in batch {
@@ -1124,6 +1140,7 @@ pub async fn apply_migrations(db: &Db) {
         include_str!("../migrations/0009_unit_shape.sql"),
         include_str!("../migrations/0010_miss_host_side.sql"),
         include_str!("../migrations/0011_miss_subgraph.sql"),
+        include_str!("../migrations/0012_dependency_identity.sql"),
     ];
     for file in FILES {
         let sql = file
@@ -1180,13 +1197,18 @@ mod sqlite_tests {
 
     fn artifact_record_with(c_metadata: &str, oci_digest: &str) -> ArtifactRecord {
         ArtifactRecord {
-            dependency_identity: None,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity"),
             compile_key: format!("{c_metadata}{c_metadata}"),
             c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
             extra_filename: format!("-{c_metadata}"),
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
-            unit_shape: None,
+            unit_shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Native,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
             profile: Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 0,
@@ -1474,12 +1496,10 @@ mod sqlite_tests {
         // publishes are servable: the build unit and the check unit —
         // a second row at a different `c_metadata` (the check unit's
         // compile identity differs from the build unit's).
-        let unit_shape = |kind| {
-            Some(stow_types::public_cache::UnitShape {
-                side: stow_types::public_cache::UnitSide::Target,
-                invocation: stow_types::public_cache::UnitInvocation::Native,
-                kind,
-            })
+        let unit_shape = |kind| stow_types::public_cache::UnitShape {
+            side: stow_types::public_cache::UnitSide::Target,
+            invocation: stow_types::public_cache::UnitInvocation::Native,
+            kind,
         };
         let record = ArtifactRecord {
             unit_shape: unit_shape(stow_types::public_cache::UnitKind::Linked),
@@ -1555,11 +1575,11 @@ mod sqlite_tests {
             crate_name: CrateName::parse("heck").expect("name"),
             version: CrateVersion::new(semver::Version::parse("0.5.0").expect("version")),
             features_json: FeaturesJson::canonicalize(Vec::<String>::new()).expect("features"),
-            unit_shape: Some(stow_types::public_cache::UnitShape {
+            unit_shape: stow_types::public_cache::UnitShape {
                 side: stow_types::public_cache::UnitSide::Host,
                 invocation,
                 kind,
-            }),
+            },
             oci_reference: format!("{}.{}", base.oci_reference, c_metadata),
             ..base.clone()
         };
@@ -1655,11 +1675,11 @@ mod sqlite_tests {
                     extra_filename: format!("-{c_metadata_prefix}{i}"),
                     compile_key: format!("{c_metadata_prefix}{i}{c_metadata_prefix}{i}"),
                     version: CrateVersion::new(semver::Version::parse(version).expect("version")),
-                    unit_shape: Some(stow_types::public_cache::UnitShape {
+                    unit_shape: stow_types::public_cache::UnitShape {
                         side: stow_types::public_cache::UnitSide::Target,
                         invocation: stow_types::public_cache::UnitInvocation::Native,
                         kind: *kind,
-                    }),
+                    },
                     min_glibc,
                     oci_reference: format!(
                         "{}.{c_metadata_prefix}{i}",

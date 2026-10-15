@@ -150,7 +150,7 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
     let index_bytes = read(&request.file).await.map_err(|error| {
         stow_types::stow_error!("read index file {}: {error}", request.file.display())
     })?;
-    let index = stow_types::index::decode(&index_bytes).map_err(|error| {
+    let index = ArtifactIndex::decode(&index_bytes).map_err(|error| {
         stow_types::stow_error!("decode index file {}: {error}", request.file.display())
     })?;
     write_signed_index(
@@ -769,7 +769,7 @@ async fn write_mock_registry_entry(
         rustc_version: plan.rustc_version.clone(),
         features_json: plan.features_json.clone(),
         dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
-        dependency_identity: Some(plan.dependency_identity.clone()),
+        dependency_identity: plan.dependency_identity.clone(),
         dependency_compile_keys_json: plan.dependency_compile_keys_json.clone(),
         profile: plan.profile.clone(),
         emit: plan.emit.clone(),
@@ -2464,13 +2464,18 @@ mod tests {
                 version: "1.0.0".parse().expect("version"),
                 features_json: FeaturesJson::default(),
                 dependency_c_metadata_json: DependencyCMetadataJson::default(),
-                dependency_identity: None,
+                dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                    .expect("leaf identity"),
                 c_metadata: CMetadata::parse(C_METADATA).expect("c_metadata"),
                 compile_key: format!("{C_METADATA}{C_METADATA}"),
                 bundle_digest,
                 bundle_size: u64::try_from(bundle.len()).expect("bundle size"),
                 artifact_kind: ArtifactKind::Rlib,
-                unit_shape: None,
+                unit_shape: stow_types::public_cache::UnitShape {
+                    side: stow_types::public_cache::UnitSide::Target,
+                    invocation: stow_types::public_cache::UnitInvocation::Target,
+                    kind: stow_types::public_cache::UnitKind::Linked,
+                },
                 crate_types: vec![RustCrateType::Rlib],
                 profile: Profile {
                     opt_level: "0".to_owned(),
@@ -2623,7 +2628,11 @@ mod tests {
             features_json: FeaturesJson::default(),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             dependency_compile_keys_json: "[]".to_owned(),
-            unit_shape: None,
+            unit_shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Target,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
             profile: Profile {

@@ -1369,7 +1369,6 @@ pub const DRIVES: &[Drive] = &[
                            AND EXISTS ( \
                                SELECT 1 FROM queue_dependencies d \
                                WHERE d.depends_on_task_id = c.task_id \
-                                 AND d.dep_crate_name != '' AND d.dep_host_side >= 0 \
                                  AND d.dep_met = 0) LIMIT 256"
                     ))
                     .fetch_all::<RestoreQueueRow>()
@@ -3040,7 +3039,7 @@ fn full_slice_report() -> Vec<PublishedSliceRow> {
                     crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
                     version: "1.0.0".parse().expect("full version"),
                     features_json: FeaturesJson::default(),
-                    unit_shape: Some(shape),
+                    unit_shape: shape,
                 })
         })
         .collect()
@@ -3070,7 +3069,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
             crate_name: crate_name.parse().expect("retire crate"),
             version: version.parse().expect("retire version"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(node_shapes(n.is_multiple_of(10), target)[0]),
+            unit_shape: node_shapes(n.is_multiple_of(10), target)[0],
         });
     }
     for i in 0..DELTA_ROWS / 2 {
@@ -3082,7 +3081,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
                     crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
                     version: "9.9.9".parse().expect("delta version"),
                     features_json: FeaturesJson::default(),
-                    unit_shape: Some(shape),
+                    unit_shape: shape,
                 }),
         );
     }

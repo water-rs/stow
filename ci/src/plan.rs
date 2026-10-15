@@ -361,9 +361,7 @@ fn bundle_files_match(left: &ArtifactBundleFile, right: &ArtifactBundleFile) -> 
 
 /// The machine this artifact's objects must be for, when it has any to
 /// check: the builder's own for a host-side unit, the artifact's target
-/// for a target-side one. `unit_shape` is the only fact that names the
-/// side, so an artifact holding files with no shape is a defect in the
-/// scan, not a pass.
+/// for a target-side one.
 fn expected_object_arch(
     artifact: &ScannedArtifact,
 ) -> stow_types::error::Result<Option<ExpectedArch>> {
@@ -375,13 +373,7 @@ fn expected_object_arch(
     if !has_files {
         return Ok(None);
     }
-    let shape = artifact.unit_shape.ok_or_else(|| {
-        stow_types::stow_error!(
-            "artifact {} has no unit shape to tell its objects' machine by",
-            artifact.crate_name
-        )
-    })?;
-    Ok(Some(match shape.side {
+    Ok(Some(match artifact.unit_shape.side {
         UnitSide::Host => ExpectedArch::of_host()?,
         UnitSide::Target => ExpectedArch::of_triple(&artifact.target)?,
     }))
@@ -727,11 +719,11 @@ mod tests {
                 "link".to_owned(),
                 "metadata".to_owned(),
             ],
-            unit_shape: Some(stow_types::public_cache::UnitShape {
+            unit_shape: stow_types::public_cache::UnitShape {
                 side: stow_types::public_cache::UnitSide::Target,
                 invocation: stow_types::public_cache::UnitInvocation::Target,
                 kind: stow_types::public_cache::UnitKind::Linked,
-            }),
+            },
             features_json: "[]".to_owned(),
             dependencies: Vec::new(),
             artifact_size,

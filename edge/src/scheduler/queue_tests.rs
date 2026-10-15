@@ -2999,18 +2999,18 @@ fn gate_pub_rows() -> Vec<stow_types::api::PublishedSliceRow> {
             crate_name: name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(s),
+            unit_shape: s,
         })
         .chain(std::iter::once(stow_types::api::PublishedSliceRow {
             dependency_identity: dep_identity("dep-short"),
             crate_name: "dep-short".parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(shape(
+            unit_shape: shape(
                 UnitSide::Target,
                 UnitInvocation::Native,
                 UnitKind::Linked,
-            )),
+            ),
         }))
         .collect()
 }
@@ -4008,7 +4008,7 @@ async fn publish(db: &DurableDb, crate_name: &str) {
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
         })
         .collect::<Vec<_>>();
     super::record_published_slice(db, TARGET, RUSTC, None, None, &rows, &[])
@@ -4027,7 +4027,7 @@ async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: 
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(*shape),
+            unit_shape: *shape,
         })
         .collect::<Vec<_>>();
     super::record_published_slice(db, target, RUSTC, None, None, &rows, &[])
@@ -4280,7 +4280,7 @@ fn dep_slice_rows(crate_name: &str) -> Vec<stow_types::api::PublishedSliceRow> {
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
         })
         .collect()
 }
@@ -4952,7 +4952,7 @@ async fn a_larger_slice_reports_whole() {
                 crate_name: format!("crate-{index}").parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
-                unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, kind)),
+                unit_shape: shape(UnitSide::Target, UnitInvocation::Native, kind),
             })
         })
         .collect::<Vec<_>>();
@@ -7013,115 +7013,6 @@ async fn a_small_slot_pass_reads_one_page_not_the_frontier() {
         asked, 6,
         "the coverage lookup is sized to the page (2 × slots), not the frontier"
     );
-}
-
-/// A dependent behind an unestablished edge (`dep_host_side = -1`)
-/// stays held even when its dep publishes every shape it owns:
-/// `p.unit_side = -1` matches no row, so nothing published can
-/// satisfy it — only the resolver's resync rewrites the edge with a
-/// real side, which is what a re-request carrying `depends_on` does.
-#[tokio::test]
-async fn dependent_behind_an_unestablished_edge_waits_for_resync() {
-    let db = memory_db().await.expect("memory db");
-    // Owner on iOS, dep on the macOS family's host triple — the
-    // unambiguous case `derive_edge_side` resolves to a host unit.
-    let dep = host_dependency_on("aarch64-apple-ios", "dep");
-    let host_target = dep.target.as_str().to_owned();
-    enqueue(&db, std::slice::from_ref(&dep))
-        .await
-        .expect("enqueue dep");
-    enqueue(
-        &db,
-        &[request_on(
-            "parent",
-            "aarch64-apple-ios",
-            std::slice::from_ref(&dep),
-        )],
-    )
-    .await
-    .expect("enqueue parent");
-    // The spelling the migration writes on an edge whose required
-    // side it could not derive.
-    db.query("UPDATE queue_dependencies SET dep_host_side = -1")
-        .execute()
-        .await
-        .expect("stamp unestablished edge");
-
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim dep");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].crate_name, "dep");
-    super::complete(
-        &db,
-        &claim_settings(),
-        &report(
-            &claimed[0].task_id,
-            &claimed[0].generation_id,
-            claimed[0].attempt,
-            true,
-        ),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("complete dep");
-    publish_shapes(
-        &db,
-        "dep",
-        &host_target,
-        &[
-            shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
-            shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Unlinked),
-            shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
-            shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Unlinked),
-        ],
-    )
-    .await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim with unestablished edge");
-    assert!(claimed.is_empty(), "a -1 edge satisfies no published row");
-
-    // The request path never rewrites edges: a task id's edge set is a
-    // function of the id (stow#588), so a resubmit of the same id
-    // carries nothing new — the failing-closed row is the migration's
-    // job, and it stamps `dep_side_known = 0` to mark that.
-    db.query("UPDATE queue_dependencies SET dep_side_known = 0")
-        .execute()
-        .await
-        .expect("stamp edge side unknown");
-    enqueue(
-        &db,
-        &[request_on(
-            "parent",
-            "aarch64-apple-ios",
-            std::slice::from_ref(&dep),
-        )],
-    )
-    .await
-    .expect("re-request parent leaves the edge alone");
-    let side = db
-        .query("SELECT dep_host_side FROM queue_dependencies")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("edge side");
-    assert_eq!(side, -1, "the request path does not repair edges");
-
-    super::derive_dev_era_edge_sides(&db)
-        .await
-        .expect("migration derives the edge side");
-    let side = db
-        .query("SELECT dep_host_side FROM queue_dependencies")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("edge side");
-    assert_eq!(side, 1);
-
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim after migration resync");
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].crate_name, "parent");
 }
 
 /// A dependency reported `completed` whose published rows never
@@ -9631,7 +9522,7 @@ async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
                             crate_name: crate_name.parse().expect("crate name"),
                             version: VERSION.parse().expect("semver"),
                             features_json: FeaturesJson::default(),
-                            unit_shape: Some(shape(UnitSide::Target, *invocation, *kind)),
+                            unit_shape: shape(UnitSide::Target, *invocation, *kind),
                         })
                         .collect::<Vec<_>>()
                 })
@@ -9710,7 +9601,7 @@ async fn dispatch_fails_on_a_missing_node_naming_it() {
             crate_name: leaf_name.parse().expect("crate name"),
             version: VERSION.parse().expect("semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
         })
         .collect::<Vec<_>>();
     super::record_published_slice(&db, TARGET, RUSTC, None, None, &rows, &[])

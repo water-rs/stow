@@ -296,13 +296,9 @@ fn candidates<'a>(
 /// Whether the row's unit shape sits on the side the unit-graph entry
 /// needs — a host entry is served only by a host-side row (the
 /// proc-macro/build-dep shape), never by the same package's target-side
-/// row. Rows published before `unit_shape` was recorded carry `None` and
-/// stay eligible on either side: the compile-key lookup still decides
-/// the hit, and a wrong-shape fetch only wastes a download.
+/// row.
 fn package_matches_side(package: &dep_scan::ConsumablePackage, row: &ArtifactIndexRow) -> bool {
-    row.unit_shape.as_ref().is_none_or(|shape| {
-        (shape.side == stow_types::public_cache::UnitSide::Host) == package.host_side
-    })
+    (row.unit_shape.side == stow_types::public_cache::UnitSide::Host) == package.host_side
 }
 
 /// One row through the CLI's own verified-download chain: the bundle blob
@@ -390,11 +386,10 @@ mod tests {
     /// stow#589: a row is consumable only at the unit-graph identity —
     /// canonical name, exact version, the activated feature set AND the
     /// side. A host-side entry matches a host-shaped row and never the
-    /// same package's target shape; a row published before `unit_shape`
-    /// was recorded carries `None` and stays eligible on either side;
-    /// and a row still labelled with cargo metadata's platform-agnostic
-    /// resolve features (a feature this target never compiles, stow#579)
-    /// does not match the graph's activated set.
+    /// same package's target shape; and a row still labelled with cargo
+    /// metadata's platform-agnostic resolve features (a feature this
+    /// target never compiles, stow#579) does not match the graph's
+    /// activated set.
     #[test]
     fn candidates_match_the_unit_graphs_side_and_features() {
         let packages = vec![
@@ -412,21 +407,17 @@ mod tests {
             },
         ];
 
-        let mut host_row = index_row("windows-link", "0.2.1", "aaaaaaaaaaaaaaaa", &[], None);
-        host_row.unit_shape = Some(shape(UnitSide::Host));
-        let mut target_row = index_row("windows-link", "0.2.1", "bbbbbbbbbbbbbbbb", &[], None);
-        target_row.unit_shape = Some(shape(UnitSide::Target));
         let slice = index_slice(vec![
-            host_row,
-            target_row,
-            index_row("windows-link", "0.2.1", "cccccccccccccccc", &[], None),
-            index_row("tokio", "1.53.2", "dddddddddddddddd", &["fs", "net"], None),
+            index_row("windows-link", "0.2.1", "aaaaaaaaaaaaaaaa", &[], UnitSide::Host),
+            index_row("windows-link", "0.2.1", "bbbbbbbbbbbbbbbb", &[], UnitSide::Target),
+            index_row("windows-link", "0.2.1", "cccccccccccccccc", &[], UnitSide::Host),
+            index_row("tokio", "1.53.2", "dddddddddddddddd", &["fs", "net"], UnitSide::Target),
             index_row(
                 "tokio",
                 "1.53.2",
                 "eeeeeeeeeeeeeeee",
                 &["fs", "net", "windows-sys"],
-                None,
+                UnitSide::Target,
             ),
         ]);
 
@@ -439,7 +430,7 @@ mod tests {
         assert_eq!(
             staged,
             BTreeSet::from(["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "dddddddddddddddd"]),
-            "host-shaped and shapeless windows-link rows and the exactly-labelled tokio row stage; the target shape and the metadata-labelled row do not"
+            "the host-shaped windows-link rows and the exactly-labelled tokio row stage; the target shape and the metadata-labelled row do not"
         );
     }
 
@@ -458,7 +449,7 @@ mod tests {
                             "1.0.0",
                             &format!("{index:016x}"),
                             &[],
-                            None,
+                            UnitSide::Target,
                         )
                     })
                     .collect(),
@@ -502,9 +493,9 @@ mod tests {
     fn an_unfetchable_candidate_is_skipped_and_the_rest_are_staged() {
         smol::block_on(async {
             let slice = index_slice(vec![
-                index_row("absent", "1.0.0", "0000000000000001", &[], None),
-                index_row("present-a", "1.0.0", "0000000000000002", &[], None),
-                index_row("present-b", "1.0.0", "0000000000000003", &[], None),
+                index_row("absent", "1.0.0", "0000000000000001", &[], UnitSide::Target),
+                index_row("present-a", "1.0.0", "0000000000000002", &[], UnitSide::Target),
+                index_row("present-b", "1.0.0", "0000000000000003", &[], UnitSide::Target),
             ]);
             let candidates = slice
                 .index
@@ -537,8 +528,8 @@ mod tests {
     fn an_unverifiable_candidate_fails_the_stage() {
         smol::block_on(async {
             let slice = index_slice(vec![
-                index_row("forged", "2.3.4", "0000000000000004", &[], None),
-                index_row("genuine", "1.0.0", "0000000000000005", &[], None),
+                index_row("forged", "2.3.4", "0000000000000004", &[], UnitSide::Target),
+                index_row("genuine", "1.0.0", "0000000000000005", &[], UnitSide::Target),
             ]);
             let candidates = slice
                 .index
@@ -590,17 +581,17 @@ mod tests {
     }
 
     /// An index row fixture: `compile_key` hashes to `c_metadata`'s prefix
-    /// (canonical rows are keyed so); `side` sets the row's `unit_shape`,
-    /// `None` modelling a row published before shapes were recorded.
+    /// (canonical rows are keyed so); `side` sets the row's `unit_shape`.
     fn index_row(
         name: &str,
         version: &str,
         c_metadata: &str,
         features: &[&str],
-        side: Option<UnitSide>,
+        side: UnitSide,
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: None,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity"),
             crate_name: CrateName::parse(name).unwrap(),
             version: CrateVersion::new(semver::Version::parse(version).unwrap()),
             features_json: FeaturesJson::canonicalize(
@@ -623,7 +614,7 @@ mod tests {
                 strip: StripLevel::None,
             },
             emit: vec![],
-            unit_shape: side.map(shape),
+            unit_shape: shape(side),
             min_glibc: None,
         }
     }

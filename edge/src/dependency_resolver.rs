@@ -9,7 +9,7 @@ use stow_types::api::{
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::{
-    UnitInvocation, UnitKind, UnitShape, UnitSide, required_unit_shapes,
+    UnitInvocation, UnitShape, required_unit_shapes,
     stable_c_metadata_for_compile_key,
 };
 
@@ -206,23 +206,18 @@ struct CachedArtifactRow {
     features_json: String,
     c_metadata: String,
     dependency_c_metadata_json: String,
-    /// The builder-recorded unit shape — `-1` on a row registered
-    /// before the columns existed.
+    /// The builder-recorded unit shape.
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
 }
 
 /// The unit shape a cached row serves, decoded from the columns the
-/// builder wrote. A row carrying `-1` legs — registered before the
-/// columns existed — is shapeless: `None` here means the row covers
-/// nothing, never a fallback to a profile-inferred shape.
-fn cached_row_unit_shape(row: &CachedArtifactRow) -> Option<UnitShape> {
-    Some(UnitShape {
-        side: UnitSide::from_int(row.unit_side)?,
-        invocation: UnitInvocation::from_int(row.unit_invocation)?,
-        kind: UnitKind::from_int(row.unit_linked)?,
-    })
+/// builder wrote — a corrupt triplet is the invariant error the shared
+/// decoder reports (stow#730).
+fn cached_row_unit_shape(row: &CachedArtifactRow) -> Result<UnitShape, ResolverError> {
+    crate::db::decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
+        .map_err(ResolverError::Invariant)
 }
 
 /// Decode a stored canonical features-json string into the structured wire type.
@@ -645,12 +640,10 @@ pub async fn load_cached_artifacts_for_keys(
     let required = required_unit_shapes(host_side, invocation);
     let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<UnitShape>>::new();
     for candidate in &candidates {
-        if let Some(shape) = candidate.shape {
-            shapes_by_key
-                .entry(&candidate.semantic_key)
-                .or_default()
-                .insert(shape);
-        }
+        shapes_by_key
+            .entry(&candidate.semantic_key)
+            .or_default()
+            .insert(candidate.shape);
     }
     Ok(shapes_by_key
         .into_iter()
@@ -784,7 +777,7 @@ fn partition_cached_rows(
             }
             candidate_index.insert(identity_key, candidates.len());
             candidates.push(ReachableCandidateRow {
-                shape: cached_row_unit_shape(&row),
+                shape: cached_row_unit_shape(&row)?,
                 semantic_key,
                 row,
                 dependency_identities,
@@ -935,9 +928,8 @@ struct DependencyIdentity {
 #[derive(Debug)]
 struct ReachableCandidateRow {
     /// The unit shape this artifact serves — what a consumer's compile
-    /// key lookup finds it under. `None` on a row registered before the
-    /// shape columns existed: it covers nothing.
-    shape: Option<UnitShape>,
+    /// key lookup finds it under.
+    shape: UnitShape,
     semantic_key: (PackageKey, String),
     row: CachedArtifactRow,
     dependency_identities: Vec<DependencyIdentity>,

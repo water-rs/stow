@@ -113,7 +113,7 @@ pub async fn ensure_slice(
 /// # Errors
 ///
 /// Returns an error when the cached bytes or pointer cannot be decoded —
-/// corruption is surfaced, absence is not an error.
+/// corruption is surfaced, absence and foreign formats are not errors.
 pub async fn cached_slice(
     config: &StowConfig,
     target: &str,
@@ -123,7 +123,7 @@ pub async fn cached_slice(
     let Some(pointer) = read_pointer(&dir).await else {
         return Ok(None);
     };
-    load_cached(&dir, &pointer).await.map(Some)
+    load_cached(&dir, &pointer).await
 }
 
 /// `stow index refresh` — hit the registry even when the pointer is fresh.
@@ -210,7 +210,12 @@ async fn fetch_slice(
         && let Some(pointer) = &pointer
         && now_secs().saturating_sub(pointer.fetched_at) < config.index_refresh_interval.as_secs()
     {
-        return load_cached(&dir, pointer).await;
+        if let Some(slice) = load_cached(&dir, pointer).await? {
+            return Ok(slice);
+        }
+        // A cached blob of another index format is exactly a stale slice:
+        // a format bump republishes every slice, so the tag's manifest
+        // digest has moved and the revalidation below picks the new one.
     }
 
     let tag = index_tag(target, rustc_version);
@@ -233,7 +238,12 @@ async fn fetch_slice(
                         fetched_at: now_secs(),
                     };
                     write_pointer(&dir, &pointer).await?;
-                    return load_cached(&dir, &pointer).await;
+                    if let Some(slice) = load_cached(&dir, &pointer).await? {
+                        return Ok(slice);
+                    }
+                    // The tag still names the foreign-format manifest —
+                    // it is the *published* slice that cannot be read:
+                    // the pull below surfaces that `Format` error.
                 }
             }
             Err(error) => {
@@ -242,7 +252,9 @@ async fn fetch_slice(
                     tag = %tag,
                     "index refresh failed; serving cached slice"
                 );
-                return load_cached(&dir, pointer).await;
+                if let Some(slice) = load_cached(&dir, pointer).await? {
+                    return Ok(slice);
+                }
             }
         }
     }
@@ -313,7 +325,7 @@ async fn download_verified_slice(
     // A slice decodes every row the index publishes for the target, so
     // the decode runs on a blocking thread (stow#624).
     let (index, blob) = smol::unblock(move || {
-        stow_types::index::decode(&blob)
+        ArtifactIndex::decode(&blob)
             .wrap_err("decode index slice")
             .map(|index| (index, blob))
     })
@@ -387,18 +399,28 @@ async fn read_pointer(dir: &Path) -> Option<SlicePointer> {
     serde_json::from_slice(&bytes).ok()
 }
 
-async fn load_cached(dir: &Path, pointer: &SlicePointer) -> stow_types::error::Result<IndexSlice> {
+/// Decode the cached blob `pointer` selects. `None` when the blob carries
+/// a foreign `format_version` — not corruption, a publish format this
+/// build does not read; the caller re-pulls (or, on the read-only path,
+/// counts the slice as absent). Any other decode failure is corrupt
+/// cache and is surfaced.
+async fn load_cached(
+    dir: &Path,
+    pointer: &SlicePointer,
+) -> stow_types::error::Result<Option<IndexSlice>> {
     let path = dir.join(blob_name(&pointer.manifest_digest));
     let bytes = async_fs::read(&path)
         .await
         .wrap_err_with(|| format!("read cached index {}", path.display()))?;
-    let index = smol::unblock(move || stow_types::index::decode(&bytes))
-        .await
-        .wrap_err("decode cached index slice")?;
-    Ok(IndexSlice {
+    let index = match smol::unblock(move || ArtifactIndex::decode(&bytes)).await {
+        Ok(index) => index,
+        Err(stow_types::index::IndexDecodeError::Format { .. }) => return Ok(None),
+        Err(error) => return Err(error).wrap_err("decode cached index slice"),
+    };
+    Ok(Some(IndexSlice {
         manifest_digest: pointer.manifest_digest.clone(),
         index,
-    })
+    }))
 }
 
 /// `sha256:<hex>` → `sha256_<hex>` — the on-disk blob name for a manifest
@@ -459,7 +481,8 @@ mod tests {
 
     fn test_row(c_metadata: &str) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: None,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity"),
             crate_name: CrateName::parse("serde").expect("crate name"),
             version: CrateVersion::new(Version::new(1, 0, 219)),
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
@@ -481,7 +504,11 @@ mod tests {
             },
             emit: vec!["link".to_owned(), "metadata".to_owned()],
             min_glibc: None,
-            unit_shape: None,
+            unit_shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Native,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
         }
     }
 
@@ -544,9 +571,47 @@ mod tests {
 
         let pointer = read_pointer(&dir).await.expect("pointer");
         assert_eq!(pointer.manifest_digest, digest);
-        let loaded = load_cached(&dir, &pointer).await.expect("load cached");
+        let loaded = load_cached(&dir, &pointer)
+            .await
+            .expect("load cached")
+            .expect("readable format");
         assert_eq!(loaded.manifest_digest, digest);
         assert_eq!(loaded.index, index);
+    }
+
+    /// A cached blob of another index format decodes to no slice — the
+    /// fetch path then treats it as stale and re-pulls through the
+    /// ordinary refresh.
+    #[tokio::test]
+    async fn load_cached_returns_none_on_a_foreign_format() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let dir = slice_dir(&config, TARGET, RUSTC);
+        let mut index = test_index(vec![test_row("aaaa")]);
+        index.header.format_version += 1;
+        let blob = stow_types::index::encode(&index).expect("encode");
+        store_slice(&dir, "sha256:aaaa", &blob)
+            .await
+            .expect("store");
+        write_pointer(
+            &dir,
+            &SlicePointer {
+                manifest_digest: "sha256:aaaa".to_owned(),
+                fetched_at: 1,
+                row_count: 1,
+            },
+        )
+        .await
+        .expect("pointer");
+
+        let pointer = read_pointer(&dir).await.expect("pointer");
+        assert!(
+            load_cached(&dir, &pointer)
+                .await
+                .expect("load cached")
+                .is_none(),
+            "a foreign format reads as an absent slice, not an error"
+        );
     }
 
     #[tokio::test]

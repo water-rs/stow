@@ -38,13 +38,15 @@ CREATE TABLE IF NOT EXISTS queue (
     -- host unit), 0 for a target-side node. Part of the identity: the
     -- same crate legitimately exists at both sides of one triple.
     host_side INTEGER NOT NULL DEFAULT 0,
-    -- NULL is historical context that was never recorded, not a leaf.
+    -- The Merkle dependency digest the task's subtree commits to
+    -- (stow#588); every enqueued task carries one. The column stays
+    -- nullable for the v15 rebuild's migrated rows, which it is a
+    -- dedup operand for and nothing else reads.
     dependency_identity TEXT,
     -- Repair latch: 1 once a `completed` row has been re-queued because a
     -- dependent's edge required unit shapes its published rows never
-    -- covered (shapeless legacy rows satisfy no gate clause). The
-    -- re-queue is at most once — the rebuild republishes real shapes, so
-    -- the missing-shape condition cannot recur.
+    -- covered. The re-queue is at most once — the rebuild republishes
+    -- real shapes, so the missing-shape condition cannot recur.
     shape_requeue INTEGER NOT NULL DEFAULT 0,
     -- The owner's count of unmet dependency edges — edges whose
     -- `dep_met` is 0 — maintained as a counter: set at insert, ±1'd by
@@ -155,13 +157,10 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     dep_features_json TEXT NOT NULL DEFAULT '',
     dep_target TEXT NOT NULL DEFAULT '',
     dep_rustc_version TEXT NOT NULL DEFAULT '',
-    dep_dependency_identity TEXT,
-    -- The side of the dep the dependent needs. -1 marks an edge written
-    -- before the side model whose side the migration could not derive
-    -- (a dep on the family host triple under an owner on the same
-    -- triple is ambiguous): `p.unit_side = -1` matches no published
-    -- row, so the gate holds the dependent until the resolver rewrites
-    -- the edge with a real side.
+    dep_dependency_identity TEXT NOT NULL,
+    -- The side of the dep the dependent needs — always resolved at edge
+    -- insert: the resolver supplies it (stow#730, a `-1` or `0`-masked
+    -- edge is invalid).
     dep_host_side INTEGER NOT NULL DEFAULT 0,
     -- The gate's required shapes, precomputed at edge-write time (see
     -- dep_invocation_mask / dep_edge_unpublished_sql in queue.rs):
@@ -169,21 +168,19 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     -- dependent's build compiles the dep under (1 = native, 2 =
     -- --target, 3 = both for a host-side dependent), and dep_shapes is
     -- the distinct (invocation, linked) pairs the slice must publish
-    -- before the dependent may dispatch. 0 marks an edge written before
-    -- the columns existed; it fails closed until resynced.
+    -- before the dependent may dispatch.
     dep_invocations INTEGER NOT NULL DEFAULT 0,
     dep_shapes INTEGER NOT NULL DEFAULT 0,
     -- The edge's own gate answer, persisted: 1 while the live published
     -- slice for the dep's (dep_target, dep_rustc_version) serves every
     -- unit shape the mask requires — the row form of
-    -- dep_edge_unpublished_sql. Written at insert, flipped by slice
-    -- deltas on the edges they match, backfilled by the migration — so
-    -- the owner's `unpublished_deps` counter can move by ±1 on a flip
-    -- instead of re-evaluating the slice join per edge.
+    -- dep_edge_unpublished_sql. Written at insert and flipped by slice
+    -- deltas on the edges they match — so the owner's `unpublished_deps`
+    -- counter can move by ±1 on a flip instead of re-evaluating the
+    -- slice join per edge.
     dep_met INTEGER NOT NULL DEFAULT 0,
-    -- Whether the edge's required side is established — resolver-written
-    -- edges carry 1, legacy rows the side migration derives stamp their
-    -- outcome and mark themselves known so it runs once.
+    -- Stays for the previous build's edge inserts while a deploy rolls:
+    -- every edge this build writes carries 1 and nothing reads it.
     dep_side_known INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
@@ -547,13 +544,10 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     dependency_identity TEXT NOT NULL,
     -- The unit shape the row serves — the builder-recorded side, cargo
     -- invocation spelling, and link kind the dependency gate compares an
-    -- edge's required shapes against. -1 on all three legs marks a row
-    -- reported before the columns existed: shapeless rows satisfy no
-    -- coverage clause and the dependent stays gated until the node
-    -- rebuilds and republishes.
-    unit_side INTEGER NOT NULL DEFAULT -1,
-    unit_invocation INTEGER NOT NULL DEFAULT -1,
-    unit_linked INTEGER NOT NULL DEFAULT -1,
+    -- edge's required shapes against.
+    unit_side INTEGER NOT NULL,
+    unit_invocation INTEGER NOT NULL,
+    unit_linked INTEGER NOT NULL,
     PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked)
 );
 

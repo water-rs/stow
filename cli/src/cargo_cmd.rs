@@ -1864,31 +1864,27 @@ pub async fn admit_observed_misses(
     // and a build script links share their bytes — and such a dep's
     // edge has to fall back to the invocation's own semantics, so only
     // rows that agree on a single side pin it.
-    let mut published_shapes: BTreeMap<String, (Option<UnitShape>, bool)> = BTreeMap::new();
+    let mut published_shapes: BTreeMap<String, (UnitShape, bool)> = BTreeMap::new();
     for slice_target in [consumer_target, build_host] {
         if let Some(slice) = index::cached_slice(config, slice_target, rustc_version).await? {
             for row in slice.index.rows {
                 published_shapes
                     .entry(row.c_metadata.as_str().to_owned())
-                    .and_modify(|(shape, consistent)| match (*shape, row.unit_shape) {
-                        (Some(seen), Some(current)) if seen.side != current.side => {
+                    .and_modify(|(shape, consistent)| {
+                        if shape.side != row.unit_shape.side {
                             *consistent = false;
                         }
-                        (None, current) => *shape = current,
-                        _ => {}
                     })
                     .or_insert((row.unit_shape, true));
             }
         }
     }
-    let published_shapes: BTreeMap<String, Option<UnitShape>> = published_shapes
+    let published_shapes: BTreeMap<String, UnitShape> = published_shapes
         .into_iter()
-        .map(|(c_metadata, (shape, consistent))| {
-            (c_metadata, consistent.then_some(shape).flatten())
-        })
+        .filter_map(|(c_metadata, (shape, consistent))| consistent.then_some((c_metadata, shape)))
         .collect();
     for (c_metadata, dep) in &mut dep_identities {
-        dep.unit_shape = published_shapes.get(c_metadata).copied().flatten();
+        dep.unit_shape = published_shapes.get(c_metadata).copied();
     }
     // Host units classify against the build's probed host — the
     // triple cargo never passes `--target` for — not the family's
