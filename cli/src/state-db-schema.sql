@@ -92,14 +92,18 @@ CREATE TABLE negative_cache_entries (
 
 -- `glibc_refusals` counts lookups refused because the artifact's
 -- `min_glibc` exceeds the host's glibc — apart from misses, because the
--- artifact exists and the unit just compiled locally. DEFAULT 0 covers
--- the hit/miss/error inserts, which do not name the column.
+-- artifact exists and the unit just compiled locally. `local_dependency_builds`
+-- counts units that compiled locally with no lookup at all, because a
+-- dependency they link was compiled locally in the same build — apart
+-- from misses for the same reason. DEFAULT 0 covers the inserts that do
+-- not name a column.
 CREATE TABLE crate_stats (
     crate_name TEXT PRIMARY KEY,
     hits INTEGER NOT NULL,
     misses INTEGER NOT NULL,
     errors INTEGER NOT NULL,
-    glibc_refusals INTEGER NOT NULL DEFAULT 0
+    glibc_refusals INTEGER NOT NULL DEFAULT 0,
+    local_dependency_builds INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE materialized_outputs (

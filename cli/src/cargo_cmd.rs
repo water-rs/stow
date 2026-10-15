@@ -4909,7 +4909,7 @@ async fn report_cache_coverage(
         return;
     };
     let delta = after.since(before.stats);
-    if delta.rust_lookups() == 0 && covered_units == 0 {
+    if delta.rust_lookups() == 0 && delta.rust_local_dependency_builds == 0 && covered_units == 0 {
         return;
     }
     // An errored unit resolved a cached artifact and then could not use
