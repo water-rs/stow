@@ -4,7 +4,7 @@
 #   1. build the four host binaries and generate a P-256 PKCS#8 key pair
 #   2. start stow-mock-registry (28123), the edge under `wrangler dev`
 #      (workerd, 8788; bundle built by `skyzen build`), and
-#      `stow-build serve` (28124), running the scheduler schema migration
+#      `stow-build serve` (28124), running the scheduler store reset
 #      the deploy pipeline runs before the new build takes traffic
 #   3. submit one small registry crate (itoa, latest 1.0.x, host target)
 #      through `stow-admin` and wait for the scheduler to report
@@ -334,15 +334,21 @@ wait_for "mock registry /v2/" 60 "$SERVICE_PID" mock_registry_ready
     skyzen build --provider cloudflare --manifest Skyzen.mock.toml
 ) >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
-# The edge assumes its schema exists; migrations are deployment work, so the
-# local D1 gets the same files the production pipeline applies, through the
-# same `d1_migrations` bookkeeping: `ALTER TABLE … ADD COLUMN` and `DROP
-# COLUMN` are not idempotent, so a reused edge-state dir (STOW_E2E_WORK_DIR)
-# must apply only what it has not applied yet.
-wrangler d1 migrations apply stow-mock --local \
+# The edge assumes its D1 schema exists; creating it is deployment work, so
+# the local D1 gets the one schema file an operator applies.
+# Apply the one schema the same way an operator does — skipped on a
+# reused edge-state dir (STOW_E2E_WORK_DIR), where the schema already
+# exists and the file's plain CREATEs would fail.
+if ! wrangler d1 execute stow-mock --local \
     --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-    --persist-to "$WORK_DIR/edge-state" >>"$LOG_DIR/edge-migrate.log" 2>&1 \
-    || die "edge migrations failed — see $LOG_DIR/edge-migrate.log"
+    --persist-to "$WORK_DIR/edge-state" \
+    --command "SELECT 1 FROM artifacts LIMIT 1" >>"$LOG_DIR/edge-schema.log" 2>&1; then
+    wrangler d1 execute stow-mock --local \
+        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
+        --persist-to "$WORK_DIR/edge-state" \
+        --file "$REPO_ROOT/edge/schema.sql" >>"$LOG_DIR/edge-schema.log" 2>&1 \
+        || die "edge schema apply failed — see $LOG_DIR/edge-schema.log"
+fi
 (
     cd "$REPO_ROOT/edge"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
@@ -352,23 +358,18 @@ SERVICE_PID=$!
 CHILD_PIDS+=("$SERVICE_PID")
 CHILD_NAMES+=(edge)
 echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
-# The scheduler Durable Object applies its schema through the operator
-# migrate route — deployment work, never request work — so the mock
-# plays the deploy pipeline: wait only for the listener, then run the
-# same `stow-admin scheduler migrate` deploy-edge.yml runs, before any
-# scheduler traffic. A status read before the migration is a 500; the
-# listener probe takes the route's response code as its ready signal.
+# The scheduler Durable Object's schema exists only through the operator
+# reset route — deployment work, never request work — so the mock plays
+# the deploy's operator: wait only for the listener, then run
+# `stow-admin scheduler reset --yes` before any scheduler traffic. A
+# status read on an uninitialized store is a 500; the listener probe
+# takes the route's response code as its ready signal.
 wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
     http_listening "$SCHEDULER_URL/status"
-migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" scheduler migrate 2>&1)" \
-    || die "stow-admin scheduler migrate failed: $migrate_out"
-echo "[mock-e2e] $migrate_out"
-current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
-    "$REPO_ROOT/edge/src/scheduler/queue.rs")"
-[ -n "$current_schema" ] || die "could not read SCHEMA_VERSION from queue.rs"
-[ "${migrate_out##* }" = "$current_schema" ] \
-    || die "scheduler migrate reported '$migrate_out', expected schema $current_schema"
+reset_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler reset --yes 2>&1)" \
+    || die "stow-admin scheduler reset failed: $reset_out"
+echo "[mock-e2e] $reset_out"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 

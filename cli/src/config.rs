@@ -62,7 +62,7 @@ pub struct StowConfig {
     /// each load, and closes it when the command ends (stow#682). Every
     /// `artifact_cache` / circuit / stats call draws the one pool from
     /// it, so the rustc-wrapper hot path does not pay the
-    /// `SqliteConnectOptions` / schema-migration cost on each invocation.
+    /// `SqliteConnectOptions` / schema-identity check on each invocation.
     /// Never serialised — a config read back from `STOW_CONFIG_BLOB`
     /// takes the reading process's handle.
     #[serde(skip, default)]

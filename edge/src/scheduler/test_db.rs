@@ -18,20 +18,20 @@ use crate::scheduler::queue::{self, SchedulerSettings};
 struct SqliteBackend {
     pool: sqlx::SqlitePool,
     /// Whether DDL and PRAGMA statements pass [`check_do_statements`].
-    /// Migrations are operations work — only the migrate path may issue
-    /// them — so the flag is on while a migration-capable database is
-    /// constructed or handed to a migration test (`memory_db_raw`), and
-    /// off on every database the request paths see. A statement that
-    /// creates, alters, drops or probes the schema from request code
-    /// fails the test instead of slipping to production, where the DO
-    /// would accept the DDL but the ops rule forbids it.
+    /// Schema work is operations work — only the reset path may issue
+    /// it — so the flag is on while a database is constructed or handed
+    /// to a reset/fixture test (`memory_db_raw`), and off on every
+    /// database the request paths see. A statement that creates,
+    /// alters, drops or probes the schema from request code fails the
+    /// test instead of slipping to production, where the DO would
+    /// accept the DDL but the ops rule forbids it.
     ddl_permitted: std::sync::Arc<AtomicBool>,
 }
 
 impl SqliteBackend {
     /// Revert the backend to request-path mode — every constructor that
-    /// runs the migration calls this once it has applied the schema.
-    fn close_migration(&self) {
+    /// runs the reset calls this once it has applied the schema.
+    fn close_ddl_permit(&self) {
         self.ddl_permitted.store(false, Ordering::Relaxed);
     }
 }
@@ -44,20 +44,23 @@ impl SqliteBackend {
 ///
 /// # Errors
 ///
-/// Returns `QueueError::Sql` if the pool cannot be opened or `migrate`
+/// Returns `QueueError::Sql` if the pool cannot be opened or `reset`
 /// fails.
 pub async fn memory_db() -> Result<DurableDb, QueueError> {
     let backend = memory_backend().await?;
     let db = DurableDb::new(backend.clone());
-    queue::migrate(&db, &SchedulerSettings::default()).await?;
-    backend.close_migration();
+    queue::reset(&db).await?;
+    // The operator reset route stamps the configured floor right after
+    // the schema lands — the deployed store always carries the row.
+    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    backend.close_ddl_permit();
     Ok(db)
 }
 
 /// Open a fresh in-memory queue database with NO schema applied and the
-/// DDL/PRAGMA permit still on — the migrate path's fixture: migration
-/// tests write an older schema's DDL themselves before calling
-/// `queue::migrate`, the only code that may issue DDL.
+/// DDL/PRAGMA permit still on — the reset path's fixture: tests that
+/// create objects `schema.sql` does not declare, or exercise `reset`
+/// itself, start here. `reset` is the only code that may issue DDL.
 ///
 /// # Errors
 ///
@@ -98,7 +101,7 @@ pub type StatementLog = std::sync::Arc<std::sync::Mutex<Vec<LoggedStatement>>>;
 ///
 /// # Errors
 ///
-/// Returns `QueueError::Sql` if the pool cannot be opened or `migrate`
+/// Returns `QueueError::Sql` if the pool cannot be opened or `reset`
 /// fails.
 pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueError> {
     let log = StatementLog::default();
@@ -107,15 +110,16 @@ pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueErro
         inner: inner.clone(),
         log: log.clone(),
     });
-    queue::migrate(&db, &SchedulerSettings::default()).await?;
-    inner.close_migration();
+    queue::reset(&db).await?;
+    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    inner.close_ddl_permit();
     Ok((db, log))
 }
 
-/// [`counting_memory_db`] without closing the migration permit — for the
-/// one route that legitimately issues DDL: the operator `migrate`
-/// handler itself, which the stow#433 gate measures against the same
-/// fixture but outside the no-DDL rule.
+/// [`counting_memory_db`] without closing the DDL permit — for the one
+/// route that legitimately issues DDL: the operator `reset` handler
+/// itself, which the stow#433 gate measures against the same fixture
+/// but outside the no-DDL rule.
 pub async fn counting_memory_db_raw() -> Result<(DurableDb, StatementLog), QueueError> {
     let log = StatementLog::default();
     let inner = memory_backend().await?;
@@ -123,14 +127,21 @@ pub async fn counting_memory_db_raw() -> Result<(DurableDb, StatementLog), Queue
         inner,
         log: log.clone(),
     });
-    queue::migrate(&db, &SchedulerSettings::default()).await?;
+    queue::reset(&db).await?;
+    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
     Ok((db, log))
 }
 
 async fn memory_backend() -> Result<SqliteBackend, QueueError> {
+    // The Durable Object's SQLite does not enforce foreign keys — sqlx
+    // defaults them ON, which would make `reset`'s table drops order-
+    // dependent where the real store is not. Match the DO semantics.
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(":memory:")
+        .foreign_keys(false);
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
-        .connect("sqlite::memory:")
+        .connect_with(options)
         .await
         .map_err(|error| QueueError::Sql(format!("open in-memory sqlite: {error}")))?;
     Ok(SqliteBackend {
@@ -268,7 +279,7 @@ impl DurableDbBackend for ScriptedSyncBackend {
 ///
 /// # Errors
 ///
-/// Returns `QueueError::Sql` if the pool cannot be opened or `migrate`
+/// Returns `QueueError::Sql` if the pool cannot be opened or `reset`
 /// fails.
 pub async fn scripted_sync_db(
     syncs: Vec<Result<(), String>>,
@@ -286,8 +297,9 @@ pub async fn scripted_sync_db(
         syncs: std::sync::Arc::new(std::sync::Mutex::new(syncs.into_iter().collect())),
         events: events.clone(),
     });
-    queue::migrate(&db, &SchedulerSettings::default()).await?;
-    inner.close_migration();
+    queue::reset(&db).await?;
+    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    inner.close_ddl_permit();
     Ok((db, events))
 }
 
@@ -304,7 +316,7 @@ pub async fn scripted_sync_db(
 const DO_ALLOWED_PRAGMAS: &[&str] = &["defer_foreign_keys", "table_info", "table_list"];
 
 /// Statement heads that mutate or probe schema: the DO accepts them,
-/// but the ops rule is that only the migrate route may issue them —
+/// but the ops rule is that only the reset route may issue them —
 /// request paths and the alarm never create, alter, drop, index or
 /// backfill anything (stow#432). The backend enforces it by refusing
 /// them unless `ddl_permitted` is set, so host tests exercise the same
@@ -315,10 +327,10 @@ const DDL_HEADS: &[&str] = &[
 
 /// Gate one statement string on the two boundaries the host backend
 /// stands in for: the DO authorizer's pragma allowlist
-/// ([`DO_ALLOWED_PRAGMAS`], applied even inside the migrate path — the
-/// real DO authorizer checks the migrate handler's statements too) and
-/// the ops rule that only migration code may issue DDL or pragmas
-/// (`ddl_permitted`, set only while `queue::migrate` is reachable).
+/// ([`DO_ALLOWED_PRAGMAS`], applied even inside the reset path — the
+/// real DO authorizer checks the reset handler's statements too) and
+/// the ops rule that only the reset path may issue DDL or pragmas
+/// (`ddl_permitted`, set only while `queue::reset` is reachable).
 /// Statement heads are read after `;`; string literals and
 /// `--`/`/* */` comments are skipped so a false positive cannot block a
 /// statement that merely mentions the word — and an injection
@@ -386,7 +398,7 @@ fn check_do_statements(sql: &str, ddl_permitted: bool) -> Result<(), DurableDbEr
                         let name = sql[name_start..cursor].to_ascii_lowercase();
                         if !ddl_permitted {
                             return Err(backend_error(format!(
-                                "PRAGMA {name} outside the scheduler migrate route"
+                                "PRAGMA {name} outside the scheduler reset route"
                             )));
                         }
                         if !DO_ALLOWED_PRAGMAS.contains(&name.as_str()) {
@@ -396,7 +408,7 @@ fn check_do_statements(sql: &str, ddl_permitted: bool) -> Result<(), DurableDbEr
                         }
                     } else if !ddl_permitted && DDL_HEADS.contains(&head.as_str()) {
                         return Err(backend_error(format!(
-                            "{head} outside the scheduler migrate route — request code \
+                            "{head} outside the scheduler reset route — request code \
                              and the alarm never issue DDL"
                         )));
                     }

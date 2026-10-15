@@ -172,7 +172,7 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
                 "/queue/cancel".post(api::admin_queue_cancel),
                 "/queue/promote".post(api::admin_queue_promote),
                 "/queue/purge".post(api::admin_queue_purge),
-                "/scheduler/migrate".post(api::admin_scheduler_migrate),
+                "/scheduler/reset".post(api::admin_scheduler_reset),
                 "/scheduler/budget".post(api::admin_scheduler_budget),
                 "/scheduler/budget/seed".post(api::admin_scheduler_budget_seed),
                 "/scheduler/demand".post(api::admin_scheduler_demand),

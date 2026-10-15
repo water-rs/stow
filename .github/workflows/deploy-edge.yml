@@ -8,7 +8,7 @@ name: deploy-edge
 #
 #   prepare          upload the new version (`wrangler versions upload` via
 #                    `skyzen deploy --upload-only`), add it to the deployment
-#                    at 0%, migrate the scheduler and run the synthetic suite
+#                    at 0% and run the synthetic suite
 #                    against it via the `Cloudflare-Workers-Version-Overrides`
 #                    header, then shift `canary_share`% of traffic onto it.
 #   canary-verdict   `environment: deploy-canary` — a GitHub environment whose
@@ -62,7 +62,7 @@ permissions:
   contents: read
   # `gh run list` reads the Test run's conclusion for a dispatched sha.
   actions: read
-  # `stow-admin scheduler migrate` mints an Actions OIDC JWT per request.
+  # Trusted `stow-admin` calls mint an Actions OIDC JWT per request.
   id-token: write
   # Pull the commit's signed stow toolchain from GHCR.
   packages: read
@@ -144,17 +144,8 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      # The Worker assumes its D1 schema exists; migrations are deployment
-      # work, applied before the new build goes live. `skyzen migrate` runs
-      # `wrangler d1 migrations apply --remote`, which applies each pending
-      # file once and records it in the `d1_migrations` table: re-executing
-      # the directory on every deploy cannot work, because `ALTER TABLE …
-      # ADD COLUMN` and `DROP COLUMN` are not idempotent and a later drop
-      # invalidates an earlier file (0006 dropped the column 0001's seed
-      # index is built on).
       - run: |
           skyzen build --provider cloudflare --manifest edge/Skyzen.toml
-          skyzen migrate --provider cloudflare --manifest edge/Skyzen.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -218,8 +209,8 @@ jobs:
           echo "candidate_version=$candidate" >> "$GITHUB_OUTPUT"
 
       # A version override only reaches a version in the current
-      # deployment, so the candidate joins at 0% first — the migrate call
-      # and synthetic suite below then address it directly. The
+      # deployment, so the candidate joins at 0% first — the synthetic
+      # suite below then addresses it directly. The
       # observation window starts here: suite and canary traffic both land
       # inside it.
       - name: Add the candidate to the deployment at 0%
@@ -252,32 +243,6 @@ jobs:
           CF_ZONE_ID: ${{ vars.CF_ZONE_ID }}
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
         run: stow-admin maintenance ensure --yes
-
-      # The scheduler queue's schema is the DO's, not D1's: it migrates
-      # through the admin route, never in request code. The override header
-      # runs the call on the candidate build; migrations are additive, so
-      # the baseline keeps serving. The step fails if the stamped version
-      # is not the candidate's SCHEMA_VERSION.
-      - name: Migrate the scheduler schema on the candidate
-        env:
-          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
-          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
-        run: |
-          set -euo pipefail
-          export STOW_EDGE_VERSION_OVERRIDE="stow-edge=\"$CANDIDATE_VERSION\""
-          report=$(stow-admin --json scheduler migrate)
-          echo "$report"
-          after=$(jq -r '.after' <<<"$report")
-          expected=$(sed -n 's/.*const SCHEMA_VERSION: i64 = \([0-9]\+\).*/\1/p' \
-            edge/src/scheduler/queue.rs)
-          if [ -z "$expected" ]; then
-            echo "::error::no SCHEMA_VERSION in the candidate source" >&2
-            exit 1
-          fi
-          if [ "$after" != "$expected" ]; then
-            echo "::error::scheduler schema at $after, candidate expects $expected" >&2
-            exit 1
-          fi
 
       # The suite is the verdict's guaranteed signal on BOTH sides:
       # version overrides pin each probe to the candidate then the

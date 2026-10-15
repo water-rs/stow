@@ -267,10 +267,19 @@ echo "[load] published index slice for x86_64-unknown-linux-gnu / $RUSTC_VERSION
     skyzen build --provider cloudflare --manifest Skyzen.mock.toml
 ) >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
-wrangler d1 migrations apply stow-mock --local \
+# Apply the one schema the same way an operator does — skipped on a
+# reused edge-state dir (STOW_E2E_WORK_DIR), where the schema already
+# exists and the file's plain CREATEs would fail.
+if ! wrangler d1 execute stow-mock --local \
     --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-    --persist-to "$WORK_DIR/edge-state" >>"$LOG_DIR/edge-migrate.log" 2>&1 \
-    || die "edge D1 migrations failed — see $LOG_DIR/edge-migrate.log"
+    --persist-to "$WORK_DIR/edge-state" \
+    --command "SELECT 1 FROM artifacts LIMIT 1" >>"$LOG_DIR/edge-schema.log" 2>&1; then
+    wrangler d1 execute stow-mock --local \
+        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
+        --persist-to "$WORK_DIR/edge-state" \
+        --file "$REPO_ROOT/edge/schema.sql" >>"$LOG_DIR/edge-schema.log" 2>&1 \
+        || die "edge schema apply failed — see $LOG_DIR/edge-schema.log"
+fi
 # The edge runs under `wrangler dev`, whose miniflare service graph
 # (the ProxyWorker in front of every request plus the dev-time
 # tail/live-reload plumbing) retains native memory per request —
@@ -334,12 +343,12 @@ edge_rss_kb() {
 
 start_edge
 
-# Same deploy order as deploy-edge.yml: the operator migration runs
+# Same deploy order as deploy-edge.yml: the operator reset runs
 # before the scheduler takes traffic.
-migrate_out="$(env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" scheduler migrate 2>&1)" \
-    || die "stow-admin scheduler migrate failed: $migrate_out"
-echo "[load] $migrate_out"
+reset_out="$(env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler reset --yes 2>&1)" \
+    || die "stow-admin scheduler reset failed: $reset_out"
+echo "[load] $reset_out"
 
 # The local dispatch endpoint the edge's STOW_LOCAL_CI_URL points at —
 # STOW_LOCAL_CI_STUB short-circuits run_dispatched_task to the signed

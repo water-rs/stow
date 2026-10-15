@@ -10,32 +10,6 @@ use tokio::sync::OnceCell;
 
 const STATE_DB_FILE_NAME: &str = "state-v3.sqlite3";
 
-/// One column as `state-db-schema.sql` declares it.
-///
-/// `CREATE TABLE IF NOT EXISTS` does nothing to a table that already
-/// exists, so a column added to the schema file never reaches a database
-/// created before it. The columns are therefore read back out of the
-/// schema file and added to whatever is on disk — which means adding a
-/// column to the schema file is the whole of adding a column, with no
-/// second list to keep in step. `artifact_cache_native_out_dir_files.sha256`
-/// was added to the schema and to no migration, so every database older
-/// than it answered `no such column: sha256` for the rest of its life and
-/// every bundle whose artifact had native out-dir files was downloaded,
-/// verified, and then thrown away. (The table has since been removed — the
-/// consumer no longer stores build-script products — but the mechanism it
-/// motivated remains the way columns reach existing databases.)
-#[derive(Debug, PartialEq, Eq)]
-struct SchemaColumn<'a> {
-    table: &'a str,
-    name: &'a str,
-    /// The column's declaration, verbatim, for `ALTER TABLE … ADD COLUMN`.
-    definition: &'a str,
-}
-
-/// Table-level constraints, which sit among the column declarations and
-/// are not columns.
-const CONSTRAINT_KEYWORDS: &[&str] = &["PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT"];
-
 pub fn state_db_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(STATE_DB_FILE_NAME)
 }
@@ -107,10 +81,34 @@ impl StateDb {
     }
 }
 
+/// The state database's one schema — the shape every database at
+/// `state_db_path` was created with. A schema change is a new database,
+/// never a repair of the old one.
+const SCHEMA_SQL: &str = include_str!("state-db-schema.sql");
+
+/// The schema's identity — the first four bytes of the file's blake3
+/// digest as a nonzero `i32`, stamped into `PRAGMA user_version` when a
+/// database is created and compared on every open. `| 1` keeps the value
+/// off `0`, which is what an unstamped database reads.
+fn schema_identity() -> i32 {
+    let digest = blake3::hash(SCHEMA_SQL.as_bytes());
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&digest.as_bytes()[..4]);
+    i32::from_le_bytes(bytes) | 1
+}
+
 /// Open the state `SQLite` pool. Callers go through [`StateDb::pool`] —
 /// it opens once per process, so the hot path doesn't pay schema
-/// migration costs per invocation, and it is the handle the process
-/// closes.
+/// work per invocation, and it is the handle the process closes.
+///
+/// The database carries the schema's identity in `user_version`, stamped
+/// at creation. An open whose stamp differs — including a database an
+/// older stow created before the stamp existed — fails fast and names
+/// the remedy (`stow clean` removes the directory whole): the state is
+/// a cache, so a shape the build does not recognize is discarded
+/// whole, never repaired in place. Only a provably fresh database — no
+/// user tables and an unstamped `user_version` — gets the schema and
+/// the stamp.
 #[tracing::instrument(name = "stow.sqlite.connect", skip_all)]
 async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool> {
     let path = state_db_path(cache_dir);
@@ -133,12 +131,76 @@ async fn connect_pool(cache_dir: &Path) -> stow_types::error::Result<SqlitePool>
         .connect_with(options)
         .await
         .wrap_err_with(|| format!("open state db {}", path.display()))?;
-    sqlx::raw_sql(include_str!("state-db-schema.sql"))
-        .execute(&pool)
+    match ensure_schema(&pool, &path).await {
+        Ok(()) => Ok(pool),
+        Err(error) => {
+            // A dropped pool closes its connection in the background, and
+            // until it does Windows refuses to delete the file `stow clean`
+            // is about to remove.
+            pool.close().await;
+            Err(error)
+        }
+    }
+}
+
+/// Accepts a database stamped with this build's schema identity, creates
+/// the schema in an empty one, and refuses anything else.
+async fn ensure_schema(pool: &SqlitePool, path: &Path) -> stow_types::error::Result<()> {
+    let stamped: i32 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await
+        .wrap_err_with(|| format!("read schema identity of {}", path.display()))?;
+    if stamped == schema_identity() {
+        return Ok(());
+    }
+    // Wrappers of one cold build open a fresh database at once: the
+    // check and the creation share one write transaction, so a second
+    // opener waits for the first and then reads its stamp.
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .wrap_err_with(|| format!("lock state db {} for creation", path.display()))?;
+    let stamped: i32 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *transaction)
+        .await
+        .wrap_err_with(|| format!("read schema identity of {}", path.display()))?;
+    if stamped == schema_identity() {
+        transaction
+            .commit()
+            .await
+            .wrap_err_with(|| format!("release state db {}", path.display()))?;
+        return Ok(());
+    }
+    let user_tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .wrap_err_with(|| format!("list tables in {}", path.display()))?;
+    if stamped != 0 || user_tables != 0 {
+        return Err(stow_types::stow_error!(
+            "the state database {} was created by a stow whose schema \
+             does not match this build — remove it with `stow clean`",
+            path.display()
+        ));
+    }
+    sqlx::raw_sql(SCHEMA_SQL)
+        .execute(&mut *transaction)
         .await
         .wrap_err_with(|| format!("initialize state db schema {}", path.display()))?;
-    ensure_declared_columns(&pool, &path).await?;
-    Ok(pool)
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA user_version = {}",
+        schema_identity()
+    )))
+    .execute(&mut *transaction)
+    .await
+    .wrap_err_with(|| format!("stamp state db schema identity {}", path.display()))?;
+    transaction
+        .commit()
+        .await
+        .wrap_err_with(|| format!("commit state db schema {}", path.display()))?;
+    Ok(())
 }
 
 /// Tell `SQLite` not to checkpoint the WAL when this connection is the
@@ -266,142 +328,6 @@ async fn reset_grown_wal(pool: &SqlitePool) -> stow_types::error::Result<()> {
         );
     }
     Ok(())
-}
-
-/// Add every column `state-db-schema.sql` declares that the database on
-/// disk does not have.
-async fn ensure_declared_columns(
-    pool: &SqlitePool,
-    db_path: &Path,
-) -> stow_types::error::Result<()> {
-    let schema = include_str!("state-db-schema.sql");
-    let declared = declared_columns(schema);
-    let mut current_table = "";
-    let mut existing: Vec<String> = Vec::new();
-    for column in declared {
-        if column.table != current_table {
-            current_table = column.table;
-            existing = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
-                "SELECT name FROM pragma_table_info('{current_table}')"
-            )))
-            .fetch_all(pool)
-            .await
-            .wrap_err_with(|| {
-                format!("inspect {current_table} columns in {}", db_path.display())
-            })?;
-        }
-        // An empty listing means the table itself is absent, which the
-        // schema file above was supposed to create: there is nothing to
-        // alter, and altering a missing table would only mask that.
-        if existing.is_empty() || existing.iter().any(|name| name == column.name) {
-            continue;
-        }
-        let statement = format!(
-            "ALTER TABLE {} ADD COLUMN {}",
-            column.table, column.definition
-        );
-        sqlx::query(sqlx::AssertSqlSafe(statement))
-            .execute(pool)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "add missing column {}.{} in {}",
-                    column.table,
-                    column.name,
-                    db_path.display()
-                )
-            })?;
-        tracing::debug!(
-            table = column.table,
-            column = column.name,
-            "added a column the state database was missing"
-        );
-    }
-    Ok(())
-}
-
-/// Every column declared by every `CREATE TABLE` in `schema`, in file
-/// order, so the tables come out grouped.
-fn declared_columns(schema: &str) -> Vec<SchemaColumn<'_>> {
-    let mut columns = Vec::new();
-    let mut rest = schema;
-    while let Some(start) = rest.find("CREATE TABLE") {
-        let after = &rest[start..];
-        let Some(open) = after.find('(') else {
-            break;
-        };
-        let table = table_name(&after[..open]);
-        let body = balanced_body(&after[open..]);
-        rest = &after[open + body.len()..];
-        let Some(table) = table else {
-            continue;
-        };
-        for declaration in split_top_level(body) {
-            let declaration = declaration.trim();
-            let Some(name) = declaration.split_whitespace().next() else {
-                continue;
-            };
-            if CONSTRAINT_KEYWORDS
-                .iter()
-                .any(|keyword| name.eq_ignore_ascii_case(keyword))
-            {
-                continue;
-            }
-            columns.push(SchemaColumn {
-                table,
-                name,
-                definition: declaration,
-            });
-        }
-    }
-    columns
-}
-
-/// The table name out of `CREATE TABLE [IF NOT EXISTS] <name>`.
-fn table_name(header: &str) -> Option<&str> {
-    header
-        .split_whitespace()
-        .last()
-        .filter(|name| !name.eq_ignore_ascii_case("TABLE") && !name.eq_ignore_ascii_case("EXISTS"))
-}
-
-/// The text between the opening parenthesis of `input` and its match.
-fn balanced_body(input: &str) -> &str {
-    let mut depth = 0usize;
-    for (index, character) in input.char_indices() {
-        match character {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &input[1..index];
-                }
-            }
-            _ => {}
-        }
-    }
-    ""
-}
-
-/// Split on the commas that separate declarations, ignoring the ones
-/// inside a nested parenthesis.
-fn split_top_level(body: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (index, character) in body.char_indices() {
-        match character {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&body[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&body[start..]);
-    parts
 }
 
 /// Thin test-only shim that calls [`connect_pool`] without the process's
@@ -718,145 +644,118 @@ mod handle_tests {
 
 #[cfg(test)]
 mod schema_tests {
-    use super::{connect_pool, declared_columns};
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+    use std::str::FromStr;
 
-    /// The schema file is the source of truth for the migration, so it has
-    /// to parse into the columns it declares — including the one whose
-    /// absence broke every pre-existing database.
-    #[test]
-    fn the_schema_file_declares_its_columns() {
-        let schema = include_str!("state-db-schema.sql");
-        let columns = declared_columns(schema);
-        assert!(
-            columns
-                .iter()
-                .any(|column| column.table == "artifact_cache_entries"
-                    && column.name == "provenance"),
-            "the parser must see artifact_cache_entries.provenance"
-        );
-        assert!(
-            columns
-                .iter()
-                .any(|column| column.table == "artifact_cache_entries"
-                    && column.name == "compile_key"),
-            "the parser must see artifact_cache_entries.compile_key"
-        );
-        assert!(
-            !columns
-                .iter()
-                .any(|column| column.name.eq_ignore_ascii_case("PRIMARY")
-                    || column.name.eq_ignore_ascii_case("FOREIGN")),
-            "table constraints are not columns"
-        );
+    use super::{connect_pool, schema_identity, state_db_path};
+
+    /// A raw second connection to the same file, for stamping a
+    /// `user_version` the schema did not write.
+    async fn raw_connection(path: &std::path::Path) -> sqlx::SqliteConnection {
+        SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .expect("connect options")
+            .create_if_missing(true)
+            .connect()
+            .await
+            .expect("a raw connection to the database")
     }
 
-    /// The regression itself: a database created before a column was added
-    /// to the schema file gets the column on the next open, instead of
-    /// answering `no such column` forever.
+    /// A fresh database gets the schema and the identity stamp, and a
+    /// later open takes the stamped path straight through.
     #[tokio::test]
-    async fn an_older_database_gains_the_columns_it_is_missing() {
+    async fn a_fresh_database_is_created_and_stamped_and_reopens() {
         let cache_dir = tempfile::tempdir().expect("temp dir");
-        let path = super::state_db_path(cache_dir.path());
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
-
-        // A database from before `provenance` existed on that table.
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
-            .await
-            .expect("open the old database");
-        sqlx::query(
-            "CREATE TABLE artifact_cache_entries (\
-                 rustc_version TEXT NOT NULL, \
-                 cache_key TEXT NOT NULL, \
-                 relative_dir TEXT NOT NULL, \
-                 size_bytes INTEGER NOT NULL, \
-                 last_accessed_ms INTEGER NOT NULL, \
-                 oci_reference TEXT NOT NULL, \
-                 oci_digest TEXT NOT NULL, \
-                 compile_key TEXT NOT NULL DEFAULT '', \
-                 crate_name TEXT NOT NULL DEFAULT '', \
-                 crate_version TEXT NOT NULL DEFAULT '', \
-                 c_metadata TEXT NOT NULL DEFAULT '', \
-                 features_json TEXT NOT NULL DEFAULT '', \
-                 dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]', \
-                 dependency_compile_keys_json TEXT NOT NULL DEFAULT '[]', \
-                 compile_millis INTEGER NOT NULL DEFAULT 0, \
-                 target TEXT NOT NULL DEFAULT '', \
-                 profile_json TEXT NOT NULL DEFAULT '{}', \
-                 emit_json TEXT NOT NULL DEFAULT '[]', \
-                 kind_json TEXT NOT NULL DEFAULT '\"Rlib\"', \
-                 crate_types_json TEXT NOT NULL DEFAULT '[]', \
-                 verified_marker_version INTEGER, \
-                 verified_marker_policy TEXT, \
-                 PRIMARY KEY (rustc_version, cache_key))",
-        )
-        .execute(&pool)
-        .await
-        .expect("create the old table");
-        pool.close().await;
-
         let pool = connect_pool(cache_dir.path())
             .await
-            .expect("open the database through the migration");
-        let columns = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM pragma_table_info('artifact_cache_entries')",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("read the migrated columns");
-        assert!(
-            columns.iter().any(|column| column == "provenance"),
-            "the missing column must be added: {columns:?}"
-        );
-        sqlx::query_scalar::<_, String>("SELECT relative_dir FROM artifact_cache_entries LIMIT 1")
-            .fetch_optional(&pool)
+            .expect("create the database");
+        let stamped: i32 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
             .await
-            .expect("the table stays usable after the migration");
+            .expect("read the stamp");
+        assert_eq!(stamped, schema_identity(), "creation stamps the schema");
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count tables");
+        assert!(tables > 0, "the schema's tables were created");
+        pool.close().await;
+
+        connect_pool(cache_dir.path())
+            .await
+            .expect("reopen the stamped database");
     }
 
-    /// The four `artifact_cache_native_*` tables are gone from the schema
-    /// (stow#640) — a database carrying them sheds them on open.
-    #[tokio::test]
-    async fn opening_a_database_drops_the_native_tables() {
+    /// Openers racing on an empty database: every open succeeds, one of
+    /// them creates the schema, the rest read its stamp. The file is
+    /// switched to WAL first — the journal-mode switch is the file's
+    /// own first write and is not what this covers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_opens_of_an_empty_database_create_it_once() {
         let cache_dir = tempfile::tempdir().expect("temp dir");
-        let path = super::state_db_path(cache_dir.path());
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
-
-        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+        let path = state_db_path(cache_dir.path());
+        let empty = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
             .await
-            .expect("open the old database");
-        for table in [
-            "artifact_cache_native_static_libs",
-            "artifact_cache_native_directives",
-            "artifact_cache_native_dep_env_vars",
-            "artifact_cache_native_out_dir_files",
-        ] {
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "CREATE TABLE {table} (marker TEXT)"
-            )))
-            .execute(&pool)
+            .expect("create the empty file");
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&empty)
             .await
-            .expect("create an old native table");
-        }
-        pool.close().await;
-
-        let pool = connect_pool(cache_dir.path())
-            .await
-            .expect("open the database through the schema");
-        let tables =
-            sqlx::query_scalar::<_, String>("SELECT name FROM sqlite_master WHERE type = 'table'")
-                .fetch_all(&pool)
+            .expect("switch the empty file to WAL");
+        empty.close().await;
+        let opens = (0..8).map(|_| connect_pool(cache_dir.path()));
+        for pool in futures_util::future::join_all(opens).await {
+            let pool = pool.expect("every concurrent open succeeds");
+            let stamped: i32 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&pool)
                 .await
-                .expect("list tables");
-        for table in [
-            "artifact_cache_native_static_libs",
-            "artifact_cache_native_directives",
-            "artifact_cache_native_dep_env_vars",
-            "artifact_cache_native_out_dir_files",
-        ] {
-            assert!(
-                !tables.iter().any(|name| name == table),
-                "{table} must be dropped: {tables:?}"
-            );
+                .expect("read the stamp");
+            assert_eq!(stamped, schema_identity());
+            pool.close().await;
         }
+    }
+
+    /// A database whose stamp is not this schema's — one an older stow
+    /// wrote before the stamp existed, or any other shape — fails fast
+    /// naming the file and the remedy; nothing repairs it in place.
+    #[tokio::test]
+    async fn a_differently_stamped_database_fails_to_clean() {
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let path = state_db_path(cache_dir.path());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+
+        // The old shape: tables on disk, no identity stamp — exactly what
+        // a pre-`user_version` stow leaves.
+        let mut conn = raw_connection(&path).await;
+        sqlx::query("CREATE TABLE old_shape (v TEXT)")
+            .execute(&mut conn)
+            .await
+            .expect("create an old-shaped table");
+        conn.close().await.expect("close the raw connection");
+
+        let error = connect_pool(cache_dir.path())
+            .await
+            .expect_err("an unstamped database with tables must fail");
+        assert!(
+            error
+                .to_string()
+                .contains(path.to_str().expect("utf8 path")),
+            "the error names the database: {error}"
+        );
+        assert!(
+            error.to_string().contains("stow clean"),
+            "the error names the remedy: {error}"
+        );
+
+        // `stow clean` removes the cache directory whole — it never opens
+        // the database — so the same path is what recovers this state.
+        std::fs::remove_dir_all(cache_dir.path())
+            .expect("remove the cache dir, as stow clean does");
+        connect_pool(cache_dir.path())
+            .await
+            .expect("after the clean, a fresh database is created");
+        assert!(state_db_path(cache_dir.path()).exists());
     }
 }

@@ -10,9 +10,9 @@
 // `null` unless the handler itself re-armed, which would make the
 // assertion meaningless.
 //
-// The scheduler is initialized only through its operator `/migrate`
-// route — the same route `deploy-edge.yml`/`stow-admin scheduler
-// migrate` invoke. No public probing endpoint and no production debug
+// The scheduler is initialized only through its operator `/reset`
+// route — the same route `stow-admin scheduler reset --yes` invokes.
+// No public probing endpoint and no production debug
 // code is added: inspection goes through `runInDurableObject` on the
 // real instance, and every outbound fetch routes through the
 // `dispatch-stub` outbound service (see vitest.config.ts), which only
@@ -31,7 +31,6 @@
 // it is deleted.
 
 import {
-	applyD1Migrations,
 	env,
 	runDurableObjectAlarm,
 	runInDurableObject,
@@ -86,9 +85,9 @@ async function freshStub() {
 	return env.SCHEDULER.get(id);
 }
 
-async function migrate(stub: DurableObjectStub) {
+async function reset(stub: DurableObjectStub) {
 	// Operator route only — the one place DDL may issue.
-	const res = await stub.fetch(`${DO}/migrate`, { method: "POST" });
+	const res = await stub.fetch(`${DO}/reset`, { method: "POST" });
 	expect(res.status).toBe(200);
 	return res.json();
 }
@@ -151,7 +150,7 @@ async function statusCounts(stub: DurableObjectStub) {
 }
 
 beforeAll(async () => {
-	await applyD1Migrations(env.STOW_DB, env.TEST_MIGRATIONS as never);
+	await env.STOW_DB.exec((env as Env2).TEST_D1_SCHEMA);
 });
 
 // A submit whose rows are immediately eligible arms a real alarm at
@@ -170,7 +169,7 @@ async function waitForStatus(stub: DurableObjectStub, wanted: string) {
 // The full idle contract for a queue that has nothing to do. Two
 // layers, in order:
 //
-//   1. Natural state — whatever alarm the real event (migrate, submit,
+//   1. Natural state — whatever alarm the real event (reset, submit,
 //      complete-run, freeze) left armed. If one is armed, it must run
 //      exactly once and leave nothing behind: `getAlarm() === null`
 //      afterwards and a second invocation `false`. A re-arm chain fails
@@ -209,14 +208,14 @@ async function expectQuiescent(
 describe("scheduler idle proof (stow#593)", () => {
 	it("empty scheduler: an armed alarm is deleted and never rescheduled", async () => {
 		const stub = await freshStub();
-		const report = await migrate(stub);
+		const report = await reset(stub);
 		expect(report).toBeTruthy();
 		await expectQuiescent(stub, {});
 	});
 
 	it("completed work: a drained queue also stops waking", async () => {
 		const stub = await freshStub();
-		await migrate(stub);
+		await reset(stub);
 		const { status, body } = await submit(stub, [enqueue("idle-done")]);
 		expect(status).toBe(200);
 		expect(body.inserted).toBe(1);
@@ -247,7 +246,7 @@ describe("scheduler idle proof (stow#593)", () => {
 
 	it("positive control: an in-flight lease keeps the alarm armed", async () => {
 		const stub = await freshStub();
-		await migrate(stub);
+		await reset(stub);
 		const { status } = await submit(stub, [enqueue("idle-inflight")]);
 		expect(status).toBe(200);
 
@@ -279,7 +278,7 @@ describe("scheduler idle proof (stow#593)", () => {
 		// in-flight lease. The stamped floor holds it ineligible.
 		(env as Env2).STOW_MIN_DISPATCH_VALUE = "1000000";
 		try {
-			await migrate(stub);
+			await reset(stub);
 			const { status: s1 } = await submit(stub, [
 				enqueue("idle-dep-parent", [], 1),
 			]);
@@ -302,10 +301,10 @@ describe("scheduler idle proof (stow#593)", () => {
 
 	it("under-floor queue: ineligible pending work keeps no alarm", async () => {
 		const stub = await freshStub();
-		// The floor is stamped into `settings` by migrate — set it first.
+		// The floor is stamped into `settings` by reset — set it first.
 		(env as Env2).STOW_MIN_DISPATCH_VALUE = "1000000";
 		try {
-			await migrate(stub);
+			await reset(stub);
 			// downloads=1 → value far below the stamped floor → the row is
 			// admitted but dispatch-ineligible until demand rises.
 			const { status } = await submit(stub, [enqueue("idle-floor", [], 1)]);
@@ -322,7 +321,7 @@ describe("scheduler idle proof (stow#593)", () => {
 		const stub = await freshStub();
 		(env as Env2).STOW_MAX_CONCURRENT_JOBS = "0";
 		try {
-			await migrate(stub);
+			await reset(stub);
 			const { status } = await submit(stub, [enqueue("idle-paused")]);
 			expect(status).toBe(200);
 			expect(await getAlarm(stub)).toBeNull();
@@ -334,7 +333,7 @@ describe("scheduler idle proof (stow#593)", () => {
 
 	it("frozen dispatch: the freeze record eats the wake", async () => {
 		const stub = await freshStub();
-		await migrate(stub);
+		await reset(stub);
 
 		// Freeze before the queue has work: the trusted lane refuses, the
 		// untrusted lane still admits, and neither arms a wake.

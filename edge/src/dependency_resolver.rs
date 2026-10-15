@@ -2053,7 +2053,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         let crates_io = closure_stub();
 
         let latest = super::latest_published_version(&db, &crates_io, "root")
@@ -2095,7 +2095,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         let crates_io = closure_stub();
 
         let error = super::latest_published_version(&db, &crates_io, "never-published")
@@ -2132,7 +2132,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         // The v1 row shape: no `format_version`, dependency entries the
         // current schema would reject — but none of that is reached,
         // because the tag is checked before the payload is trusted.
@@ -2252,7 +2252,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         let entries = (0..DIRECT)
             .map(|index| stow_types::api::DependencyGraphEntry {
                 crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
@@ -2341,7 +2341,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         db.query(
             "CREATE TRIGGER deny_graph_cache_write \
              BEFORE INSERT ON crate_version_graph_cache \

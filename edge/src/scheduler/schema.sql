@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS queue (
     -- The dependency gate's answer, persisted: 1 while every edge of this
     -- row resolves to units the published slice serves — the stored form
     -- of `unpublished_deps = 0`, derived wherever the counter is
-    -- written (insert, edge resync, slice delta, migration) and kept
+    -- written (insert, edge resync, slice delta) and kept
     -- current by every transition into `pending` — the claim reads the
     -- flag only on pending rows, so a dispatch pass never re-evaluates
     -- the dependency EXISTS.
@@ -115,13 +115,13 @@ CREATE TABLE IF NOT EXISTS queue (
     -- only by the claim UPDATE, so it is immutable for the generation
     -- while `updated_at` is rewritten by every in-flight writer (a
     -- re-request bumps it even on an active row). `NULL` until first
-    -- claim and on rows migrated from before the column: a completion
-    -- only samples duration against a real claim stamp (stow#524).
+    -- claim: a completion only samples duration against a real claim
+    -- stamp (stow#524).
     claimed_at TEXT,
     -- The admission floor's persisted answer (stow#525 I10):
     -- `lane = 'human' OR value >= floor`, with `floor` the
-    -- `min_dispatch_value` row `settings` carries — the value the last
-    -- operator migrate stamped, never a request-time read. Maintained
+    -- `min_dispatch_value` row `settings` carries — the value the
+    -- operator reset stamped, never a request-time read. Maintained
     -- by every writer that touches `value` or `lane`, and equality-
     -- indexed ahead of the order/range fields so a positive floor
     -- excludes the under-floor bulk before any rank or wake walk
@@ -156,12 +156,10 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     dep_target TEXT NOT NULL DEFAULT '',
     dep_rustc_version TEXT NOT NULL DEFAULT '',
     dep_dependency_identity TEXT,
-    -- The side of the dep the dependent needs. -1 marks an edge written
-    -- before the side model whose side the migration could not derive
-    -- (a dep on the family host triple under an owner on the same
-    -- triple is ambiguous): `p.unit_side = -1` matches no published
-    -- row, so the gate holds the dependent until the resolver rewrites
-    -- the edge with a real side.
+    -- The side of the dep the dependent needs. -1 marks an edge whose
+    -- required side was never established: `p.unit_side = -1` matches
+    -- no published row, so the gate holds the dependent until the
+    -- resolver rewrites the edge with a real side.
     dep_host_side INTEGER NOT NULL DEFAULT 0,
     -- The gate's required shapes, precomputed at edge-write time (see
     -- dep_invocation_mask / dep_edge_unpublished_sql in queue.rs):
@@ -169,21 +167,19 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     -- dependent's build compiles the dep under (1 = native, 2 =
     -- --target, 3 = both for a host-side dependent), and dep_shapes is
     -- the distinct (invocation, linked) pairs the slice must publish
-    -- before the dependent may dispatch. 0 marks an edge written before
-    -- the columns existed; it fails closed until resynced.
+    -- before the dependent may dispatch. 0 fails closed until resynced.
     dep_invocations INTEGER NOT NULL DEFAULT 0,
     dep_shapes INTEGER NOT NULL DEFAULT 0,
     -- The edge's own gate answer, persisted: 1 while the live published
     -- slice for the dep's (dep_target, dep_rustc_version) serves every
     -- unit shape the mask requires — the row form of
-    -- dep_edge_unpublished_sql. Written at insert, flipped by slice
-    -- deltas on the edges they match, backfilled by the migration — so
-    -- the owner's `unpublished_deps` counter can move by ±1 on a flip
+    -- dep_edge_unpublished_sql. Written at insert and flipped by slice
+    -- deltas on the edges they match — so the owner's
+    -- `unpublished_deps` counter can move by ±1 on a flip
     -- instead of re-evaluating the slice join per edge.
     dep_met INTEGER NOT NULL DEFAULT 0,
     -- Whether the edge's required side is established — resolver-written
-    -- edges carry 1, legacy rows the side migration derives stamp their
-    -- outcome and mark themselves known so it runs once.
+    -- edges carry 1; a 0 edge fails closed.
     dep_side_known INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
@@ -244,8 +240,8 @@ CREATE TABLE IF NOT EXISTS demand_batches (
 -- event-local staging set — relational rows, never a serialized blob.
 -- Rows under a `prepared` batch are unaccepted draft material a
 -- reprepare may clear wholesale; the guarded `prepared → accepted`
--- UPDATE on demand_batches fires the `demand_fold` trigger (created at
--- migrate), which folds every staged row into the queue inside that
+-- UPDATE on demand_batches fires the `demand_fold` trigger (defined
+-- below), which folds every staged row into the queue inside that
 -- one statement — statement-atomic acceptance, so an accepted batch
 -- has no unapplied remainder and a replay writes nothing. The staged
 -- `value`, `dispatch_key` and `dispatch_eligible` are the event's
@@ -281,6 +277,39 @@ CREATE TABLE IF NOT EXISTS demand_contributions (
 -- bound probe are driven by this index, never the stored ledger.
 CREATE INDEX IF NOT EXISTS idx_demand_contributions_batch
 ON demand_contributions (batch_id);
+
+-- Batch acceptance is one statement: flipping the batch's state to
+-- `accepted` fires this trigger, which folds the whole staged set into
+-- the queue inside that statement — `demand` accumulates the staged
+-- delta while `value`, `dispatch_key` and `dispatch_eligible` land the
+-- event's precomputed answers — then verifies the staged count reached
+-- the accepted count: `RAISE(ABORT)` on a shortfall rolls the
+-- transition AND every triggered queue effect back out of the same
+-- statement. A staged row naming no queue task simply matches nothing.
+-- The staged rows are then consumed in the same statement: an accepted
+-- batch's replay reads only the header, so the recurring feed would
+-- otherwise accumulate dead staging forever — retiring it here is
+-- still O(this batch's closure).
+CREATE TRIGGER IF NOT EXISTS demand_fold
+AFTER UPDATE OF state ON demand_batches
+WHEN NEW.state = 'accepted' AND OLD.state = 'prepared'
+BEGIN
+    UPDATE queue
+    SET demand = queue.demand + c.delta,
+        value = CAST(c.value AS INTEGER),
+        dispatch_key = c.dispatch_key,
+        dispatch_eligible = c.dispatch_eligible
+    FROM demand_contributions c
+    WHERE c.batch_id = NEW.batch_id AND queue.task_id = c.task_id
+      AND (queue.demand != queue.demand + c.delta
+           OR queue.value != CAST(c.value AS INTEGER)
+           OR queue.dispatch_key != c.dispatch_key
+           OR queue.dispatch_eligible != c.dispatch_eligible);
+    SELECT RAISE(ABORT, 'demand batch staged set short of accepted count')
+    WHERE (SELECT count(*) FROM demand_contributions c
+           WHERE c.batch_id = NEW.batch_id) != NEW.touched_count;
+    DELETE FROM demand_contributions WHERE batch_id = NEW.batch_id;
+END;
 
 -- One demand-feed hour's durable header (stow#523). `state` is the
 -- typed lifecycle: `staging` holds an incomplete materialization a
@@ -451,9 +480,8 @@ ON queue (crate_name, updated_at);
 -- The exact (status, lane) counts `status()` reports, maintained by
 -- trigger instead of a whole-queue GROUP BY on every request. The
 -- triggers fire on every write path — request handlers, operator
--- mutations, fixtures and the migration's own row moves — so no code
--- path maintains the table by hand; `migrate` rebuilds it wholesale
--- once, in case it ever drifted.
+-- mutations and fixtures — so no code path maintains the table by
+-- hand.
 CREATE TABLE IF NOT EXISTS queue_status_counts (
     status TEXT NOT NULL,
     lane TEXT NOT NULL,
@@ -503,12 +531,19 @@ CREATE INDEX IF NOT EXISTS idx_queue_dependencies_dep
 ON queue_dependencies (depends_on_task_id);
 
 -- Edges whose dep identity was never resolved can never be met — the
--- blocked-count query reads exactly the `idx_queue_dependencies_unresolved`
--- set. That index, `idx_queue_dependencies_slice` and
--- `idx_queue_dependencies_dep_match` live in
--- `migrate_queue_dependencies_columns` instead of here: a dev-era edges
--- table only gains `dep_crate_name`/`dep_host_side`/`dep_target` there,
--- so an index on them cannot build during this include.
+-- blocked-count query reads exactly this set.
+CREATE INDEX IF NOT EXISTS idx_queue_dependencies_unresolved
+ON queue_dependencies (task_id) WHERE dep_crate_name = '' OR dep_host_side < 0;
+
+-- The slice delta's edge walk: the edges a (target, rustc_version)
+-- publish touches.
+CREATE INDEX IF NOT EXISTS idx_queue_dependencies_slice
+ON queue_dependencies (dep_target, dep_rustc_version, task_id);
+
+-- The publish delta's dependent refresh, bounded to the edges whose dep
+-- identity a report row changed.
+CREATE INDEX IF NOT EXISTS idx_queue_dependencies_dep_match
+ON queue_dependencies (dep_target, dep_rustc_version, dep_crate_name, dep_version);
 
 -- What each published index slice serves, reported by the index-publish
 -- path itself after a slice goes live. A report writes its rows under a
@@ -541,16 +576,15 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
     -- The Merkle dependency digest the row was built under (stow#588).
-    -- NOT NULL since v15: a row without it satisfies no coverage clause,
-    -- so the rebuild drops context-free rows and reports that carry
-    -- none are refused — the column is `=` everywhere, never `IS`.
+    -- NOT NULL: a row without it satisfies no coverage clause, and
+    -- reports that carry none are refused — the column is `=`
+    -- everywhere, never `IS`.
     dependency_identity TEXT NOT NULL,
     -- The unit shape the row serves — the builder-recorded side, cargo
     -- invocation spelling, and link kind the dependency gate compares an
-    -- edge's required shapes against. -1 on all three legs marks a row
-    -- reported before the columns existed: shapeless rows satisfy no
-    -- coverage clause and the dependent stays gated until the node
-    -- rebuilds and republishes.
+    -- edge's required shapes against. -1 on all three legs is
+    -- shapeless: it satisfies no coverage clause and the dependent
+    -- stays gated until the node rebuilds and republishes.
     unit_side INTEGER NOT NULL DEFAULT -1,
     unit_invocation INTEGER NOT NULL DEFAULT -1,
     unit_linked INTEGER NOT NULL DEFAULT -1,
@@ -574,16 +608,6 @@ CREATE TABLE IF NOT EXISTS github_app_token (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     token TEXT NOT NULL,
     expires_at TEXT NOT NULL
-);
-
--- The schema version this queue was migrated to, kept as a singleton
--- row. `PRAGMA user_version` would be the conventional carrier but the
--- Durable Object SQL authorizer refuses it, so the operator migrate
--- route reads and stamps this row instead (see SCHEMA_VERSION in
--- queue.rs).
-CREATE TABLE IF NOT EXISTS scheduler_schema_version (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    version INTEGER NOT NULL
 );
 
 -- Operator-flipped settings and the breaker-set freeze record.

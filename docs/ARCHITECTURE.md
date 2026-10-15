@@ -4,6 +4,56 @@ This document spells out the protocols, schemas, and invariants that the
 high-level [README](../README.md) summarizes. It is the authoritative spec for
 anyone integrating with or modifying the trust-critical paths.
 
+## Crates
+
+- `cli/` (`stow-cli`, the `stow` binary): the end-user CLI and rustc
+  wrapper. `cargo_cmd.rs` orchestrates `stow check|build|test`;
+  `index.rs` fetches, verifies and caches the signed index slices the
+  resolver reads; `resolve.rs` does local coverage analysis against
+  index rows — the dependency graph never leaves the machine for
+  lookups; `lockfile_resolver.rs` drives lockfile-exact resolution for
+  the `cargo fetch`/`predict` paths; `cache_policy.rs` decides whether a
+  rustc invocation may use the public cache; `inject.rs` writes cached
+  outputs back into Cargo target dirs; `prefetch.rs` prefetches covered
+  bundles from the edge's byte path, digest-checked against the index
+  row's `bundle_digest`; `state_db.rs` keeps the wrapper's local SQLite
+  state.
+- `edge/` (`stow-edge`): the Cloudflare Worker plus the scheduler
+  Durable Object. `api.rs` serves the digest-addressed bundle byte path,
+  the admissions/enqueue endpoints, the Turnstile-admitted request lane
+  and the trusted admin routes; `dependency_resolver.rs` holds the
+  edge's crates.io reads; `db.rs` is the D1 catalog (schema at
+  `edge/schema.sql`); `scheduler/` is the DO — queue, dispatch, miss
+  draining and request records (schema at `edge/src/scheduler/schema.sql`).
+  The crate is split by target: pure catalog/scheduler logic compiles
+  and unit-tests on the host, Cloudflare-bound modules are
+  `wasm32`-gated, and crates.io access goes through the
+  `dependency_resolver::CratesIo` trait (`CfCratesIo` in production).
+- `ci/` (`stow-build`): the trusted build runner's two stages —
+  `build` (untrusted job: compile, scan, write task + plan +
+  content-addressed blobs) and `publish` (trusted job: re-hash,
+  validate against the dispatched task and a self-resolved dependency
+  closure, push the bundle and the signed records to GHCR).
+- `oci/` (`stow-oci`): shared OCI push/sign/pull machinery — bundle
+  publish for `stow-build`, index publish for `stow-admin`, digest
+  pulls for the CLI.
+- `resolver/` (`stow-resolver`): the native graph resolver on the
+  published `cargo` crate — materializes a fetched source, runs cargo's
+  own resolver per CI target with the toolchain's real rustc facts and
+  emits the per-target unit set plus the `EnqueueRequest` conversion
+  the lanes share.
+- `admin/` (`stow-admin`): the operations CLI — index
+  export/publish/sync, preheat lanes (`preheat manual` resolves
+  in-process and dispatches a whole wave), `request resolve` (the
+  Actions half of the request lane), queue mutations and the scheduler
+  reset. Every lane resolves in-process with `stow-resolver`.
+- `mock-registry/` (`stow-mock-registry`): the local mock OCI registry
+  for simulation and tests.
+- `types/` (`stow-types`): shared API and artifact key types —
+  `index.rs` carries the signed `ArtifactIndex` wire format,
+  `trusted_builder.rs` the pinned builder identity.
+- `shim/` (`stow-shim`): the rustc wrapper shim and shared constants.
+
 ## Identity
 
 Every cached artifact is uniquely identified by a five-element tuple. All wire
@@ -47,6 +97,18 @@ invocation without them keeps the key it produced before they were modeled:
   a unit whose consumer runs LTO carries `-C linker-plugin-lto`, which is
   custom codegen and never cached.
 
+Link-affecting options sit in a grid on the key rather than refusing the
+cache: the grid applies only where the unit actually links (proc-macro,
+dylib, cdylib) — an rlib's key is unchanged because rustc never runs the
+linker to produce one. `-C link-arg` carries arbitrary text, so the grid
+holds the normalized option set, not a linker name; a build that adds
+`-L` or `-Wl,-rpath=` is a different point in that space. The cache
+publishes only the mold variant of linkable units (the builders pin
+`-fuse-ld=mold`; which linker a target defaults to is never observed,
+stated or relied on — it is target- and rustc-version-dependent), and a
+Linux build without mold does not start — a fallback would produce
+artifacts keyed for a linker the cache does not publish.
+
 ## D1 schema
 
 ### `artifacts`
@@ -54,9 +116,11 @@ invocation without them keeps the key it produced before they were modeled:
 The edge worker upserts rows here from the `POST /api/v1/admin/artifacts/sync`
 endpoint (`edge/src/db.rs::insert_artifact_record`) — the D1 table is a
 mirror of GHCR's signed records artifacts, populated by
-`stow-admin index sync` inside `index-publish.yml`. The SQL template lives at
-`edge/src/sql/insert_artifact.sql`; adding a column requires editing that
-file plus the matching `bind` calls in `insert_artifact_record`. Column list
+`stow-admin index sync` inside `index-publish.yml`. The table's schema
+lives in `edge/schema.sql`; the SQL template the upsert runs lives at
+`edge/src/sql/insert_artifact.sql`, and a column change means editing
+both plus the matching `bind` calls in `insert_artifact_record` — then
+applying the schema change as an operator reset (see below). Column list
 (in INSERT order):
 
 `compile_key`, `c_metadata`, `extra_filename`, `target`, `rustc_version`,
@@ -64,11 +128,17 @@ file plus the matching `bind` calls in `insert_artifact_record`. Column list
 `oci_reference`, `oci_digest`, `has_native`,
 `artifact_kind`, `crate_types_json`, `profile_json`, `emit_json`,
 `artifact_size`, `bundle_digest`, `bundle_size`, `compile_millis`,
+`unit_side`, `unit_invocation`, `unit_linked`, `min_glibc`,
 `created_at`.
 
 `compile_millis` is the wall-clock milliseconds the CI capture wrapper
 measured for the rustc invocation that produced the artifact; the usage
-statistics sum it to estimate CPU time the cache saved.
+statistics sum it to estimate CPU time the cache saved. `unit_side` /
+`unit_invocation` / `unit_linked` record the unit shape the builder
+reported (which side of the host/target boundary the unit compiled for,
+the cargo invocation spelling that produced it, and whether it links);
+`min_glibc` is the glibc floor a hosted artifact needs, measured at
+publish from the bundle's ELF version-needed entries.
 
 The composite uniqueness key is `(c_metadata, target, rustc_version)`.
 
@@ -97,7 +167,9 @@ for failed sends (restoring the marker if the send fails again). Rows
 queued more than 7 days ago are pruned opportunistically, as are
 never-admitted rows older than 30 days (left over from when analysis
 persisted every miss). Composite uniqueness key:
-`(crate_name, version, features_json, target, rustc_version)`.
+`(crate_name, version, features_json, target, rustc_version, host_side)` —
+a host-side miss and a target-side miss at one semantic identity are two
+rows.
 
 Enqueue admissions are stateless — the edge keeps no per-request record.
 An `/api/v1/admissions` response mints an `EnqueueAdmission` per uncovered
@@ -233,7 +305,23 @@ one names that same host platform, so a `wasm32` consumer waits on a
 (`build_enqueue_requests`) mint one task per uncovered node in the exact
 graph — a package the build needs on both sides of the target/host
 split is two nodes — and wave order emerges from the gate below rather
-than from any pruning at mint time.
+than from any pruning at mint time. A host-side node's build compiles
+its crate as a wrapper `[build-dependencies]` unit and runs each phase
+under both invocation spellings (native and explicit `--target`),
+publishing both shapes, because cargo compiles the host half of a unit
+graph under the build-override profile and the two spellings hand it
+different flags; the gate serves a dependent's host edge only when the
+side it needs has published.
+
+A minted task always builds at the latest semver-compatible version —
+within a range the latest is unique and a strict improvement, so a
+project's own version pins are dropped — unless the task's source asked
+to keep them: `preserve_lockfile` (`ci/src/task.rs`) keeps the bundled
+lockfile, whose pins still admit the yanked registry versions they name
+and whose git entries lock git dependencies to the recorded sha. Feature
+sets are never forced: `A` with `{c, d}` and `A` with `{c}` are two
+legitimate artifacts with no ordering between them, so a task carries
+its source's resolved feature set verbatim.
 
 Between mint and claim a row may become redundant — an artifact covering
 its exact `(crate, version, features_json, target, rustc_version)`
@@ -264,19 +352,27 @@ identity was never resolved reports `blocked` too, named `unknown
 dependency identity` — it can never resolve to a published row, so
 pending would hide a wait that no build can end.
 
-### Migrations
+## Schema lifecycle
 
-The D1 schema lives in `edge/migrations/NNNN_*.sql`, applied by
-`wrangler d1 migrations apply` (through `skyzen migrate`) before each
-deploy: every file runs exactly once against `stow-prod` and its name is
-recorded in the `d1_migrations` table. Re-executing the directory instead
-cannot work — `ALTER TABLE … ADD COLUMN` and `DROP COLUMN` are not
-idempotent, and a drop invalidates the files before it (`0006` drops the
-column `0001`'s seed index is built on). The Worker assumes the schema
-exists; the same command with `--local` applies the same files to
-mock/local databases (see `scripts/mock-e2e.sh`). `migrations_dir` is set
-through `[cloudflare.raw]` in both manifests, because wrangler resolves it
-against the generated config under `edge/.skyzen/gen/`.
+Every store has exactly one schema, and the code is written against it
+alone — nothing reads an older shape of a store.
+
+- The D1 catalog's schema is `edge/schema.sql`. An operator creates or
+  changes it by resetting the store: drop the tables, then apply the
+  file with `wrangler d1 execute stow-prod --remote --file edge/schema.sql`,
+  and resync the mirror from the signed records with
+  `stow-admin index export --out-dir <dir> --full` followed by
+  `stow-admin index sync --file <dir>/new-records.json`.
+- The scheduler Durable Object's schema is `edge/src/scheduler/schema.sql`,
+  created by the operator reset route — `stow-admin scheduler reset
+  --yes` (→ `POST /api/v1/admin/scheduler/reset` → the object's `/reset`)
+  drops every table, index and trigger and re-executes the file; the
+  queue and recorded slices are destroyed and refill from the lanes
+  that feed them. A store that was never initialized gets its schema
+  from the same pass — a fresh deployment's operator runs it once.
+- Request code and the alarm never create, alter, drop, backfill or
+  check the schema — a request on an uninitialized store fails with
+  SQLite's own `no such table` error.
 
 ## OCI bundle layout
 

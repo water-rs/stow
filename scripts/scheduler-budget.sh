@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The workerd cost gate (stow#433): bring the edge up under
 # `wrangler dev` (workerd — the same SQLite storage and cursor
-# accounting the Durable Object bills on), migrate the scheduler schema
+# accounting the Durable Object bills on), reset the scheduler store
 # through the operator route like the deploy pipeline does, seed the
 # production-shaped fixture through the object's probe route, and run
 # the budget pass. The probe routes answer only when the deploy carries
@@ -244,10 +244,19 @@ wait_for "mock registry listener" "$READY_DEADLINE" "$SERVICE_PID" \
 # report it timestamps.
 mkdir -p "$LOG_DIR/wrangler"
 export WRANGLER_LOG_PATH="$LOG_DIR/wrangler"
-wrangler d1 migrations apply stow-mock --local \
+# Apply the one schema the same way an operator does — skipped on a
+# reused edge-state dir (STOW_E2E_WORK_DIR), where the schema already
+# exists and the file's plain CREATEs would fail.
+if ! wrangler d1 execute stow-mock --local \
     --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-    --persist-to "$WORK_DIR/edge-state" >>"$LOG_DIR/edge-migrate.log" 2>&1 \
-    || die "edge D1 migrations failed — see $LOG_DIR/edge-migrate.log"
+    --persist-to "$WORK_DIR/edge-state" \
+    --command "SELECT 1 FROM artifacts LIMIT 1" >>"$LOG_DIR/edge-schema.log" 2>&1; then
+    wrangler d1 execute stow-mock --local \
+        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
+        --persist-to "$WORK_DIR/edge-state" \
+        --file "$REPO_ROOT/edge/schema.sql" >>"$LOG_DIR/edge-schema.log" 2>&1 \
+        || die "edge schema apply failed — see $LOG_DIR/edge-schema.log"
+fi
 (
     cd "$REPO_ROOT/edge"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
@@ -284,16 +293,16 @@ echo "[budget] started local-ci stub (pid $SERVICE_PID), log: $LOG_DIR/local-ci.
 wait_for "local CI dispatch endpoint" 60 "$SERVICE_PID" \
     http_listening "http://${LOCAL_CI_ADDR}/dispatch"
 
-# Same deploy order as deploy-edge.yml: the operator migration runs
+# Same deploy order as deploy-edge.yml: the operator reset runs
 # before the scheduler takes traffic.
-migrate_out="$(env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" scheduler migrate 2>&1)" \
-    || die "stow-admin scheduler migrate failed: $migrate_out"
-echo "[budget] $migrate_out"
+reset_out="$(env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler reset --yes 2>&1)" \
+    || die "stow-admin scheduler reset failed: $reset_out"
+echo "[budget] $reset_out"
 
 print_table() {
     jq -r '
-        "scheduler budget (queue rows \(.queue_rows), schema v\(.schema_version)):",
+        "scheduler budget (queue rows \(.queue_rows)):",
         (.rows[] | "  \(.name | . + " " * (34 - length)) stmts=\(.statements)/\(.statement_budget) rows_read=\(.rows_read)/\(.read_budget) rows_written=\(.rows_written)/\(.write_budget) wall_ms=\(.wall_ms)/\(.wall_budget)\(if .over_budget then " OVER" else "" end)\(if .over_wall then " SLOW" else "" end)")
     ' "$1"
 }
