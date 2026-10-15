@@ -8,7 +8,7 @@
 //! only existed in one of them would be an unmeasured request path.
 //!
 //! Every entry is a cold-start measure — the drives deliberately skip
-//! `migrate`, which is operations work, never request code.
+//! `reset`, which is operations work, never request code.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeSet;
@@ -1213,7 +1213,7 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // One real dispatch pass over a *floored* queue (stow#525):
         // the setup stamps `min_dispatch_value` at one band through the
-        // operator migrate path — unmetered, setup is not the event —
+        // operator floor path — unmetered, setup is not the event —
         // so the persisted flags put the under-floor miss bulk outside
         // the eligible index span while the human lane and the one-band
         // windows family stay ready. The metered pass then pays the
@@ -1233,8 +1233,8 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(async move {
                 // The floor application's DML half — the same stored-
                 // floor read, conditional backfill and stamp the
-                // operator migrate runs — no index DDL, which belongs
-                // to the migrate route alone.
+                // operator reset runs — no index DDL, which belongs
+                // to the reset route alone.
                 queue::apply_dispatch_floor(
                     db,
                     &queue::SchedulerSettings {
@@ -1423,6 +1423,8 @@ pub const DRIVES: &[Drive] = &[
                                 target: row.target,
                                 rustc_version: row.rustc_version,
                                 host_side: row.host_side != 0,
+                                explicit_spelling:
+                                    stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                             }),
                         );
                     }
@@ -2185,6 +2187,7 @@ fn subgraph_of(deps: &[stow_types::api::EnqueueDependency]) -> stow_types::api::
                 version: dep.version.clone(),
                 features_json: dep.features_json.clone(),
                 host_side: dep.host_side,
+                keys_apart: false,
                 deps: Vec::new(),
             })
             .collect(),
@@ -2222,6 +2225,7 @@ fn submit_batch_named(
         ),
         preserve_lockfile: false,
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     };
     let mut fresh = resync.clone();
     fresh.crate_name = fresh_name.parse().expect("fresh crate");
@@ -2300,6 +2304,7 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
         dependency_subgraph: subgraph_of(&[dep_request(shape.dep_row(2))]),
         preserve_lockfile: false,
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     };
     let root_id = root_task.task_id().expect("derived root task id");
     stow_types::api::RequestOutcomeReport {
@@ -2686,6 +2691,7 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
         target: dep_target(d).parse().expect("event dep target"),
         rustc_version: "1.86.0".parse().expect("event dep rustc"),
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     };
     (0..FEED_EVENT_DEPS)
         .map(|d| EnqueueRequest {
@@ -2702,6 +2708,7 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
             source: EnqueueSource::CacheMiss,
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         })
         .chain((0..FEED_EVENT_ROOTS).map(|k| {
             let [first, second] = feed_event_deps(k);
@@ -2716,6 +2723,7 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
                 dependency_subgraph: subgraph_of(&[dep_edge(first), dep_edge(second)]),
                 preserve_lockfile: false,
                 host_side: false,
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             }
         }))
         .collect()
@@ -3009,6 +3017,7 @@ fn dep_request(n: u32) -> EnqueueDependency {
             "1.86.0".parse().expect("dep rustc")
         },
         host_side: n.is_multiple_of(10),
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     }
 }
 
@@ -3020,7 +3029,11 @@ fn node_shapes(host_side: bool, target: &str) -> Vec<UnitShape> {
         .map_or(UnitInvocation::Native, |family| {
             UnitInvocation::for_task(target, family.host_triple())
         });
-    stow_types::public_cache::required_unit_shapes(host_side, invocation)
+    stow_types::public_cache::required_unit_shapes(
+        host_side,
+        invocation,
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+    )
 }
 
 /// The full-report drive's slice: a held-size membership (100 rows) on
@@ -3169,7 +3182,7 @@ mod lifecycle_tests {
     impl Rig {
         async fn open(syncs: Vec<Result<(), String>>) -> Self {
             let (db, events) = scripted_sync_db(syncs).await.expect("scripted db");
-            // Construction runs migrate + the permit gate — the log
+            // Construction runs reset + the permit gate — the log
             // the tests assert on starts at the drive itself.
             events.lock().expect("events").clear();
             Self {

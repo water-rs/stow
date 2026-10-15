@@ -1,4 +1,5 @@
 <!-- stow-watchdog:incident -->
+<!-- stow-watchdog:disabled{% if !disabled.is_empty() %} {{ disabled|join(",") }}{% endif %} -->
 ## stow watchdog — {{ now }} UTC{% if dry_run %} (dry run){% endif %}
 
 Breaching signals, observed against threshold:

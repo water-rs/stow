@@ -93,7 +93,11 @@ fn target_mask_case(expr: &str) -> String {
         let _ = write!(
             arms,
             "WHEN {index} THEN {} ",
-            crate::scheduler::queue::dep_invocation_mask(target, false)
+            crate::scheduler::queue::dep_invocation_mask(
+                target,
+                false,
+                stow_types::public_cache::ExplicitSpelling::KeysAsNative
+            )
         );
     }
     format!("CASE ({expr}) % {} {arms}END", target_count())
@@ -1523,10 +1527,10 @@ const SEED_TABLES: &[&str] = &[
 ];
 
 /// `POST /budget/seed` — load the fixture through the operator path,
-/// one cursor step per call. The schema is the operator migrate
+/// one cursor step per call. The schema is the operator reset
 /// route's product — the harness runs it before seeding, and request
-/// code neither issues DDL nor re-checks the migration's queue-wide
-/// passes (a `queue::migrate` inside every chunk call walked the
+/// code neither issues DDL nor walks the queue to check the schema
+/// (a queue-wide pass inside every chunk call walked the
 /// growing queue for a no-op `!=` guard — the linear request cost that
 /// outlived the dev proxy's reply window at 1M rows). `reset` restarts
 /// the cursor and clears the fixture's tables chunk by chunk. Callers
@@ -2012,8 +2016,10 @@ mod tests {
     struct EdgeRequirement {
         owner_target: String,
         owner_side: i64,
+        owner_spelling: i64,
         dep_target: String,
         dep_side: i64,
+        dep_spelling: i64,
         stored_side: i64,
         invocations: i64,
         shapes: i64,
@@ -2023,6 +2029,7 @@ mod tests {
     struct SliceMembership {
         target: String,
         host_side: i64,
+        explicit_spelling: i64,
         unit_side: i64,
         unit_invocation: i64,
         unit_linked: i64,
@@ -2087,7 +2094,9 @@ mod tests {
         let edges = db
             .query(
                 "SELECT o.target AS owner_target, o.host_side AS owner_side, \
+                        o.explicit_spelling AS owner_spelling, \
                         d.target AS dep_target, d.host_side AS dep_side, \
+                        d.explicit_spelling AS dep_spelling, \
                         e.dep_host_side AS stored_side, \
                         e.dep_invocations AS invocations, e.dep_shapes AS shapes \
                  FROM queue_dependencies e \
@@ -2105,8 +2114,10 @@ mod tests {
                 crate::scheduler::queue::dep_edge_requirements(
                     &edge.owner_target,
                     edge.owner_side != 0,
+                    crate::scheduler::queue::spelling_of(edge.owner_spelling),
                     &edge.dep_target,
                     edge.dep_side != 0,
+                    crate::scheduler::queue::spelling_of(edge.dep_spelling),
                 ),
                 "{label}: requirements for {} dep {} (owner {})",
                 edge.dep_side,
@@ -2124,6 +2135,7 @@ mod tests {
         let membership = db
             .query(
                 "SELECT s.target AS target, q.host_side AS host_side, \
+                        q.explicit_spelling AS explicit_spelling, \
                         s.unit_side AS unit_side, s.unit_invocation AS unit_invocation, \
                         s.unit_linked AS unit_linked \
                  FROM published_slice_rows s \
@@ -2137,14 +2149,17 @@ mod tests {
         assert!(!membership.is_empty(), "{label}: no slice rows joined");
         for row in &membership {
             let invocation = node_invocation(&row.target);
-            let covered =
-                stow_types::public_cache::required_unit_shapes(row.host_side != 0, invocation)
-                    .iter()
-                    .any(|shape| {
-                        shape.side.to_int() == row.unit_side
-                            && shape.invocation.to_int() == row.unit_invocation
-                            && shape.kind.to_int() == row.unit_linked
-                    });
+            let covered = stow_types::public_cache::required_unit_shapes(
+                row.host_side != 0,
+                invocation,
+                crate::scheduler::queue::spelling_of(row.explicit_spelling),
+            )
+            .iter()
+            .any(|shape| {
+                shape.side.to_int() == row.unit_side
+                    && shape.invocation.to_int() == row.unit_invocation
+                    && shape.kind.to_int() == row.unit_linked
+            });
             assert!(
                 covered,
                 "{label}: slice row ({},{},{}) of {} (host_side={}) is no required shape",

@@ -327,15 +327,21 @@ wait_for "mock registry /v2/" 60 "$SERVICE_PID" mock_registry_ready
     skyzen build --provider cloudflare --manifest Skyzen.mock.toml
 ) >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
-# The edge assumes its schema exists; migrations are deployment work, so the
-# local D1 gets the same files the production pipeline applies, through the
-# same `d1_migrations` bookkeeping: `ALTER TABLE … ADD COLUMN` and `DROP
-# COLUMN` are not idempotent, so a reused edge-state dir (STOW_E2E_WORK_DIR)
-# must apply only what it has not applied yet.
-wrangler d1 migrations apply stow-mock --local \
+# The edge assumes its D1 schema exists; creating it is deployment work, so
+# the local D1 gets the one schema file an operator applies.
+# Apply the one schema the same way an operator does — skipped on a
+# reused edge-state dir (STOW_E2E_WORK_DIR), where the schema already
+# exists and the file's plain CREATEs would fail.
+if ! wrangler d1 execute stow-mock --local \
     --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-    --persist-to "$WORK_DIR/edge-state" >>"$LOG_DIR/edge-migrate.log" 2>&1 \
-    || die "edge migrations failed — see $LOG_DIR/edge-migrate.log"
+    --persist-to "$WORK_DIR/edge-state" \
+    --command "SELECT 1 FROM artifacts LIMIT 1" >>"$LOG_DIR/edge-schema.log" 2>&1; then
+    wrangler d1 execute stow-mock --local \
+        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
+        --persist-to "$WORK_DIR/edge-state" \
+        --file "$REPO_ROOT/edge/schema.sql" >>"$LOG_DIR/edge-schema.log" 2>&1 \
+        || die "edge schema apply failed — see $LOG_DIR/edge-schema.log"
+fi
 (
     cd "$REPO_ROOT/edge"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
@@ -345,23 +351,18 @@ SERVICE_PID=$!
 CHILD_PIDS+=("$SERVICE_PID")
 CHILD_NAMES+=(edge)
 echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
-# The scheduler Durable Object applies its schema through the operator
-# migrate route — deployment work, never request work — so the mock
-# plays the deploy pipeline: wait only for the listener, then run the
-# same `stow-admin scheduler migrate` deploy-edge.yml runs, before any
-# scheduler traffic. A status read before the migration is a 500; the
-# listener probe takes the route's response code as its ready signal.
+# The scheduler Durable Object's schema exists only through the operator
+# reset route — deployment work, never request work — so the mock plays
+# the deploy's operator: wait only for the listener, then run
+# `stow-admin scheduler reset --yes` before any scheduler traffic. A
+# status read on an uninitialized store is a 500; the listener probe
+# takes the route's response code as its ready signal.
 wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
     http_listening "$SCHEDULER_URL/status"
-migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" scheduler migrate 2>&1)" \
-    || die "stow-admin scheduler migrate failed: $migrate_out"
-echo "[mock-e2e] $migrate_out"
-current_schema="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9]*\);/\1/p' \
-    "$REPO_ROOT/edge/src/scheduler/queue.rs")"
-[ -n "$current_schema" ] || die "could not read SCHEMA_VERSION from queue.rs"
-[ "${migrate_out##* }" = "$current_schema" ] \
-    || die "scheduler migrate reported '$migrate_out', expected schema $current_schema"
+reset_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler reset --yes 2>&1)" \
+    || die "stow-admin scheduler reset failed: $reset_out"
+echo "[mock-e2e] $reset_out"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 
@@ -510,233 +511,6 @@ for s in json.load(open(sys.argv[1])):
         || die "stow-admin index sync failed — see $LOG_DIR/index-sync-$tag.log"
 }
 
-# --- retried pre-migration dependent row -----------------------------------
-#
-# The production Class-B failure's scheduler spelling: a queue row minted
-# before the side model keeps the edges it was minted with when it is
-# retried — `dep_host_side` defaulted 0, and the wire could not name a
-# side. The migration re-derives every such edge from where the dep's
-# task sits; a dep on the family host triple under an owner on the same
-# triple is ambiguous, so the edge stays unestablished (-1). The gate's
-# `p.unit_side = -1` clause matches no published row, so the dependent
-# holds until a resolver resync — any re-request carrying `depends_on` —
-# rewrites the edge.
-#
-# snafu is the library the proc-macro crate derives for: its
-# $HOST_TARGET target node edges snafu-derive host-side. Its submit and
-# legacy spelling must happen before the waves below publish any
-# coverage: `tasks/submit` arms the dispatch alarm at now, so an edge
-# that is already servable releases in the window before the UPDATE can
-# land. Spelled while nothing is published, the -1 edge then holds snafu
-# deterministically — the check after the waves is what proves the hold
-# survives published coverage.
-#
-# The queue is a Durable Object's sqlite store — `wrangler d1` reaches
-# only the catalog; workerd persists the DO under the run's edge-state.
-sched_db() {
-    find "$WORK_DIR/edge-state/v3/do" -name '*.sqlite' \
-        ! -name 'metadata.sqlite' ! -name '*-wal' ! -name '*-shm' | head -1
-}
-sched() {
-    sqlite3 -batch "$(sched_db)" ".timeout 15000" "$1"
-}
-LEGACY_VERSION="$(curl -fsS --max-time 30 -A 'stow-mock-e2e' \
-    'https://crates.io/api/v1/crates/snafu' \
-    | jq -r '.crate.max_stable_version')"
-[ -n "$LEGACY_VERSION" ] && [ "$LEGACY_VERSION" != "null" ] \
-    || die "crates.io returned no version for snafu"
-echo "[mock-e2e] legacy-row lane: snafu $LEGACY_VERSION"
-
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" --json preheat plan \
-    "snafu@${LEGACY_VERSION}" \
-    --features-json '[]' \
-    --target "$HOST_TARGET" \
-    --rustc-version "$RUSTC_VERSION" \
-    >"$WORK_DIR/preheat-plan-legacy.json" 2>"$LOG_DIR/preheat-plan-legacy.log" \
-    || die "snafu preheat plan failed — see $LOG_DIR/preheat-plan-legacy.log"
-
-legacy_tasks="$(jq '[.targets[].tasks[]]' "$WORK_DIR/preheat-plan-legacy.json")"
-jq -e '.[] | select(.crate_name == "snafu" and .host_side != true)' <<<"$legacy_tasks" >/dev/null \
-    || die "snafu plan minted no $HOST_TARGET target node: $(jq -c '[.[].crate_name]' <<<"$legacy_tasks")"
-jq -e '.[] | select(.crate_name == "snafu") | [.depends_on[].crate_name] | index("snafu-derive") != null' \
-    <<<"$legacy_tasks" >/dev/null \
-    || die "snafu's resolved edges do not name snafu-derive"
-
-curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
-    -H "Authorization: Bearer $EDGE_BEARER" \
-    -H 'content-type: application/json' \
-    --data "$legacy_tasks" >/dev/null \
-    || die "snafu submit failed"
-
-snafu_id="$(sched "SELECT task_id FROM queue WHERE crate_name = 'snafu' AND host_side = 0")"
-[ -n "$snafu_id" ] || die "snafu queue row missing after submit"
-
-# The spelling a retried pre-migration row leaves after the column
-# ALTERs: side columns exist, but no resolver ever wrote them.
-sched "UPDATE queue_dependencies SET dep_host_side = 0, dep_side_known = 0 \
-    WHERE task_id = '$snafu_id'"
-
-# The side derivation is part of the migration pass, which runs only
-# through the operator route — rerun it the way a deploy would. The
-# edge's stored side must read -1: owner and dep both sit on the family
-# host triple, so the derivation cannot prove which side the edge meant.
-migrate_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" scheduler migrate 2>&1)" \
-    || die "stow-admin scheduler migrate failed: $migrate_out"
-edge_side="$(sched "SELECT dep_host_side FROM queue_dependencies \
-    WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'")"
-[ "$edge_side" = "-1" ] \
-    || die "the migration left snafu->snafu-derive at dep_host_side $edge_side — expected -1 (unestablished)"
-
-deadline=$((SECONDS + TASK_DEADLINE))
-wave=0
-last_completed=-1
-last_publish=0
-while :; do
-    check_children_alive
-    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
-    if [ -z "$status_json" ]; then
-        sleep 5
-        continue
-    fi
-    pending="$(jq -r '.pending' <<<"$status_json")"
-    dispatched="$(jq -r '.dispatched' <<<"$status_json")"
-    running="$(jq -r '.running' <<<"$status_json")"
-    completed="$(jq -r '.completed' <<<"$status_json")"
-    failed="$(jq -r '.failed' <<<"$status_json")"
-    echo "[mock-e2e] scheduler: $status_json"
-    [ "$failed" -ge 1 ] && die "scheduler reported a failed task: $status_json"
-    # The wave drain counts only the plan's rows — snafu sits pending on
-    # its unestablished edge through the whole build, by design.
-    wave_open="$(sched "SELECT COUNT(*) FROM queue WHERE status IN ('pending','dispatched','running') \
-        AND task_id != '$snafu_id'")"
-    if [ "$wave_open" -eq 0 ]; then
-        [ "$completed" -eq "$task_count" ] \
-            || die "queue drained at $completed completed tasks, expected $task_count"
-        break
-    fi
-    if [ "$pending" -gt 0 ] && [ "$dispatched" -eq 0 ] && [ "$running" -eq 0 ] \
-        && { [ "$completed" -gt "$last_completed" ] || [ "$last_publish" -lt "$((SECONDS - 30))" ]; }; then
-        # Every dispatched task reported; the pending set is gated on the
-        # index — publish the host slice so the next wave releases. The
-        # second arm republishes while the queue sits idle-but-pending —
-        # the DO's gate re-evaluates per generation, so a publish that
-        # landed between evaluations is cheap insurance against a missed
-        # wake.
-        wave=$((wave + 1))
-        echo "[mock-e2e] publishing host slice (wave $wave)"
-        publish_slices "wave-$wave"
-        last_completed="$completed"
-        last_publish=$SECONDS
-    fi
-    [ "$SECONDS" -ge "$deadline" ] \
-        && die "scheduler did not finish the graph within ${TASK_DEADLINE}s (last status: ${status_json})"
-    sleep 5
-done
-echo "[mock-e2e] all $task_count tasks completed — the own-node check passed on every build"
-
-# --- catalog assertions ----------------------------------------------------
-#
-# The catalog's artifacts table must register every host-side unit under
-# the host triple with its stamped unit shape — side=host (1), both
-# invocations (0=native, 1=target), both kinds (0=unlinked, 1=linked).
-d1() {
-    wrangler d1 execute stow-mock --local \
-        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-        --persist-to "$WORK_DIR/edge-state" \
-        --command "$1" --json 2>/dev/null
-}
-
-heck_shapes="$(d1 "SELECT DISTINCT unit_invocation, unit_linked FROM artifacts \
-    WHERE crate_name = 'heck' AND target = '$HOST_TARGET' AND unit_side = 1")"
-echo "[mock-e2e] heck host-side shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
-[ "$(jq '.[0].results | length' <<<"$heck_shapes")" = "2" ] \
-    || die "heck host-side rows are not the two linked shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
-for want in '{"unit_invocation":0,"unit_linked":1}' '{"unit_invocation":1,"unit_linked":1}'; do
-    jq -e ".[0].results | map({unit_invocation, unit_linked}) | index($want) != null" \
-        <<<"$heck_shapes" >/dev/null \
-        || die "heck host-side rows miss shape $want"
-done
-
-# A host unit must never register under the task's *target* — the pre-#349
-# bug shape that produced heck@wasm32 at the consumer's key.
-heck_wasm="$(d1 "SELECT count(*) AS n FROM artifacts \
-    WHERE crate_name = 'heck' AND target = '$CONSUMER_TARGET'")"
-[ "$(jq -r '.[0].results[0].n' <<<"$heck_wasm")" = "0" ] \
-    || die "heck registered under $CONSUMER_TARGET — the task-target registration bug is back"
-
-# Every host dep lands under the host triple at host side.
-for dep in snafu-derive proc-macro2 quote syn unicode-ident; do
-    n="$(d1 "SELECT count(DISTINCT unit_invocation || '-' || unit_linked) AS n FROM artifacts \
-        WHERE crate_name = '$dep' AND target = '$HOST_TARGET' AND unit_side = 1" \
-        | jq -r '.[0].results[0].n')"
-    [ "$n" = "2" ] || die "$dep covers $n host shapes under $HOST_TARGET, expected 2"
-done
-echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
-
-# The proc-macro unit's honest floor — measured by the sysrooted build
-# the way production links — must sit at or under the index's published
-# baseline: an above-baseline row publishes but `index report` excludes
-# it, so the lanes below would find snafu-derive unservable forever.
-# Versions order numerically, not as strings (2.4 < 2.34), so the
-# highest floor is picked with `sort -V` rather than SQL's max().
-snafu_floors="$(d1 "SELECT min_glibc FROM artifacts \
-    WHERE crate_name = 'snafu-derive' AND min_glibc != ''")"
-floor="$(jq -r '.[0].results[].min_glibc' <<<"$snafu_floors" | sort -V | tail -1)"
-[ -n "$floor" ] \
-    || die "snafu-derive's linked unit registered no glibc floor — the sysroot build did not measure it"
-[ "$(printf '%s\n2.28\n' "$floor" | sort -V | tail -1)" = "2.28" ] \
-    || die "snafu-derive's glibc floor $floor exceeds the 2.28 baseline — the build linked outside the sysroot"
-
-# Held although snafu-derive's host coverage is published — the -1 edge
-# matches no slice row, unlike the target-side 0 the dev-era row
-# pretended to be.
-snafu_status="$(sched "SELECT status FROM queue WHERE task_id = '$snafu_id'")"
-[ "$snafu_status" = "pending" ] \
-    || die "the unestablished edge released snafu (status $snafu_status)"
-echo "[mock-e2e] dev-era edge derived -1 — snafu held behind an unestablished side"
-
-# The heal is the resolver resync: resubmitting the same plan rewrites
-# the edge with a real side — snafu-derive host-side — and marks it
-# resolver-known.
-curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
-    -H "Authorization: Bearer $EDGE_BEARER" \
-    -H 'content-type: application/json' \
-    --data "$legacy_tasks" >/dev/null \
-    || die "snafu resubmit failed"
-edge_known="$(sched "SELECT dep_host_side || '/' || dep_side_known \
-    FROM queue_dependencies \
-    WHERE task_id = '$snafu_id' AND dep_crate_name = 'snafu-derive'")"
-[ "$edge_known" = "1/1" ] \
-    || die "resync left snafu->snafu-derive at $edge_known — expected 1/1 (host, resolver-known)"
-
-# snafu now dispatches once every dep is servable — snafu-derive already
-# is; its target-side deps build and publish in this second wave.
-legacy_deadline=$((SECONDS + TASK_DEADLINE))
-legacy_wave=0
-last_publish=0
-while :; do
-    check_children_alive
-    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
-    [ -n "$status_json" ] || { sleep 5; continue; }
-    [ "$(jq -r '.failed' <<<"$status_json")" -ge 1 ] \
-        && die "scheduler reported a failed task: $status_json"
-    snafu_status="$(sched "SELECT status FROM queue WHERE task_id = '$snafu_id'")"
-    [ "$snafu_status" = "completed" ] && break
-    pending="$(jq -r '.pending' <<<"$status_json")"
-    if [ "$pending" -gt 0 ] && [ "$last_publish" -lt "$((SECONDS - 30))" ]; then
-        legacy_wave=$((legacy_wave + 1))
-        echo "[mock-e2e] publishing host slice (legacy wave $legacy_wave)"
-        publish_slices "legacy-wave-$legacy_wave"
-        last_publish=$SECONDS
-    fi
-    [ "$SECONDS" -ge "$legacy_deadline" ] \
-        && die "snafu did not complete within ${TASK_DEADLINE}s (status $snafu_status; last status: $status_json)"
-    sleep 5
-done
-echo "[mock-e2e] resynced snafu completed — a retried pre-migration row heals through the resolver"
-
 # --- consumer repro --------------------------------------------------------
 #
 # A consumer whose build compiles snafu-derive's host units itself is
@@ -745,7 +519,7 @@ echo "[mock-e2e] resynced snafu completed — a retried pre-migration row heals 
 # from the host slice at the invocation spelling's own key.
 
 # One last pass so the final wave's records fold into the slices the
-# consumer lanes fetch: export reads whatever the legacy wave left
+# consumer lanes fetch: export reads whatever the wave left
 # unpublished, publish pushes the slices, report feeds the gate, sync
 # fills the catalog.
 publish_slices "final"

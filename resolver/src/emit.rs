@@ -437,7 +437,7 @@ fn emit_deduped_dep_edges(units: &mut [StowUnit]) {
                         name: dep.name.clone(),
                         version: dep.version.clone(),
                         dep_kind: dep.dep_kind,
-                        proc_macro: false,
+                        proc_macro: dep.proc_macro,
                     },
                 ));
             }

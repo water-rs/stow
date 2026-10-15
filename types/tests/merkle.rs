@@ -536,7 +536,7 @@ fn optional_shadow_preserves_package_source() {
         ),
         "middle",
         "1.0.0",
-        &["native"],
+        &[],
         true,
         vec![],
     );
@@ -565,7 +565,10 @@ fn optional_shadow_preserves_package_source() {
 /// with a direct proc-macro dep is `KeysApart`; a lib above it
 /// inherits the flag; a host-side node and a lib with only build deps
 /// stay `KeysAsNative`.
-fn spelling_of(graph: &ResolvedTaskGraph, crate_name: &str) -> stow_types::public_cache::ExplicitSpelling {
+fn spelling_of(
+    graph: &ResolvedTaskGraph,
+    crate_name: &str,
+) -> stow_types::public_cache::ExplicitSpelling {
     graph.nodes()[node_index(graph, crate_name)].explicit_spelling
 }
 

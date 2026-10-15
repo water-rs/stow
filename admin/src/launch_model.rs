@@ -132,8 +132,8 @@ enum RouteKind {
     /// `POST /api/v1/scheduler/tasks/submit` — trusted submits; each
     /// carries a task batch.
     TrustedSubmit,
-    /// The rest of the trusted surface — status reads, queue
-    /// mutations, migrations.
+    /// The rest of the trusted surface — status reads and queue
+    /// mutations.
     AdminOperation,
 }
 

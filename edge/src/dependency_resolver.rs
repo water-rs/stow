@@ -683,7 +683,10 @@ pub async fn load_cached_artifacts_for_keys(
                 key_pair.0.crate_name, key_pair.0.version
             )
         })?;
-        required_by_key.insert(key_pair, required_unit_shapes(host_side, invocation, spelling));
+        required_by_key.insert(
+            key_pair,
+            required_unit_shapes(host_side, invocation, spelling),
+        );
     }
     let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<UnitShape>>::new();
     for candidate in &candidates {
@@ -1327,6 +1330,7 @@ mod tests {
                     version: humansize_key.version.clone(),
                     features: vec!["std".to_owned()],
                     host_side: false,
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                     dependencies: vec![ResolvedDependencyGraphDependency {
                         crate_name: libm_key.crate_name.clone(),
                         version: libm_key.version.clone(),
@@ -1339,6 +1343,7 @@ mod tests {
                     version: libm_key.version.clone(),
                     features: Vec::new(),
                     host_side: false,
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
@@ -1393,6 +1398,7 @@ mod tests {
                     version: consumer_key.version.clone(),
                     features: Vec::new(),
                     host_side: false,
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                     dependencies: vec![
                         ResolvedDependencyGraphDependency {
                             crate_name: syn_key.crate_name.clone(),
@@ -1412,6 +1418,7 @@ mod tests {
                     version: syn_key.version.clone(),
                     features: vec!["parsing".to_owned()],
                     host_side: false,
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
@@ -1420,6 +1427,7 @@ mod tests {
                     version: syn_key.version.clone(),
                     features: vec!["full".to_owned(), "parsing".to_owned()],
                     host_side: true,
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 },
@@ -1751,6 +1759,7 @@ mod tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
@@ -1799,6 +1808,7 @@ mod tests {
                     .map(|raw| super::parse_canonical_features_json(raw).expect("features parse"))
                     .unwrap_or_default(),
                 host_side: member.host_side,
+                keys_apart: false,
                 deps: graph
                     .get(member)
                     .into_iter()
@@ -1851,6 +1861,15 @@ mod tests {
             .collect()
     }
 
+    fn spellings(
+        graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
+    ) -> BTreeMap<ExpandedNodeKey, super::ExplicitSpelling> {
+        graph
+            .keys()
+            .map(|key| (key.clone(), super::ExplicitSpelling::KeysAsNative))
+            .collect()
+    }
+
     fn covered(names: &[&str]) -> BTreeSet<(ExpandedNodeKey, String)> {
         names
             .iter()
@@ -1873,6 +1892,7 @@ mod tests {
             &features(&graph),
             &graph,
             &subgraphs(&graph, &features(&graph)),
+            &spellings(&graph),
             &covered(&["b"]),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1917,6 +1937,7 @@ mod tests {
             &features,
             &graph,
             &subgraphs(&graph, &features),
+            &spellings(&graph),
             &BTreeSet::new(),
             &"wasm32-unknown-unknown".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1966,6 +1987,7 @@ mod tests {
             &features,
             &graph,
             &subgraphs(&graph, &features),
+            &spellings(&graph),
             &BTreeSet::new(),
             &"aarch64-apple-ios".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -2099,7 +2121,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         let crates_io = closure_stub();
 
         let latest = super::latest_published_version(&db, &crates_io, "root")
@@ -2141,7 +2163,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         let crates_io = closure_stub();
 
         let error = super::latest_published_version(&db, &crates_io, "never-published")
@@ -2178,7 +2200,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         // The v1 row shape: no `format_version`, dependency entries the
         // current schema would reject — but none of that is reached,
         // because the tag is checked before the payload is trusted.
@@ -2298,7 +2320,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         let entries = (0..DIRECT)
             .map(|index| stow_types::api::DependencyGraphEntry {
                 crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
@@ -2312,6 +2334,7 @@ mod sqlite_tests {
                 version: semver::Version::parse("1.0.0").expect("version"),
                 features: Vec::new(),
                 host_side: false,
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             })
@@ -2360,6 +2383,7 @@ mod sqlite_tests {
                 version: semver::Version::parse("1.0.0").expect("version"),
                 features: Vec::new(),
                 host_side: false,
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             })
@@ -2387,7 +2411,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        crate::db::apply_migrations(&db).await;
+        crate::db::apply_schema(&db).await;
         db.query(
             "CREATE TRIGGER deny_graph_cache_write \
              BEFORE INSERT ON crate_version_graph_cache \

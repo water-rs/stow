@@ -352,9 +352,11 @@ impl UnitInvocation {
 }
 
 /// Whether a target-side unit at a host triple keys differently under
-/// the explicit `--target <host>` spelling — exactly when a proc-macro
-/// is in its `--extern` closure (stow#736). Derived from the
-/// dependency subgraph, so it is not part of the task id.
+/// the explicit `--target <host>` spelling (stow#736).
+///
+/// The difference exists exactly when a proc-macro is in the unit's
+/// `--extern` closure. Derived from the dependency subgraph, so it is
+/// not part of the task id.
 #[derive(
     Debug,
     Default,
@@ -1174,14 +1176,22 @@ mod tests {
         // A target-side node serves the build shape and the check shape
         // of its own invocation only.
         assert_eq!(
-            required_unit_shapes(false, UnitInvocation::Native, ExplicitSpelling::KeysAsNative),
+            required_unit_shapes(
+                false,
+                UnitInvocation::Native,
+                ExplicitSpelling::KeysAsNative
+            ),
             vec![
                 shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Unlinked),
                 shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
             ]
         );
         assert_eq!(
-            required_unit_shapes(false, UnitInvocation::Target, ExplicitSpelling::KeysAsNative),
+            required_unit_shapes(
+                false,
+                UnitInvocation::Target,
+                ExplicitSpelling::KeysAsNative
+            ),
             vec![
                 shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Unlinked),
                 shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Linked),

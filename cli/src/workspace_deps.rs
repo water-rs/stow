@@ -855,7 +855,7 @@ fn unit_graph_task_units(
                     // `--extern` exactly when the dep unit IS the
                     // proc-macro lib — the flag the shared projection
                     // derives `KeysApart` from (stow#736).
-                    proc_macro: dep_unit.target.kind.iter().any(|kind| *kind == "proc-macro"),
+                    proc_macro: dep_unit.target.kind.contains(&"proc-macro"),
                 });
             }
             units.push(TaskUnit { deps, ..base });

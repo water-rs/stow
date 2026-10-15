@@ -397,6 +397,7 @@ fn submit_task(rustc: &str, counter: u64) -> Result<EnqueueRequest, String> {
             nodes: Vec::new(),
         },
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         preserve_lockfile: false,
     })
 }
@@ -436,6 +437,7 @@ fn admission_body(target: &str, rustc: &str, counter: u64) -> Result<serde_json:
             version,
             features,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: Vec::new(),
             dependency_subgraph: stow_types::api::TaskSubgraph::default(),
         }],

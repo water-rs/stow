@@ -715,6 +715,7 @@ fn payload_for(request: &EnqueueRequest) -> BuildTaskPayload {
         rustc_version: request.rustc_version.clone(),
         preserve_lockfile: request.preserve_lockfile,
         host_side: request.host_side,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         dependency_subgraph: request.dependency_subgraph.clone(),
     }
 }
@@ -1202,7 +1203,7 @@ fn an_altered_subgraph_fails_the_context_check() {
         task.dependency_subgraph = altered;
         task.task_id = task
             .dependency_subgraph
-            .resolve(&task.task_node_identity())
+            .resolve(&task.task_node_identity(), task.explicit_spelling)
             .expect("altered subgraph resolves")
             .task_id(0)
             .expect("resolved root")

@@ -63,10 +63,12 @@ fn publish_with_build_deps(
             .collect::<serde_json::Map<_, _>>(),
     });
     if !build_deps.is_empty() {
-        manifest["build-dependencies"] = json!(build_deps
-            .iter()
-            .map(|(name, req)| ((*name).to_owned(), json!(req)))
-            .collect::<serde_json::Map<_, _>>());
+        manifest["build-dependencies"] = json!(
+            build_deps
+                .iter()
+                .map(|(name, req)| ((*name).to_owned(), json!(req)))
+                .collect::<serde_json::Map<_, _>>()
+        );
     }
     if !fixture.target_deps.is_empty() {
         let mut target = serde_json::Map::new();
@@ -168,9 +170,7 @@ fn index_deps(fixture: &Fixture, build_deps: &[(&'static str, &'static str)]) ->
     fixture
         .deps
         .iter()
-        .map(|(name, req, features)| {
-            entry(name, req, &json!(features), &Value::Null, "normal")
-        })
+        .map(|(name, req, features)| entry(name, req, &json!(features), &Value::Null, "normal"))
         .chain(
             fixture
                 .target_deps
@@ -2850,10 +2850,7 @@ fn explicit_spelling_marks_proc_macro_closures() {
     // `bs` builds against `hostlib` only — a build-dep edge that never
     // reaches its lib's `--extern`.
     publish_with_build_deps(&reg, &plain("bs"), &[("hostlib", "1")]);
-    let manifest = project(
-        &work.path().join("root"),
-        &json!({ "top": "1", "bs": "1" }),
-    );
+    let manifest = project(&work.path().join("root"), &json!({ "top": "1", "bs": "1" }));
     let (_home, resolver) = resolver_at(&reg);
     let out = resolver
         .resolve(
@@ -2862,8 +2859,8 @@ fn explicit_spelling_marks_proc_macro_closures() {
             &["aarch64-unknown-linux-gnu".to_owned()],
         )
         .unwrap();
-    let graph = stow_resolver::resolved_task_graph(&out[0].1.units, pinned_rustc_version())
-        .unwrap();
+    let graph =
+        stow_resolver::resolved_task_graph(&out[0].1.units, pinned_rustc_version()).unwrap();
     let spelling_of = |name: &str| {
         let index = graph
             .nodes()

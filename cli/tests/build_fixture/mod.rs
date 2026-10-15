@@ -70,6 +70,32 @@ pub fn stow_build_in(
     cargo_home: &Path,
     target_dir: &Path,
 ) -> Output {
+    stow_build_in_with_env(
+        dir,
+        args,
+        edge_url,
+        registry_url,
+        cache_dir,
+        cargo_home,
+        target_dir,
+        &[],
+    )
+}
+
+/// [`stow_build_in`] with caller-supplied environment layered on top —
+/// a `RUST_LOG` a test wants set, or the `STOW_TRACE_FILE` one reads
+/// afterwards.
+#[allow(clippy::too_many_arguments)]
+pub fn stow_build_in_with_env(
+    dir: &Path,
+    args: &[&str],
+    edge_url: &str,
+    registry_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+    target_dir: &Path,
+    env: &[(&str, &str)],
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     hermetic_stow_env(&mut command, edge_url, cache_dir);
     command
@@ -87,7 +113,7 @@ pub fn stow_build_in(
         // Level markers and cargo's status lines are asserted on as
         // plain text, whatever colour the environment asks for.
         .env("NO_COLOR", "1")
-        .env("CARGO_TERM_COLOR", "never")
-        .output()
-        .expect("run stow-cli build")
+        .env("CARGO_TERM_COLOR", "never");
+    command.envs(env.iter().copied());
+    command.output().expect("run stow-cli build")
 }

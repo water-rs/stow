@@ -1355,9 +1355,17 @@ impl CargoInvocation {
 /// compiles its crate as a host unit, and consumers reach that unit
 /// from both invocation spellings — a native build and any `--target`
 /// build compute different compile keys for it — so the task runs each
-/// phase under both and publishes both artifacts (stow#349).
-const fn phase_invocations(task: &BuildTaskPayload) -> &'static [CargoInvocation] {
-    if task.host_side {
+/// phase under both and publishes both artifacts (stow#349). A
+/// `KeysApart` target-side task at the runner's host triple does the
+/// same: a proc-macro in its `--extern` closure keys the unit
+/// differently per spelling, so it publishes the target-side shapes of
+/// both (stow#736).
+fn phase_invocations(task: &BuildTaskPayload) -> &'static [CargoInvocation] {
+    let runs_both_spellings = task.host_side
+        || (task.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
+            && stow_types::api::runner_family(task.target.as_str())
+                .is_some_and(|family| family.host_triple() == task.target.as_str()));
+    if runs_both_spellings {
         &[CargoInvocation::Native, CargoInvocation::Explicit]
     } else {
         &[CargoInvocation::Task]
@@ -1787,14 +1795,17 @@ fn targets_android(target: &str) -> bool {
 /// out of `names` — the caller passes the parent environment's names at
 /// sandbox-build time, and the task's `target` decides which apply.
 ///
-/// Exact names cover the compiler drivers the `cc` crate and rustc invoke,
-/// the SDK roots those tools locate their install trees through, and
-/// pkg-config's sysroot wiring. The Android SDK/NDK roots
-/// (`ANDROID_ROOT_VARS`) count only for a task that targets Android; the
-/// runner image exports them whatever the job builds. The prefixed forms
-/// are the `cc` crate's per-target overrides (`CC_<target>`,
-/// `AR_<target>`, `CFLAGS_<target>`) plus cargo's per-target configuration
-/// (`CARGO_TARGET_<TRIPLE>_LINKER`, `_AR`, `_RUNNER`, `_RUSTFLAGS`).
+/// Exact names cover the compiler drivers the `cc` crate and rustc invoke
+/// and the SDK roots those tools locate their install trees through. The
+/// Android SDK/NDK roots (`ANDROID_ROOT_VARS`) count only for a task that
+/// targets Android; the runner image exports them whatever the job
+/// builds. The prefixed forms are the `cc` crate's per-target overrides
+/// (`CC_<target>`, `AR_<target>`, `CFLAGS_<target>`), cargo's per-target
+/// configuration (`CARGO_TARGET_<TRIPLE>_LINKER`, `_AR`, `_RUNNER`,
+/// `_RUSTFLAGS`), and the `pkg-config` crate's configuration in both its
+/// plain and its per-target spelling — the aarch64 job names its cross
+/// pkg-config in `PKG_CONFIG_aarch64_unknown_linux_gnu`, so a build
+/// script compiling for the host keeps the native one (stow#729).
 /// `CARGO_TARGET_DIR` is deliberately not a prefix match here —
 /// `CARGO_TARGET_DIR` is set explicitly per phase.
 fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec<String> {
@@ -1809,10 +1820,6 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "LDFLAGS",
         "SDKROOT",
         "DEVELOPER_DIR",
-        "PKG_CONFIG_PATH",
-        "PKG_CONFIG_LIBDIR",
-        "PKG_CONFIG_SYSROOT_DIR",
-        "PKG_CONFIG_ALLOW_CROSS",
         // The glibc sysroot root the Linux build job installs:
         // passthrough is what `toolchain_grant_dirs` keys on to grant
         // the whole tree (its bin/ holds the PATH-resolved driver shims).
@@ -1843,6 +1850,7 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "CXXFLAGS_",
         "CPPFLAGS_",
         "LDFLAGS_",
+        "PKG_CONFIG_",
     ];
     let android = targets_android(target);
     names
@@ -2509,6 +2517,7 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependency_subgraph: TaskSubgraph {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
@@ -2675,6 +2684,7 @@ mod tests {
                 ])
                 .expect("features"),
                 host_side: false,
+                keys_apart: false,
                 deps: Vec::new(),
             },
             SubgraphNode {
@@ -2683,6 +2693,7 @@ mod tests {
                 features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                     .expect("features"),
                 host_side: true,
+                keys_apart: false,
                 deps: Vec::new(),
             },
         ]);
@@ -2739,6 +2750,7 @@ mod tests {
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             host_side: false,
+            keys_apart: false,
             deps: Vec::new(),
         }]);
         let manifest: toml::Table =
@@ -2780,6 +2792,7 @@ mod tests {
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             host_side,
+            keys_apart: false,
             deps: Vec::new(),
         };
         task.dependency_subgraph = leaf_pins(vec![
@@ -2790,6 +2803,7 @@ mod tests {
                 version: CrateVersion::new(semver::Version::parse("9.9.9").expect("version")),
                 features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
                 host_side: false,
+                keys_apart: false,
                 deps: Vec::new(),
             },
         ]);
@@ -2841,6 +2855,29 @@ mod tests {
             phase_invocations(&task).len(),
             1,
             "a target-side task keeps its single task-target invocation"
+        );
+    }
+
+    /// stow#736: a `KeysApart` target-side task at the runner's host
+    /// triple runs and publishes both spellings like a host-side task;
+    /// `KeysApart` at a cross target — whose own spelling is already
+    /// explicit — and `KeysAsNative` at the host triple keep `[Task]`.
+    #[test]
+    fn flagged_target_side_task_at_host_triple_runs_both_invocations() {
+        let mut task = task_with_features(&["std"]);
+        task.target = TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target");
+        task.explicit_spelling = stow_types::public_cache::ExplicitSpelling::KeysApart;
+        let invocations = phase_invocations(&task);
+        assert_eq!(invocations.len(), 2);
+        assert!(matches!(invocations[0], CargoInvocation::Native));
+        assert!(matches!(invocations[1], CargoInvocation::Explicit));
+
+        let mut cross = task_with_features(&["std"]);
+        cross.explicit_spelling = stow_types::public_cache::ExplicitSpelling::KeysApart;
+        assert_eq!(
+            phase_invocations(&cross).len(),
+            1,
+            "a cross target's task spelling is already the explicit one"
         );
     }
 
@@ -3537,6 +3574,18 @@ checksum = "33"
             ["CC_aarch64_linux_android".to_owned()].into_iter(),
         );
         assert_eq!(passed, ["CC_aarch64_linux_android"]);
+        let passed = toolchain_env_names(
+            "aarch64-unknown-linux-gnu",
+            [
+                "PKG_CONFIG_aarch64_unknown_linux_gnu".to_owned(),
+                "PKG_CONFIG_PATH".to_owned(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            passed,
+            ["PKG_CONFIG_aarch64_unknown_linux_gnu", "PKG_CONFIG_PATH"]
+        );
         for target in ["x86_64-unknown-linux-gnu", "aarch64-linux-android"] {
             assert!(
                 toolchain_env_names(target, ["CARGO_TARGET_DIR".to_owned()].into_iter()).is_empty(),

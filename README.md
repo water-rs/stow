@@ -51,6 +51,8 @@ The cache holds compiled **library and macro crates** — rlibs, dylibs and proc
 
 A dependency is cached at one exact identity — crate, version, feature set, target, rustc version and profile — because that is what the compiler's output depends on. The same crate at two feature sets is two different artifacts, and asking for one when only the other was built is a miss, not a near-miss. This is what `stow predict` reports on, and why a project can be mostly covered and still compile a few crates itself.
 
+On Linux, a crate that links a system library — `openssl-sys`, `alsa-sys` — is built against the library of the Ubuntu LTS image the builders run on (Ubuntu 24.04 today, so OpenSSL 3.0). When the crate's build script turns the library's version into compile flags, as `openssl-sys` does, your machine is served only if its own library yields the same flags; otherwise that crate compiles locally, exactly as it would without stow.
+
 Crates enter the cache from four places: the most-downloaded binary crates on crates.io and the library trees beneath them, requests anyone can make at [stow.waterui.dev](https://stow.waterui.dev), the misses real builds report automatically, and preheats run by whoever operates the cache. A crate nobody has ever asked for is not there yet; asking is what puts it in the queue.
 
 ## Why

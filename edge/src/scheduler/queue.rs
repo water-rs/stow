@@ -5,8 +5,8 @@ use std::num::{NonZero, NonZeroU32};
 use skyzen_services::durable::{Alarm, DbValue, DurableDb};
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
-    QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerStatus,
-    SchemaMigrationReport, TaskLane, runner_family,
+    QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerResetReport,
+    SchedulerStatus, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -81,7 +81,7 @@ pub struct QueuedTask {
 /// Decode a stored `explicit_spelling` integer — the queue and
 /// node-store columns carry 0 for `KeysAsNative`, 1 for `KeysApart`
 /// (stow#736).
-fn spelling_of(stored: i64) -> stow_types::public_cache::ExplicitSpelling {
+pub(crate) fn spelling_of(stored: i64) -> stow_types::public_cache::ExplicitSpelling {
     if stored != 0 {
         stow_types::public_cache::ExplicitSpelling::KeysApart
     } else {
@@ -187,8 +187,8 @@ pub struct SchedulerSettings {
     /// built. `0` admits everything. The human lane is exempt: a
     /// request someone asked for by name is never held by the floor.
     /// Parsed from `STOW_MIN_DISPATCH_VALUE` as a nonnegative i64 —
-    /// the *operator input* `migrate` stamps into `settings` and
-    /// backfills `dispatch_eligible` from. A changed binding takes
+    /// the *operator input* the reset route stamps into `settings` and
+    /// derives `dispatch_eligible` from. A changed binding takes
     /// effect only through that pass: the queue's writers and probes
     /// read the persisted answer, never this field.
     pub min_dispatch_value: i64,
@@ -812,6 +812,7 @@ async fn upsert_task_nodes(db: &DurableDb, rows: &[BatchedNodeRow]) -> Result<()
                     e ->> 'host_side', e ->> 'explicit_spelling', e ->> 'dependency_identity', \
                     e ->> 'children_json' \
              FROM (SELECT value AS e FROM json_each(?)) e \
+             WHERE TRUE \
              ON CONFLICT(task_id) DO UPDATE SET \
                 explicit_spelling = MAX(task_nodes.explicit_spelling, excluded.explicit_spelling)",
         )
@@ -1300,6 +1301,7 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
         let (dep_invocations, dep_shapes) = dep_edge_requirements(
             entry.request.target.as_str(),
             entry.request.host_side,
+            entry.request.explicit_spelling,
             dependency.target.as_str(),
             dependency.host_side,
             dependency.explicit_spelling,
@@ -1350,7 +1352,8 @@ fn plan_enqueue(
         let lane = request_lane(entry.request.source);
         let downloads = u64_to_i64(entry.request.downloads, "downloads")?;
         let request_explicit = u8::from(
-            entry.request.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart,
+            entry.request.explicit_spelling
+                == stow_types::public_cache::ExplicitSpelling::KeysApart,
         );
         if let Some(probe) = statuses.get(&entry.task_id) {
             // Beyond the lane resurrection: a request proving the node
@@ -1360,8 +1363,9 @@ fn plan_enqueue(
             // flag describes (stow#736). `failed` still never revives,
             // and the claim's coverage retirement applies the same
             // requirement to rows that never complete again.
-            let flaggap =
-                probe.status == "completed" && request_explicit == 1 && probe.explicit_spelling == 0;
+            let flaggap = probe.status == "completed"
+                && request_explicit == 1
+                && probe.explicit_spelling == 0;
             let redispatch = resurrects(probe.status.as_str(), lane) || flaggap;
             let update = updates
                 .entry(entry.task_id.clone())
@@ -1383,9 +1387,9 @@ fn plan_enqueue(
                     entry.task_id.clone(),
                     TaskStatusProbe {
                         status: "pending".to_owned(),
-                        explicit_spelling: i64::from(
-                            probe.explicit_spelling.max(i64::from(request_explicit)),
-                        ),
+                        explicit_spelling: probe
+                            .explicit_spelling
+                            .max(i64::from(request_explicit)),
                     },
                 );
             } else {
@@ -1393,9 +1397,7 @@ fn plan_enqueue(
                     entry.task_id.clone(),
                     TaskStatusProbe {
                         status: probe.status.clone(),
-                        explicit_spelling: probe
-                            .explicit_spelling
-                            .max(i64::from(request_explicit)),
+                        explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
                     },
                 );
             }
@@ -1425,9 +1427,7 @@ fn plan_enqueue(
             // A task id commits to its whole dependency subgraph, so a
             // task's edge set is a function of the id (stow#588): edges
             // are written only for the row this request inserts — a
-            // re-enqueue of an existing id can carry nothing new, and
-            // pre-v15 `dep_side_known != 1` rows are the migration's
-            // job, never the request path's.
+            // re-enqueue of an existing id can carry nothing new.
             if !entry.deps.is_empty() {
                 let edges = dep_edges(entry)?;
                 plan.edge_inserts.insert(entry.task_id.clone(), edges);
@@ -2902,10 +2902,9 @@ async fn request_record_status(
 ///   dependent — which compiles deps under both spellings — both.
 ///
 /// `p.unit_invocation + 1` maps the stored invocation (0 = native,
-/// 1 = `--target`) onto its bit. Rows reported before the unit-shape
-/// columns existed carry `-1` legs: they match no clause, so a
-/// shapeless dep stays gated until the node republishes — legacy rows
-/// are unreachable under this lookup, never migrated into it.
+/// 1 = `--target`) onto its bit. A row carrying `-1` legs is
+/// shapeless — it matches no clause, so a shapeless dep stays gated
+/// until the node republishes.
 pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
     // The live generation is a scalar lookup on the slice marker's
     // primary key `(target, rustc_version)`, so each edge probes one
@@ -2979,9 +2978,9 @@ pub(super) fn unpublished_deps_sql(owner_task: &str) -> String {
 /// `deps_met` as a SQL expression over the owner's row: `1` while every
 /// edge resolves to units the live published slice serves — the
 /// `unpublished_deps = 0` derivation, evaluated as a count of unmet
-/// edges rather than a slice EXISTS per edge. Written at edge sync,
-/// refreshed by slice publish and the schema migration — the three
-/// places an edge's answer can change — so the claim walk and the
+/// edges rather than a slice EXISTS per edge. Written at edge sync and
+/// refreshed by slice publish — the two places an edge's answer can
+/// change — so the claim walk and the
 /// alarm's wake probes read the flag instead of re-evaluating the gate
 /// per pending row.
 pub(super) fn deps_met_sql(owner_task: &str) -> String {
@@ -3040,19 +3039,18 @@ const DEFAULT_MIN_DISPATCH_VALUE: i64 = 0;
 /// `lane = 'human' OR value >= floor`. The human lane is exempt by
 /// contract — a request someone asked for by name is never held by the
 /// floor. `floor` is the authoritative `min_dispatch_value` row the
-/// operator migrate stamps into `settings` — decimal text, `CAST` to
+/// operator reset stamps into `settings` — decimal text, `CAST` to
 /// SQLite's integer domain in place, so no wide value ever crosses a
 /// JS bind/cursor boundary; an absent row reads as the default `0`
-/// (admit everything), which is also the answer before the first
-/// migrate of a fresh deploy. Every writer that assigns `value` or
+/// (admit everything). Every writer that assigns `value` or
 /// `lane` evaluates this expression in the same statement — SET terms
 /// see the pre-update row, so the `value` operand is the expression
 /// being assigned ([`value_sql`]), never the stale column.
 ///
 /// The admission expression with an explicit floor operand — the shape
-/// the settings-row formula shares, used only by the operator
-/// migrate's backfill, which must evaluate against the configured
-/// value before the row recording it exists.
+/// the settings-row formula shares, used only by
+/// [`apply_dispatch_floor`]'s pass, which must evaluate against the
+/// configured value before the row recording it exists.
 fn dispatch_eligible_at_floor_sql(lane: &str, value: &str, floor: &str) -> String {
     format!("CASE WHEN ({lane}) = 'human' OR ({value}) >= ({floor}) THEN 1 ELSE 0 END")
 }
@@ -3164,7 +3162,6 @@ struct KeyUpdate {
 #[derive(Debug, skyzen::FromRow)]
 struct RankSourceRow {
     task_id: String,
-    target: String,
     lane: String,
     dispatch_family: String,
     priority: String,
@@ -3181,7 +3178,7 @@ struct RankSourceRow {
 /// wide INTEGER crosses the wire as TEXT: the Durable Object's JSON
 /// number crossing loses integer precision past `2^53`, the very
 /// range the exact rank exists to preserve.
-const RANK_SOURCE_SELECT: &str = "SELECT q.task_id, q.target, q.lane, q.dispatch_family, \
+const RANK_SOURCE_SELECT: &str = "SELECT q.task_id, q.lane, q.dispatch_family, \
             CAST(q.priority AS TEXT) AS priority, \
             CAST(q.demand AS TEXT) AS demand, \
             q.first_requested_at, q.created_at, \
@@ -3197,7 +3194,6 @@ const RANK_SOURCE_SELECT: &str = "SELECT q.task_id, q.target, q.lane, q.dispatch
 /// fails the writer, never silently reverts to 1.
 struct RankRow {
     task_id: String,
-    target: String,
     lane: String,
     dispatch_family: String,
     priority: i64,
@@ -3225,7 +3221,6 @@ impl RankSourceRow {
         };
         Ok(RankRow {
             task_id: self.task_id.clone(),
-            target: self.target.clone(),
             lane: self.lane.clone(),
             dispatch_family: self.dispatch_family.clone(),
             priority: parse_i64("priority", &self.priority)?,
@@ -3415,92 +3410,6 @@ async fn refresh_dispatch_keys(db: &DurableDb, task_ids: &[String]) -> Result<()
             .map_err(|error| format!("load rows for dispatch-key refresh: {error}"))?;
         let updates = rank_updates(&rows)?;
         apply_key_updates(db, &updates).await?;
-    }
-    Ok(())
-}
-
-/// The operator migration's rank-column backfill — one paged pass over
-/// the whole queue, legal only inside operations code. Every row's
-/// `dispatch_family`, `value` and `dispatch_key` re-derive through the
-/// same shared Rust abstraction the writers use: the family recomputes
-/// from `target`, never the stored column, so a stale family cannot
-/// bake into the `value` it feeds, and the stored-pair diff writes
-/// only rows whose triple actually moved. Paging by `task_id` keyset
-/// keeps worker memory flat across a million-row queue.
-async fn backfill_rank_pairs(db: &DurableDb) -> Result<(), QueueError> {
-    #[derive(serde::Serialize)]
-    struct BackfillUpdate {
-        task_id: String,
-        lane: String,
-        dispatch_family: String,
-        value: String,
-        dispatch_key: String,
-    }
-    let mut after = String::new();
-    loop {
-        let rows = db
-            .query(&format!(
-                "{RANK_SOURCE_SELECT} \
-                 WHERE q.task_id > ? ORDER BY q.task_id LIMIT 2048"
-            ))
-            .bind(after.clone())
-            .fetch_all::<RankSourceRow>()
-            .await
-            .map_err(|error| format!("page queue rows for backfill: {error}"))?;
-        if rows.is_empty() {
-            break;
-        }
-        after = rows
-            .last()
-            .map(|row| row.task_id.clone())
-            .unwrap_or_default();
-        let mut updates: Vec<BackfillUpdate> = Vec::new();
-        for source in &rows {
-            let row = source.checked()?;
-            let family = crate::scheduler::rank::dispatch_family(&row.target).to_owned();
-            let value =
-                crate::scheduler::rank::raw_value(&row.lane, &family, row.priority, row.demand);
-            let dispatch_key =
-                crate::scheduler::rank::dispatch_key(&crate::scheduler::rank::KeyOperands {
-                    lane: &row.lane,
-                    family: &family,
-                    priority: row.priority,
-                    demand: row.demand,
-                    cost_ms: row.cost_ms,
-                    first_requested_at: &row.first_requested_at,
-                    created_at: &row.created_at,
-                    task_id: &row.task_id,
-                });
-            if family != row.dispatch_family
-                || value != row.value
-                || dispatch_key != row.dispatch_key
-            {
-                updates.push(BackfillUpdate {
-                    task_id: row.task_id.clone(),
-                    lane: row.lane.clone(),
-                    dispatch_family: family,
-                    value: value.to_string(),
-                    dispatch_key,
-                });
-            }
-        }
-        for chunk in updates.chunks(ENQUEUE_JSON_BATCH_ROWS) {
-            db.query(&format!(
-                "UPDATE queue \
-                 SET dispatch_family = j.e ->> 'dispatch_family', \
-                     value = CAST(j.e ->> 'value' AS INTEGER), \
-                     dispatch_key = j.e ->> 'dispatch_key', \
-                     dispatch_eligible = {eligible} \
-                 FROM (SELECT value AS e FROM json_each(?)) AS j \
-                 WHERE queue.task_id = j.e ->> 'task_id'",
-                eligible =
-                    dispatch_eligible_sql("j.e ->> 'lane'", "CAST(j.e ->> 'value' AS INTEGER)",),
-            ))
-            .bind(enqueue_json(chunk)?)
-            .execute()
-            .await
-            .map_err(|error| format!("backfill dispatch keys: {error}"))?;
-        }
     }
     Ok(())
 }
@@ -6004,10 +5913,20 @@ async fn earliest_active_lease_expiry_ms(
 /// The invocation-spelling mask a dependent's edges carry: the cargo
 /// invocations its own build compiles the dep's units under. A
 /// host-side task runs every phase both natively and under `--target`
-/// (its deps are host units under either spelling); a target-side task
-/// runs the one spelling its target implies.
-pub fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
-    if owner_host_side {
+/// (its deps are host units under either spelling); so does a
+/// `KeysApart` target-side task at the host triple, which compiles its
+/// deps under both spellings too (stow#736); any other target-side
+/// task runs the one spelling its target implies.
+pub fn dep_invocation_mask(
+    owner_target: &str,
+    owner_host_side: bool,
+    owner_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
+) -> i64 {
+    let runs_both_spellings = owner_host_side
+        || (owner_explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
+            && stow_types::api::runner_family(owner_target)
+                .is_some_and(|family| family.host_triple() == owner_target));
+    if runs_both_spellings {
         return 0b11;
     }
     match stow_types::api::runner_family(owner_target) {
@@ -6028,16 +5947,22 @@ pub fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
 pub fn dep_edge_requirements(
     owner_target: &str,
     owner_host_side: bool,
+    owner_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
     dep_target: &str,
     dep_host_side: bool,
     dep_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
 ) -> (i64, i64) {
     if dep_host_side {
-        let mask = dep_invocation_mask(owner_target, owner_host_side);
+        let mask = dep_invocation_mask(owner_target, owner_host_side, owner_explicit_spelling);
         return (mask, i64::from(mask.count_ones()));
     }
-    let mask = dep_invocation_mask(dep_target, false);
-    if mask == 0b01 && dep_explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
+    let mask = dep_invocation_mask(
+        dep_target,
+        false,
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+    );
+    if mask == 0b01
+        && dep_explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
     {
         return (0b11, 4);
     }
@@ -6389,7 +6314,7 @@ async fn apply_slice_delta(
             .map_err(|error| QueueError::Sql(format!("encode slice retire json: {error}")))?;
         // `json_each` drives: each retired row is one row-value probe
         // of the table's primary key — the ten-column tuple in PK order,
-        // `dependency_identity` included (NOT NULL post-v15, so row-value
+        // `dependency_identity` included (NOT NULL, so row-value
         // equality is exact; stow#588). One PK lookup per retired row,
         // proportional to the delta, never a slice scan — and no rowid
         // second seek.
@@ -6774,1037 +6699,78 @@ async fn apply_slice_gate_delta(
     Ok(())
 }
 
-/// The scheduler schema version this build serves, recorded in the
-/// `scheduler_schema_version` singleton row once [`migrate`] has applied
-/// it — `PRAGMA user_version` is the usual carrier but the Durable
-/// Object SQL authorizer refuses it
-/// (<https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/>),
-/// so the version lives in a table. Bump it whenever `schema.sql` or
-/// any step of [`migrate_schema`] changes — and keep every change
-/// additive (expand, then contract): `deploy-edge.yml` runs the
-/// migration right after `skyzen deploy`, while the previous build may
-/// still be serving requests, so nothing the running code reads may
-/// stop existing while the pass applies.
-const SCHEMA_VERSION: i64 = 15;
-
-/// The version-4 queue step on top of #470's version-3 tables: the
-/// persisted dispatch-gate forms — `deps_met` (the dependency gate's
-/// answer per row), `blocked`, `wake_at`, `dispatch_family` and
-/// `dispatch_key` (the claim-order tuple) — backfilled on every row;
-/// `queue_status_counts` and the `queue_counts_on_*` triggers, created
-/// in `schema.sql` with the table's initial contents rebuilt here from
-/// the queue itself; and the `idx_queue_dependencies_dep_match` /
-/// `idx_queue_{target,crate}_updated` indexes. The columns are added by
-/// `migrate_schema`'s modern branch (ahead of the schema.sql include,
-/// whose new indexes build on them) and exist from creation on fresh
-/// and dev-era-recreated queues. The backfill stays unconditional: a
-/// re-run writes the same values.
-async fn migrate_dispatch_gate(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-) -> Result<(), QueueError> {
-    // The (status, lane, blocked) counter table must be in shape before
-    // the backfills below run: they fire `queue_counts_on_move`, and an
-    // old-shape counts table — pre-`blocked`, which an earlier rebuild's
-    // rename may have stranded here — makes the new-shape trigger fail
-    // inside the UPDATE. Rebuild it first, then the triggers and the
-    // repopulate agree on the key.
-    let has_blocked = db
-        .query("PRAGMA table_info(queue_status_counts)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("inspect status counts shape: {error}"))?
-        .iter()
-        .any(|column| column.name == "blocked");
-    if !has_blocked {
-        for statement in [
-            "DROP TRIGGER IF EXISTS queue_counts_on_insert",
-            "DROP TRIGGER IF EXISTS queue_counts_on_delete",
-            "DROP TRIGGER IF EXISTS queue_counts_on_move",
-            "DROP TABLE IF EXISTS queue_status_counts",
-        ] {
-            db.query(statement)
-                .execute()
-                .await
-                .map_err(|error| format!("drop old-shape status counts: {error}"))?;
-        }
-        migrate_schema(db).await?;
-    }
-    // The claim-order columns are derived from columns every row
-    // carries — `value`'s lane/family/priority/demand bands, the
-    // `dispatch_family` from `target`, and the `dispatch_key` that
-    // ranks the exact value/cost ratio — so one pass backfills all
-    // three (`value` came in the version-10 step; a key written under
-    // an older format rebuilds under the current one through the
-    // stored-pair diff). `dep_met` replays each edge's slice EXISTS
-    // once — the seed for the per-owner counter — then
-    // `unpublished_deps` counts those flags, `deps_met` is the `= 0`
-    // derivation, and `blocked`/`wake_at` carry their stored
-    // expressions. Queue-wide passes are legal here and only here —
-    // this is operations code. The pass pages by task id rather than
-    // holding the queue in memory, and each row's family/value/key
-    // derives in the same shared Rust abstraction the writers use —
-    // `dispatch_family` recomputes from `target`, not the stored
-    // column, so a stale family cannot bake into the value it feeds.
-    backfill_rank_pairs(db).await?;
-    // Backfill the edge flags first: the counter recount below reads
-    // `dep_met`, so edges must carry real answers before it runs. `f`
-    // materializes each edge's fresh answer once (`LIMIT -1`) so the
-    // `!=` guard compares against it instead of re-running the probe.
-    db.query(&format!(
-        "UPDATE queue_dependencies \
-         SET dep_met = f.new_met \
-         FROM (SELECT d.rowid AS rid, CASE WHEN {unpub} THEN 0 ELSE 1 END AS new_met \
-               FROM queue_dependencies d \
-               LIMIT -1) AS f \
-         WHERE queue_dependencies.rowid = f.rid \
-           AND queue_dependencies.dep_met != f.new_met",
-        unpub = dep_edge_unpublished_sql("d"),
-    ))
-    .execute()
-    .await
-    .map_err(|error| format!("backfill edge dep_met flags: {error}"))?;
-    // Same materialization the enqueue refresh uses: `y` evaluates
-    // each row's probes once (`LIMIT -1` keeps it a co-routine —
-    // flattening would re-run the count per reference) and the `!=`
-    // guards compare stored against computed columns.
-    let unpublished = unpublished_deps_sql("q.task_id");
-    let blocked = blocked_sql("q.task_id");
-    let wake = wake_at_sql(
-        "lane",
-        "first_requested_at",
-        "not_before",
-        settings.dispatch_min_age_minutes,
-    );
-    db.query(&format!(
-        "UPDATE queue \
-         SET unpublished_deps = f.unpublished, deps_met = f.met, \
-             blocked = f.blocked, wake_at = f.wake \
-         FROM (SELECT y.tid, y.unpublished, y.blocked, y.wake, \
-                      CASE WHEN y.unpublished = 0 THEN 1 ELSE 0 END AS met \
-               FROM (SELECT q.task_id AS tid, {unpublished} AS unpublished, \
-                            {blocked} AS blocked, {wake} AS wake \
-                     FROM queue q \
-                     LIMIT -1) AS y \
-               LIMIT -1) AS f \
-         WHERE queue.task_id = f.tid \
-           AND (queue.unpublished_deps != f.unpublished \
-                OR queue.deps_met != f.met OR queue.blocked != f.blocked \
-                OR queue.wake_at != f.wake)",
-    ))
-    .execute()
-    .await
-    .map_err(|error| format!("backfill dependency-gate columns: {error}"))?;
-    // This rebuild plants the trigger-maintained counts on a queue whose
-    // writes predate them — the one place a whole-queue GROUP BY is
-    // legal.
-    db.query("DELETE FROM queue_status_counts")
-        .execute()
-        .await
-        .map_err(|error| format!("clear status counts for rebuild: {error}"))?;
-    db.query(
-        "INSERT INTO queue_status_counts (status, lane, blocked, n) \
-         SELECT status, lane, blocked, count(*) FROM queue GROUP BY status, lane, blocked",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("rebuild status counts: {error}"))?;
-    Ok(())
+/// One `sqlite_master` row — the store objects [`reset`] drops.
+#[derive(Debug, skyzen::FromRow)]
+struct SchemaObject {
+    kind: String,
+    name: String,
 }
 
-/// Run the scheduler schema migration — the only code that may issue
-/// DDL or a backfill against the queue database. Migrations are
-/// operations work: no request handler, and not the alarm, calls this.
-/// The deploy pipeline drives it through
-/// `POST /api/v1/admin/scheduler/migrate` (→ the Durable Object's
-/// `/migrate` handler) right after `skyzen deploy`; `stow-admin
-/// scheduler migrate` is the manual path. Request code assumes the
-/// schema exists — when it does not, its own SQL fails loudly, which is
-/// the fail-fast.
-///
-/// A stored version newer than `SCHEMA_VERSION` means the database was
-/// migrated by newer code — fail fast rather than silently serve it.
-/// The stamp is written only after every migration step has succeeded
-/// — the same per-statement commit discipline `migrate_queue_schema`
-/// and the column migrations already use — so a pass that dies midway
-/// leaves the version behind and re-runs: every step is idempotent, and
-/// a queue already at `SCHEMA_VERSION` reports `before == after`.
-pub async fn migrate(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-) -> Result<SchemaMigrationReport, QueueError> {
-    let before = stored_schema_version(db).await?;
-    if before > SCHEMA_VERSION {
-        return Err(QueueError::Invariant(format!(
-            "scheduler schema version {before} exceeds the {SCHEMA_VERSION} \
-             this build understands — the database was migrated by newer code"
-        )));
+/// Reset the scheduler store — the only code that may issue DDL on the
+/// queue database. Drops every table, index, trigger and view the store
+/// holds, then executes `schema.sql`; it reads no row data — a schema
+/// change is applied by this reset, never by reading an older shape,
+/// and the store refills from the lanes that feed it. Reached from
+/// `POST /api/v1/admin/scheduler/reset` (→ the Durable Object's
+/// `/reset` handler); `stow-admin scheduler reset --yes` is the manual
+/// path. A store that was never initialized gets the same pass. Request
+/// code and the alarm assume the schema exists — when it does not,
+/// their own SQL fails loudly, which is the fail-fast.
+pub async fn reset(db: &DurableDb) -> Result<SchedulerResetReport, QueueError> {
+    // The store's objects minus SQLite's own (`sqlite_sequence` and
+    // friends) and the platform's internal tables — GLOB keeps the
+    // `_` literals.
+    let objects = db
+        .query(
+            "SELECT type AS kind, name FROM sqlite_master \
+             WHERE type IN ('table', 'index', 'trigger', 'view') \
+               AND name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*'",
+        )
+        .fetch_all::<SchemaObject>()
+        .await
+        .map_err(|error| format!("list scheduler store objects: {error}"))?;
+    // A table's drop takes its indexes and triggers with it, so the
+    // `IF EXISTS` statements below only ever fire on objects still
+    // standing — an orphaned name is a no-op, never an error.
+    for (kind, keyword) in [
+        ("trigger", "TRIGGER"),
+        ("view", "VIEW"),
+        ("table", "TABLE"),
+        ("index", "INDEX"),
+    ] {
+        for object in objects.iter().filter(|object| object.kind == kind) {
+            db.query(&format!("DROP {keyword} IF EXISTS {}", object.name))
+                .execute()
+                .await
+                .map_err(|error| format!("drop {kind} {}: {error}", object.name))?;
+        }
     }
-    migrate_schema(db).await?;
-    // The dependency-identity rebuilds run ahead of every other step
-    // (stow#588): `queue` is rebuilt as a shadow copy — the live table
-    // keeps its name and keeps serving every read and write of the old
-    // code while bounded batches copy across repeated migrate calls —
-    // and `published_slice_rows` swaps in one tick (its identity column
-    // is NOT NULL, so every context-free historical row drops and the
-    // shadow's only valid content is empty). While the queue copy is
-    // in flight the remaining steps stay off and the version stamp
-    // holds at its stored value — the report's `after` answers
-    // SCHEMA_VERSION only once both shadows verified and swapped in,
-    // so the deploy gate keeps calling until the rebuild completes.
-    // Reads and writes keep working throughout against the real
-    // tables: mirror triggers follow every live queue write into the
-    // shadow.
-    if !migrate_dependency_identity_rebuilds(db).await? {
-        return Ok(SchemaMigrationReport {
-            before,
-            after: stored_schema_version(db).await?,
-        });
-    }
-    migrate_queue_dependencies_columns(db).await?;
-    migrate_task_nodes_columns(db).await?;
-    migrate_published_slice_row_shape(db).await?;
-    migrate_published_slice_columns(db).await?;
-    migrate_dispatch_gate(db, settings).await?;
-    migrate_generation_identity(db, settings).await?;
-    migrate_dispatch_eligible(db, settings).await?;
-    migrate_demand_ledger(db).await?;
-    // Every `migrate_schema` path has applied `schema.sql`, so `settings`
-    // exists here. Its `panic` row belonged to the in-Worker circuit
-    // breaker the zone's WAF maintenance rules replaced; nothing reads it.
-    db.query("DELETE FROM settings WHERE key = 'panic'")
+    db.query(include_str!("schema.sql"))
         .execute()
         .await
-        .map_err(|error| format!("delete retired panic setting: {error}"))?;
-    db.query(
-        "INSERT INTO scheduler_schema_version (id, version) VALUES (1, ?) \
-         ON CONFLICT(id) DO UPDATE SET version = excluded.version",
-    )
-    .bind(SCHEMA_VERSION)
-    .execute()
-    .await
-    .map_err(|error| format!("stamp scheduler schema version: {error}"))?;
-    Ok(SchemaMigrationReport {
-        before,
-        after: SCHEMA_VERSION,
+        .map_err(|error| format!("create scheduler schema: {error}"))?;
+    Ok(SchedulerResetReport {
+        dropped: objects.len() as u64,
     })
 }
 
-/// Rows one copy statement moves and statements one migrate call makes
-/// during the identity rebuilds — bounded so a call stays well inside
-/// the Durable Object's CPU budget; the operator's repeated migrate
-/// calls (the deploy gate retries until `after` matches) drive the
-/// cursors forward.
-const IDENTITY_COPY_BATCH_ROWS: i64 = 1_000;
-const IDENTITY_COPY_BATCHES_PER_CALL: usize = 8;
-
-/// A table's column names — the probe the rebuild uses to tell whether
-/// the live table carries the identity column yet.
-async fn table_columns(
-    db: &DurableDb,
-    table: &str,
-) -> Result<std::collections::BTreeSet<String>, QueueError> {
-    Ok(db
-        .query(&format!("PRAGMA table_info({table})"))
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load {table} table_info: {error}"))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect())
-}
-
-/// One stored rebuild cursor from `settings` (`NULL`/`0` means the copy
-/// has not started).
-async fn identity_copy_cursor(db: &DurableDb, key: &str) -> Result<String, QueueError> {
-    Ok(db
-        .query("SELECT value FROM settings WHERE key = ?")
-        .bind(key.to_owned())
-        .fetch_scalar_optional::<String>()
-        .await
-        .map_err(|error| format!("read identity copy cursor {key}: {error}"))?
-        .unwrap_or_default())
-}
-
-async fn set_identity_copy_cursor(
-    db: &DurableDb,
-    key: &str,
-    value: &str,
-) -> Result<(), QueueError> {
-    db.query(
-        "INSERT INTO settings (key, value) VALUES (?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(key.to_owned())
-    .bind(value.to_owned())
-    .execute()
-    .await
-    .map_err(|error| format!("write identity copy cursor {key}: {error}"))?;
-    Ok(())
-}
-
-/// The `queue` half of the version-15 identity rebuild (stow#588): the
-/// task-id uniqueness change is a table rebuild, done as a shadow copy
-/// so the live `queue` keeps its name and keeps serving every read and
-/// write of the running (baseline) code for the whole migration — a
-/// mid-copy `queue` is never a partially populated table.
+/// The operator floor application — pure row work (a stored-floor read,
+/// the conditional backfill, the stamp), no DDL. The reset route's
+/// handler runs it after [`reset`] recreates the schema: on the empty
+/// queue the conditional backfill is a zero-row pass and the stamp
+/// lands the configured floor as `settings.min_dispatch_value`, the
+/// value every writer's eligibility expression reads. The cost-gate's
+/// floored-pass fixture calls it directly from an unmetered setup hook
+/// so the probe's floor and flags take the same code path (stow#525).
 ///
-/// `queue_v15` — its CREATE TABLE extracted from `schema.sql` itself, so
-/// the shadow's shape cannot drift from a fresh database's — grows
-/// beside the live table. AFTER INSERT/UPDATE/DELETE mirror triggers on
-/// `queue` write every live change into the shadow (`INSERT OR
-/// REPLACE`/`DELETE` keyed on `task_id`), and historical rows copy
-/// across in bounded `task_id`-ordered `INSERT OR IGNORE` batches over
-/// repeated migrate calls — a mirrored row is newer than the copy's
-/// stale read and wins the IGNORE. The shadow also carries
-/// `schema.sql`'s queue indexes from birth, under `v15sh_` build
-/// names: created empty, the copy maintains them incrementally — a
-/// 1M-row `CREATE INDEX` inside the swap tick would cost more than the
-/// rest of the swap combined. **Transient cost:** while the copy runs,
-/// every live `queue` write pays one extra `queue_v15` statement (a
-/// second row written per insert or update, one shadow row deleted
-/// per delete) plus that row's shadow-index maintenance — the mirror
-/// roughly doubles `queue` rowsWritten until the triggers drop at
-/// swap.
-///
-/// Each copy batch also verifies its own task-id range inside the
-/// batch's tick (both directions, plus the NULL-identity audit): a
-/// verified range stays equal because the mirror triggers write every
-/// later change to both sides. So when the cursor is exhausted the
-/// swap's storage tick makes no table-wide comparison and builds no
-/// index — it verifies only the open tail, drops the live table (its
-/// mirror triggers die with it), renames the shadow to `queue`,
-/// strips the `v15sh_` build names off the shadow's already-indexed
-/// indexes via `writable_schema` (SQLite has no ALTER INDEX RENAME; a
-/// `sqlite_master` UPDATE is the metadata-only equivalent), replays
-/// `schema.sql` for the triggers, and recomputes `queue_status_counts`
-/// from the swapped table — the same unbroken-statement atomicity the
-/// enqueue write phase relies on, so the swap lands whole or not at
-/// all. Returns `false` while the copy is incomplete. Historical rows
-/// get `NULL` `dependency_identity` — unknown context, never guessed.
-async fn migrate_queue_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
-    const CURSOR_KEY: &str = "migrate_queue_identity_cursor";
-    let queue = table_columns(db, "queue").await?;
-    let shadow = table_columns(db, "queue_v15").await?;
-    if queue.contains("dependency_identity") {
-        if shadow.is_empty() {
-            // The swapped (or fresh) table — rebuild done. The
-            // shadow's indexes already carry their `schema.sql`
-            // names, so a crash after the rename needs no tail work.
-            return Ok(true);
-        }
-        // Crash recovery: the swap's `DROP TABLE queue` committed on an
-        // eager-commit backend and the call died before the rename;
-        // `migrate_schema` has already recreated `queue` new-shape
-        // (empty — or holding straggler writes that slipped the gap).
-        // The shadow verified before the drop, so it is authoritative:
-        // merge whatever the gap wrote — a straggler insert or update
-        // replaces its shadow copy and keeps its own real digest — then
-        // finish the tail. A straggler *delete* is unmirrored and its
-        // row resurrects; on the Durable Object the swap is one storage
-        // tick and this state can never commit partway, so the gap only
-        // exists on eager-commit backends.
-        db.query(
-            "INSERT OR REPLACE INTO queue_v15 ( \
-                 task_id, crate_name, version, features_json, target, rustc_version, \
-                 downloads, miss_count, request_count, priority, status, error_msg, \
-                 preserve_lockfile, lane, dispatch_attempts, attempt, generation_id, \
-                 not_before, first_requested_at, created_at, updated_at, github_run_id, \
-                 host_side, shape_requeue, unpublished_deps, deps_met, blocked, \
-                 wake_at, dispatch_family, value, demand, dispatch_key, claimed_at, \
-                 dispatch_eligible, dependency_identity \
-             ) SELECT \
-                 task_id, crate_name, version, features_json, target, rustc_version, \
-                 downloads, miss_count, request_count, priority, status, error_msg, \
-                 preserve_lockfile, lane, dispatch_attempts, attempt, generation_id, \
-                 not_before, first_requested_at, created_at, updated_at, github_run_id, \
-                 host_side, shape_requeue, unpublished_deps, deps_met, blocked, \
-                 wake_at, dispatch_family, value, demand, dispatch_key, claimed_at, \
-                 dispatch_eligible, dependency_identity \
-             FROM queue",
-        )
-        .execute()
-        .await
-        .map_err(|error| format!("merge straggler queue rows into shadow: {error}"))?;
-        db.query("DROP TABLE queue")
-            .execute()
-            .await
-            .map_err(|error| format!("drop recreated queue for identity swap: {error}"))?;
-        return finish_queue_identity_swap(db, CURSOR_KEY).await;
-    }
-    if queue.is_empty() {
-        return Err(QueueError::Invariant(
-            "queue identity rebuild: no queue and no queue_v15".to_owned(),
-        ));
-    }
-    // Live old-shape queue: grow the shadow beside it.
-    if shadow.is_empty() {
-        db.query(&shadow_create_ddl("queue", "queue_v15"))
-            .execute()
-            .await
-            .map_err(|error| format!("create queue_v15 shadow: {error}"))?;
-    }
-    // The index handoff — one index per call (see the function).
-    handoff_one_queue_index(db).await?;
-    // The mirror triggers re-assert every call while the copy runs:
-    // idempotent, and it closes the crash window between shadow
-    // creation and trigger creation — an unmirrored write gap would
-    // wedge the swap's verify.
-    db.query(include_str!("mirror_queue_identity_triggers.sql"))
-        .execute()
-        .await
-        .map_err(|error| format!("install queue identity mirror triggers: {error}"))?;
-    let mut cursor = identity_copy_cursor(db, CURSOR_KEY).await?;
-    for _ in 0..IDENTITY_COPY_BATCHES_PER_CALL {
-        // The batch's upper bound is a separate probe: a mirrored row
-        // already standing in the shadow makes `INSERT OR IGNORE` skip
-        // its stale copy, so the cursor cannot ride on an insert count.
-        let Some(bound) = db
-            .query(
-                "SELECT MAX(task_id) FROM ( \
-                     SELECT task_id FROM queue \
-                     WHERE task_id > ? ORDER BY task_id LIMIT ?)",
-            )
-            .bind(cursor.clone())
-            .bind(IDENTITY_COPY_BATCH_ROWS)
-            .fetch_scalar::<Option<String>>()
-            .await
-            .map_err(|error| format!("probe identity copy bound: {error}"))?
-        else {
-            // Copy exhausted: verify the open tail `(cursor, +inf)` —
-            // every bounded range already verified in its own copy
-            // tick, and the mirror triggers keep a verified range
-            // equal, so nothing table-wide runs here — then swap, the
-            // same storage tick, so verified and swapped are one
-            // decision, never two.
-            verify_queue_identity_range(db, &cursor, None).await?;
-            db.query("DROP TABLE queue")
-                .execute()
-                .await
-                .map_err(|error| format!("drop live queue for identity swap: {error}"))?;
-            return finish_queue_identity_swap(db, CURSOR_KEY).await;
-        };
-        db.query(include_str!("copy_queue_dependency_identity.sql"))
-            .bind(cursor.clone())
-            .bind(IDENTITY_COPY_BATCH_ROWS)
-            .execute()
-            .await
-            .map_err(|error| format!("copy queue rows for identity rebuild: {error}"))?;
-        // Verify this batch's range `(cursor, bound]` in the same
-        // tick: copied and verified are one decision. A verified range
-        // stays equal — later live writes land in both sides via the
-        // mirror — so a failed verify fails the call and the next call
-        // retries this same range from the unchanged cursor.
-        verify_queue_identity_range(db, &cursor, Some(&bound)).await?;
-        set_identity_copy_cursor(db, CURSOR_KEY, &bound).await?;
-        cursor = bound;
-    }
-    Ok(false)
-}
-
-/// A table's `CREATE TABLE` statement pulled out of `schema.sql` and
-/// renamed to its shadow — single source of truth, so the swapped
-/// table's `sqlite_master` entry equals what a fresh database gets.
-fn shadow_create_ddl(live: &str, shadow: &str) -> String {
-    let schema = include_str!("schema.sql");
-    let needle = format!("CREATE TABLE IF NOT EXISTS {live} (");
-    let start = schema
-        .find(&needle)
-        .unwrap_or_else(|| panic!("{needle} not in schema.sql"));
-    let tail = &schema[start..];
-    let end = tail
-        .find("\n);")
-        .unwrap_or_else(|| panic!("{live} create table unterminated in schema.sql"));
-    tail[..end + 3].replacen(&format!("{live} ("), &format!("{shadow} ("), 1)
-}
-
-/// One step of the index handoff, run every migrate call while the
-/// copy is in flight. The shadow builds `schema.sql`'s queue indexes
-/// from birth so the copy maintains them incrementally — building any
-/// of them over the copied 1M-row table inside the swap tick costs
-/// more than the rest of the swap combined. Index names are
-/// schema-global and SQLite has no ALTER INDEX RENAME (and Durable
-/// Objects SQLite has no `writable_schema`), so the live table's
-/// index gives the name up by drop-and-recreate under a `v15live_`
-/// stand-in — one index per call keeps each call's rebuild bounded,
-/// and inside a storage tick the serving table never loses the index.
-/// Once the name is free the shadow's copy goes up under the real
-/// name — which is also what makes the `schema.sql` replay's
-/// `IF NOT EXISTS` skip it for the rest of the migration. The stand-
-/// ins die with the live table at the swap.
-async fn handoff_one_queue_index(db: &DurableDb) -> Result<(), QueueError> {
-    for ddl in queue_index_ddls() {
-        let name = index_name(&ddl);
-        if shadow_has_index(db, &name).await? {
-            continue;
-        }
-        // The live index holding `name` drops first — freeing it —
-        // then its `v15live_` stand-in goes up on `queue`, then the
-        // shadow's copy under the real name. Each is IF EXISTS /
-        // IF NOT EXISTS, so a crash anywhere inside the triple resumes
-        // into the same step; on a Durable Object the whole call is
-        // one tick anyway.
-        db.query(&format!("DROP INDEX IF EXISTS {name}"))
-            .execute()
-            .await
-            .map_err(|error| format!("drop live index {name} for handoff: {error}"))?;
-        db.query(&standin_index_ddl(&ddl, &name))
-            .execute()
-            .await
-            .map_err(|error| format!("stand-in live index for {name}: {error}"))?;
-        db.query(&shadow_index_ddl(&ddl))
-            .execute()
-            .await
-            .map_err(|error| format!("create shadow index {name}: {error}"))?;
-        break;
-    }
-    Ok(())
-}
-
-/// Every `CREATE INDEX` statement `schema.sql` declares `ON queue` —
-/// the secondary set the handoff moves onto the shadow. Statements
-/// are harvested line by line because a later edit could spread one
-/// over several.
-fn queue_index_ddls() -> Vec<String> {
-    let mut ddls = Vec::new();
-    let mut pending: Option<String> = None;
-    for line in include_str!("schema.sql").lines() {
-        match &mut pending {
-            None => {
-                if line.trim_start().starts_with("CREATE INDEX") {
-                    if line.trim_end().ends_with(';') {
-                        if line.contains("ON queue ") || line.contains("ON queue\n") {
-                            ddls.push(line.to_owned());
-                        }
-                    } else {
-                        pending = Some(format!("{line}\n"));
-                    }
-                }
-            }
-            Some(buf) => {
-                buf.push_str(line);
-                buf.push('\n');
-                if line.trim_end().ends_with(';') {
-                    let ddl = pending.take().expect("pending index ddl");
-                    if ddl.contains("ON queue ") || ddl.contains("ON queue\n") {
-                        ddls.push(ddl);
-                    }
-                }
-            }
-        }
-    }
-    ddls
-}
-
-/// The index name a `CREATE INDEX IF NOT EXISTS <name> ...`
-/// `schema.sql` statement declares — everything between the keyword
-/// and the next whitespace.
-fn index_name(ddl: &str) -> String {
-    let head = "CREATE INDEX IF NOT EXISTS ";
-    let name_at = ddl
-        .find(head)
-        .unwrap_or_else(|| panic!("{head} not in index ddl"))
-        + head.len();
-    ddl[name_at..]
-        .split_whitespace()
-        .next()
-        .expect("index name in index ddl")
-        .to_owned()
-}
-
-/// True when the shadow already carries an index named `name` — the
-/// handoff's done-state for that index (`IF NOT EXISTS` would also
-/// match the live table's holder of the same name, so it cannot be
-/// the probe).
-async fn shadow_has_index(db: &DurableDb, name: &str) -> Result<bool, QueueError> {
-    Ok(db
-        .query(
-            "SELECT COUNT(*) FROM sqlite_master \
-             WHERE type = 'index' AND name = ? AND tbl_name = 'queue_v15'",
-        )
-        .bind(name)
-        .fetch_scalar::<i64>()
-        .await
-        .map_err(|error| format!("probe shadow index {name}: {error}"))?
-        != 0)
-}
-
-/// A `schema.sql` queue index statement rewritten onto the shadow:
-/// `ON queue_v15`, name unchanged — the name was freed by the live
-/// index's drop in the same handoff step.
-fn shadow_index_ddl(ddl: &str) -> String {
-    ddl.replacen("ON queue", "ON queue_v15", 1)
-}
-
-/// A `schema.sql` queue index statement renamed to `v15live_<name>`,
-/// still on the live `queue` — the stand-in that keeps the serving
-/// table indexed while its real name is given to the shadow.
-fn standin_index_ddl(ddl: &str, name: &str) -> String {
-    ddl.replacen(name, &format!("v15live_{name}"), 1)
-}
-
-/// The swap's mutating tail, ordered for crash recovery: the live
-/// `queue` drops first — taking the mirror triggers, its counts
-/// triggers and the `v15live_` stand-in indexes with it — so the only
-/// mid-swap crash state is `queue` absent with `queue_v15` present,
-/// which always means "rename pending". The shadow's indexes already
-/// carry their `schema.sql` names — the handoff gave them up during
-/// the copy — so `schema.sql`'s replay only has the queue's triggers
-/// left to recreate (everything else is `IF NOT EXISTS`, a no-op),
-/// and `queue_status_counts` is recomputed wholesale from the swapped
-/// table — the live counters were already consistent, the recompute
-/// is the swap's own audit. Called either right after the drop in the
-/// same statement sequence, or alone from the crash-resume path.
-async fn finish_queue_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<bool, QueueError> {
-    db.query("ALTER TABLE queue_v15 RENAME TO queue")
-        .execute()
-        .await
-        .map_err(|error| format!("rename queue_v15 for identity swap: {error}"))?;
-    db.query(include_str!("schema.sql"))
-        .execute()
-        .await
-        .map_err(|error| format!("recreate queue schema after identity swap: {error}"))?;
-    db.query("DELETE FROM queue_status_counts")
-        .execute()
-        .await
-        .map_err(|error| format!("reset status counts for identity swap: {error}"))?;
-    db.query(
-        "INSERT INTO queue_status_counts (status, lane, blocked, n) \
-         SELECT status, lane, blocked, COUNT(*) FROM queue \
-         GROUP BY status, lane, blocked",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("recompute status counts for identity swap: {error}"))?;
-    db.query("DELETE FROM settings WHERE key = ?")
-        .bind(cursor_key)
-        .execute()
-        .await
-        .map_err(|error| format!("clear identity copy cursor: {error}"))?;
-    Ok(true)
-}
-
-/// The verify half of one copy range `(lower, upper]` (a NULL `upper`
-/// is the open tail): the shadow's live-column content must equal the
-/// live table's in both directions and no shadow row may carry a
-/// digest. Runs inside the same storage tick as the copy batch it
-/// gates; a divergence fails the migrate call, and since the cursor
-/// was not yet advanced the next call retries this same range.
-async fn verify_queue_identity_range(
-    db: &DurableDb,
-    lower: &str,
-    upper: Option<&str>,
-) -> Result<(), QueueError> {
-    let mut query = db.query(include_str!("verify_queue_dependency_identity.sql"));
-    for _ in 0..5 {
-        query = query.bind(lower).bind(upper).bind(upper);
-    }
-    let differs = query
-        .fetch_scalar::<i64>()
-        .await
-        .map_err(|error| format!("verify queue identity copy range: {error}"))?;
-    if differs != 0 {
-        return Err(QueueError::Invariant(
-            "queue identity rebuild: queue_v15 shadow diverges from live queue".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-/// The `published_slice_rows` half of the version-15 identity rebuild.
-/// Unlike `queue`, the slice's `dependency_identity` is NOT NULL: a
-/// context-free row satisfies no coverage clause, so historical rows —
-/// all of which predate the column — drop at the swap rather than
-/// carry NULL. The copy therefore degenerates: every row a v14 table
-/// can hold dies by design, the shadow's only valid content is empty,
-/// and the whole rebuild is one atomic tick — shadow create, empty-
-/// shadow audit, drop, rename — so no mirror triggers or cursor
-/// batches are needed (the window they guard does not exist).
-async fn migrate_slice_dependency_identity(db: &DurableDb) -> Result<bool, QueueError> {
-    const CURSOR_KEY: &str = "migrate_slice_identity_cursor";
-    let rows = table_columns(db, "published_slice_rows").await?;
-    let shadow = table_columns(db, "published_slice_rows_v15").await?;
-    if rows.contains("dependency_identity") {
-        if shadow.is_empty() {
-            return Ok(true);
-        }
-        // Same crash recovery as the queue half: `migrate_schema`
-        // recreated `published_slice_rows` new-shape after the swap's
-        // drop committed and the call died before the rename. The
-        // verified shadow is authoritative — absorb any straggler
-        // writes (new-code rows carry real digests, preserved by the
-        // primary-key replace) and finish the tail.
-        db.query(
-            "INSERT OR REPLACE INTO published_slice_rows_v15 \
-             (target, rustc_version, generation, crate_name, version, features_json, \
-              dependency_identity, unit_side, unit_invocation, unit_linked) \
-             SELECT target, rustc_version, generation, crate_name, version, \
-                    features_json, dependency_identity, unit_side, \
-                    unit_invocation, unit_linked \
-             FROM published_slice_rows \
-             WHERE dependency_identity IS NOT NULL",
-        )
-        .execute()
-        .await
-        .map_err(|error| format!("merge straggler slice rows into shadow: {error}"))?;
-        db.query("DROP TABLE published_slice_rows")
-            .execute()
-            .await
-            .map_err(|error| format!("drop recreated slice rows for identity swap: {error}"))?;
-        return finish_slice_identity_swap(db, CURSOR_KEY).await;
-    }
-    if rows.is_empty() {
-        if shadow.is_empty() {
-            return Err(QueueError::Invariant(
-                "slice identity rebuild: no published_slice_rows and no shadow".to_owned(),
-            ));
-        }
-        return finish_slice_identity_swap(db, CURSOR_KEY).await;
-    }
-    if shadow.is_empty() {
-        db.query(&shadow_create_ddl(
-            "published_slice_rows",
-            "published_slice_rows_v15",
-        ))
-        .execute()
-        .await
-        .map_err(|error| format!("create published_slice_rows_v15 shadow: {error}"))?;
-    }
-    // The audit before the drop: nothing may occupy the shadow — a
-    // v14 live table holds no digests to copy and no mirror or merge
-    // could have written here. A non-empty shadow is corruption.
-    verify_slice_identity_copy(db).await?;
-    db.query("DROP TABLE published_slice_rows")
-        .execute()
-        .await
-        .map_err(|error| format!("drop live slice rows for identity swap: {error}"))?;
-    finish_slice_identity_swap(db, CURSOR_KEY).await
-}
-
-/// The slice swap's mutating tail — same crash-resume contract as
-/// [`finish_queue_identity_swap`]: rename the shadow in, replay
-/// `schema.sql`, clear the cursor. (`published_slice_rows` has no
-/// indexes or counters of its own; the schema replay is a no-op past
-/// the rename and stays in the sequence for symmetry with any future
-/// table additions.)
-async fn finish_slice_identity_swap(db: &DurableDb, cursor_key: &str) -> Result<bool, QueueError> {
-    db.query("ALTER TABLE published_slice_rows_v15 RENAME TO published_slice_rows")
-        .execute()
-        .await
-        .map_err(|error| format!("rename slice-rows shadow for identity swap: {error}"))?;
-    db.query(include_str!("schema.sql"))
-        .execute()
-        .await
-        .map_err(|error| format!("recreate slice schema after identity swap: {error}"))?;
-    db.query("DELETE FROM settings WHERE key = ?")
-        .bind(cursor_key)
-        .execute()
-        .await
-        .map_err(|error| format!("clear slice identity copy cursor: {error}"))?;
-    Ok(true)
-}
-
-/// The slice rebuild's audit before the live table drops: the shadow
-/// must be empty. A v14 `published_slice_rows` carries no
-/// `dependency_identity` column, so every historical row is
-/// context-free — it satisfies no coverage clause and dies at the
-/// swap rather than violate the NOT NULL shadow. Nothing else can
-/// write the shadow (no mirror triggers exist on this path — the
-/// rebuild is one atomic tick), so a non-empty shadow is corruption.
-async fn verify_slice_identity_copy(db: &DurableDb) -> Result<(), QueueError> {
-    let differs = db
-        .query("SELECT EXISTS (SELECT 1 FROM published_slice_rows_v15) AS differs")
-        .fetch_scalar::<i64>()
-        .await
-        .map_err(|error| format!("verify slice identity copy: {error}"))?;
-    if differs != 0 {
-        return Err(QueueError::Invariant(
-            "slice identity rebuild: shadow holds rows a context-free live set cannot produce"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-/// Both identity rebuilds; `false` while either copy is still in
-/// flight so the caller holds the version stamp. `task_nodes` itself
-/// needs no copy: it is created fresh by `schema.sql` and populated
-/// only by new-code submits — historical rows carry no nodes by
-/// design (unknown context is never re-minted).
-async fn migrate_dependency_identity_rebuilds(db: &DurableDb) -> Result<bool, QueueError> {
-    if !migrate_queue_dependency_identity(db).await? {
-        return Ok(false);
-    }
-    migrate_slice_dependency_identity(db).await
-}
-
-/// The stored schema version, or 0 on a queue that predates the marker
-/// table or was never stamped. Both mean the migration pass has not run
-/// under this versioning scheme — the pass is idempotent and is what
-/// creates the table (via `schema.sql`) and the row in the first place.
-/// Whether the table exists is asked of `PRAGMA table_info`, which the
-/// Durable Object authorizer admits and which answers an empty set for a
-/// missing table, rather than read off a failed query's message.
-async fn stored_schema_version(db: &DurableDb) -> Result<i64, QueueError> {
-    let marker_columns = db
-        .query("PRAGMA table_info(scheduler_schema_version)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load scheduler_schema_version table_info: {error}"))?;
-    if marker_columns.is_empty() {
-        return Ok(0);
-    }
-    let version = db
-        .query("SELECT version FROM scheduler_schema_version WHERE id = 1")
-        .fetch_scalar_optional::<i64>()
-        .await
-        .map_err(|error| format!("read scheduler schema version: {error}"))?;
-    Ok(version.unwrap_or(0))
-}
-
-/// The full schema migration pass [`migrate`] runs. Re-running it is a
-/// no-op on a current queue — every step is idempotent — so the operator
-/// route is safe to call from a deploy retry. No transaction exists on
-/// `DurableDb`, so every step is written to be safe to re-run after a
-/// mid-pass failure. Every statement may run while the previous build
-/// still serves requests: additive only, expand then contract.
-async fn migrate_schema(db: &DurableDb) -> Result<(), QueueError> {
-    let columns = db
-        .query("PRAGMA table_info(queue)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load queue table_info: {error}"))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-
-    // Nothing reads `rust_stable_channel` — stable resolution lives in
-    // the Worker's Cache API — so the drop is additive-safe. It runs
-    // ahead of the queue-shape branches so a database holding the
-    // retired table alone loses it too; `IF EXISTS` keeps every other
-    // pass a no-op.
-    db.query("DROP TABLE IF EXISTS rust_stable_channel")
-        .execute()
-        .await
-        .map_err(|error| format!("drop rust_stable_channel: {error}"))?;
-
-    if columns.is_empty() {
-        db.query(include_str!("schema.sql"))
-            .execute()
-            .await
-            .map_err(|error| format!("ensure scheduler schema: {error}"))?;
-        return Ok(());
-    }
-
-    if columns.contains("features_json")
-        && columns.contains("request_count")
-        && columns.contains("first_requested_at")
-        && columns.contains("rustc_version")
-        && !columns.contains("source_json")
-    {
-        migrate_queue_columns(db, &columns).await?;
-        // 'partial' is gone as a terminal state: a stopped-early build
-        // was a failure anyway (the task's own artifact is still
-        // missing), so rows it left behind collapse onto the failure
-        // state its semantics already shared.
-        db.query("UPDATE queue SET status = 'failed' WHERE status = 'partial'")
-            .execute()
-            .await
-            .map_err(|error| format!("collapse partial queue rows: {error}"))?;
-        // Tables added after the queue schema (github_app_token) land
-        // here rather than through the drop-and-recreate path: every
-        // statement in schema.sql is IF NOT EXISTS, so re-running it on
-        // an existing modern queue only creates what is missing.
-        db.query(include_str!("schema.sql"))
-            .execute()
-            .await
-            .map_err(|error| format!("ensure scheduler schema additions: {error}"))?;
-        if !columns.contains("host_side") {
-            migrate_queue_host_side(db).await?;
-        }
-        return Ok(());
-    }
-
-    migrate_queue_schema(db).await
-}
-
-/// Add every column a modern `queue` carries that `columns` lacks.
-/// Each column is guarded separately — a pass that dies between ALTERs
-/// must retry the ones it missed rather than skip them all on the first
-/// column's presence (one shared guard wedged a retry behind
-/// `no such column: dispatch_key`, stow#433). The dispatch-gate columns
-/// (`deps_met`, `dispatch_family`, `dispatch_key`) must exist before the
-/// schema.sql include creates the indexes built on them; their values
-/// backfill in `migrate_dispatch_gate` after the whole pass.
-async fn migrate_queue_columns(
-    db: &DurableDb,
-    columns: &BTreeSet<String>,
-) -> Result<(), QueueError> {
-    for (column, statement) in [
-        (
-            "preserve_lockfile",
-            "ALTER TABLE queue ADD COLUMN preserve_lockfile INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "dispatch_attempts",
-            "ALTER TABLE queue ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "attempt",
-            "ALTER TABLE queue ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
-        ),
-        (
-            "generation_id",
-            "ALTER TABLE queue ADD COLUMN generation_id TEXT NOT NULL DEFAULT ''",
-        ),
-        (
-            "not_before",
-            "ALTER TABLE queue ADD COLUMN not_before TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'",
-        ),
-        (
-            "lane",
-            "ALTER TABLE queue ADD COLUMN lane TEXT NOT NULL DEFAULT 'miss' \
-             CHECK (lane IN ('miss', 'human'))",
-        ),
-        (
-            "github_run_id",
-            "ALTER TABLE queue ADD COLUMN github_run_id TEXT",
-        ),
-        (
-            "shape_requeue",
-            "ALTER TABLE queue ADD COLUMN shape_requeue INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "unpublished_deps",
-            "ALTER TABLE queue ADD COLUMN unpublished_deps INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "deps_met",
-            "ALTER TABLE queue ADD COLUMN deps_met INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "blocked",
-            "ALTER TABLE queue ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "wake_at",
-            "ALTER TABLE queue ADD COLUMN wake_at TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'",
-        ),
-        (
-            "dispatch_family",
-            "ALTER TABLE queue ADD COLUMN dispatch_family TEXT NOT NULL DEFAULT ''",
-        ),
-        (
-            "value",
-            "ALTER TABLE queue ADD COLUMN value INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "demand",
-            "ALTER TABLE queue ADD COLUMN demand INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "dispatch_key",
-            "ALTER TABLE queue ADD COLUMN dispatch_key TEXT NOT NULL DEFAULT ''",
-        ),
-        ("claimed_at", "ALTER TABLE queue ADD COLUMN claimed_at TEXT"),
-        (
-            "dispatch_eligible",
-            "ALTER TABLE queue ADD COLUMN dispatch_eligible INTEGER NOT NULL DEFAULT 1",
-        ),
-        (
-            "explicit_spelling",
-            "ALTER TABLE queue ADD COLUMN explicit_spelling INTEGER NOT NULL DEFAULT 0",
-        ),
-    ] {
-        if !columns.contains(column) {
-            db.query(statement)
-                .execute()
-                .await
-                .map_err(|error| format!("add queue.{column} column: {error}"))?;
-        }
-    }
-    Ok(())
-}
-
-/// Give every queue row a unique dispatch identity and expand the raw
-/// failure evidence key beyond the resettable attempt counter. This is
-/// operator migration work: request paths only read and write the columns.
-async fn migrate_generation_identity(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-) -> Result<(), QueueError> {
-    let next_not_before =
-        "datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes')";
-    db.query(&format!(
-        "UPDATE queue SET status = 'pending', \
-             error_msg = 'legacy in-flight dispatch requeued during generation migration', \
-             not_before = {next_not_before}, \
-             deps_met = {deps_met}, blocked = {blocked}, wake_at = {wake}, \
-             updated_at = datetime('now') \
-         WHERE generation_id = '' AND status IN ('dispatched', 'running') \
-           AND github_run_id IS NULL",
-        deps_met = deps_met_sql("queue.task_id"),
-        blocked = blocked_sql("queue.task_id"),
-        wake = wake_at_sql(
-            "lane",
-            "first_requested_at",
-            next_not_before,
-            settings.dispatch_min_age_minutes,
-        ),
-    ))
-    .execute()
-    .await
-    .map_err(|error| format!("requeue unbound legacy dispatches: {error}"))?;
-    db.query(
-        "UPDATE queue SET generation_id = lower(hex(randomblob(16))) \
-         WHERE generation_id = ''",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("backfill queue generation identities: {error}"))?;
-
-    Ok(())
-}
-
-/// The combined schema's dispatch-eligible step (stow#525 I10): the
-/// admission floor becomes a
-/// persisted `dispatch_eligible` answer — `lane = 'human' OR value >=
-/// floor` — maintained by every writer and equality-indexed ahead of
-/// the claim's `dispatch_key` order and the wake probes' `wake_at`
-/// range. The column itself lands in `migrate_queue_columns` (ahead of
-/// the schema include, which creates the replacement indexes); this
-/// step retires the floor-blind index names once the eligible-aware
-/// ones exist — additive-create then drop, inside this operator pass —
-/// and applies the configured floor: the authoritative value is stored
-/// in `settings` as decimal text (every writer's eligibility
-/// expression reads it there, so a changed env binding cannot produce
-/// mixed flags before its migrate runs), then the queue backfills only
-/// when that stored value differs. Re-runs are no-ops — an unchanged
-/// floor backfills nothing and re-stamps nothing. The cost-gate drive
-/// that floors the probe queue reuses this operator path as its
-/// (unmetered) preparation so floor and flags are always consistent.
-pub(super) async fn migrate_dispatch_eligible(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-) -> Result<(), QueueError> {
-    for statement in [
-        "DROP INDEX IF EXISTS idx_queue_dispatch",
-        "DROP INDEX IF EXISTS idx_queue_wake_eligible",
-    ] {
-        db.query(statement)
-            .execute()
-            .await
-            .map_err(|error| format!("retire floor-blind queue index: {error}"))?;
-    }
-    apply_dispatch_floor(db, settings).await
-}
-
-/// The floor application half of [`migrate_dispatch_eligible`] — pure
-/// row work (a stored-floor read, the conditional backfill, the
-/// stamp), no DDL. The operator migrate calls it after retiring the
-/// floor-blind indexes; the cost-gate's floored-pass fixture calls it
-/// directly from an unmetered setup hook so the probe's floor and
-/// flags take the same code path (stow#525).
+/// The stamp is the pass's success record, so it writes LAST: the
+/// backfill evaluates against the configured floor as its operand — an
+/// i64 literal, since the settings row it must not read is the row this
+/// same pass is about to write — and only a completed backfill earns
+/// the stamp. A statement failure leaves the pass unstamped, so a
+/// retried call sees the old stored value (or none) and runs the full
+/// repair again; a completed pass needs no re-verification because the
+/// writers' flags stayed consistent with the stored value throughout.
 pub(super) async fn apply_dispatch_floor(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -7818,18 +6784,6 @@ pub(super) async fn apply_dispatch_floor(
         .transpose()
         .map_err(|error| format!("parse applied dispatch floor: {error}"))?;
     if stored != Some(settings.min_dispatch_value) {
-        // The stamp is the pass's success record, so it writes LAST:
-        // the backfill evaluates against the configured floor as its
-        // operand — an i64 literal, since the settings row it must not
-        // read is the row this same pass is about to write — and only a
-        // completed backfill earns the stamp. A statement failure
-        // leaves the pass unstamped, so a retried migrate sees the old
-        // stored value (or none) and runs the full repair again; a
-        // completed pass needs no re-verification because the writers'
-        // flags stayed consistent with the stored value throughout.
-        // This is the caught-statement-failure contract — an
-        // application-level SQL error aborts this function here, with
-        // no claim that earlier or later calls share a transaction.
         let eligible = dispatch_eligible_at_floor_sql(
             "lane",
             "value",
@@ -7851,559 +6805,6 @@ pub(super) async fn apply_dispatch_floor(
         .await
         .map_err(|error| format!("stamp applied dispatch floor: {error}"))?;
     }
-    Ok(())
-}
-
-/// The demand ledger's runtime piece (stow#522): `demand_batches` and
-/// `demand_contributions` are pure DDL in `schema.sql`, created by
-/// `migrate_schema`'s `schema.sql` application on every path; the step
-/// that remains is the `demand_fold` trigger. The trigger writes only
-/// the staged prepared fields — `delta`, `value`, `dispatch_key`,
-/// `dispatch_eligible` — all of which the demand route computes in
-/// Rust through the shared rank abstraction before staging, so no SQL
-/// ranking formula exists anywhere. The migrate replaces the
-/// definition outright each run — DROP then CREATE — so a redeploy
-/// always carries the current trigger and an obsolete formula-writing
-/// definition an older deploy left cannot survive an `IF NOT EXISTS`.
-async fn migrate_demand_ledger(db: &DurableDb) -> Result<(), QueueError> {
-    // The demand ledger tables are entirely new with this schema — no
-    // released state carries a prior shape, so the only compatibility
-    // work here is replacing a stale `demand_fold` trigger definition
-    // before recreating it.
-    db.query("DROP TRIGGER IF EXISTS demand_fold")
-        .execute()
-        .await
-        .map_err(|error| format!("drop draft demand fold trigger: {error}"))?;
-    // Acceptance is one statement: flipping the batch's state to
-    // `accepted` fires this trigger, which folds the whole staged set
-    // into the queue inside that statement — `demand` accumulates the
-    // staged delta while `value`, `dispatch_key` and
-    // `dispatch_eligible` land the event's precomputed answers — then
-    // verifies the staged count reached the accepted count:
-    // `RAISE(ABORT)` on a shortfall rolls the transition AND every
-    // triggered queue effect back out of the same statement. A staged
-    // row naming no queue task simply matches nothing. The staged rows
-    // are then consumed in the same statement: an accepted batch's
-    // replay reads only the header, so the recurring feed (#523) would
-    // otherwise accumulate dead staging forever — retiring it here is
-    // still O(this batch's closure) and a failed later statement
-    // cannot leak unbounded dead rows.
-    db.query(
-        "CREATE TRIGGER demand_fold \
-         AFTER UPDATE OF state ON demand_batches \
-         WHEN NEW.state = 'accepted' AND OLD.state = 'prepared' \
-         BEGIN \
-             UPDATE queue \
-             SET demand = queue.demand + c.delta, \
-                 value = CAST(c.value AS INTEGER), \
-                 dispatch_key = c.dispatch_key, \
-                 dispatch_eligible = c.dispatch_eligible \
-             FROM demand_contributions c \
-             WHERE c.batch_id = NEW.batch_id AND queue.task_id = c.task_id \
-               AND (queue.demand != queue.demand + c.delta \
-                    OR queue.value != CAST(c.value AS INTEGER) \
-                    OR queue.dispatch_key != c.dispatch_key \
-                    OR queue.dispatch_eligible != c.dispatch_eligible); \
-             SELECT RAISE(ABORT, 'demand batch staged set short of accepted count') \
-             WHERE (SELECT count(*) FROM demand_contributions c \
-                    WHERE c.batch_id = NEW.batch_id) != NEW.touched_count; \
-             DELETE FROM demand_contributions WHERE batch_id = NEW.batch_id; \
-         END",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("create demand fold trigger: {error}"))?;
-    Ok(())
-}
-
-/// A `queue_dependencies` edge whose shape mask was never written —
-/// joined to its owner task's identity so the migration can recompute
-/// the same values the enqueue's dependency resync writes.
-#[derive(Debug, skyzen::FromRow)]
-struct UnmaskedEdge {
-    task_id: String,
-    depends_on_task_id: String,
-    owner_target: Option<String>,
-    owner_host_side: Option<i64>,
-    dep_target: String,
-    dep_host_side: i64,
-}
-
-/// `task_nodes` columns added after the node store shipped (stow#736):
-/// `explicit_spelling` defaults to 0 — the `KeysAsNative` contract rows
-/// written before the flag existed always carried; a flagged
-/// resubmission's `MAX` upgrade in `upsert_task_nodes` lifts it.
-async fn migrate_task_nodes_columns(db: &DurableDb) -> Result<(), QueueError> {
-    let columns = db
-        .query("PRAGMA table_info(task_nodes)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load task_nodes table_info: {error}"))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-    if columns.is_empty() || columns.contains("explicit_spelling") {
-        return Ok(());
-    }
-    db.query(
-        "ALTER TABLE task_nodes ADD COLUMN explicit_spelling INTEGER NOT NULL DEFAULT 0",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("add task_nodes.explicit_spelling column: {error}"))?;
-    Ok(())
-}
-
-/// Columns added to `queue_dependencies` after the table first shipped:
-/// the dependency's semantic identity, denormalized so the published-slice
-/// gate reads it without the dependency's queue row. Rows written before
-/// the columns existed backfill from the queue row their
-/// `depends_on_task_id` still points at; an edge whose dependency left
-/// the queue keeps '' and never satisfies the gate. `dep_host_side`
-/// defaults to the target-side requirement the gate always applied.
-async fn migrate_queue_dependencies_columns(db: &DurableDb) -> Result<(), QueueError> {
-    let columns = db
-        .query("PRAGMA table_info(queue_dependencies)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load queue_dependencies table_info: {error}"))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-    if columns.is_empty() {
-        return Ok(());
-    }
-    // Guarded per column: a pass dying between ALTERs retries the ones
-    // it missed rather than skipping the block on the first column's
-    // presence.
-    for column in [
-        "dep_crate_name",
-        "dep_version",
-        "dep_features_json",
-        "dep_target",
-        "dep_rustc_version",
-    ] {
-        if !columns.contains(column) {
-            db.query(&format!(
-                "ALTER TABLE queue_dependencies ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
-            ))
-            .execute()
-            .await
-            .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
-        }
-    }
-    // The identity backfill is gated on the never-written marker rather
-    // than on whether the ALTERs just ran: an edge whose dep resolves
-    // but whose `dep_crate_name` is still '' was missed by a pass that
-    // died mid-block, while an already-backfilled edge always carries a
-    // real name and an unresolved one fails the EXISTS — so re-running
-    // costs the unresolved set, once, and the pass stays idempotent.
-    db.query(
-        "UPDATE queue_dependencies SET \
-            dep_crate_name = (SELECT crate_name FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_version = (SELECT version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_features_json = (SELECT features_json FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_target = (SELECT target FROM queue WHERE task_id = queue_dependencies.depends_on_task_id), \
-            dep_rustc_version = (SELECT rustc_version FROM queue WHERE task_id = queue_dependencies.depends_on_task_id) \
-         WHERE dep_crate_name = '' \
-           AND EXISTS (SELECT 1 FROM queue WHERE task_id = queue_dependencies.depends_on_task_id)",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("backfill queue_dependencies identity columns: {error}"))?;
-    if !columns.contains("dep_host_side") {
-        db.query(
-            "ALTER TABLE queue_dependencies ADD COLUMN dep_host_side INTEGER NOT NULL DEFAULT 0",
-        )
-        .execute()
-        .await
-        .map_err(|error| format!("add queue_dependencies.dep_host_side column: {error}"))?;
-    }
-    // Guarded per column: a pass dying between ALTERs retries the ones
-    // it missed rather than skipping the block on the first column's
-    // presence.
-    for (column, statement) in [
-        (
-            "dep_invocations",
-            "ALTER TABLE queue_dependencies ADD COLUMN dep_invocations INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "dep_shapes",
-            "ALTER TABLE queue_dependencies ADD COLUMN dep_shapes INTEGER NOT NULL DEFAULT 0",
-        ),
-    ] {
-        if !columns.contains(column) {
-            db.query(statement)
-                .execute()
-                .await
-                .map_err(|error| format!("add queue_dependencies.{column} column: {error}"))?;
-        }
-    }
-    // The dep's contextual digest (stow#588): nullable on purpose —
-    // edges written before the identity model carry NULL, and NULL
-    // satisfies no coverage clause.
-    if !columns.contains("dep_dependency_identity") {
-        db.query("ALTER TABLE queue_dependencies ADD COLUMN dep_dependency_identity TEXT")
-            .execute()
-            .await
-            .map_err(|error| {
-                format!("add queue_dependencies.dep_dependency_identity column: {error}")
-            })?;
-    }
-    if !columns.contains("dep_side_known") {
-        db.query(
-            "ALTER TABLE queue_dependencies ADD COLUMN dep_side_known INTEGER NOT NULL DEFAULT 0",
-        )
-        .execute()
-        .await
-        .map_err(|error| format!("add queue_dependencies.dep_side_known column: {error}"))?;
-    }
-    if !columns.contains("dep_met") {
-        db.query("ALTER TABLE queue_dependencies ADD COLUMN dep_met INTEGER NOT NULL DEFAULT 0")
-            .execute()
-            .await
-            .map_err(|error| format!("add queue_dependencies.dep_met column: {error}"))?;
-    }
-    migrate_queue_dependencies_indexes(db).await?;
-    derive_dev_era_edge_sides(db).await?;
-    backfill_dev_era_edge_masks(db).await
-}
-
-/// The indexes this migration's columns make possible — kept out of
-/// `schema.sql` because a dev-era edges table only gains the columns
-/// here. The two marker selects (`dep_side_known = 0`,
-/// `dep_invocations = 0`) scanned every edge in the queue without them
-/// (stow#432); the unresolved-edge and slice probes serve the request
-/// paths that read them, and `dep_match` bounds the publish delta's
-/// dependent refresh to the rows a report actually changed.
-async fn migrate_queue_dependencies_indexes(db: &DurableDb) -> Result<(), QueueError> {
-    for (statement, error) in [
-        (
-            "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_side_unknown \
-             ON queue_dependencies(task_id) WHERE dep_side_known = 0",
-            "index edges with an unknown side",
-        ),
-        (
-            "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_unmasked \
-             ON queue_dependencies(task_id) WHERE dep_invocations = 0",
-            "index edges without a shape mask",
-        ),
-        (
-            "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_unresolved \
-             ON queue_dependencies(task_id) WHERE dep_crate_name = '' OR dep_host_side < 0",
-            "index unresolved dependency edges",
-        ),
-        (
-            "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_slice \
-             ON queue_dependencies(dep_target, dep_rustc_version, task_id)",
-            "index edges by published slice",
-        ),
-        (
-            "CREATE INDEX IF NOT EXISTS idx_queue_dependencies_dep_match \
-             ON queue_dependencies(dep_target, dep_rustc_version, dep_crate_name, dep_version)",
-            "index edges by dep identity",
-        ),
-    ] {
-        db.query(statement)
-            .execute()
-            .await
-            .map_err(|e| format!("{error}: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Edges written before the columns carried no required-shape set:
-/// recompute each one's mask from its owner task's identity — the
-/// same values the enqueue's dependency resync writes.
-/// `dep_invocations = 0` marks an unbackfilled edge (every mask
-/// `dep_edge_requirements` produces is non-zero), so the backfill
-/// stands on the rows themselves rather than on which ALTERs just
-/// ran: a retry after a migration that committed the column adds but
-/// failed mid-backfill heals here instead of gating dependents on a
-/// permanently-zero mask.
-async fn backfill_dev_era_edge_masks(db: &DurableDb) -> Result<(), QueueError> {
-    let edges = db
-        .query(
-            "SELECT d.task_id, d.depends_on_task_id, \
-                    q.target AS owner_target, q.host_side AS owner_host_side, \
-                    d.dep_target, d.dep_host_side \
-             FROM queue_dependencies d \
-             LEFT JOIN queue q ON q.task_id = d.task_id \
-             WHERE d.dep_invocations = 0",
-        )
-        .fetch_all::<UnmaskedEdge>()
-        .await
-        .map_err(|error| format!("load unmasked dependency edges: {error}"))?;
-    for edge in edges {
-        // An edge whose owner row is gone takes the requirement
-        // for a masked-off owner — moot on a task that no longer
-        // exists.
-        let (mask, shapes) = dep_edge_requirements(
-            edge.owner_target.as_deref().unwrap_or(""),
-            edge.owner_host_side.unwrap_or(0) != 0,
-            edge.dep_target.as_str(),
-            edge.dep_host_side != 0,
-            // A dev-era edge predates the flag: its dep's contract was
-            // never flagged, so `KeysAsNative` is the requirement the
-            // row always carried.
-            stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-        );
-        db.query(
-            "UPDATE queue_dependencies \
-             SET dep_invocations = ?, dep_shapes = ? \
-             WHERE task_id = ? AND depends_on_task_id = ?",
-        )
-        .bind(mask)
-        .bind(shapes)
-        .bind(edge.task_id)
-        .bind(edge.depends_on_task_id)
-        .execute()
-        .await
-        .map_err(|error| format!("backfill dependency edge shape mask: {error}"))?;
-    }
-    Ok(())
-}
-
-/// Edges written before the side model carry `dep_host_side = 0` — the
-/// wire could not name a side, so the required side is derived from the
-/// only honest signal left: where the dep's task minted relative to the
-/// owner's target and the family's host triple. `dep_side_known` runs
-/// the derivation exactly once — resolver-written edges carry 1.
-async fn derive_dev_era_edge_sides(db: &DurableDb) -> Result<(), QueueError> {
-    let side_edges = db
-        .query(
-            "SELECT d.task_id, d.depends_on_task_id, \
-                    q.target AS owner_target, q.host_side AS owner_host_side, \
-                    d.dep_target, d.dep_host_side \
-             FROM queue_dependencies d \
-             LEFT JOIN queue q ON q.task_id = d.task_id \
-             WHERE d.dep_side_known = 0",
-        )
-        .fetch_all::<UnmaskedEdge>()
-        .await
-        .map_err(|error| format!("load unestablished dependency edges: {error}"))?;
-    for edge in &side_edges {
-        let owner_target = edge.owner_target.as_deref().unwrap_or("");
-        let owner_host_side = edge.owner_host_side.unwrap_or(0) != 0;
-        let side = derive_edge_side(owner_target, owner_host_side, &edge.dep_target);
-        // The mask is moot on a -1 edge — `p.unit_side = -1` matches no
-        // published row — but a non-zero shape count keeps the edge out
-        // of the unbackfilled-0 marker class.
-        let (mask, shapes) = dep_edge_requirements(
-            owner_target,
-            owner_host_side,
-            &edge.dep_target,
-            side > 0,
-            stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-        );
-        db.query(
-            "UPDATE queue_dependencies \
-             SET dep_host_side = ?, dep_invocations = ?, dep_shapes = ?, dep_side_known = 1 \
-             WHERE task_id = ? AND depends_on_task_id = ?",
-        )
-        .bind(side)
-        .bind(mask)
-        .bind(shapes)
-        .bind(edge.task_id.clone())
-        .bind(edge.depends_on_task_id.clone())
-        .execute()
-        .await
-        .map_err(|error| format!("derive dependency edge side: {error}"))?;
-        // `dep_met` is a stored answer the request path only writes at
-        // edge insert — nothing else re-evaluates a derived edge until
-        // a slice delta happens to touch it, so recount it here with
-        // the same EXISTS the insert evaluates (a second statement:
-        // a SET expression sees the row's old values).
-        db.query(&format!(
-            "UPDATE queue_dependencies \
-             SET dep_met = CASE WHEN {unpub} THEN 0 ELSE 1 END \
-             WHERE task_id = ? AND depends_on_task_id = ?",
-            unpub = dep_edge_unpublished_sql("queue_dependencies"),
-        ))
-        .bind(edge.task_id.clone())
-        .bind(edge.depends_on_task_id.clone())
-        .execute()
-        .await
-        .map_err(|error| format!("recount derived edge coverage: {error}"))?;
-    }
-    // The owners' stored counters (`unpublished_deps`/`deps_met`/
-    // `blocked`) follow from the edges just rewritten — recount them
-    // on exactly those rows.
-    let owner_ids: Vec<String> = side_edges.iter().map(|edge| edge.task_id.clone()).collect();
-    refresh_deps_met_tasks(db, &owner_ids).await?;
-    Ok(())
-}
-
-/// The required side a pre-side-model edge left derivable: the dep's own
-/// target says which task minted it — a host dep mints on the owner
-/// family's host triple, a target dep on the owner's target. Where the
-/// two coincide nothing in the row distinguishes them, so the edge's
-/// side stays unestablished (-1) until the resolver rewrites it.
-fn derive_edge_side(owner_target: &str, owner_host_side: bool, dep_target: &str) -> i64 {
-    if owner_host_side {
-        // A host-side node's whole dependency subtree compiles host-side.
-        return 1;
-    }
-    let host_triple = stow_types::api::runner_family(owner_target)
-        .map_or(owner_target, |family| family.host_triple());
-    if dep_target == host_triple && dep_target != owner_target {
-        // A cross owner's dep on the family host triple can only be a
-        // host unit — its target deps mint on its own target.
-        1
-    } else if dep_target == owner_target && dep_target != host_triple {
-        // A dep on the owner's own target off the family host triple
-        // can only be a target unit.
-        0
-    } else {
-        // dep_target == owner_target == host_triple is ambiguous — a
-        // lib's target dep and a proc-macro's host dep mint alike — and
-        // a dep matching neither is a corrupt edge. Either way the side
-        // was never established; -1 satisfies no gate clause, so the
-        // dependent waits for the resolver to rewrite the edge rather
-        // than dispatching on a guess.
-        -1
-    }
-}
-
-/// `host_side` is part of the queue's `UNIQUE` identity — `SQLite` cannot
-/// alter a constraint in place, so the table is rebuilt: renamed aside,
-/// recreated from schema.sql, copied back with `host_side = 0`, and
-/// dropped. Rows keep their target-side identity: `task_id`s and
-/// `queue_dependencies` edges are spelled identically at `host_side =
-/// 0`, so no dependent or admission needs rewriting.
-async fn migrate_queue_host_side(db: &DurableDb) -> Result<(), QueueError> {
-    tracing::warn!("migrating scheduler queue: adding host_side to the task identity");
-    db.query("ALTER TABLE queue RENAME TO queue_migrated")
-        .execute()
-        .await
-        .map_err(|error| format!("rename queue for host_side migration: {error}"))?;
-    db.query(include_str!("schema.sql"))
-        .execute()
-        .await
-        .map_err(|error| format!("recreate queue with host_side: {error}"))?;
-    db.query(
-        "INSERT INTO queue \
-         (task_id, crate_name, version, features_json, target, rustc_version, \
-          host_side, downloads, miss_count, request_count, priority, status, \
-          error_msg, preserve_lockfile, lane, dispatch_attempts, attempt, \
-          not_before, first_requested_at, created_at, updated_at, \
-          github_run_id, shape_requeue) \
-         SELECT task_id, crate_name, version, features_json, target, rustc_version, \
-                0, downloads, miss_count, request_count, priority, status, \
-                error_msg, preserve_lockfile, lane, dispatch_attempts, attempt, \
-                not_before, first_requested_at, created_at, updated_at, \
-                github_run_id, shape_requeue \
-         FROM queue_migrated",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("copy queue rows for host_side migration: {error}"))?;
-    db.query("DROP TABLE queue_migrated")
-        .execute()
-        .await
-        .map_err(|error| format!("drop migrated queue copy: {error}"))?;
-    // The RENAME moved the old table's named indexes and triggers onto
-    // `queue_migrated`, so the include above could not create them (the
-    // `IF NOT EXISTS` names were still taken) — and the drop just freed
-    // those names. One more include builds them on the rebuilt queue;
-    // every statement is idempotent, so the second run only adds what is
-    // missing. `queue_status_counts` still reads empty afterwards —
-    // `migrate_dispatch_gate` rebuilds it from the queue at the end of
-    // the pass.
-    db.query(include_str!("schema.sql"))
-        .execute()
-        .await
-        .map_err(|error| format!("rebuild queue indexes and triggers: {error}"))?;
-    Ok(())
-}
-
-/// `unit_side`/`unit_invocation`/`unit_linked` key each row's unit
-/// shape — a crate legitimately serves one row per shape its consumers
-/// compile — so the table is rebuilt the same way `host_side` rebuilt
-/// the queue. Rows copy back with `-1` legs — shapeless: a row reported
-/// before the columns existed covers nothing under the gate, so a
-/// dependent behind one waits for the slice's next publish rather than
-/// releasing on membership alone.
-async fn migrate_published_slice_row_shape(db: &DurableDb) -> Result<(), QueueError> {
-    let columns = db
-        .query("PRAGMA table_info(published_slice_rows)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load published_slice_rows table_info: {error}"))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-    if columns.is_empty() || columns.contains("unit_side") {
-        return Ok(());
-    }
-    tracing::warn!("migrating scheduler published_slice_rows: adding the unit-shape key");
-    db.query("ALTER TABLE published_slice_rows RENAME TO published_slice_rows_migrated")
-        .execute()
-        .await
-        .map_err(|error| format!("rename published_slice_rows for shape migration: {error}"))?;
-    db.query(include_str!("schema.sql"))
-        .execute()
-        .await
-        .map_err(|error| format!("recreate published_slice_rows with shape key: {error}"))?;
-    db.query(
-        "INSERT INTO published_slice_rows \
-         (target, rustc_version, generation, crate_name, version, features_json) \
-         SELECT target, rustc_version, generation, crate_name, version, features_json \
-         FROM published_slice_rows_migrated",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("copy slice rows for shape migration: {error}"))?;
-    db.query("DROP TABLE published_slice_rows_migrated")
-        .execute()
-        .await
-        .map_err(|error| format!("drop migrated slice-row copy: {error}"))?;
-    Ok(())
-}
-
-/// Add `published_slices.applied_generation` — the optimistic token a
-/// delta slice report's `base_generation` checks against. Rows that
-/// predate it start at 0: the first report for an existing slice comes
-/// through the full path (`base_generation = None` on a stale or absent
-/// base — the reporter cannot have produced a delta for a generation it
-/// never saw), which applies and stamps the counter for the next delta.
-async fn migrate_published_slice_columns(db: &DurableDb) -> Result<(), QueueError> {
-    let columns = db
-        .query("PRAGMA table_info(published_slices)")
-        .fetch_all::<QueueTableInfoRow>()
-        .await
-        .map_err(|error| format!("load published_slices table_info: {error}"))?
-        .into_iter()
-        .map(|row| row.name)
-        .collect::<BTreeSet<_>>();
-    if columns.is_empty() || columns.contains("applied_generation") {
-        return Ok(());
-    }
-    db.query(
-        "ALTER TABLE published_slices ADD COLUMN applied_generation INTEGER NOT NULL DEFAULT 0",
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("add published_slices.applied_generation column: {error}"))?;
-    Ok(())
-}
-
-async fn migrate_queue_schema(db: &DurableDb) -> Result<(), QueueError> {
-    // Legacy rows lack features_json and rustc_version — these are essential
-    // identity fields. Instead of backfilling with bogus data ('[]' / ''),
-    // drop the table and recreate it from the canonical schema. Dropped
-    // tasks are re-enqueued with correct identity on the next cache miss.
-    tracing::warn!(
-        "migrating scheduler queue schema — legacy rows without identity fields will be dropped"
-    );
-    db.query("DROP TABLE queue")
-        .execute()
-        .await
-        .map_err(|error| format!("drop legacy scheduler queue: {error}"))?;
-    db.query(include_str!("schema.sql"))
-        .execute()
-        .await
-        .map_err(|error| format!("recreate scheduler schema after migration: {error}"))?;
     Ok(())
 }
 
@@ -8671,12 +7072,6 @@ struct BoundPendingCompletionRow {
     generation: String,
     #[row(rename = "github_run_id")]
     run: String,
-}
-
-/// One `PRAGMA table_info` row — only the column name matters.
-#[derive(Debug, skyzen::FromRow)]
-struct QueueTableInfoRow {
-    name: String,
 }
 
 /// One `GROUP BY target` count over active rows.
