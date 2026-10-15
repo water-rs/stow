@@ -12,7 +12,7 @@ use crate::scheduler::test_db::{
     StatementLog, counting_memory_db, counting_memory_db_raw, memory_db, memory_db_raw,
 };
 use skyzen_services::durable::DurableDb;
-use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+use stow_types::public_cache::{ExplicitSpelling, UnitInvocation, UnitKind, UnitShape, UnitSide};
 
 const fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
     UnitShape {
@@ -160,6 +160,7 @@ fn semantic_identity(crate_name: &str) -> SemanticTaskIdentity {
         target: TARGET.to_owned(),
         rustc_version: RUSTC.to_owned(),
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     }
 }
 
@@ -182,6 +183,8 @@ fn subgraph_of(deps: &[EnqueueRequest]) -> stow_types::api::TaskSubgraph {
             version: dep.version.clone(),
             features_json: dep.features_json.clone(),
             host_side: dep.host_side,
+            keys_apart: dep.explicit_spelling
+                == stow_types::public_cache::ExplicitSpelling::KeysApart,
             deps: dep
                 .dependency_subgraph
                 .root_deps
@@ -195,6 +198,7 @@ fn subgraph_of(deps: &[EnqueueRequest]) -> stow_types::api::TaskSubgraph {
                 version: node.version.clone(),
                 features_json: node.features_json.clone(),
                 host_side: node.host_side,
+                keys_apart: node.keys_apart,
                 deps: node.deps.iter().map(remap).collect(),
             }
         }));
@@ -218,6 +222,7 @@ fn request_on(crate_name: &str, target: &str, deps: &[EnqueueRequest]) -> Enqueu
         source: EnqueueSource::CacheMiss,
         preserve_lockfile: false,
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     }
 }
 
@@ -1070,6 +1075,7 @@ async fn demand_can_cross_the_floor() {
             downloads: 1_000,
             redispatch: 0,
             human: 0,
+            explicit: 0,
         }],
     )
     .await
@@ -1455,6 +1461,7 @@ async fn demand_touches_both_compile_sides_of_one_identity() {
     let db = memory_db().await.expect("memory db");
     let host = EnqueueRequest {
         host_side: true,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         ..request("dual", &[])
     };
     enqueue(&db, &[request("dual", &[]), host])
@@ -2947,7 +2954,14 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
     // sits 'failed' (nothing in this submit names it, so no
     // requeue revives it), contributing unpub=0/blocker=1, while
     // dep-short is unmet but pending-free, unpub=1/blocker=0.
-    let (invocations, shapes) = super::dep_edge_requirements(TARGET, false, TARGET, false);
+    let (invocations, shapes) = super::dep_edge_requirements(
+        TARGET,
+        false,
+        ExplicitSpelling::KeysAsNative,
+        TARGET,
+        false,
+        ExplicitSpelling::KeysAsNative,
+    );
     for (dep, side_known) in [("dep-fpub", 1), ("dep-short", 1)] {
         db.query(
             "INSERT INTO queue_dependencies \
@@ -2961,9 +2975,7 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
         .bind(dep.to_owned())
         .bind(TARGET.to_owned())
         .bind(RUSTC.to_owned())
-        .bind(
-            dep_identity(dep).to_string(),
-        )
+        .bind(dep_identity(dep).to_string())
         .bind(invocations)
         .bind(shapes)
         .bind(side_known)
@@ -8132,6 +8144,7 @@ async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
             rustc_version: task.rustc_version.parse().expect("rustc"),
             preserve_lockfile: false,
             host_side: task.host_side,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependency_subgraph: task.dependency_subgraph.clone(),
         };
         let graph = payload.verified_dependency_graph().expect("verify");

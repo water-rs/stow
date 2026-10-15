@@ -201,6 +201,7 @@ mod tests {
             },
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
@@ -242,6 +243,7 @@ mod tests {
                 features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
                     .expect("dep features"),
                 host_side: false,
+                keys_apart: false,
                 deps: Vec::new(),
             }],
         };

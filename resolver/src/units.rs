@@ -122,6 +122,10 @@ pub struct StowDep {
     /// The dep's manifest kind on this edge.
     #[serde(with = "dep_kind_serde")]
     pub dep_kind: DepKind,
+    /// The dep is a proc-macro crate — the edge puts it in the parent
+    /// lib's `--extern`, where its key differs between the native and
+    /// explicit `--target` spellings (stow#736).
+    pub proc_macro: bool,
 }
 
 /// The vendored wire shape for [`DepKind`]: `null` for normal, `"dev"`,

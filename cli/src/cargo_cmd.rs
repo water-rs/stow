@@ -5936,6 +5936,7 @@ mod tests {
             host_side,
             dependencies: Vec::new(),
             dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
