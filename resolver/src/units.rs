@@ -125,7 +125,6 @@ pub struct StowDep {
     /// The dep is a proc-macro crate — the edge puts it in the parent
     /// lib's `--extern`, where its key differs between the native and
     /// explicit `--target` spellings (stow#736).
-    #[serde(default)]
     pub proc_macro: bool,
 }
 

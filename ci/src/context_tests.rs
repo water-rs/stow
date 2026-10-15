@@ -715,7 +715,7 @@ fn payload_for(request: &EnqueueRequest) -> BuildTaskPayload {
         rustc_version: request.rustc_version.clone(),
         preserve_lockfile: request.preserve_lockfile,
         host_side: request.host_side,
-        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        explicit_spelling: request.explicit_spelling,
         dependency_subgraph: request.dependency_subgraph.clone(),
     }
 }
@@ -1136,6 +1136,61 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
                 );
             }
         }
+    });
+}
+
+/// stow#736: a target-side lib with a proc-macro in its `--extern`
+/// closure resolves `KeysApart` — its payload runs the check phase
+/// under both invocation spellings, and each spelling's real unit
+/// graph mints the one task id (the flag is never identity).
+#[test]
+fn a_flagged_target_side_task_verifies_under_both_invocations() {
+    let _env = env_guard();
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "pm",
+            version: "1.0.0",
+            deps: vec![],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: true,
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "lib",
+            version: "1.0.0",
+            deps: vec![("pm", "1", &[])],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: false,
+        },
+    );
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "lib": "1" }),
+        &json!({}),
+    );
+    let requests = resolve_requests(cargo_home.path(), &manifest);
+    let lib = request_for(&requests, "lib");
+    assert!(!lib.host_side, "lib is a target-side node");
+    assert_eq!(
+        lib.explicit_spelling,
+        stow_types::public_cache::ExplicitSpelling::KeysApart,
+        "a proc-macro dep flags the lib KeysApart"
+    );
+    let task = payload_for(&lib);
+
+    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
+    smol::block_on(async {
+        let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+        verify(&task, &workspace)
+            .await
+            .expect("the flagged task verifies under both spellings");
     });
 }
 

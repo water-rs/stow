@@ -38,14 +38,8 @@ fn publish(reg: &Path, fixture: &Fixture) -> String {
     publish_with_build_deps(reg, fixture, &[])
 }
 
-/// `publish`, plus `[build-dependencies]` `(name, req)` entries and a
-/// `build.rs`, so cargo emits the build-script units the build-dep
-/// edges ride on (a build dep without a build script never emits).
-fn publish_with_build_deps(
-    reg: &Path,
-    fixture: &Fixture,
-    build_deps: &[(&'static str, &'static str)],
-) -> String {
+/// The manifest `publish_with_build_deps` writes for `fixture`.
+fn fixture_manifest(fixture: &Fixture, build_deps: &[(&'static str, &'static str)]) -> Value {
     let features: serde_json::Map<String, Value> = fixture
         .features
         .iter()
@@ -83,6 +77,19 @@ fn publish_with_build_deps(
     if fixture.proc_macro {
         manifest["lib"] = json!({ "proc-macro": true });
     }
+    manifest
+}
+
+/// `publish`, plus `[build-dependencies]` `(name, req)` entries and a
+/// `build.rs`, so cargo emits the build-script units the build-dep
+/// edges ride on (a build dep without a build script never emits).
+fn publish_with_build_deps(
+    reg: &Path,
+    fixture: &Fixture,
+    build_deps: &[(&'static str, &'static str)],
+) -> String {
+    let manifest = fixture_manifest(fixture, build_deps);
+    let features = manifest["features"].clone();
     let lib = if fixture.proc_macro {
         "extern crate proc_macro;\n"
     } else {
@@ -2802,6 +2809,20 @@ fn merkle_context_propagates_from_offline_resolve() {
     );
     assert_ne!(plain_id, unsafe_id);
 }
+/// A resolved node's explicit-spelling flag by crate name — the test
+/// asserts on the flag `resolved_task_graph` stamped on it.
+fn node_spelling(
+    graph: &stow_types::task_graph::ResolvedTaskGraph,
+    crate_name: &str,
+) -> stow_types::public_cache::ExplicitSpelling {
+    let index = graph
+        .nodes()
+        .iter()
+        .position(|node| node.identity.crate_name == crate_name)
+        .unwrap_or_else(|| panic!("{crate_name} is a node"));
+    graph.nodes()[index].explicit_spelling
+}
+
 /// stow#736's flag over a real resolve: a lib with a proc-macro in its
 /// `--extern` is `KeysApart`, so is every target-side lib above it; a
 /// lib with only build-deps and the proc-macro subtree itself stay
@@ -2861,47 +2882,36 @@ fn explicit_spelling_marks_proc_macro_closures() {
         .unwrap();
     let graph =
         stow_resolver::resolved_task_graph(&out[0].1.units, pinned_rustc_version()).unwrap();
-    let spelling_of = |name: &str| {
-        let index = graph
-            .nodes()
-            .iter()
-            .position(|node| node.identity.crate_name == name)
-            .unwrap_or_else(|| panic!("{name} is a node"));
-        graph.nodes()[index].explicit_spelling
-    };
     let apart = stow_types::public_cache::ExplicitSpelling::KeysApart;
     let native = stow_types::public_cache::ExplicitSpelling::KeysAsNative;
-    assert_eq!(spelling_of("mid"), apart, "a direct proc-macro dep flags");
     assert_eq!(
-        spelling_of("top"),
+        node_spelling(&graph, "mid"),
+        apart,
+        "a direct proc-macro dep flags"
+    );
+    assert_eq!(
+        node_spelling(&graph, "top"),
         apart,
         "the flag propagates through target-side deps"
     );
     assert_eq!(
-        spelling_of("pm"),
+        node_spelling(&graph, "pm"),
         native,
         "a host-side node is never flagged"
     );
     assert_eq!(
-        spelling_of("pm-dep"),
+        node_spelling(&graph, "pm-dep"),
         native,
         "a proc-macro's own dep subtree is never flagged"
     );
     assert_eq!(
-        spelling_of("bs"),
+        node_spelling(&graph, "bs"),
         native,
         "a build-dep-only lib is never flagged"
     );
-    assert_eq!(spelling_of("hostlib"), native);
+    assert_eq!(node_spelling(&graph, "hostlib"), native);
 
     // The flag rides `depends_on`'s dep edges the same way.
-    let top = graph
-        .nodes()
-        .iter()
-        .enumerate()
-        .find(|(_, node)| node.identity.crate_name == "top")
-        .map(|(index, _)| index)
-        .expect("top is a node");
     let (requests, _uncovered) = stow_resolver::enqueue_requests_inner(
         &graph,
         &std::collections::BTreeSet::new(),
@@ -2921,5 +2931,4 @@ fn explicit_spelling_marks_proc_macro_closures() {
         .map(|dep| (dep.crate_name.as_str().to_owned(), dep.explicit_spelling))
         .collect();
     assert_eq!(dep_flags, vec![("mid".to_owned(), apart)]);
-    let _ = top;
 }

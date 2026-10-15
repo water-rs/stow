@@ -236,9 +236,8 @@ pub struct SubgraphNode {
     #[serde(rename = "h", default, skip_serializing_if = "std::ops::Not::not")]
     pub host_side: bool,
     /// Whether the node keys differently under the explicit `--target`
-    /// spelling — `ExplicitSpelling::KeysApart` (stow#736). A subgraph
-    /// minted before the flag existed decodes `KeysAsNative`, the shape
-    /// the node always published under.
+    /// spelling — `ExplicitSpelling::KeysApart` (stow#736). Absent on the
+    /// wire means `KeysAsNative`: the compact encoding writes only `true`.
     #[serde(rename = "x", default, skip_serializing_if = "std::ops::Not::not")]
     pub keys_apart: bool,
     /// Indexes into [`TaskSubgraph::nodes`] naming this node's direct
@@ -612,10 +611,7 @@ pub struct EnqueueDependency {
     pub dependency_identity: DependencyIdentity,
     /// Whether the dep node keys differently under the explicit
     /// `--target <host>` spelling (stow#736). The edge's shape gate
-    /// requires the dep's four-shape set under it. Defaults to
-    /// `KeysAsNative` so edges serialized before the flag existed keep
-    /// their two-shape requirement.
-    #[serde(default)]
+    /// requires the dep's four-shape set under it.
     pub explicit_spelling: crate::public_cache::ExplicitSpelling,
 }
 
@@ -898,10 +894,7 @@ pub struct ResolvedDependencyGraphEntry {
     pub dependency_subgraph: TaskSubgraph,
     /// Whether this node keys differently under the explicit
     /// `--target <host>` spelling (stow#736) — the flag its
-    /// `EnqueueRequest` mints with. Defaults to `KeysAsNative` so
-    /// entries persisted before the flag existed decode with the shape
-    /// they always carried.
-    #[serde(default)]
+    /// `EnqueueRequest` mints with.
     pub explicit_spelling: crate::public_cache::ExplicitSpelling,
 }
 

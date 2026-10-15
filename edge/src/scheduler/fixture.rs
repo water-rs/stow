@@ -355,6 +355,7 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
     "host_side",
+    "explicit_spelling",
     "preserve_lockfile",
     "attempt",
     "shape_requeue",
@@ -507,6 +508,7 @@ fn queue_seed_insert_sql(
                 {first_at}, \
                 {updated_at}, \
                 CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
+                0, \
                 0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
                 CASE WHEN n > {failed_end} THEN 'run-' || n ELSE NULL END, \
                 lower(hex(randomblob(16))), \
@@ -756,7 +758,7 @@ async fn seed_nodes_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), QueueE
         "WITH RECURSIVE seq(n) AS ({seq}) \
          INSERT OR IGNORE INTO task_nodes \
              (task_id, crate_name, version, features_json, target, rustc_version, \
-              host_side, dependency_identity, children_json) \
+              host_side, explicit_spelling, dependency_identity, children_json) \
          SELECT printf('%064x', n), \
                 'crate' || (n / {CRATE_NAME_ROWS}), \
                 '1.' || (n / 20000) || '.' || (n % 500), \
@@ -764,6 +766,7 @@ async fn seed_nodes_chunk(db: &DurableDb, lo: u32, hi: u32) -> Result<(), QueueE
                 {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
                 CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
+                0, \
                 printf('%064x', n), \
                 COALESCE( \
                     (SELECT json_group_array(d.depends_on_task_id) \

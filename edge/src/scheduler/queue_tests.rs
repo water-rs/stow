@@ -12,7 +12,7 @@ use crate::scheduler::test_db::{
     StatementLog, counting_memory_db, counting_memory_db_raw, memory_db, memory_db_raw,
 };
 use skyzen_services::durable::DurableDb;
-use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+use stow_types::public_cache::{ExplicitSpelling, UnitInvocation, UnitKind, UnitShape, UnitSide};
 
 const fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
     UnitShape {
@@ -2957,10 +2957,10 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
     let (invocations, shapes) = super::dep_edge_requirements(
         TARGET,
         false,
-        stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        ExplicitSpelling::KeysAsNative,
         TARGET,
         false,
-        stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        ExplicitSpelling::KeysAsNative,
     );
     for (dep, side_known) in [("dep-fpub", 1), ("dep-short", 1)] {
         db.query(
@@ -2975,9 +2975,7 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
         .bind(dep.to_owned())
         .bind(TARGET.to_owned())
         .bind(RUSTC.to_owned())
-        .bind(
-            dep_identity(dep).to_string(),
-        )
+        .bind(dep_identity(dep).to_string())
         .bind(invocations)
         .bind(shapes)
         .bind(side_known)

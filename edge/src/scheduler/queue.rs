@@ -81,7 +81,7 @@ pub struct QueuedTask {
 /// Decode a stored `explicit_spelling` integer — the queue and
 /// node-store columns carry 0 for `KeysAsNative`, 1 for `KeysApart`
 /// (stow#736).
-pub(crate) fn spelling_of(stored: i64) -> stow_types::public_cache::ExplicitSpelling {
+pub const fn spelling_of(stored: i64) -> stow_types::public_cache::ExplicitSpelling {
     if stored != 0 {
         stow_types::public_cache::ExplicitSpelling::KeysApart
     } else {
@@ -797,11 +797,14 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
 /// submit-side half of the node store (stow#588). `INSERT` with an
 /// `ON CONFLICT` that only lifts `explicit_spelling`: a task id is a
 /// content address, so a node another request already wrote is
-/// identical by construction — except the flag, which rows stored
-/// before stow#736 could not carry. A flagged resubmission upgrades
-/// the stored row's `KeysAsNative` so the next dispatch payload and
-/// edge requirement see the real contract; `KeysApart` never lowers
-/// (`MAX`).
+/// identical by construction — except the flag, which two subgraphs
+/// minting the same id can disagree on (it derives from the unit
+/// graph, a finer input than the task-id digest commits to). A
+/// flagged resubmission upgrades the stored row's `KeysAsNative` so
+/// the next dispatch payload and edge requirement see the real
+/// contract; `KeysApart` never lowers. The `WHERE` confines the
+/// write to a real upgrade — `MAX` would leave the value unchanged
+/// otherwise, and an unchanged row is not an event worth billing.
 async fn upsert_task_nodes(db: &DurableDb, rows: &[BatchedNodeRow]) -> Result<(), QueueError> {
     for chunk in rows.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(
@@ -814,7 +817,8 @@ async fn upsert_task_nodes(db: &DurableDb, rows: &[BatchedNodeRow]) -> Result<()
              FROM (SELECT value AS e FROM json_each(?)) e \
              WHERE TRUE \
              ON CONFLICT(task_id) DO UPDATE SET \
-                explicit_spelling = MAX(task_nodes.explicit_spelling, excluded.explicit_spelling)",
+                explicit_spelling = excluded.explicit_spelling \
+             WHERE excluded.explicit_spelling > task_nodes.explicit_spelling",
         )
         .bind(enqueue_json(chunk)?)
         .execute()
@@ -1387,9 +1391,7 @@ fn plan_enqueue(
                     entry.task_id.clone(),
                     TaskStatusProbe {
                         status: "pending".to_owned(),
-                        explicit_spelling: probe
-                            .explicit_spelling
-                            .max(i64::from(request_explicit)),
+                        explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
                     },
                 );
             } else {
@@ -6984,12 +6986,6 @@ fn u64_to_i64(value: u64, field: &'static str) -> Result<i64, QueueError> {
 
 fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
     u32::try_from(value).map_err(|_| QueueError::Overflow { field, value })
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct TaskIdRow {
-    task_id: String,
-    status: String,
 }
 
 /// The enqueue probe's per-row answer — status plus the stored

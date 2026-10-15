@@ -249,8 +249,7 @@ pub async fn expand_scheduler_requests(
     // explicit-spelling flag travels the same way: the caller derived
     // it from its unit graph, and the edge answers it for coverage,
     // the queue row and the dispatched payload (stow#736).
-    let mut subgraph_by_key = BTreeMap::<ExpandedNodeKey, stow_types::api::TaskSubgraph>::new();
-    let mut spelling_by_key = BTreeMap::<ExpandedNodeKey, ExplicitSpelling>::new();
+    let mut context_by_key = BTreeMap::<ExpandedNodeKey, ExpandedNodeContext>::new();
     for entry in expanded_entries {
         let key = ExpandedNodeKey {
             package: PackageKey {
@@ -259,8 +258,14 @@ pub async fn expand_scheduler_requests(
             },
             host_side: entry.host_side,
         };
-        if subgraph_by_key
-            .insert(key.clone(), entry.dependency_subgraph.clone())
+        if context_by_key
+            .insert(
+                key,
+                ExpandedNodeContext {
+                    subgraph: entry.dependency_subgraph.clone(),
+                    explicit_spelling: entry.explicit_spelling,
+                },
+            )
             .is_some()
         {
             return Err(ResolverError::Invariant(format!(
@@ -268,7 +273,6 @@ pub async fn expand_scheduler_requests(
                 entry.crate_name, entry.version
             )));
         }
-        spelling_by_key.insert(key, entry.explicit_spelling);
     }
     // A consumer target outside `CI_TARGET_TRIPLES` has no runner
     // family, so its host units have no host triple to mint on —
@@ -288,15 +292,14 @@ pub async fn expand_scheduler_requests(
         target,
         rustc_version,
         &exact_graph.feature_json_by_key,
-        &spelling_by_key,
+        &context_by_key,
     )
     .await?;
 
     let requests = build_enqueue_requests(
         &exact_graph.feature_json_by_key,
         &exact_graph.dependency_keys_by_key,
-        &subgraph_by_key,
-        &spelling_by_key,
+        &context_by_key,
         &semantic_keys,
         &target_typed,
         &rustc_version_typed,
@@ -330,8 +333,7 @@ fn node_target(node_key: &ExpandedNodeKey, target_typed: &TargetTriple) -> Targe
 fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
     dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
-    subgraph_by_key: &BTreeMap<ExpandedNodeKey, stow_types::api::TaskSubgraph>,
-    spelling_by_key: &BTreeMap<ExpandedNodeKey, ExplicitSpelling>,
+    context_by_key: &BTreeMap<ExpandedNodeKey, ExpandedNodeContext>,
     cached_semantic_keys: &BTreeSet<(ExpandedNodeKey, String)>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
@@ -349,6 +351,12 @@ fn build_enqueue_requests(
             continue;
         }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
+        let context = context_by_key.get(node_key).ok_or_else(|| {
+            format!(
+                "missing node context for {} {}",
+                node_key.package.crate_name, node_key.package.version
+            )
+        })?;
         let request = EnqueueRequest {
             crate_name: node_key.package.crate_name.clone(),
             version: CrateVersion::new(node_key.package.version.clone()),
@@ -357,20 +365,10 @@ fn build_enqueue_requests(
             rustc_version: rustc_version_typed.clone(),
             downloads: 0,
             source,
-            dependency_subgraph: subgraph_by_key.get(node_key).cloned().ok_or_else(|| {
-                format!(
-                    "missing dependency subgraph for {} {}",
-                    node_key.package.crate_name, node_key.package.version
-                )
-            })?,
+            dependency_subgraph: context.subgraph.clone(),
             preserve_lockfile: false,
             host_side: node_key.host_side,
-            explicit_spelling: spelling_by_key.get(node_key).copied().ok_or_else(|| {
-                format!(
-                    "missing explicit-spelling flag for {} {}",
-                    node_key.package.crate_name, node_key.package.version
-                )
-            })?,
+            explicit_spelling: context.explicit_spelling,
         };
         // Re-derive every id the subgraph yields: a wire that does not
         // resolve is refused rather than minted (stow#588). The
@@ -487,6 +485,14 @@ struct ExactExpandedGraph {
     dependency_keys_by_key: BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
 }
 
+/// What one expanded-graph entry carries per node: the client-minted
+/// dependency subgraph and the explicit-spelling flag the caller
+/// derived from its unit graph (stow#736).
+struct ExpandedNodeContext {
+    subgraph: stow_types::api::TaskSubgraph,
+    explicit_spelling: ExplicitSpelling,
+}
+
 fn exact_graph_from_request(
     roots: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
@@ -581,7 +587,7 @@ async fn load_cached_artifacts(
     target: &str,
     rustc_version: &str,
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
-    spelling_by_key: &BTreeMap<ExpandedNodeKey, ExplicitSpelling>,
+    context_by_key: &BTreeMap<ExpandedNodeKey, ExpandedNodeContext>,
 ) -> Result<BTreeSet<(ExpandedNodeKey, String)>, ResolverError> {
     let host_triple = runner_family(target).map_or_else(|| target, |family| family.host_triple());
     let mut cached = BTreeSet::new();
@@ -595,10 +601,10 @@ async fn load_cached_artifacts(
             .filter(|(key, _)| key.host_side == host_side)
             .map(|(key, features_json)| (key.package.clone(), features_json.clone()))
             .collect::<BTreeSet<_>>();
-        let spellings = spelling_by_key
+        let spellings = context_by_key
             .iter()
             .filter(|(key, _)| key.host_side == host_side)
-            .map(|(key, spelling)| (key.package.clone(), *spelling))
+            .map(|(key, context)| (key.package.clone(), context.explicit_spelling))
             .collect::<BTreeMap<_, _>>();
         for (package, features_json) in load_cached_artifacts_for_keys(
             db,
@@ -1766,13 +1772,21 @@ mod tests {
     /// Subgraphs minted off the exact graph the same way the wire
     /// carries them — each node's closure, covered nodes with their own
     /// feature set (stow#588).
-    fn subgraphs(
+    fn contexts(
         graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
         features: &BTreeMap<ExpandedNodeKey, String>,
-    ) -> BTreeMap<ExpandedNodeKey, stow_types::api::TaskSubgraph> {
+    ) -> BTreeMap<ExpandedNodeKey, super::ExpandedNodeContext> {
         graph
             .keys()
-            .map(|key| (key.clone(), subgraph_for(key, graph, features)))
+            .map(|key| {
+                (
+                    key.clone(),
+                    super::ExpandedNodeContext {
+                        subgraph: subgraph_for(key, graph, features),
+                        explicit_spelling: super::ExplicitSpelling::KeysAsNative,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -1861,15 +1875,6 @@ mod tests {
             .collect()
     }
 
-    fn spellings(
-        graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
-    ) -> BTreeMap<ExpandedNodeKey, super::ExplicitSpelling> {
-        graph
-            .keys()
-            .map(|key| (key.clone(), super::ExplicitSpelling::KeysAsNative))
-            .collect()
-    }
-
     fn covered(names: &[&str]) -> BTreeSet<(ExpandedNodeKey, String)> {
         names
             .iter()
@@ -1891,8 +1896,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features(&graph),
             &graph,
-            &subgraphs(&graph, &features(&graph)),
-            &spellings(&graph),
+            &contexts(&graph, &features(&graph)),
             &covered(&["b"]),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1936,8 +1940,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
-            &subgraphs(&graph, &features),
-            &spellings(&graph),
+            &contexts(&graph, &features),
             &BTreeSet::new(),
             &"wasm32-unknown-unknown".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1986,8 +1989,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
-            &subgraphs(&graph, &features),
-            &spellings(&graph),
+            &contexts(&graph, &features),
             &BTreeSet::new(),
             &"aarch64-apple-ios".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),

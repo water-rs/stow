@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS queue (
     -- spellings. Semantic data, not identity — upgraded only while the
     -- row has not committed to a dispatch, and carried through the
     -- node store into the dispatched payload.
-    explicit_spelling INTEGER NOT NULL DEFAULT 0,
+    explicit_spelling INTEGER NOT NULL,
     -- NULL is historical context that was never recorded, not a leaf.
     dependency_identity TEXT,
     -- Repair latch: 1 once a `completed` row has been re-queued because a
@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS task_nodes (
     -- proc-macro sits in its `--extern` closure and it therefore keys
     -- differently per invocation spelling. Rebuilt into the dispatched
     -- payload's root flag on every claim.
-    explicit_spelling INTEGER NOT NULL DEFAULT 0,
+    explicit_spelling INTEGER NOT NULL,
     -- The Merkle dependency digest this node's task id commits to —
     -- every node in the store carries it; NULL belongs to tables whose
     -- context is historical, never here.

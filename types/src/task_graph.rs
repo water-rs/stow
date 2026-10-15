@@ -85,7 +85,6 @@ pub struct ResolvedTaskNode {
     /// bottom-up by whichever projection produced the node — it is
     /// presentation, never identity: task ids and dependency digests
     /// ignore it.
-    #[serde(default)]
     pub explicit_spelling: crate::public_cache::ExplicitSpelling,
     /// Indexes of this node's direct dependencies in the graph's node
     /// list. Every entry must name a real node; ordering and repetition

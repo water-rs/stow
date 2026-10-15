@@ -2873,6 +2873,7 @@ mod tests {
         assert!(matches!(invocations[1], CargoInvocation::Explicit));
 
         let mut cross = task_with_features(&["std"]);
+        cross.target = TargetTriple::parse("wasm32-unknown-unknown").expect("target");
         cross.explicit_spelling = stow_types::public_cache::ExplicitSpelling::KeysApart;
         assert_eq!(
             phase_invocations(&cross).len(),
