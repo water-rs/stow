@@ -307,6 +307,14 @@ pub fn resolved_task_graph(
 /// unit's feature set, which is the identity a consumer computes.
 /// Without the pin the wrapper resolves the host subtree alone and
 /// the task publishes dep identities no consumer links (stow#506).
+///
+/// The twin must be one cargo would share: the same package at the
+/// same feature set — cargo's sharing probe compares package, mode,
+/// features and profile, and `TaskUnitKey` carries no features, so
+/// the lookup below compares them itself, as the sets `task_node`
+/// canonicalizes. A different-feature twin is never shared, so
+/// pinning it reproduces nothing a consumer computes and makes the
+/// task compile units no node publishes (stow#722).
 fn dedup_shadow_edges<'u>(
     units: &'u [TaskUnit],
     raw_deps: impl Fn(&'u TaskUnit) -> Result<Vec<&'u TaskUnit>>,
@@ -338,6 +346,8 @@ fn dedup_shadow_edges<'u>(
             if dep_unit.is_crates_io
                 && let Some(target) = by_key(&target_key)
                 && target.is_crates_io
+                && target.features.iter().collect::<BTreeSet<_>>()
+                    == dep_unit.features.iter().collect::<BTreeSet<_>>()
             {
                 shadows.insert(task_node(target)?);
             }
@@ -401,4 +411,73 @@ fn decode_features_json(raw: &str) -> Result<FeaturesJson> {
         .map_err(|error| stow_error!("canonical features json: {error}"))?;
     FeaturesJson::from_sorted(features)
         .map_err(|error| stow_error!("canonical features json: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TaskUnit, TaskUnitDep, TaskUnitKey, TaskUnitKind, TaskUnitSide, task_graph, task_node,
+    };
+
+    const PLATFORM: &str = "x86_64-unknown-linux-gnu";
+
+    fn crates_io_lib(name: &str, version: &str, side: TaskUnitSide, features: &[&str]) -> TaskUnit {
+        TaskUnit {
+            key: TaskUnitKey {
+                pkg: format!(
+                    "registry+https://github.com/rust-lang/crates.io-index#{name}@{version}"
+                ),
+                platform: PLATFORM.to_owned(),
+                side,
+                kind: TaskUnitKind::Lib,
+            },
+            name: name.to_owned(),
+            version: version.to_owned(),
+            features: features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            is_crates_io: true,
+            deps: Vec::new(),
+        }
+    }
+
+    fn dep_on(unit: &TaskUnit) -> TaskUnitDep {
+        TaskUnitDep {
+            key: unit.key.clone(),
+            name: unit.name.clone(),
+            version: unit.version.clone(),
+        }
+    }
+
+    /// The shadow edge names the twin cargo would share — the same
+    /// package at the same feature set. A host dep with `[]` pins its
+    /// `[]` target twin, and pins nothing when the only target unit
+    /// carries `["std"]` (stow#722).
+    #[test]
+    fn a_shadow_edge_names_only_a_same_feature_twin() {
+        let host_dep = crates_io_lib("dep", "1.0.0", TaskUnitSide::Host, &[]);
+        let mut owner = crates_io_lib("owner", "1.0.0", TaskUnitSide::Target, &[]);
+        owner.deps.push(dep_on(&host_dep));
+        let owner_node = task_node(&owner).expect("owner node");
+        let host_dep_node = task_node(&host_dep).expect("host dep node");
+
+        // The twin at the host dep's own feature set is one cargo
+        // shares — the node gains the edge.
+        let twin = crates_io_lib("dep", "1.0.0", TaskUnitSide::Target, &[]);
+        let twin_node = task_node(&twin).expect("twin node");
+        let (_, edges) = task_graph(&[owner.clone(), host_dep.clone(), twin]).expect("task graph");
+        let deps = &edges[&owner_node];
+        assert!(deps.contains(&host_dep_node));
+        assert!(deps.contains(&twin_node));
+
+        // A different-feature twin is one cargo never shares — the
+        // node gains no edge to it.
+        let other = crates_io_lib("dep", "1.0.0", TaskUnitSide::Target, &["std"]);
+        let other_node = task_node(&other).expect("other node");
+        let (_, edges) = task_graph(&[owner, host_dep, other]).expect("task graph");
+        let deps = &edges[&owner_node];
+        assert!(deps.contains(&host_dep_node));
+        assert!(!deps.contains(&other_node));
+    }
 }

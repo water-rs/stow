@@ -14,7 +14,7 @@ use stow_types::identity::IdentityError;
 /// Errors raised by the D1 / artifact-catalog layer (`edge::db`).
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
-    /// A D1 query or migration failed.
+    /// A D1 query failed.
     #[error("d1 query failed: {0}")]
     Query(String),
     /// A row read from D1 had a column with an invalid identity shape.

@@ -55,8 +55,8 @@ in `cargo check`/`cargo build`. Keep them at `stow check` startup, on
   the prefetch budget clock starts (so a >1s refresh never eats the
   per-artifact allowance), and once lazily on the first verification inside
   a wrapper process. Keep it out of per-unit work.
-* **Full SQLite migration runs.** `state_db::connect` is fast on warm pools
-  but should not call `ensure_migrations` on every invocation.
+* **Full SQLite schema passes.** `state_db::connect` is fast on warm pools
+  but its column-parity pass should not run on every invocation.
 * **`cargo metadata`.** Already removed; do not re-add. Use lockfile parsing
   via `workspace_deps::lockfile_registry_packages` instead.
 * **`rustc -vV` / `rustc --version` probes.** The parent `stow check`

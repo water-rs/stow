@@ -1738,18 +1738,13 @@ pub struct QueueMutationResult {
     pub affected: u32,
 }
 
-/// What `POST /api/v1/admin/scheduler/migrate` reports — the stored
-/// scheduler schema version before and after the migration pass ran.
-/// `before == after` means the queue was already current.
+/// What `POST /api/v1/admin/scheduler/reset` reports — the operator
+/// reset dropped every store object and re-executed `schema.sql`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct SchemaMigrationReport {
-    /// Schema version the queue carried coming in — `0` on a
-    /// pre-versioned queue whose `scheduler_schema_version` row did not
-    /// exist yet.
-    pub before: i64,
-    /// Schema version the queue carries now — the build's own
-    /// `SCHEMA_VERSION`, since a successful pass always ends stamped.
-    pub after: i64,
+pub struct SchedulerResetReport {
+    /// Schema objects (tables, indexes, triggers, views) the reset
+    /// dropped before recreating the schema.
+    pub dropped: u64,
 }
 
 /// Body of `POST /api/v1/admin/scheduler/budget/seed`.
@@ -1891,8 +1886,6 @@ pub struct SchedulerBudgetRequest {
 pub struct SchedulerBudgetReport {
     /// Queue rows the fixture holds.
     pub queue_rows: u64,
-    /// The schema version the queue reports.
-    pub schema_version: i64,
     /// The dispatch cap the pass ran under — the run's own setting
     /// after any request override, so the per-claim marginal price
     /// divides by what the pass could actually claim.

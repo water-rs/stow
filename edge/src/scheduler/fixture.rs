@@ -715,7 +715,7 @@ pub async fn seed_edges_chunk(
          INSERT OR IGNORE INTO queue_dependencies \
              (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, \
               dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, \
-              dep_invocations, dep_shapes, dep_side_known) \
+              dep_invocations, dep_shapes) \
          SELECT printf('%064x', n), \
                 printf('%064x', {dep}), \
                 'crate' || ({dep} / {CRATE_NAME_ROWS}), \
@@ -726,8 +726,7 @@ pub async fn seed_edges_chunk(
                 CASE WHEN {dep} % 10 = 0 THEN 1 ELSE 0 END, \
                 printf('%064x', {dep}), \
                 CASE WHEN {dep} % 10 = 0 THEN ({owner_mask}) ELSE ({dep_mask}) END, \
-                CASE WHEN {dep} % 10 = 0 THEN CASE WHEN n % 10 = 0 THEN 2 ELSE 1 END ELSE 2 END, \
-                1 \
+                CASE WHEN {dep} % 10 = 0 THEN CASE WHEN n % 10 = 0 THEN 2 ELSE 1 END ELSE 2 END \
          FROM seq {extra}",
         seq = seq_sql(lo, hi),
     ))
@@ -1523,10 +1522,10 @@ const SEED_TABLES: &[&str] = &[
 ];
 
 /// `POST /budget/seed` — load the fixture through the operator path,
-/// one cursor step per call. The schema is the operator migrate
+/// one cursor step per call. The schema is the operator reset
 /// route's product — the harness runs it before seeding, and request
-/// code neither issues DDL nor re-checks the migration's queue-wide
-/// passes (a `queue::migrate` inside every chunk call walked the
+/// code neither issues DDL nor walks the queue to check the schema
+/// (a queue-wide pass inside every chunk call walked the
 /// growing queue for a no-op `!=` guard — the linear request cost that
 /// outlived the dev proxy's reply window at 1M rows). `reset` restarts
 /// the cursor and clears the fixture's tables chunk by chunk. Callers

@@ -228,6 +228,20 @@ pub fn bundle_oci_reference(reference: &str) -> Option<String> {
     is_oci_tag(&bundle_tag).then(|| format!("{GHCR_BASE}:{bundle_tag}"))
 }
 
+/// The artifact tag a bundle-pair tag names — `tag` itself, or the
+/// stem a `<tag>.bundle` suffix wraps.
+///
+/// `stow-build publish` pushes the pair from one [`oci_reference`]: the
+/// signed artifact manifest under `<tag>` and the bundle tar's manifest
+/// under `<tag>.bundle`, so the stem must be a legal OCI tag carrying
+/// the `name.version` dot. Anything else is not a tag this pipeline
+/// wrote.
+#[must_use]
+pub fn artifact_bundle_tag(tag: &str) -> Option<&str> {
+    let stem = tag.strip_suffix(BUNDLE_TAG_SUFFIX).unwrap_or(tag);
+    (is_oci_tag(stem) && stem.contains('.')).then_some(stem)
+}
+
 /// The crate segment stays lowercase even though OCI tags are
 /// case-sensitive and crate names need not be (`Inflector`, `RustyXML`, …).
 /// crates.io already rejects a new name that differs from a published one

@@ -393,10 +393,8 @@ impl FullArtifactRow {
             version: decoded.version,
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
-            dependency_identity: decode_dependency_identity(
-                self.dependency_identity.as_deref(),
-            )
-            .map_err(|error| invalid("dependency_identity", error))?,
+            dependency_identity: decode_dependency_identity(self.dependency_identity.as_deref())
+                .map_err(|error| invalid("dependency_identity", error))?,
             oci_reference: self.oci_reference,
             oci_digest: self.oci_digest,
             has_native: self.has_native != 0,
@@ -482,15 +480,13 @@ impl IndexArtifactRow {
             version: decoded.version,
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
-            dependency_identity: decode_dependency_identity(
-                self.dependency_identity.as_deref(),
-            )
-            .map_err(|error| {
-                DbError::Invariant(format!(
-                    "artifact row {}/{}/{}: dependency_identity: {error}",
-                    self.c_metadata, self.target, self.rustc_version
-                ))
-            })?,
+            dependency_identity: decode_dependency_identity(self.dependency_identity.as_deref())
+                .map_err(|error| {
+                    DbError::Invariant(format!(
+                        "artifact row {}/{}/{}: dependency_identity: {error}",
+                        self.c_metadata, self.target, self.rustc_version
+                    ))
+                })?,
             c_metadata: decoded.c_metadata,
             compile_key: self.compile_key,
             bundle_digest: self.bundle_digest,
@@ -1123,41 +1119,25 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
     Ok(())
 }
 
-/// Apply the migration files to a test database — the same SQL the deploy
-/// pipeline hands to `wrangler d1 execute --file`. `Db::query` prepares one
+/// Apply `edge/schema.sql` to a test database — the same file an operator
+/// hands to `wrangler d1 execute --file`. `Db::query` prepares one
 /// statement at a time, so the file is split on `;`.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub async fn apply_migrations(db: &Db) {
-    const FILES: &[&str] = &[
-        include_str!("../migrations/0001_schema.sql"),
-        include_str!("../migrations/0002_drop_subscriptions.sql"),
-        include_str!("../migrations/0003_bundle_digest.sql"),
-        include_str!("../migrations/0004_index_page.sql"),
-        include_str!("../migrations/0005_compile_millis.sql"),
-        include_str!("../migrations/0006_drop_dependency_count.sql"),
-        include_str!("../migrations/0007_miss_depends_on.sql"),
-        include_str!("../migrations/0008_min_glibc.sql"),
-        include_str!("../migrations/0009_unit_shape.sql"),
-        include_str!("../migrations/0010_miss_host_side.sql"),
-        include_str!("../migrations/0011_miss_subgraph.sql"),
-        include_str!("../migrations/0012_dependency_identity.sql"),
-    ];
-    for file in FILES {
-        let sql = file
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for statement in sql.split(';') {
-            let statement = statement.trim();
-            if statement.is_empty() {
-                continue;
-            }
-            db.query(statement)
-                .execute()
-                .await
-                .expect("apply migration statement");
+pub async fn apply_schema(db: &Db) {
+    let sql = include_str!("../schema.sql")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for statement in sql.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
         }
+        db.query(statement)
+            .execute()
+            .await
+            .expect("apply schema statement");
     }
 }
 
@@ -1178,7 +1158,7 @@ mod sqlite_tests {
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
 
     use super::{
-        apply_migrations, artifact_index_page, artifact_record as fetch_artifact_record,
+        apply_schema, artifact_index_page, artifact_record as fetch_artifact_record,
         covered_semantic_identities, insert_artifact_records, record_admitted_miss,
         set_dependency_graph_misses_queued, take_dependency_graph_misses,
     };
@@ -1281,7 +1261,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
         let mut request = enqueue_request("serde", "1.0.5", &["derive"]);
         // stow#317: the recorded miss keeps the edges the admitting
         // request carried so the drain re-mints it with them.
@@ -1355,7 +1335,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
         let request = enqueue_request("serde", "1.0.5", &["derive"]);
 
         record_admitted_miss(&db, &request)
@@ -1400,7 +1380,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
         db.query(
             "INSERT INTO dependency_graph_misses \
              (crate_name, version, features_json, target, rustc_version, host_side, depends_on_json, seen_count, admitted_at) \
@@ -1436,7 +1416,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
         let mut request = enqueue_request("heck", "0.5.0", &[]);
         let mut host_request = request.clone();
         host_request.host_side = true;
@@ -1490,7 +1470,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
         let record = artifact_record(FIRST_DIGEST);
         // A target-side node is covered when both shapes its task
         // publishes are servable: the build unit and the check unit —
@@ -1557,7 +1537,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
         let mut identity = SemanticTaskIdentity {
             crate_name: "heck".to_owned(),
             version: "0.5.0".to_owned(),
@@ -1651,7 +1631,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
         let floor = |minor: u32| {
             Some(stow_types::glibc::GlibcVersion {
                 major: 2,
@@ -1781,7 +1761,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
 
         insert_artifact_records(&db, &[artifact_record(FIRST_DIGEST)])
             .await
@@ -1830,7 +1810,7 @@ mod sqlite_tests {
         let db = skyzen_services::Db::connect_sqlite_memory()
             .await
             .expect("memory db");
-        apply_migrations(&db).await;
+        apply_schema(&db).await;
 
         for c_metadata in ["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"] {
             insert_artifact_records(&db, &[artifact_record_with(c_metadata, FIRST_DIGEST)])

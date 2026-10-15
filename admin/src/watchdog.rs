@@ -5,7 +5,9 @@
 //! invocation statuses, DO resource failures, `overloaded` events), the
 //! build pipeline (build-crate failure rate, dispatch retries, pending
 //! age, dispatch stalls), and the public endpoints — then acts on the
-//! verdict: `Trip` breaches disable the dispatching workflows and enable
+//! verdict: `Trip` breaches disable the dispatching workflows that read
+//! `active` — the exact set, recorded on the incident issue for `clear`
+//! to restore — and enable
 //! the zone's `stow maintenance: anonymous` WAF rule, and any breach opens
 //! or updates the `incident`
 //! issue and mails the alert. Health and latency signals alert without
@@ -21,9 +23,11 @@
 //! GraphQL POST, one Analytics Engine SQL POST, ≤3 admin/endpoint calls,
 //! one GHCR verified pull for the bundle probe (tag list + index
 //! manifest + signature + blob), ≤ `1 + MAX_CLASSIFIED_RUNS*2` GitHub
-//! REST reads, and, only while an incident is open, ≤8 REST mutations
+//! REST reads plus one per trip workflow when a trip runs, and, only
+//! while an incident is open, ≤8 REST mutations
 //! plus one email — idle runs issue no mutations at all.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use askama::Template;
@@ -435,9 +439,11 @@ const MAX_CLASSIFIED_RUNS: usize = 25;
 /// AGENTS.md states 60 concurrent runners.
 const RUNNER_CAPACITY: usize = 60;
 
-/// Dispatching workflows a trip disables — everything that can start a
+/// Dispatching workflows a trip touches — everything that can start a
 /// build wave or move the index: `build-crate`, the index cron, and
-/// every preheat lane.
+/// every preheat lane. A trip disables only the ones reading `active`
+/// and records exactly that set on the incident issue; `clear` restores
+/// the record, nothing more (stow#744).
 const TRIP_WORKFLOWS: &[&str] = &[
     "build-crate.yml",
     "index-publish-cron.yml",
@@ -892,27 +898,23 @@ impl Watcher<'_> {
         }
     }
 
-    /// One `bundle_digest` out of a published index slice, or `None`
-    /// when no slice carries rows. The slice is pulled and verified off
-    /// GHCR — the same signed source `index export` and `preheat manual`
-    /// pull — so the probe depends on the store the CLI itself reads,
-    /// not the D1 mirror.
+    /// One `bundle_digest` out of a published index slice of the current
+    /// stable toolchain, or `None` when none of its slices carries rows.
+    /// The slice is pulled and verified off GHCR — the same signed source
+    /// `index export` and `preheat manual` pull — so the probe depends on
+    /// the store the CLI itself reads, not the D1 mirror. Only the current
+    /// stable rustc's `index.<target>.<rustc>` tags answer: another
+    /// toolchain's slice proves nothing about what users are served.
     async fn pick_bundle_digest(&self) -> stow_types::error::Result<Option<String>> {
+        let rustc_version = crate::rust_channel::stable_rustc_version().await?;
         let base = crate::index_cmd::registry_base()?;
         let http = stow_oci::RegistryHttp::new().await?;
         let session = base.session(&http);
         let trust = crate::index_cmd::records_trust().await?;
-        let mut tags = session
-            .list_tags()
-            .await
-            .map_err(|error| stow_error!("list registry tags: {error}"))?;
-        // Sorted so the probed slice is deterministic run to run.
-        tags.sort();
-        for tag in tags {
-            let Some((target, rustc_version)) = crate::index_cmd::index_tag_parts(&tag) else {
-                continue;
-            };
-            let Some(pulled) = stow_oci::pull_index(&session, &base, target, rustc_version).await?
+        for target in stow_types::api::CI_TARGET_TRIPLES {
+            let tag = stow_types::index::index_tag(target, rustc_version.as_str());
+            let Some(pulled) =
+                stow_oci::pull_index(&session, &base, target, rustc_version.as_str()).await?
             else {
                 continue;
             };
@@ -926,8 +928,6 @@ impl Watcher<'_> {
                 crate::index_cmd::INDEX_CERT_URL,
             )
             .await?;
-            let rustc_version = stow_types::identity::WireRustcVersion::parse(rustc_version)
-                .map_err(|error| stow_error!("index tag {tag}: {error}"))?;
             let index = crate::index_cmd::decode_published_slice(
                 &reference,
                 &rustc_version,
@@ -1392,10 +1392,22 @@ struct GhIssue {
     number: u64,
     title: String,
     html_url: String,
+    /// The issue body — the disabled-workflow record (the
+    /// `stow-watchdog:disabled` marker) lives here (stow#744).
+    #[serde(default)]
+    body: Option<String>,
     /// Present on pull requests — `…/issues` returns both; PRs are not
     /// incidents.
     #[serde(default)]
     pull_request: Option<serde_json::Value>,
+}
+
+/// `GET /actions/workflows/{file}`'s answer — `state` is the only field
+/// the trip reads (`active`, `disabled_manually`, `disabled_inactivity`,
+/// …): only `active` earns a disable.
+#[derive(Debug, serde::Deserialize)]
+struct GhWorkflow {
+    state: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1436,19 +1448,71 @@ struct ApplyOutcome {
     mailed: bool,
 }
 
-/// Trip the breaker: disable every dispatching workflow, then enable the
+/// One trip workflow's state read — the name and what the GET answered.
+struct TripState {
+    workflow: &'static str,
+    state: Result<String, String>,
+}
+
+/// Read every trip workflow's `state` at once — the list is a fixed
+/// six, so `join_all` over it is the whole bound.
+async fn read_trip_states(gh_token: &str) -> Vec<TripState> {
+    let reads = TRIP_WORKFLOWS.iter().map(|workflow| async move {
+        let state = github::get::<GhWorkflow>(
+            gh_token,
+            &format!("actions/workflows/{workflow}"),
+            Backoff::new(),
+        )
+        .await
+        .map(|body| body.state)
+        .map_err(|error| error.to_string());
+        TripState { workflow, state }
+    });
+    futures_util::future::join_all(reads).await
+}
+
+/// The trip's selection, pure for tests: the set to disable is exactly
+/// the workflows that read `active` — the same set the incident marker
+/// records for `clear` to restore (stow#744). A failed read names the
+/// workflow and leaves it alone: the record can only promise restores
+/// for workflows whose prior state is known.
+fn select_trip_set(reads: &[TripState]) -> (BTreeSet<String>, Vec<String>) {
+    let mut active = BTreeSet::new();
+    let mut failures = Vec::new();
+    for read in reads {
+        match &read.state {
+            Ok(state) if state == "active" => {
+                active.insert(read.workflow.to_owned());
+            }
+            Ok(_) => {}
+            Err(error) => failures.push(format!("read {} state: {error}", read.workflow)),
+        }
+    }
+    (active, failures)
+}
+
+/// Trip the breaker: disable every dispatching workflow that reads
+/// `active` — the returned set is the trip's record, which the incident
+/// issue carries for `clear` to restore — then enable the
 /// zone's `stow maintenance: anonymous` WAF rule — the shed happens in the
 /// security phase, before the Worker, so a broken edge cannot keep the
 /// breaker open. Both kinds of failure are collected — one failed disable
-/// never skips the rule enable.
-async fn apply_trip(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) {
-    for workflow in TRIP_WORKFLOWS {
-        match github::put(
+/// never skips the rule enable. A workflow whose disable write failed
+/// stays in the record regardless: it read `active`, so enabling it is
+/// always the right restore.
+async fn apply_trip(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) -> BTreeSet<String> {
+    let (disabled, read_failures) = select_trip_set(&read_trip_states(watcher.gh_token).await);
+    outcome.failures.extend(read_failures);
+    let writes = disabled.iter().map(|workflow| async move {
+        let result = github::put(
             watcher.gh_token,
             &format!("actions/workflows/{workflow}/disable"),
         )
-        .await
-        {
+        .await;
+        (workflow, result)
+    });
+    for (workflow, result) in futures_util::future::join_all(writes).await {
+        match result {
             Ok(()) => outcome.actions.push(format!("disabled {workflow}")),
             Err(error) => outcome
                 .failures
@@ -1471,10 +1535,18 @@ async fn apply_trip(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) {
             .failures
             .push(format!("enable maintenance rule: {error}")),
     }
+    disabled
 }
 
-/// Lift the breaker — `watchdog clear`'s actuation half.
-async fn apply_clear(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) {
+/// Lift the breaker — `watchdog clear`'s actuation half. The workflows
+/// re-enabled are exactly the incident's recorded set; every other trip
+/// workflow keeps whatever state it has, and the report says so
+/// (stow#744).
+async fn apply_clear(
+    watcher: &Watcher<'_>,
+    restore: &BTreeSet<String>,
+    outcome: &mut ApplyOutcome,
+) {
     match maintenance::set_scope(
         watcher.cf_token,
         watcher.zone,
@@ -1491,15 +1563,23 @@ async fn apply_clear(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) {
             .failures
             .push(format!("disable maintenance rule: {error}")),
     }
-    for workflow in TRIP_WORKFLOWS {
-        match github::put(
+    let enables = restore.iter().map(|workflow| async move {
+        let result = github::put(
             watcher.gh_token,
             &format!("actions/workflows/{workflow}/enable"),
         )
-        .await
-        {
+        .await;
+        (workflow, result)
+    });
+    for (workflow, result) in futures_util::future::join_all(enables).await {
+        match result {
             Ok(()) => outcome.actions.push(format!("enabled {workflow}")),
             Err(error) => outcome.failures.push(format!("enable {workflow}: {error}")),
+        }
+    }
+    for workflow in TRIP_WORKFLOWS {
+        if !restore.contains(*workflow) {
+            outcome.actions.push(format!("left {workflow} untouched"));
         }
     }
 }
@@ -1512,6 +1592,11 @@ const INCIDENT_TITLE_PREFIX: &str = "stow incident:";
 /// HTML marker stamped on digest comments so cadence is derivable.
 const DIGEST_MARKER: &str = "<!-- stow-watchdog:update -->";
 const CLEAR_MARKER: &str = "<!-- stow-watchdog:clear -->";
+/// The machine-readable trip record on the incident body —
+/// `watchdog/incident.md` renders it as
+/// `<!-- stow-watchdog:disabled a.yml,b.yml -->`; `watchdog clear`
+/// restores exactly the set it names (stow#744).
+const DISABLED_MARKER: &str = "<!-- stow-watchdog:disabled";
 /// Digest cadence — at most one comment an hour while open.
 const DIGEST_PERIOD_SECS: i64 = 3600;
 
@@ -1533,6 +1618,74 @@ async fn find_incident(gh_token: &str) -> Result<Option<GhIssue>, String> {
     Ok(issues.into_iter().find(|issue| {
         issue.pull_request.is_none() && issue.title.starts_with(INCIDENT_TITLE_PREFIX)
     }))
+}
+
+/// Parse the [`DISABLED_MARKER`] set out of an incident issue body:
+/// `Ok(None)` when the body carries no marker — nothing was recorded,
+/// so nothing is restored; `Ok(Some(set))`
+/// for the recorded set, empty included; `Err` when a marker is present
+/// but does not parse. `issue` only names the record in the error.
+fn parse_disabled_marker(issue: u64, body: &str) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(at) = body.find(DISABLED_MARKER) else {
+        return Ok(None);
+    };
+    let tail = &body[at + DISABLED_MARKER.len()..];
+    // The key ends at a word boundary — a comment whose key merely
+    // starts with `disabled` is not the record.
+    if !tail.starts_with(' ') && !tail.starts_with("-->") {
+        return Ok(None);
+    }
+    let Some(end) = tail.find("-->") else {
+        return Err(format!(
+            "incident #{issue}: unterminated `{DISABLED_MARKER}` marker"
+        ));
+    };
+    let payload = tail[..end].trim();
+    let mut set = BTreeSet::new();
+    if payload.is_empty() {
+        return Ok(Some(set));
+    }
+    for entry in payload.split(',') {
+        let name = entry.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(format!(
+                "incident #{issue}: malformed entry {entry:?} in the `{DISABLED_MARKER}` marker"
+            ));
+        }
+        set.insert(name.to_owned());
+    }
+    Ok(Some(set))
+}
+
+/// What `watchdog clear` re-enables, decided by the open incident's
+/// record — every variant but `Set` enables nothing (stow#744).
+enum RestoreSet {
+    /// No open incident exists.
+    NoIncident,
+    /// The open incident's body has no marker — nothing was recorded,
+    /// so nothing is restored.
+    NoRecord(u64),
+    /// The marker is present but does not parse — the recorded set is
+    /// unknowable, so nothing is enabled and the error is reported.
+    Malformed(String),
+    /// Exactly this set returns to `active`.
+    Set(BTreeSet<String>),
+}
+
+/// `clear`'s restore decision from the open incident.
+fn clear_restore(incident: Option<&GhIssue>) -> RestoreSet {
+    let Some(issue) = incident else {
+        return RestoreSet::NoIncident;
+    };
+    match parse_disabled_marker(issue.number, issue.body.as_deref().unwrap_or_default()) {
+        Ok(Some(set)) => RestoreSet::Set(set),
+        Ok(None) => RestoreSet::NoRecord(issue.number),
+        Err(error) => RestoreSet::Malformed(error),
+    }
 }
 
 /// Is `error` the typed `zenwave::Error::Http` carrying `code`? Other
@@ -1745,6 +1898,9 @@ struct IncidentTemplate<'a> {
     actions: &'a [String],
     /// Collector and actuation failures — the watchdog's own failures.
     failures: &'a [String],
+    /// The union of every workflow the incident's trips disabled —
+    /// rendered as the `disabled` marker `clear` restores from.
+    disabled: &'a BTreeSet<String>,
 }
 
 /// One signal's breach, template-shaped.
@@ -2071,6 +2227,9 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
     let mut outcome = ApplyOutcome::default();
     let now_text = format_time(watcher.now);
     let mut issue_number: Option<u64> = None;
+    // The trip's record — the workflows it disabled, for the incident
+    // body's marker.
+    let mut disabled = BTreeSet::new();
 
     if decision.incident {
         let mut breach_views: Vec<BreachView<'_>> = decision
@@ -2086,14 +2245,26 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
                 .actions
                 .push("alert only — nothing tripped".to_owned());
         } else if dry_run {
-            outcome
-                .actions
-                .push("would disable dispatching workflows".to_owned());
+            let reads = read_trip_states(&gh_token).await;
+            let (planned, read_failures) = select_trip_set(&reads);
+            for read in &reads {
+                match &read.state {
+                    Ok(_) if planned.contains(read.workflow) => outcome
+                        .actions
+                        .push(format!("would disable {}", read.workflow)),
+                    Ok(state) => outcome.actions.push(format!(
+                        "would leave {} untouched (state {state})",
+                        read.workflow
+                    )),
+                    Err(_) => {}
+                }
+            }
+            outcome.failures.extend(read_failures);
             outcome
                 .actions
                 .push("would enable `stow maintenance: anonymous`".to_owned());
         } else {
-            apply_trip(&watcher, &mut outcome).await;
+            disabled = apply_trip(&watcher, &mut outcome).await;
         }
 
         let mut failure_lines: Vec<String> = collect_failures
@@ -2124,10 +2295,10 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
                     token: &gh_token,
                 },
                 watcher.now,
-                &now_text,
                 &title,
                 &breach_views,
                 &failure_lines,
+                &disabled,
                 &mut outcome,
             )
             .await?;
@@ -2323,9 +2494,10 @@ fn finish(output: Output, report: &WatchdogReport) -> stow_types::error::Result<
     Ok(())
 }
 
-/// `watchdog clear` — maintenance rule off, workflows re-enabled, incident
-/// commented+closed, clear-mail. Manual recovery; the watchdog never
-/// does this on its own.
+/// `watchdog clear` — maintenance rule off, the workflows the incident's
+/// trip record names re-enabled (no incident or no record: nothing),
+/// incident commented+closed, clear-mail. Manual recovery; the watchdog
+/// never does this on its own.
 #[allow(clippy::too_many_lines)]
 async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error::Result<()> {
     let gh_token = crate::github_token().await?;
@@ -2345,39 +2517,73 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
     };
     let mut outcome = ApplyOutcome::default();
     let now_text = format_time(watcher.now);
+    // The restore record is the open incident's marker — read it before
+    // any workflow moves, so a missing or unreadable record enables
+    // nothing (stow#744).
+    let (incident, restore) = match find_incident(&gh_token).await {
+        Err(error) => {
+            outcome
+                .failures
+                .push(format!("find incident issue: {error}"));
+            (None, BTreeSet::new())
+        }
+        Ok(incident) => {
+            let restore = match clear_restore(incident.as_ref()) {
+                RestoreSet::Set(set) => set,
+                RestoreSet::NoIncident => {
+                    outcome
+                        .actions
+                        .push("no open incident — no workflows re-enabled".to_owned());
+                    BTreeSet::new()
+                }
+                RestoreSet::NoRecord(number) => {
+                    outcome.actions.push(format!(
+                        "incident #{number} has no disabled-workflow record — no workflows re-enabled"
+                    ));
+                    BTreeSet::new()
+                }
+                RestoreSet::Malformed(error) => {
+                    outcome.failures.push(error);
+                    BTreeSet::new()
+                }
+            };
+            (incident, restore)
+        }
+    };
     if dry_run {
         outcome
             .actions
             .push("would disable `stow maintenance: anonymous`".to_owned());
-        for workflow in TRIP_WORKFLOWS {
+        for workflow in &restore {
             outcome.actions.push(format!("would enable {workflow}"));
+        }
+        for workflow in TRIP_WORKFLOWS {
+            if !restore.contains(*workflow) {
+                outcome
+                    .actions
+                    .push(format!("would leave {workflow} untouched"));
+            }
         }
         outcome
             .actions
             .push("would comment+close the open incident and send the clear mail".to_owned());
     } else {
-        apply_clear(&watcher, &mut outcome).await;
-        match find_incident(&gh_token).await {
-            Err(error) => outcome
-                .failures
-                .push(format!("find incident issue: {error}")),
-            Ok(None) => {}
-            Ok(Some(issue)) => {
-                let comment = ClearedTemplate {
-                    now: &now_text,
-                    actions: &outcome.actions,
+        apply_clear(&watcher, &restore, &mut outcome).await;
+        if let Some(issue) = incident {
+            let comment = ClearedTemplate {
+                now: &now_text,
+                actions: &outcome.actions,
+            }
+            .render()
+            .unwrap_or_else(|_| "cleared by operator".to_owned());
+            match close_incident(&gh_token, issue.number, &comment).await {
+                Ok(()) => {
+                    outcome.incident_url = Some(issue.html_url.clone());
+                    outcome
+                        .actions
+                        .push(format!("incident closed: {}", issue.html_url));
                 }
-                .render()
-                .unwrap_or_else(|_| "cleared by operator".to_owned());
-                match close_incident(&gh_token, issue.number, &comment).await {
-                    Ok(()) => {
-                        outcome.incident_url = Some(issue.html_url.clone());
-                        outcome
-                            .actions
-                            .push(format!("incident closed: {}", issue.html_url));
-                    }
-                    Err(error) => outcome.failures.push(format!("close incident: {error}")),
-                }
+                Err(error) => outcome.failures.push(format!("close incident: {error}")),
             }
         }
         match render_mail(
@@ -2434,24 +2640,26 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
     }
 }
 
-/// Open or update the incident issue. The open-vs-update branch is what
-/// keeps a later run from opening a duplicate.
+/// Write the incident issue — PATCH the open one, POST a fresh issue
+/// otherwise. `existing` is the caller's `find_incident` result, which
+/// it already read for the marker union; the open-vs-update branch is
+/// what keeps a later run from opening a duplicate.
 async fn upsert_incident(
     gh_token: &str,
+    existing: Option<&GhIssue>,
     title: &str,
     body: &str,
 ) -> Result<(GhIssue, bool), String> {
-    if let Some(issue) = find_incident(gh_token).await? {
-        let updated: GhIssue = github::patch(
+    match existing {
+        Some(issue) => github::patch::<GhIssue>(
             gh_token,
             &format!("issues/{}", issue.number),
             &IssuePatch { title, body },
         )
         .await
-        .map_err(|error| format!("PATCH issue #{}: {error}", issue.number))?;
-        Ok((updated, false))
-    } else {
-        let issue: GhIssue = github::post(
+        .map(|updated| (updated, false))
+        .map_err(|error| format!("PATCH issue #{}: {error}", issue.number)),
+        None => github::post::<GhIssue>(
             gh_token,
             "issues",
             &IssueNew {
@@ -2461,8 +2669,8 @@ async fn upsert_incident(
             },
         )
         .await
-        .map_err(|error| format!("POST issue: {error}"))?;
-        Ok((issue, true))
+        .map(|issue| (issue, true))
+        .map_err(|error| format!("POST issue: {error}")),
     }
 }
 
@@ -2549,66 +2757,91 @@ struct GhChannel<'a> {
 async fn update_incident(
     gh: GhChannel<'_>,
     now: OffsetDateTime,
-    now_text: &str,
     title: &str,
     breaches: &[BreachView<'_>],
     failure_lines: &[String],
+    disabled: &BTreeSet<String>,
     outcome: &mut ApplyOutcome,
 ) -> stow_types::error::Result<IssueOutcome> {
+    let now_text = format_time(now);
     let mut issue_outcome = IssueOutcome::default();
     if let Err(error) =
         ensure_label(gh.api_base, gh.token, std::time::Duration::from_secs(30)).await
     {
         issue_outcome.failure = Some(format!("label: {error}"));
-    } else {
-        let body = IncidentTemplate {
-            now: now_text,
-            dry_run: false,
-            breaches,
-            actions: &outcome.actions,
-            failures: failure_lines,
+        return Ok(issue_outcome);
+    }
+    let existing = match find_incident(gh.token).await {
+        Ok(existing) => existing,
+        Err(error) => {
+            issue_outcome.failure = Some(format!("find incident: {error}"));
+            return Ok(issue_outcome);
         }
-        .render()
-        .map_err(|error| stow_error!("render incident body: {error}"))?;
-        match upsert_incident(gh.token, title, &body).await {
+    };
+    // The record accumulates: a second trip under one open incident
+    // unions its disabled set into the marker `clear` restores from,
+    // and an alert-only update leaves the standing marker untouched.
+    let mut disabled_set = disabled.clone();
+    if let Some(issue) = &existing {
+        match parse_disabled_marker(issue.number, issue.body.as_deref().unwrap_or_default()) {
+            Ok(Some(prior)) => disabled_set.extend(prior),
+            Ok(None) => {}
             Err(error) => issue_outcome.failure = Some(error),
-            Ok((issue, opened)) => {
-                issue_outcome.opened = opened;
-                issue_outcome.number = Some(issue.number);
-                outcome.incident_url = Some(issue.html_url.clone());
-                outcome.actions.push(if opened {
-                    format!("incident opened: {}", issue.html_url)
-                } else {
-                    format!("incident updated: {}", issue.html_url)
-                });
-                if !opened {
-                    // Digest cadence: at most one comment an hour; a
-                    // freshly opened issue needs none.
-                    match last_digest_at(gh.token, issue.number).await {
-                        Ok(last) => {
-                            if digest_due(last, now) {
-                                let comment = DigestTemplate {
-                                    now: now_text,
-                                    breaches,
-                                    failures: failure_lines,
-                                    actions: &outcome.actions,
+        }
+    }
+    let body = IncidentTemplate {
+        now: &now_text,
+        dry_run: false,
+        breaches,
+        actions: &outcome.actions,
+        failures: failure_lines,
+        disabled: &disabled_set,
+    }
+    .render()
+    .map_err(|error| stow_error!("render incident body: {error}"))?;
+    match upsert_incident(gh.token, existing.as_ref(), title, &body).await {
+        Err(error) => {
+            issue_outcome.failure = Some(match issue_outcome.failure.take() {
+                Some(prior) => format!("{prior}; {error}"),
+                None => error,
+            });
+        }
+        Ok((issue, opened)) => {
+            issue_outcome.opened = opened;
+            issue_outcome.number = Some(issue.number);
+            outcome.incident_url = Some(issue.html_url.clone());
+            outcome.actions.push(if opened {
+                format!("incident opened: {}", issue.html_url)
+            } else {
+                format!("incident updated: {}", issue.html_url)
+            });
+            if !opened {
+                // Digest cadence: at most one comment an hour; a
+                // freshly opened issue needs none.
+                match last_digest_at(gh.token, issue.number).await {
+                    Ok(last) => {
+                        if digest_due(last, now) {
+                            let comment = DigestTemplate {
+                                now: &now_text,
+                                breaches,
+                                failures: failure_lines,
+                                actions: &outcome.actions,
+                            }
+                            .render()
+                            .map_err(|error| stow_error!("render digest: {error}"))?;
+                            match post_comment(gh.token, issue.number, &comment).await {
+                                Ok(()) => {
+                                    issue_outcome.digest_posted = true;
+                                    outcome.actions.push("digest comment posted".to_owned());
                                 }
-                                .render()
-                                .map_err(|error| stow_error!("render digest: {error}"))?;
-                                match post_comment(gh.token, issue.number, &comment).await {
-                                    Ok(()) => {
-                                        issue_outcome.digest_posted = true;
-                                        outcome.actions.push("digest comment posted".to_owned());
-                                    }
-                                    Err(error) => {
-                                        issue_outcome.failure = Some(format!("comment: {error}"));
-                                    }
+                                Err(error) => {
+                                    issue_outcome.failure = Some(format!("comment: {error}"));
                                 }
                             }
                         }
-                        Err(error) => {
-                            issue_outcome.failure = Some(format!("comments: {error}"));
-                        }
+                    }
+                    Err(error) => {
+                        issue_outcome.failure = Some(format!("comments: {error}"));
                     }
                 }
             }
@@ -2846,6 +3079,7 @@ mod tests {
             number: 7,
             title: format!("{INCIDENT_TITLE_PREFIX} x"),
             html_url: String::new(),
+            body: None,
             pull_request: Some(serde_json::json!({"url": "x"})),
         };
         assert!(pr.pull_request.is_some());
@@ -2875,12 +3109,14 @@ mod tests {
             threshold: "69.4k rows".to_owned(),
             evidence: &[],
         };
+        let disabled = BTreeSet::new();
         let body = IncidentTemplate {
             now: "2026-09-28T00:00:00Z",
             dry_run: false,
             breaches: &[breach],
             actions: &["disabled build-crate.yml".to_owned()],
             failures: &[],
+            disabled: &disabled,
         }
         .render()
         .unwrap();
@@ -2888,9 +3124,135 @@ mod tests {
         assert!(body.contains("disabled build-crate.yml"));
     }
 
-    /// `clear` plans maintenance-off plus every workflow enable.
+    /// Marker render + parse round-trip: the set the template writes is
+    /// the set the clear reads back (stow#744).
     #[test]
-    fn clear_reverses_the_trip_list() {
+    fn disabled_marker_round_trips() {
+        let disabled =
+            BTreeSet::from(["build-crate.yml".to_owned(), "preheat-cron.yml".to_owned()]);
+        let body = IncidentTemplate {
+            now: "2026-10-14T00:00:00Z",
+            dry_run: false,
+            breaches: &[],
+            actions: &[],
+            failures: &[],
+            disabled: &disabled,
+        }
+        .render()
+        .unwrap();
+        assert!(
+            body.contains("<!-- stow-watchdog:disabled build-crate.yml,preheat-cron.yml -->"),
+            "unexpected body:\n{body}"
+        );
+        assert_eq!(parse_disabled_marker(42, &body), Ok(Some(disabled)));
+    }
+
+    /// The empty record — an alert-only incident — still renders a
+    /// marker, and it parses to the empty set rather than to "absent".
+    #[test]
+    fn disabled_marker_empty_set() {
+        let disabled = BTreeSet::new();
+        let body = IncidentTemplate {
+            now: "2026-10-14T00:00:00Z",
+            dry_run: false,
+            breaches: &[],
+            actions: &[],
+            failures: &[],
+            disabled: &disabled,
+        }
+        .render()
+        .unwrap();
+        assert!(body.contains("<!-- stow-watchdog:disabled -->"));
+        assert_eq!(parse_disabled_marker(42, &body), Ok(Some(disabled)));
+    }
+
+    /// No marker parses to `None`; a malformed marker is an error that
+    /// names the issue.
+    #[test]
+    fn disabled_marker_parsing() {
+        assert_eq!(parse_disabled_marker(42, "no marker here"), Ok(None));
+        // An adjacent key (`disabled-else`) is not the record.
+        assert_eq!(
+            parse_disabled_marker(42, "<!-- stow-watchdog:disabled-else a.yml -->"),
+            Ok(None)
+        );
+        let error = parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-crate.yml, -->")
+            .unwrap_err();
+        assert!(error.contains("incident #42"), "unexpected error: {error}");
+        let error =
+            parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-crate.yml").unwrap_err();
+        assert!(error.contains("incident #42"), "unexpected error: {error}");
+        let error =
+            parse_disabled_marker(42, "<!-- stow-watchdog:disabled not a file -->").unwrap_err();
+        assert!(error.contains("incident #42"), "unexpected error: {error}");
+    }
+
+    /// The trip's selection: only `active` reads land in the set; a
+    /// read failure names the workflow and keeps it out.
+    #[test]
+    fn trip_selects_only_the_active() {
+        let reads = vec![
+            TripState {
+                workflow: "build-crate.yml",
+                state: Ok("active".to_owned()),
+            },
+            TripState {
+                workflow: "preheat-cron.yml",
+                state: Ok("disabled_manually".to_owned()),
+            },
+            TripState {
+                workflow: "index-publish-cron.yml",
+                state: Err("boom".to_owned()),
+            },
+        ];
+        let (set, failures) = select_trip_set(&reads);
+        assert_eq!(set, BTreeSet::from(["build-crate.yml".to_owned()]));
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("index-publish-cron.yml"));
+    }
+
+    /// The clear restores exactly the marker's set; no incident and no
+    /// marker both enable nothing.
+    #[test]
+    fn clear_restores_only_the_recorded_set() {
+        let issue = |body: Option<&str>| GhIssue {
+            number: 7,
+            title: format!("{INCIDENT_TITLE_PREFIX} x"),
+            html_url: String::new(),
+            body: body.map(str::to_owned),
+            pull_request: None,
+        };
+        match clear_restore(Some(&issue(Some(
+            "<!-- stow-watchdog:disabled build-crate.yml,preheat-cron.yml -->",
+        )))) {
+            RestoreSet::Set(set) => assert_eq!(
+                set,
+                BTreeSet::from(["build-crate.yml".to_owned(), "preheat-cron.yml".to_owned()])
+            ),
+            _ => panic!("a recorded set restores"),
+        }
+        assert!(matches!(clear_restore(None), RestoreSet::NoIncident));
+        assert!(matches!(
+            clear_restore(Some(&issue(Some("no marker")))),
+            RestoreSet::NoRecord(7)
+        ));
+        assert!(matches!(
+            clear_restore(Some(&issue(None))),
+            RestoreSet::NoRecord(7)
+        ));
+        assert!(matches!(
+            clear_restore(Some(&issue(Some(
+                "<!-- stow-watchdog:disabled broken entry -->"
+            )))),
+            RestoreSet::Malformed(_)
+        ));
+    }
+
+    /// The trip list stays exactly the dispatch lanes — `build-crate`
+    /// plus the five cron/preheat workflows — each a workflow file the
+    /// API names by path.
+    #[test]
+    fn trip_workflows_are_the_dispatch_lanes() {
         assert_eq!(TRIP_WORKFLOWS.len(), 6);
         assert!(TRIP_WORKFLOWS.contains(&"build-crate.yml"));
         assert!(TRIP_WORKFLOWS.iter().all(|name| {
@@ -3200,10 +3562,10 @@ mod tests {
                     token: "test-token",
                 },
                 OffsetDateTime::now_utc(),
-                "now",
                 "stow incident: cf.d1.rows_written",
                 &[],
                 &[],
+                &BTreeSet::new(),
                 &mut outcome,
             ),
         )

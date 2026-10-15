@@ -301,7 +301,7 @@ impl ArtifactIndex {
     /// [`IndexDecodeError::Decompress`], [`IndexDecodeError::Deserialize`],
     /// [`IndexDecodeError::Format`], or
     /// [`IndexDecodeError::RowCountMismatch`].
-    pub fn decode(bytes: &[u8]) -> Result<ArtifactIndex, IndexDecodeError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, IndexDecodeError> {
         use std::io::Read as _;
 
         /// Decompressed JSON the decoder will read before giving up — a
@@ -337,7 +337,7 @@ impl ArtifactIndex {
                 expected: ARTIFACT_INDEX_FORMAT_VERSION,
             });
         }
-        let index: ArtifactIndex =
+        let index: Self =
             serde_json::from_slice(&json).map_err(IndexDecodeError::Deserialize)?;
         let actual = index.rows.len() as u64;
         if index.header.row_count != actual {

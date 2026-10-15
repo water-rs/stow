@@ -38,30 +38,26 @@ trusted GitHub-Actions builder, `admin/` is the operator CLI,
   `TargetTriple`, `WireRustcVersion`, `CMetadata`,
   `DependencyCMetadataJson`) are wire-validated by `serde::Deserialize`
   at the API boundary. Don't reinvent them with raw strings.
-- New columns in `artifacts` go in `edge/src/sql/insert_artifact.sql`
+- The D1 catalog has one schema — `edge/schema.sql`. New columns in
+  `artifacts` go in that file, `edge/src/sql/insert_artifact.sql`,
   AND `edge/src/db.rs::insert_artifact_record`'s `bind` chain — keep
-  these two in sync. Old D1s migrate via
-  `edge/src/db.rs::ensure_artifact_table_columns`.
-- New scheduler queue columns go in
-  `edge/src/scheduler/schema.sql`,
-  `edge/src/scheduler/queue.rs::migrate_schema` (forward migration
-  branch), `edge/src/scheduler/queue.rs::migrate_queue_schema` (full
-  rebuild branch), `TaskRow`, the SELECT column list in
+  the three in sync. A schema change is an operator reset: drop the
+  tables, `wrangler d1 execute stow-prod --remote --file edge/schema.sql`,
+  then resync the mirror (`stow-admin index export --out-dir <dir>
+  --full` + `index sync --file <dir>/new-records.json`).
+- The scheduler has one schema — `edge/src/scheduler/schema.sql`. New
+  queue columns go in that file, `TaskRow`, the SELECT column list in
   `claim_dispatchable_tasks`, and the INSERT in `enqueue`.
 - Scheduler schema changes are operations work, never request work: no
   request handler, and not the alarm, may issue DDL (CREATE / ALTER /
   DROP), a backfill, or a schema check — request code assumes the schema
   exists and lets its own SQL fail loudly when it does not. The only
-  code that runs the migration is `queue.rs::migrate`, behind
-  `POST /api/v1/admin/scheduler/migrate`, which `deploy-edge.yml` calls
-  right after `skyzen deploy` (or `stow-admin scheduler migrate`
-  manually). Because the pass can run while the previous build still
-  serves traffic, every migration must be additive — expand, then
-  contract across deploys — so running code keeps working while it
-  applies.
-- Any change to `edge/src/scheduler/schema.sql` or to a migration step
-  in `queue.rs` must bump `SCHEMA_VERSION` in `queue.rs` — the migrate
-  route re-runs the pass on the deployed queue and re-stamps it.
+  code that issues DDL is `queue.rs::reset`, behind
+  `POST /api/v1/admin/scheduler/reset` (`stow-admin scheduler reset
+  --yes` manually), which drops every object and re-executes
+  `schema.sql`; the queue and recorded slices are destroyed and refill
+  from the lanes that feed them. A fresh deployment's operator runs it
+  once to create the store.
 
 ## Testing changes locally
 

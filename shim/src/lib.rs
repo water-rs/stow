@@ -4,11 +4,8 @@
 //!   runner; both processes need a stable filesystem path that resolves to
 //!   the current stow binary so cargo can be told `RUSTC_WRAPPER` once).
 //!   Native targets only.
-//! * Shared D1 / `SQLite` schema constants (used by edge and mock-registry).
 //! * Shared zstd compression level (used by ci and mock-registry; gated
 //!   behind the `zstd` feature).
-
-pub mod schema;
 
 /// Default zstd compression level for stow OCI layers. Used by ci's upload
 /// path and the mock registry so they produce identically-shaped layers.

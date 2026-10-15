@@ -4221,10 +4221,11 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // write lands rather than compiling what the in-flight fetch may
     // cover.
     let serve_map_ready = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
-    let (serve_map_path, serve_waiters) =
+    let (serve_map_path, mut serve_waiters) =
         write_initial_serve_map(scratch.path(), plan.servable_units, &serve_map_ready)
             .instrument(tracing::debug_span!("stow.precargo.serve_map_write"))
             .await?;
+    arm_or_settle_serve_map_ready(plan, config, &serve_map_ready, &mut serve_waiters);
     export_wrapper_env(
         &mut command,
         plan,
@@ -4304,6 +4305,10 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             resolution_done,
         }))
     } else {
+        // No enrichment, so no fetch will ever land a slice: release
+        // whatever waits on one before cargo runs, not when it returns
+        // (stow#735).
+        drop(serve_waiters);
         None
     };
 
@@ -4572,6 +4577,32 @@ async fn export_wrapper_env(
     Ok(())
 }
 
+/// A missing slice is final only once the build's fetch has settled —
+/// the same settling `AwaitServeMap` marks — so `serve_map_ready` must
+/// complete in lockstep with that fetch or a lookup waits forever
+/// (stow#735). When the lite pass produced no map the enrichment still
+/// fetches the consumer slices mid-build, so the guard rides with it;
+/// when nothing in this build can land a slice the signal settles now —
+/// a build that cannot serve must not hold a lookup for a fetch that is
+/// never coming.
+fn arm_or_settle_serve_map_ready(
+    plan: &CargoRunPlan<'_>,
+    config: Option<&StowConfig>,
+    serve_map_ready: &std::sync::Arc<crate::facade::ServeMapSignal>,
+    serve_waiters: &mut Option<crate::facade::ServeMapWaiters>,
+) {
+    if serve_waiters.is_some() {
+        return;
+    }
+    if plan.deferred_analysis && config.is_some() && plan.servable_units.is_none() {
+        *serve_waiters = Some(crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(
+            serve_map_ready,
+        )));
+    } else {
+        serve_map_ready.complete();
+    }
+}
+
 /// The serve map a build starts cargo with, written atomically: the
 /// facades read this file on every rustc invocation, so it lands in the
 /// build's scratch directory complete or not at all. The build's
@@ -4587,9 +4618,13 @@ async fn write_initial_serve_map(
     };
     // Arm the waiters' guard before the map that announces it: a facade
     // that reads `pending` asks the supervisor to hold it — the signal
-    // exists by construction, so there is no bind to fail here. An
-    // empty pending map waits on nothing (stow#347).
-    let waiters = (map.pending && !map.is_empty())
+    // exists by construction, so there is no bind to fail here. The
+    // guard arms on `pending` alone: an empty map's facades wait on
+    // nothing (`map.names` is empty either way), but `pending` still
+    // means a slice fetch is in flight, and the slice memo's wait rides
+    // the same signal (stow#735).
+    let waiters = map
+        .pending
         .then(|| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(serve_map_ready)));
     let path = write_build_json_table(scratch_dir, "serve-map", map.clone()).await?;
     Ok((Some(path), waiters))
@@ -4650,10 +4685,10 @@ struct BuildEnrichment {
     cell: std::sync::Arc<std::sync::OnceLock<crate::AnalysisFacts>>,
     map_path: Option<PathBuf>,
     policy_dir: Option<PathBuf>,
-    /// The pending serve map's completion guard: held until this task
-    /// has written the final map — and its drop releases the facades
-    /// waiting on `AwaitServeMap` whichever way the analysis ends
-    /// (stow#347).
+    /// The build fetch's completion guard: held until the consumer
+    /// slices have settled — its drop releases the facades waiting on
+    /// `AwaitServeMap` and the slice memo's lookups, whichever way the
+    /// analysis ends (stow#347, stow#735).
     readiness: Option<crate::facade::ServeMapWaiters>,
     /// Held until the supervisor's first compile-unit frame says
     /// cargo's resolution is over: only then may this task's own
@@ -4679,19 +4714,19 @@ fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> 
 }
 
 async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::Result<()> {
-    // A `pending` map's facades are waiting on the supervisor for the
-    // final map: answer them as soon as coverage is knowable — the
-    // fresh slice landed, the filesystem pass rebuilt with it — rather
-    // than after the metadata resolve and the prefetch. The write
-    // clears `pending` (the cached slices now exist) and the guard's
-    // drop releases the waiters; an early return releases them the
-    // same way (stow#347).
-    if work.readiness.is_some()
-        && let Some(map_path) = &work.map_path
-    {
+    // The build's slice waiters — a `pending` map's facades, and the
+    // slice memo's lookups (stow#735) — hold until coverage is knowable:
+    // the fresh slices landed, the filesystem pass rebuilt the map with
+    // them. Answer as soon as the fetch settles rather than after the
+    // metadata resolve and the prefetch. The write clears `pending`
+    // (the cached slices now exist) and the guard's drop releases the
+    // waiters; an early return releases them the same way (stow#347).
+    if work.readiness.is_some() {
         ensure_consumer_slices(&work.config, &work.project).await?;
-        let lite = analyze_workspace_prediction_lite(&work.project, &work.config).await?;
-        write_build_json_file(map_path, lite.servable_units.unwrap_or_default()).await?;
+        if let Some(map_path) = &work.map_path {
+            let lite = analyze_workspace_prediction_lite(&work.project, &work.config).await?;
+            write_build_json_file(map_path, lite.servable_units.unwrap_or_default()).await?;
+        }
         drop(work.readiness.take());
     }
     let analysis = analyze_workspace_prediction(
@@ -4870,7 +4905,7 @@ async fn report_cache_coverage(
         return;
     };
     let delta = after.since(before.stats);
-    if delta.rust_lookups() == 0 && covered_units == 0 {
+    if delta.rust_lookups() == 0 && delta.rust_local_dependency_builds == 0 && covered_units == 0 {
         return;
     }
     // An errored unit resolved a cached artifact and then could not use
@@ -5961,7 +5996,10 @@ mod tests {
         .await
         .expect("an absent lockfile is not an error");
         let map = prediction.servable_units.expect("a serve map");
-        assert!(map.is_empty(), "nothing local to admit: {map:?}");
+        assert!(
+            map.target.is_empty() && map.host.is_empty(),
+            "nothing local to admit: {map:?}"
+        );
     }
 
     /// stow#617 through the real pass: no cached graph and a locally

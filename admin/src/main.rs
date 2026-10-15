@@ -25,6 +25,7 @@ mod manual;
 mod preheat;
 mod projects;
 mod queue;
+mod registry_gc;
 mod render;
 mod request;
 mod resolve;
@@ -63,8 +64,8 @@ const ACTIONS_ID_TOKEN_REQUEST_URL_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
 const ACTIONS_ID_TOKEN_REQUEST_TOKEN_ENV: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
 /// Pinned verbatim onto every edge call as the
 /// `Cloudflare-Workers-Version-Overrides` header when set — the deploy
-/// workflow uses it to aim `scheduler migrate` (and any other trusted
-/// call) at the uploaded candidate version before traffic shifts.
+/// workflow uses it to aim trusted calls at the uploaded candidate
+/// version before traffic shifts.
 const STOW_EDGE_VERSION_OVERRIDE_ENV: &str = "STOW_EDGE_VERSION_OVERRIDE";
 /// The header `STOW_EDGE_VERSION_OVERRIDE` fills.
 const VERSION_OVERRIDES_HEADER: &str = "Cloudflare-Workers-Version-Overrides";
@@ -92,8 +93,8 @@ enum Command {
     Status,
     /// Inspect and mutate scheduler queue rows.
     Queue(queue::QueueArgs),
-    /// Scheduler operations — the schema migration route and anything
-    /// else that runs on operator cadence, not per request.
+    /// Scheduler operations — the store reset and anything else that
+    /// runs on operator cadence, not per request.
     Scheduler(scheduler::SchedulerArgs),
     /// Per-target servable identities for one crate.
     Coverage(coverage::CoverageArgs),
@@ -117,6 +118,9 @@ enum Command {
     DispatchFreeze(DispatchFreezeArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
+    /// Garbage-collect the `stow-cache` GHCR package — delete every
+    /// version no kept slice can reach.
+    Registry(registry_gc::RegistryArgs),
     /// Regenerate the checked-in launch traffic model from production
     /// analytics (stow#452).
     LaunchModel(launch_model::LaunchModelArgs),
@@ -241,6 +245,7 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
             dispatch_freeze_switch(&Edge::connect().await?, args, output).await
         }
         Command::Index(args) => index_cmd::run(args).await,
+        Command::Registry(args) => registry_gc::run(&github_token().await?, args, output).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
         Command::LaunchGate(args) => launch_gate::run(&args, output).await,
         Command::LaunchLoad(args) => launch_load::run(&Edge::connect().await?, &args, output).await,

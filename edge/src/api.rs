@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
-use skyzen::runtime::wasm::from_js_response;
+use skyzen::runtime::wasm::passthrough_js_response;
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Response, StatusCode};
 use skyzen_cloudflare::worker::send::IntoSendFuture as _;
@@ -422,24 +422,24 @@ pub async fn admin_status(
     Ok(Json(scheduler_client::admin_status(&scheduler).await?))
 }
 
-/// `POST /api/v1/admin/scheduler/migrate`
+/// `POST /api/v1/admin/scheduler/reset`
 ///
-/// Run the scheduler Durable Object's schema migration — the only code
-/// path that may issue DDL on its database. `deploy-edge.yml` calls it
-/// right after `skyzen deploy` (migrations are additive, so the previous
-/// build keeps serving while they apply); `stow-admin scheduler
-/// migrate` is the manual path. Reports the schema version before and
-/// after.
-pub async fn admin_scheduler_migrate(
+/// Reset the scheduler Durable Object's store — the only code path that
+/// may issue DDL on its database, and the only way the schema lands:
+/// every table, index and trigger is dropped and `schema.sql`
+/// re-executed, destroying the queue and the recorded slices; the
+/// queues refill from the lanes that feed them. `stow-admin scheduler
+/// reset --yes` is the manual path, which a fresh deployment's
+/// operator runs once to create the schema.
+pub async fn admin_scheduler_reset(
     SchedulerCaller(caller): SchedulerCaller,
     State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::SchemaMigrationReport>, GetArtifactError> {
-    let report = scheduler_client::migrate_scheduler(&scheduler).await?;
+) -> Result<Json<stow_types::api::SchedulerResetReport>, GetArtifactError> {
+    let report = scheduler_client::reset_scheduler(&scheduler).await?;
     tracing::warn!(
-        before = report.before,
-        after = report.after,
+        dropped = report.dropped,
         %caller,
-        "scheduler schema migrated via admin endpoint"
+        "scheduler store reset via admin endpoint"
     );
     Ok(Json(report))
 }
@@ -1212,12 +1212,14 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
 /// GET /`api/v1/bundles/{digest}`
 ///
 /// The byte path: streams the `<tag>.bundle` blobs under
-/// `ghcr.io/water-rs/stow-cache`. The `sha256:<64 lowercase hex>` path
-/// segment is the whole address — it is validated before any fetch; the
-/// answer's immutable `Cache-Control` is what Workers Cache stores and
-/// replays without this worker running; a GHCR 404 is a 404. No catalog
-/// row is consulted: the CLI's signed index named these bytes, and the
-/// CLI verifies them against the index before they are used.
+/// `ghcr.io/water-rs/stow-cache`, handing workerd the upstream body as the
+/// registry's own stream so the bytes never enter wasm. The
+/// `sha256:<64 lowercase hex>` path segment is the whole address — it is
+/// validated before any fetch; the answer's immutable `Cache-Control` is
+/// what Workers Cache stores and replays without this worker running; a
+/// GHCR 404 is a 404. No catalog row is consulted: the CLI's signed index
+/// named these bytes, and the CLI verifies them against the index before
+/// they are used.
 pub async fn get_bundle(
     params: Params,
     State(ghcr): State<GhcrConfig>,
@@ -1231,10 +1233,9 @@ pub async fn get_bundle(
         )));
     }
 
-    let (body, content_length) = open_bundle_stream(&ghcr, digest)
+    open_bundle_stream(&ghcr, digest)
         .await
-        .map_err(registry_fetch_error)?;
-    Ok(bundle_response(body, content_length))
+        .map_err(registry_fetch_error)
 }
 
 /* ---- index slices ---- */
@@ -1484,15 +1485,15 @@ fn worker_content_length(response: &worker::Response) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
-/// The streamed slice response. `Content-Type` is `application/json`
-/// because `Content-Encoding` describes the transfer encoding: the bytes
-/// the client ends up reading are always the index JSON document.
+/// Decorate the slice answer with its headers. `Content-Type` is
+/// `application/json` because `Content-Encoding` describes the transfer
+/// encoding: the bytes the client ends up reading are always the index
+/// JSON document.
 fn slice_response(
-    body: Body,
+    mut response: Response,
     encoding: index_slice::SliceEncoding,
     content_length: Option<u64>,
 ) -> Response {
-    let mut response = Response::new(body);
     let headers = response.headers_mut();
     headers.insert(
         skyzen::header::CONTENT_TYPE,
@@ -1523,9 +1524,10 @@ fn slice_response(
 /// from this origin so a browser never has to run GHCR's anonymous
 /// bearer exchange, and cached by Workers Cache on the response's own
 /// immutable `Cache-Control`. `Accept-Encoding` picks the
-/// `Content-Encoding`: `zstd` passes the published blob through
-/// byte-for-byte; anything else gets a gzip transcode, cached per
-/// encoding by the `Vary` the answer carries.
+/// `Content-Encoding`: `zstd` hands workerd the upstream stream itself,
+/// so the published blob passes through byte-for-byte without entering
+/// wasm; anything else gets a gzip transcode, cached per encoding by the
+/// `Vary` the answer carries.
 pub async fn get_index_slice(
     params: Params,
     accept: AcceptEncoding,
@@ -1560,7 +1562,7 @@ pub async fn get_index_slice(
         index_slice::SliceEncoding::Zstd => {
             let content_length = worker_content_length(&upstream);
             Ok(slice_response(
-                body_from_worker_response(upstream).map_err(registry_fetch_error)?,
+                passthrough_upstream(upstream).map_err(registry_fetch_error)?,
                 encoding,
                 content_length,
             ))
@@ -1575,7 +1577,7 @@ pub async fn get_index_slice(
                 .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
             let content_length = gzip.len() as u64;
             Ok(slice_response(
-                Body::from(gzip),
+                Response::new(Body::from(gzip)),
                 encoding,
                 Some(content_length),
             ))
@@ -1805,13 +1807,12 @@ pub async fn enqueue_admitted_task(
     Ok(response)
 }
 
-/// The streamed bundle response: the body is the published bundle blob
-/// byte-for-byte, so its length is the upstream `content-length` when the
-/// registry reported one. The immutable `Cache-Control` is the whole
-/// caching contract Workers Cache needs to answer later reads without
-/// this worker running.
-fn bundle_response(body: Body, content_length: Option<u64>) -> Response {
-    let mut response = Response::new(body);
+/// Decorate the bundle answer with its headers: the body is the
+/// published bundle blob byte-for-byte, so its length is the upstream
+/// `content-length` when the registry reported one. The immutable
+/// `Cache-Control` is the whole caching contract Workers Cache needs to
+/// answer later reads without this worker running.
+fn bundle_response(mut response: Response, content_length: Option<u64>) -> Response {
     let headers = response.headers_mut();
     headers.insert(
         skyzen::header::CONTENT_TYPE,
@@ -1827,15 +1828,12 @@ fn bundle_response(body: Body, content_length: Option<u64>) -> Response {
     response
 }
 
-/// Open the bundle for `digest` as a stream straight from the registry.
-/// Nothing on this path buffers the bundle or inspects it — the publish
-/// stage validated the tar before pushing it, GHCR addresses it by
-/// content, and the CLI verifies the digest and the cosign material
-/// inside it.
-async fn open_bundle_stream(
-    ghcr: &GhcrConfig,
-    digest: &str,
-) -> Result<(Body, Option<u64>), ghcr::FetchError> {
+/// Answer with the bundle for `digest` as the registry's stream itself.
+/// Nothing on this path buffers the bundle, inspects it or copies it
+/// through wasm — the publish stage validated the tar before pushing it,
+/// GHCR addresses it by content, and the CLI verifies the digest and the
+/// cosign material inside it.
+async fn open_bundle_stream(ghcr: &GhcrConfig, digest: &str) -> Result<Response, ghcr::FetchError> {
     let upstream = ghcr::open_blob(
         &ghcr.base_url,
         cache_repository(),
@@ -1854,15 +1852,24 @@ async fn open_bundle_stream(
     })?;
 
     let content_length = worker_content_length(&upstream);
-    Ok((body_from_worker_response(upstream)?, content_length))
+    Ok(bundle_response(
+        passthrough_upstream(upstream)?,
+        content_length,
+    ))
 }
 
-/// Hand a `worker::Response` body to Skyzen without reading it.
-fn body_from_worker_response(response: worker::Response) -> Result<Body, ghcr::FetchError> {
-    let js: worker::web_sys::Response = response.into();
-    from_js_response(&js)
-        .map(skyzen::Response::into_body)
-        .map_err(|error| ghcr::FetchError::Network(format!("wrap registry response: {error:?}")))
+/// Hand the registry's body to workerd as the very stream it arrived as.
+/// It never enters wasm: copying it chunk by chunk into wasm memory and
+/// back out cost 63 ms of Worker CPU per bundle on average. The answer
+/// starts from an empty header set — GHCR's `cache-control`, `etag`,
+/// `docker-*` and cookie headers are the registry's, not this origin's —
+/// and the caller sets exactly the headers it serves.
+fn passthrough_upstream(upstream: worker::Response) -> Result<Response, ghcr::FetchError> {
+    let js: worker::web_sys::Response = upstream.into();
+    let mut response = passthrough_js_response(&js)
+        .map_err(|error| ghcr::FetchError::Network(format!("wrap registry response: {error:?}")))?;
+    response.headers_mut().clear();
+    Ok(response)
 }
 
 /// OCI registry configuration for artifact fetching, stored via `State<GhcrConfig>`.

@@ -859,7 +859,6 @@ mod tests {
     fn fixture_report(scale: impl Fn(&str) -> f64) -> SchedulerBudgetReport {
         SchedulerBudgetReport {
             queue_rows: 100_000,
-            schema_version: 5,
             // The production dispatch cap (45) minus the fixture's 30
             // in-flight rows: the slots the hot pass claims.
             dispatch_limit: 45,

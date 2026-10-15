@@ -15,7 +15,7 @@ const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/pu
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
-const SCHEDULER_MIGRATE_URL: &str = "https://scheduler.internal/migrate";
+const SCHEDULER_RESET_URL: &str = "https://scheduler.internal/reset";
 const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
 const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
 const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
@@ -148,14 +148,14 @@ pub async fn record_published_index(
     send_json(namespace, SCHEDULER_PUBLISHED_INDEX_URL, slice).await
 }
 
-/// Run the queue schema migration — the operator endpoint behind
-/// `POST /api/v1/admin/scheduler/migrate`, which `deploy-edge.yml`
-/// calls right after `skyzen deploy`. The only code path that issues
-/// DDL on the queue database.
-pub async fn migrate_scheduler(
+/// Reset the scheduler store — the operator endpoint behind
+/// `POST /api/v1/admin/scheduler/reset`. The only code path that
+/// issues DDL on the queue database: it drops every object and
+/// re-executes `schema.sql`, destroying the queue.
+pub async fn reset_scheduler(
     namespace: &CfDurableNamespace,
-) -> Result<stow_types::api::SchemaMigrationReport, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_MIGRATE_URL, &serde_json::json!({})).await
+) -> Result<stow_types::api::SchedulerResetReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_RESET_URL, &serde_json::json!({})).await
 }
 
 /// The dispatch freeze's current state — flag plus the stored record

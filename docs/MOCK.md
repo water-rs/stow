@@ -127,14 +127,14 @@ use the prebuilt artifacts skyzen leaves under `edge/`:
 
 ```sh
 cd edge
-# Apply the schema — the worker assumes it exists, and migrations are
-# deployment work. `migrations apply` records what it ran in the
-# `d1_migrations` table, so running it again on the same persist dir is a
-# no-op rather than a duplicate-column error.
+# Apply the schema — the worker assumes it exists, and creating it is
+# deployment work. The file's plain CREATEs fail on a persist dir that
+# already carries the schema — drop the tables first for a reset.
 skyzen build --provider cloudflare --manifest Skyzen.mock.toml
-wrangler d1 migrations apply stow-mock --local \
+wrangler d1 execute stow-mock --local \
     --config .skyzen/gen/wrangler.toml \
-    --persist-to /tmp/stow-bench/edge-state
+    --persist-to /tmp/stow-bench/edge-state \
+    --file schema.sql
 skyzen dev --provider cloudflare --manifest Skyzen.mock.toml --port 8788 \
     --persist-to /tmp/stow-bench/edge-state
 # OR:
@@ -143,22 +143,21 @@ wrangler --config /path/to/edge/.skyzen/gen/wrangler.toml dev --local --port 878
 ```
 
 The D1 schema above is only half the story: the scheduler Durable Object
-keeps its own SQLite store, and request code never creates it —
-migrations are operations work. Run the same operator migration the
-deploy pipeline runs after `skyzen deploy`, in a fourth shell once
-Wrangler is listening (any HTTP response is enough — the scheduler
-routes are 500s until the schema exists):
+keeps its own SQLite store, and request code never creates it — the
+reset is operations work. Run the same operator reset `stow-admin`
+offers, in a fourth shell once Wrangler is listening (any HTTP response
+is enough — the scheduler routes are 500s until the schema exists):
 
 ```sh
-# Prints `scheduler schema <before> → <after>`; <after> is the build's
-# SCHEMA_VERSION. Safe to repeat — a current queue is a no-op.
+# Prints `scheduler store reset — <n> objects dropped` and stamps the
+# configured dispatch floor.
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-    target/debug/stow-admin scheduler migrate
+    target/debug/stow-admin scheduler reset --yes
 ```
 
 Verify: `curl http://127.0.0.1:8788/api/v1/scheduler/status` returns
 `{"pending":0,"dispatched":0,"running":0,"completed":0,"failed":0}` —
-a 500 `no such table: queue` means the migrate step did not run.
+a 500 `no such table: queue` means the reset step did not run.
 
 **Terminal 3 — local CI dispatch endpoint:**
 

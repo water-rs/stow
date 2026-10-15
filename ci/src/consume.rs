@@ -408,10 +408,34 @@ mod tests {
         ];
 
         let slice = index_slice(vec![
-            index_row("windows-link", "0.2.1", "aaaaaaaaaaaaaaaa", &[], UnitSide::Host),
-            index_row("windows-link", "0.2.1", "bbbbbbbbbbbbbbbb", &[], UnitSide::Target),
-            index_row("windows-link", "0.2.1", "cccccccccccccccc", &[], UnitSide::Host),
-            index_row("tokio", "1.53.2", "dddddddddddddddd", &["fs", "net"], UnitSide::Target),
+            index_row(
+                "windows-link",
+                "0.2.1",
+                "aaaaaaaaaaaaaaaa",
+                &[],
+                UnitSide::Host,
+            ),
+            index_row(
+                "windows-link",
+                "0.2.1",
+                "bbbbbbbbbbbbbbbb",
+                &[],
+                UnitSide::Target,
+            ),
+            index_row(
+                "windows-link",
+                "0.2.1",
+                "cccccccccccccccc",
+                &[],
+                UnitSide::Host,
+            ),
+            index_row(
+                "tokio",
+                "1.53.2",
+                "dddddddddddddddd",
+                &["fs", "net"],
+                UnitSide::Target,
+            ),
             index_row(
                 "tokio",
                 "1.53.2",
@@ -494,8 +518,20 @@ mod tests {
         smol::block_on(async {
             let slice = index_slice(vec![
                 index_row("absent", "1.0.0", "0000000000000001", &[], UnitSide::Target),
-                index_row("present-a", "1.0.0", "0000000000000002", &[], UnitSide::Target),
-                index_row("present-b", "1.0.0", "0000000000000003", &[], UnitSide::Target),
+                index_row(
+                    "present-a",
+                    "1.0.0",
+                    "0000000000000002",
+                    &[],
+                    UnitSide::Target,
+                ),
+                index_row(
+                    "present-b",
+                    "1.0.0",
+                    "0000000000000003",
+                    &[],
+                    UnitSide::Target,
+                ),
             ]);
             let candidates = slice
                 .index
@@ -529,7 +565,13 @@ mod tests {
         smol::block_on(async {
             let slice = index_slice(vec![
                 index_row("forged", "2.3.4", "0000000000000004", &[], UnitSide::Target),
-                index_row("genuine", "1.0.0", "0000000000000005", &[], UnitSide::Target),
+                index_row(
+                    "genuine",
+                    "1.0.0",
+                    "0000000000000005",
+                    &[],
+                    UnitSide::Target,
+                ),
             ]);
             let candidates = slice
                 .index
