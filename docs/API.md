@@ -222,7 +222,7 @@ not semver; `404` when crates.io does not publish the crate.
 The landing page's "is this crate cached?" lookup reads the same signed
 index slice the CLI's resolver uses — the zstd JSON `ArtifactIndex`
 published per `(target, rustc_version)` as the OCI tag
-`index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache`. A browser
+`index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-2`. A browser
 cannot run GHCR's anonymous bearer exchange or reach ghcr.io
 cross-origin, so the worker serves the slice from its own origin in two
 steps: a short-lived tag→digest pointer, then the immutable

@@ -44,54 +44,6 @@ pub async fn get_path<T: serde::de::DeserializeOwned>(
         .map_err(|error| stow_error!("GET {url}: {error}"))
 }
 
-/// `GET` an absolute `api.github.com` path (leading `/`) and follow the
-/// `Link: rel="next"` pagination chain, collecting every page's rows into
-/// one vector — the read shape of the org package-version listing.
-pub async fn get_pages<T: serde::de::DeserializeOwned>(
-    token: &str,
-    path: &str,
-) -> stow_types::error::Result<Vec<T>> {
-    let mut url = format!("{API_BASE}{path}");
-    let mut rows = Vec::new();
-    loop {
-        // Each page is its own read unit — a fresh retry budget per GET.
-        let backoff = Backoff::new();
-        let response = send_get(
-            Some(token),
-            &url,
-            Some("application/vnd.github+json"),
-            None,
-            backoff,
-        )
-        .await
-        .map_err(|error| stow_error!("GET {url}: {error}"))?;
-        let next = response
-            .headers()
-            .get("link")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|link| {
-                link.split(',').find_map(|entry| {
-                    let (target, params) = entry.split_once(';')?;
-                    params
-                        .contains("rel=\"next\"")
-                        .then(|| target.trim().trim_matches(['<', '>']).to_owned())
-                })
-            });
-        let page: Vec<T> = response
-            .error_for_status()
-            .await
-            .map_err(|error| stow_error!("GET {url}: {error}"))?
-            .into_json()
-            .await
-            .map_err(|error| stow_error!("read {url}: {error}"))?;
-        rows.extend(page);
-        match next {
-            Some(next) => url = next,
-            None => return Ok(rows),
-        }
-    }
-}
-
 /// `GET` an absolute `api.github.com` path (leading `/`) and decode the
 /// JSON body, surfacing the raw transport error so the caller can read
 /// the status itself — a 404 on a named repository is the repository
@@ -490,15 +442,8 @@ pub async fn delete(token: &str, path: &str) -> stow_types::error::Result<()> {
     delete_url(token, &format!("{API_BASE}/repos/{REPO}/{path}")).await
 }
 
-/// `DELETE` an absolute `api.github.com` path (leading `/`) — for
-/// endpoints outside `/repos/{REPO}`, like the org package versions
-/// `registry gc` removes.
-pub async fn delete_path(token: &str, path: &str) -> stow_types::error::Result<()> {
-    delete_url(token, &format!("{API_BASE}{path}")).await
-}
-
-/// `delete`/`delete_path` at a resolved URL — production passes
-/// [`API_BASE`]-rooted paths, tests an owned loopback URL.
+/// `delete` at a resolved URL — production passes an
+/// [`API_BASE`]-rooted path, tests an owned loopback URL.
 async fn delete_url(token: &str, url: &str) -> stow_types::error::Result<()> {
     let mut client = zenwave::client();
     let result = client
@@ -526,8 +471,7 @@ async fn delete_url(token: &str, url: &str) -> stow_types::error::Result<()> {
     }
 }
 
-/// `delete`/`delete_path` against an explicit API root — the tests'
-/// loopback server.
+/// `delete` against an explicit API root — the tests' loopback server.
 #[cfg(test)]
 async fn delete_at(api_base: &str, token: &str, path: &str) -> stow_types::error::Result<()> {
     delete_url(token, &format!("{api_base}/repos/{REPO}/{path}")).await

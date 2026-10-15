@@ -3273,7 +3273,7 @@ pub mod tests {
         bundle.manifest.config.features_json =
             stow_types::identity::FeaturesJson::canonicalize(vec!["default".to_owned()]).unwrap();
         bundle.manifest.config.compile_key = "semantic-compile-key".to_owned();
-        bundle.manifest.oci_reference = "ghcr.io/water-rs/stow-cache:ignore.test".to_owned();
+        bundle.manifest.oci_reference = "ghcr.io/water-rs/stow-cache-2:ignore.test".to_owned();
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -4045,7 +4045,7 @@ pub mod tests {
     fn test_config(root: &std::path::Path) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
-            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache-2".to_owned(),
             cache_dir: root.join(".stow"),
             request_timeout: Duration::from_secs(1),
             negative_cache_ttl: Duration::from_mins(1),
@@ -4076,7 +4076,7 @@ pub mod tests {
             .expect("compress sample artifact bundle output");
         ArtifactBundle {
             manifest: ArtifactBundleManifest {
-                oci_reference: "ghcr.io/water-rs/stow-cache:demo.test".to_owned(),
+                oci_reference: "ghcr.io/water-rs/stow-cache-2:demo.test".to_owned(),
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
                     dependency_identity: stow_types::identity::DependencyIdentity::leaf()
@@ -4130,7 +4130,7 @@ pub mod tests {
                     serde_json::to_vec(&serde_json::json!({
                         "critical": {
                             "identity": {
-                                "docker-reference": "ghcr.io/water-rs/stow-cache:demo.test"
+                                "docker-reference": "ghcr.io/water-rs/stow-cache-2:demo.test"
                             },
                             "image": {
                                 "docker-manifest-digest": "sha256:test"

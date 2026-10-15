@@ -225,7 +225,7 @@ isolated_env() {
 stow_cli() {
     isolated_env \
         STOW_EDGE_URL="$EDGE_URL" \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
@@ -395,7 +395,7 @@ fi
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
         STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
         STOW_CACHE_DIR="$WORK_DIR/ci-cache" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
@@ -476,7 +476,7 @@ echo "[mock-e2e] submit: $submit_json"
 publish_slices() {
     local tag="$1"
     isolated_env \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         "$BIN/stow-admin" index export \
         --out-dir "$WORK_DIR/index-export" \

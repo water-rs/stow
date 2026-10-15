@@ -133,7 +133,7 @@ pub struct ArtifactIndexRow {
 }
 
 /// The OCI tag of the index artifact for one slice:
-/// `index.<target>.<rustc_short>` on `ghcr.io/water-rs/stow-cache`.
+/// `index.<target>.<rustc_short>` on `ghcr.io/water-rs/stow-cache-2`.
 ///
 /// `rustc_short` is the same short form artifact tags carry — the semver
 /// rendering `RustcVersion::short` produces, which is exactly the wire

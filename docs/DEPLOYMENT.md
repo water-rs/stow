@@ -406,21 +406,22 @@ while ignoring the published `index`/`folded` pairs entirely, so a
 slice published in a format the current `stow-admin` can no longer
 decode is replaced rather than read.
 
-Every artifact is a tag of the single GHCR package
-`ghcr.io/water-rs/stow-cache` —
+Every artifact is a tag of the current generation's GHCR package
+`ghcr.io/water-rs/stow-cache-2` —
 `{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}` —
 because GHCR creates each package private and offers no REST or GraphQL
 call to change visibility: a per-crate package layout would have meant a
 manual flip per crate ever cached. The edge pulls the package with no
 credential at all — public GHCR packages grant
-`repository:water-rs/stow-cache:pull` to the anonymous `GET /token`
+`repository:water-rs/stow-cache-2:pull` to the anonymous `GET /token`
 exchange that `edge/src/ghcr.rs` drives on every `401` challenge. One
 manual step remains after the first trusted build pushes
-`ghcr.io/water-rs/stow-cache`: set the package visibility to public in
+`ghcr.io/water-rs/stow-cache-2`: set the package visibility to public in
 the `water-rs` org package settings ([GitHub's package visibility
 docs](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility)).
-That flip is one-time and covers the cache forever; until it happens the
-exchange fails with the `401`/`403` the `FetchError` reports.
+That flip is one-time per generation; until it happens every anonymous
+pull — CLI, edge, `index export` — is refused (the token exchange
+answers `403`).
 
 The edge authenticates `workflow_dispatch` with a GitHub App
 installation token minted on the Worker: the `GITHUB_APP_ID`
@@ -553,8 +554,9 @@ pool. The library pool and the binary pool are independent.
   hostname down. `stow-admin maintenance status` prints all three
   rules' state.
 - **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
-- **GHCR storage:** the whole cache is the single `ghcr.io/water-rs/stow-cache`
-  package (every artifact a tag); monitor disk via the GitHub UI.
+- **GHCR storage:** the whole cache is the current generation's
+  `ghcr.io/water-rs/stow-cache-2` package (every artifact a tag);
+  monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.
   CI access is the `build-crate.yml` OIDC identity itself — revoke by
   removing the workflow or narrowing the `job_workflow_ref` pin in
@@ -566,6 +568,26 @@ pool. The library pool and the binary pool are independent.
   egress got rate-limited. Denied verdicts expire sooner
   (`PUSH_DENIED_TTL_SECS`, 1 minute), and an isolate restart cold-starts
   the cache — so revocation can also land sooner, never later.
+
+### Cache generation rollover
+
+Superseded manifests accumulate in the package and stow never deletes
+single versions — GitHub's package-versions API cannot list a package at
+the cache's size, so a purge moves the whole cache to the next
+generation:
+
+1. Change the repository literal in `types/src/registry.rs`
+   (`ghcr_repository!`) to the next generation name and release.
+2. The first push from a build creates the new package, private.
+3. Make it public in the package's settings (Danger Zone → Change
+   visibility → Public). Until then every anonymous pull — CLI, edge,
+   `index export` — is refused.
+4. Run `index-publish.yml` on `main` with `full=true` to republish the
+   index slices into the new package.
+5. The previous generation is now unreferenced: delete it in the
+   package's settings, or through GitHub support when one of its
+   versions passed 5,000 downloads — GitHub refuses self-service
+   deletion then.
 
 ## Releases
 

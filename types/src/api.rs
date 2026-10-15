@@ -495,7 +495,7 @@ pub struct ArtifactRecord {
     /// The Merkle dependency digest of the dependency subgraph the
     /// artifact was built under (stow#588) — the node's context key.
     pub dependency_identity: DependencyIdentity,
-    /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache:serde.1.0.0-...").
+    /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache-2:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
     pub oci_digest: String,
