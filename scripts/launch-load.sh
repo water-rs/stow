@@ -243,7 +243,7 @@ cat >"$WORK_DIR/load-records.json" <<'RECORDS'
   "version": "1.0.219",
   "features_json": "[]",
   "dependency_c_metadata_json": "[]",
-  "oci_reference": "ghcr.io/water-rs/stow-cache:serde.1.0.219-x86_64-unknown-linux-gnu",
+  "oci_reference": "ghcr.io/water-rs/stow-cache-2:serde.1.0.219-x86_64-unknown-linux-gnu",
   "oci_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "has_native": false,
   "artifact_kind": "Rlib",

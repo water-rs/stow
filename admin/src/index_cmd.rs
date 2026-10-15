@@ -1869,7 +1869,7 @@ mod tests {
         // The transport pull reference the signature materials fetch
         // through — the value verification compared before the fix.
         let transport =
-            stow_oci::RegistryBase::parse("http://127.0.0.1:28123/v2/water-rs/stow-cache")
+            stow_oci::RegistryBase::parse("http://127.0.0.1:28123/v2/water-rs/stow-cache-2")
                 .expect("transport base")
                 .reference(&tag)
                 .expect("transport reference")

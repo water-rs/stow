@@ -21,7 +21,7 @@ edge_url = "https://stow.waterui.dev"
 # pulled from (bundles stream through the edge). Defaults to the
 # production GHCR repository; set it for mock runs.
 # May also be set via $STOW_REGISTRY_BASE_URL.
-# registry_base_url = "https://ghcr.io/v2/water-rs/stow-cache"
+# registry_base_url = "https://ghcr.io/v2/water-rs/stow-cache-2"
 
 # Seconds a cached index slice may sit before `stow check`/`build`
 # revalidates its manifest digest against the registry. Default 600.

@@ -98,8 +98,9 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
     validate_crate_types(&record.crate_types)?;
     if stow_types::registry::oci_reference_name(&record.oci_reference).is_none() {
         return Err(DbError::Invariant(format!(
-            "oci_reference `{}` is not a canonical ghcr.io/water-rs/stow-cache:{{crate}}.{{rest}} reference",
-            record.oci_reference
+            "oci_reference `{}` is not a canonical {}:{{crate}}.{{rest}} reference",
+            record.oci_reference,
+            stow_types::registry::GHCR_BASE
         )));
     }
 
@@ -1170,7 +1171,7 @@ mod sqlite_tests {
                 .expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             oci_reference: format!(
-                "ghcr.io/water-rs/stow-cache:serde.1.0.0-x86_64-linux-{RUSTC}-abcdef012345-{c_metadata}"
+                "ghcr.io/water-rs/stow-cache-2:serde.1.0.0-x86_64-linux-{RUSTC}-abcdef012345-{c_metadata}"
             ),
             oci_digest: oci_digest.to_owned(),
             has_native: false,

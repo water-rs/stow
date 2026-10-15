@@ -1212,7 +1212,7 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
 /// GET /`api/v1/bundles/{digest}`
 ///
 /// The byte path: streams the `<tag>.bundle` blobs under
-/// `ghcr.io/water-rs/stow-cache`, handing workerd the upstream body as the
+/// `ghcr.io/water-rs/stow-cache-2`, handing workerd the upstream body as the
 /// registry's own stream so the bytes never enter wasm. The
 /// `sha256:<64 lowercase hex>` path segment is the whole address — it is
 /// validated before any fetch; the answer's immutable `Cache-Control` is
@@ -1316,7 +1316,7 @@ async fn index_rustc_version(
 }
 
 /// The fixed repository every cached blob lives in —
-/// `water-rs/stow-cache`, the repository the pull scope names. Slice tags
+/// `water-rs/stow-cache-2`, the repository the pull scope names. Slice tags
 /// are built by `index_tag` under `GHCR_BASE` and bundle digests are
 /// caller-supplied but validated to `sha256:<64 hex>` — neither ever names
 /// another repository.

@@ -251,7 +251,7 @@ pub struct RegistrySession {
     http: RegistryHttp,
     /// `{scheme}://{host[:port]}` — challenge ping and asset URLs hang off it.
     origin: String,
-    /// The repository every request addresses (`water-rs/stow-cache`).
+    /// The repository every request addresses (`water-rs/stow-cache-2`).
     repository: String,
     credential: SessionCredential,
     /// OAuth scope the bearer requests: `pull` for anonymous sessions,
@@ -845,6 +845,25 @@ impl RegistrySession {
         // `Box::pin` breaks the `send → refresh_bearer → exchange_token →
         // send` cycle — boxing makes this future's size finite.
         let response = Box::pin(self.send("exchange bearer token", request)).await?;
+        // GHCR answers the anonymous exchange for a package that does not
+        // exist or is still private with `403 DENIED` — a bare envelope
+        // that reads like an auth failure. Name the real cause so a
+        // refused pull during a generation's private window is legible;
+        // still a hard refusal, never a retry or a fallback.
+        if !response.status.is_success() && matches!(self.credential, SessionCredential::Anonymous)
+        {
+            return Err(RegistryError {
+                what: format!("exchange bearer token {url}"),
+                kind: RegistryErrorKind::Refused {
+                    status: response.status,
+                    body: format!(
+                        "registry refused anonymous pull of {}: the package does not exist yet or is not public (registry's answer: {})",
+                        self.repository,
+                        String::from_utf8_lossy(&response.body)
+                    ),
+                },
+            });
+        }
         response.ensure_success("exchange bearer token", &url)?;
         let body: serde_json::Value =
             serde_json::from_slice(&response.body).map_err(|error| RegistryError {
