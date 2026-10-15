@@ -77,10 +77,14 @@ env:
   SKYZEN_REV: 0271f693d253a9b32660affacbafaeffca455620
   # The generated wrangler config, relative to edge/ (the manifest root).
   WRANGLER_CONFIG: .skyzen/gen/wrangler.toml
-  # The synthetic suite's request count PER SIDE — also the verdict's
-  # --min-requests-per-version floor, so a low-traffic deploy still fails
-  # closed if the suite itself did not land.
-  SUITE_REQUESTS: "50"
+  # The synthetic suite's request count PER SIDE. Large enough that the
+  # verdict's p99 is a percentile rather than the single slowest request
+  # (one cold isolate of a fresh version would otherwise decide it).
+  SUITE_REQUESTS: "250"
+  # The verdict's --min-requests-per-version floor: a deploy fails closed
+  # when the suite did not land. Below SUITE_REQUESTS because Workers
+  # analytics is sampled and does not count every invocation (stow#749).
+  MIN_SAMPLE_REQUESTS: "200"
 
 jobs:
   prepare:
@@ -337,7 +341,7 @@ jobs:
           set -euo pipefail
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           stow-admin deploy verdict --phase canary \
-            --min-requests-per-version "$SUITE_REQUESTS" \
+            --min-requests-per-version "$MIN_SAMPLE_REQUESTS" \
             --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
             --script stow-edge \
             --baseline-version "$BASELINE_VERSION" \
