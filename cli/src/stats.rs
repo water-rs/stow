@@ -137,6 +137,18 @@ pub async fn record_glibc_refusal(
     update_stats(config, crate_name, StatsField::GlibcRefusals).await
 }
 
+/// Count a unit that compiled locally without a lookup: a dependency it
+/// links was compiled locally in this build, so its cached copy —
+/// compiled against CI's copy of that dependency — could not serve it
+/// (stow#734). Distinct from a miss: the artifact exists and the unit
+/// was never offered one.
+pub async fn record_local_dependency_build(
+    config: &StowConfig,
+    crate_name: &str,
+) -> stow_types::error::Result<()> {
+    update_stats(config, crate_name, StatsField::LocalDependencyBuilds).await
+}
+
 pub async fn record_error(config: &StowConfig, crate_name: &str) -> stow_types::error::Result<()> {
     update_stats(config, crate_name, StatsField::Errors).await
 }
@@ -267,18 +279,23 @@ pub fn newly_errored(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u6
 
 pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<StatsSummary> {
     let connection = config.state_db_pool().await?;
-    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
-        "SELECT crate_name, hits, misses, errors, glibc_refusals FROM crate_stats",
+    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
+        "SELECT crate_name, hits, misses, errors, glibc_refusals, local_dependency_builds \
+         FROM crate_stats",
     )
     .fetch_all(&connection)
     .await?;
 
     let mut summary = StatsSummary::default();
-    for (crate_name, hits, misses, errors, glibc_refusals) in rows {
+    for (crate_name, hits, misses, errors, glibc_refusals, local_dependency_builds) in rows {
         let hits: u64 = db_int(hits, "crate stats hits")?;
         let misses: u64 = db_int(misses, "crate stats misses")?;
         let errors: u64 = db_int(errors, "crate stats errors")?;
         let glibc_refusals: u64 = db_int(glibc_refusals, "crate stats glibc refusals")?;
+        let local_dependency_builds: u64 = db_int(
+            local_dependency_builds,
+            "crate stats local dependency builds",
+        )?;
         if crate_name.starts_with("cc:") {
             summary.cc_hits = summary.cc_hits.saturating_add(hits);
             summary.cc_misses = summary.cc_misses.saturating_add(misses);
@@ -289,6 +306,9 @@ pub async fn read_summary(config: &StowConfig) -> stow_types::error::Result<Stat
             summary.rust_errors = summary.rust_errors.saturating_add(errors);
             summary.rust_glibc_refusals =
                 summary.rust_glibc_refusals.saturating_add(glibc_refusals);
+            summary.rust_local_dependency_builds = summary
+                .rust_local_dependency_builds
+                .saturating_add(local_dependency_builds);
         }
     }
     Ok(summary)
@@ -319,6 +339,12 @@ async fn update_stats(
              ON CONFLICT(crate_name) DO UPDATE SET \
              glibc_refusals = crate_stats.glibc_refusals + 1"
         }
+        StatsField::LocalDependencyBuilds => {
+            "INSERT INTO crate_stats (crate_name, hits, misses, errors, local_dependency_builds) \
+             VALUES (?, 0, 0, 0, 1) \
+             ON CONFLICT(crate_name) DO UPDATE SET \
+             local_dependency_builds = crate_stats.local_dependency_builds + 1"
+        }
     };
     sqlx::query(query)
         .bind(crate_name)
@@ -333,6 +359,7 @@ enum StatsField {
     Misses,
     Errors,
     GlibcRefusals,
+    LocalDependencyBuilds,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -344,6 +371,11 @@ pub struct StatsSummary {
     /// load — counted apart from misses because the artifact exists;
     /// the unit compiled locally and no enqueue can change that.
     pub rust_glibc_refusals: u64,
+    /// Units compiled locally without a lookup because a dependency they
+    /// link was compiled locally in this build — counted apart from
+    /// misses for the same reason: the artifact exists; it just links
+    /// the wrong copy of that dependency for this build (stow#734).
+    pub rust_local_dependency_builds: u64,
     pub cc_hits: u64,
     pub cc_misses: u64,
     pub cc_errors: u64,
@@ -363,6 +395,9 @@ impl StatsSummary {
             rust_glibc_refusals: self
                 .rust_glibc_refusals
                 .saturating_sub(before.rust_glibc_refusals),
+            rust_local_dependency_builds: self
+                .rust_local_dependency_builds
+                .saturating_sub(before.rust_local_dependency_builds),
             cc_hits: self.cc_hits.saturating_sub(before.cc_hits),
             cc_misses: self.cc_misses.saturating_sub(before.cc_misses),
             cc_errors: self.cc_errors.saturating_sub(before.cc_errors),
@@ -384,22 +419,26 @@ impl StatsSummary {
     /// Every defect the acceleration audit turned up was invisible at default
     /// verbosity, and a 1.02x median looked exactly like a working cache.
     ///
-    /// The denominator is what the wrapper actually looked up — every unit it
-    /// could have served — not the artifact count the edge advertised, which
-    /// counts several shapes per crate. `covered_units` is used only to catch
-    /// the case that motivated this line: artifacts were available and the
-    /// cache was never consulted at all.
+    /// The denominator is every unit the wrapper could have served — the
+    /// lookups it ran, plus the units it sent local without one because a
+    /// linked dependency compiled locally in this build — not the artifact
+    /// count the edge advertised, which counts several shapes per crate
+    /// (stow#734). `covered_units` is used only to catch the case that
+    /// motivated this line: artifacts were available and the cache was
+    /// never consulted at all.
     #[must_use]
     pub fn summary_line(self, covered_units: usize, errored_crates: &[String]) -> String {
-        let lookups = self.rust_lookups();
-        if lookups == 0 {
+        let servable = self
+            .rust_lookups()
+            .saturating_add(self.rust_local_dependency_builds);
+        if servable == 0 {
             return format!(
                 "stow: cache not consulted for this build ({covered_units} artifacts available)\n"
             );
         }
         let mut line = format!(
             "stow: served {} of {} cacheable dependencies",
-            self.rust_hits, lookups
+            self.rust_hits, servable
         );
         if self.rust_misses > 0 {
             let _ = write!(line, ", {} missed", self.rust_misses);
@@ -415,6 +454,13 @@ impl StatsSummary {
                 line,
                 ", {} refused for host glibc",
                 self.rust_glibc_refusals
+            );
+        }
+        if self.rust_local_dependency_builds > 0 {
+            let _ = write!(
+                line,
+                ", {} compiled locally behind a local dependency",
+                self.rust_local_dependency_builds
             );
         }
         if self.cc_hits > 0 || self.cc_misses > 0 {
@@ -536,6 +582,22 @@ mod tests {
         assert_eq!(
             summary(3, 20, 1).summary_line(48, &[]),
             "stow: served 3 of 24 cacheable dependencies, 20 missed, 1 errored\n"
+        );
+    }
+
+    /// A unit sent local because a linked dependency compiled locally
+    /// joins the denominator without ever reaching a lookup (stow#734).
+    #[test]
+    fn local_dependency_builds_join_the_denominator() {
+        let summary = StatsSummary {
+            rust_hits: 24,
+            rust_local_dependency_builds: 2,
+            ..StatsSummary::default()
+        };
+        assert_eq!(
+            summary.summary_line(48, &[]),
+            "stow: served 24 of 26 cacheable dependencies, \
+             2 compiled locally behind a local dependency\n"
         );
     }
 
