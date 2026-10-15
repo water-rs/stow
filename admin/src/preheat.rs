@@ -1079,7 +1079,19 @@ async fn plan(
         .iter()
         .map(|(target, _)| TargetTriple::parse(target.clone()).map_err(Into::into))
         .collect::<stow_types::error::Result<Vec<_>>>()?;
-    let covered = crate::manual::contextual_coverage(&target_triples, &rustc_version).await?;
+    let mut spellings = std::collections::BTreeMap::new();
+    for (_, target_parts) in &parts {
+        for (index, node) in target_parts.graph.nodes().iter().enumerate() {
+            let task_id = target_parts
+                .graph
+                .task_id(index)
+                .ok_or_else(|| stow_error!("resolved graph has no task id for node {index}"))?
+                .to_owned();
+            spellings.insert(task_id, node.explicit_spelling);
+        }
+    }
+    let covered =
+        crate::manual::contextual_coverage(&target_triples, &rustc_version, &spellings).await?;
     let mut planned = Vec::with_capacity(parts.len());
     for (target, target_parts) in parts {
         let (tasks, _uncovered) = stow_resolver::enqueue_requests_inner(

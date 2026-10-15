@@ -347,10 +347,7 @@ failure report re-queues it under an exponential `not_before` backoff
 until the attempt cap, where it parks `failed`. From there the read
 paths report the dependents as `blocked`, naming the failed task
 id, until the operator's `queue retry` (or a later successful build
-plus publish) releases them back to `pending`. An edge whose dependency
-identity was never resolved reports `blocked` too, named `unknown
-dependency identity` — it can never resolve to a published row, so
-pending would hide a wait that no build can end.
+plus publish) releases them back to `pending`.
 
 ## Schema lifecycle
 
@@ -412,9 +409,8 @@ ever assembles, buffers or inspects it. The publish stage validated the tar
 | `sigstore/payload-<n>.json` | Cosign simple-signing payloads, one per signature layer |
 | `files/<name>` | One entry per layer in manifest order: `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, the native archive |
 
-A record whose artifact predates bundle publishing carries an empty
-`bundle_digest`; the index export omits it — a row with no pullable
-digest is not coverage.
+A record always carries its pushed bundle's digest — the publish
+writes it — so every record maps to one index row.
 
 Constants (media types, paths) are defined in `types/src/bundle.rs`.
 
@@ -457,6 +453,24 @@ never churns the tag. Pushed indexes are cosign-signed keyless under
 `index-publish.yml@refs/heads/main`
 (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), the same
 Fulcio chain the CLI verifies for artifact bundles.
+
+Every publish leaves superseded manifests in the `stow-cache` package —
+an index republish untags the previous manifest, a rebuilt task's older
+`records-*` artifacts stay tagged, and each `sha256-<digest>[.sig]`
+signature manifest accumulates under no retention of its own.
+`stow-admin registry gc --keep-rustc <R> [--min-age-hours N] [--delete]`
+collects them: it lists the package's versions through the GitHub
+packages API, classifies each by tag shape (slice, folded set, records,
+signature/referrer, bundle pair, untagged — an unrecognized tag fails
+the run before anything is deleted), pulls the kept toolchains' slices,
+folded sets and records through the anonymous OCI session, and deletes
+every version no kept slice reaches, except versions younger than
+`--min-age-hours` (a build pushes its bundle before its records, so a
+fresh bundle is legitimately unreferenced). `.github/workflows/
+registry-gc.yml` runs it dispatch-only on `main`. After an index-format
+change the order is: ship the release, `registry gc --keep-rustc R
+--delete`, `index export --full` for R, then `registry gc` again to
+collect what the old format's manifests held.
 
 ## Trust boundaries
 

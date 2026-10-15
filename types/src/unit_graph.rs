@@ -73,6 +73,10 @@ pub struct TaskUnitDep {
     pub name: String,
     /// Dep crate version, kept for error messages.
     pub version: String,
+    /// The dep is a proc-macro crate: the edge puts a proc-macro in the
+    /// parent's `--extern` set, where its key differs between the
+    /// native and explicit `--target` spellings (stow#736).
+    pub proc_macro: bool,
 }
 
 /// One cargo unit's projection-relevant facts.
@@ -251,6 +255,99 @@ fn direct_dep_nodes<'u>(
     Ok(deps)
 }
 
+/// Every lib unit's explicit-spelling flag (stow#736).
+///
+/// Derived bottom-up: a target-side unit is [`ExplicitSpelling::KeysApart`]
+/// when one of its lib deps is a proc-macro — the edge puts it in the
+/// parent's `--extern`, where it keys differently per invocation
+/// spelling — or one of its target-side lib deps is itself
+/// `KeysApart`. A host-side unit is always `KeysAsNative`: it already
+/// publishes both spellings. Build-script deps never reach a lib's
+/// `--extern`, so they can never flag a node.
+///
+/// # Errors
+/// A lib dep ref that names no unit in this resolve, or a lib
+/// dependency cycle — both unit-source inconsistencies, never dropped
+/// edges.
+pub fn explicit_spellings(
+    units: &[TaskUnit],
+) -> Result<BTreeMap<TaskUnitKey, crate::public_cache::ExplicitSpelling>> {
+    use crate::public_cache::ExplicitSpelling;
+    let libs: BTreeMap<&TaskUnitKey, &TaskUnit> = units
+        .iter()
+        .filter(|unit| unit.key.kind == TaskUnitKind::Lib)
+        .map(|unit| (&unit.key, unit))
+        .collect();
+    let mut flags = BTreeMap::<&TaskUnitKey, ExplicitSpelling>::new();
+    for &unit in libs.values() {
+        // Iterative post-order over the lib-dep DAG: `visiting` doubles
+        // as the cycle check — cargo's unit graph is acyclic, so a
+        // repeat is a unit-source inconsistency.
+        let mut stack = vec![(unit, false)];
+        let mut visiting = BTreeSet::<&TaskUnitKey>::new();
+        while let Some((current, children_done)) = stack.pop() {
+            if children_done {
+                visiting.remove(&current.key);
+                let flag = if current.key.side == TaskUnitSide::Host {
+                    ExplicitSpelling::KeysAsNative
+                } else if current
+                    .deps
+                    .iter()
+                    .filter(|dep| dep.key.kind == TaskUnitKind::Lib)
+                    .any(|dep| {
+                        dep.proc_macro
+                            || (dep.key.side == TaskUnitSide::Target
+                                && flags.get(&dep.key) == Some(&ExplicitSpelling::KeysApart))
+                    })
+                {
+                    ExplicitSpelling::KeysApart
+                } else {
+                    ExplicitSpelling::KeysAsNative
+                };
+                flags.insert(&current.key, flag);
+                continue;
+            }
+            if flags.contains_key(&current.key) {
+                continue;
+            }
+            if !visiting.insert(&current.key) {
+                return Err(stow_error!(
+                    "{} {} ({}, {:?}) sits on a lib dependency cycle",
+                    current.name,
+                    current.version,
+                    current.key.platform,
+                    current.key.side,
+                ));
+            }
+            stack.push((current, true));
+            for dep in &current.deps {
+                if dep.key.kind != TaskUnitKind::Lib || flags.contains_key(&dep.key) {
+                    continue;
+                }
+                let dep_unit = libs.get(&dep.key).ok_or_else(|| {
+                    stow_error!(
+                        "{} {} ({}, {:?}) declares {} {} ({}, {:?}, {}) as a lib dep, but no such unit is in this resolve",
+                        current.name,
+                        current.version,
+                        current.key.platform,
+                        current.key.side,
+                        dep.name,
+                        dep.version,
+                        dep.key.platform,
+                        dep.key.side,
+                        dep.key.pkg,
+                    )
+                })?;
+                stack.push((dep_unit, false));
+            }
+        }
+    }
+    Ok(flags
+        .into_iter()
+        .map(|(key, flag)| (key.clone(), flag))
+        .collect())
+}
+
 /// The Merkle task identity of one resolve's unit graph (stow#588).
 ///
 /// Every [`TaskNode`] of `units`' lib graph becomes a
@@ -271,6 +368,23 @@ pub fn resolved_task_graph(
     rustc_version: &WireRustcVersion,
 ) -> Result<ResolvedTaskGraph> {
     let (nodes, edges) = task_graph(units)?;
+    let spellings = explicit_spellings(units)?;
+    let mut spelling_by_node = BTreeMap::<TaskNode, crate::public_cache::ExplicitSpelling>::new();
+    for unit in units {
+        if unit.key.kind != TaskUnitKind::Lib || !unit.is_crates_io {
+            continue;
+        }
+        let flag = spellings.get(&unit.key).copied().ok_or_else(|| {
+            stow_error!(
+                "lib unit {} {} ({}, {:?}) minted no explicit-spelling flag",
+                unit.name,
+                unit.version,
+                unit.key.platform,
+                unit.key.side,
+            )
+        })?;
+        spelling_by_node.insert(task_node(unit)?, flag);
+    }
     let ordered: Vec<&TaskNode> = nodes.iter().collect();
     let index_of: BTreeMap<&TaskNode, usize> = ordered
         .iter()
@@ -293,6 +407,14 @@ pub fn resolved_task_graph(
         }
         resolved.push(ResolvedTaskNode {
             identity: task_identity(node, rustc_version)?,
+            explicit_spelling: spelling_by_node.get(*node).copied().ok_or_else(|| {
+                stow_error!(
+                    "task node {} {} ({}) minted no explicit-spelling flag",
+                    node.crate_name,
+                    node.version,
+                    node.target,
+                )
+            })?,
             dependencies,
         });
     }
@@ -447,6 +569,7 @@ mod tests {
             key: unit.key.clone(),
             name: unit.name.clone(),
             version: unit.version.clone(),
+            proc_macro: false,
         }
     }
 

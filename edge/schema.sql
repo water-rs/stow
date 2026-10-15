@@ -18,6 +18,9 @@ CREATE TABLE artifacts (
     version TEXT NOT NULL,
     features_json TEXT NOT NULL,
     dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]',
+    -- The Merkle dependency digest the artifact was built under
+    -- (stow#588) — every row carries it.
+    dependency_identity TEXT NOT NULL,
     oci_reference TEXT NOT NULL,
     oci_digest TEXT NOT NULL,
     has_native INTEGER NOT NULL DEFAULT 0,
@@ -29,29 +32,25 @@ CREATE TABLE artifacts (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     -- The trusted publish stage pushes the assembled bundle tar as the
     -- `<tag>.bundle` layer; the edge streams that blob by digest instead
-    -- of assembling a tar from the artifact's layers. A row with an
-    -- empty digest serves nothing and is pruned the first time it is
-    -- served.
-    bundle_digest TEXT NOT NULL DEFAULT '',
+    -- of assembling a tar from the artifact's layers.
+    bundle_digest TEXT NOT NULL,
     bundle_size INTEGER NOT NULL DEFAULT 0,
     -- Wall-clock milliseconds the captured rustc invocation took,
     -- recorded at register time.
     compile_millis INTEGER NOT NULL DEFAULT 0,
     -- The glibc floor a hosted artifact needs to load, measured at
-    -- publish from the bundle members' ELF version-needed entries.
-    -- Tri-state TEXT: NULL means the row is unmeasured and must never
-    -- read as "no floor"; '' means measured with no glibc requirement
-    -- (every non-ELF payload); 'x.y' is the floor itself.
-    min_glibc TEXT,
+    -- publish from the bundle members' ELF version-needed entries:
+    -- '' is measured with no glibc requirement (every non-ELF
+    -- payload), 'x.y' is the floor itself.
+    min_glibc TEXT NOT NULL,
     -- The unit shape the row serves, recorded verbatim by the builder:
     -- which side of the host/target boundary the unit compiles for
     -- (0 = target, 1 = host), the cargo invocation spelling that
     -- produced it (0 = native, 1 = `--target`), and whether it links
-    -- (0 = check-only, 1 = built). -1 on any of the three marks a
-    -- shapeless row: it satisfies no coverage clause.
-    unit_side INTEGER NOT NULL DEFAULT -1,
-    unit_invocation INTEGER NOT NULL DEFAULT -1,
-    unit_linked INTEGER NOT NULL DEFAULT -1,
+    -- (0 = check-only, 1 = built).
+    unit_side INTEGER NOT NULL,
+    unit_invocation INTEGER NOT NULL,
+    unit_linked INTEGER NOT NULL,
     PRIMARY KEY (c_metadata, target, rustc_version)
 );
 
@@ -71,9 +70,7 @@ ON artifacts (target, rustc_version, c_metadata);
 -- one semantic identity never collide. `depends_on_json` is the
 -- serialized `Vec<EnqueueDependency>` of the enqueue request that
 -- admitted the miss; `subgraph_json` + `task_id` record the contextual
--- identity the admission minted so the drain re-mints the exact unit —
--- both NULL on a row recorded without context, which the drain
--- consumes as an explicit skip, never a guess.
+-- identity the admission minted so the drain re-mints the exact unit.
 CREATE TABLE dependency_graph_misses (
     crate_name TEXT NOT NULL,
     version TEXT NOT NULL,
@@ -81,14 +78,17 @@ CREATE TABLE dependency_graph_misses (
     target TEXT NOT NULL,
     rustc_version TEXT NOT NULL,
     host_side INTEGER NOT NULL DEFAULT 0,
+    explicit_spelling INTEGER NOT NULL,
     seen_count INTEGER NOT NULL DEFAULT 0,
     first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-    admitted_at TEXT,
+    -- When the admission ticket passed the challenge + PoW gate; every
+    -- row is born admitted, so `queued_at` alone marks the drain.
+    admitted_at TEXT NOT NULL,
     queued_at TEXT,
     depends_on_json TEXT NOT NULL DEFAULT '[]',
-    subgraph_json TEXT,
-    task_id TEXT,
+    subgraph_json TEXT NOT NULL,
+    task_id TEXT NOT NULL,
     PRIMARY KEY (crate_name, version, features_json, target, rustc_version, host_side)
 );
 

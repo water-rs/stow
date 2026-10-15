@@ -919,23 +919,6 @@ mod tests {
         }
     }
 
-    /// Every artifact published before `compile_millis` joined the config
-    /// carries a signed blob without the field, and the decoded config
-    /// fills the documented default. Comparing the raw JSON instead
-    /// rejected the entire published pool.
-    #[test]
-    fn a_config_signed_before_a_field_existed_still_verifies() {
-        let (manifest, files) = declared_bundle_parts();
-        let (manifest, files) = with_config_bytes(manifest, files, |config| {
-            config
-                .as_object_mut()
-                .expect("config object")
-                .remove("compile_millis");
-        });
-
-        validate_oci_manifest(&manifest, &files).expect("old signed config verifies");
-    }
-
     /// The unsigned `manifest.json` copy claiming a different artifact than
     /// the signed `oci/config.json` is the tampering this check exists for.
     #[test]
@@ -950,30 +933,6 @@ mod tests {
             error.to_string().contains("may have been tampered with"),
             "{error}"
         );
-    }
-
-    /// Rewrite the signed config blob with `edit` and restore the digest
-    /// chain the manifest states, so only the config's contents change.
-    fn with_config_bytes(
-        mut manifest: ArtifactBundleManifest,
-        mut files: BTreeMap<String, Vec<u8>>,
-        edit: impl FnOnce(&mut serde_json::Value),
-    ) -> (ArtifactBundleManifest, BTreeMap<String, Vec<u8>>) {
-        let mut config: serde_json::Value =
-            serde_json::from_slice(&files[STOW_OCI_CONFIG_PATH]).expect("config json");
-        edit(&mut config);
-        let config_bytes = serde_json::to_vec(&config).expect("config bytes");
-
-        let mut oci_manifest: serde_json::Value =
-            serde_json::from_slice(&files[STOW_OCI_MANIFEST_PATH]).expect("oci manifest json");
-        oci_manifest["config"]["digest"] = sha256_prefixed(&config_bytes).into();
-        oci_manifest["config"]["size"] = config_bytes.len().into();
-        let oci_manifest_bytes = serde_json::to_vec(&oci_manifest).expect("oci manifest bytes");
-
-        manifest.oci_digest = sha256_prefixed(&oci_manifest_bytes);
-        files.insert(STOW_OCI_CONFIG_PATH.to_owned(), config_bytes);
-        files.insert(STOW_OCI_MANIFEST_PATH.to_owned(), oci_manifest_bytes);
-        (manifest, files)
     }
 
     /// stow#578: the bundle's `crate_name` is the package name — an
@@ -1010,7 +969,8 @@ mod tests {
     fn declared_bundle_parts() -> (ArtifactBundleManifest, BTreeMap<String, Vec<u8>>) {
         let output_contents = b"demo-artifact".to_vec();
         let config = ArtifactBlobConfig {
-            dependency_identity: None,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity"),
             compile_key: "compile-key".to_owned(),
             crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
             crate_version: stow_types::identity::CrateVersion::new(

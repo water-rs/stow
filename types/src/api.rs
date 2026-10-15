@@ -162,6 +162,13 @@ pub struct BuildTaskPayload {
     /// as target-side tasks.
     #[serde(default)]
     pub host_side: bool,
+    /// Whether this node keys differently under the explicit
+    /// `--target <host>` spelling — `KeysApart` exactly when a proc-macro
+    /// sits in its `--extern` closure (stow#736). A target-side task at
+    /// the runner's host triple runs and publishes both invocation
+    /// spellings under it. Semantic graph data, never task identity: no
+    /// default — the flag is derived from the resolved graph.
+    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
     /// The task's whole dependency subgraph: the graph inputs of every
     /// transitive dependency node plus the root's direct-dependency
     /// indexes (stow#588). The generated wrapper package pins every node
@@ -228,6 +235,11 @@ pub struct SubgraphNode {
     /// graph.
     #[serde(rename = "h", default, skip_serializing_if = "std::ops::Not::not")]
     pub host_side: bool,
+    /// Whether the node keys differently under the explicit `--target`
+    /// spelling — `ExplicitSpelling::KeysApart` (stow#736). Absent on the
+    /// wire means `KeysAsNative`: the compact encoding writes only `true`.
+    #[serde(rename = "x", default, skip_serializing_if = "std::ops::Not::not")]
+    pub keys_apart: bool,
     /// Indexes into [`TaskSubgraph::nodes`] naming this node's direct
     /// dependencies.
     #[serde(rename = "d", default, skip_serializing_if = "Vec::is_empty")]
@@ -295,6 +307,8 @@ impl TaskSubgraph {
                 version: node.identity.version.clone(),
                 features_json: node.identity.features_json.clone(),
                 host_side: node.identity.host_side,
+                keys_apart: node.explicit_spelling
+                    == crate::public_cache::ExplicitSpelling::KeysApart,
                 deps: node
                     .dependencies
                     .iter()
@@ -315,8 +329,15 @@ impl TaskSubgraph {
     /// # Errors
     /// `runner_family(root.target)` returning `None` — the subgraph's
     /// host-side nodes key at the family's host triple — or a wire
-    /// index past the node list.
-    pub fn resolve(&self, root: &TaskNodeIdentity) -> crate::error::Result<ResolvedTaskGraph> {
+    /// index past the node list. `root_spelling` is the task node's own
+    /// `ExplicitSpelling`: the root's identity comes from the payload's
+    /// fields, so the flag rides beside them rather than in the node
+    /// list.
+    pub fn resolve(
+        &self,
+        root: &TaskNodeIdentity,
+        root_spelling: crate::public_cache::ExplicitSpelling,
+    ) -> crate::error::Result<ResolvedTaskGraph> {
         let host_triple = runner_family(root.target.as_str())
             .ok_or_else(|| {
                 stow_error!(
@@ -328,6 +349,7 @@ impl TaskSubgraph {
         let mut nodes = Vec::with_capacity(self.nodes.len() + 1);
         nodes.push(ResolvedTaskNode {
             identity: root.clone(),
+            explicit_spelling: root_spelling,
             dependencies: self
                 .root_deps
                 .iter()
@@ -353,6 +375,11 @@ impl TaskSubgraph {
                     })?,
                     rustc_version: root.rustc_version.clone(),
                     host_side: node.host_side,
+                },
+                explicit_spelling: if node.keys_apart {
+                    crate::public_cache::ExplicitSpelling::KeysApart
+                } else {
+                    crate::public_cache::ExplicitSpelling::KeysAsNative
                 },
                 dependencies: node
                     .deps
@@ -390,7 +417,7 @@ impl BuildTaskPayload {
     pub fn verified_dependency_graph(&self) -> crate::error::Result<ResolvedTaskGraph> {
         let graph = self
             .dependency_subgraph
-            .resolve(&self.task_node_identity())?;
+            .resolve(&self.task_node_identity(), self.explicit_spelling)?;
         let derived = graph
             .task_id(0)
             .ok_or_else(|| stow_error!("resolved dependency subgraph has no root node"))?;
@@ -465,11 +492,9 @@ pub struct ArtifactRecord {
     /// JSON-encoded dependency `c_metadata` identities captured from rustc
     /// --extern inputs; sorted by `(crate_name, c_metadata)`.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// The Merkle dependency digest the artifact was built under
-    /// (stow#588). `None` on archive rows recorded before the digest
-    /// existed — `None` answers no contextual coverage query.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dependency_identity: Option<DependencyIdentity>,
+    /// The Merkle dependency digest of the dependency subgraph the
+    /// artifact was built under (stow#588) — the node's context key.
+    pub dependency_identity: DependencyIdentity,
     /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
@@ -494,11 +519,9 @@ pub struct ArtifactRecord {
     pub compile_millis: u64,
     /// The unit shape the builder recorded for this artifact — which side
     /// of the host/target boundary it serves, the cargo invocation
-    /// spelling that produced it, and whether it links. `None` only on
-    /// records serialized before the field existed; the coverage checks
-    /// and the dependency gate treat shapeless rows as covering nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit_shape: Option<crate::public_cache::UnitShape>,
+    /// spelling that produced it, and whether it links. The coverage
+    /// checks and the dependency gate compare it.
+    pub unit_shape: crate::public_cache::UnitShape,
     /// Lowest glibc the artifact's ELF members can `dlopen` against — the
     /// highest `GLIBC_x.y` in their version-needed entries, measured at
     /// publish. `None` for non-ELF payloads and for artifacts with no glibc
@@ -543,6 +566,14 @@ pub struct EnqueueRequest {
     /// decode as target-side tasks.
     #[serde(default)]
     pub host_side: bool,
+    /// Whether this node keys differently under the explicit
+    /// `--target <host>` spelling — `KeysApart` exactly when a proc-macro
+    /// sits in its `--extern` closure (stow#736). A target-side task at
+    /// the runner's host triple runs and publishes both invocation
+    /// spellings under it. Semantic graph data, never task identity: no
+    /// default — the flag is derived from the resolved graph a request
+    /// carries.
+    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
     /// Mirrors `BuildTaskPayload::preserve_lockfile`. Set to true for binary-
     /// derived overlay enqueues so the trusted build resolves transitive deps
     /// against the binary's published `Cargo.lock`.
@@ -574,6 +605,10 @@ pub struct EnqueueDependency {
     /// commits to (stow#588). No default: the digest is derived from the
     /// dep's actual resolved subgraph.
     pub dependency_identity: DependencyIdentity,
+    /// Whether the dep node keys differently under the explicit
+    /// `--target <host>` spelling (stow#736). The edge's shape gate
+    /// requires the dep's four-shape set under it.
+    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
 }
 
 impl EnqueueDependency {
@@ -613,7 +648,8 @@ impl EnqueueRequest {
     /// # Errors
     /// The subgraph cannot resolve (bad index, cycle, unmapped target).
     pub fn resolved_dependency_graph(&self) -> crate::error::Result<ResolvedTaskGraph> {
-        self.dependency_subgraph.resolve(&self.task_node_identity())
+        self.dependency_subgraph
+            .resolve(&self.task_node_identity(), self.explicit_spelling)
     }
 
     /// The Merkle digest committing to this node's dependency subgraph —
@@ -665,6 +701,7 @@ impl EnqueueRequest {
                     dependency_identity: graph.dependency_identity(dep).cloned().ok_or_else(
                         || stow_error!("resolved dependency graph yields no digest for node {dep}"),
                     )?,
+                    explicit_spelling: node.explicit_spelling,
                 })
             })
             .collect()
@@ -851,6 +888,10 @@ pub struct ResolvedDependencyGraphEntry {
     /// task id from, so a forged or leaf-shaped context is refused
     /// (stow#588).
     pub dependency_subgraph: TaskSubgraph,
+    /// Whether this node keys differently under the explicit
+    /// `--target <host>` spelling (stow#736) — the flag its
+    /// `EnqueueRequest` mints with.
+    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
 }
 
 /// The dispatch freeze — the scheduler's "builds are failing
@@ -1643,9 +1684,7 @@ pub struct PublishedSliceReport {
 /// a crate compiled as a host-side unit has a different compile key than
 /// the same crate compiled as a target unit — so the stored
 /// `unit_shape` distinguishes rows the edge's servable gate compares
-/// separately. Rows reported without one carry no shape and satisfy no
-/// coverage clause: a dependent gated on such a dependency stays gated
-/// until the node republishes.
+/// separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedSliceRow {
     /// Crate name as published on crates.io.
@@ -1656,12 +1695,9 @@ pub struct PublishedSliceRow {
     pub features_json: FeaturesJson,
     /// The unit shape the builder recorded for the row — its side, the
     /// cargo invocation spelling that produced it, and whether it links.
-    /// `None` only on reports serialized before the field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit_shape: Option<crate::public_cache::UnitShape>,
+    pub unit_shape: crate::public_cache::UnitShape,
     /// The Merkle dependency digest the row was built under (stow#588) —
-    /// required: an index row without one is filtered before it ever
-    /// reaches this wire, so a stored or reported row always carries it.
+    /// the dependency context the gate's coverage clause joins on.
     pub dependency_identity: DependencyIdentity,
 }
 

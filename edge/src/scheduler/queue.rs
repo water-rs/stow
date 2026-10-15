@@ -25,6 +25,10 @@ pub struct SemanticTaskIdentity {
     pub target: String,
     pub rustc_version: String,
     pub host_side: bool,
+    /// The node's explicit-spelling flag (stow#736): semantic data,
+    /// not identity — two catalog memberships of one node differ only
+    /// in the shape set they require, never in the node's task id.
+    pub explicit_spelling: stow_types::public_cache::ExplicitSpelling,
 }
 
 /// Answers, for a batch of pending crates.io tasks, which of them the
@@ -59,6 +63,10 @@ pub struct QueuedTask {
     /// through to `BuildTaskPayload` so the CI builder shapes the
     /// wrapper package's dependency as the unit's consumers compile it.
     pub host_side: bool,
+    /// The task's explicit-spelling flag (stow#736) — passed through to
+    /// `BuildTaskPayload` so a target-side task at the runner's host
+    /// triple builds and publishes both invocation spellings.
+    pub explicit_spelling: stow_types::public_cache::ExplicitSpelling,
     pub preserve_lockfile: bool,
     /// The task's dependency subgraph at claim time, rebuilt from its
     /// `queue_dependencies` rows (stow#588). Dispatch carries it to
@@ -68,6 +76,17 @@ pub struct QueuedTask {
     /// subgraph node lands as a leaf; the scheduler's storage rework is
     /// owned by a follow-up task.
     pub dependency_subgraph: stow_types::api::TaskSubgraph,
+}
+
+/// Decode a stored `explicit_spelling` integer — the queue and
+/// node-store columns carry 0 for `KeysAsNative`, 1 for `KeysApart`
+/// (stow#736).
+pub const fn spelling_of(stored: i64) -> stow_types::public_cache::ExplicitSpelling {
+    if stored != 0 {
+        stow_types::public_cache::ExplicitSpelling::KeysApart
+    } else {
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative
+    }
 }
 
 // Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
@@ -292,6 +311,10 @@ struct BatchedUpdate {
     downloads: i64,
     redispatch: u8,
     human: u8,
+    /// Any occurrence's explicit-spelling flag (stow#736): the flag
+    /// upgrades a row the request proves `KeysApart` — the UPDATE
+    /// writes the max while the row is uncommitted or redispatching.
+    explicit: u8,
 }
 
 /// A first-occurrence row for the bulk `INSERT INTO queue`.
@@ -304,6 +327,7 @@ struct BatchedInsert {
     target: String,
     rustc_version: String,
     host_side: u8,
+    explicit_spelling: u8,
     dependency_identity: String,
     downloads: i64,
     priority: i64,
@@ -323,14 +347,14 @@ struct BatchedNodeRow {
     target: String,
     rustc_version: String,
     host_side: u8,
+    explicit_spelling: u8,
     dependency_identity: String,
     children_json: String,
 }
 
 /// One stored edge's readiness as probed for an insert chunk: whether
 /// the dep's required publication is missing (`unpub`) and whether that
-/// edge also blocks (`blocker` — the dep failed, names no crate, or
-/// carries an unresolved legacy side).
+/// edge also blocks (`blocker` — the dep failed).
 #[derive(Debug, skyzen::FromRow)]
 struct EdgeFlag {
     owner: String,
@@ -543,7 +567,11 @@ async fn apply_batched_updates(
                      THEN {wake} ELSE wake_at END, \
                  updated_at = datetime('now'), \
                  lane = {next_lane}, \
-                 dispatch_eligible = {eligible} \
+                 dispatch_eligible = {eligible}, \
+                 explicit_spelling = CASE \
+                     WHEN status NOT IN ('dispatched', 'running') OR e ->> 'redispatch' = 1 \
+                     THEN MAX(explicit_spelling, e ->> 'explicit') \
+                     ELSE explicit_spelling END \
              FROM (SELECT value AS e FROM json_each(?)) AS j \
              WHERE queue.task_id = j.e ->> 'task_id'",
             deps_met = deps_met_sql("queue.task_id"),
@@ -656,8 +684,7 @@ async fn apply_batched_inserts(
             .query(&format!(
                 "SELECT d.task_id AS owner, \
                         CASE WHEN {unpub} THEN 1 ELSE 0 END AS unpub, \
-                        CASE WHEN bdep.status = 'failed' OR d.dep_crate_name = '' \
-                                  OR d.dep_host_side < 0 \
+                        CASE WHEN bdep.status = 'failed' \
                              THEN 1 ELSE 0 END AS blocker \
                  FROM queue_dependencies d \
                  LEFT JOIN queue bdep ON bdep.task_id = d.depends_on_task_id \
@@ -678,9 +705,9 @@ async fn apply_batched_inserts(
         let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, dependency_identity, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, dependency_identity, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
-                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'dependency_identity', e ->> 'downloads', \
+                        e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'explicit_spelling', e ->> 'dependency_identity', e ->> 'downloads', \
                         0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
                         1, lower(hex(randomblob(16))), e ->> 'first_requested_at', \
                         e ->> 'created_at', \
@@ -734,12 +761,12 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
     for chunk in edges.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(&format!(
             "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_met, dep_side_known) \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_met) \
              SELECT d.task_id, d.depends_on_task_id, d.dep_crate_name, \
                     d.dep_version, d.dep_features_json, d.dep_target, \
                     d.dep_rustc_version, d.dep_host_side, d.dep_dependency_identity, \
                     d.dep_invocations, \
-                    d.dep_shapes, CASE WHEN {unpub} THEN 0 ELSE 1 END, 1 \
+                    d.dep_shapes, CASE WHEN {unpub} THEN 0 ELSE 1 END \
              FROM (SELECT e ->> 'task_id' AS task_id, \
                          e ->> 'depends_on_task_id' AS depends_on_task_id, \
                          e ->> 'dep_crate_name' AS dep_crate_name, \
@@ -765,21 +792,31 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
 }
 
 /// Upsert every resolved-subgraph node into `task_nodes` — the
-/// submit-side half of the node store (stow#588). `INSERT OR IGNORE`:
-/// a task id is a content address, so a node another request already
-/// wrote is identical by construction and skipped. Batched by JSON
-/// like every enqueue write; the per-node payload is fixed-width plus
-/// one `children_json` array.
+/// submit-side half of the node store (stow#588). `INSERT` with an
+/// `ON CONFLICT` that only lifts `explicit_spelling`: a task id is a
+/// content address, so a node another request already wrote is
+/// identical by construction — except the flag, which two subgraphs
+/// minting the same id can disagree on (it derives from the unit
+/// graph, a finer input than the task-id digest commits to). A
+/// flagged resubmission upgrades the stored row's `KeysAsNative` so
+/// the next dispatch payload and edge requirement see the real
+/// contract; `KeysApart` never lowers. The `WHERE` confines the
+/// write to a real upgrade — `MAX` would leave the value unchanged
+/// otherwise, and an unchanged row is not an event worth billing.
 async fn upsert_task_nodes(db: &DurableDb, rows: &[BatchedNodeRow]) -> Result<(), QueueError> {
     for chunk in rows.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(
-            "INSERT OR IGNORE INTO task_nodes \
-             (task_id, crate_name, version, features_json, target, rustc_version, host_side, dependency_identity, children_json) \
+            "INSERT INTO task_nodes \
+             (task_id, crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, dependency_identity, children_json) \
              SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', \
                     e ->> 'features_json', e ->> 'target', e ->> 'rustc_version', \
-                    e ->> 'host_side', e ->> 'dependency_identity', \
+                    e ->> 'host_side', e ->> 'explicit_spelling', e ->> 'dependency_identity', \
                     e ->> 'children_json' \
-             FROM (SELECT value AS e FROM json_each(?)) e",
+             FROM (SELECT value AS e FROM json_each(?)) e \
+             WHERE TRUE \
+             ON CONFLICT(task_id) DO UPDATE SET \
+                explicit_spelling = excluded.explicit_spelling \
+             WHERE excluded.explicit_spelling > task_nodes.explicit_spelling",
         )
         .bind(enqueue_json(chunk)?)
         .execute()
@@ -1095,6 +1132,7 @@ pub async fn submit_task_ids(
             dependency_subgraph,
             preserve_lockfile: false,
             host_side: root.host_side != 0,
+            explicit_spelling: spelling_of(root.explicit_spelling),
         };
         // The rebuilt context must re-derive the submitted id exactly —
         // a store that produces anything else is corrupt, never
@@ -1179,6 +1217,9 @@ fn node_store_rows(
             target: node.identity.target.as_str().to_owned(),
             rustc_version: node.identity.rustc_version.as_str().to_owned(),
             host_side: u8::from(node.identity.host_side),
+            explicit_spelling: u8::from(
+                node.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart,
+            ),
             dependency_identity,
             children_json: serde_json::to_string(&children)
                 .map_err(|error| QueueError::Sql(format!("encode node children json: {error}")))?,
@@ -1199,30 +1240,47 @@ struct EnqueuePlan {
     edge_inserts: BTreeMap<String, Vec<BatchedDepEdge>>,
 }
 
+/// One existence probe's answer for a chunk task id: the row's status
+/// and the explicit-spelling flag it stored (stow#736). The flag is
+/// what a `KeysApart` resubmission resurrects a `KeysAsNative`
+/// `completed` row against — the row's published native-only set
+/// cannot serve the consumers the flag describes.
+#[derive(Debug)]
+struct TaskStatusProbe {
+    status: String,
+    explicit_spelling: i64,
+}
+
 /// One existence probe for the chunk, over every task id it can
 /// touch. `task_id` is the queue's primary key, so this answers every
 /// existence check the row-at-a-time loop ran.
 async fn probe_task_statuses(
     db: &DurableDb,
     prepared: &[Prepared<'_>],
-) -> Result<BTreeMap<String, String>, QueueError> {
+) -> Result<BTreeMap<String, TaskStatusProbe>, QueueError> {
     let probe_ids: Vec<&str> = prepared
         .iter()
         .map(|entry| entry.task_id.as_str())
         .collect();
-    let mut statuses: BTreeMap<String, String> = BTreeMap::new();
+    let mut statuses: BTreeMap<String, TaskStatusProbe> = BTreeMap::new();
     for chunk in probe_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         let rows = db
             .query(
-                "SELECT task_id, status FROM queue \
+                "SELECT task_id, status, explicit_spelling FROM queue \
                  WHERE task_id IN (SELECT value FROM json_each(?))",
             )
             .bind(enqueue_json(chunk)?)
-            .fetch_all::<TaskIdRow>()
+            .fetch_all::<TaskStatusRow>()
             .await
             .map_err(|error| format!("select existing tasks: {error}"))?;
         for row in rows {
-            statuses.insert(row.task_id, row.status);
+            statuses.insert(
+                row.task_id,
+                TaskStatusProbe {
+                    status: row.status,
+                    explicit_spelling: row.explicit_spelling,
+                },
+            );
         }
     }
     Ok(statuses)
@@ -1238,12 +1296,17 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
         // The gate needs every required unit shape of the dep's
         // semantic identity — the shapes the dependent's own build
         // compiles the dep's units at. The mask and the pair count go
-        // on the edge so the gate SQL stays a row-count compare.
+        // on the edge so the gate SQL stays a row-count compare; the
+        // dep's explicit-spelling flag is the fourth input — a
+        // `KeysApart` dep owes its explicit `Native`-spelling shapes
+        // too (stow#736).
         let (dep_invocations, dep_shapes) = dep_edge_requirements(
             entry.request.target.as_str(),
             entry.request.host_side,
+            entry.request.explicit_spelling,
             dependency.target.as_str(),
             dependency.host_side,
+            dependency.explicit_spelling,
         );
         if *dep_task_id == entry.task_id {
             return Err(QueueError::Sql(format!(
@@ -1279,7 +1342,7 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
 /// occurrence leaves.
 fn plan_enqueue(
     prepared: &[Prepared<'_>],
-    statuses: &mut BTreeMap<String, String>,
+    statuses: &mut BTreeMap<String, TaskStatusProbe>,
 ) -> Result<EnqueuePlan, QueueError> {
     let mut updates: BTreeMap<String, BatchedUpdate> = BTreeMap::new();
     let mut plan = EnqueuePlan {
@@ -1290,8 +1353,22 @@ fn plan_enqueue(
     for entry in prepared {
         let lane = request_lane(entry.request.source);
         let downloads = u64_to_i64(entry.request.downloads, "downloads")?;
-        if let Some(status) = statuses.get(&entry.task_id) {
-            let redispatch = resurrects(status.as_str(), lane);
+        let request_explicit = u8::from(
+            entry.request.explicit_spelling
+                == stow_types::public_cache::ExplicitSpelling::KeysApart,
+        );
+        if let Some(probe) = statuses.get(&entry.task_id) {
+            // Beyond the lane resurrection: a request proving the node
+            // `KeysApart` against a row stored `KeysAsNative` resurrects
+            // a `completed` row on any lane — its published native-only
+            // shapes cannot serve the explicit-spelling consumers the
+            // flag describes (stow#736). `failed` still never revives,
+            // and the claim's coverage retirement applies the same
+            // requirement to rows that never complete again.
+            let flaggap = probe.status == "completed"
+                && request_explicit == 1
+                && probe.explicit_spelling == 0;
+            let redispatch = resurrects(probe.status.as_str(), lane) || flaggap;
             let update = updates
                 .entry(entry.task_id.clone())
                 .or_insert_with(|| BatchedUpdate {
@@ -1300,13 +1377,29 @@ fn plan_enqueue(
                     downloads,
                     redispatch: 0,
                     human: 0,
+                    explicit: 0,
                 });
             update.occurrences += 1;
             update.downloads = update.downloads.max(downloads);
             update.redispatch |= u8::from(redispatch);
             update.human |= u8::from(lane == TaskLane::Human);
+            update.explicit |= request_explicit;
             if redispatch {
-                statuses.insert(entry.task_id.clone(), "pending".to_owned());
+                statuses.insert(
+                    entry.task_id.clone(),
+                    TaskStatusProbe {
+                        status: "pending".to_owned(),
+                        explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
+                    },
+                );
+            } else {
+                statuses.insert(
+                    entry.task_id.clone(),
+                    TaskStatusProbe {
+                        status: probe.status.clone(),
+                        explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
+                    },
+                );
             }
         } else {
             plan.inserts.push(BatchedInsert {
@@ -1317,13 +1410,20 @@ fn plan_enqueue(
                 target: entry.identity.target.clone(),
                 rustc_version: entry.identity.rustc_version.clone(),
                 host_side: u8::from(entry.identity.host_side),
+                explicit_spelling: request_explicit,
                 dependency_identity: entry.root_dependency_identity.clone(),
                 downloads,
                 priority: compute_priority(entry.request.downloads, 0)?,
                 preserve_lockfile: u8::from(entry.request.preserve_lockfile),
                 lane: lane.as_str(),
             });
-            statuses.insert(entry.task_id.clone(), "pending".to_owned());
+            statuses.insert(
+                entry.task_id.clone(),
+                TaskStatusProbe {
+                    status: "pending".to_owned(),
+                    explicit_spelling: i64::from(request_explicit),
+                },
+            );
             // A task id commits to its whole dependency subgraph, so a
             // task's edge set is a function of the id (stow#588): edges
             // are written only for the row this request inserts — a
@@ -1707,7 +1807,7 @@ const OUTCOME_BUCKET_SECS: i64 = 300;
 /// what aged out. The read set of a completion is constant in traffic:
 /// the `UPDATE … RETURNING target` in `complete` names the row's target,
 /// one bucket upsert counts it, and — for failures — one raw
-/// `attempt_outcomes` row keeps the trip alert's class and run-id
+/// `attempt_outcomes_v2` row keeps the trip alert's class and run-id
 /// evidence; successes never land a raw row at all. Both expiry deletes
 /// bound on `window_minutes` (the same horizon the trip check reads), so
 /// each insert removes at most what just aged out — the tables never
@@ -1750,12 +1850,6 @@ async fn record_attempt_outcome(
         .await
         .map_err(|error| format!("record attempt failure evidence: {error}"))?;
     }
-    let window = format!("-{window_minutes} minutes");
-    db.query("DELETE FROM attempt_outcomes WHERE finished_at < datetime('now', ?)")
-        .bind(window)
-        .execute()
-        .await
-        .map_err(|error| format!("expire old attempt outcome rows: {error}"))?;
     db.query("DELETE FROM attempt_outcomes_v2 WHERE finished_at < datetime('now', ?)")
         .bind(format!("-{window_minutes} minutes"))
         .execute()
@@ -2802,9 +2896,7 @@ async fn request_record_status(
 ///   dependent — which compiles deps under both spellings — both.
 ///
 /// `p.unit_invocation + 1` maps the stored invocation (0 = native,
-/// 1 = `--target`) onto its bit. A row carrying `-1` legs is
-/// shapeless — it matches no clause, so a shapeless dep stays gated
-/// until the node republishes.
+/// 1 = `--target`) onto its bit.
 pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
     // The live generation is a scalar lookup on the slice marker's
     // primary key `(target, rustc_version)`, so each edge probes one
@@ -2825,13 +2917,10 @@ pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
 /// one caller that already knows it: the slice-commit gate delta, where
 /// a correlated probe would re-seek the same marker row once per edge.
 fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
-    // Keep legacy -1 shape legs out of coverage. The integer enums are
-    // stored as 0/1 and legacy rows as -1, so BETWEEN is equivalent to
-    // the accepted domain while letting SQLite retain a bounded suffix
-    // range on the published-row primary key.
+    // The BETWEEN bounds are the enum domains phrased so SQLite keeps a
+    // bounded suffix range on the published-row primary key.
     format!(
-        "({dep}.dep_shapes = 0 \
-         OR (SELECT count(*) \
+        "(SELECT count(*) \
              FROM published_slice_rows p \
              WHERE p.target = {dep}.dep_target \
                AND p.rustc_version = {dep}.dep_rustc_version \
@@ -2845,7 +2934,7 @@ fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
                AND p.unit_linked BETWEEN 0 AND 1 \
                AND ({dep}.dep_host_side = 0 OR p.unit_linked = 1) \
                AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
-            ) < {dep}.dep_shapes)"
+            ) < {dep}.dep_shapes"
     )
 }
 
@@ -2891,8 +2980,7 @@ pub(super) fn deps_met_sql(owner_task: &str) -> String {
 }
 
 /// `blocked` as a SQL expression over the owner's row: `1` while a
-/// pending row owns an edge whose dep failed or was never resolved
-/// (`dep_crate_name = ''`, `dep_host_side < 0`) AND whose required units
+/// pending row owns an edge whose dep failed AND whose required units
 /// the live published slice does not serve — exactly the predicate the
 /// derived `blocked` status evaluated per row on every read before the
 /// flag existed. Written wherever `deps_met` is, and refreshed on the
@@ -2905,8 +2993,7 @@ pub(super) fn blocked_sql(owner_task: &str) -> String {
             SELECT 1 FROM queue_dependencies bd \
             LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = {owner_task} \
-              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' \
-                   OR bd.dep_host_side < 0) \
+              AND bdep.status = 'failed' \
               AND bd.dep_met = 0 \
         ) THEN 1 ELSE 0 END"
     )
@@ -3913,17 +4000,15 @@ fn effective_status_sql() -> String {
 }
 
 /// The first blocking edge a pending row names — the `blocked_by`
-/// companion to [`effective_status_sql`]. A failed dependency reports
-/// its task id; an edge whose identity was never resolved reports
-/// `unknown dependency identity`, since no task names it.
+/// companion to [`effective_status_sql`]: the failed dependency's task
+/// id.
 fn blocked_by_sql() -> String {
     "CASE WHEN queue.status = 'pending' AND queue.blocked != 0 THEN ( \
-        SELECT CASE WHEN bd.dep_crate_name = '' THEN 'unknown dependency identity' \
-                    ELSE bd.depends_on_task_id END \
+        SELECT bd.depends_on_task_id \
             FROM queue_dependencies bd \
-            LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = queue.task_id \
-              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' OR bd.dep_host_side < 0) \
+              AND bdep.status = 'failed' \
               AND bd.dep_met = 0 \
             ORDER BY bd.depends_on_task_id LIMIT 1 \
     ) END"
@@ -3972,6 +4057,7 @@ async fn claim_dispatchable_row(
         target: row.target,
         rustc_version: row.rustc_version,
         host_side: row.host_side != 0,
+        explicit_spelling: spelling_of(row.explicit_spelling),
         preserve_lockfile: row.preserve_lockfile != 0,
         dependency_subgraph: stow_types::api::TaskSubgraph {
             root_deps: Vec::new(),
@@ -4093,6 +4179,7 @@ struct TaskNodeRow {
     target: String,
     rustc_version: String,
     host_side: i64,
+    explicit_spelling: i64,
     children_json: String,
 }
 
@@ -4330,7 +4417,7 @@ async fn fetch_task_nodes(
     task_ids: &[String],
 ) -> Result<Vec<TaskNodeRow>, QueueError> {
     db.query(
-        "SELECT task_id, crate_name, version, features_json, target, rustc_version, host_side, children_json \
+        "SELECT task_id, crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, children_json \
          FROM task_nodes \
          WHERE task_id IN (SELECT value FROM json_each(?))",
     )
@@ -4372,6 +4459,7 @@ fn subgraph_node_from_store(
         )
         .map_err(|error| format!("node {}: invalid features: {error}", row.task_id))?,
         host_side: row.host_side != 0,
+        keys_apart: row.explicit_spelling != 0,
         deps: children
             .iter()
             .map(|id| {
@@ -4404,6 +4492,7 @@ async fn retire_covered_rows(
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
             host_side: row.host_side != 0,
+            explicit_spelling: spelling_of(row.explicit_spelling),
         })
         .collect::<Vec<_>>();
     if identities.is_empty() {
@@ -4422,6 +4511,7 @@ async fn retire_covered_rows(
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
             host_side: row.host_side != 0,
+            explicit_spelling: spelling_of(row.explicit_spelling),
         };
         if row.preserve_lockfile == 0 && covered.contains(&identity) {
             let result = db
@@ -4534,7 +4624,7 @@ async fn select_dispatchable_page(
     page_rows: i64,
 ) -> Result<Vec<TaskRow>, QueueError> {
     let sql = dispatchable_page_sql(
-        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key",
+        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.explicit_spelling, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key",
         full_family,
     );
     let cutoff = dispatch_cutoff_modifier(settings.dispatch_min_age_minutes);
@@ -4959,11 +5049,7 @@ pub async fn evaluate_freeze_trip(
     let window = format!("-{} minutes", settings.window_minutes);
     let class_rows = db
         .query(
-            "SELECT failure_class, count(*) AS count FROM ( \
-                 SELECT failure_class, finished_at FROM attempt_outcomes \
-                 UNION ALL \
-                 SELECT failure_class, finished_at FROM attempt_outcomes_v2 \
-             ) \
+            "SELECT failure_class, count(*) AS count FROM attempt_outcomes_v2 \
              WHERE finished_at >= datetime('now', ?) \
              GROUP BY failure_class ORDER BY count DESC, failure_class",
         )
@@ -4980,11 +5066,7 @@ pub async fn evaluate_freeze_trip(
     }
     let example_run_ids = db
         .query(
-            "SELECT github_run_id FROM ( \
-                 SELECT github_run_id, finished_at FROM attempt_outcomes \
-                 UNION ALL \
-                 SELECT github_run_id, finished_at FROM attempt_outcomes_v2 \
-             ) \
+            "SELECT github_run_id FROM attempt_outcomes_v2 \
              WHERE github_run_id IS NOT NULL \
                AND finished_at >= datetime('now', ?) \
              GROUP BY github_run_id ORDER BY MAX(finished_at) DESC LIMIT ?",
@@ -5808,10 +5890,20 @@ async fn earliest_active_lease_expiry_ms(
 /// The invocation-spelling mask a dependent's edges carry: the cargo
 /// invocations its own build compiles the dep's units under. A
 /// host-side task runs every phase both natively and under `--target`
-/// (its deps are host units under either spelling); a target-side task
-/// runs the one spelling its target implies.
-pub fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
-    if owner_host_side {
+/// (its deps are host units under either spelling); so does a
+/// `KeysApart` target-side task at the host triple, which compiles its
+/// deps under both spellings too (stow#736); any other target-side
+/// task runs the one spelling its target implies.
+pub fn dep_invocation_mask(
+    owner_target: &str,
+    owner_host_side: bool,
+    owner_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
+) -> i64 {
+    let runs_both_spellings = owner_host_side
+        || (owner_explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
+            && stow_types::api::runner_family(owner_target)
+                .is_some_and(|family| family.host_triple() == owner_target));
+    if runs_both_spellings {
         return 0b11;
     }
     match stow_types::api::runner_family(owner_target) {
@@ -5827,19 +5919,31 @@ pub fn dep_invocation_mask(owner_target: &str, owner_host_side: bool) -> i64 {
 /// needs the linked row under each spelling the owner compiles — host
 /// units always link, so the check phase publishes the same shape the
 /// build does. A target-side dep edge needs both kinds at the dep
-/// node's own invocation spelling — the only one a target task
-/// produces.
+/// node's own invocation spelling — except a `KeysApart` dep invoked
+/// `Native`, which owes the four shapes of both spellings (stow#736).
 pub fn dep_edge_requirements(
     owner_target: &str,
     owner_host_side: bool,
+    owner_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
     dep_target: &str,
     dep_host_side: bool,
+    dep_explicit_spelling: stow_types::public_cache::ExplicitSpelling,
 ) -> (i64, i64) {
     if dep_host_side {
-        let mask = dep_invocation_mask(owner_target, owner_host_side);
+        let mask = dep_invocation_mask(owner_target, owner_host_side, owner_explicit_spelling);
         return (mask, i64::from(mask.count_ones()));
     }
-    (dep_invocation_mask(dep_target, false), 2)
+    let mask = dep_invocation_mask(
+        dep_target,
+        false,
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+    );
+    if mask == 0b01
+        && dep_explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
+    {
+        return (0b11, 4);
+    }
+    (mask, 2)
 }
 
 /// Record what one published index slice serves — the semantic identities
@@ -5898,19 +6002,17 @@ struct GateIdentity {
     crate_name: String,
     version: String,
     features_json: String,
-    dependency_identity: Option<String>,
+    dependency_identity: String,
     unit_side: i64,
     kind: Option<SliceChangeKind>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct NormalizedGateRow {
     crate_name: String,
     version: String,
     features_json: String,
-    /// `None` serializes as JSON null — the match join's `=` never
-    /// binds it, so a context-free row flips no edge (stow#588).
-    dependency_identity: Option<String>,
+    dependency_identity: String,
     unit_side: i64,
     invocations: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5956,23 +6058,35 @@ fn slice_row_key(row: &SliceRowJson) -> (String, String, String, String, i64, i6
     )
 }
 
+/// Fold changed slice rows into the gate's per-`(crate identity,
+/// side)` invocation masks. A stored leg outside its enum — a `-1`
+/// included — is corruption (stow#730): the decode fails loudly rather
+/// than dropping the row from the edge-refresh set. A host-side row
+/// that does not link is a real but useless shape — the gate never
+/// requires it — so it folds to nothing.
 fn normalize_gate_rows(
     rows: impl IntoIterator<Item = (SliceRowJson, Option<SliceChangeKind>)>,
-) -> Vec<NormalizedGateRow> {
+) -> Result<Vec<NormalizedGateRow>, QueueError> {
     let mut normalized = std::collections::BTreeMap::<GateIdentity, i64>::new();
     for (row, kind) in rows {
+        let invalid = |leg: &str, value: i64| {
+            QueueError::Invariant(format!(
+                "published slice row {}/{}/{}: {leg} = {value} is off-enum",
+                row.crate_name, row.version, row.features_json
+            ))
+        };
         let Some(invocation) =
             stow_types::public_cache::UnitInvocation::from_int(row.unit_invocation)
         else {
-            continue;
+            return Err(invalid("unit_invocation", row.unit_invocation));
         };
         let Some(side) = stow_types::public_cache::UnitSide::from_int(row.unit_side) else {
-            continue;
+            return Err(invalid("unit_side", row.unit_side));
         };
         let linked = match row.unit_linked {
             0 => false,
             1 => true,
-            _ => continue,
+            _ => return Err(invalid("unit_linked", row.unit_linked)),
         };
         if side == stow_types::public_cache::UnitSide::Host && !linked {
             continue;
@@ -5981,14 +6095,14 @@ fn normalize_gate_rows(
             crate_name: row.crate_name,
             version: row.version,
             features_json: row.features_json,
-            dependency_identity: Some(row.dependency_identity),
+            dependency_identity: row.dependency_identity,
             unit_side: side.to_int(),
             kind,
         };
         let bit = 1_i64 << invocation.to_int();
         *normalized.entry(identity).or_default() |= bit;
     }
-    normalized
+    Ok(normalized
         .into_iter()
         .map(|(identity, invocations)| NormalizedGateRow {
             crate_name: identity.crate_name,
@@ -5999,13 +6113,13 @@ fn normalize_gate_rows(
             invocations,
             kind: identity.kind,
         })
-        .collect()
+        .collect())
 }
 
 fn normalized_gate_json(
     rows: impl IntoIterator<Item = (SliceRowJson, Option<SliceChangeKind>)>,
 ) -> Result<Option<String>, QueueError> {
-    let normalized = normalize_gate_rows(rows);
+    let normalized = normalize_gate_rows(rows)?;
     if normalized.is_empty() {
         return Ok(None);
     }
@@ -6149,10 +6263,9 @@ struct LiveSliceRow {
 }
 
 /// Map report rows onto the stored 6-column identity — `rowid` zeroes
-/// out (only live-read rows carry one) and a missing unit shape writes
-/// the `-1` legs that satisfy no coverage clause. Every report row
-/// carries a digest: `PublishedSliceRow.dependency_identity` is
-/// required on the wire, so this map cannot fail on identity.
+/// out (only live-read rows carry one). Every report row carries a
+/// digest and a unit shape: both are required on the wire, so this map
+/// cannot fail.
 fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
     rows.iter()
         .map(|row| SliceRowJson {
@@ -6160,9 +6273,9 @@ fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
             version: row.version.to_string(),
             features_json: row.features_json.raw(),
             dependency_identity: row.dependency_identity.to_string(),
-            unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
-            unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
-            unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
+            unit_side: row.unit_shape.side.to_int(),
+            unit_invocation: row.unit_shape.invocation.to_int(),
+            unit_linked: row.unit_shape.kind.to_int(),
             rowid: 0,
         })
         .collect()
@@ -6509,9 +6622,7 @@ async fn apply_slice_gate_delta(
              WHERE queue_dependencies.rowid = answers.rid \
                AND answers.old_met != answers.new_met \
              RETURNING queue_dependencies.task_id, queue_dependencies.dep_met, \
-                       CASE WHEN queue_dependencies.dep_crate_name = '' \
-                                  OR queue_dependencies.dep_host_side < 0 \
-                                  OR EXISTS ( \
+                       CASE WHEN EXISTS ( \
                                       SELECT 1 FROM queue bdep \
                                       WHERE bdep.task_id = queue_dependencies.depends_on_task_id \
                                         AND bdep.status = 'failed' \
@@ -6732,18 +6843,11 @@ async fn recover_stale_active_tasks(
 }
 
 /// A `completed` dependency is not done until its published slice rows
-/// cover every unit shape a dependent's edge requires — and rows
-/// registered before the unit-shape columns existed carry `-1` legs that
-/// satisfy no clause, so a dep published pre-upgrade would gate its
-/// dependents forever. `completed` here means "reported done without
-/// covering": re-queue the row once, behind the same backoff the
-/// failed-dependency requeue applies, and let the rebuild republish real
-/// shapes; `shape_requeue` latches the repair so it runs at most once.
-/// Edges whose dep identity never resolved (`dep_crate_name = ''`) name
-/// no node a republish could satisfy, and an edge whose required side
-/// was never established (`dep_host_side = -1`) asks for a side the dep
-/// can never publish — both leave nothing to re-queue: the first has no
-/// dep, the second is the resolver's rewrite, not the dep's rebuild.
+/// cover every unit shape a dependent's edge requires. `completed`
+/// here means "reported done without covering": re-queue the row once,
+/// behind the same backoff the failed-dependency requeue applies, and
+/// let the rebuild republish real shapes; `shape_requeue` latches the
+/// repair so it runs at most once.
 async fn requeue_incomplete_shape_deps(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -6781,7 +6885,6 @@ async fn requeue_incomplete_shape_deps(
            AND EXISTS ( \
                SELECT 1 FROM queue_dependencies d \
                WHERE d.depends_on_task_id = queue.task_id \
-                 AND d.dep_crate_name != '' AND d.dep_host_side >= 0 \
                  AND d.dep_met = 0 \
            ) \
          RETURNING task_id",
@@ -6859,10 +6962,13 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
     u32::try_from(value).map_err(|_| QueueError::Overflow { field, value })
 }
 
+/// The enqueue probe's per-row answer — status plus the stored
+/// explicit-spelling flag (stow#736).
 #[derive(Debug, skyzen::FromRow)]
-struct TaskIdRow {
+struct TaskStatusRow {
     task_id: String,
     status: String,
+    explicit_spelling: i64,
 }
 
 /// One `GROUP BY status, lane, blocked` aggregate row from [`status`].
@@ -6884,6 +6990,7 @@ struct TaskRow {
     target: String,
     rustc_version: String,
     host_side: i64,
+    explicit_spelling: i64,
     preserve_lockfile: i64,
     dispatch_key: String,
 }
@@ -6957,7 +7064,7 @@ struct GitHubAppTokenRow {
 mod tests {
     use super::{
         AlarmInputs, AlarmPlan, DispatchCapacity, SliceChangeKind, SliceRowJson,
-        normalize_gate_rows, normalized_gate_json, plan_alarm, seconds_until_utc_midnight,
+        normalize_gate_rows, plan_alarm, seconds_until_utc_midnight,
     };
     const NOW_MS: i64 = 1_000_000;
 
@@ -6989,10 +7096,8 @@ mod tests {
             (row(1, 0, 0), Some(SliceChangeKind::Added)),
             (row(1, 0, 1), Some(SliceChangeKind::Added)),
             (row(1, 1, 1), Some(SliceChangeKind::Added)),
-            (row(-1, 0, 1), Some(SliceChangeKind::Added)),
-            (row(0, -1, 1), Some(SliceChangeKind::Added)),
         ];
-        let normalized = normalize_gate_rows(added);
+        let normalized = normalize_gate_rows(added).expect("normalize valid rows");
         let shapes = normalized
             .iter()
             .map(|row| (row.unit_side, row.invocations, row.kind))
@@ -7005,7 +7110,8 @@ mod tests {
             ]
         );
 
-        let retired = normalize_gate_rows([(row(0, 0, 1), Some(SliceChangeKind::Retired))]);
+        let retired = normalize_gate_rows([(row(0, 0, 1), Some(SliceChangeKind::Retired))])
+            .expect("normalize retired row");
         assert_eq!(
             retired
                 .iter()
@@ -7014,17 +7120,21 @@ mod tests {
             vec![(0, 1, Some(SliceChangeKind::Retired))]
         );
 
-        let full = normalize_gate_rows([(row(0, 0, 0), None), (row(0, 1, 1), None)]);
+        let full =
+            normalize_gate_rows([(row(0, 0, 0), None), (row(0, 1, 1), None)]).expect("normalize");
         assert_eq!(
             full.iter()
                 .map(|row| (row.unit_side, row.invocations, row.kind))
                 .collect::<Vec<_>>(),
             vec![(0, 3, None)]
         );
-        assert_eq!(
-            normalized_gate_json([(row(-1, -1, -1), None)]).expect("normalize legacy rows"),
-            None
-        );
+        // Off-enum legs are corrupt storage (stow#730): an invariant
+        // error, not a skipped row.
+        for bad in [(-1, 0, 1), (0, -1, 1), (0, 0, 9)] {
+            let error = normalize_gate_rows([(row(bad.0, bad.1, bad.2), None)])
+                .expect_err("off-enum legs are an invariant failure");
+            assert!(error.to_string().contains("off-enum"), "{error}");
+        }
     }
 
     #[test]

@@ -264,9 +264,7 @@ pub enum UnitSide {
 }
 
 impl UnitSide {
-    /// The storage integer of one side value (`-1` marks a row that
-    /// carries no shape — registered before the field existed; it
-    /// satisfies no coverage check).
+    /// The storage integer of one side value.
     #[must_use]
     pub const fn to_int(self) -> i64 {
         match self {
@@ -275,8 +273,8 @@ impl UnitSide {
         }
     }
 
-    /// Decode one stored integer back into a side; `None` on the
-    /// legacy `-1` and any other value the table cannot carry.
+    /// Decode one stored integer back into a side; `None` on any value
+    /// the table cannot carry (a `-1` is corruption, not a row shape).
     #[must_use]
     pub const fn from_int(value: i64) -> Option<Self> {
         match value {
@@ -351,6 +349,40 @@ impl UnitInvocation {
     }
 }
 
+/// Whether a target-side unit at a host triple keys differently under
+/// the explicit `--target <host>` spelling (stow#736).
+///
+/// The difference exists exactly when a proc-macro is in the unit's
+/// `--extern` closure. Derived from the dependency subgraph, so it is
+/// not part of the task id.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExplicitSpelling {
+    /// The unit's key is the same under both spellings — no proc-macro
+    /// reaches its `--extern` closure, and host-side nodes always
+    /// (they already publish both spellings).
+    #[default]
+    KeysAsNative,
+    /// A proc-macro reaches the unit's `--extern` closure: the
+    /// proc-macro keys differently per spelling and every unit above
+    /// it hashes that in, so the unit must publish the shapes of both
+    /// invocation spellings.
+    KeysApart,
+}
+
 /// Whether a unit reaches the linker (`--emit` carries `link`) or
 /// stops at metadata — the check-phase shape.
 #[derive(
@@ -412,9 +444,7 @@ impl UnitKind {
 /// that produced it, and whether it links. The scheduler's dependency
 /// gate and the coverage checks compare this field — never values
 /// re-derived from a normalized profile, which would tie coverage to
-/// one profile's defaults. Rows registered before the field existed
-/// carry no shape and satisfy no coverage clause: they are unreachable
-/// under this lookup until the node rebuilds and republishes.
+/// one profile's defaults.
 #[derive(
     Debug,
     Clone,
@@ -449,8 +479,19 @@ pub struct UnitShape {
 /// links host units, because build scripts run and proc-macros load
 /// even under `cargo check` (their `--emit` always carries `link`),
 /// so the unlinked host shape does not exist.
+///
+/// The exception is a `KeysApart` target-side node whose own
+/// invocation is `Native` (stow#736): its `--extern` closure carries a
+/// proc-macro, so the explicit `--target <host>` spelling keys it
+/// differently and it owes the linked and unlinked shapes of both
+/// spellings. A `KeysApart` node already invoked `Target` — a cross
+/// target — changes nothing.
 #[must_use]
-pub fn required_unit_shapes(host_side: bool, invocation: UnitInvocation) -> Vec<UnitShape> {
+pub fn required_unit_shapes(
+    host_side: bool,
+    invocation: UnitInvocation,
+    explicit_spelling: ExplicitSpelling,
+) -> Vec<UnitShape> {
     if host_side {
         return [UnitInvocation::Native, UnitInvocation::Target]
             .map(|invocation| UnitShape {
@@ -460,13 +501,23 @@ pub fn required_unit_shapes(host_side: bool, invocation: UnitInvocation) -> Vec<
             })
             .into();
     }
-    [UnitKind::Unlinked, UnitKind::Linked]
-        .map(|kind| UnitShape {
-            side: UnitSide::Target,
-            invocation,
-            kind,
+    let invocations = if invocation == UnitInvocation::Native
+        && explicit_spelling == ExplicitSpelling::KeysApart
+    {
+        [UnitInvocation::Native, UnitInvocation::Target].as_slice()
+    } else {
+        std::slice::from_ref(&invocation)
+    };
+    invocations
+        .iter()
+        .flat_map(|invocation| {
+            [UnitKind::Unlinked, UnitKind::Linked].map(|kind| UnitShape {
+                side: UnitSide::Target,
+                invocation: *invocation,
+                kind,
+            })
         })
-        .into()
+        .collect()
 }
 
 /// Whether any of the invocation's crate types goes through the linker.
@@ -612,8 +663,9 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        UnitInvocation, UnitKind, UnitShape, UnitSide, detect_registry_crate_version,
-        normalized_cache_profile, required_unit_shapes, stable_registry_artifact_identity,
+        ExplicitSpelling, UnitInvocation, UnitKind, UnitShape, UnitSide,
+        detect_registry_crate_version, normalized_cache_profile, required_unit_shapes,
+        stable_registry_artifact_identity,
     };
     use crate::rustc::ParsedRustcArgs;
 
@@ -1099,7 +1151,7 @@ mod tests {
         for kind in [UnitKind::Unlinked, UnitKind::Linked] {
             assert_eq!(UnitKind::from_int(kind.to_int()), Some(kind));
         }
-        // Legacy rows carry -1 — a shapeless row decodes to nothing.
+        // A `-1` leg is corruption — it decodes to nothing.
         assert_eq!(UnitSide::from_int(-1), None);
         assert_eq!(UnitInvocation::from_int(-1), None);
         assert_eq!(UnitKind::from_int(-1), None);
@@ -1111,7 +1163,7 @@ mod tests {
         // spellings, linked only: cargo links host units in every
         // phase, so check and build produce the same host shape.
         assert_eq!(
-            required_unit_shapes(true, UnitInvocation::Target),
+            required_unit_shapes(true, UnitInvocation::Target, ExplicitSpelling::KeysAsNative),
             vec![
                 shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
                 shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
@@ -1120,17 +1172,57 @@ mod tests {
         // A target-side node serves the build shape and the check shape
         // of its own invocation only.
         assert_eq!(
-            required_unit_shapes(false, UnitInvocation::Native),
+            required_unit_shapes(
+                false,
+                UnitInvocation::Native,
+                ExplicitSpelling::KeysAsNative
+            ),
             vec![
                 shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Unlinked),
                 shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
             ]
         );
         assert_eq!(
-            required_unit_shapes(false, UnitInvocation::Target),
+            required_unit_shapes(
+                false,
+                UnitInvocation::Target,
+                ExplicitSpelling::KeysAsNative
+            ),
             vec![
                 shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Unlinked),
                 shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Linked),
+            ]
+        );
+    }
+
+    /// stow#736: a `KeysApart` target-side node invoked `Native` owes
+    /// both spellings' shapes — the explicit `--target <host>`
+    /// consumer looks it up at a different key. `KeysApart` under an
+    /// already-explicit invocation and `KeysAsNative` under either
+    /// change nothing.
+    #[test]
+    fn required_shapes_add_the_explicit_spelling_for_a_flagged_native_node() {
+        assert_eq!(
+            required_unit_shapes(false, UnitInvocation::Native, ExplicitSpelling::KeysApart),
+            vec![
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Unlinked),
+                shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Unlinked),
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Linked),
+            ]
+        );
+        assert_eq!(
+            required_unit_shapes(false, UnitInvocation::Target, ExplicitSpelling::KeysApart),
+            vec![
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Unlinked),
+                shape(UnitSide::Target, UnitInvocation::Target, UnitKind::Linked),
+            ]
+        );
+        assert_eq!(
+            required_unit_shapes(true, UnitInvocation::Native, ExplicitSpelling::KeysApart),
+            vec![
+                shape(UnitSide::Host, UnitInvocation::Native, UnitKind::Linked),
+                shape(UnitSide::Host, UnitInvocation::Target, UnitKind::Linked),
             ]
         );
     }

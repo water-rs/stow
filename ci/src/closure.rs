@@ -281,6 +281,7 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependency_subgraph: stow_types::api::TaskSubgraph {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),

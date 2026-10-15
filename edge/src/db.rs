@@ -20,9 +20,11 @@ struct QueuedDependencyGraphMissRow {
     target: String,
     rustc_version: String,
     host_side: i64,
+    /// The node's explicit-spelling flag (stow#736).
+    explicit_spelling: i64,
     seen_count: u64,
-    subgraph_json: Option<String>,
-    task_id: Option<String>,
+    subgraph_json: String,
+    task_id: String,
 }
 
 // URL-path inputs (from `Params::get(...)`) come in as `&str` and have not
@@ -133,9 +135,7 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
         )));
     }
     // `min_glibc` stores the floor as text: `''` for a measured artifact
-    // with no glibc requirement, `'x.y'` for the floor itself. NULL means
-    // "not yet measured" and is reserved for rows that predate the
-    // column — a sync write always writes a concrete value.
+    // with no glibc requirement, `'x.y'` for the floor itself.
     let min_glibc = record
         .min_glibc
         .map_or_else(String::new, |floor| floor.to_string());
@@ -150,6 +150,7 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
         .bind(record.version.to_string())
         .bind(record.features_json.raw())
         .bind(record.dependency_c_metadata_json.raw())
+        .bind(record.dependency_identity.as_str())
         .bind(record.oci_reference.as_str())
         .bind(record.oci_digest.as_str())
         .bind(i32::from(record.has_native))
@@ -161,13 +162,9 @@ fn artifact_record_statement(record: &ArtifactRecord) -> Result<BatchStatement, 
         .bind(record.bundle_digest.as_str())
         .bind(bundle_size)
         .bind(compile_millis)
-        .bind(record.unit_shape.map_or(-1, |shape| shape.side.to_int()))
-        .bind(
-            record
-                .unit_shape
-                .map_or(-1, |shape| shape.invocation.to_int()),
-        )
-        .bind(record.unit_shape.map_or(-1, |shape| shape.kind.to_int()))
+        .bind(record.unit_shape.side.to_int())
+        .bind(record.unit_shape.invocation.to_int())
+        .bind(record.unit_shape.kind.to_int())
         .bind(min_glibc.as_str()))
 }
 
@@ -219,13 +216,16 @@ struct FullArtifactRow {
     bundle_digest: String,
     bundle_size: u64,
     compile_millis: u64,
-    /// The builder-recorded unit shape — `-1` on a row registered
-    /// before the columns existed.
+    /// The Merkle dependency digest the artifact was built under —
+    /// `NOT NULL`, so a NULL surfacing here is store corruption the
+    /// decode rejects (stow#730).
+    dependency_identity: Option<String>,
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
     /// The measured glibc floor — `''` when measured with no
-    /// requirement, NULL on rows the measurement predates.
+    /// requirement; `NOT NULL`, so a NULL is corruption the decode
+    /// rejects.
     min_glibc: Option<String>,
 }
 
@@ -262,34 +262,43 @@ struct DecodedArtifactColumns {
     emit: Vec<String>,
 }
 
-/// The stored unit-shape triplet decoded back to a [`UnitShape`]:
-/// `-1` on all three legs is the legacy marker — a row registered
-/// before the columns existed is shapeless and covers nothing.
-/// Anything else off-enum, or `-1` mixed with real values, is a corrupt
-/// row — an invariant violation, not a quiet miss.
+/// The stored unit-shape triplet decoded back to a [`UnitShape`]: any
+/// leg off-enum — a `-1` included — is a corrupt row, an invariant
+/// violation rather than a quiet miss (stow#730).
 ///
 /// # Errors
 ///
 /// Returns an invariant message for any corrupt triplet.
-fn decode_unit_shape(side: i64, invocation: i64, linked: i64) -> Result<Option<UnitShape>, String> {
-    if (side, invocation, linked) == (-1, -1, -1) {
-        return Ok(None);
-    }
+pub fn decode_unit_shape(side: i64, invocation: i64, linked: i64) -> Result<UnitShape, String> {
     match (
         UnitSide::from_int(side),
         UnitInvocation::from_int(invocation),
         stow_types::public_cache::UnitKind::from_int(linked),
     ) {
-        (Some(side), Some(invocation), Some(kind)) => Ok(Some(UnitShape {
+        (Some(side), Some(invocation), Some(kind)) => Ok(UnitShape {
             side,
             invocation,
             kind,
-        })),
+        }),
         _ => Err(format!(
-            "corrupt unit shape ({side}, {invocation}, {linked}): -1 is the \
-             legacy marker and must appear on all three legs or none"
+            "corrupt unit shape ({side}, {invocation}, {linked})"
         )),
     }
+}
+
+/// The stored dependency-identity string decoded back to the typed
+/// digest: the column is `NOT NULL`, so a NULL is store corruption the
+/// invariant names, never data (stow#730).
+///
+/// # Errors
+///
+/// Returns an invariant message on NULL or an invalid digest.
+fn decode_dependency_identity(
+    raw: Option<&str>,
+) -> Result<stow_types::identity::DependencyIdentity, String> {
+    let raw = raw.ok_or_else(|| "NULL dependency_identity".to_owned())?;
+    stow_types::identity::DependencyIdentity::parse(raw)
+        .map_err(|error| format!("invalid dependency_identity `{raw}`: {error}"))
 }
 
 /// Decode the identity and JSON columns every row read shares, so
@@ -380,10 +389,8 @@ impl FullArtifactRow {
             version: decoded.version,
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
-            // stow#588: the artifacts table stores no digest column —
-            // a row decoded here is the archive's older shape, so its
-            // contextual coverage answer is `None`.
-            dependency_identity: None,
+            dependency_identity: decode_dependency_identity(self.dependency_identity.as_deref())
+                .map_err(|error| invalid("dependency_identity", error))?,
             oci_reference: self.oci_reference,
             oci_digest: self.oci_digest,
             has_native: self.has_native != 0,
@@ -402,12 +409,13 @@ impl FullArtifactRow {
 }
 
 /// The stored form of a row's glibc floor back into the typed field:
-/// `''` and NULL both decode to `None` — a record carries no
-/// "unmeasured" state, so an unmeasured row reads as floorless and the
-/// unmeasured listing keys on NULL in SQL, not on this value.
+/// `''` decodes to `None` (measured with no requirement), `'x.y'` to
+/// the floor. The column is `NOT NULL`, so a NULL is store corruption
+/// the invariant names, never "unmeasured" data.
 fn decode_min_glibc(raw: Option<&str>) -> Result<Option<stow_types::glibc::GlibcVersion>, String> {
     match raw {
-        None | Some("") => Ok(None),
+        None => Err("NULL min_glibc".to_owned()),
+        Some("") => Ok(None),
         Some(text) => text
             .parse::<stow_types::glibc::GlibcVersion>()
             .map(Some)
@@ -436,8 +444,9 @@ struct IndexArtifactRow {
     crate_types_json: String,
     profile_json: String,
     emit_json: String,
-    /// The builder-recorded unit shape — `-1` on a row registered
-    /// before the columns existed.
+    /// `NOT NULL` — a NULL reaching the decode is store corruption,
+    /// not data (stow#730).
+    dependency_identity: Option<String>,
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
@@ -468,8 +477,13 @@ impl IndexArtifactRow {
             version: decoded.version,
             features_json: decoded.features_json,
             dependency_c_metadata_json: decoded.dependency_c_metadata_json,
-            // stow#588: same archive row shape — no digest column.
-            dependency_identity: None,
+            dependency_identity: decode_dependency_identity(self.dependency_identity.as_deref())
+                .map_err(|error| {
+                    DbError::Invariant(format!(
+                        "artifact row {}/{}/{}: dependency_identity: {error}",
+                        self.c_metadata, self.target, self.rustc_version
+                    ))
+                })?,
             c_metadata: decoded.c_metadata,
             compile_key: self.compile_key,
             bundle_digest: self.bundle_digest,
@@ -496,8 +510,7 @@ impl IndexArtifactRow {
 }
 
 /// One page of the servable `(target, rustc_version)` slice for the
-/// published artifact index: every row with a pushed bundle (non-empty
-/// `bundle_digest`), ordered by `c_metadata`, starting strictly
+/// published artifact index, ordered by `c_metadata`, starting strictly
 /// after the `after` cursor. `limit` bounds the page; the caller turns a
 /// full page into a `next_after` cursor.
 pub async fn artifact_index_page(
@@ -511,19 +524,6 @@ pub async fn artifact_index_page(
     validate_rustc_version(rustc_version)?;
     if let Some(after) = after {
         validate_c_metadata(after)?;
-    } else {
-        // The page query drops unmeasured rows, so exporting a slice
-        // that still has any would sign an index missing rows it used
-        // to carry. Refuse instead — a NULL floor means a row older
-        // than the column survived into the mirror, which should not
-        // exist: fix the row before re-exporting.
-        let unmeasured = unmeasured_glibc_count_in_slice(db, target, rustc_version).await?;
-        if unmeasured > 0 {
-            return Err(DbError::Invariant(format!(
-                "slice {target}/{rustc_version} has {unmeasured} artifact rows with \
-                 no measured glibc floor",
-            )));
-        }
     }
     let limit = i64::try_from(limit)
         .map_err(|_| DbError::Invariant(format!("index page limit {limit} exceeds i64")))?;
@@ -531,11 +531,10 @@ pub async fn artifact_index_page(
         .query(
             "SELECT crate_name, version, features_json, dependency_c_metadata_json, c_metadata, \
                     compile_key, target, rustc_version, bundle_digest, bundle_size, artifact_kind, \
-                    crate_types_json, profile_json, emit_json, unit_side, unit_invocation, unit_linked, \
+                    crate_types_json, profile_json, emit_json, dependency_identity, unit_side, unit_invocation, unit_linked, \
                     min_glibc \
              FROM artifacts \
-             WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
-                   AND min_glibc IS NOT NULL AND c_metadata > ? \
+             WHERE target = ? AND rustc_version = ? AND c_metadata > ? \
              ORDER BY c_metadata LIMIT ?",
         )
         .bind(target)
@@ -558,27 +557,7 @@ const FULL_ARTIFACT_COLUMNS: &str = "compile_key, c_metadata, extra_filename, ta
      rustc_version, crate_name, version, features_json, dependency_c_metadata_json, \
      oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, \
      profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, \
-     unit_side, unit_invocation, unit_linked, min_glibc";
-
-/// How many bundled rows in one `(target, rustc_version)` slice still
-/// have no measured floor — the rows the index page's `min_glibc IS NOT
-/// NULL` filter would silently drop from a signed export.
-async fn unmeasured_glibc_count_in_slice(
-    db: &Db,
-    target: &str,
-    rustc_version: &str,
-) -> Result<u64, DbError> {
-    db.query(
-        "SELECT COUNT(*) FROM artifacts \
-         WHERE target = ? AND rustc_version = ? AND bundle_digest != '' \
-               AND min_glibc IS NULL",
-    )
-    .bind(target)
-    .bind(rustc_version)
-    .fetch_scalar::<u64>()
-    .await
-    .map_err(|error| DbError::Query(format!("unmeasured count query: {error}")))
-}
+     dependency_identity, unit_side, unit_invocation, unit_linked, min_glibc";
 
 /// One servable-identity row for the coverage listing.
 #[derive(Debug, skyzen::FromRow)]
@@ -608,7 +587,7 @@ pub async fn artifact_coverage(
     validate_crate_name(crate_name)?;
     let mut sql = String::from(
         "SELECT target, version, features_json, rustc_version, c_metadata, bundle_size \
-         FROM artifacts WHERE crate_name = ? AND bundle_digest != ''",
+         FROM artifacts WHERE crate_name = ?",
     );
     if let Some(version) = version {
         parse_semver(version)?;
@@ -763,10 +742,7 @@ pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<
 /// breaks servability on a baseline host — the row publishes, but the
 /// pending rebuild that exists to replace it must not be retired as
 /// covered. Floors compare as `GlibcVersion`, never as text (`'2.4'`
-/// sorts above `'2.28'`); an unmeasured (NULL) row covers as before.
-/// Rows registered before the unit shape columns existed carry `-1` —
-/// shapeless, they match no required shape and the identity stays
-/// uncovered until the node rebuilds and re-registers.
+/// sorts above `'2.28'`).
 pub async fn covered_semantic_identities(
     db: &Db,
     identities: &[SemanticTaskIdentity],
@@ -804,8 +780,7 @@ async fn covered_batch(
         "SELECT crate_name, version, features_json, target, rustc_version, min_glibc, \
                 unit_side, unit_invocation, unit_linked \
          FROM artifacts \
-         WHERE bundle_digest != '' \
-           AND (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
+         WHERE (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
         sql_batch::values_rows("(?, ?, ?, ?, ?)", batch.len())
     );
     let mut query = db.query(&sql);
@@ -836,25 +811,23 @@ async fn covered_batch(
         if floor.is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE) {
             continue;
         }
-        if let Some(shape) = decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
+        let shape = decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
             .map_err(|error| {
                 DbError::Invariant(format!(
                     "artifact row {}/{}: {error}",
                     row.target, row.rustc_version
                 ))
-            })?
-        {
-            shapes_by_identity
-                .entry((
-                    row.crate_name,
-                    row.version,
-                    row.features_json,
-                    row.target,
-                    row.rustc_version,
-                ))
-                .or_default()
-                .insert(shape);
-        }
+            })?;
+        shapes_by_identity
+            .entry((
+                row.crate_name,
+                row.version,
+                row.features_json,
+                row.target,
+                row.rustc_version,
+            ))
+            .or_default()
+            .insert(shape);
     }
     let mut covered = BTreeSet::new();
     for identity in batch {
@@ -865,7 +838,8 @@ async fn covered_batch(
             .map_or(UnitInvocation::Target, |family| {
                 UnitInvocation::for_task(identity.target.as_str(), family.host_triple())
             });
-        let required = required_unit_shapes(identity.host_side, invocation);
+        let required =
+            required_unit_shapes(identity.host_side, invocation, identity.explicit_spelling);
         let covered_all = required.iter().all(|shape| {
             shapes_by_identity
                 .get(&(
@@ -898,9 +872,10 @@ struct CoveredIdentityRow {
 }
 
 /// The outcome of one admitted-miss drain: the requests re-minted from
-/// stored subgraphs, plus how many rows were consumed without one —
-/// historical rows carry NULL context and are never promoted to a
-/// guessed one; they drain as an explicit skip (stow#588).
+/// stored subgraphs, plus how many rows were consumed without one — a
+/// row whose stored subgraph does not decode or whose stored task id
+/// disagrees is never promoted to a guessed context; it drains as an
+/// explicit skip (stow#588).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MissDrain {
     pub requests: Vec<EnqueueRequest>,
@@ -911,13 +886,10 @@ pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissD
     let limit =
         i64::try_from(limit).map_err(|_| format!("miss drain limit exceeds i64: {limit}"))?;
     // Opportunistic cleanup: rows already handed to the scheduler stop
-    // mattering once the queue has owned them for a while. Rows with no
-    // `admitted_at` are leftovers from when analysis persisted every miss —
-    // they age out, and no new ones are written.
+    // mattering once the queue has owned them for a while.
     db.query(
         "DELETE FROM dependency_graph_misses \
-         WHERE (queued_at IS NOT NULL AND queued_at <= datetime('now', '-7 days')) \
-            OR (admitted_at IS NULL AND last_seen_at <= datetime('now', '-30 days'))",
+         WHERE queued_at IS NOT NULL AND queued_at <= datetime('now', '-7 days')",
     )
     .execute()
     .await
@@ -928,9 +900,9 @@ pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissD
     // channel for unadmitted misses.
     let rows = db
         .query(
-            "SELECT crate_name, version, features_json, target, rustc_version, host_side, seen_count, subgraph_json, task_id \
+            "SELECT crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, seen_count, subgraph_json, task_id \
              FROM dependency_graph_misses \
-             WHERE admitted_at IS NOT NULL AND queued_at IS NULL \
+             WHERE queued_at IS NULL \
              ORDER BY seen_count DESC, last_seen_at DESC, first_seen_at ASC \
              LIMIT ?",
         )
@@ -969,10 +941,10 @@ pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissD
 }
 
 /// Re-mint one miss row's `EnqueueRequest` from the subgraph its
-/// verified admission stored — `None` is an explicit skip: NULL context
-/// (a historical row), an undecodable subgraph, or a stored task id
-/// that disagrees with what the subgraph derives is never promoted to
-/// a guessed context (stow#588). Field decode failures are errors.
+/// verified admission stored — `None` is an explicit skip: an
+/// undecodable subgraph or a stored task id that disagrees with what
+/// the subgraph derives is never promoted to a guessed context
+/// (stow#588). Field decode failures are errors.
 fn miss_request(row: &QueuedDependencyGraphMissRow) -> Result<Option<EnqueueRequest>, DbError> {
     let crate_name = stow_types::identity::CrateName::parse(row.crate_name.as_str())
         .map_err(|error| format!("draining miss crate_name `{}`: {error}", row.crate_name))?;
@@ -993,11 +965,8 @@ fn miss_request(row: &QueuedDependencyGraphMissRow) -> Result<Option<EnqueueRequ
             row.rustc_version
         )
     })?;
-    let Some(subgraph_json) = row.subgraph_json.as_deref() else {
-        return Ok(None);
-    };
     let dependency_subgraph = match serde_json::from_str::<stow_types::api::TaskSubgraph>(
-        subgraph_json,
+        &row.subgraph_json,
     ) {
         Ok(subgraph) => subgraph,
         Err(error) => {
@@ -1016,11 +985,16 @@ fn miss_request(row: &QueuedDependencyGraphMissRow) -> Result<Option<EnqueueRequ
         dependency_subgraph,
         preserve_lockfile: false,
         host_side: row.host_side != 0,
+        explicit_spelling: if row.explicit_spelling != 0 {
+            stow_types::public_cache::ExplicitSpelling::KeysApart
+        } else {
+            stow_types::public_cache::ExplicitSpelling::KeysAsNative
+        },
     };
     let derived_task_id = request
         .task_id()
         .map_err(|error| format!("draining miss task id: {error}"))?;
-    if row.task_id.as_deref() != Some(derived_task_id.as_str()) {
+    if row.task_id != derived_task_id.as_str() {
         tracing::warn!(crate_name = %row.crate_name, task_id = %derived_task_id, stored = ?row.task_id, "skipping a miss drain row whose stored task id disagrees with its subgraph");
         return Ok(None);
     }
@@ -1083,14 +1057,15 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
         .map_err(|error| format!("derive admitted miss task id: {error}"))?;
     db.query(
         "INSERT INTO dependency_graph_misses \
-         (crate_name, version, features_json, target, rustc_version, host_side, depends_on_json, subgraph_json, task_id, seen_count, first_seen_at, last_seen_at, admitted_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
+         (crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, depends_on_json, subgraph_json, task_id, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
          ON CONFLICT(crate_name, version, features_json, target, rustc_version, host_side) \
          DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), \
              depends_on_json = CASE WHEN excluded.depends_on_json IN ('', '[]') \
                  THEN dependency_graph_misses.depends_on_json \
                  ELSE excluded.depends_on_json END, \
-             subgraph_json = excluded.subgraph_json, task_id = excluded.task_id",
+             subgraph_json = excluded.subgraph_json, task_id = excluded.task_id, \
+             explicit_spelling = excluded.explicit_spelling",
     )
     .bind(request.crate_name.as_str())
     .bind(request.version.to_string())
@@ -1098,6 +1073,9 @@ pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(
     .bind(request.target.as_str())
     .bind(request.rustc_version.as_str())
     .bind(i64::from(request.host_side))
+    .bind(i64::from(
+        request.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart,
+    ))
     .bind(depends_on_json)
     .bind(subgraph_json)
     .bind(task_id)
@@ -1165,13 +1143,18 @@ mod sqlite_tests {
 
     fn artifact_record_with(c_metadata: &str, oci_digest: &str) -> ArtifactRecord {
         ArtifactRecord {
-            dependency_identity: None,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity"),
             compile_key: format!("{c_metadata}{c_metadata}"),
             c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
             extra_filename: format!("-{c_metadata}"),
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
-            unit_shape: None,
+            unit_shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Native,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
             profile: Profile {
                 opt_level: "0".to_owned(),
                 debuginfo: 0,
@@ -1223,6 +1206,7 @@ mod sqlite_tests {
             source: stow_types::api::EnqueueSource::CacheMiss,
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
@@ -1256,6 +1240,7 @@ mod sqlite_tests {
                 features_json: FeaturesJson::canonicalize(vec!["derive".to_owned()])
                     .expect("dep features"),
                 host_side: false,
+                keys_apart: false,
                 deps: Vec::new(),
             }],
         };
@@ -1354,42 +1339,6 @@ mod sqlite_tests {
         );
     }
 
-    /// A historical row — `admitted_at` set but no stored subgraph —
-    /// drains as an explicit skip: it is consumed (`queued_at` marked),
-    /// counted in the drain, and never promoted to a guessed context
-    /// (stow#588).
-    #[tokio::test]
-    async fn a_row_without_a_stored_subgraph_drains_as_a_skip() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        apply_schema(&db).await;
-        db.query(
-            "INSERT INTO dependency_graph_misses \
-             (crate_name, version, features_json, target, rustc_version, host_side, depends_on_json, seen_count, admitted_at) \
-             VALUES ('serde', '1.0.5', '[]', 'x86_64-unknown-linux-gnu', '1.85.0', 0, '[]', 3, datetime('now'))",
-        )
-        .execute()
-        .await
-        .expect("seed historical miss");
-
-        let drain = take_dependency_graph_misses(&db, 10)
-            .await
-            .expect("take misses");
-        assert_eq!(drain.requests, Vec::<EnqueueRequest>::new());
-        assert_eq!(drain.skipped, 1);
-        assert_eq!(
-            miss_count_where(&db, "queued_at IS NOT NULL").await,
-            1,
-            "the skipped row is consumed, not left to retry forever"
-        );
-        // Nothing drainable remains: the row does not keep coming back.
-        let drain = take_dependency_graph_misses(&db, 10)
-            .await
-            .expect("take misses");
-        assert_eq!(drain.requests.len() + drain.skipped, 0);
-    }
-
     /// A host miss and a target miss at one semantic identity are two
     /// nodes: neither upserts the other, and each drains as its own
     /// side (stow#367 — the 5-tuple primary key used to merge them and
@@ -1410,6 +1359,7 @@ mod sqlite_tests {
                 version: CrateVersion::new(semver::Version::parse("0.5.0").expect("dep version")),
                 features_json: FeaturesJson::canonicalize(Vec::new()).expect("dep features"),
                 host_side: true,
+                keys_apart: false,
                 deps: Vec::new(),
             }],
         };
@@ -1446,8 +1396,7 @@ mod sqlite_tests {
         );
     }
 
-    /// Coverage is exact on every identity column and ignores rows without
-    /// a published bundle, which serving lookups treat as a miss too.
+    /// Coverage is exact on every identity column.
     #[tokio::test]
     async fn covered_identities_match_servable_rows_exactly() {
         let db = skyzen_services::Db::connect_sqlite_memory()
@@ -1459,12 +1408,10 @@ mod sqlite_tests {
         // publishes are servable: the build unit and the check unit —
         // a second row at a different `c_metadata` (the check unit's
         // compile identity differs from the build unit's).
-        let unit_shape = |kind| {
-            Some(stow_types::public_cache::UnitShape {
-                side: stow_types::public_cache::UnitSide::Target,
-                invocation: stow_types::public_cache::UnitInvocation::Native,
-                kind,
-            })
+        let unit_shape = |kind| stow_types::public_cache::UnitShape {
+            side: stow_types::public_cache::UnitSide::Target,
+            invocation: stow_types::public_cache::UnitInvocation::Native,
+            kind,
         };
         let record = ArtifactRecord {
             unit_shape: unit_shape(stow_types::public_cache::UnitKind::Linked),
@@ -1489,6 +1436,7 @@ mod sqlite_tests {
             target: target.to_owned(),
             rustc_version: RUSTC.to_owned(),
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         };
         let exact = identity(&record.features_json.raw(), TARGET);
         let other_features = identity("[\"extra\"]", TARGET);
@@ -1499,17 +1447,6 @@ mod sqlite_tests {
                 .await
                 .expect("coverage");
         assert_eq!(covered, BTreeSet::from([exact.clone()]));
-
-        db.query("UPDATE artifacts SET bundle_digest = ''")
-            .execute()
-            .await
-            .expect("age the row to the pre-bundle schema");
-        assert_eq!(
-            covered_semantic_identities(&db, std::slice::from_ref(&exact))
-                .await
-                .expect("coverage"),
-            BTreeSet::new()
-        );
     }
 
     /// A host-side node is covered only when the slice serves every
@@ -1530,6 +1467,7 @@ mod sqlite_tests {
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
             host_side: true,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         };
 
         let base = artifact_record(FIRST_DIGEST);
@@ -1540,11 +1478,11 @@ mod sqlite_tests {
             crate_name: CrateName::parse("heck").expect("name"),
             version: CrateVersion::new(semver::Version::parse("0.5.0").expect("version")),
             features_json: FeaturesJson::canonicalize(Vec::<String>::new()).expect("features"),
-            unit_shape: Some(stow_types::public_cache::UnitShape {
+            unit_shape: stow_types::public_cache::UnitShape {
                 side: stow_types::public_cache::UnitSide::Host,
                 invocation,
                 kind,
-            }),
+            },
             oci_reference: format!("{}.{}", base.oci_reference, c_metadata),
             ..base.clone()
         };
@@ -1606,7 +1544,7 @@ mod sqlite_tests {
     /// it must not count as coverage, or the retire oracle would kill
     /// the pending rebuild that exists to replace it. The compare is
     /// `GlibcVersion`, never text: `'2.4'` sorts above `'2.28'` as a
-    /// string. An unmeasured NULL row covers as before.
+    /// string.
     ///
     /// Coverage needs both rules at once: each identity's rows carry the
     /// two target-side shapes a native invocation requires, so only the
@@ -1640,11 +1578,11 @@ mod sqlite_tests {
                     extra_filename: format!("-{c_metadata_prefix}{i}"),
                     compile_key: format!("{c_metadata_prefix}{i}{c_metadata_prefix}{i}"),
                     version: CrateVersion::new(semver::Version::parse(version).expect("version")),
-                    unit_shape: Some(stow_types::public_cache::UnitShape {
+                    unit_shape: stow_types::public_cache::UnitShape {
                         side: stow_types::public_cache::UnitSide::Target,
                         invocation: stow_types::public_cache::UnitInvocation::Native,
                         kind: *kind,
-                    }),
+                    },
                     min_glibc,
                     oci_reference: format!(
                         "{}.{c_metadata_prefix}{i}",
@@ -1654,19 +1592,13 @@ mod sqlite_tests {
                 })
                 .collect()
             };
-        // Four identities at distinct floors: 2.39 (over), 2.28 (at
-        // baseline), measured-no-floor (''), and NULL (unmeasured —
-        // pre-column rows).
+        // Three identities at distinct floors: 2.39 (over), 2.28 (at
+        // baseline), measured-no-floor ('').
         let mut rows: Vec<ArtifactRecord> = Vec::new();
         rows.extend(shaped_pair("bbbbbbbbbbbbbbb", "1.0.0", floor(39)));
         rows.extend(shaped_pair("ccccccccccccccc", "1.0.1", floor(28)));
         rows.extend(shaped_pair("ddddddddddddddd", "1.0.2", None));
-        rows.extend(shaped_pair("fffffffffffffff", "1.0.3", floor(39)));
         insert_artifact_records(&db, &rows).await.expect("insert");
-        db.query("UPDATE artifacts SET min_glibc = NULL WHERE c_metadata LIKE 'fffffffffffffff%'")
-            .execute()
-            .await
-            .expect("unmeasure the fourth identity's rows");
         // The over-floor identity also carries a baseline sibling pair:
         // coverage is any-servable-row per shape, so it covers after
         // all — only the 2.39-alone identity must not.
@@ -1676,19 +1608,14 @@ mod sqlite_tests {
 
         let covered = covered_semantic_identities(
             &db,
-            &[
-                over_identity(),
-                baseline_identity(),
-                no_floor_identity(),
-                null_identity(),
-            ],
+            &[over_identity(), baseline_identity(), no_floor_identity()],
         )
         .await
         .expect("coverage");
         assert_eq!(
             covered.len(),
-            4,
-            "over-floor-alone, at-baseline, no-floor and NULL identities all cover — but see below"
+            3,
+            "over-floor-alone, at-baseline and no-floor identities all cover — but see below"
         );
 
         // Removing the baseline sibling leaves the 1.0.0 identity with
@@ -1699,16 +1626,11 @@ mod sqlite_tests {
             .expect("drop sibling");
         let covered = covered_semantic_identities(
             &db,
-            &[
-                over_identity(),
-                baseline_identity(),
-                no_floor_identity(),
-                null_identity(),
-            ],
+            &[over_identity(), baseline_identity(), no_floor_identity()],
         )
         .await
         .expect("coverage");
-        assert_eq!(covered.len(), 3);
+        assert_eq!(covered.len(), 2);
         assert!(!covered.contains(&over_identity()));
     }
 
@@ -1721,9 +1643,6 @@ mod sqlite_tests {
     fn no_floor_identity() -> SemanticTaskIdentity {
         identity_at("1.0.2")
     }
-    fn null_identity() -> SemanticTaskIdentity {
-        identity_at("1.0.3")
-    }
     fn identity_at(version: &str) -> SemanticTaskIdentity {
         SemanticTaskIdentity {
             crate_name: "serde".to_owned(),
@@ -1734,6 +1653,7 @@ mod sqlite_tests {
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
@@ -1788,8 +1708,7 @@ mod sqlite_tests {
     }
 
     /// Two pages walk every servable row of the slice exactly once, in
-    /// `c_metadata` order; the one pre-bundle row — sorted first so an
-    /// off-by-one at the slice head would surface it — never appears.
+    /// `c_metadata` order.
     #[tokio::test]
     async fn index_pages_walk_every_servable_row_once() {
         let db = skyzen_services::Db::connect_sqlite_memory()
@@ -1802,18 +1721,6 @@ mod sqlite_tests {
                 .await
                 .expect("insert servable row");
         }
-        let unbundled = "0f0f0f0f0f0f0f0f";
-        insert_artifact_records(&db, &[artifact_record_with(unbundled, FIRST_DIGEST)])
-            .await
-            .expect("insert unbundled row");
-        db.query(&format!(
-            "UPDATE artifacts SET bundle_digest = '', bundle_size = 0 \
-             WHERE c_metadata = '{unbundled}'"
-        ))
-        .execute()
-        .await
-        .expect("age the row to the pre-bundle schema");
-
         let first = artifact_index_page(&db, TARGET, RUSTC, None, 2)
             .await
             .expect("first page");
@@ -1972,7 +1879,7 @@ mod coverage_concurrency_tests {
                         "unit_side": UnitSide::Target.to_int(),
                         "unit_invocation": UnitInvocation::Native.to_int(),
                         "unit_linked": kind.to_int(),
-                        "min_glibc": null,
+                        "min_glibc": "",
                     })
                 })
             })
@@ -1996,6 +1903,7 @@ mod coverage_concurrency_tests {
             target: "x86_64-unknown-linux-gnu".to_owned(),
             rustc_version: "1.85.0".to_owned(),
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
 
@@ -2072,7 +1980,7 @@ mod coverage_concurrency_tests {
             "unit_side": 9,
             "unit_invocation": 0,
             "unit_linked": 0,
-            "min_glibc": null,
+            "min_glibc": "",
         });
         let (db, _state) = held_db(HeldResponse::Rows(vec![corrupt]));
         let identities: Vec<SemanticTaskIdentity> = (0..21).map(identity).collect();

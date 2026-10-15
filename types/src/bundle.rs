@@ -263,11 +263,9 @@ pub struct ArtifactBlobConfig {
     pub features_json: FeaturesJson,
     /// Sorted dependency identities driving the cache key.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// The Merkle dependency digest the bundle was built under
-    /// (stow#588). `None` on bundles written before the digest existed —
-    /// `None` answers no contextual coverage query.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dependency_identity: Option<crate::identity::DependencyIdentity>,
+    /// The Merkle dependency digest of the dependency subgraph the bundle
+    /// was built under (stow#588) — the node's context key.
+    pub dependency_identity: crate::identity::DependencyIdentity,
     /// JSON-encoded compile keys of dependencies.
     pub dependency_compile_keys_json: String,
     /// Cargo profile.
@@ -276,10 +274,8 @@ pub struct ArtifactBlobConfig {
     pub emit: Vec<String>,
     /// Bundle size in bytes.
     pub artifact_size: u64,
-    /// Wall-clock milliseconds the captured rustc invocation took. Bundles
-    /// published before the field existed carry no timing and count as zero
-    /// CPU time saved.
-    #[serde(default)]
+    /// Wall-clock milliseconds the captured rustc invocation took — what a
+    /// served hit on this artifact is credited as CPU time saved.
     pub compile_millis: u64,
     /// Artifact kind.
     pub kind: ArtifactKind,

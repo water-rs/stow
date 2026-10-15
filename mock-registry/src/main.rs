@@ -20,7 +20,6 @@ use axum::{
 };
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
-use rusqlite::Connection;
 use sha2::Digest;
 use sigstore::cosign::payload::SimpleSigning;
 use sigstore::crypto::signing_key::SigStoreKeyPair;
@@ -88,9 +87,6 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
     let plans = load_upload_plan(&request.upload_plan_path).await?;
     validate_upload_plan(&plans)?;
     create_dir_all(&request.registry_root).await?;
-    if let Some(parent) = request.sqlite_path.as_ref().and_then(|p| p.parent()) {
-        create_dir_all(parent).await?;
-    }
 
     let key_pair = load_key_pair(&request.private_key_path).await?;
     if let Some(public_key_path) = request.public_key_path.as_ref() {
@@ -126,9 +122,6 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
         &min_glibc_by_reference,
     )?;
     write_records_outputs(&request, &records).await?;
-    if let Some(sqlite_path) = request.sqlite_path.as_ref() {
-        upsert_sqlite(sqlite_path, &records).await?;
-    }
     tracing::info!(
         artifacts = records.len(),
         "mock registry population completed"
@@ -149,7 +142,7 @@ async fn publish_index(request: PublishIndexArgs) -> stow_types::error::Result<(
     let index_bytes = read(&request.file).await.map_err(|error| {
         stow_types::stow_error!("read index file {}: {error}", request.file.display())
     })?;
-    let index = stow_types::index::decode(&index_bytes).map_err(|error| {
+    let index = ArtifactIndex::decode(&index_bytes).map_err(|error| {
         stow_types::stow_error!("decode index file {}: {error}", request.file.display())
     })?;
     write_signed_index(
@@ -768,7 +761,7 @@ async fn write_mock_registry_entry(
         rustc_version: plan.rustc_version.clone(),
         features_json: plan.features_json.clone(),
         dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
-        dependency_identity: Some(plan.dependency_identity.clone()),
+        dependency_identity: plan.dependency_identity.clone(),
         dependency_compile_keys_json: plan.dependency_compile_keys_json.clone(),
         profile: plan.profile.clone(),
         emit: plan.emit.clone(),
@@ -1036,103 +1029,7 @@ async fn write_records_outputs(
                 stow_types::stow_error!("write artifact records {}: {error}", path.display())
             })?;
     }
-    if let Some(path) = request.sql_output_path.as_ref() {
-        if let Some(parent) = path.parent() {
-            create_dir_all(parent).await?;
-        }
-        write(path, build_sql(records)).await.map_err(|error| {
-            stow_types::stow_error!("write artifact SQL {}: {error}", path.display())
-        })?;
-    }
     Ok(())
-}
-
-async fn upsert_sqlite(path: &Path, records: &[ArtifactRecord]) -> stow_types::error::Result<()> {
-    let sqlite_path = path.to_path_buf();
-    let records = records.to_vec();
-    smol::unblock(move || -> stow_types::error::Result<()> {
-        let mut connection = Connection::open(&sqlite_path)
-            .map_err(|error| stow_types::stow_error!("open sqlite {}: {error}", sqlite_path.display()))?;
-        // The mirror tracks the edge's one schema — recreate it the way
-        // an operator resets the real store: drop every object
-        // `sqlite_master` reports, then execute the schema file.
-        let objects = connection
-            .prepare(
-                "SELECT type, name FROM sqlite_master \
-                 WHERE type IN ('table', 'index', 'trigger', 'view') \
-                   AND name NOT GLOB 'sqlite_*'",
-            )
-            .map_err(|error| {
-                stow_types::stow_error!("list sqlite objects {}: {error}", sqlite_path.display())
-            })?
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|error| {
-                stow_types::stow_error!("query sqlite_master {}: {error}", sqlite_path.display())
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                stow_types::stow_error!("read sqlite_master row {}: {error}", sqlite_path.display())
-            })?;
-        for (kind, name) in &objects {
-            connection
-                .execute_batch(&format!("DROP {} IF EXISTS {name}", kind.to_uppercase()))
-                .map_err(|error| {
-                    stow_types::stow_error!("drop {kind} {name} in {}: {error}", sqlite_path.display())
-                })?;
-        }
-        connection
-            .execute_batch(include_str!("../../edge/schema.sql"))
-            .map_err(|error| {
-                stow_types::stow_error!("apply sqlite schema {}: {error}", sqlite_path.display())
-            })?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| stow_types::stow_error!("begin sqlite transaction {}: {error}", sqlite_path.display()))?;
-        let sql = "INSERT INTO artifacts (compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, bundle_digest=excluded.bundle_digest, bundle_size=excluded.bundle_size, compile_millis=excluded.compile_millis, created_at=datetime('now')";
-        let mut statement = transaction
-            .prepare(sql)
-            .map_err(|error| stow_types::stow_error!("prepare sqlite upsert {}: {error}", sqlite_path.display()))?;
-        for record in &records {
-            let crate_types_json = serde_json::to_string(&record.crate_types)?;
-            let profile_json = serde_json::to_string(&record.profile)?;
-            let emit_json = serde_json::to_string(&record.emit)?;
-            // SQLite integers are i64; rusqlite no longer binds u64
-            // directly.
-            let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-            statement
-                .execute(rusqlite::params![
-                    record.compile_key,
-                    record.c_metadata.as_str(),
-                    record.extra_filename,
-                    record.target.as_str(),
-                    record.rustc_version.as_str(),
-                    record.crate_name.as_str(),
-                    record.version.to_string(),
-                    record.features_json.raw(),
-                    record.dependency_c_metadata_json.raw(),
-                    record.oci_reference,
-                    record.oci_digest,
-                    if record.has_native { 1 } else { 0 },
-                    record.artifact_kind.as_str(),
-                    crate_types_json,
-                    profile_json,
-                    emit_json,
-                    to_i64(record.artifact_size),
-                    record.bundle_digest,
-                    to_i64(record.bundle_size),
-                    to_i64(record.compile_millis),
-                ])
-                .map_err(|error| stow_types::stow_error!("upsert sqlite artifact {} {} {}: {error}", record.crate_name, record.target, record.c_metadata))?;
-        }
-        drop(statement);
-        transaction
-            .commit()
-            .map_err(|error| stow_types::stow_error!("commit sqlite transaction {}: {error}", sqlite_path.display()))?;
-        Ok(())
-    })
-    .await
 }
 
 async fn write_blob(root: &Path, digest: &str, bytes: &[u8]) -> stow_types::error::Result<()> {
@@ -1247,72 +1144,6 @@ fn split_reference(reference: &str) -> stow_types::error::Result<(String, String
     Ok((repo.to_string(), tag.to_owned()))
 }
 
-fn build_sql(records: &[ArtifactRecord]) -> Vec<u8> {
-    let mut sql = String::from("BEGIN;\n");
-    for record in records {
-        let crate_types_json = serde_json::to_string(&record.crate_types)
-            .expect("crate_types serialization must succeed");
-        let profile_json =
-            serde_json::to_string(&record.profile).expect("profile serialization must succeed");
-        let emit_json =
-            serde_json::to_string(&record.emit).expect("emit serialization must succeed");
-        sql.push_str("INSERT INTO artifacts (");
-        sql.push_str("compile_key, c_metadata, extra_filename, target, rustc_version, crate_name, version, features_json, dependency_c_metadata_json, oci_reference, oci_digest, has_native, artifact_kind, crate_types_json, profile_json, emit_json, artifact_size, bundle_digest, bundle_size, compile_millis, created_at");
-        sql.push_str(") VALUES (");
-        sql.push_str(&sql_quote(&record.compile_key));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(record.c_metadata.as_str()));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.extra_filename));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(record.target.as_str()));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(record.rustc_version.as_str()));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(record.crate_name.as_str()));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.version.to_string()));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.features_json.raw()));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.dependency_c_metadata_json.raw()));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.oci_reference));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.oci_digest));
-        sql.push_str(", ");
-        sql.push_str(if record.has_native { "1" } else { "0" });
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(record.artifact_kind.as_str()));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&crate_types_json));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&profile_json));
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&emit_json));
-        sql.push_str(", ");
-        sql.push_str(&record.artifact_size.to_string());
-        sql.push_str(", ");
-        sql.push_str(&sql_quote(&record.bundle_digest));
-        sql.push_str(", ");
-        sql.push_str(&record.bundle_size.to_string());
-        sql.push_str(", ");
-        sql.push_str(&record.compile_millis.to_string());
-        sql.push_str(
-            ", datetime('now')) ON CONFLICT(c_metadata, target, rustc_version) DO UPDATE SET ",
-        );
-        sql.push_str("compile_key=excluded.compile_key, extra_filename=excluded.extra_filename, crate_name=excluded.crate_name, version=excluded.version, features_json=excluded.features_json, dependency_c_metadata_json=excluded.dependency_c_metadata_json, ");
-        sql.push_str("oci_reference=excluded.oci_reference, oci_digest=excluded.oci_digest, has_native=excluded.has_native, ");
-        sql.push_str("artifact_kind=excluded.artifact_kind, crate_types_json=excluded.crate_types_json, profile_json=excluded.profile_json, emit_json=excluded.emit_json, artifact_size=excluded.artifact_size, bundle_digest=excluded.bundle_digest, bundle_size=excluded.bundle_size, compile_millis=excluded.compile_millis, created_at=datetime('now');\n");
-    }
-    sql.push_str("COMMIT;\n");
-    sql.into_bytes()
-}
-
-fn sql_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 fn install_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
@@ -1393,19 +1224,12 @@ struct PopulateArgs {
     upload_plan_path: PathBuf,
     #[arg(long = "registry-root")]
     registry_root: PathBuf,
-    /// Optional artifacts-table mirror — nothing reads it since the edge
-    /// stopped serving artifact lookups, but it keeps the fixture's schema
-    /// exercised against the real schema file.
-    #[arg(long = "sqlite")]
-    sqlite_path: Option<PathBuf>,
     #[arg(long = "private-key")]
     private_key_path: PathBuf,
     #[arg(long = "public-key")]
     public_key_path: Option<PathBuf>,
     #[arg(long = "records-out")]
     records_output_path: Option<PathBuf>,
-    #[arg(long = "sql-out")]
-    sql_output_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2417,13 +2241,18 @@ mod tests {
                 version: "1.0.0".parse().expect("version"),
                 features_json: FeaturesJson::default(),
                 dependency_c_metadata_json: DependencyCMetadataJson::default(),
-                dependency_identity: None,
+                dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                    .expect("leaf identity"),
                 c_metadata: CMetadata::parse(C_METADATA).expect("c_metadata"),
                 compile_key: format!("{C_METADATA}{C_METADATA}"),
                 bundle_digest,
                 bundle_size: u64::try_from(bundle.len()).expect("bundle size"),
                 artifact_kind: ArtifactKind::Rlib,
-                unit_shape: None,
+                unit_shape: stow_types::public_cache::UnitShape {
+                    side: stow_types::public_cache::UnitSide::Target,
+                    invocation: stow_types::public_cache::UnitInvocation::Target,
+                    kind: stow_types::public_cache::UnitKind::Linked,
+                },
                 crate_types: vec![RustCrateType::Rlib],
                 profile: Profile {
                     opt_level: "0".to_owned(),
@@ -2576,7 +2405,11 @@ mod tests {
             features_json: FeaturesJson::default(),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
             dependency_compile_keys_json: "[]".to_owned(),
-            unit_shape: None,
+            unit_shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Target,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
             target: TARGET.parse().expect("target"),
             rustc_version: RUSTC.parse().expect("rustc"),
             profile: Profile {

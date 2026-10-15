@@ -151,9 +151,10 @@ pub struct ObservedDepIdentity {
     /// The feature set the dep's artifact was recorded at.
     pub features: Vec<String>,
     /// The unit shape the published index records for the dep's
-    /// `c_metadata` — the side the dep node serves. `None` when the dep
-    /// has no published row carrying a shape: a locally compiled
-    /// artifact, or a legacy shapeless index row.
+    /// `c_metadata` — the side the dep node serves. `None` when no
+    /// published row names the dep's `c_metadata` — a locally compiled
+    /// artifact the index does not cover — or when its rows disagree
+    /// on a side.
     pub unit_shape: Option<stow_types::public_cache::UnitShape>,
     /// Whether the dep's recorded artifact is a proc-macro — the only
     /// host-side extern a target-side unit can carry.
@@ -4078,7 +4079,8 @@ pub mod tests {
                 oci_reference: "ghcr.io/water-rs/stow-cache:demo.test".to_owned(),
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
-                    dependency_identity: None,
+                    dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                        .expect("leaf identity"),
                     compile_key: "compile-key".to_owned(),
                     crate_name: stow_types::identity::CrateName::parse("demo").unwrap(),
                     crate_version: stow_types::identity::CrateVersion::new(

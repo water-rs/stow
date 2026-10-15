@@ -39,6 +39,7 @@ fn lean_unit(unit: &StowUnit) -> TaskUnit {
                 key: lean_key(&dep.key),
                 name: dep.name.clone(),
                 version: dep.version.clone(),
+                proc_macro: dep.proc_macro,
             })
             .collect(),
     }
@@ -215,6 +216,7 @@ pub fn enqueue_requests_inner(
                 .map_err(|error| anyhow::anyhow!("{error}"))?,
             preserve_lockfile: false,
             host_side: node.identity.host_side,
+            explicit_spelling: node.explicit_spelling,
         });
     }
     Ok((requests, uncovered))

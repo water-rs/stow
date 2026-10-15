@@ -1153,7 +1153,7 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     // same pass's shape-requeue sweep then re-enters the row as
     // `pending` at `attempt + 1` — the post-pass read is that state,
     // which is also the state the re-arm restores from. A success
-    // never writes a raw `attempt_outcomes` row: the per-target
+    // never writes a raw `attempt_outcomes_v2` row: the per-target
     // bucket's `outcomes` count is the completion's evidence, and it
     // must increase exactly once per landed transition.
     let first = running_target(&db, shape).await;

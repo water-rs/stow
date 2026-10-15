@@ -187,15 +187,11 @@ pub fn is_records_tag(tag: &str) -> bool {
     tag.starts_with(RECORDS_TAG_PREFIX)
 }
 
-/// One record as one index row, or `None` when the record carries no
-/// pushed bundle — an unbundled row is not servable and never enters the
-/// index.
+/// One record as one index row. A record always carries its pushed
+/// bundle's digest — the publish writes it — so every record maps.
 #[must_use]
-pub fn record_to_index_row(record: &ArtifactRecord) -> Option<ArtifactIndexRow> {
-    if record.bundle_digest.is_empty() {
-        return None;
-    }
-    Some(ArtifactIndexRow {
+pub fn record_to_index_row(record: &ArtifactRecord) -> ArtifactIndexRow {
+    ArtifactIndexRow {
         crate_name: record.crate_name.clone(),
         version: record.version.clone(),
         features_json: record.features_json.clone(),
@@ -211,7 +207,7 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> Option<ArtifactIndexRow> 
         emit: record.emit.clone(),
         min_glibc: record.min_glibc,
         unit_shape: record.unit_shape,
-    })
+    }
 }
 
 #[cfg(test)]

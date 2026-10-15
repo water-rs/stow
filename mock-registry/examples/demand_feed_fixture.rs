@@ -165,6 +165,7 @@ fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
                     version: crate_version("1.0.0"),
                     features_json: FeaturesJson::default(),
                     host_side,
+                    keys_apart: false,
                     deps: vec![1],
                 },
                 stow_types::api::SubgraphNode {
@@ -172,11 +173,13 @@ fn enqueue_request(n: usize, combos: &[DepCombo]) -> EnqueueRequest {
                     version: crate_version("1.0.0"),
                     features_json: FeaturesJson::default(),
                     host_side,
+                    keys_apart: false,
                     deps: Vec::new(),
                 },
             ],
         },
         host_side,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         preserve_lockfile: false,
     }
 }
@@ -202,10 +205,12 @@ fn base_dep_request(combo_index: usize, combo: DepCombo) -> EnqueueRequest {
                 version: crate_version("1.0.0"),
                 features_json: FeaturesJson::default(),
                 host_side,
+                keys_apart: false,
                 deps: Vec::new(),
             }],
         },
         host_side,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         preserve_lockfile: false,
     }
 }

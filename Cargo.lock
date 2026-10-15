@@ -8021,7 +8021,6 @@ dependencies = [
  "blake3",
  "clap",
  "hex",
- "rusqlite",
  "rustls",
  "serde",
  "serde_html_form",

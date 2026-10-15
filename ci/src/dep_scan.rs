@@ -126,6 +126,7 @@ pub async fn scan_artifacts(
     )
     .await?;
     let output_owners = output_owner_index(&selected, &consumed_captures)?;
+    reject_unflagged_proc_macro_extern(task, &selected, &consumed_captures, &output_owners)?;
     let phase_units = phase_feature_sets(task, built)?;
     let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
     let mut visiting = BTreeSet::<usize>::new();
@@ -900,7 +901,7 @@ async fn build_scanned_artifact(
         // The shape the edge's gate checks: the task's own side, the
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
-        unit_shape: Some(stow_types::public_cache::UnitShape {
+        unit_shape: stow_types::public_cache::UnitShape {
             // Every registered unit is the task's own crate's library
             // product — the own-node check bounds the registered set to
             // the crate the task owns, and `restorable` keeps
@@ -920,7 +921,7 @@ async fn build_scanned_artifact(
                 )
             })?,
             kind: stow_types::public_cache::UnitKind::from_emit(&artifact.captured.emit),
-        }),
+        },
         build_script_out_dir: artifact.captured.build_script_out_dir.clone(),
         native: None,
     })
@@ -1173,6 +1174,63 @@ fn resolve_dependencies(
     dependencies
         .dedup_by(|left, right| left.crate_name == right.crate_name && left.path == right.path);
     Ok(dependencies)
+}
+
+/// stow#736: a target-side task at the runner's host triple handed
+/// `KeysAsNative` must never carry a proc-macro in its own unit's
+/// `--extern` set — one `--extern` to a proc-macro is exactly what makes
+/// the explicit `--target <host>` spelling key differently, and
+/// publishing the native-only shapes would serve the node at a key its
+/// `--target` consumers never compute. The flag is resolved upstream, so
+/// its presence here means the flag and the compiled graph disagree —
+/// fail naming the dep rather than publish an incomplete node.
+/// Transitive flagging is the resolver's; this guard covers the direct
+/// edge the task's own capture records.
+fn reject_unflagged_proc_macro_extern(
+    task: &BuildTaskPayload,
+    selected: &[SelectedCapturedArtifact],
+    consumed: &[ConsumedCapture],
+    output_owners: &BTreeMap<PathBuf, OutputOwner>,
+) -> stow_types::error::Result<()> {
+    let applies = !task.host_side
+        && task.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysAsNative
+        && stow_types::api::runner_family(task.target.as_str())
+            .is_some_and(|family| family.host_triple() == task.target.as_str());
+    if !applies {
+        return Ok(());
+    }
+    let is_proc_macro = |owner: OutputOwner| -> bool {
+        match owner {
+            OutputOwner::Compiled(index) => selected
+                .get(index)
+                .is_some_and(|artifact| artifact.artifact_kind == ArtifactKind::ProcMacro),
+            OutputOwner::Consumed(index) => consumed
+                .get(index)
+                .and_then(|capture| capture.records.first())
+                .is_some_and(|record| {
+                    artifact_kind_for_capture(record) == Some(ArtifactKind::ProcMacro)
+                }),
+        }
+    };
+    for artifact in selected {
+        for dependency in &artifact.captured.dependencies {
+            let owner = output_owners.get(&dependency.path).copied();
+            if owner.is_some_and(is_proc_macro) {
+                return Err(stow_types::stow_error!(
+                    "task {} ({} {} for {}) was dispatched KeysAsNative but its unit's --extern \
+                     {} at {} is a proc-macro — the node's explicit-spelling flag is wrong \
+                     (stow#736)",
+                    task.task_id,
+                    task.crate_name,
+                    task.version,
+                    task.target,
+                    dependency.crate_name,
+                    dependency.path.display(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn output_owner_index(
@@ -1485,7 +1543,7 @@ pub struct ScannedArtifact {
     /// The unit shape the builder knows by construction — the task's own
     /// side, the invocation spelling the collector stamped, and the emit
     /// set's link membership.
-    pub unit_shape: Option<stow_types::public_cache::UnitShape>,
+    pub unit_shape: stow_types::public_cache::UnitShape,
     /// Exact build-script `OUT_DIR` recorded at capture time, when the crate
     /// has a build script.
     pub build_script_out_dir: Option<PathBuf>,
@@ -1580,8 +1638,9 @@ mod tests {
     use stow_types::public_cache::UnitInvocation;
 
     use super::{
-        IndexedPackage, ResolvedArtifact, RlibPair, SelectedCapturedArtifact, Selection,
-        output_owner_index, resolve_artifact, select_captured_artifact, select_captured_artifacts,
+        ConsumedCapture, IndexedPackage, ResolvedArtifact, RlibPair, SelectedCapturedArtifact,
+        Selection, output_owner_index, reject_unflagged_proc_macro_extern, resolve_artifact,
+        select_captured_artifact, select_captured_artifacts,
     };
     use stow_types::capture::{
         CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput,
@@ -2497,6 +2556,7 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependency_subgraph: stow_types::api::TaskSubgraph {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
@@ -3032,6 +3092,7 @@ mod tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.99.0").unwrap(),
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependency_subgraph: stow_types::api::TaskSubgraph {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
@@ -3133,4 +3194,94 @@ mod tests {
         ],
         "roots": [0]
     }"#;
+    /// stow#736: a `KeysAsNative` contract is wrong when the task's own
+    /// unit's `--extern` set holds a proc-macro — the flag the
+    /// resolution handed down and the compiled graph disagree, and
+    /// publishing the native-only shapes would leave `--target`
+    /// consumers missing. The scan fails naming the dep before a byte
+    /// is planned.
+    #[test]
+    fn an_unflagged_task_with_a_proc_macro_extern_is_rejected() {
+        use stow_types::identity::{
+            CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+        };
+        let task = BuildTaskPayload {
+            task_id: "task".to_owned(),
+            attempt: 1,
+            crate_name: CrateName::parse("demo").expect("name"),
+            version: CrateVersion::new(semver::Version::new(1, 0, 0)),
+            features_json: FeaturesJson::default(),
+            target: TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target"),
+            rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc"),
+            preserve_lockfile: false,
+            host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
+        };
+        // The proc-macro dep was served, not compiled: a consumed record
+        // whose dylib output is the path the own unit's `--extern` names.
+        let extern_path =
+            PathBuf::from("/tmp/store/x86_64-unknown-linux-gnu/key/libderive-aa.dylib");
+        let mut served = captured("derive", "aabbccddeeff0011", "/tmp/served/deps");
+        served.crate_types = vec!["proc-macro".to_owned()];
+        served.outputs = vec![CapturedRustcOutput {
+            kind: CapturedRustcOutputKind::DynamicLibrary,
+            path: extern_path.clone(),
+            snapshot_path: None,
+            sha256: "ab".repeat(32),
+        }];
+        let consumed = vec![ConsumedCapture {
+            artifact: super::ConsumedArtifact {
+                crate_name: "derive".to_owned(),
+                crate_version: "1.0.0".to_owned(),
+                compile_key: "f".repeat(64),
+                c_metadata: "aabbccddeeff0011".to_owned(),
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                rustc_version: "1.91.1".to_owned(),
+                emit: vec!["link".to_owned()],
+            },
+            records: vec![served],
+        }];
+        let mut own = captured(
+            "demo",
+            "1122334455667788",
+            "/tmp/workspace/target/debug/deps",
+        );
+        own.dependencies = vec![CapturedDependencyIdentity {
+            crate_name: "derive".to_owned(),
+            path: extern_path,
+            compile_key: "f".repeat(64),
+            stable_c_metadata: "aabbccddeeff0011".to_owned(),
+        }];
+        let selected = vec![SelectedCapturedArtifact {
+            package: indexed("demo", "1.0.0"),
+            artifact_kind: ArtifactKind::Rlib,
+            captured: own,
+            dependency_aliases: Vec::new(),
+        }];
+        let owners = output_owner_index(&selected, &consumed).expect("owners");
+
+        let error = reject_unflagged_proc_macro_extern(&task, &selected, &consumed, &owners)
+            .expect_err("a proc-macro extern under KeysAsNative must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("derive"),
+            "names the proc-macro: {message}"
+        );
+        assert!(message.contains("736"), "names the issue: {message}");
+
+        // The same capture under the flag the resolver should have
+        // minted — or off the host triple — is legitimate.
+        let mut flagged = task.clone();
+        flagged.explicit_spelling = stow_types::public_cache::ExplicitSpelling::KeysApart;
+        reject_unflagged_proc_macro_extern(&flagged, &selected, &consumed, &owners)
+            .expect("a flagged task publishes both spellings");
+        let mut cross = task;
+        cross.target = TargetTriple::parse("aarch64-unknown-linux-gnu").expect("target");
+        reject_unflagged_proc_macro_extern(&cross, &selected, &consumed, &owners)
+            .expect("a cross target's one spelling is already explicit");
+    }
 }

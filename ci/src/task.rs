@@ -1355,9 +1355,17 @@ impl CargoInvocation {
 /// compiles its crate as a host unit, and consumers reach that unit
 /// from both invocation spellings — a native build and any `--target`
 /// build compute different compile keys for it — so the task runs each
-/// phase under both and publishes both artifacts (stow#349).
-const fn phase_invocations(task: &BuildTaskPayload) -> &'static [CargoInvocation] {
-    if task.host_side {
+/// phase under both and publishes both artifacts (stow#349). A
+/// `KeysApart` target-side task at the runner's host triple does the
+/// same: a proc-macro in its `--extern` closure keys the unit
+/// differently per spelling, so it publishes the target-side shapes of
+/// both (stow#736).
+fn phase_invocations(task: &BuildTaskPayload) -> &'static [CargoInvocation] {
+    let runs_both_spellings = task.host_side
+        || (task.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart
+            && stow_types::api::runner_family(task.target.as_str())
+                .is_some_and(|family| family.host_triple() == task.target.as_str()));
+    if runs_both_spellings {
         &[CargoInvocation::Native, CargoInvocation::Explicit]
     } else {
         &[CargoInvocation::Task]
@@ -2509,6 +2517,7 @@ mod tests {
             rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc version"),
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependency_subgraph: TaskSubgraph {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
@@ -2675,6 +2684,7 @@ mod tests {
                 ])
                 .expect("features"),
                 host_side: false,
+                keys_apart: false,
                 deps: Vec::new(),
             },
             SubgraphNode {
@@ -2683,6 +2693,7 @@ mod tests {
                 features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                     .expect("features"),
                 host_side: true,
+                keys_apart: false,
                 deps: Vec::new(),
             },
         ]);
@@ -2739,6 +2750,7 @@ mod tests {
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             host_side: false,
+            keys_apart: false,
             deps: Vec::new(),
         }]);
         let manifest: toml::Table =
@@ -2780,6 +2792,7 @@ mod tests {
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             host_side,
+            keys_apart: false,
             deps: Vec::new(),
         };
         task.dependency_subgraph = leaf_pins(vec![
@@ -2790,6 +2803,7 @@ mod tests {
                 version: CrateVersion::new(semver::Version::parse("9.9.9").expect("version")),
                 features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
                 host_side: false,
+                keys_apart: false,
                 deps: Vec::new(),
             },
         ]);
@@ -2841,6 +2855,30 @@ mod tests {
             phase_invocations(&task).len(),
             1,
             "a target-side task keeps its single task-target invocation"
+        );
+    }
+
+    /// stow#736: a `KeysApart` target-side task at the runner's host
+    /// triple runs and publishes both spellings like a host-side task;
+    /// `KeysApart` at a cross target — whose own spelling is already
+    /// explicit — and `KeysAsNative` at the host triple keep `[Task]`.
+    #[test]
+    fn flagged_target_side_task_at_host_triple_runs_both_invocations() {
+        let mut task = task_with_features(&["std"]);
+        task.target = TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target");
+        task.explicit_spelling = stow_types::public_cache::ExplicitSpelling::KeysApart;
+        let invocations = phase_invocations(&task);
+        assert_eq!(invocations.len(), 2);
+        assert!(matches!(invocations[0], CargoInvocation::Native));
+        assert!(matches!(invocations[1], CargoInvocation::Explicit));
+
+        let mut cross = task_with_features(&["std"]);
+        cross.target = TargetTriple::parse("wasm32-unknown-unknown").expect("target");
+        cross.explicit_spelling = stow_types::public_cache::ExplicitSpelling::KeysApart;
+        assert_eq!(
+            phase_invocations(&cross).len(),
+            1,
+            "a cross target's task spelling is already the explicit one"
         );
     }
 

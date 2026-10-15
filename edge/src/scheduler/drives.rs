@@ -1369,7 +1369,6 @@ pub const DRIVES: &[Drive] = &[
                            AND EXISTS ( \
                                SELECT 1 FROM queue_dependencies d \
                                WHERE d.depends_on_task_id = c.task_id \
-                                 AND d.dep_crate_name != '' AND d.dep_host_side >= 0 \
                                  AND d.dep_met = 0) LIMIT 256"
                     ))
                     .fetch_all::<RestoreQueueRow>()
@@ -1423,6 +1422,8 @@ pub const DRIVES: &[Drive] = &[
                                 target: row.target,
                                 rustc_version: row.rustc_version,
                                 host_side: row.host_side != 0,
+                                explicit_spelling:
+                                    stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                             }),
                         );
                     }
@@ -2185,6 +2186,7 @@ fn subgraph_of(deps: &[stow_types::api::EnqueueDependency]) -> stow_types::api::
                 version: dep.version.clone(),
                 features_json: dep.features_json.clone(),
                 host_side: dep.host_side,
+                keys_apart: false,
                 deps: Vec::new(),
             })
             .collect(),
@@ -2222,6 +2224,7 @@ fn submit_batch_named(
         ),
         preserve_lockfile: false,
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     };
     let mut fresh = resync.clone();
     fresh.crate_name = fresh_name.parse().expect("fresh crate");
@@ -2300,6 +2303,7 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
         dependency_subgraph: subgraph_of(&[dep_request(shape.dep_row(2))]),
         preserve_lockfile: false,
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     };
     let root_id = root_task.task_id().expect("derived root task id");
     stow_types::api::RequestOutcomeReport {
@@ -2686,6 +2690,7 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
         target: dep_target(d).parse().expect("event dep target"),
         rustc_version: "1.86.0".parse().expect("event dep rustc"),
         host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     };
     (0..FEED_EVENT_DEPS)
         .map(|d| EnqueueRequest {
@@ -2702,6 +2707,7 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
             source: EnqueueSource::CacheMiss,
             preserve_lockfile: false,
             host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         })
         .chain((0..FEED_EVENT_ROOTS).map(|k| {
             let [first, second] = feed_event_deps(k);
@@ -2716,6 +2722,7 @@ fn feed_event_requests() -> Vec<EnqueueRequest> {
                 dependency_subgraph: subgraph_of(&[dep_edge(first), dep_edge(second)]),
                 preserve_lockfile: false,
                 host_side: false,
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             }
         }))
         .collect()
@@ -3009,6 +3016,7 @@ fn dep_request(n: u32) -> EnqueueDependency {
             "1.86.0".parse().expect("dep rustc")
         },
         host_side: n.is_multiple_of(10),
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     }
 }
 
@@ -3020,7 +3028,11 @@ fn node_shapes(host_side: bool, target: &str) -> Vec<UnitShape> {
         .map_or(UnitInvocation::Native, |family| {
             UnitInvocation::for_task(target, family.host_triple())
         });
-    stow_types::public_cache::required_unit_shapes(host_side, invocation)
+    stow_types::public_cache::required_unit_shapes(
+        host_side,
+        invocation,
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+    )
 }
 
 /// The full-report drive's slice: a held-size membership (100 rows) on
@@ -3040,7 +3052,7 @@ fn full_slice_report() -> Vec<PublishedSliceRow> {
                     crate_name: format!("stow-gate-full-{i}").parse().expect("full crate"),
                     version: "1.0.0".parse().expect("full version"),
                     features_json: FeaturesJson::default(),
-                    unit_shape: Some(shape),
+                    unit_shape: shape,
                 })
         })
         .collect()
@@ -3070,7 +3082,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
             crate_name: crate_name.parse().expect("retire crate"),
             version: version.parse().expect("retire version"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(node_shapes(n.is_multiple_of(10), target)[0]),
+            unit_shape: node_shapes(n.is_multiple_of(10), target)[0],
         });
     }
     for i in 0..DELTA_ROWS / 2 {
@@ -3082,7 +3094,7 @@ fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<Publi
                     crate_name: format!("stow-gate-delta-{i}").parse().expect("delta crate"),
                     version: "9.9.9".parse().expect("delta version"),
                     features_json: FeaturesJson::default(),
-                    unit_shape: Some(shape),
+                    unit_shape: shape,
                 }),
         );
     }

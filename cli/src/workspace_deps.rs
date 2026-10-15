@@ -851,6 +851,11 @@ fn unit_graph_task_units(
                     key: dep_base.key.clone(),
                     name: name.to_owned(),
                     version: version.to_owned(),
+                    // The dep edge puts a proc-macro in the parent's
+                    // `--extern` exactly when the dep unit IS the
+                    // proc-macro lib — the flag the shared projection
+                    // derives `KeysApart` from (stow#736).
+                    proc_macro: dep_unit.target.kind.contains(&"proc-macro"),
                 });
             }
             units.push(TaskUnit { deps, ..base });
@@ -1069,6 +1074,7 @@ fn emit_expanded_graph(
                     host_side: side == HOST,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 });
             // One `(crate, version, side)` key is one node, and cargo's
             // resolver assigns it one feature set — a second, different
@@ -1108,11 +1114,15 @@ fn emit_expanded_graph(
     // Each entry's dependency subgraph comes from the resolved task
     // graph over this same unit graph — a covered dep still has its
     // own real context there, so nothing is minted leaf-shaped
-    // (stow#588).
+    // (stow#588). The node's explicit-spelling flag is derived on the
+    // same pass — the shared projection computes it bottom-up from the
+    // dep edges' proc-macro flags (stow#736).
     let task_units = unit_graph_task_units(graph, target, host_triple)?;
     let resolved = stow_types::unit_graph::resolved_task_graph(&task_units, rustc_version)?;
     for entry in entries.values_mut() {
-        entry.dependency_subgraph = node_subgraph(&resolved, entry)?;
+        let (subgraph, spelling) = node_subgraph(&resolved, entry)?;
+        entry.dependency_subgraph = subgraph;
+        entry.explicit_spelling = spelling;
     }
     Ok((
         entries.into_values().collect(),
@@ -1131,14 +1141,17 @@ fn emit_expanded_graph(
 fn node_subgraph(
     resolved: &stow_types::task_graph::ResolvedTaskGraph,
     entry: &ResolvedDependencyGraphEntry,
-) -> stow_types::error::Result<stow_types::api::TaskSubgraph> {
+) -> stow_types::error::Result<(
+    stow_types::api::TaskSubgraph,
+    stow_types::public_cache::ExplicitSpelling,
+)> {
     let mut matched = resolved.nodes().iter().enumerate().filter(|(_, node)| {
         node.identity.crate_name.as_str() == entry.crate_name.as_str()
             && node.identity.version.as_semver() == &entry.version
             && node.identity.host_side == entry.host_side
             && node.identity.features_json.features() == entry.features.as_slice()
     });
-    let Some((index, _)) = matched.next() else {
+    let Some((index, node)) = matched.next() else {
         return Err(stow_types::stow_error!(
             "cargo --unit-graph has no task node for {} {} (host_side={}) at features {:?} — cannot mint its dependency subgraph",
             entry.crate_name,
@@ -1147,8 +1160,10 @@ fn node_subgraph(
             entry.features,
         ));
     };
-    stow_types::api::TaskSubgraph::from_resolved(resolved, index)
-        .map_err(|e| stow_types::stow_error!("{e}"))
+    let spelling = node.explicit_spelling;
+    let subgraph = stow_types::api::TaskSubgraph::from_resolved(resolved, index)
+        .map_err(|e| stow_types::stow_error!("{e}"))?;
+    Ok((subgraph, spelling))
 }
 
 /// Every local package manifest cargo read for this answer —
@@ -1331,6 +1346,7 @@ pub fn observed_miss_graph(
                 host_side,
                 dependencies,
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
         );
     }
@@ -1352,12 +1368,15 @@ pub fn observed_miss_graph(
                     host_side: side,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 }
             });
     }
 
     for entry in entries.values_mut() {
-        entry.dependency_subgraph = node_subgraph(resolved, entry)?;
+        let (subgraph, spelling) = node_subgraph(resolved, entry)?;
+        entry.dependency_subgraph = subgraph;
+        entry.explicit_spelling = spelling;
     }
 
     Ok(ObservedMissGraph {
@@ -1446,10 +1465,9 @@ fn observed_dep_edges(
             return None;
         };
         // The dep's published shape says which side its node serves.
-        // Without one — a local artifact, or a legacy shapeless row —
-        // the edge's own semantics decide: every extern of a host unit
-        // is host-side, and a target unit's only host extern is a
-        // proc-macro.
+        // Without one — a dep no published row names — the edge's own
+        // semantics decide: every extern of a host unit is host-side,
+        // and a target unit's only host extern is a proc-macro.
         let dep_side = dep_shape.map_or(observation_host_side || dep_proc_macro, |shape| {
             shape.side == UnitSide::Host
         });
@@ -2036,8 +2054,8 @@ mod observed_miss_tests {
 
     /// `(c_metadata, name, version, features, published_host_side,
     /// proc_macro)` — the published side is the dep row's recorded
-    /// `unit_shape` (`None` for a dep with no shape row), `proc_macro`
-    /// the artifact's recorded kind.
+    /// `unit_shape` (`None` for a dep the published slices do not name),
+    /// `proc_macro` the artifact's recorded kind.
     type DepIdentityFixture<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], Option<bool>, bool);
 
     fn task_node(
@@ -2067,6 +2085,7 @@ mod observed_miss_tests {
                 rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc parses"),
                 host_side,
             },
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: Vec::new(),
         }
     }
@@ -2287,6 +2306,7 @@ mod observed_miss_tests {
                 rustc_version: WireRustcVersion::parse("1.91.1").expect("rustc parses"),
                 host_side,
             },
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: Vec::new(),
         }])
         .expect("fixture resolves")

@@ -1212,7 +1212,8 @@ mod tests {
         deps: &[(&str, &str)],
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: None,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity"),
             crate_name: CrateName::parse(crate_name).expect("name"),
             version: CrateVersion::new(Version::parse(version).expect("version")),
             features_json: FeaturesJson::canonicalize(
@@ -1248,7 +1249,11 @@ mod tests {
             },
             emit: vec!["link".to_owned()],
             min_glibc: None,
-            unit_shape: None,
+            unit_shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Native,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
         }
     }
 
@@ -1275,6 +1280,7 @@ mod tests {
                         host_side: false,
                     }],
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
@@ -1283,6 +1289,7 @@ mod tests {
                     host_side: false,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 },
             ],
         )
@@ -1405,9 +1412,9 @@ mod tests {
             kind,
         };
         let mut linked = row("dep-linked", "1.0.0", "72e2ded9fa67e0a1", &[], &[]);
-        linked.unit_shape = Some(shape(stow_types::public_cache::UnitKind::Linked));
+        linked.unit_shape = shape(stow_types::public_cache::UnitKind::Linked);
         let mut unlinked = row("dep-unlinked", "1.0.0", "72e2ded9fa67e0a1", &[], &[]);
-        unlinked.unit_shape = Some(shape(stow_types::public_cache::UnitKind::Unlinked));
+        unlinked.unit_shape = shape(stow_types::public_cache::UnitKind::Unlinked);
         let rows = vec![
             row(
                 "consumer",
@@ -1597,6 +1604,7 @@ mod tests {
                     host_side: false,
                 }],
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
@@ -1605,6 +1613,7 @@ mod tests {
                 host_side: false,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: missing.crate_name.clone(),
@@ -1613,6 +1622,7 @@ mod tests {
                 host_side: false,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
         ];
         let analysis =
@@ -1786,6 +1796,7 @@ mod tests {
                     host_side: false,
                 }],
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
@@ -1794,6 +1805,7 @@ mod tests {
                 host_side: false,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             },
         ];
         let host = Some(GlibcVersion {
