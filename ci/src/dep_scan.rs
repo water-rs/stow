@@ -901,7 +901,7 @@ async fn build_scanned_artifact(
         // The shape the edge's gate checks: the task's own side, the
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
-        unit_shape: Some(stow_types::public_cache::UnitShape {
+        unit_shape: stow_types::public_cache::UnitShape {
             // Every registered unit is the task's own crate's library
             // product — the own-node check bounds the registered set to
             // the crate the task owns, and `restorable` keeps
@@ -921,7 +921,7 @@ async fn build_scanned_artifact(
                 )
             })?,
             kind: stow_types::public_cache::UnitKind::from_emit(&artifact.captured.emit),
-        }),
+        },
         build_script_out_dir: artifact.captured.build_script_out_dir.clone(),
         native: None,
     })
@@ -1543,7 +1543,7 @@ pub struct ScannedArtifact {
     /// The unit shape the builder knows by construction — the task's own
     /// side, the invocation spelling the collector stamped, and the emit
     /// set's link membership.
-    pub unit_shape: Option<stow_types::public_cache::UnitShape>,
+    pub unit_shape: stow_types::public_cache::UnitShape,
     /// Exact build-script `OUT_DIR` recorded at capture time, when the crate
     /// has a build script.
     pub build_script_out_dir: Option<PathBuf>,

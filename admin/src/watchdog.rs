@@ -898,27 +898,23 @@ impl Watcher<'_> {
         }
     }
 
-    /// One `bundle_digest` out of a published index slice, or `None`
-    /// when no slice carries rows. The slice is pulled and verified off
-    /// GHCR — the same signed source `index export` and `preheat manual`
-    /// pull — so the probe depends on the store the CLI itself reads,
-    /// not the D1 mirror.
+    /// One `bundle_digest` out of a published index slice of the current
+    /// stable toolchain, or `None` when none of its slices carries rows.
+    /// The slice is pulled and verified off GHCR — the same signed source
+    /// `index export` and `preheat manual` pull — so the probe depends on
+    /// the store the CLI itself reads, not the D1 mirror. Only the current
+    /// stable rustc's `index.<target>.<rustc>` tags answer: another
+    /// toolchain's slice proves nothing about what users are served.
     async fn pick_bundle_digest(&self) -> stow_types::error::Result<Option<String>> {
+        let rustc_version = crate::rust_channel::stable_rustc_version().await?;
         let base = crate::index_cmd::registry_base()?;
         let http = stow_oci::RegistryHttp::new().await?;
         let session = base.session(&http);
         let trust = crate::index_cmd::records_trust().await?;
-        let mut tags = session
-            .list_tags()
-            .await
-            .map_err(|error| stow_error!("list registry tags: {error}"))?;
-        // Sorted so the probed slice is deterministic run to run.
-        tags.sort();
-        for tag in tags {
-            let Some((target, rustc_version)) = crate::index_cmd::index_tag_parts(&tag) else {
-                continue;
-            };
-            let Some(pulled) = stow_oci::pull_index(&session, &base, target, rustc_version).await?
+        for target in stow_types::api::CI_TARGET_TRIPLES {
+            let tag = stow_types::index::index_tag(target, rustc_version.as_str());
+            let Some(pulled) =
+                stow_oci::pull_index(&session, &base, target, rustc_version.as_str()).await?
             else {
                 continue;
             };
@@ -932,8 +928,6 @@ impl Watcher<'_> {
                 crate::index_cmd::INDEX_CERT_URL,
             )
             .await?;
-            let rustc_version = stow_types::identity::WireRustcVersion::parse(rustc_version)
-                .map_err(|error| stow_error!("index tag {tag}: {error}"))?;
             let index = crate::index_cmd::decode_published_slice(
                 &reference,
                 &rustc_version,

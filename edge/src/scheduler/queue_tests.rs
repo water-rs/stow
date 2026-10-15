@@ -1532,13 +1532,14 @@ async fn demand_stops_at_built_in_flight_and_met_edges() {
     .expect("met edge");
     // A failed dep is unbuilt — demand still flows to it.
     mark_active(&db, "leaf", TARGET, "failed").await;
-    db.query("INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_invocations, dep_shapes, dep_met, dep_side_known) \
-                  VALUES (?, ?, 'leaf', ?, '[]', ?, ?, 0, 1, 2, 0, 1)")
+    db.query("INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_met) \
+                  VALUES (?, ?, 'leaf', ?, '[]', ?, ?, 0, ?, 1, 2, 0)")
             .bind(root_id.clone())
             .bind(task_id_on("leaf", TARGET))
             .bind(VERSION)
             .bind(TARGET)
             .bind(RUSTC)
+            .bind(dep_identity("leaf").to_string())
             .execute()
             .await
             .expect("leaf edge");
@@ -1591,10 +1592,11 @@ async fn demand_sums_distinct_identities_and_survives_cycles() {
         .expect("enqueue cycle");
     for (owner, dep) in [(&cyc_a, &cyc_b), (&cyc_b, &cyc_a)] {
         db.query(
-            "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_met)                  VALUES (?, ?, 0)",
+            "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_dependency_identity, dep_met) VALUES (?, ?, ?, 0)",
         )
         .bind(owner.task_id().expect("owner id"))
         .bind(dep.task_id().expect("dep id"))
+        .bind(dep.dependency_identity().expect("dep identity").to_string())
         .execute()
         .await
         .expect("cycle edge");
@@ -2008,10 +2010,11 @@ async fn demand_replay_uses_the_frozen_set_not_the_live_closure() {
         .expect("enqueue extra");
     db.query(
         "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_met) VALUES (?, ?, 0)",
+             (task_id, depends_on_task_id, dep_dependency_identity, dep_met) VALUES (?, ?, ?, 0)",
     )
     .bind(task_id_on("leaf", TARGET))
     .bind(task_id_on("extra", TARGET))
+    .bind(dep_identity("extra").to_string())
     .execute()
     .await
     .expect("new edge");
@@ -2105,10 +2108,11 @@ async fn demand_unaccepted_draft_retry_recomputes_the_live_closure() {
         .expect("enqueue extra");
     db.query(
         "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_met) VALUES (?, ?, 0)",
+             (task_id, depends_on_task_id, dep_dependency_identity, dep_met) VALUES (?, ?, ?, 0)",
     )
     .bind(task_id_with("root", TARGET, &[dependency("leaf")]))
     .bind(task_id_on("extra", TARGET))
+    .bind(dep_identity("extra").to_string())
     .execute()
     .await
     .expect("new edge");
@@ -2324,10 +2328,11 @@ async fn demand_multi_chunk_closure_is_atomic_end_to_end() {
     // the walk reads `queue_dependencies`, not the mint.
     for i in 0..CHAIN - 1 {
         db.query(
-            "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_met)                  VALUES (?, ?, 0)",
+            "INSERT INTO queue_dependencies (task_id, depends_on_task_id, dep_dependency_identity, dep_met) VALUES (?, ?, ?, 0)",
         )
         .bind(requests[i].task_id().expect("owner id"))
         .bind(requests[i + 1].task_id().expect("dep id"))
+        .bind(dep_identity(&format!("chain-{}", i + 1)).to_string())
         .execute()
         .await
         .expect("chain edge");
@@ -2891,18 +2896,14 @@ fn gate_pub_rows() -> Vec<stow_types::api::PublishedSliceRow> {
             crate_name: name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(s),
+            unit_shape: s,
         })
         .chain(std::iter::once(stow_types::api::PublishedSliceRow {
             dependency_identity: dep_identity("dep-short"),
             crate_name: "dep-short".parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(shape(
-                UnitSide::Target,
-                UnitInvocation::Native,
-                UnitKind::Linked,
-            )),
+            unit_shape: shape(UnitSide::Target, UnitInvocation::Native, UnitKind::Linked),
         }))
         .collect()
 }
@@ -2911,8 +2912,8 @@ fn gate_pub_rows() -> Vec<stow_types::api::PublishedSliceRow> {
 /// single readiness pass over the batch's edges: a row with no
 /// edges lands met, a dep published at both of the shapes its
 /// target requires releases its parent, a half-published dep only
-/// waits, a dep retrying a transient failure waits unblocked,
-/// and an unresolved-side edge blocks. Multi-dep owners fold per
+/// waits, and a dep retrying a transient failure waits unblocked.
+/// Multi-dep owners fold per
 /// edge: a met edge beside an unmet one still gates, and a blocker
 /// flag on an already-published dep never blocks on its own.
 #[tokio::test]
@@ -2933,21 +2934,6 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
         .execute()
         .await
         .expect("fail published dep");
-    // The fail-closed spelling of an edge whose required side was
-    // never established — seeded directly so the owner below is
-    // born carrying it (its empty `depends_on` means the resync
-    // never deletes the row).
-    db.query(
-        "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, \
-              dep_features_json, dep_target, dep_rustc_version, \
-              dep_host_side, dep_invocations, dep_shapes, dep_side_known) \
-             VALUES (?, 'unresolved', '', '', '', '', '', -1, 0, 0, 0)",
-    )
-    .bind(task_id_on("mystery", TARGET))
-    .execute()
-    .await
-    .expect("seed unknown-side edge");
     // `pair` holds two stored edges, so the fold must sum across
     // them — and only an edge that is unmet *and* blocking may
     // raise `blocked`: dep-fpub publishes both shapes but its row
@@ -2962,13 +2948,13 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
         false,
         ExplicitSpelling::KeysAsNative,
     );
-    for (dep, side_known) in [("dep-fpub", 1), ("dep-short", 1)] {
+    for dep in ["dep-fpub", "dep-short"] {
         db.query(
             "INSERT INTO queue_dependencies \
                  (task_id, depends_on_task_id, dep_crate_name, dep_version, \
                   dep_features_json, dep_target, dep_rustc_version, \
-                  dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_side_known) \
-                 VALUES (?, ?, ?, '1.0.0', '[]', ?, ?, 0, ?, ?, ?, ?)",
+                  dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes) \
+                 VALUES (?, ?, ?, '1.0.0', '[]', ?, ?, 0, ?, ?, ?)",
         )
         .bind(task_id_on("pair", TARGET))
         .bind(task_id_on(dep, TARGET))
@@ -2978,7 +2964,6 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
         .bind(dep_identity(dep).to_string())
         .bind(invocations)
         .bind(shapes)
-        .bind(side_known)
         .execute()
         .await
         .expect("seed known-side edge");
@@ -3000,21 +2985,19 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
             request("met", &[dependency("dep-met")]),
             request("short", &[dependency("dep-short")]),
             request("stalled", &[dependency("dep-failed")]),
-            request("mystery", &[]),
             request("twin", &[dependency("dep-met"), dependency("dep-short")]),
             request("pair", &[]),
         ],
     )
     .await
     .expect("enqueue gate cases");
-    assert_eq!(inserted, 7, "every newcomer landed");
+    assert_eq!(inserted, 6, "every newcomer landed");
 
     for (name, deps_met, blocked) in [
         ("free", 1, 0),
         ("met", 1, 0),
         ("short", 0, 0),
         ("stalled", 0, 0),
-        ("mystery", 0, 1),
         // A met edge beside an unmet one: the fold still reports
         // the owner unmet, and a pending dep never blocks.
         ("twin", 0, 0),
@@ -3905,7 +3888,7 @@ async fn publish(db: &DurableDb, crate_name: &str) {
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
         })
         .collect::<Vec<_>>();
     super::record_published_slice(db, TARGET, RUSTC, None, None, &rows, &[])
@@ -3914,8 +3897,7 @@ async fn publish(db: &DurableDb, crate_name: &str) {
 }
 
 /// The same, carrying the row's unit shape — what `index report`
-/// sends once the publish path registers the builder-recorded shape
-/// (`None` is the legacy shapeless row that covers nothing).
+/// sends once the publish path registers the builder-recorded shape.
 async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: &[UnitShape]) {
     let rows = shapes
         .iter()
@@ -3924,7 +3906,7 @@ async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: 
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(*shape),
+            unit_shape: *shape,
         })
         .collect::<Vec<_>>();
     super::record_published_slice(db, target, RUSTC, None, None, &rows, &[])
@@ -4177,7 +4159,7 @@ fn dep_slice_rows(crate_name: &str) -> Vec<stow_types::api::PublishedSliceRow> {
             crate_name: crate_name.parse().expect("valid crate name"),
             version: VERSION.parse().expect("valid semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
         })
         .collect()
 }
@@ -4849,7 +4831,7 @@ async fn a_larger_slice_reports_whole() {
                 crate_name: format!("crate-{index}").parse().expect("valid crate name"),
                 version: VERSION.parse().expect("valid semver"),
                 features_json: FeaturesJson::default(),
-                unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, kind)),
+                unit_shape: shape(UnitSide::Target, UnitInvocation::Native, kind),
             })
         })
         .collect::<Vec<_>>();
@@ -4883,8 +4865,9 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
     // above the committed one, then the writer dies before the flip.
     db.query(
         "INSERT INTO published_slice_rows \
-             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity) \
-             VALUES (?, ?, 2, 'stale', '1.0.0', '[]', 'd0deadbeef')",
+             (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, \
+              unit_side, unit_invocation, unit_linked) \
+             VALUES (?, ?, 2, 'stale', '1.0.0', '[]', 'd0deadbeef', 0, 0, 1)",
     )
     .bind(TARGET.to_owned())
     .bind(RUSTC.to_owned())
@@ -4924,43 +4907,6 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
         .expect("claim after republish");
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].crate_name, "fresh-dep");
-}
-
-/// An edge whose dep identity never resolved keeps `''` for the
-/// dependency's semantic identity — it can never resolve to a
-/// published row, so the dependent is blocked rather than pending
-/// forever, and the report says why.
-#[tokio::test]
-async fn an_unresolvable_dependency_edge_reports_blocked_with_unknown_identity() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("parent", &[dependency("dep")])])
-        .await
-        .expect("enqueue parent");
-    db.query("UPDATE queue_dependencies SET dep_crate_name = '' WHERE task_id = ?")
-        .bind(task_id_with("parent", TARGET, &[dependency("dep")]))
-        .execute()
-        .await
-        .expect("erase dep identity");
-    // The persisted `blocked` flag answers at write time: replay the
-    // owner refresh that recomputes it.
-    super::refresh_deps_met_tasks(&db, &[task_id_with("parent", TARGET, &[dependency("dep")])])
-        .await
-        .expect("recompute blocked after identity erase");
-
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim with unknown edge");
-    assert!(claimed.is_empty());
-    let parent = super::task_status(&db, &task_id_with("parent", TARGET, &[dependency("dep")]))
-        .await
-        .expect("read parent status")
-        .expect("parent row");
-    assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Blocked);
-    assert_eq!(
-        parent.blocked_by.as_deref(),
-        Some("unknown dependency identity")
-    );
-    assert_eq!(super::status(&db).await.expect("status").blocked, 1);
 }
 
 fn report(
@@ -6519,7 +6465,7 @@ const fn wide_claim_settings() -> SchedulerSettings {
 /// Enqueue then claim `count` tasks on `target`, then complete each
 /// one — `Some((error, run_id))` fails it, `None` succeeds —
 /// leaving `count` outcomes counted in `attempt_outcome_buckets`
-/// (and `count` raw rows in `attempt_outcomes` when all fail).
+/// (and `count` raw rows in `attempt_outcomes_v2` when all fail).
 async fn seed_outcomes(
     db: &DurableDb,
     batch: u32,
@@ -6623,7 +6569,7 @@ async fn freeze_gates_dispatch_but_not_enqueue_and_clear_resumes() {
     assert_eq!(claimed.len(), 1, "the freeze-queued miss dispatches");
 }
 
-/// The trip decision reads `attempt_outcomes`, not live queue rows —
+/// The trip decision reads `attempt_outcomes_v2`, not live queue rows —
 /// a retried task keeps every failed attempt inside the window.
 #[tokio::test]
 async fn evaluate_freeze_trip_reads_attempt_outcomes() {
@@ -8108,7 +8054,7 @@ async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
                             crate_name: crate_name.parse().expect("crate name"),
                             version: VERSION.parse().expect("semver"),
                             features_json: FeaturesJson::default(),
-                            unit_shape: Some(shape(UnitSide::Target, *invocation, *kind)),
+                            unit_shape: shape(UnitSide::Target, *invocation, *kind),
                         })
                         .collect::<Vec<_>>()
                 })
@@ -8188,7 +8134,7 @@ async fn dispatch_fails_on_a_missing_node_naming_it() {
             crate_name: leaf_name.parse().expect("crate name"),
             version: VERSION.parse().expect("semver"),
             features_json: FeaturesJson::default(),
-            unit_shape: Some(shape(UnitSide::Target, UnitInvocation::Native, *kind)),
+            unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
         })
         .collect::<Vec<_>>();
     super::record_published_slice(&db, TARGET, RUSTC, None, None, &rows, &[])

@@ -492,11 +492,9 @@ pub struct ArtifactRecord {
     /// JSON-encoded dependency `c_metadata` identities captured from rustc
     /// --extern inputs; sorted by `(crate_name, c_metadata)`.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// The Merkle dependency digest the artifact was built under
-    /// (stow#588). `None` on archive rows recorded before the digest
-    /// existed — `None` answers no contextual coverage query.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dependency_identity: Option<DependencyIdentity>,
+    /// The Merkle dependency digest of the dependency subgraph the
+    /// artifact was built under (stow#588) — the node's context key.
+    pub dependency_identity: DependencyIdentity,
     /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
@@ -521,11 +519,9 @@ pub struct ArtifactRecord {
     pub compile_millis: u64,
     /// The unit shape the builder recorded for this artifact — which side
     /// of the host/target boundary it serves, the cargo invocation
-    /// spelling that produced it, and whether it links. `None` only on
-    /// records serialized before the field existed; the coverage checks
-    /// and the dependency gate treat shapeless rows as covering nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit_shape: Option<crate::public_cache::UnitShape>,
+    /// spelling that produced it, and whether it links. The coverage
+    /// checks and the dependency gate compare it.
+    pub unit_shape: crate::public_cache::UnitShape,
     /// Lowest glibc the artifact's ELF members can `dlopen` against — the
     /// highest `GLIBC_x.y` in their version-needed entries, measured at
     /// publish. `None` for non-ELF payloads and for artifacts with no glibc
@@ -1688,9 +1684,7 @@ pub struct PublishedSliceReport {
 /// a crate compiled as a host-side unit has a different compile key than
 /// the same crate compiled as a target unit — so the stored
 /// `unit_shape` distinguishes rows the edge's servable gate compares
-/// separately. Rows reported without one carry no shape and satisfy no
-/// coverage clause: a dependent gated on such a dependency stays gated
-/// until the node republishes.
+/// separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedSliceRow {
     /// Crate name as published on crates.io.
@@ -1701,12 +1695,9 @@ pub struct PublishedSliceRow {
     pub features_json: FeaturesJson,
     /// The unit shape the builder recorded for the row — its side, the
     /// cargo invocation spelling that produced it, and whether it links.
-    /// `None` only on reports serialized before the field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit_shape: Option<crate::public_cache::UnitShape>,
+    pub unit_shape: crate::public_cache::UnitShape,
     /// The Merkle dependency digest the row was built under (stow#588) —
-    /// required: an index row without one is filtered before it ever
-    /// reaches this wire, so a stored or reported row always carries it.
+    /// the dependency context the gate's coverage clause joins on.
     pub dependency_identity: DependencyIdentity,
 }
 

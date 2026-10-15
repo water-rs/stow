@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS queue (
     -- host unit), 0 for a target-side node. Part of the identity: the
     -- same crate legitimately exists at both sides of one triple.
     host_side INTEGER NOT NULL DEFAULT 0,
+    -- The Merkle dependency digest the task's subtree commits to
+    -- (stow#588); every enqueued task carries one.
+    dependency_identity TEXT NOT NULL,
     -- The explicit-spelling contract (stow#736): 1 when the node's
     -- `--extern` closure holds a proc-macro and a target-side task at
     -- a host triple therefore owes the shapes of BOTH invocation
@@ -45,13 +48,10 @@ CREATE TABLE IF NOT EXISTS queue (
     -- row has not committed to a dispatch, and carried through the
     -- node store into the dispatched payload.
     explicit_spelling INTEGER NOT NULL,
-    -- NULL is historical context that was never recorded, not a leaf.
-    dependency_identity TEXT,
     -- Repair latch: 1 once a `completed` row has been re-queued because a
     -- dependent's edge required unit shapes its published rows never
-    -- covered (shapeless legacy rows satisfy no gate clause). The
-    -- re-queue is at most once — the rebuild republishes real shapes, so
-    -- the missing-shape condition cannot recur.
+    -- covered. The re-queue is at most once — the rebuild republishes
+    -- real shapes, so the missing-shape condition cannot recur.
     shape_requeue INTEGER NOT NULL DEFAULT 0,
     -- The owner's count of unmet dependency edges — edges whose
     -- `dep_met` is 0 — maintained as a counter: set at insert, ±1'd by
@@ -162,11 +162,10 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     dep_features_json TEXT NOT NULL DEFAULT '',
     dep_target TEXT NOT NULL DEFAULT '',
     dep_rustc_version TEXT NOT NULL DEFAULT '',
-    dep_dependency_identity TEXT,
-    -- The side of the dep the dependent needs. -1 marks an edge whose
-    -- required side was never established: `p.unit_side = -1` matches
-    -- no published row, so the gate holds the dependent until the
-    -- resolver rewrites the edge with a real side.
+    dep_dependency_identity TEXT NOT NULL,
+    -- The side of the dep the dependent needs — always resolved at edge
+    -- insert: the resolver supplies it (stow#730, a `-1` or `0`-masked
+    -- edge is invalid).
     dep_host_side INTEGER NOT NULL DEFAULT 0,
     -- The gate's required shapes, precomputed at edge-write time (see
     -- dep_invocation_mask / dep_edge_unpublished_sql in queue.rs):
@@ -174,20 +173,17 @@ CREATE TABLE IF NOT EXISTS queue_dependencies (
     -- dependent's build compiles the dep under (1 = native, 2 =
     -- --target, 3 = both for a host-side dependent), and dep_shapes is
     -- the distinct (invocation, linked) pairs the slice must publish
-    -- before the dependent may dispatch. 0 fails closed until resynced.
+    -- before the dependent may dispatch.
     dep_invocations INTEGER NOT NULL DEFAULT 0,
     dep_shapes INTEGER NOT NULL DEFAULT 0,
     -- The edge's own gate answer, persisted: 1 while the live published
     -- slice for the dep's (dep_target, dep_rustc_version) serves every
     -- unit shape the mask requires — the row form of
     -- dep_edge_unpublished_sql. Written at insert and flipped by slice
-    -- deltas on the edges they match — so the owner's
-    -- `unpublished_deps` counter can move by ±1 on a flip
-    -- instead of re-evaluating the slice join per edge.
+    -- deltas on the edges they match — so the owner's `unpublished_deps`
+    -- counter can move by ±1 on a flip instead of re-evaluating the
+    -- slice join per edge.
     dep_met INTEGER NOT NULL DEFAULT 0,
-    -- Whether the edge's required side is established — resolver-written
-    -- edges carry 1; a 0 edge fails closed.
-    dep_side_known INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, depends_on_task_id)
 );
@@ -594,12 +590,10 @@ CREATE TABLE IF NOT EXISTS published_slice_rows (
     dependency_identity TEXT NOT NULL,
     -- The unit shape the row serves — the builder-recorded side, cargo
     -- invocation spelling, and link kind the dependency gate compares an
-    -- edge's required shapes against. -1 on all three legs is
-    -- shapeless: it satisfies no coverage clause and the dependent
-    -- stays gated until the node rebuilds and republishes.
-    unit_side INTEGER NOT NULL DEFAULT -1,
-    unit_invocation INTEGER NOT NULL DEFAULT -1,
-    unit_linked INTEGER NOT NULL DEFAULT -1,
+    -- edge's required shapes against.
+    unit_side INTEGER NOT NULL,
+    unit_invocation INTEGER NOT NULL,
+    unit_linked INTEGER NOT NULL,
     PRIMARY KEY (target, rustc_version, generation, crate_name, version, features_json, dependency_identity, unit_side, unit_invocation, unit_linked)
 );
 
@@ -647,48 +641,28 @@ CREATE TABLE IF NOT EXISTS attempt_outcome_buckets (
     PRIMARY KEY (target, bucket)
 );
 
--- Raw outcome rows are kept for failures only — the class and
--- example-run evidence the trip alert prints is read once, when the
--- check trips, so successes never land here and failures expire with
--- the window (the completion insert deletes what aged out).
-CREATE TABLE IF NOT EXISTS attempt_outcomes (
-    task_id TEXT NOT NULL,
-    attempt INTEGER NOT NULL,
-    -- Compilation target — the breaker's per-target trip streams group
-    -- on it.
-    target TEXT NOT NULL,
-    -- 'build' | 'publish' | 'register' — the pipeline step the old CI
-    -- completion report carried. Never written since the route's
-    -- removal; kept for the rows that predate it.
-    failure_step TEXT,
-    -- The failure's error first line (or `unknown`) — what the trip
-    -- alert groups failures by.
-    failure_class TEXT,
-    github_run_id TEXT,
-    finished_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (task_id, attempt)
-);
-
--- The trip evidence reads and the expiry delete both bound on
--- finished_at — the index keeps those scans off the row payload.
-CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_finished
-ON attempt_outcomes (finished_at);
-
--- Generation-keyed failure evidence. This table is additive so an older
--- Worker may continue inserting the legacy attempt_outcomes columns while
--- the new code rolls out; freeze evidence reads both tables.
+-- Generation-keyed failure evidence: raw outcome rows kept for
+-- failures only — the class and example-run evidence the trip alert
+-- prints is read once, when the check trips, so successes never land
+-- here and failures expire with the window (the completion insert
+-- deletes what aged out).
 CREATE TABLE IF NOT EXISTS attempt_outcomes_v2 (
     task_id TEXT NOT NULL,
     generation_id TEXT NOT NULL,
     attempt INTEGER NOT NULL,
+    -- Compilation target — the breaker's per-target trip streams group
+    -- on it.
     target TEXT NOT NULL,
-    failure_step TEXT,
+    -- The failure's error first line (or `unknown`) — what the trip
+    -- alert groups failures by.
     failure_class TEXT,
     github_run_id TEXT,
     finished_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (task_id, generation_id)
 );
 
+-- The trip evidence reads and the expiry delete both bound on
+-- finished_at — the index keeps those scans off the row payload.
 CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_v2_finished
 ON attempt_outcomes_v2 (finished_at);
 

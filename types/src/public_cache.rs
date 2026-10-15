@@ -264,9 +264,7 @@ pub enum UnitSide {
 }
 
 impl UnitSide {
-    /// The storage integer of one side value (`-1` marks a row that
-    /// carries no shape — registered before the field existed; it
-    /// satisfies no coverage check).
+    /// The storage integer of one side value.
     #[must_use]
     pub const fn to_int(self) -> i64 {
         match self {
@@ -275,8 +273,8 @@ impl UnitSide {
         }
     }
 
-    /// Decode one stored integer back into a side; `None` on the
-    /// legacy `-1` and any other value the table cannot carry.
+    /// Decode one stored integer back into a side; `None` on any value
+    /// the table cannot carry (a `-1` is corruption, not a row shape).
     #[must_use]
     pub const fn from_int(value: i64) -> Option<Self> {
         match value {
@@ -446,9 +444,7 @@ impl UnitKind {
 /// that produced it, and whether it links. The scheduler's dependency
 /// gate and the coverage checks compare this field — never values
 /// re-derived from a normalized profile, which would tie coverage to
-/// one profile's defaults. Rows registered before the field existed
-/// carry no shape and satisfy no coverage clause: they are unreachable
-/// under this lookup until the node rebuilds and republishes.
+/// one profile's defaults.
 #[derive(
     Debug,
     Clone,
@@ -1155,7 +1151,7 @@ mod tests {
         for kind in [UnitKind::Unlinked, UnitKind::Linked] {
             assert_eq!(UnitKind::from_int(kind.to_int()), Some(kind));
         }
-        // Legacy rows carry -1 — a shapeless row decodes to nothing.
+        // A `-1` leg is corruption — it decodes to nothing.
         assert_eq!(UnitSide::from_int(-1), None);
         assert_eq!(UnitInvocation::from_int(-1), None);
         assert_eq!(UnitKind::from_int(-1), None);

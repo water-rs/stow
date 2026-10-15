@@ -1055,11 +1055,8 @@ fn covered_slice_nodes(
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let mut shapes = HashMap::<_, BTreeSet<_>>::new();
     for row in rows {
-        let (Some(shape), Some(dependency_identity)) =
-            (row.unit_shape, row.dependency_identity.as_ref())
-        else {
-            continue;
-        };
+        let shape = row.unit_shape;
+        let dependency_identity = &row.dependency_identity;
         let host_side = shape.side == stow_types::public_cache::UnitSide::Host;
         if host_side && host_triple(target) != target.as_str() {
             return Err(stow_error!("host row reported in non-host slice {target}"));
@@ -2923,8 +2920,8 @@ mod tests {
             },
             emit: vec!["link".to_owned(), "metadata".to_owned()],
             min_glibc: None,
-            unit_shape: Some(shape),
-            dependency_identity: Some(request.dependency_identity().expect("digest")),
+            unit_shape: shape,
+            dependency_identity: request.dependency_identity().expect("digest"),
         }
     }
 
@@ -2977,18 +2974,10 @@ mod tests {
         assert!(!covered.contains(&right.task_id().expect("right id")));
 
         let mut mixed = rows;
-        mixed[0].dependency_identity = Some(right.dependency_identity().expect("right digest"));
+        mixed[0].dependency_identity = right.dependency_identity().expect("right digest");
         assert!(
             super::covered_slice_nodes(&mixed, &target, &left.rustc_version, &BTreeMap::new())
                 .expect("mixed coverage")
-                .is_empty()
-        );
-        for row in &mut mixed {
-            row.dependency_identity = None;
-        }
-        assert!(
-            super::covered_slice_nodes(&mixed, &target, &left.rustc_version, &BTreeMap::new())
-                .expect("historical coverage")
                 .is_empty()
         );
     }
@@ -3008,7 +2997,7 @@ mod tests {
         .collect::<Vec<_>>();
         assert!(
             rows.iter()
-                .any(|row| row.unit_shape.expect("shape").invocation == UnitInvocation::Target)
+                .any(|row| row.unit_shape.invocation == UnitInvocation::Target)
         );
         let complete =
             super::covered_slice_nodes(&rows, &target, &host.rustc_version, &BTreeMap::new())
@@ -3016,7 +3005,7 @@ mod tests {
         assert!(complete.contains(&host.task_id().expect("host id")));
         let partial = rows
             .into_iter()
-            .filter(|row| row.unit_shape.expect("shape").invocation == UnitInvocation::Native)
+            .filter(|row| row.unit_shape.invocation == UnitInvocation::Native)
             .collect::<Vec<_>>();
         assert!(
             super::covered_slice_nodes(&partial, &target, &host.rustc_version, &BTreeMap::new())

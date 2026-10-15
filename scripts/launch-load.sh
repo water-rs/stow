@@ -251,7 +251,9 @@ cat >"$WORK_DIR/load-records.json" <<'RECORDS'
   "artifact_size": 10,
   "bundle_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "bundle_size": 100,
-  "compile_millis": 5
+  "compile_millis": 5,
+  "dependency_identity": "ff949149c544832f5c9c33f5d66d9580315b37862ddea7df01ba2c678d988f0d",
+  "unit_shape": {"side": "target", "invocation": "native", "kind": "linked"}
 }]
 RECORDS
 sed -i "s/__RUSTC__/$RUSTC_VERSION/" "$WORK_DIR/load-records.json"

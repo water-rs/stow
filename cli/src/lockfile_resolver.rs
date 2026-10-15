@@ -896,7 +896,8 @@ mod tests {
         deps: &[(&str, &str)],
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: None,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity"),
             crate_name: CrateName::parse(crate_name).expect("name"),
             version: CrateVersion::new(Version::parse(version).expect("version")),
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
@@ -927,7 +928,11 @@ mod tests {
             },
             emit: vec!["link".to_owned()],
             min_glibc: None,
-            unit_shape: None,
+            unit_shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Target,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
         }
     }
 

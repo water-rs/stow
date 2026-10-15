@@ -30,7 +30,7 @@ use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport, P
 use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
-    IndexError, content_sha256, decode, encode, folded_tag, folded_tag_parts, index_tag,
+    IndexDecodeError, content_sha256, encode, folded_tag, folded_tag_parts, index_tag,
 };
 use stow_types::public_cache::UnitShape;
 use stow_types::records::{parse_records_tag, record_to_index_row};
@@ -115,7 +115,9 @@ pub struct IndexExportArgs {
     rustc_version: String,
     /// Ignore every published `folded` set and re-pull all records of
     /// this rustc — the first publish of a new rustc and the
-    /// disaster-recovery path.
+    /// disaster-recovery path. An index-format change needs a `--full`
+    /// export: the previous slices are of the format this reader no
+    /// longer reads.
     #[arg(long)]
     full: bool,
 }
@@ -397,8 +399,8 @@ pub fn decode_published_slice(
     rustc_version: &WireRustcVersion,
     bytes: &[u8],
 ) -> stow_types::error::Result<ArtifactIndex> {
-    decode(bytes).map_err(|error| match error {
-        IndexError::UnsupportedFormatVersion { .. } => stow_error!(
+    ArtifactIndex::decode(bytes).map_err(|error| match error {
+        IndexDecodeError::Format { .. } => stow_error!(
             "decode index {reference}: {error}; \
              re-export the slice with index-publish.yml `full: true` for rustc {rustc_version}"
         ),
@@ -439,40 +441,22 @@ type PullFut<'a, T> =
 /// what a consumer's key space identifies, but it is not the row key:
 /// two nodes that differ only in dependency context can compile to the
 /// same unit, and each keeps a row so the slice answers for both
-/// (stow#657). A record carrying no dependency identity — an archive
-/// record predating stow#588 — keys on `None`, which sorts ahead of the
-/// identified rows of the same unit and gives the emitted order a
-/// defined tie-break.
-type RowsByIdentity =
-    BTreeMap<(String, Option<UnitShape>, Option<DependencyIdentity>), ArtifactIndexRow>;
+/// (stow#657).
+type RowsByIdentity = BTreeMap<(String, UnitShape, DependencyIdentity), ArtifactIndexRow>;
 
 /// Fold `row` into `rows` under its
-/// `(c_metadata, unit_shape, dependency_identity)` key.
-///
-/// An identified row also evicts the identity-less archive row of the
-/// same `(c_metadata, unit_shape)`: the archive row answers no
-/// contextual question once an identified sibling exists. An
-/// identity-less row arriving after an identified sibling — inside one
-/// pass or from the previous slice — is skipped instead, so either
-/// arrival order keeps exactly the identified set.
+/// `(c_metadata, unit_shape, dependency_identity)` key — a rebuilt unit
+/// replaces its node's row, a second node publishing the same unit adds
+/// a row beside it.
 fn fold_row(rows: &mut RowsByIdentity, row: ArtifactIndexRow) {
-    let unit = (row.c_metadata.as_str().to_owned(), row.unit_shape);
-    if let Some(identity) = row.dependency_identity.clone() {
-        rows.remove(&(unit.0.clone(), unit.1, None));
-        rows.insert((unit.0, unit.1, Some(identity)), row);
-    } else {
-        // `None` sorts ahead of every `Some` under the same
-        // `(c_metadata, unit_shape)`, so the first key at or past the
-        // `None` key is an identified sibling exactly when one exists.
-        let identified_sibling = matches!(
-            rows.range((unit.0.clone(), unit.1, None)..).next(),
-            Some(((c_metadata, shape, Some(_)), _))
-                if c_metadata == &unit.0 && shape == &unit.1
-        );
-        if !identified_sibling {
-            rows.insert((unit.0, unit.1, None), row);
-        }
-    }
+    rows.insert(
+        (
+            row.c_metadata.as_str().to_owned(),
+            row.unit_shape,
+            row.dependency_identity.clone(),
+        ),
+        row,
+    );
 }
 
 /// The `(target, rustc)` an `index.*` tag names — the same suffix shape
@@ -572,15 +556,13 @@ where
     for ((_, _, tag), records) in missing.iter().zip(per_tag) {
         // The tag joins the folded set of every slice its records name;
         // a records artifact is immutable per build, so the tag is never
-        // pulled again once marked — including an artifact whose rows
-        // are all still unbundled.
+        // pulled again once marked.
         let mut named = BTreeSet::new();
         for record in &records {
             let key = (record.target.clone(), record.rustc_version.clone());
             named.insert(key.clone());
-            if let Some(row) = record_to_index_row(record) {
-                fold_row(new_rows.entry(key).or_default(), row);
-            }
+            let row = record_to_index_row(record);
+            fold_row(new_rows.entry(key).or_default(), row);
         }
         for key in named {
             new_folded.entry(key).or_default().insert((*tag).to_owned());
@@ -601,10 +583,8 @@ where
 /// Fold the new records into the previous slices: previous rows first,
 /// then each new row through [`fold_row`] — a rebuilt unit replaces its
 /// node's row, a second node publishing the same unit adds a row beside
-/// it, and an incoming identified row retires the slice's identity-less
-/// archive row of the same unit — and the folded set growing by every
-/// tag a record named. `generated_at` is stamped once so every slice of
-/// the pass matches.
+/// it — and the folded set growing by every tag a record named.
+/// `generated_at` is stamped once so every slice of the pass matches.
 fn merge_exports(
     mut prev: BTreeMap<(TargetTriple, WireRustcVersion), PrevSlice>,
     new_rows: &BTreeMap<(TargetTriple, WireRustcVersion), RowsByIdentity>,
@@ -856,7 +836,7 @@ async fn read_prev_sidecar(
             ));
         }
     };
-    decode(&bytes)
+    ArtifactIndex::decode(&bytes)
         .map(Some)
         .map_err(|error| stow_error!("decode previous index {}: {error}", sidecar.display()))
 }
@@ -867,15 +847,10 @@ async fn read_prev_sidecar(
 /// one `(crate, version, features, shape)` — so the report
 /// deduplicates. Two rows of the same identity at different unit shapes
 /// stay separate: the gate compares each shape an edge requires against
-/// its own row. A catalog row carrying no shape (registered before the
-/// column existed) reports as shapeless and covers nothing. A measured
-/// row above the sysroot's glibc floor publishes in the index but a
-/// baseline host cannot load it, so it releases no dependent — the same
-/// rule the catalog's coverage oracle applies (stow#336). A row carrying
-/// no dependency digest (every archive row registered before stow#588)
-/// satisfies no contextual coverage clause either, so it is not slice
-/// membership: filtered here, on the index side, it can also never
-/// appear in a delta's added or retired set.
+/// its own row. A measured row above the sysroot's glibc floor
+/// publishes in the index but a baseline host cannot load it, so it
+/// releases no dependent — the same rule the catalog's coverage oracle
+/// applies (stow#336).
 fn semantic_rows(index: &ArtifactIndex) -> Vec<PublishedSliceRow> {
     let mut seen = std::collections::BTreeSet::new();
     index
@@ -885,14 +860,12 @@ fn semantic_rows(index: &ArtifactIndex) -> Vec<PublishedSliceRow> {
             row.min_glibc
                 .is_none_or(|floor| floor <= stow_types::glibc::GLIBC_BASELINE)
         })
-        .filter_map(|row| {
-            Some(PublishedSliceRow {
-                crate_name: row.crate_name.clone(),
-                version: row.version.clone(),
-                features_json: row.features_json.clone(),
-                unit_shape: row.unit_shape,
-                dependency_identity: row.dependency_identity.clone()?,
-            })
+        .map(|row| PublishedSliceRow {
+            crate_name: row.crate_name.clone(),
+            version: row.version.clone(),
+            features_json: row.features_json.clone(),
+            unit_shape: row.unit_shape,
+            dependency_identity: row.dependency_identity.clone(),
         })
         .filter(|row| {
             seen.insert((
@@ -915,7 +888,7 @@ fn row_key(
     String,
     String,
     stow_types::identity::DependencyIdentity,
-    Option<stow_types::public_cache::UnitShape>,
+    stow_types::public_cache::UnitShape,
 ) {
     (
         row.crate_name.as_str().to_owned(),
@@ -935,7 +908,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
     let bytes = tokio::fs::read(&args.file)
         .await
         .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
-    let index = decode(&bytes)
+    let index = ArtifactIndex::decode(&bytes)
         .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
     let folded_bytes = tokio::fs::read(&args.folded)
         .await
@@ -1010,7 +983,7 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
     let bytes = tokio::fs::read(&args.file)
         .await
         .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
-    let index = decode(&bytes)
+    let index = ArtifactIndex::decode(&bytes)
         .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
     let target = index.header.target.clone();
     let rustc_version = index.header.rustc_version.clone();
@@ -1223,9 +1196,8 @@ mod tests {
     fn record(task_id: &str) -> ArtifactRecord {
         let c_metadata = CMetadata::parse(task_id).expect("c_metadata");
         ArtifactRecord {
-            dependency_identity: Some(
-                stow_types::identity::DependencyIdentity::leaf().expect("fixture leaf"),
-            ),
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("fixture leaf"),
             compile_key: format!("key-{task_id}"),
             c_metadata,
             extra_filename: String::new(),
@@ -1253,7 +1225,11 @@ mod tests {
             bundle_digest: format!("sha256:{task_id:0>64}"),
             bundle_size: 100,
             compile_millis: 5,
-            unit_shape: None,
+            unit_shape: UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Native,
+                kind: stow_types::public_cache::UnitKind::Linked,
+            },
             min_glibc: None,
         }
     }
@@ -1284,10 +1260,7 @@ mod tests {
         let folded_tag_name = folded_tag(TARGET, RUSTC);
         let prior = [record("aaaa1111"), record("bbbb2222")];
         let new = [record("cccc3333"), record("dddd4444")];
-        let prev_rows: Vec<ArtifactIndexRow> = prior
-            .iter()
-            .map(|record| record_to_index_row(record).expect("bundled record"))
-            .collect();
+        let prev_rows: Vec<ArtifactIndexRow> = prior.iter().map(record_to_index_row).collect();
         let pulled = Mutex::new(Vec::<String>::new());
         // The tag's digest is one-way — the registry answers records by
         // task id (its manifest annotation), which the test models with
@@ -1503,10 +1476,7 @@ mod tests {
         let mut second = record("aaaa1111");
         second.bundle_size = 2;
         let prev = PrevSlice {
-            index: prev_index(
-                vec![record_to_index_row(&first).expect("bundled record")],
-                7,
-            ),
+            index: prev_index(vec![record_to_index_row(&first)], 7),
             folded: [records_tag(RUSTC, "aaaa1111", build(1))].into(),
         };
         let pull_prev = {
@@ -1700,18 +1670,9 @@ mod tests {
     /// nodes differing only in context compile to the same unit.
     fn shared_unit_record(deps: &[&str]) -> ArtifactRecord {
         let mut record = record("aaaa1111");
-        record.dependency_identity = Some(
+        record.dependency_identity =
             stow_types::identity::DependencyIdentity::from_task_ids(deps.iter().copied())
-                .expect("dependency identity"),
-        );
-        record
-    }
-
-    /// The `aaaa1111` unit as an archive record — a row registered
-    /// before stow#588 carries no dependency identity.
-    fn archive_unit_record() -> ArtifactRecord {
-        let mut record = record("aaaa1111");
-        record.dependency_identity = None;
+                .expect("dependency identity");
         record
     }
 
@@ -1751,15 +1712,15 @@ mod tests {
         .expect("export pass");
         let rows = &target_slice(&pass).index.rows;
         assert_eq!(rows.len(), 2);
-        let left_identity = left.dependency_identity.expect("left identity");
-        let right_identity = right.dependency_identity.expect("right identity");
         let identities: Vec<_> = rows
             .iter()
-            .map(|row| row.dependency_identity.clone().expect("identified row"))
+            .map(|row| row.dependency_identity.clone())
             .collect();
         assert_eq!(
             identities.iter().collect::<BTreeSet<_>>(),
-            [&left_identity, &right_identity].into_iter().collect(),
+            [&left.dependency_identity, &right.dependency_identity]
+                .into_iter()
+                .collect(),
             "both nodes keep a row"
         );
         assert!(
@@ -1777,8 +1738,8 @@ mod tests {
         let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
         let left = shared_unit_record(&["dep-left"]);
         let right = shared_unit_record(&["dep-right"]);
-        let left_row = record_to_index_row(&left).expect("left row");
-        let right_row = record_to_index_row(&right).expect("right row");
+        let left_row = record_to_index_row(&left);
+        let right_row = record_to_index_row(&right);
         let prev = prev_index(vec![left_row.clone()], 7);
         let tags = vec![
             folded_tag(TARGET, RUSTC),
@@ -1801,97 +1762,13 @@ mod tests {
         assert!(rows.contains(&right_row), "the second node's row landed");
     }
 
-    /// An identity-less archive row and an identified row of the same
-    /// unit may meet either way — the archive record arriving first in
-    /// the pass or second — and either way only the identified row
-    /// survives, since it is the row that answers a contextual
-    /// question. The same holds when the archive row is already in the
-    /// published slice. An archive row with no identified sibling
-    /// stays as it is.
-    #[test]
-    fn an_identified_row_retires_its_units_identity_less_row() {
-        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
-        let identified = shared_unit_record(&["dep-a"]);
-        let identified_identity = identified.dependency_identity.clone().expect("identified");
-        let mut tags = [
-            records_tag(RUSTC, "bbbb2222", BUILD),
-            records_tag(RUSTC, "cccc3333", BUILD),
-        ];
-        tags.sort_unstable();
-        for archive_first in [true, false] {
-            let (first, second) = if archive_first {
-                (archive_unit_record(), identified.clone())
-            } else {
-                (identified.clone(), archive_unit_record())
-            };
-            let by_tag = BTreeMap::from([
-                (tags[0].clone(), vec![first]),
-                (tags[1].clone(), vec![second]),
-            ]);
-            let pass = block_on(export_pass(
-                &tags,
-                pull_no_prev(),
-                pull_records_by_tag(by_tag),
-                false,
-                &rustc,
-            ))
-            .expect("export pass");
-            let rows = &target_slice(&pass).index.rows;
-            assert_eq!(rows.len(), 1, "archive_first={archive_first}");
-            assert_eq!(
-                rows[0].dependency_identity.as_ref(),
-                Some(&identified_identity),
-                "archive_first={archive_first}"
-            );
-        }
-
-        // The archive row already sits in the published slice; the
-        // identified record's pass retires it.
-        let archive_row = record_to_index_row(&archive_unit_record()).expect("archive row");
-        let prev = prev_index(vec![archive_row], 7);
-        let tags = vec![
-            folded_tag(TARGET, RUSTC),
-            records_tag(RUSTC, "cccc3333", BUILD),
-        ];
-        let by_tag = BTreeMap::from([(tags[1].clone(), vec![identified])]);
-        let pass = block_on(export_pass(
-            &tags,
-            pull_only_prev(prev, [records_tag(RUSTC, "bbbb2222", BUILD)].into()),
-            pull_records_by_tag(by_tag),
-            false,
-            &rustc,
-        ))
-        .expect("export pass");
-        let rows = &target_slice(&pass).index.rows;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].dependency_identity.as_ref(),
-            Some(&identified_identity)
-        );
-
-        // An archive row with no identified sibling stays.
-        let tags = [records_tag(RUSTC, "bbbb2222", BUILD)];
-        let by_tag = BTreeMap::from([(tags[0].clone(), vec![archive_unit_record()])]);
-        let pass = block_on(export_pass(
-            &tags,
-            pull_no_prev(),
-            pull_records_by_tag(by_tag),
-            false,
-            &rustc,
-        ))
-        .expect("export pass");
-        let rows = &target_slice(&pass).index.rows;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].dependency_identity, None);
-    }
-
     /// The membership the export reports to the scheduler covers both
     /// nodes of a shared unit — the second node's row is semantic slice
     /// membership like the first's, not a duplicate.
     #[test]
     fn semantic_rows_reports_each_node_of_a_shared_unit() {
-        let left = record_to_index_row(&shared_unit_record(&["dep-left"])).expect("left row");
-        let right = record_to_index_row(&shared_unit_record(&["dep-right"])).expect("right row");
+        let left = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let right = record_to_index_row(&shared_unit_record(&["dep-right"]));
         let index = prev_index(vec![left.clone(), right.clone()], 3);
         let rows = semantic_rows(&index);
         assert_eq!(rows.len(), 2);
@@ -1899,8 +1776,8 @@ mod tests {
             .iter()
             .map(|row| row.dependency_identity.clone())
             .collect();
-        assert!(identities.contains(left.dependency_identity.as_ref().expect("left")));
-        assert!(identities.contains(right.dependency_identity.as_ref().expect("right")));
+        assert!(identities.contains(&left.dependency_identity));
+        assert!(identities.contains(&right.dependency_identity));
     }
 
     /// The publish delta already diffs on the dependency identity: a
@@ -1909,9 +1786,9 @@ mod tests {
     /// and retires nothing.
     #[test]
     fn a_second_nodes_row_reports_as_a_pure_addition() {
-        let left = record_to_index_row(&shared_unit_record(&["dep-left"])).expect("left row");
-        let right = record_to_index_row(&shared_unit_record(&["dep-right"])).expect("right row");
-        let right_identity = right.dependency_identity.clone().expect("right identity");
+        let left = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let right = record_to_index_row(&shared_unit_record(&["dep-right"]));
+        let right_identity = right.dependency_identity.clone();
         let previous = semantic_rows(&prev_index(vec![left.clone()], 7));
         let current = semantic_rows(&prev_index(vec![left, right], 8));
         assert_eq!(previous.len(), 1);
@@ -1942,65 +1819,6 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
-    }
-
-    /// An archive row registered before stow#588 carries no dependency
-    /// digest: it satisfies no coverage clause, so it is not slice
-    /// membership — `semantic_rows` filters it, and a delta between two
-    /// such indexes never names it as added or retired.
-    #[test]
-    fn rows_without_a_dependency_digest_are_not_slice_membership() {
-        let archive = || {
-            let mut row = record_to_index_row(&record("eeee5555")).expect("archive row");
-            row.dependency_identity = None;
-            row
-        };
-        let mut old_digest_row = record_to_index_row(&record("ffff6666")).expect("old digest row");
-        old_digest_row.dependency_identity = Some(
-            stow_types::identity::DependencyIdentity::from_task_ids(["task-a"]).expect("digest"),
-        );
-        let mut new_digest_row = record_to_index_row(&record("aaaa7777")).expect("new digest row");
-        new_digest_row.dependency_identity = Some(
-            stow_types::identity::DependencyIdentity::from_task_ids(["task-b"]).expect("digest"),
-        );
-        let old_digest = old_digest_row
-            .dependency_identity
-            .clone()
-            .expect("old digest");
-        let new_digest = new_digest_row
-            .dependency_identity
-            .clone()
-            .expect("new digest");
-
-        let previous = prev_index(vec![archive(), old_digest_row.clone()], 7);
-        let prev_rows = semantic_rows(&previous);
-        assert_eq!(
-            prev_rows.len(),
-            1,
-            "the digest-less archive row is filtered"
-        );
-        assert_eq!(prev_rows[0].dependency_identity, old_digest);
-
-        // The delta a later `index report` computes: prev and current
-        // both carry the archive row; only the new digest row diffs.
-        let current = prev_index(vec![archive(), old_digest_row, new_digest_row], 8);
-        let current_rows = semantic_rows(&current);
-        assert_eq!(current_rows.len(), 2);
-        let current_keys: std::collections::BTreeSet<_> =
-            current_rows.iter().map(row_key).collect();
-        let previous_keys: std::collections::BTreeSet<_> = prev_rows.iter().map(row_key).collect();
-        let added: Vec<_> = current_rows
-            .iter()
-            .filter(|row| !previous_keys.contains(&row_key(row)))
-            .collect();
-        assert!(
-            !prev_rows
-                .iter()
-                .any(|row| !current_keys.contains(&row_key(row))),
-            "the archive row is never retired"
-        );
-        assert_eq!(added.len(), 1, "only the new digest row is added");
-        assert_eq!(added[0].dependency_identity, new_digest);
     }
 
     /// The `.prev` rule is exact: generation 1 is the slice's first

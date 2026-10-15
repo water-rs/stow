@@ -1465,10 +1465,9 @@ fn observed_dep_edges(
             return None;
         };
         // The dep's published shape says which side its node serves.
-        // Without one — a local artifact, or a legacy shapeless row —
-        // the edge's own semantics decide: every extern of a host unit
-        // is host-side, and a target unit's only host extern is a
-        // proc-macro.
+        // Without one — a dep no published row names — the edge's own
+        // semantics decide: every extern of a host unit is host-side,
+        // and a target unit's only host extern is a proc-macro.
         let dep_side = dep_shape.map_or(observation_host_side || dep_proc_macro, |shape| {
             shape.side == UnitSide::Host
         });
@@ -2055,8 +2054,8 @@ mod observed_miss_tests {
 
     /// `(c_metadata, name, version, features, published_host_side,
     /// proc_macro)` — the published side is the dep row's recorded
-    /// `unit_shape` (`None` for a dep with no shape row), `proc_macro`
-    /// the artifact's recorded kind.
+    /// `unit_shape` (`None` for a dep the published slices do not name),
+    /// `proc_macro` the artifact's recorded kind.
     type DepIdentityFixture<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], Option<bool>, bool);
 
     fn task_node(

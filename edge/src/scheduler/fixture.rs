@@ -338,6 +338,7 @@ fn seq_sql(lo: u32, hi: u32) -> String {
 /// same list (`task_id` is the conflict key, never an update target).
 const QUEUE_SEED_COLUMNS: &[&str] = &[
     "task_id",
+    "dependency_identity",
     "crate_name",
     "version",
     "features_json",
@@ -372,6 +373,28 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "demand",
 ];
 
+/// The seed's `lane` expression over `n`.
+///
+/// The human lane inside the pending range is the pin window alone:
+/// a pending row parked `dispatch_eligible = 0` must be miss-lane,
+/// because the lane exemption (`lane = 'human' OR value >= floor`)
+/// recomputes a human row to eligible under EVERY admission floor —
+/// a below-floor stored flag is only a stable state for a miss row.
+/// Keeping the parked bulk miss-lane also keeps the pin window the
+/// first rows the claim walks at any floor: humans order ahead of
+/// every miss row in `dispatch_key`, so the claimed set is the pin
+/// — and its pooled closure — even after a floor change flips some
+/// parked rows back to eligible. Rows outside the pending range
+/// keep the upstream lane split (their lane never prices a claim).
+fn fixture_lane_case_sql(pending_end: u32, human_pin: u32, human_end: u32) -> String {
+    format!(
+        "CASE WHEN n <= {pending_end} \
+              THEN CASE WHEN n > {human_pin} AND n <= {human_end} \
+                        THEN 'human' ELSE 'miss' END \
+              ELSE CASE WHEN n <= {human_end} THEN 'human' ELSE 'miss' END END"
+    )
+}
+
 /// Build the seed's queue statement over an arbitrary `seq` source:
 /// identity and scheduling columns are functions of `n`, including the `dispatch_key`
 /// the claim walk orders on and the `wake_at` the alarm probes read
@@ -403,23 +426,7 @@ fn queue_seed_insert_sql(
     let target_case = target_case_sql("n");
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
-    // The human lane inside the pending range is the pin window alone:
-    // a pending row parked `dispatch_eligible = 0` must be miss-lane,
-    // because the lane exemption (`lane = 'human' OR value >= floor`)
-    // recomputes a human row to eligible under EVERY admission floor —
-    // a below-floor stored flag is only a stable state for a miss row.
-    // Keeping the parked bulk miss-lane also keeps the pin window the
-    // first rows the claim walks at any floor: humans order ahead of
-    // every miss row in `dispatch_key`, so the claimed set is the pin
-    // — and its pooled closure — even after a floor change flips some
-    // parked rows back to eligible. Rows outside the pending range
-    // keep the upstream lane split (their lane never prices a claim).
-    let lane_case = &format!(
-        "CASE WHEN n <= {pending_end} \
-              THEN CASE WHEN n > {human_pin} AND n <= {human_end} \
-                        THEN 'human' ELSE 'miss' END \
-              ELSE CASE WHEN n <= {human_end} THEN 'human' ELSE 'miss' END END"
-    );
+    let lane_case = &fixture_lane_case_sql(pending_end, human_pin, human_end);
     let first_at = "datetime('now', '-' || (n % 2880) || ' minutes')";
     let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
     // The claimable set is exactly the planted window (the human-lane
@@ -489,6 +496,7 @@ fn queue_seed_insert_sql(
         "WITH RECURSIVE seq(n) AS ({seq_source}) \
          {verb} INTO queue ({columns}) \
          SELECT {task_id}, \
+                {task_id}, \
                 'crate' || (n / {CRATE_NAME_ROWS}), \
                 '1.' || (n / 20000) || '.' || (n % 500), \
                 '[]', \
@@ -721,7 +729,7 @@ pub async fn seed_edges_chunk(
          INSERT OR IGNORE INTO queue_dependencies \
              (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, \
               dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, \
-              dep_invocations, dep_shapes, dep_side_known) \
+              dep_invocations, dep_shapes) \
          SELECT printf('%064x', n), \
                 printf('%064x', {dep}), \
                 'crate' || ({dep} / {CRATE_NAME_ROWS}), \
@@ -732,8 +740,7 @@ pub async fn seed_edges_chunk(
                 CASE WHEN {dep} % 10 = 0 THEN 1 ELSE 0 END, \
                 printf('%064x', {dep}), \
                 CASE WHEN {dep} % 10 = 0 THEN ({owner_mask}) ELSE ({dep_mask}) END, \
-                CASE WHEN {dep} % 10 = 0 THEN CASE WHEN n % 10 = 0 THEN 2 ELSE 1 END ELSE 2 END, \
-                1 \
+                CASE WHEN {dep} % 10 = 0 THEN CASE WHEN n % 10 = 0 THEN 2 ELSE 1 END ELSE 2 END \
          FROM seq {extra}",
         seq = seq_sql(lo, hi),
     ))

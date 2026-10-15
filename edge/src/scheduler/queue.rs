@@ -354,8 +354,7 @@ struct BatchedNodeRow {
 
 /// One stored edge's readiness as probed for an insert chunk: whether
 /// the dep's required publication is missing (`unpub`) and whether that
-/// edge also blocks (`blocker` — the dep failed, names no crate, or
-/// carries an unresolved legacy side).
+/// edge also blocks (`blocker` — the dep failed).
 #[derive(Debug, skyzen::FromRow)]
 struct EdgeFlag {
     owner: String,
@@ -685,8 +684,7 @@ async fn apply_batched_inserts(
             .query(&format!(
                 "SELECT d.task_id AS owner, \
                         CASE WHEN {unpub} THEN 1 ELSE 0 END AS unpub, \
-                        CASE WHEN bdep.status = 'failed' OR d.dep_crate_name = '' \
-                                  OR d.dep_host_side < 0 \
+                        CASE WHEN bdep.status = 'failed' \
                              THEN 1 ELSE 0 END AS blocker \
                  FROM queue_dependencies d \
                  LEFT JOIN queue bdep ON bdep.task_id = d.depends_on_task_id \
@@ -763,12 +761,12 @@ async fn insert_dep_edges(db: &DurableDb, edges: &[BatchedDepEdge]) -> Result<()
     for chunk in edges.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         db.query(&format!(
             "INSERT INTO queue_dependencies \
-             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_met, dep_side_known) \
+             (task_id, depends_on_task_id, dep_crate_name, dep_version, dep_features_json, dep_target, dep_rustc_version, dep_host_side, dep_dependency_identity, dep_invocations, dep_shapes, dep_met) \
              SELECT d.task_id, d.depends_on_task_id, d.dep_crate_name, \
                     d.dep_version, d.dep_features_json, d.dep_target, \
                     d.dep_rustc_version, d.dep_host_side, d.dep_dependency_identity, \
                     d.dep_invocations, \
-                    d.dep_shapes, CASE WHEN {unpub} THEN 0 ELSE 1 END, 1 \
+                    d.dep_shapes, CASE WHEN {unpub} THEN 0 ELSE 1 END \
              FROM (SELECT e ->> 'task_id' AS task_id, \
                          e ->> 'depends_on_task_id' AS depends_on_task_id, \
                          e ->> 'dep_crate_name' AS dep_crate_name, \
@@ -1809,7 +1807,7 @@ const OUTCOME_BUCKET_SECS: i64 = 300;
 /// what aged out. The read set of a completion is constant in traffic:
 /// the `UPDATE … RETURNING target` in `complete` names the row's target,
 /// one bucket upsert counts it, and — for failures — one raw
-/// `attempt_outcomes` row keeps the trip alert's class and run-id
+/// `attempt_outcomes_v2` row keeps the trip alert's class and run-id
 /// evidence; successes never land a raw row at all. Both expiry deletes
 /// bound on `window_minutes` (the same horizon the trip check reads), so
 /// each insert removes at most what just aged out — the tables never
@@ -1852,12 +1850,6 @@ async fn record_attempt_outcome(
         .await
         .map_err(|error| format!("record attempt failure evidence: {error}"))?;
     }
-    let window = format!("-{window_minutes} minutes");
-    db.query("DELETE FROM attempt_outcomes WHERE finished_at < datetime('now', ?)")
-        .bind(window)
-        .execute()
-        .await
-        .map_err(|error| format!("expire old attempt outcome rows: {error}"))?;
     db.query("DELETE FROM attempt_outcomes_v2 WHERE finished_at < datetime('now', ?)")
         .bind(format!("-{window_minutes} minutes"))
         .execute()
@@ -2904,9 +2896,7 @@ async fn request_record_status(
 ///   dependent — which compiles deps under both spellings — both.
 ///
 /// `p.unit_invocation + 1` maps the stored invocation (0 = native,
-/// 1 = `--target`) onto its bit. A row carrying `-1` legs is
-/// shapeless — it matches no clause, so a shapeless dep stays gated
-/// until the node republishes.
+/// 1 = `--target`) onto its bit.
 pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
     // The live generation is a scalar lookup on the slice marker's
     // primary key `(target, rustc_version)`, so each edge probes one
@@ -2927,13 +2917,10 @@ pub(super) fn dep_edge_unpublished_sql(dep: &str) -> String {
 /// one caller that already knows it: the slice-commit gate delta, where
 /// a correlated probe would re-seek the same marker row once per edge.
 fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
-    // Keep legacy -1 shape legs out of coverage. The integer enums are
-    // stored as 0/1 and legacy rows as -1, so BETWEEN is equivalent to
-    // the accepted domain while letting SQLite retain a bounded suffix
-    // range on the published-row primary key.
+    // The BETWEEN bounds are the enum domains phrased so SQLite keeps a
+    // bounded suffix range on the published-row primary key.
     format!(
-        "({dep}.dep_shapes = 0 \
-         OR (SELECT count(*) \
+        "(SELECT count(*) \
              FROM published_slice_rows p \
              WHERE p.target = {dep}.dep_target \
                AND p.rustc_version = {dep}.dep_rustc_version \
@@ -2947,7 +2934,7 @@ fn dep_edge_unpublished_sql_at(dep: &str, generation: &str) -> String {
                AND p.unit_linked BETWEEN 0 AND 1 \
                AND ({dep}.dep_host_side = 0 OR p.unit_linked = 1) \
                AND ({dep}.dep_invocations & (p.unit_invocation + 1)) != 0 \
-            ) < {dep}.dep_shapes)"
+            ) < {dep}.dep_shapes"
     )
 }
 
@@ -2993,8 +2980,7 @@ pub(super) fn deps_met_sql(owner_task: &str) -> String {
 }
 
 /// `blocked` as a SQL expression over the owner's row: `1` while a
-/// pending row owns an edge whose dep failed or was never resolved
-/// (`dep_crate_name = ''`, `dep_host_side < 0`) AND whose required units
+/// pending row owns an edge whose dep failed AND whose required units
 /// the live published slice does not serve — exactly the predicate the
 /// derived `blocked` status evaluated per row on every read before the
 /// flag existed. Written wherever `deps_met` is, and refreshed on the
@@ -3007,8 +2993,7 @@ pub(super) fn blocked_sql(owner_task: &str) -> String {
             SELECT 1 FROM queue_dependencies bd \
             LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = {owner_task} \
-              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' \
-                   OR bd.dep_host_side < 0) \
+              AND bdep.status = 'failed' \
               AND bd.dep_met = 0 \
         ) THEN 1 ELSE 0 END"
     )
@@ -4015,17 +4000,15 @@ fn effective_status_sql() -> String {
 }
 
 /// The first blocking edge a pending row names — the `blocked_by`
-/// companion to [`effective_status_sql`]. A failed dependency reports
-/// its task id; an edge whose identity was never resolved reports
-/// `unknown dependency identity`, since no task names it.
+/// companion to [`effective_status_sql`]: the failed dependency's task
+/// id.
 fn blocked_by_sql() -> String {
     "CASE WHEN queue.status = 'pending' AND queue.blocked != 0 THEN ( \
-        SELECT CASE WHEN bd.dep_crate_name = '' THEN 'unknown dependency identity' \
-                    ELSE bd.depends_on_task_id END \
+        SELECT bd.depends_on_task_id \
             FROM queue_dependencies bd \
-            LEFT JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
+            JOIN queue bdep ON bdep.task_id = bd.depends_on_task_id \
             WHERE bd.task_id = queue.task_id \
-              AND (bdep.status = 'failed' OR bd.dep_crate_name = '' OR bd.dep_host_side < 0) \
+              AND bdep.status = 'failed' \
               AND bd.dep_met = 0 \
             ORDER BY bd.depends_on_task_id LIMIT 1 \
     ) END"
@@ -5066,11 +5049,7 @@ pub async fn evaluate_freeze_trip(
     let window = format!("-{} minutes", settings.window_minutes);
     let class_rows = db
         .query(
-            "SELECT failure_class, count(*) AS count FROM ( \
-                 SELECT failure_class, finished_at FROM attempt_outcomes \
-                 UNION ALL \
-                 SELECT failure_class, finished_at FROM attempt_outcomes_v2 \
-             ) \
+            "SELECT failure_class, count(*) AS count FROM attempt_outcomes_v2 \
              WHERE finished_at >= datetime('now', ?) \
              GROUP BY failure_class ORDER BY count DESC, failure_class",
         )
@@ -5087,11 +5066,7 @@ pub async fn evaluate_freeze_trip(
     }
     let example_run_ids = db
         .query(
-            "SELECT github_run_id FROM ( \
-                 SELECT github_run_id, finished_at FROM attempt_outcomes \
-                 UNION ALL \
-                 SELECT github_run_id, finished_at FROM attempt_outcomes_v2 \
-             ) \
+            "SELECT github_run_id FROM attempt_outcomes_v2 \
              WHERE github_run_id IS NOT NULL \
                AND finished_at >= datetime('now', ?) \
              GROUP BY github_run_id ORDER BY MAX(finished_at) DESC LIMIT ?",
@@ -6027,19 +6002,17 @@ struct GateIdentity {
     crate_name: String,
     version: String,
     features_json: String,
-    dependency_identity: Option<String>,
+    dependency_identity: String,
     unit_side: i64,
     kind: Option<SliceChangeKind>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct NormalizedGateRow {
     crate_name: String,
     version: String,
     features_json: String,
-    /// `None` serializes as JSON null — the match join's `=` never
-    /// binds it, so a context-free row flips no edge (stow#588).
-    dependency_identity: Option<String>,
+    dependency_identity: String,
     unit_side: i64,
     invocations: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6085,23 +6058,35 @@ fn slice_row_key(row: &SliceRowJson) -> (String, String, String, String, i64, i6
     )
 }
 
+/// Fold changed slice rows into the gate's per-`(crate identity,
+/// side)` invocation masks. A stored leg outside its enum — a `-1`
+/// included — is corruption (stow#730): the decode fails loudly rather
+/// than dropping the row from the edge-refresh set. A host-side row
+/// that does not link is a real but useless shape — the gate never
+/// requires it — so it folds to nothing.
 fn normalize_gate_rows(
     rows: impl IntoIterator<Item = (SliceRowJson, Option<SliceChangeKind>)>,
-) -> Vec<NormalizedGateRow> {
+) -> Result<Vec<NormalizedGateRow>, QueueError> {
     let mut normalized = std::collections::BTreeMap::<GateIdentity, i64>::new();
     for (row, kind) in rows {
+        let invalid = |leg: &str, value: i64| {
+            QueueError::Invariant(format!(
+                "published slice row {}/{}/{}: {leg} = {value} is off-enum",
+                row.crate_name, row.version, row.features_json
+            ))
+        };
         let Some(invocation) =
             stow_types::public_cache::UnitInvocation::from_int(row.unit_invocation)
         else {
-            continue;
+            return Err(invalid("unit_invocation", row.unit_invocation));
         };
         let Some(side) = stow_types::public_cache::UnitSide::from_int(row.unit_side) else {
-            continue;
+            return Err(invalid("unit_side", row.unit_side));
         };
         let linked = match row.unit_linked {
             0 => false,
             1 => true,
-            _ => continue,
+            _ => return Err(invalid("unit_linked", row.unit_linked)),
         };
         if side == stow_types::public_cache::UnitSide::Host && !linked {
             continue;
@@ -6110,14 +6095,14 @@ fn normalize_gate_rows(
             crate_name: row.crate_name,
             version: row.version,
             features_json: row.features_json,
-            dependency_identity: Some(row.dependency_identity),
+            dependency_identity: row.dependency_identity,
             unit_side: side.to_int(),
             kind,
         };
         let bit = 1_i64 << invocation.to_int();
         *normalized.entry(identity).or_default() |= bit;
     }
-    normalized
+    Ok(normalized
         .into_iter()
         .map(|(identity, invocations)| NormalizedGateRow {
             crate_name: identity.crate_name,
@@ -6128,13 +6113,13 @@ fn normalize_gate_rows(
             invocations,
             kind: identity.kind,
         })
-        .collect()
+        .collect())
 }
 
 fn normalized_gate_json(
     rows: impl IntoIterator<Item = (SliceRowJson, Option<SliceChangeKind>)>,
 ) -> Result<Option<String>, QueueError> {
-    let normalized = normalize_gate_rows(rows);
+    let normalized = normalize_gate_rows(rows)?;
     if normalized.is_empty() {
         return Ok(None);
     }
@@ -6278,10 +6263,9 @@ struct LiveSliceRow {
 }
 
 /// Map report rows onto the stored 6-column identity — `rowid` zeroes
-/// out (only live-read rows carry one) and a missing unit shape writes
-/// the `-1` legs that satisfy no coverage clause. Every report row
-/// carries a digest: `PublishedSliceRow.dependency_identity` is
-/// required on the wire, so this map cannot fail on identity.
+/// out (only live-read rows carry one). Every report row carries a
+/// digest and a unit shape: both are required on the wire, so this map
+/// cannot fail.
 fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
     rows.iter()
         .map(|row| SliceRowJson {
@@ -6289,9 +6273,9 @@ fn to_slice_rows(rows: &[PublishedSliceRow]) -> Vec<SliceRowJson> {
             version: row.version.to_string(),
             features_json: row.features_json.raw(),
             dependency_identity: row.dependency_identity.to_string(),
-            unit_side: row.unit_shape.map_or(-1, |shape| shape.side.to_int()),
-            unit_invocation: row.unit_shape.map_or(-1, |shape| shape.invocation.to_int()),
-            unit_linked: row.unit_shape.map_or(-1, |shape| shape.kind.to_int()),
+            unit_side: row.unit_shape.side.to_int(),
+            unit_invocation: row.unit_shape.invocation.to_int(),
+            unit_linked: row.unit_shape.kind.to_int(),
             rowid: 0,
         })
         .collect()
@@ -6638,9 +6622,7 @@ async fn apply_slice_gate_delta(
              WHERE queue_dependencies.rowid = answers.rid \
                AND answers.old_met != answers.new_met \
              RETURNING queue_dependencies.task_id, queue_dependencies.dep_met, \
-                       CASE WHEN queue_dependencies.dep_crate_name = '' \
-                                  OR queue_dependencies.dep_host_side < 0 \
-                                  OR EXISTS ( \
+                       CASE WHEN EXISTS ( \
                                       SELECT 1 FROM queue bdep \
                                       WHERE bdep.task_id = queue_dependencies.depends_on_task_id \
                                         AND bdep.status = 'failed' \
@@ -6861,18 +6843,11 @@ async fn recover_stale_active_tasks(
 }
 
 /// A `completed` dependency is not done until its published slice rows
-/// cover every unit shape a dependent's edge requires — and rows
-/// registered before the unit-shape columns existed carry `-1` legs that
-/// satisfy no clause, so a dep published pre-upgrade would gate its
-/// dependents forever. `completed` here means "reported done without
-/// covering": re-queue the row once, behind the same backoff the
-/// failed-dependency requeue applies, and let the rebuild republish real
-/// shapes; `shape_requeue` latches the repair so it runs at most once.
-/// Edges whose dep identity never resolved (`dep_crate_name = ''`) name
-/// no node a republish could satisfy, and an edge whose required side
-/// was never established (`dep_host_side = -1`) asks for a side the dep
-/// can never publish — both leave nothing to re-queue: the first has no
-/// dep, the second is the resolver's rewrite, not the dep's rebuild.
+/// cover every unit shape a dependent's edge requires. `completed`
+/// here means "reported done without covering": re-queue the row once,
+/// behind the same backoff the failed-dependency requeue applies, and
+/// let the rebuild republish real shapes; `shape_requeue` latches the
+/// repair so it runs at most once.
 async fn requeue_incomplete_shape_deps(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -6910,7 +6885,6 @@ async fn requeue_incomplete_shape_deps(
            AND EXISTS ( \
                SELECT 1 FROM queue_dependencies d \
                WHERE d.depends_on_task_id = queue.task_id \
-                 AND d.dep_crate_name != '' AND d.dep_host_side >= 0 \
                  AND d.dep_met = 0 \
            ) \
          RETURNING task_id",
@@ -7090,7 +7064,7 @@ struct GitHubAppTokenRow {
 mod tests {
     use super::{
         AlarmInputs, AlarmPlan, DispatchCapacity, SliceChangeKind, SliceRowJson,
-        normalize_gate_rows, normalized_gate_json, plan_alarm, seconds_until_utc_midnight,
+        normalize_gate_rows, plan_alarm, seconds_until_utc_midnight,
     };
     const NOW_MS: i64 = 1_000_000;
 
@@ -7122,10 +7096,8 @@ mod tests {
             (row(1, 0, 0), Some(SliceChangeKind::Added)),
             (row(1, 0, 1), Some(SliceChangeKind::Added)),
             (row(1, 1, 1), Some(SliceChangeKind::Added)),
-            (row(-1, 0, 1), Some(SliceChangeKind::Added)),
-            (row(0, -1, 1), Some(SliceChangeKind::Added)),
         ];
-        let normalized = normalize_gate_rows(added);
+        let normalized = normalize_gate_rows(added).expect("normalize valid rows");
         let shapes = normalized
             .iter()
             .map(|row| (row.unit_side, row.invocations, row.kind))
@@ -7138,7 +7110,8 @@ mod tests {
             ]
         );
 
-        let retired = normalize_gate_rows([(row(0, 0, 1), Some(SliceChangeKind::Retired))]);
+        let retired = normalize_gate_rows([(row(0, 0, 1), Some(SliceChangeKind::Retired))])
+            .expect("normalize retired row");
         assert_eq!(
             retired
                 .iter()
@@ -7147,17 +7120,21 @@ mod tests {
             vec![(0, 1, Some(SliceChangeKind::Retired))]
         );
 
-        let full = normalize_gate_rows([(row(0, 0, 0), None), (row(0, 1, 1), None)]);
+        let full =
+            normalize_gate_rows([(row(0, 0, 0), None), (row(0, 1, 1), None)]).expect("normalize");
         assert_eq!(
             full.iter()
                 .map(|row| (row.unit_side, row.invocations, row.kind))
                 .collect::<Vec<_>>(),
             vec![(0, 3, None)]
         );
-        assert_eq!(
-            normalized_gate_json([(row(-1, -1, -1), None)]).expect("normalize legacy rows"),
-            None
-        );
+        // Off-enum legs are corrupt storage (stow#730): an invariant
+        // error, not a skipped row.
+        for bad in [(-1, 0, 1), (0, -1, 1), (0, 0, 9)] {
+            let error = normalize_gate_rows([(row(bad.0, bad.1, bad.2), None)])
+                .expect_err("off-enum legs are an invariant failure");
+            assert!(error.to_string().contains("off-enum"), "{error}");
+        }
     }
 
     #[test]
