@@ -421,6 +421,34 @@ fn now_secs() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
+/// Write `index` as the cached slice for `(target, rustc_version)` in the
+/// same shape `fetch_slice` leaves it — blob plus `current.json` pointer —
+/// so a test lands a slice without a registry (stow#735). Returns the
+/// manifest digest the pointer names.
+#[cfg(test)]
+pub async fn write_cached_test_slice(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+    index: &ArtifactIndex,
+) -> stow_types::error::Result<String> {
+    let dir = slice_dir(config, target, rustc_version);
+    let blob = stow_types::index::encode(index)
+        .map_err(|error| stow_types::stow_error!("encode test index slice: {error}"))?;
+    let digest = "sha256:test-slice-manifest".to_owned();
+    store_slice(&dir, &digest, &blob).await?;
+    write_pointer(
+        &dir,
+        &SlicePointer {
+            manifest_digest: digest.clone(),
+            fetched_at: now_secs(),
+            row_count: index.rows.len() as u64,
+        },
+    )
+    .await?;
+    Ok(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use semver::Version;

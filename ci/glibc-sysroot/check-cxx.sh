@@ -24,6 +24,8 @@
 set -euo pipefail
 
 sysroot="${1:?usage: check-cxx.sh <sysroot-dir>}"
+# shellcheck source=ci/glibc-sysroot/elf-audit.sh
+. "$(dirname "${BASH_SOURCE[0]}")/elf-audit.sh"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -50,21 +52,14 @@ fail() {
     exit 1
 }
 
-# True when version name $1 sorts strictly above the $2
-# ceiling — `sort -V` orders the dotted fields.
-version_over() {
-    [ "$1" != "$2" ] \
-        && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
-}
-
 # Audit one linked output: refuse a GLIBC_ reference above
 # 2.28 or a GLIBCXX_ reference above 3.4.25, refuse a missing
 # libstdc++.so.6 NEEDED, and print the observed maxima.
 audit() {
     local file="$1" arch="$2" step="$3"
     local glibc glibcxx
-    glibc="$(readelf -V "$file" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -1 || true)"
-    glibcxx="$(readelf -V "$file" | grep -o 'GLIBCXX_[0-9][0-9.]*' | sort -Vu | tail -1 || true)"
+    glibc="$(highest_version "$file" GLIBC_)"
+    glibcxx="$(highest_version "$file" GLIBCXX_)"
     if [ -n "$glibc" ] && version_over "$glibc" GLIBC_2.28; then
         fail "$file ($step): requires $glibc, above the GLIBC_2.28 floor"
     fi

@@ -698,6 +698,12 @@ impl PhaseUnitGraph {
         format!("{} {}", self.phase.as_str(), self.invocation.spelling())
     }
 
+    /// The phase this graph answers for — the closure reads `check`/`build`
+    /// graphs into the publishable set and ignores `test` ones.
+    pub(crate) const fn phase(&self) -> CargoSubcommand {
+        self.phase
+    }
+
     /// This graph's units in the shared task-unit model — the resolved
     /// feature set the scan labels each captured unit's row with
     /// (stow#611).
@@ -707,6 +713,24 @@ impl PhaseUnitGraph {
     ) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
         self.graph.task_units(self.target.as_deref(), host_triple)
     }
+}
+
+/// The host triple of the runner family that builds `task`'s target —
+/// the platform a unit cargo gives no `--target` compiles for.
+///
+/// # Errors
+/// Returns an error when no runner family builds the task's target.
+pub fn runner_host_triple(task: &BuildTaskPayload) -> stow_types::error::Result<&'static str> {
+    Ok(stow_types::api::runner_family(task.target.as_str())
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "task {} {} targets {} — no runner family names its host triple",
+                task.crate_name.as_str(),
+                task.version,
+                task.target
+            )
+        })?
+        .host_triple())
 }
 
 /// The units this build's workspace will compile, read from cargo's own
@@ -740,16 +764,7 @@ pub async fn phase_unit_graphs(
                     .collect::<Vec<_>>(),
                 passes_target.then(|| task.target.as_str()),
                 workspace.workspace_root(),
-                stow_types::api::runner_family(task.target.as_str())
-                    .ok_or_else(|| {
-                        stow_types::stow_error!(
-                            "task {} {} targets {} — no runner family names its host triple",
-                            task.crate_name.as_str(),
-                            task.version,
-                            task.target
-                        )
-                    })?
-                    .host_triple(),
+                runner_host_triple(task)?,
                 &task.rustc_version,
             )
             .await?;
@@ -797,16 +812,7 @@ pub fn verify_dependency_context(
     unit_graphs: &[PhaseUnitGraph],
 ) -> stow_types::error::Result<()> {
     let expected = task.verified_dependency_graph()?;
-    let host_triple = stow_types::api::runner_family(task.target.as_str())
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "task {} {} targets {} — no runner family names its host triple",
-                task.crate_name.as_str(),
-                task.version,
-                task.target
-            )
-        })?
-        .host_triple();
+    let host_triple = runner_host_triple(task)?;
     for unit_graph in unit_graphs {
         let units = unit_graph.task_units(host_triple).map_err(|error| {
             stow_types::stow_error!(
@@ -1781,14 +1787,17 @@ fn targets_android(target: &str) -> bool {
 /// out of `names` — the caller passes the parent environment's names at
 /// sandbox-build time, and the task's `target` decides which apply.
 ///
-/// Exact names cover the compiler drivers the `cc` crate and rustc invoke,
-/// the SDK roots those tools locate their install trees through, and
-/// pkg-config's sysroot wiring. The Android SDK/NDK roots
-/// (`ANDROID_ROOT_VARS`) count only for a task that targets Android; the
-/// runner image exports them whatever the job builds. The prefixed forms
-/// are the `cc` crate's per-target overrides (`CC_<target>`,
-/// `AR_<target>`, `CFLAGS_<target>`) plus cargo's per-target configuration
-/// (`CARGO_TARGET_<TRIPLE>_LINKER`, `_AR`, `_RUNNER`, `_RUSTFLAGS`).
+/// Exact names cover the compiler drivers the `cc` crate and rustc invoke
+/// and the SDK roots those tools locate their install trees through. The
+/// Android SDK/NDK roots (`ANDROID_ROOT_VARS`) count only for a task that
+/// targets Android; the runner image exports them whatever the job
+/// builds. The prefixed forms are the `cc` crate's per-target overrides
+/// (`CC_<target>`, `AR_<target>`, `CFLAGS_<target>`), cargo's per-target
+/// configuration (`CARGO_TARGET_<TRIPLE>_LINKER`, `_AR`, `_RUNNER`,
+/// `_RUSTFLAGS`), and the `pkg-config` crate's configuration in both its
+/// plain and its per-target spelling — the aarch64 job names its cross
+/// pkg-config in `PKG_CONFIG_aarch64_unknown_linux_gnu`, so a build
+/// script compiling for the host keeps the native one (stow#729).
 /// `CARGO_TARGET_DIR` is deliberately not a prefix match here —
 /// `CARGO_TARGET_DIR` is set explicitly per phase.
 fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec<String> {
@@ -1803,10 +1812,6 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "LDFLAGS",
         "SDKROOT",
         "DEVELOPER_DIR",
-        "PKG_CONFIG_PATH",
-        "PKG_CONFIG_LIBDIR",
-        "PKG_CONFIG_SYSROOT_DIR",
-        "PKG_CONFIG_ALLOW_CROSS",
         // The glibc sysroot root the Linux build job installs:
         // passthrough is what `toolchain_grant_dirs` keys on to grant
         // the whole tree (its bin/ holds the PATH-resolved driver shims).
@@ -1837,6 +1842,7 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "CXXFLAGS_",
         "CPPFLAGS_",
         "LDFLAGS_",
+        "PKG_CONFIG_",
     ];
     let android = targets_android(target);
     names
@@ -2350,8 +2356,9 @@ pub fn sibling_runtime_wrapper(capture_wrapper: &Path) -> stow_types::error::Res
 /// it decides which packages cargo resolves. A crate resolved as the root
 /// package unifies its own dev-dependencies' feature requests into the
 /// normal graph, so a dev-dependency asking for `digest/dev` activates
-/// `digest`'s optional `blobby` and `cargo tree` lists a package the build,
-/// which compiles the crate as somebody else's dependency, never compiles.
+/// `digest`'s optional `blobby` and the unit graphs carry a package the
+/// build, which compiles the crate as somebody else's dependency, never
+/// compiles.
 /// Resolving the closure that way therefore demanded artifacts that could
 /// not exist and failed the publish of `sha2`, `aes` and every other crate
 /// whose dev-dependencies enable a feature of a normal one.
@@ -3530,6 +3537,18 @@ checksum = "33"
             ["CC_aarch64_linux_android".to_owned()].into_iter(),
         );
         assert_eq!(passed, ["CC_aarch64_linux_android"]);
+        let passed = toolchain_env_names(
+            "aarch64-unknown-linux-gnu",
+            [
+                "PKG_CONFIG_aarch64_unknown_linux_gnu".to_owned(),
+                "PKG_CONFIG_PATH".to_owned(),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            passed,
+            ["PKG_CONFIG_aarch64_unknown_linux_gnu", "PKG_CONFIG_PATH"]
+        );
         for target in ["x86_64-unknown-linux-gnu", "aarch64-linux-android"] {
             assert!(
                 toolchain_env_names(target, ["CARGO_TARGET_DIR".to_owned()].into_iter()).is_empty(),

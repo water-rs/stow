@@ -102,18 +102,6 @@ impl ServeMap {
         }
     }
 
-    /// Any coverage at all, exact or wildcard: the empty map is the
-    /// build that provably has nothing to serve yet — no locally stored
-    /// unit this build could compile, no covered index row — so a
-    /// `pending` map names nothing to wait on (stow#347). Local
-    /// coverage does not wait on a cached unit graph: the lockfile's
-    /// registry packages name the build's units when no graph is on
-    /// disk (stow#617), and a lockfile cargo has not written yet names
-    /// none — the local half is then empty, not an error (stow#608).
-    pub const fn is_empty(&self) -> bool {
-        self.target.is_empty() && self.host.is_empty()
-    }
-
     /// Whether anything in the build could serve `name` at `version` on
     /// this side of the graph: an exact pair, or a wildcard when the
     /// build's semantic fallback is on.

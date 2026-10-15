@@ -1,0 +1,12 @@
+# Development packages of the system libraries crate build scripts
+# link through pkg-config on the Linux builders (stow#729): the
+# runner image's own builds, one package name per line, the same
+# list for both legs: ci/glibc-sysroot/system-libs.sh installs each
+# name natively for x86_64-unknown-linux-gnu and as its arm64 build,
+# through dpkg multiarch, for aarch64-unknown-linux-gnu. The x86_64
+# image ships further development packages of its own (zlib, sqlite,
+# libpq, …) that the aarch64 leg does not get unless they are listed
+# here.
+libssl-dev
+libasound2-dev
+libva-dev

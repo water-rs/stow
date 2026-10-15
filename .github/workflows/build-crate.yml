@@ -108,14 +108,17 @@ jobs:
               } >> "$GITHUB_ENV"
               ;;
             x86_64-unknown-linux-gnu)
-              # Native-target system libraries crate build scripts probe
-              # through pkg-config — cros-libva needs libva.pc and the
-              # libva headers, which the runner image does not ship.
-              sudo apt-get update -qq
-              sudo apt-get install -y --no-install-recommends libva-dev mold
+              # The system libraries crate build scripts link through
+              # pkg-config — the image ships only some (stow#729). The
+              # script also refreshes the apt index.
+              ci/glibc-sysroot/system-libs.sh "$TASK_TARGET"
+              sudo apt-get install -y --no-install-recommends mold
               ;;
             aarch64-unknown-linux-gnu)
-              sudo apt-get update -qq
+              # The arm64 builds of the same system libraries, through
+              # dpkg multiarch, and the cross pkg-config that finds them
+              # (stow#729); the script also refreshes the apt index.
+              ci/glibc-sysroot/system-libs.sh "$TASK_TARGET"
               # The sysroot shims drive GCC 12 (stow#693); the runner image
               # ships the native drivers and not the cross ones.
               sudo apt-get install -y --no-install-recommends \
@@ -130,6 +133,9 @@ jobs:
                 echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
                 echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
                 echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+                # Per target, so a build script compiling for the host
+                # keeps the native pkg-config.
+                echo "PKG_CONFIG_aarch64_unknown_linux_gnu=aarch64-linux-gnu-pkg-config"
               } >> "$GITHUB_ENV"
               ;;
             aarch64-apple-ios)

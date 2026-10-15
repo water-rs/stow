@@ -931,6 +931,8 @@ if [ "$(uname -s)" = "Linux" ]; then
         || die "glibc sysroot wrapper write failed"
     "$REPO_ROOT/ci/glibc-sysroot/check-cxx.sh" "$SYSROOT" \
         || die "C++ does not build through the glibc sysroot shims"
+    "$REPO_ROOT/ci/glibc-sysroot/check-system-libs.sh" "$SYSROOT" \
+        || die "a system library does not build through the glibc sysroot shims"
 fi
 
 # The dispatch tree (.tmp/local-ci-dispatch) is written under the server's

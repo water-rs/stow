@@ -657,6 +657,17 @@ mod handle_tests {
     /// A truncating checkpoint that meets another connection's read
     /// reports busy instead of waiting on it: the close is a process on
     /// its way out, and a read snapshot may outlive it (stow#687).
+    ///
+    /// The reader's snapshot predates the filler and reads the database
+    /// file alone. A checkpoint copies every frame up to the oldest
+    /// snapshot into the database and syncs it before it reports busy,
+    /// and a hosted Windows runner's disk stalls for seconds at a time:
+    /// with the snapshot at the WAL's end the close copied 2 MiB and took
+    /// past 10 s, and a snapshot past only the schema's frames still left
+    /// syncs that took 6.5 s (stow#728). With the WAL backfilled before
+    /// the snapshot, the checkpoint meets the reader's lock before it
+    /// copies or syncs anything, so the bound times the wait alone — 2 s,
+    /// below sqlx's default 5 s busy timeout.
     #[tokio::test]
     async fn a_close_beside_another_connections_read_does_not_wait() {
         let cache_dir = tempfile::tempdir().expect("temp dir");
@@ -665,7 +676,10 @@ mod handle_tests {
             .pool(cache_dir.path())
             .await
             .expect("open the state database");
-        grow_wal(&pool, 2 * WAL_RESET_BYTES).await;
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&pool)
+            .await
+            .expect("backfill the schema's frames");
 
         let path = state_db_path(cache_dir.path());
         let mut reader = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
@@ -677,14 +691,22 @@ mod handle_tests {
             .execute(&mut reader)
             .await
             .expect("begin the reader's transaction");
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wal_filler")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master")
             .fetch_one(&mut reader)
             .await
-            .expect("hold a read snapshot on the filler table");
+            .expect("hold a read snapshot that predates the filler");
+        grow_wal(&pool, 2 * WAL_RESET_BYTES).await;
 
         tokio::time::timeout(Duration::from_secs(2), state_db.close())
             .await
             .expect("the close must not wait behind another connection's read");
+        let wal_len = std::fs::metadata(wal_path(&path))
+            .expect("the WAL exists")
+            .len();
+        assert!(
+            wal_len >= WAL_RESET_BYTES,
+            "the close truncated a WAL another connection was reading: {wal_len} bytes"
+        );
 
         sqlx::query("ROLLBACK")
             .execute(&mut reader)
