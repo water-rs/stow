@@ -9,7 +9,7 @@ use stow_types::api::{
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::public_cache::{
-    UnitInvocation, UnitKind, UnitShape, UnitSide, required_unit_shapes,
+    ExplicitSpelling, UnitInvocation, UnitKind, UnitShape, UnitSide, required_unit_shapes,
     stable_c_metadata_for_compile_key,
 };
 
@@ -245,8 +245,12 @@ pub async fn expand_scheduler_requests(
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
     // Every entry's dependency subgraph is client-supplied — minted
     // off the build's own `cargo --unit-graph` — so a dep the coverage
-    // prune drops still carries its real context (stow#588).
+    // prune drops still carries its real context (stow#588). The
+    // explicit-spelling flag travels the same way: the caller derived
+    // it from its unit graph, and the edge answers it for coverage,
+    // the queue row and the dispatched payload (stow#736).
     let mut subgraph_by_key = BTreeMap::<ExpandedNodeKey, stow_types::api::TaskSubgraph>::new();
+    let mut spelling_by_key = BTreeMap::<ExpandedNodeKey, ExplicitSpelling>::new();
     for entry in expanded_entries {
         let key = ExpandedNodeKey {
             package: PackageKey {
@@ -256,7 +260,7 @@ pub async fn expand_scheduler_requests(
             host_side: entry.host_side,
         };
         if subgraph_by_key
-            .insert(key, entry.dependency_subgraph.clone())
+            .insert(key.clone(), entry.dependency_subgraph.clone())
             .is_some()
         {
             return Err(ResolverError::Invariant(format!(
@@ -264,6 +268,7 @@ pub async fn expand_scheduler_requests(
                 entry.crate_name, entry.version
             )));
         }
+        spelling_by_key.insert(key, entry.explicit_spelling);
     }
     // A consumer target outside `CI_TARGET_TRIPLES` has no runner
     // family, so its host units have no host triple to mint on —
@@ -278,13 +283,20 @@ pub async fn expand_scheduler_requests(
             "`{target}` is not a CI target; host units cannot be minted for it"
         )));
     }
-    let semantic_keys =
-        load_cached_artifacts(db, target, rustc_version, &exact_graph.feature_json_by_key).await?;
+    let semantic_keys = load_cached_artifacts(
+        db,
+        target,
+        rustc_version,
+        &exact_graph.feature_json_by_key,
+        &spelling_by_key,
+    )
+    .await?;
 
     let requests = build_enqueue_requests(
         &exact_graph.feature_json_by_key,
         &exact_graph.dependency_keys_by_key,
         &subgraph_by_key,
+        &spelling_by_key,
         &semantic_keys,
         &target_typed,
         &rustc_version_typed,
@@ -319,6 +331,7 @@ fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
     dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
     subgraph_by_key: &BTreeMap<ExpandedNodeKey, stow_types::api::TaskSubgraph>,
+    spelling_by_key: &BTreeMap<ExpandedNodeKey, ExplicitSpelling>,
     cached_semantic_keys: &BTreeSet<(ExpandedNodeKey, String)>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
@@ -352,6 +365,12 @@ fn build_enqueue_requests(
             })?,
             preserve_lockfile: false,
             host_side: node_key.host_side,
+            explicit_spelling: spelling_by_key.get(node_key).copied().ok_or_else(|| {
+                format!(
+                    "missing explicit-spelling flag for {} {}",
+                    node_key.package.crate_name, node_key.package.version
+                )
+            })?,
         };
         // Re-derive every id the subgraph yields: a wire that does not
         // resolve is refused rather than minted (stow#588). The
@@ -562,6 +581,7 @@ async fn load_cached_artifacts(
     target: &str,
     rustc_version: &str,
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
+    spelling_by_key: &BTreeMap<ExpandedNodeKey, ExplicitSpelling>,
 ) -> Result<BTreeSet<(ExpandedNodeKey, String)>, ResolverError> {
     let host_triple = runner_family(target).map_or_else(|| target, |family| family.host_triple());
     let mut cached = BTreeSet::new();
@@ -575,9 +595,20 @@ async fn load_cached_artifacts(
             .filter(|(key, _)| key.host_side == host_side)
             .map(|(key, features_json)| (key.package.clone(), features_json.clone()))
             .collect::<BTreeSet<_>>();
-        for (package, features_json) in
-            load_cached_artifacts_for_keys(db, platform, rustc_version, &key_pairs, host_side)
-                .await?
+        let spellings = spelling_by_key
+            .iter()
+            .filter(|(key, _)| key.host_side == host_side)
+            .map(|(key, spelling)| (key.package.clone(), *spelling))
+            .collect::<BTreeMap<_, _>>();
+        for (package, features_json) in load_cached_artifacts_for_keys(
+            db,
+            platform,
+            rustc_version,
+            &key_pairs,
+            host_side,
+            &spellings,
+        )
+        .await?
         {
             cached.insert((ExpandedNodeKey { package, host_side }, features_json));
         }
@@ -595,6 +626,7 @@ pub async fn load_cached_artifacts_for_keys(
     rustc_version: &str,
     key_pairs: &BTreeSet<(PackageKey, String)>,
     host_side: bool,
+    spellings: &BTreeMap<PackageKey, ExplicitSpelling>,
 ) -> Result<BTreeSet<(PackageKey, String)>, ResolverError> {
     if key_pairs.is_empty() {
         return Ok(BTreeSet::new());
@@ -638,11 +670,21 @@ pub async fn load_cached_artifacts_for_keys(
     // Coverage is per unit shape, not per semantic row: the consumer's
     // build looks up each unit at the shape its invocation computes, so
     // a key is covered only when reachable candidates carry every shape
-    // its side requires (`required_unit_shapes`).
+    // its side requires (`required_unit_shapes`) — a `KeysApart` node's
+    // four-shape set included (stow#736).
     let invocation = runner_family(target).map_or(UnitInvocation::Target, |family| {
         UnitInvocation::for_task(target, family.host_triple())
     });
-    let required = required_unit_shapes(host_side, invocation);
+    let mut required_by_key = BTreeMap::<&(PackageKey, String), Vec<UnitShape>>::new();
+    for key_pair in key_pairs {
+        let spelling = spellings.get(&key_pair.0).copied().ok_or_else(|| {
+            format!(
+                "missing explicit-spelling flag for {} {}",
+                key_pair.0.crate_name, key_pair.0.version
+            )
+        })?;
+        required_by_key.insert(key_pair, required_unit_shapes(host_side, invocation, spelling));
+    }
     let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<UnitShape>>::new();
     for candidate in &candidates {
         if let Some(shape) = candidate.shape {
@@ -654,7 +696,11 @@ pub async fn load_cached_artifacts_for_keys(
     }
     Ok(shapes_by_key
         .into_iter()
-        .filter(|(_, shapes)| required.iter().all(|shape| shapes.contains(shape)))
+        .filter(|(key, shapes)| {
+            required_by_key
+                .get(key)
+                .is_some_and(|required| required.iter().all(|shape| shapes.contains(shape)))
+        })
         .map(|(key, _)| key.clone())
         .collect::<BTreeSet<_>>())
 }

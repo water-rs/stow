@@ -80,6 +80,13 @@ impl TaskNodeIdentity {
 pub struct ResolvedTaskNode {
     /// The node's semantic identity.
     pub identity: TaskNodeIdentity,
+    /// Whether this node keys differently under the explicit `--target
+    /// <host>` spelling (stow#736). Semantic graph data, derived
+    /// bottom-up by whichever projection produced the node — it is
+    /// presentation, never identity: task ids and dependency digests
+    /// ignore it.
+    #[serde(default)]
+    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
     /// Indexes of this node's direct dependencies in the graph's node
     /// list. Every entry must name a real node; ordering and repetition
     /// do not change identity.
@@ -261,6 +268,7 @@ mod tests {
     fn node(identity: TaskNodeIdentity, dependencies: &[usize]) -> ResolvedTaskNode {
         ResolvedTaskNode {
             identity,
+            explicit_spelling: crate::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: dependencies.to_vec(),
         }
     }
@@ -534,5 +542,28 @@ mod tests {
             tampered.dependency_identity(1).unwrap(),
             &DependencyIdentity::leaf().unwrap()
         );
+    }
+
+    /// stow#736: the explicit-spelling flag is semantic graph data,
+    /// never identity — two nodes differing only in the flag mint the
+    /// same task id and the same dependency digest, so a flag carried
+    /// by an older submission cannot fork the queue's identity space.
+    #[test]
+    fn explicit_spelling_is_not_task_identity() {
+        let flagged = ResolvedTaskNode {
+            explicit_spelling: crate::public_cache::ExplicitSpelling::KeysApart,
+            ..node(identity("dep", "1.0.0", &[], TARGET, RUSTC, false), &[])
+        };
+        let plain = node(identity("dep", "1.0.0", &[], TARGET, RUSTC, false), &[]);
+        let graph = ResolvedTaskGraph::resolve(vec![
+            flagged,
+            plain,
+            node(identity("root", "2.0.0", &[], TARGET, RUSTC, false), &[0]),
+            node(identity("root", "2.0.0", &[], TARGET, RUSTC, false), &[1]),
+        ])
+        .unwrap();
+        assert_eq!(graph.task_id(0), graph.task_id(1));
+        assert_eq!(graph.task_id(2), graph.task_id(3));
+        assert_eq!(graph.dependency_identity(2), graph.dependency_identity(3));
     }
 }

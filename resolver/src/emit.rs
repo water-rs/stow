@@ -276,6 +276,7 @@ pub fn emit_units(
                 name: dep_id.name().to_string(),
                 version: dep_id.version().to_string(),
                 dep_kind: edge.dep_kind,
+                proc_macro: edge.proc_macro,
             };
             if edge.dep_kind == DepKind::Build {
                 build_deps.push(dep);
@@ -298,6 +299,7 @@ pub fn emit_units(
                         name: dep_id.name().to_string(),
                         version: dep_id.version().to_string(),
                         dep_kind: edge.dep_kind,
+                        proc_macro: false,
                     });
                 }
                 lib_deps.push(dep);
@@ -345,6 +347,7 @@ pub fn emit_units(
                 name: pkg_id.name().to_string(),
                 version: pkg_id.version().to_string(),
                 dep_kind: DepKind::Build,
+                proc_macro: false,
             }];
             run_dep_list.extend(run_deps);
             units.push(push_unit(
@@ -371,6 +374,7 @@ pub fn emit_units(
                 name: pkg_id.name().to_string(),
                 version: pkg_id.version().to_string(),
                 dep_kind: DepKind::Build,
+                proc_macro: false,
             });
         }
         if pkg.library().is_some() {
@@ -433,6 +437,7 @@ fn emit_deduped_dep_edges(units: &mut [StowUnit]) {
                         name: dep.name.clone(),
                         version: dep.version.clone(),
                         dep_kind: dep.dep_kind,
+                        proc_macro: false,
                     },
                 ));
             }

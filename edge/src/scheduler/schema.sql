@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS queue (
     -- host unit), 0 for a target-side node. Part of the identity: the
     -- same crate legitimately exists at both sides of one triple.
     host_side INTEGER NOT NULL DEFAULT 0,
+    -- The explicit-spelling contract (stow#736): 1 when the node's
+    -- `--extern` closure holds a proc-macro and a target-side task at
+    -- a host triple therefore owes the shapes of BOTH invocation
+    -- spellings. Semantic data, not identity — upgraded only while the
+    -- row has not committed to a dispatch, and carried through the
+    -- node store into the dispatched payload.
+    explicit_spelling INTEGER NOT NULL DEFAULT 0,
     -- NULL is historical context that was never recorded, not a leaf.
     dependency_identity TEXT,
     -- Repair latch: 1 once a `completed` row has been re-queued because a
@@ -208,6 +215,11 @@ CREATE TABLE IF NOT EXISTS task_nodes (
     target TEXT NOT NULL,
     rustc_version TEXT NOT NULL,
     host_side INTEGER NOT NULL DEFAULT 0,
+    -- The node's explicit-spelling flag (stow#736): 1 when a
+    -- proc-macro sits in its `--extern` closure and it therefore keys
+    -- differently per invocation spelling. Rebuilt into the dispatched
+    -- payload's root flag on every claim.
+    explicit_spelling INTEGER NOT NULL DEFAULT 0,
     -- The Merkle dependency digest this node's task id commits to —
     -- every node in the store carries it; NULL belongs to tables whose
     -- context is historical, never here.

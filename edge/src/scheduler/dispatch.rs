@@ -56,6 +56,7 @@ pub async fn trigger_build(
         "target": task.target,
         "rustc_version": task.rustc_version,
         "host_side": task.host_side,
+        "explicit_spelling": task.explicit_spelling,
         "preserve_lockfile": task.preserve_lockfile,
         "dependency_subgraph": task.dependency_subgraph,
     });

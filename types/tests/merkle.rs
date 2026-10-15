@@ -54,6 +54,7 @@ fn dep(
         key: key(name, version, platform, side, kind),
         name: name.to_owned(),
         version: version.to_owned(),
+        proc_macro: false,
     }
 }
 
@@ -66,6 +67,7 @@ fn dep_of(unit: &TaskUnit) -> TaskUnitDep {
         key: unit.key.clone(),
         name: unit.name.clone(),
         version: unit.version.clone(),
+        proc_macro: false,
     }
 }
 
@@ -558,4 +560,89 @@ fn optional_shadow_preserves_package_source() {
     assert_eq!(forward.nodes()[root].dependencies.len(), 2);
     assert_eq!(forward.nodes(), backward.nodes());
     assert_eq!(forward.task_id(root), backward.task_id(root));
+}
+/// stow#736's flag rule over the shared projection: a target-side lib
+/// with a direct proc-macro dep is `KeysApart`; a lib above it
+/// inherits the flag; a host-side node and a lib with only build deps
+/// stay `KeysAsNative`.
+fn spelling_of(graph: &ResolvedTaskGraph, crate_name: &str) -> stow_types::public_cache::ExplicitSpelling {
+    graph.nodes()[node_index(graph, crate_name)].explicit_spelling
+}
+
+#[test]
+fn a_direct_proc_macro_dep_flags_the_parent() {
+    let pm_dep = TaskUnitDep {
+        proc_macro: true,
+        ..dep("pm", "1.0.0", HOST, TaskUnitSide::Host, TaskUnitKind::Lib)
+    };
+    let units = vec![
+        lib("parent", "1.0.0", &[], vec![pm_dep]),
+        host_unit("pm", "1.0.0", TaskUnitKind::Lib, vec![]),
+    ];
+    let graph = resolved_task_graph(&units, &rustc()).unwrap();
+    assert_eq!(
+        spelling_of(&graph, "parent"),
+        stow_types::public_cache::ExplicitSpelling::KeysApart
+    );
+    assert_eq!(
+        spelling_of(&graph, "pm"),
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        "a host-side node is never flagged"
+    );
+}
+
+#[test]
+fn a_flagged_dep_flags_every_ancestor() {
+    let pm_dep = TaskUnitDep {
+        proc_macro: true,
+        ..dep("pm", "1.0.0", HOST, TaskUnitSide::Host, TaskUnitKind::Lib)
+    };
+    let units = vec![
+        lib(
+            "root",
+            "1.0.0",
+            &[],
+            vec![dep(
+                "mid",
+                "1.0.0",
+                TARGET,
+                TaskUnitSide::Target,
+                TaskUnitKind::Lib,
+            )],
+        ),
+        lib("mid", "1.0.0", &[], vec![pm_dep]),
+        host_unit("pm", "1.0.0", TaskUnitKind::Lib, vec![]),
+    ];
+    let graph = resolved_task_graph(&units, &rustc()).unwrap();
+    assert_eq!(
+        spelling_of(&graph, "mid"),
+        stow_types::public_cache::ExplicitSpelling::KeysApart
+    );
+    assert_eq!(
+        spelling_of(&graph, "root"),
+        stow_types::public_cache::ExplicitSpelling::KeysApart,
+        "the flag propagates through target-side deps"
+    );
+}
+
+#[test]
+fn build_script_deps_never_flag_their_owner() {
+    // `build` is a build dependency: it hangs under the build-script
+    // compile unit, never reaches the lib's `--extern`, so it cannot
+    // flag the node even as a host-side lib.
+    let units = vec![
+        lib("owner", "1.0.0", &[], vec![]),
+        host_unit(
+            "owner",
+            "1.0.0",
+            TaskUnitKind::BuildScript,
+            vec![build_dep("build", "1.0.0")],
+        ),
+        host_unit("build", "1.0.0", TaskUnitKind::Lib, vec![]),
+    ];
+    let graph = resolved_task_graph(&units, &rustc()).unwrap();
+    assert_eq!(
+        spelling_of(&graph, "owner"),
+        stow_types::public_cache::ExplicitSpelling::KeysAsNative
+    );
 }
