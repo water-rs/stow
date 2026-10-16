@@ -61,6 +61,18 @@ pub enum Step {
         /// The response body.
         body: &'static str,
     },
+    /// Answer `status` in GitHub's primary-rate-limit shape —
+    /// `x-ratelimit-remaining: 0` and `x-ratelimit-reset` `reset_in`
+    /// seconds ahead of when the response is built, so the client sees
+    /// a near reset the test can afford to wait out.
+    RateLimited {
+        /// The status code — GitHub answers 403 or 429.
+        status: u16,
+        /// Seconds past the response the `x-ratelimit-reset` epoch lands.
+        reset_in: u64,
+        /// The response body.
+        body: &'static str,
+    },
     /// Answer `status` headers declaring `content_length`, send `body`
     /// once, then hold the connection open — the rest of the declared
     /// body never arrives, so a read that trusted the headers stalls
@@ -177,6 +189,11 @@ async fn run(
                                 retry_after,
                                 body,
                             } => respond(status, retry_after, body),
+                            Step::RateLimited {
+                                status,
+                                reset_in,
+                                body,
+                            } => rate_limited(status, reset_in, body),
                             Step::Stall {
                                 status,
                                 body,
@@ -218,7 +235,7 @@ async fn run(
                     }
                     // Every response step must serve cleanly; anything
                     // else is a server bug, not a scripted outcome.
-                    Step::Respond { .. } => {
+                    Step::Respond { .. } | Step::RateLimited { .. } => {
                         served
                             .expect("each connection serves inside the bound")
                             .expect("a respond step serves the request");
@@ -259,6 +276,28 @@ fn respond(
             .insert(http::header::RETRY_AFTER, HeaderValue::from(hint));
     }
     Ok(response)
+}
+
+/// A typed h1 response in GitHub's primary-rate-limit shape:
+/// `x-ratelimit-remaining: 0` and `x-ratelimit-reset` `reset_in`
+/// seconds ahead of now.
+fn rate_limited(
+    status: u16,
+    reset_in: u64,
+    body: &'static str,
+) -> io::Result<Response<ServedBody>> {
+    use http_body_util::BodyExt as _;
+    let reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+        + reset_in;
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header("x-ratelimit-remaining", "0")
+        .header("x-ratelimit-reset", reset.to_string())
+        .body(Full::new(Bytes::from_static(body.as_bytes())).boxed())
+        .map_err(io::Error::other)
 }
 
 /// A body that emits its bytes once, then pends forever — the

@@ -1743,10 +1743,12 @@ fn is_duplicate_label_conflict(error: &zenwave::Error) -> bool {
 /// happens on the error, never on a response branch that cannot run.
 /// A 200 names a different entity → hard failure. The POST accepts 201;
 /// a racing create answers 422, success only via
-/// [`is_duplicate_label_conflict`]. Everything else — auth, transport,
-/// server and validation failures — propagates. `request_timeout`
-/// bounds each whole read — send, status, and body decode — so a
-/// stalled body cannot outlive it.
+/// [`is_duplicate_label_conflict`]. A rate-limited answer waits out
+/// the reset it names and resends, like every operator-token path.
+/// Everything else — auth, transport, server and validation failures —
+/// propagates. `request_timeout` bounds each whole read — send, status,
+/// body decode, and any rate-limit wait — so a stalled body or a far
+/// reset cannot outlive it.
 async fn ensure_label(
     api_base: &str,
     gh_token: &str,
@@ -1763,26 +1765,23 @@ async fn ensure_label(
         color: "B60205",
         description: "stow watchdog incident — one open issue per incident",
     };
-    // The default client yields `zenwave::Error` — the 30 s request bound
-    // the watchdog's other calls use goes on the await through tokio so the
-    // carried response stays reachable (`Error::response()`); a middleware
-    // timeout would make the error type opaque.
-    let mut client = zenwave::client();
-
     let get_url = format!("{api_base}/repos/{}/labels/{INCIDENT_LABEL}", github::REPO);
-    let request = client
-        .get(&get_url)
-        .and_then(|request| request.header("Authorization", format!("Bearer {gh_token}")))
-        .and_then(|request| request.header("User-Agent", github::USER_AGENT))
-        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
-        .map_err(|error| format!("GET {get_url}: {error}"))?;
-    // The deadline covers the whole named-label read — the send, the
-    // status, and the body decode — so a response that stalls mid-body
-    // expires here instead of hanging the mail that follows.
+    // The shared read path — transient retries and the rate-limit waits
+    // `send_get` holds — under the same whole-read deadline: a reset
+    // that outlasts the bound surfaces as the timeout rather than
+    // hanging the mail that follows.
     let found = tokio::time::timeout(request_timeout, {
         let url = get_url.clone();
         async move {
-            let response = match request.await {
+            let response = match github::send_get(
+                Some(gh_token),
+                &url,
+                Some("application/vnd.github+json"),
+                None,
+                Backoff::new(),
+            )
+            .await
+            {
                 // A backend that delivers 4xx/5xx as `Ok` meets the same
                 // gate: `error_for_status` lifts it into the `Err` arm.
                 Ok(response) => response.error_for_status().await,
@@ -1813,42 +1812,58 @@ async fn ensure_label(
     }
 
     let post_url = format!("{api_base}/repos/{}/labels", github::REPO);
-    let request = client
-        .post(&post_url)
-        .and_then(|request| request.header("Authorization", format!("Bearer {gh_token}")))
-        .and_then(|request| request.header("User-Agent", github::USER_AGENT))
-        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
-        .and_then(|request| request.json_body(&label))
-        .map_err(|error| format!("POST {post_url}: {error}"))?;
     // Same whole-read bound: `error_for_status` reads the error body
     // where a backend delivers non-2xx on `Ok`, so it lives inside the
     // deadline too; the 422 check's `body_text` arrives inside
-    // `Error::Http` and needs no further read.
-    let post_result = tokio::time::timeout(request_timeout, async move {
-        match request.await {
-            Ok(response) => response.error_for_status().await,
-            Err(error) => Err(error),
+    // `Error::Http` and needs no further read. A rate-limited answer is
+    // the write settled as not-happened — the wait it names is slept
+    // and the ask rebuilt and resent, inside the same deadline. The
+    // block answers `Some(response)` for a live response and `None`
+    // when the duplicate-label race already achieved the end state.
+    let created = tokio::time::timeout(request_timeout, async {
+        loop {
+            let mut client = zenwave::client();
+            let request = client
+                .post(&post_url)
+                .and_then(|request| {
+                    request.header("Authorization", format!("Bearer {gh_token}"))
+                })
+                .and_then(|request| request.header("User-Agent", github::USER_AGENT))
+                .and_then(|request| request.header("Accept", "application/vnd.github+json"))
+                .and_then(|request| request.json_body(&label))
+                .map_err(|error| format!("POST {post_url}: {error}"))?;
+            let outcome = match request.await {
+                Ok(response) => response.error_for_status().await,
+                Err(error) => Err(error),
+            };
+            let error = match outcome {
+                Ok(response) => break Ok(Some(response)),
+                Err(error) => error,
+            };
+            if is_duplicate_label_conflict(&error) {
+                break Ok(None);
+            }
+            match github::classify_write(&format!("POST {post_url}"), &error) {
+                github::WriteFailure::RateLimited { hint: Some(wait), .. } => {
+                    tracing::warn!(url = %post_url, wait = ?wait, "rate-limited; waiting for the reset");
+                    tokio::time::sleep(wait).await;
+                }
+                failure => break Err(failure.to_string()),
+            }
         }
     })
     .await
-    .map_err(|_| format!("POST {post_url}: timed out"))?;
-    let error = match post_result {
-        Ok(created) => {
-            return if created.status() == zenwave::StatusCode::CREATED {
-                Ok(())
-            } else {
-                Err(format!(
-                    "POST {post_url}: unexpected status {}",
-                    created.status()
-                ))
-            };
+    .map_err(|_| format!("POST {post_url}: timed out"))??;
+    created.map_or(Ok(()), |created| {
+        if created.status() == zenwave::StatusCode::CREATED {
+            Ok(())
+        } else {
+            Err(format!(
+                "POST {post_url}: unexpected status {}",
+                created.status()
+            ))
         }
-        Err(error) => error,
-    };
-    if is_duplicate_label_conflict(&error) {
-        return Ok(());
-    }
-    Err(format!("POST {post_url}: {error}"))
+    })
 }
 
 /// `digest_due` — is it an hour or more since the last watchdog comment?
@@ -3386,6 +3401,49 @@ mod tests {
         );
     }
 
+    /// The primary rate limit is a settled "not yet", on the read and
+    /// on the write alike — each waits out the reset it names and the
+    /// label still lands, all inside the request bound.
+    #[tokio::test]
+    async fn rate_limited_label_calls_wait_out_the_reset() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::RateLimited {
+                status: 403,
+                reset_in: 1,
+                body: "{}",
+            },
+            crate::test_server::Step::Respond {
+                status: 404,
+                retry_after: None,
+                body: r#"{"message":"Not Found"}"#,
+            },
+            crate::test_server::Step::RateLimited {
+                status: 403,
+                reset_in: 1,
+                body: "{}",
+            },
+            crate::test_server::Step::Respond {
+                status: 201,
+                retry_after: None,
+                body: r#"{"id":123,"name":"incident","color":"B60205","default":false}"#,
+            },
+        ])
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            ensure_label(
+                &server.url,
+                "test-token",
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("ensure_label completes within the deadline")
+        .expect("the limits are waited out and the label lands");
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 4);
+    }
+
     /// The racing create: 422 whose every validation row is
     /// `Label`/`name`/`already_exists` — GitHub's own duplicate body.
     #[tokio::test]
@@ -3494,19 +3552,24 @@ mod tests {
     }
 
     /// Authorization and server failures on the named GET propagate —
-    /// neither is the missing case.
+    /// neither is the missing case. A 403 is terminal after one
+    /// request; a 500 is transient under the shared read policy and its
+    /// error surfaces only once the four-attempt budget is spent.
     #[tokio::test]
     async fn label_get_failures_propagate() {
-        for status in [403u16, 500u16] {
-            let server =
-                crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
-                    status,
-                    retry_after: None,
-                    body: r#"{"message":"broken"}"#,
-                }])
-                .await;
+        for (status, attempts) in [(403u16, 1usize), (500, 4)] {
+            let server = crate::test_server::Loopback::start(
+                (0..attempts)
+                    .map(|_| crate::test_server::Step::Respond {
+                        status,
+                        retry_after: None,
+                        body: r#"{"message":"broken"}"#,
+                    })
+                    .collect(),
+            )
+            .await;
             tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(20),
                 ensure_label(
                     &server.url,
                     "test-token",
@@ -3517,7 +3580,7 @@ mod tests {
             .expect("ensure_label completes within the deadline")
             .expect_err("a non-404 GET failure propagates");
             let heads = server.join().await;
-            assert_eq!(heads.len(), 1);
+            assert_eq!(heads.len(), attempts, "status {status}");
         }
     }
 
