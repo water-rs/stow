@@ -41,7 +41,8 @@ pub struct LaunchWindow {
 /// the flat daily cadences that do not scale with installs.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LaunchRates {
-    /// `GET /api/v1/bundles/{digest}` — one per covered unit an install's
+    /// `GET /api/v1/bundles/{rustc_version}/{digest}` — one per covered
+    /// unit an install's
     /// builds consume. Analytics Engine `stow_events`, `sum(double1)`
     /// where `blob1 = 'hit'` (the 1/10 sample's weight restores the true
     /// count).

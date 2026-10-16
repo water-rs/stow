@@ -121,7 +121,7 @@ async fn sign_once(args: &[String], image: &str) -> stow_types::error::Result<()
 ///
 /// `--sign-container-identity` is what puts the tagged reference into the
 /// payload's `critical.identity.docker-reference`. Without it cosign writes
-/// `Image.Repository.Name()` — `ghcr.io/water-rs/stow-cache-2`, the bare
+/// `Image.Repository.Name()` — `ghcr.io/water-rs/stow-cache-<rustc>`, the bare
 /// repository with the tag stripped — and the CLI, which requires that field
 /// to equal the artifact's `oci_reference`, rejects every signature. Since
 /// every artifact is now a tag of one repository, the bare repository name
@@ -152,7 +152,7 @@ mod tests {
     /// otherwise derive from the digest.
     #[test]
     fn sign_claims_the_tagged_reference_as_the_container_identity() {
-        let reference = "ghcr.io/water-rs/stow-cache-2:serde.1.0.219-x86_64-linux-1.91.1-0123abcd-fedcba9876543210";
+        let reference = "ghcr.io/water-rs/stow-cache-1.91.1:serde.1.0.219-x86_64-linux-1.91.1-0123abcd-fedcba9876543210";
         let args = sign_args(
             reference,
             &format!("{reference}@sha256:00"),
@@ -178,8 +178,8 @@ mod tests {
     #[test]
     fn sign_pins_the_legacy_signature_layout() {
         let args = sign_args(
-            "ghcr.io/water-rs/stow-cache-2:index.x86_64-unknown-linux-gnu.1.98.1",
-            "ghcr.io/water-rs/stow-cache-2:index.x86_64-unknown-linux-gnu.1.98.1@sha256:00",
+            "ghcr.io/water-rs/stow-cache-1.98.1:index.x86_64-unknown-linux-gnu.1.98.1",
+            "ghcr.io/water-rs/stow-cache-1.98.1:index.x86_64-unknown-linux-gnu.1.98.1@sha256:00",
             &RegistryCredentials {
                 username: "user".to_owned(),
                 password: "token".to_owned(),

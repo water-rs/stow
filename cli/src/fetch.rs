@@ -81,12 +81,13 @@ pub struct ArtifactBundle {
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
-/// The edge byte-path URL for one bundle — the `sha256:…` digest the
-/// signed index pins is the whole address.
+/// The edge byte-path URL for one bundle — the slice's rustc and the
+/// `sha256:…` digest the signed index pins are the whole address.
 fn artifact_url(bundle: &BundleRef<'_>, edge_url: &str) -> String {
     format!(
-        "{}/api/v1/bundles/{}",
+        "{}/api/v1/bundles/{}/{}",
         edge_url.trim_end_matches('/'),
+        bundle.rustc_version,
         bundle.bundle_digest
     )
 }
@@ -761,7 +762,7 @@ mod tests {
             let request_line = captured.lock().expect("captured lock").clone();
             assert_eq!(
                 request_line.trim_end(),
-                format!("GET /api/v1/bundles/{digest} HTTP/1.1"),
+                format!("GET /api/v1/bundles/1.85.0/{digest} HTTP/1.1"),
             );
         });
     }
@@ -1021,7 +1022,7 @@ mod tests {
         }))
         .expect("serialize OCI manifest");
         let manifest = ArtifactBundleManifest {
-            oci_reference: "ghcr.io/water-rs/stow-cache-2:demo.test".to_owned(),
+            oci_reference: "ghcr.io/water-rs/stow-cache-1.91.1:demo.test".to_owned(),
             oci_digest: sha256_prefixed(&oci_manifest_bytes),
             config,
             sigstore_signatures: vec![SigstoreSignature {

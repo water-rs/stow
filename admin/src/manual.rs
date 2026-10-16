@@ -29,7 +29,7 @@ use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersi
 use stow_types::index::{ArtifactIndexRow, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
 use stow_types::records::parse_run_title;
-use stow_types::registry::GHCR_BASE;
+use stow_types::registry::{CacheRepository, cache_repository};
 use stow_types::stow_error;
 use stow_types::task_graph::TaskNodeIdentity;
 use stow_types::transient::Backoff;
@@ -397,11 +397,12 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
 
     let base = crate::index_cmd::registry_base()?;
     let http = stow_oci::RegistryHttp::new().await?;
-    let session = base.session(&http);
+    let repository = cache_repository(&rustc_version);
+    let session = base.session(&repository, &http);
     let trust = crate::index_cmd::records_trust().await?;
     let catalog = Index {
         session: &session,
-        base: &base,
+        repository: &repository,
         trust: &trust,
     };
     let adopt_since = args.adopt_since.unwrap_or_else(|| {
@@ -1103,12 +1104,13 @@ pub async fn contextual_coverage(
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let base = crate::index_cmd::registry_base()?;
     let http = stow_oci::RegistryHttp::new().await?;
-    let session = base.session(&http);
+    let repository = cache_repository(rustc_version);
+    let session = base.session(&repository, &http);
     let trust = crate::index_cmd::records_trust().await?;
     covered_nodes(
         &Index {
             session: &session,
-            base: &base,
+            repository: &repository,
             trust: &trust,
         },
         targets,
@@ -1122,7 +1124,7 @@ pub async fn contextual_coverage(
 /// request lane pulls the same verified slices.
 pub struct Index<'a> {
     pub session: &'a stow_oci::RegistrySession,
-    pub base: &'a stow_oci::RegistryBase,
+    pub repository: &'a CacheRepository,
     pub trust: &'a stow_oci::verify::Trust,
 }
 
@@ -1135,7 +1137,7 @@ pub async fn published_slice_rows(
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<Option<Vec<ArtifactIndexRow>>> {
     let tag = index_tag(target.as_str(), rustc_version.as_str());
-    let reference = index.base.reference(&tag)?;
+    let reference = index.session.reference(&tag)?;
     let (bytes, manifest_digest) = match index.session.pull_manifest(&reference).await {
         Ok(pair) => pair,
         Err(error) if error.is_not_found() => return Ok(None),
@@ -1160,7 +1162,7 @@ pub async fn published_slice_rows(
         stow_oci::pull_signature_materials(index.session, &reference, &manifest_digest).await?;
     stow_oci::verify::verify_materials(
         index.trust,
-        &format!("{GHCR_BASE}:{tag}"),
+        &index.repository.reference(&tag),
         &manifest_digest,
         &materials,
         INDEX_CERTIFICATE_IDENTITY,

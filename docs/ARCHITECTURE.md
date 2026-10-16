@@ -373,15 +373,16 @@ alone — nothing reads an older shape of a store.
 
 ## OCI bundle layout
 
-Every artifact is a tag of the current generation's GHCR package
-`ghcr.io/water-rs/stow-cache-2`, referenced as
-`ghcr.io/water-rs/stow-cache-2:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
+Every artifact is a tag of its rustc's GHCR package — one package per
+rustc version — referenced as
+`ghcr.io/water-rs/stow-cache-<rustc>:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
 (see `types/src/registry.rs`). The crate name is the tag's first
 `.`-separated segment — crates.io names never contain `.`, so the split is
-unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). One
-package per generation means one GHCR visibility flip covers the whole
-cache: GHCR creates packages private and has no API to change that, so
-each generation is made public once by hand.
+unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). A new
+rustc's package is created by its first `build-crate.yml` push: it links
+to the public `water-rs/stow` repository and inherits its visibility, so
+no manual step ever opens one, and a retired rustc's package is deleted
+whole.
 
 Each artifact is two OCI images on that package. The signed image is the
 tag above: its config is the `ArtifactBlobConfig` and it carries one
@@ -394,7 +395,8 @@ config, the signature materials, and the layers byte-for-byte, and the CLI
 verifies that material after download. The build's records artifact
 carries the bundle layer's digest and size (`bundle_digest`,
 `bundle_size`), republished verbatim into the index row; the CLI asks the
-edge for `GET /api/v1/bundles/{bundle_digest}`, which streams the blob
+edge for `GET /api/v1/bundles/{rustc_version}/{bundle_digest}`, which
+streams the blob
 from GHCR behind Workers Cache (the answer's immutable `Cache-Control`
 lets the platform serve later reads without the Worker running), and the
 CLI requires
@@ -420,7 +422,7 @@ Constants (media types, paths) are defined in `types/src/bundle.rs`.
 Every servable artifact row is additionally published as a signed,
 per-slice index so a client resolves cache coverage locally instead of
 querying the edge (#188). One index exists per `(target, rustc_version)`
-pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-2`
+pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-<rustc>`
 (`stow_types::index::index_tag`) names a single-layer OCI artifact whose
 layer is the zstd-compressed JSON `ArtifactIndex` (media type
 `application/vnd.stow.index.v1+zstd`; config
@@ -460,11 +462,10 @@ republish untags the previous manifest, a rebuilt task's older
 `records-*` artifacts stay tagged, and each `sha256-<digest>[.sig]`
 signature manifest accumulates under no retention of its own. GitHub's
 package-versions API cannot enumerate a package at the cache's size, so
-stow never deletes single versions: a purge is a new package generation —
-the repository literal in `types/src/registry.rs` moves to the next name
-(`stow-cache` was the retired first generation), the cache rebuilds into
-the fresh package from empty, and the abandoned generation is deleted
-whole. `docs/DEPLOYMENT.md` carries the procedure.
+stow never deletes single versions: when a rustc is retired its whole
+`stow-cache-<rustc>` package is deleted, and a served rustc's cache
+rebuilds into its package from empty if the package is ever reset.
+`docs/DEPLOYMENT.md` carries the procedure.
 
 ## Trust boundaries
 
@@ -534,12 +535,12 @@ What each hop is allowed to do:
 
 | Hop | Reads | Writes |
 |---|---|---|
-| stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
+| stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{rustc_version}/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
 | edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/sync`, gated by repo push users and bound to records already published in GHCR); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
 | scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-2`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
 rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,
@@ -817,7 +818,7 @@ deserialization.
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
 | GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Workers-Cached for one hour |
-| GET `/api/v1/bundles/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Digest-addressed byte fetch — the only artifact-serving route; the `sha256:<64 hex>` path segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
+| GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | POST `/api/v1/admin/artifacts/sync` | Bearer: repo push user | `Vec<ArtifactRecord>` chunk | `OkResponse` | Mirror the GHCR records into the D1 catalog — `stow-admin index sync` inside `index-publish.yml` |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|clear`) |

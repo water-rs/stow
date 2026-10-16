@@ -517,7 +517,7 @@ mod tests {
     fn test_config() -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
-            registry_base_url: "http://127.0.0.1:9/v2/water-rs/stow-cache-2".to_owned(),
+            registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: std::path::PathBuf::from("/tmp/stow-admission-test"),
             request_timeout: Duration::from_millis(50),
             negative_cache_ttl: Duration::from_secs(1),

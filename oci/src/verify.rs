@@ -946,7 +946,7 @@ mod tests {
             &trust,
             &material,
             b"payload",
-            "ghcr.io/water-rs/stow-cache-2:demo.artifact",
+            "ghcr.io/water-rs/stow-cache-1.91.1:demo.artifact",
             "sha256:demo",
             CERTIFICATE_IDENTITY,
         )
@@ -986,8 +986,8 @@ mod tests {
     fn materials_verify_on_the_layer_binding_the_reference() {
         let sigstore = MiniSigstore::new();
         let digest = format!("sha256:{:064x}", 1);
-        let expected = "ghcr.io/water-rs/stow-cache-2:folded.aarch64-apple-darwin.1.98.1";
-        let other = "ghcr.io/water-rs/stow-cache-2:folded.x86_64-pc-windows-msvc.1.98.1";
+        let expected = "ghcr.io/water-rs/stow-cache-1.98.1:folded.aarch64-apple-darwin.1.98.1";
+        let other = "ghcr.io/water-rs/stow-cache-1.98.1:folded.x86_64-pc-windows-msvc.1.98.1";
         // The matching layer is deliberately not first.
         let materials = [other, expected]
             .iter()
@@ -1010,11 +1010,11 @@ mod tests {
     fn materials_binding_only_another_reference_are_rejected() {
         let sigstore = MiniSigstore::new();
         let digest = format!("sha256:{:064x}", 1);
-        let other = "ghcr.io/water-rs/stow-cache-2:folded.x86_64-pc-windows-msvc.1.98.1";
+        let other = "ghcr.io/water-rs/stow-cache-1.98.1:folded.x86_64-pc-windows-msvc.1.98.1";
         let materials = vec![signed_material(&sigstore, other, &digest, 0)];
         let error = super::verify_materials(
             &super::Trust::GithubCi(std::sync::Arc::new(sigstore.trust)),
-            "ghcr.io/water-rs/stow-cache-2:folded.aarch64-apple-darwin.1.98.1",
+            "ghcr.io/water-rs/stow-cache-1.98.1:folded.aarch64-apple-darwin.1.98.1",
             &digest,
             &materials,
             CERTIFICATE_IDENTITY,

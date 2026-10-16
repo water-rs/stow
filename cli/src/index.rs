@@ -22,8 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_lite::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use stow_types::error::Context;
+use stow_types::identity::WireRustcVersion;
 use stow_types::index::{ArtifactIndex, STOW_INDEX_MEDIA_TYPE, index_tag};
-use stow_types::registry::GHCR_BASE;
+use stow_types::registry::{CacheRepository, cache_repository};
 
 use crate::config::StowConfig;
 use crate::verify;
@@ -220,8 +221,12 @@ async fn fetch_slice(
     let tag = index_tag(target, rustc_version);
     let base = stow_oci::RegistryBase::parse(&config.registry_base_url)?;
     let http = config.registry_http().await?;
-    let session = base.session(&http);
-    let reference = base.reference(&tag)?;
+    let repository = cache_repository(
+        &WireRustcVersion::parse(rustc_version)
+            .map_err(|error| stow_types::stow_error!("rustc version {rustc_version}: {error}"))?,
+    );
+    let session = base.session(&repository, &http);
+    let reference = session.reference(&tag)?;
 
     // With a cached pointer the freshness check is one `HEAD`; without one
     // there is nothing to compare, so the manifest pull itself answers the
@@ -258,8 +263,16 @@ async fn fetch_slice(
         }
     }
 
-    let (blob, manifest_digest, index) =
-        download_verified_slice(config, &session, &reference, &tag, target, rustc_version).await?;
+    let (blob, manifest_digest, index) = download_verified_slice(
+        config,
+        &session,
+        &repository,
+        &reference,
+        &tag,
+        target,
+        rustc_version,
+    )
+    .await?;
     store_slice(&dir, &manifest_digest, &blob).await?;
     let pointer = SlicePointer {
         row_count: index.rows.len() as u64,
@@ -285,6 +298,7 @@ async fn fetch_slice(
 async fn download_verified_slice(
     config: &StowConfig,
     session: &stow_oci::RegistrySession,
+    repository: &CacheRepository,
     reference: &oci_client::Reference,
     tag: &str,
     target: &str,
@@ -310,7 +324,7 @@ async fn download_verified_slice(
     )?;
     // The signer binds the canonical GHCR reference, not whichever
     // transport base the pull came through.
-    let identity_reference = format!("{GHCR_BASE}:{tag}");
+    let identity_reference = repository.reference(tag);
     let trust = trust
         .await
         .map_err(|error| stow_types::stow_error!("join sigstore trust task: {error}"))??;
@@ -490,7 +504,7 @@ mod tests {
     fn test_config(cache_dir: &Path) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:8787".to_owned(),
-            registry_base_url: "http://127.0.0.1:8787/v2/water-rs/stow-cache-2".to_owned(),
+            registry_base_url: "http://127.0.0.1:8787".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
             request_timeout: std::time::Duration::from_secs(15),
             negative_cache_ttl: std::time::Duration::from_mins(5),

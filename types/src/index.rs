@@ -133,7 +133,7 @@ pub struct ArtifactIndexRow {
 }
 
 /// The OCI tag of the index artifact for one slice:
-/// `index.<target>.<rustc_short>` on `ghcr.io/water-rs/stow-cache-2`.
+/// `index.<target>.<rustc_short>` on `ghcr.io/water-rs/stow-cache-<rustc>`.
 ///
 /// `rustc_short` is the same short form artifact tags carry — the semver
 /// rendering `RustcVersion::short` produces, which is exactly the wire
@@ -381,7 +381,7 @@ mod tests {
     use super::*;
     use crate::api::CI_TARGET_TRIPLES;
     use crate::platform::{PanicStrategy, StripLevel};
-    use crate::registry::{GHCR_BASE, oci_reference_tag};
+    use crate::registry::{cache_repository, oci_reference_tag};
 
     fn index(rows: Vec<ArtifactIndexRow>) -> ArtifactIndex {
         ArtifactIndex {
@@ -497,7 +497,8 @@ mod tests {
     fn every_ci_target_produces_a_legal_index_tag() {
         for target in CI_TARGET_TRIPLES {
             let tag = index_tag(target, "1.91.1");
-            let reference = format!("{GHCR_BASE}:{tag}");
+            let reference = cache_repository(&WireRustcVersion::parse("1.91.1").expect("rustc"))
+                .reference(&tag);
             assert_eq!(
                 oci_reference_tag(&reference),
                 Some(tag.as_str()),

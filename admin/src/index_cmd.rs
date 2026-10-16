@@ -34,7 +34,7 @@ use stow_types::index::{
 };
 use stow_types::public_cache::UnitShape;
 use stow_types::records::{parse_records_tag, record_to_index_row};
-use stow_types::registry::{GHCR_BASE, sha256_digest};
+use stow_types::registry::{CacheRepository, cache_repository, sha256_digest};
 use stow_types::stow_error;
 
 use crate::Edge;
@@ -255,9 +255,9 @@ pub async fn records_trust() -> stow_types::error::Result<stow_oci::verify::Trus
 ///
 /// `reference` is the transport pull reference the signature materials
 /// fetch through; the signature itself binds the canonical
-/// `GHCR_BASE:tag` the publisher signed, so `identity_reference` is
-/// what verification compares — the same split the CLI's bundle and
-/// index verification makes.
+/// `ghcr.io/<repository>:<tag>` the publisher signed, so
+/// `identity_reference` is what verification compares — the same split
+/// the CLI's bundle and index verification makes.
 pub async fn verify_artifact(
     session: &stow_oci::RegistrySession,
     trust: &stow_oci::verify::Trust,
@@ -289,7 +289,7 @@ struct PrevSlice {
 /// so the injected pull closures may own their futures.
 struct PullContext {
     session: stow_oci::RegistrySession,
-    base: stow_oci::RegistryBase,
+    repository: CacheRepository,
     trust: stow_oci::verify::Trust,
 }
 
@@ -310,32 +310,25 @@ impl PullContext {
         let rustc_version = WireRustcVersion::parse(rustc_version)
             .map_err(|error| stow_error!("folded rustc_version: {error}"))?;
 
-        let folded_reference = self.base.reference(folded)?;
-        let pulled_folded = stow_oci::pull_folded(
-            &self.session,
-            &self.base,
-            target.as_str(),
-            rustc_version.as_str(),
-        )
-        .await?
-        .ok_or_else(|| stow_error!("folded tag {folded} listed but its manifest does not exist"))?;
+        let folded_reference = self.session.reference(folded)?;
+        let pulled_folded =
+            stow_oci::pull_folded(&self.session, target.as_str(), rustc_version.as_str())
+                .await?
+                .ok_or_else(|| {
+                    stow_error!("folded tag {folded} listed but its manifest does not exist")
+                })?;
         verify_artifact(
             &self.session,
             &self.trust,
             &folded_reference,
-            &format!("{GHCR_BASE}:{folded}"),
+            &self.repository.reference(folded),
             &pulled_folded.manifest_digest,
             INDEX_CERT_URL,
         )
         .await?;
 
-        let Some(pulled_index) = stow_oci::pull_index(
-            &self.session,
-            &self.base,
-            target.as_str(),
-            rustc_version.as_str(),
-        )
-        .await?
+        let Some(pulled_index) =
+            stow_oci::pull_index(&self.session, target.as_str(), rustc_version.as_str()).await?
         else {
             return Err(stow_error!(
                 "folded {folded} exists but index.{target}.{rustc_version} is missing — \
@@ -343,12 +336,12 @@ impl PullContext {
             ));
         };
         let itag = index_tag(target.as_str(), rustc_version.as_str());
-        let index_reference = self.base.reference(&itag)?;
+        let index_reference = self.session.reference(&itag)?;
         verify_artifact(
             &self.session,
             &self.trust,
             &index_reference,
-            &format!("{GHCR_BASE}:{itag}"),
+            &self.repository.reference(&itag),
             &pulled_index.manifest_digest,
             INDEX_CERT_URL,
         )
@@ -374,13 +367,13 @@ impl PullContext {
     /// pinned identity is fatal: the alternative, silently dropping it,
     /// would export a slice that quietly misses crates.
     async fn records(&self, tag: &str) -> stow_types::error::Result<Vec<ArtifactRecord>> {
-        let pulled = stow_oci::pull_records_by_tag(&self.session, &self.base, tag).await?;
-        let reference = self.base.reference(tag)?;
+        let pulled = stow_oci::pull_records_by_tag(&self.session, tag).await?;
+        let reference = self.session.reference(tag)?;
         verify_artifact(
             &self.session,
             &self.trust,
             &reference,
-            &format!("{GHCR_BASE}:{tag}"),
+            &self.repository.reference(tag),
             &pulled.manifest_digest,
             RECORDS_CERT_URL,
         )
@@ -702,7 +695,8 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
     let base = registry_base()?;
     let http = stow_oci::RegistryHttp::new().await?;
-    let session = base.session(&http);
+    let repository = cache_repository(&rustc_version);
+    let session = base.session(&repository, &http);
     let trust = records_trust().await?;
     let mut tags = session
         .list_tags()
@@ -711,7 +705,7 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     tags.sort();
     let ctx = std::sync::Arc::new(PullContext {
         session,
-        base,
+        repository,
         trust,
     });
     let pull_prev = {
@@ -933,7 +927,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
                 &http,
                 &bytes,
                 &target,
-                &rustc_version,
+                &index.header.rustc_version,
                 &sha256,
             )
             .await?;
@@ -945,7 +939,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
                 &http,
                 &serde_json::to_vec(&folded)?,
                 &target,
-                &rustc_version,
+                &index.header.rustc_version,
             )
             .await?;
             match outcome {
@@ -1177,6 +1171,9 @@ mod tests {
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.88.0";
+    /// The canonical `ghcr.io/water-rs/stow-cache-<RUSTC>` signed
+    /// references bind.
+    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-1.88.0";
     /// A second rustc's tags the pass must never pull.
     const OTHER_RUSTC: &str = "1.99.0";
 
@@ -1216,7 +1213,7 @@ mod tests {
             version: CrateVersion::new(Version::new(1, 0, 0)),
             features_json: FeaturesJson::canonicalize(vec![]).expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
-            oci_reference: format!("{GHCR_BASE}:{}", records_tag(RUSTC, task_id, BUILD)),
+            oci_reference: format!("{REFERENCE_BASE}:{}", records_tag(RUSTC, task_id, BUILD)),
             oci_digest: "sha256:deadbeef".to_owned(),
             has_native: false,
             artifact_kind: ArtifactKind::Rlib,
@@ -1844,11 +1841,11 @@ mod tests {
         );
     }
 
-    /// The signature binds the canonical `GHCR_BASE:tag`, not whichever
-    /// transport base the pull came through: a payload signed for GHCR
-    /// verifies against the canonical reference and is rejected against
-    /// the localhost mock's pull reference — the split `verify_artifact`
-    /// makes.
+    /// The signature binds the canonical `ghcr.io/<repository>:<tag>`,
+    /// not whichever transport base the pull came through: a payload
+    /// signed for GHCR verifies against the canonical reference and is
+    /// rejected against the localhost mock's pull reference — the split
+    /// `verify_artifact` makes.
     #[test]
     fn the_signature_binds_the_canonical_reference_not_the_transport() {
         let tag = records_tag(RUSTC, "aaaa1111", BUILD);
@@ -1857,23 +1854,22 @@ mod tests {
             "critical": {
                 "type": "cosign container image signature",
                 "image": { "docker-manifest-digest": digest },
-                "identity": { "docker-reference": format!("{GHCR_BASE}:{tag}") },
+                "identity": { "docker-reference": format!("{REFERENCE_BASE}:{tag}") },
             }
         }))
         .expect("payload");
 
         // What `verify_artifact` feeds `verify_material`.
-        stow_oci::verify::verify_payload_identity(&payload, &format!("{GHCR_BASE}:{tag}"), digest)
-            .expect("canonical reference verifies");
+        stow_oci::verify::verify_payload_identity(
+            &payload,
+            &format!("{REFERENCE_BASE}:{tag}"),
+            digest,
+        )
+        .expect("canonical reference verifies");
 
         // The transport pull reference the signature materials fetch
         // through — the value verification compared before the fix.
-        let transport =
-            stow_oci::RegistryBase::parse("http://127.0.0.1:28123/v2/water-rs/stow-cache-2")
-                .expect("transport base")
-                .reference(&tag)
-                .expect("transport reference")
-                .to_string();
+        let transport = format!("127.0.0.1:28123/water-rs/stow-cache-1.88.0:{tag}");
         assert!(stow_oci::verify::verify_payload_identity(&payload, &transport, digest).is_err());
     }
 }

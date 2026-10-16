@@ -36,11 +36,13 @@ use skyzen_cloudflare::CfDurableNamespace;
 use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 #[cfg(target_arch = "wasm32")]
 use stow_types::api::WorkflowRunComplete;
+#[cfg(target_arch = "wasm32")]
+use stow_types::identity::WireRustcVersion;
 use stow_types::records::parse_run_title;
 #[cfg(target_arch = "wasm32")]
 use stow_types::records::{RECORDS_ARTIFACT_TYPE, RECORDS_TASK_ID_ANNOTATION, records_tag};
 #[cfg(target_arch = "wasm32")]
-use stow_types::registry::{GHCR_BASE, repository_path};
+use stow_types::registry::cache_repository;
 
 #[cfg(target_arch = "wasm32")]
 use crate::api::{GhcrConfig, OkResponse};
@@ -486,16 +488,16 @@ async fn records_artifact_exists(
     task_id: &str,
     build: stow_types::records::BuildRun,
 ) -> Result<bool, ghcr::FetchError> {
+    let rustc = WireRustcVersion::parse(rustc_version).map_err(|error| {
+        ghcr::FetchError::InvalidRequest(format!(
+            "malformed records rustc {rustc_version}: {error}"
+        ))
+    })?;
     let tag = records_tag(rustc_version, task_id, build);
-    let reference = format!("{GHCR_BASE}:{tag}");
-    let Some(repository) = repository_path(&reference) else {
-        return Err(ghcr::FetchError::InvalidRequest(format!(
-            "malformed records reference {reference}"
-        )));
-    };
+    let repository = cache_repository(&rustc);
     let response = ghcr::open_manifest(
         &config.base_url,
-        repository,
+        repository.path(),
         &tag,
         &config.tokens,
         &OutboundPool::new(),

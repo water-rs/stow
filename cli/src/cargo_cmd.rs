@@ -5270,7 +5270,7 @@ mod tests {
     fn test_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
-            registry_base_url: "http://127.0.0.1:9/v2/stow".to_owned(),
+            registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
             request_timeout: std::time::Duration::from_millis(200),
             negative_cache_ttl: std::time::Duration::ZERO,
@@ -6169,7 +6169,7 @@ mod tests {
     fn stow_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
             edge_url: "http://127.0.0.1:1".to_owned(),
-            registry_base_url: "http://127.0.0.1:1/v2/mock".to_owned(),
+            registry_base_url: "http://127.0.0.1:1".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
             request_timeout: std::time::Duration::from_secs(1),
             negative_cache_ttl: std::time::Duration::from_secs(1),

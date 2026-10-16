@@ -45,6 +45,19 @@ impl RustcVersion {
     pub fn short(&self) -> String {
         self.version.to_string()
     }
+
+    /// The wire form of this toolchain's release — what index slices,
+    /// records tags and the rustc's cache package are named by.
+    ///
+    /// # Panics
+    ///
+    /// When `version`'s semver render is outside the wire rustc alphabet —
+    /// a `+build` suffix, which no rustc release carries.
+    #[must_use]
+    pub fn wire(&self) -> crate::identity::WireRustcVersion {
+        crate::identity::WireRustcVersion::parse(self.version.to_string())
+            .expect("rustc version outside the wire rustc alphabet")
+    }
 }
 
 impl fmt::Display for RustcVersion {

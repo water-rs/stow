@@ -1209,21 +1209,25 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
     cacheable_json(&response, CATALOG_VERSIONS_MAX_AGE)
 }
 
-/// GET /`api/v1/bundles/{digest}`
+/// GET /`api/v1/bundles/{rustc_version}/{digest}`
 ///
-/// The byte path: streams the `<tag>.bundle` blobs under
-/// `ghcr.io/water-rs/stow-cache-2`, handing workerd the upstream body as the
-/// registry's own stream so the bytes never enter wasm. The
-/// `sha256:<64 lowercase hex>` path segment is the whole address — it is
-/// validated before any fetch; the answer's immutable `Cache-Control` is
-/// what Workers Cache stores and replays without this worker running; a
-/// GHCR 404 is a 404. No catalog row is consulted: the CLI's signed index
-/// named these bytes, and the CLI verifies them against the index before
-/// they are used.
+/// The byte path: streams the `<tag>.bundle` blobs under the rustc's
+/// `ghcr.io/water-rs/stow-cache-<rustc>` package, handing workerd the
+/// upstream body as the registry's own stream so the bytes never enter
+/// wasm. The `sha256:<64 lowercase hex>` path segment is validated before
+/// any fetch; the answer's immutable `Cache-Control` is what Workers Cache
+/// stores and replays without this worker running; a GHCR 404 is a 404.
+/// No catalog row is consulted: the CLI's signed index named these bytes,
+/// and the CLI verifies them against the index before they are used.
 pub async fn get_bundle(
     params: Params,
     State(ghcr): State<GhcrConfig>,
 ) -> Result<Response, GetArtifactError> {
+    let rustc_version = params
+        .get("rustc_version")
+        .map_err(|_| GetArtifactError::BadRequest)?
+        .parse::<WireRustcVersion>()
+        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
     let digest = params
         .get("digest")
         .map_err(|_| GetArtifactError::BadRequest)?;
@@ -1233,7 +1237,7 @@ pub async fn get_bundle(
         )));
     }
 
-    open_bundle_stream(&ghcr, digest)
+    open_bundle_stream(&ghcr, &rustc_version, digest)
         .await
         .map_err(registry_fetch_error)
 }
@@ -1315,16 +1319,6 @@ async fn index_rustc_version(
         .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))
 }
 
-/// The fixed repository every cached blob lives in —
-/// `water-rs/stow-cache-2`, the repository the pull scope names. Slice tags
-/// are built by `index_tag` under `GHCR_BASE` and bundle digests are
-/// caller-supplied but validated to `sha256:<64 hex>` — neither ever names
-/// another repository.
-fn cache_repository() -> stow_types::registry::RepositoryPath<'static> {
-    stow_types::registry::repository_path(stow_types::registry::GHCR_BASE)
-        .expect("GHCR_BASE is a fixed canonical reference with a repository path")
-}
-
 /// Map a registry failure on the byte paths onto the public error
 /// surface: a missing blob is a 404, a rate-limited or 5xx registry is
 /// a 502, and anything else is an internal error — never a silent empty
@@ -1350,8 +1344,9 @@ async fn index_slice_layer(
     pool: &OutboundPool,
 ) -> Result<stow_types::api::OciDescriptor, GetArtifactError> {
     let tag = stow_types::index::index_tag(target.as_str(), rustc_version.as_str());
+    let repository = stow_types::registry::cache_repository(rustc_version);
     let mut response =
-        ghcr::open_manifest(&ghcr.base_url, cache_repository(), &tag, &ghcr.tokens, pool)
+        ghcr::open_manifest(&ghcr.base_url, repository.path(), &tag, &ghcr.tokens, pool)
             .await
             .map_err(registry_fetch_error)?;
     let body = response
@@ -1413,9 +1408,10 @@ async fn fetch_index_slice_upstream(
     if layer.digest != digest {
         return Err(GetArtifactError::NotFound);
     }
+    let repository = stow_types::registry::cache_repository(rustc_version);
     let upstream = ghcr::open_blob(
         &ghcr.base_url,
-        cache_repository(),
+        repository.path(),
         digest,
         &ghcr.tokens,
         pool,
@@ -1834,10 +1830,15 @@ fn bundle_response(mut response: Response, content_length: Option<u64>) -> Respo
 /// through wasm — the publish stage validated the tar before pushing it,
 /// GHCR addresses it by content, and the CLI verifies the digest and the
 /// cosign material inside it.
-async fn open_bundle_stream(ghcr: &GhcrConfig, digest: &str) -> Result<Response, ghcr::FetchError> {
+async fn open_bundle_stream(
+    ghcr: &GhcrConfig,
+    rustc_version: &WireRustcVersion,
+    digest: &str,
+) -> Result<Response, ghcr::FetchError> {
+    let repository = stow_types::registry::cache_repository(rustc_version);
     let upstream = ghcr::open_blob(
         &ghcr.base_url,
-        cache_repository(),
+        repository.path(),
         digest,
         &ghcr.tokens,
         &OutboundPool::new(),

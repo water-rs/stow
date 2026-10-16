@@ -251,7 +251,10 @@ pub struct RegistrySession {
     http: RegistryHttp,
     /// `{scheme}://{host[:port]}` — challenge ping and asset URLs hang off it.
     origin: String,
-    /// The repository every request addresses (`water-rs/stow-cache-2`).
+    /// `host[:port]` — the reference-form half of `origin`.
+    registry: String,
+    /// The repository every request addresses
+    /// (`water-rs/stow-cache-<rustc>`).
     repository: String,
     credential: SessionCredential,
     /// OAuth scope the bearer requests: `pull` for anonymous sessions,
@@ -315,13 +318,16 @@ struct BearerChallenge {
 }
 
 impl RegistrySession {
-    /// A session on `base`: `origin` keeps the parsed scheme and host so
-    /// `http` stays plain HTTP for the mock registry and `https` for GHCR.
-    /// `http` is the process's [`RegistryHttp`]; a session never builds a
-    /// client of its own (stow#624).
+    /// A session on `base` addressing `repository` — one per cache
+    /// package, so the session's bearer mints under that repository's
+    /// scope. `origin` keeps the parsed scheme and host so `http` stays
+    /// plain HTTP for the mock registry and `https` for GHCR. `http` is
+    /// the process's [`RegistryHttp`]; a session never builds a client of
+    /// its own (stow#624).
     #[must_use]
     pub fn new(
         base: &RegistryBase,
+        repository: &stow_types::registry::CacheRepository,
         credential: SessionCredential,
         scope: &'static str,
         http: &RegistryHttp,
@@ -329,11 +335,42 @@ impl RegistrySession {
         Self {
             http: http.clone(),
             origin: format!("{}://{}", base.scheme(), base.registry()),
-            repository: base.repository().to_owned(),
+            registry: base.registry().to_owned(),
+            repository: repository.as_str().to_owned(),
             credential,
             scope,
             auth: smol::lock::Mutex::new(AuthState::default()),
         }
+    }
+
+    /// The repository path this session's requests address.
+    #[must_use]
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    /// `<host>/<repository>:<tag>` — the pull reference of `tag` in this
+    /// session's repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `tag` cannot form a valid OCI reference.
+    pub fn reference(&self, tag: &str) -> stow_types::error::Result<Reference> {
+        format!("{}/{}:{tag}", self.registry, self.repository)
+            .parse()
+            .wrap_err_with(|| format!("build OCI reference for tag {tag:?}"))
+    }
+
+    /// `<host>/<repository>@<digest>` — the digest-addressed pull
+    /// reference of `digest` in this session's repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `digest` cannot form a valid OCI reference.
+    pub fn digest_reference(&self, digest: &str) -> stow_types::error::Result<Reference> {
+        format!("{}/{}@{digest}", self.registry, self.repository)
+            .parse()
+            .wrap_err_with(|| format!("build OCI reference for digest {digest:?}"))
     }
 
     /// Whether `digest`'s blob is already stored — the `HEAD` that makes a
@@ -846,9 +883,9 @@ impl RegistrySession {
         // send` cycle — boxing makes this future's size finite.
         let response = Box::pin(self.send("exchange bearer token", request)).await?;
         // GHCR answers the anonymous exchange for a package that does not
-        // exist or is still private with `403 DENIED` — a bare envelope
-        // that reads like an auth failure. Name the real cause so a
-        // refused pull during a generation's private window is legible;
+        // exist or is not public with `403 DENIED` — a bare envelope that
+        // reads like an auth failure. Name the real cause so a refused
+        // pull against a rustc nothing has been built for is legible;
         // still a hard refusal, never a retry or a fallback.
         if !response.status.is_success() && matches!(self.credential, SessionCredential::Anonymous)
         {
@@ -1063,14 +1100,20 @@ pub fn canonical_manifest_bytes(
     Ok(body)
 }
 
-/// The session variants `RegistryBase` hands out.
+/// The session variants `RegistryBase` hands out — one per cache
+/// package, so the minted bearer's `repository:<repo>:<scope>` names the
+/// rustc's own repository.
 impl RegistryBase {
-    /// The anonymous pull session every stow read path uses — the cache
-    /// package is public, so the bearer mints with a `pull` scope and no
-    /// credential.
+    /// The anonymous pull session every stow read path uses — cache
+    /// packages are public, so the bearer mints with a `pull` scope and
+    /// no credential.
     #[must_use]
-    pub fn session(&self, http: &RegistryHttp) -> RegistrySession {
-        RegistrySession::new(self, SessionCredential::Anonymous, "pull", http)
+    pub fn session(
+        &self,
+        repository: &stow_types::registry::CacheRepository,
+        http: &RegistryHttp,
+    ) -> RegistrySession {
+        RegistrySession::new(self, repository, SessionCredential::Anonymous, "pull", http)
     }
 
     /// The credentialed publish session — `pull,push` scope over
@@ -1078,11 +1121,13 @@ impl RegistryBase {
     #[must_use]
     pub fn push_session(
         &self,
+        repository: &stow_types::registry::CacheRepository,
         credentials: &RegistryCredentials,
         http: &RegistryHttp,
     ) -> RegistrySession {
         RegistrySession::new(
             self,
+            repository,
             SessionCredential::Basic {
                 username: credentials.username.clone(),
                 password: credentials.password.clone(),
@@ -1106,8 +1151,12 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = RegistryHttp::new().await.expect("build registry http");
         let base = RegistryBase::production().expect("production registry base");
-        let pull = base.session(&http);
+        let repository = stow_types::registry::cache_repository(
+            &stow_types::identity::WireRustcVersion::parse("1.99.0").expect("rustc"),
+        );
+        let pull = base.session(&repository, &http);
         let push = base.push_session(
+            &repository,
             &RegistryCredentials {
                 username: "u".to_owned(),
                 password: "p".to_owned(),
@@ -1120,7 +1169,7 @@ mod tests {
 
         let second = RegistryHttp::new().await.expect("build a second handle");
         assert!(
-            !base.session(&second).http.same_client(&http),
+            !base.session(&repository, &second).http.same_client(&http),
             "a second constructor call builds a second client"
         );
     }
