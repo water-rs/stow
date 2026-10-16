@@ -77,7 +77,7 @@ cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 │ stow-edge wasm + miniflare   │  POST /api/v1/github/workflow-run   │ local CI     │
 │ D1, Durable Object           │◄────────────────────────────────────│ port 28124   │
 └──────────┬───────────────────┘                                     └─────┬────────┘
-           │ GET /api/v1/bundles/{digest} (bundle bytes), POST /api/v1/admissions │ bundles + records
+           │ GET /api/v1/bundles/{rustc_version}/{digest} (bundle bytes), POST /api/v1/admissions │ bundles + records
            ▲                                                               │ sigstore push
 ┌──────────┴───────────────────┐                                           ▼
 │ stow-cli (consumer machine)  │  OCI pulls: signed index.* slices ┌──────────────────┐
@@ -178,7 +178,7 @@ Verify: the log prints `local CI server listening listen=127.0.0.1:28124`.
 mkdir -p ~/Library/Application\ Support/stow  # macOS path; ~/.config/stow on Linux
 cat > ~/Library/Application\ Support/stow/config.toml <<EOF
 edge_url = "http://127.0.0.1:8788"
-registry_base_url = "http://127.0.0.1:28123/v2/water-rs/stow-cache-2"
+registry_base_url = "http://127.0.0.1:28123"
 verify_mode = "mock-key"   # needs a stow-cli built with --features mock-verify
 mock_public_key_path = "/tmp/stow-bench/keys/public.pem"
 EOF

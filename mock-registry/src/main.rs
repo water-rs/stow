@@ -42,7 +42,7 @@ use stow_types::records::{
     BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
     records_tag,
 };
-use stow_types::registry::{GHCR_BASE, bundle_oci_reference, sha256_digest};
+use stow_types::registry::{bundle_oci_reference, cache_repository, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -245,17 +245,16 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     })?;
     // The signature binds the canonical GHCR reference — the same string
     // production's cosign signs — never the mock transport base.
-    let oci_reference = format!(
-        "{GHCR_BASE}:{}",
-        records_tag(
-            &request.rustc_version,
-            &request.task_id,
-            BuildRun {
-                run_id: request.run_id,
-                run_attempt: request.run_attempt,
-            },
-        )
-    );
+    let rustc = WireRustcVersion::parse(&request.rustc_version)
+        .map_err(|error| stow_types::stow_error!("--rustc-version: {error}"))?;
+    let oci_reference = cache_repository(&rustc).reference(&records_tag(
+        rustc.as_str(),
+        &request.task_id,
+        BuildRun {
+            run_id: request.run_id,
+            run_attempt: request.run_attempt,
+        },
+    ));
 
     let layer_digest = sha256_digest(&bytes);
     write_blob(&request.registry_root, &layer_digest, &bytes).await?;
@@ -327,10 +326,13 @@ async fn write_signed_index(
         index.header.target.as_str(),
         index.header.rustc_version.as_str(),
     );
-    let repository = stow_types::registry::GHCR_REPOSITORY;
-    let reference = format!("{GHCR_BASE}:{tag}");
+    let repository = cache_repository(&index.header.rustc_version);
+    let reference = repository.reference(&tag);
 
-    let manifest_path = registry_root.join("manifests").join(repository).join(&tag);
+    let manifest_path = registry_root
+        .join("manifests")
+        .join(repository.as_str())
+        .join(&tag);
     if let Ok(existing) = read(&manifest_path).await {
         let published: serde_json::Value = serde_json::from_slice(&existing).map_err(|error| {
             stow_types::stow_error!(
@@ -377,7 +379,13 @@ async fn write_signed_index(
         },
     }))?;
     let manifest_digest = sha256_digest(&manifest_bytes);
-    write_manifest(registry_root, repository, &manifest_digest, &manifest_bytes).await?;
+    write_manifest(
+        registry_root,
+        repository.as_str(),
+        &manifest_digest,
+        &manifest_bytes,
+    )
+    .await?;
 
     let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
     let payload_bytes = serde_json::to_vec(&payload)?;
@@ -387,14 +395,14 @@ async fn write_signed_index(
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
     append_mock_signature(
         registry_root,
-        repository,
+        repository.as_str(),
         &manifest_digest,
         &payload_bytes,
         &signature_b64,
     )
     .await?;
     // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
-    write_manifest(registry_root, repository, &tag, &manifest_bytes).await?;
+    write_manifest(registry_root, repository.as_str(), &tag, &manifest_bytes).await?;
     tracing::info!(%reference, %manifest_digest, "published mock index artifact");
     report_index_publish("published", &manifest_digest);
     Ok(())
@@ -457,7 +465,7 @@ fn registry_app_with_probe(
         )
         .route("/token", get(issue_token))
         .route(
-            "/api/v1/bundles/{digest}",
+            "/api/v1/bundles/{rustc_version}/{digest}",
             get(serve_edge_bundle).head(serve_edge_bundle),
         )
         .route("/analytics_engine/sql", post(analytics_engine_sql))
@@ -591,11 +599,15 @@ impl RegistryProbe {
     /// hostile-registry stub a digest-verifying client must reject.
     #[cfg(test)]
     fn forge_manifest(&self, reference: &str, forged: &[u8], claimed_digest: &str) {
-        let file = manifest_file_name(reference);
+        let (repository, name) = reference
+            .split_once('@')
+            .or_else(|| reference.rsplit_once(':'))
+            .expect("forge target is <repo>:<tag> or <repo>@<digest>");
+        let file = manifest_file_name(name);
         let path = self
             .registry_root
             .join("manifests")
-            .join(stow_types::registry::GHCR_REPOSITORY)
+            .join(repository)
             .join(&file);
         std::fs::create_dir_all(path.parent().expect("manifest parent")).expect("manifest dir");
         std::fs::write(&path, forged).expect("forged manifest");
@@ -1077,8 +1089,10 @@ async fn write_signed_folded(
         stow_types::stow_error!("read folded file {}: {error}", folded_path.display())
     })?;
     let tag = folded_tag(target, rustc_version);
-    let repository = stow_types::registry::GHCR_REPOSITORY;
-    let reference = format!("{GHCR_BASE}:{tag}");
+    let rustc = WireRustcVersion::parse(rustc_version)
+        .map_err(|error| stow_types::stow_error!("folded rustc_version: {error}"))?;
+    let repository = cache_repository(&rustc);
+    let reference = repository.reference(&tag);
 
     let layer_digest = sha256_digest(&folded_bytes);
     let config_bytes = b"{}".to_vec();
@@ -1098,7 +1112,10 @@ async fn write_signed_folded(
         }],
     }))?;
     let manifest_digest = sha256_digest(&manifest_bytes);
-    let manifest_path = registry_root.join("manifests").join(repository).join(&tag);
+    let manifest_path = registry_root
+        .join("manifests")
+        .join(repository.as_str())
+        .join(&tag);
     if let Ok(existing) = read(&manifest_path).await
         && published_manifest_digest(&existing)? == manifest_digest
     {
@@ -1113,7 +1130,13 @@ async fn write_signed_folded(
 
     write_blob(registry_root, &layer_digest, &folded_bytes).await?;
     write_blob(registry_root, &config_digest, &config_bytes).await?;
-    write_manifest(registry_root, repository, &manifest_digest, &manifest_bytes).await?;
+    write_manifest(
+        registry_root,
+        repository.as_str(),
+        &manifest_digest,
+        &manifest_bytes,
+    )
+    .await?;
 
     let payload = SimpleSigning::new(&reference.parse()?, &manifest_digest);
     let payload_bytes = serde_json::to_vec(&payload)?;
@@ -1123,14 +1146,14 @@ async fn write_signed_folded(
     let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
     append_mock_signature(
         registry_root,
-        repository,
+        repository.as_str(),
         &manifest_digest,
         &payload_bytes,
         &signature_b64,
     )
     .await?;
     // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
-    write_manifest(registry_root, repository, &tag, &manifest_bytes).await?;
+    write_manifest(registry_root, repository.as_str(), &tag, &manifest_bytes).await?;
     tracing::info!(%reference, %manifest_digest, "published mock folded artifact");
     Ok(())
 }
@@ -1293,7 +1316,7 @@ struct TokenState {
 /// a bare `200` leaves clients with no way to authenticate.
 async fn v2_ping(State(state): State<MockRegistryState>) -> Response<Body> {
     state.record(&Method::GET, "/v2/");
-    unauthorized(&state.token_realm)
+    unauthorized(&state.token_realm, None)
 }
 
 /// `GET /token?service=…&scope=…` — mints an anonymous bearer exactly the
@@ -1351,21 +1374,29 @@ async fn serve_v2(
         StatusCode::BAD_REQUEST
     })?;
     if !state.bearer_authorized(&headers) {
-        return Ok(unauthorized(&state.token_realm));
+        return Ok(unauthorized(&state.token_realm, Some(asset.repository())));
     }
     match (method.clone(), asset) {
         (
             Method::GET | Method::HEAD,
             asset @ (RegistryAsset::Manifest { .. } | RegistryAsset::Blob { .. }),
         ) => serve_asset(&state, asset, method).await,
-        (Method::POST, RegistryAsset::BlobUpload) => store_blob_upload(&state, &query, body).await,
-        (Method::PUT, RegistryAsset::BlobUploadSession) => {
-            commit_blob_upload(&state, &query, body).await
+        (Method::POST, RegistryAsset::BlobUpload { repository }) => {
+            store_blob_upload(&state, &repository, &query, body).await
         }
-        (Method::PUT, RegistryAsset::Manifest { reference }) => {
-            store_manifest(&state, &reference, body).await
+        (Method::PUT, RegistryAsset::BlobUploadSession { repository }) => {
+            commit_blob_upload(&state, &repository, &query, body).await
         }
-        (Method::GET, RegistryAsset::TagsList) => list_tags(&state, &query).await,
+        (
+            Method::PUT,
+            RegistryAsset::Manifest {
+                repository,
+                reference,
+            },
+        ) => store_manifest(&state, &repository, &reference, body).await,
+        (Method::GET, RegistryAsset::TagsList { repository }) => {
+            list_tags(&state, &repository, &query).await
+        }
         _ => Err(StatusCode::METHOD_NOT_ALLOWED),
     }
 }
@@ -1376,12 +1407,10 @@ async fn serve_v2(
 /// the limit answers `Link: rel="next"` so the caller continues.
 async fn list_tags(
     state: &MockRegistryState,
+    repository: &str,
     query: &BTreeMap<String, String>,
 ) -> Result<Response<Body>, StatusCode> {
-    let dir = state
-        .registry_root
-        .join("manifests")
-        .join(stow_types::registry::GHCR_REPOSITORY);
+    let dir = state.registry_root.join("manifests").join(repository);
     let mut names: Vec<String> = Vec::new();
     let mut entries = std::fs::read_dir(&dir).map_err(|error| {
         tracing::warn!(path = %dir.display(), %error, "mock registry manifests dir missing");
@@ -1409,7 +1438,7 @@ async fn list_tags(
         .collect();
     let has_more = window.len() == limit;
     let body = serde_json::json!({
-        "name": stow_types::registry::GHCR_REPOSITORY,
+        "name": repository,
         "tags": window,
     });
     let mut response = Response::new(Body::from(
@@ -1420,8 +1449,7 @@ async fn list_tags(
         response.headers_mut().insert(
             header::LINK,
             HeaderValue::from_str(&format!(
-                "</v2/{}/tags/list?n={}&last={}>; rel=\"next\"",
-                stow_types::registry::GHCR_REPOSITORY,
+                "</v2/{repository}/tags/list?n={}&last={}>; rel=\"next\"",
                 limit,
                 last.as_str().unwrap_or_default(),
             ))
@@ -1443,16 +1471,21 @@ async fn serve_asset(
     method: Method,
 ) -> Result<Response<Body>, StatusCode> {
     let path = match &asset {
-        RegistryAsset::Manifest { reference } => state
+        RegistryAsset::Manifest {
+            repository,
+            reference,
+        } => state
             .registry_root
             .join("manifests")
-            .join(stow_types::registry::GHCR_REPOSITORY)
+            .join(repository)
             .join(manifest_file_name(reference)),
-        RegistryAsset::Blob { digest } => state
+        RegistryAsset::Blob { digest, .. } => state
             .registry_root
             .join("blobs")
             .join(digest.replace(':', "_")),
-        RegistryAsset::BlobUpload | RegistryAsset::BlobUploadSession | RegistryAsset::TagsList => {
+        RegistryAsset::BlobUpload { .. }
+        | RegistryAsset::BlobUploadSession { .. }
+        | RegistryAsset::TagsList { .. } => {
             return Err(StatusCode::METHOD_NOT_ALLOWED);
         }
     };
@@ -1478,7 +1511,7 @@ async fn serve_asset(
     // freshness probe (`fetch_manifest_digest`) never falls back to a
     // full GET — unless the probe forged a claim, which is the point of
     // the forgery tests.
-    if let RegistryAsset::Manifest { reference } = &asset {
+    if let RegistryAsset::Manifest { reference, .. } = &asset {
         let claimed = state.forged_digest(&manifest_file_name(reference));
         let digest = claimed.unwrap_or_else(|| sha256_digest(&bytes));
         response.headers_mut().insert(
@@ -1498,6 +1531,7 @@ async fn serve_asset(
 /// form.
 async fn store_blob_upload(
     state: &MockRegistryState,
+    repository: &str,
     query: &BTreeMap<String, String>,
     body: Body,
 ) -> Result<Response<Body>, StatusCode> {
@@ -1509,11 +1543,8 @@ async fn store_blob_upload(
         *response.status_mut() = StatusCode::ACCEPTED;
         response.headers_mut().insert(
             header::LOCATION,
-            HeaderValue::from_str(&format!(
-                "/v2/{}/blobs/uploads/{session}",
-                stow_types::registry::GHCR_REPOSITORY
-            ))
-            .expect("location header value"),
+            HeaderValue::from_str(&format!("/v2/{repository}/blobs/uploads/{session}"))
+                .expect("location header value"),
         );
         return Ok(response);
     }
@@ -1521,7 +1552,7 @@ async fn store_blob_upload(
         tracing::warn!("blob upload POST carried no digest query");
         return Err(StatusCode::BAD_REQUEST);
     };
-    finish_blob_upload(state, digest, body).await
+    finish_blob_upload(state, repository, digest, body).await
 }
 
 /// `PUT /v2/{repo}/blobs/uploads/{session}?digest=<sha256:…>` — the commit
@@ -1529,6 +1560,7 @@ async fn store_blob_upload(
 /// and the digest query is the promise, identical to the single `POST`.
 async fn commit_blob_upload(
     state: &MockRegistryState,
+    repository: &str,
     query: &BTreeMap<String, String>,
     body: Body,
 ) -> Result<Response<Body>, StatusCode> {
@@ -1536,7 +1568,7 @@ async fn commit_blob_upload(
         tracing::warn!("blob upload commit carried no digest query");
         return Err(StatusCode::BAD_REQUEST);
     };
-    finish_blob_upload(state, digest, body).await
+    finish_blob_upload(state, repository, digest, body).await
 }
 
 /// Store the uploaded bytes as `digest`'s blob, answering `201` + the
@@ -1544,6 +1576,7 @@ async fn commit_blob_upload(
 /// single `POST` and the session commit `PUT`.
 async fn finish_blob_upload(
     state: &MockRegistryState,
+    repository: &str,
     digest: &str,
     body: Body,
 ) -> Result<Response<Body>, StatusCode> {
@@ -1564,11 +1597,8 @@ async fn finish_blob_upload(
     *response.status_mut() = StatusCode::CREATED;
     response.headers_mut().insert(
         header::LOCATION,
-        HeaderValue::from_str(&format!(
-            "/v2/{}/blobs/{digest}",
-            stow_types::registry::GHCR_REPOSITORY
-        ))
-        .expect("location header value"),
+        HeaderValue::from_str(&format!("/v2/{repository}/blobs/{digest}"))
+            .expect("location header value"),
     );
     response.headers_mut().insert(
         HeaderName::from_static("docker-content-digest"),
@@ -1582,6 +1612,7 @@ async fn finish_blob_upload(
 /// digest so digest-addressed pulls resolve.
 async fn store_manifest(
     state: &MockRegistryState,
+    repository: &str,
     reference: &str,
     body: Body,
 ) -> Result<Response<Body>, StatusCode> {
@@ -1603,20 +1634,16 @@ async fn store_manifest(
     let digest = sha256_digest(&bytes);
     let store = |reference: &str, bytes: &[u8]| {
         let root = state.registry_root.clone();
+        let repository = repository.to_owned();
         let reference = reference.to_owned();
         let bytes = bytes.to_vec();
         async move {
-            write_manifest(
-                &root,
-                stow_types::registry::GHCR_REPOSITORY,
-                &reference,
-                &bytes,
-            )
-            .await
-            .map_err(|error| {
-                tracing::warn!(%reference, %error, "manifest PUT store failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })
+            write_manifest(&root, &repository, &reference, &bytes)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%reference, %error, "manifest PUT store failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })
         }
     };
     store(reference, &bytes).await?;
@@ -1627,11 +1654,8 @@ async fn store_manifest(
     *response.status_mut() = StatusCode::CREATED;
     response.headers_mut().insert(
         header::LOCATION,
-        HeaderValue::from_str(&format!(
-            "/v2/{}/manifests/{digest}",
-            stow_types::registry::GHCR_REPOSITORY
-        ))
-        .expect("location header value"),
+        HeaderValue::from_str(&format!("/v2/{repository}/manifests/{digest}"))
+            .expect("location header value"),
     );
     // A minimal registry answers the PUT without reporting the stored
     // digest — the probe reproduces that so the client's read-back is
@@ -1874,14 +1898,19 @@ async fn analytics_engine_sql(
 }
 
 /// The edge byte path for hosts that run no worker (the bench lane):
-/// `GET|HEAD /api/v1/bundles/{digest}` serves the blob the digest names —
+/// `GET|HEAD /api/v1/bundles/{rustc_version}/{digest}` serves the blob the
+/// digest names —
 /// the same contract the real edge answers between its Cache API and the
 /// registry, so `STOW_EDGE_URL` can point here.
 async fn serve_edge_bundle(
     State(state): State<MockRegistryState>,
     method: Method,
-    AxumPath(digest): AxumPath<String>,
+    AxumPath((rustc_version, digest)): AxumPath<(String, String)>,
 ) -> Result<Response<Body>, StatusCode> {
+    if WireRustcVersion::parse(&rustc_version).is_err() {
+        tracing::warn!(%rustc_version, "byte path: malformed rustc version");
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if !stow_types::registry::is_sha256_digest(&digest) {
         tracing::warn!(%digest, "byte path: malformed bundle digest");
         return Err(StatusCode::BAD_REQUEST);
@@ -1988,18 +2017,20 @@ impl MockRegistryState {
 }
 
 /// `401` carrying the Bearer challenge the edge's token exchange parses:
-/// realm is this server's `/token`, scope is the single repository's
-/// `repository:water-rs/stow-cache-2:pull`.
-fn unauthorized(realm: &str) -> Response<Body> {
-    let repository = stow_types::registry::GHCR_REPOSITORY;
-    let challenge = format!(
-        "Bearer realm=\"{realm}\",service=\"{TOKEN_SERVICE}\",scope=\"repository:{repository}:pull\""
-    );
+/// realm is this server's `/token`, scope the request's repository when the
+/// path named one (`repository:<repo>:pull`) — the `/v2/` ping names none.
+fn unauthorized(realm: &str, repository: Option<&str>) -> Response<Body> {
+    let challenge = match repository {
+        Some(repository) => format!(
+            "Bearer realm=\"{realm}\",service=\"{TOKEN_SERVICE}\",scope=\"repository:{repository}:pull\""
+        ),
+        None => format!("Bearer realm=\"{realm}\",service=\"{TOKEN_SERVICE}\""),
+    };
     let body = serde_json::json!({
         "errors": [{
             "code": "UNAUTHORIZED",
             "message": "authentication required",
-            "detail": [{"Type": "repository", "Name": repository, "Action": "pull"}],
+            "detail": [{"Type": "repository", "Name": repository.unwrap_or(""), "Action": "pull"}],
         }],
     });
     let mut response = Response::new(Body::from(body.to_string()));
@@ -2023,12 +2054,15 @@ fn manifest_file_name(reference: &str) -> String {
     }
 }
 
-/// `/v2/water-rs/stow-cache-2/(manifests|blobs)/<id>` — the mock serves the
-/// single `water-rs/stow-cache-2` repository: manifests addressed by tag and
-/// blobs by digest, nothing else. Only the upload endpoint's own trailing
-/// slash is allowed to leave an empty segment: GHCR answers any other empty
-/// segment (`stow-cache-2//blobs/…`) with a `301` to the canonical path,
-/// which turns a `POST` into a refused `GET`, so the mock refuses it too.
+/// `/v2/<repository>/(manifests|blobs|tags)/<id>` — the mock serves any
+/// number of repositories: the `manifests`/`blobs`/`tags` anchor segment
+/// splits the variable-length repository path from the asset, manifests
+/// store per repository (`manifests/<repo>/<ref>`), and the
+/// content-addressed blob store is shared. Only the upload endpoint's own
+/// trailing slash is allowed to leave an empty segment: GHCR answers any
+/// other empty segment (`<repo>//blobs/…`) with a `301` to the canonical
+/// path, which turns a `POST` into a refused `GET`, so the mock refuses it
+/// too.
 fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> {
     let segments = rest
         .strip_suffix('/')
@@ -2040,56 +2074,77 @@ fn parse_registry_asset(rest: &str) -> stow_types::error::Result<RegistryAsset> 
             "non-canonical registry path /v2/{rest}: an empty path segment"
         ));
     }
-    let repository = stow_types::registry::GHCR_REPOSITORY
-        .split('/')
-        .collect::<Vec<_>>();
-    if segments.len() < repository.len() + 2
-        || segments.len() > repository.len() + 3
-        || segments[..repository.len()] != repository[..]
-    {
+    // The asset kind anchors on the tail: the repository is every segment
+    // before it and must be non-empty.
+    let split_tail = |tail_len: usize| -> Option<(String, &[&str])> {
+        let (repository, asset) = segments.split_at(segments.len().checked_sub(tail_len)?);
+        (!repository.is_empty()).then(|| (repository.join("/"), asset))
+    };
+    let Some((repository, asset)) = split_tail(2) else {
         return Err(stow_types::stow_error!(
-            "expected /v2/{}/(manifests|blobs)/<id>, got /v2/{rest}",
-            stow_types::registry::GHCR_REPOSITORY
+            "registry path /v2/{rest} carries no repository"
         ));
-    }
-    let identifier = segments[repository.len() + 1].to_owned();
-    match segments[repository.len()] {
-        "tags" if identifier == "list" && segments.len() == repository.len() + 2 => {
-            Ok(RegistryAsset::TagsList)
-        }
-        "manifests" if segments.len() == repository.len() + 2 => Ok(RegistryAsset::Manifest {
-            reference: identifier,
+    };
+    match asset {
+        ["tags", "list"] => Ok(RegistryAsset::TagsList { repository }),
+        ["manifests", reference] => Ok(RegistryAsset::Manifest {
+            repository,
+            reference: (*reference).to_owned(),
         }),
-        "blobs" if identifier == "uploads" && segments.len() == repository.len() + 2 => {
-            Ok(RegistryAsset::BlobUpload)
+        ["blobs", "uploads"] => Ok(RegistryAsset::BlobUpload { repository }),
+        ["blobs", digest] => Ok(RegistryAsset::Blob {
+            repository,
+            digest: (*digest).to_owned(),
+        }),
+        _ => {
+            // `blobs/uploads/<session>` is the only three-segment tail.
+            if let Some((repository, ["blobs", "uploads", _])) = split_tail(3) {
+                return Ok(RegistryAsset::BlobUploadSession { repository });
+            }
+            Err(stow_types::stow_error!(
+                "expected /v2/<repository>/(manifests|blobs|tags)/<id>, got /v2/{rest}"
+            ))
         }
-        "blobs" if identifier == "uploads" && segments.len() == repository.len() + 3 => {
-            Ok(RegistryAsset::BlobUploadSession)
-        }
-        "blobs" if segments.len() == repository.len() + 2 => {
-            Ok(RegistryAsset::Blob { digest: identifier })
-        }
-        other => Err(stow_types::stow_error!(
-            "expected manifests/blobs segment in /v2/{rest}, got {other}"
-        )),
     }
 }
 
 enum RegistryAsset {
     Manifest {
+        repository: String,
         reference: String,
     },
     Blob {
+        repository: String,
         digest: String,
     },
     /// `GET .../tags/list` — the distribution spec's tag listing.
-    TagsList,
+    TagsList {
+        repository: String,
+    },
     /// `POST .../blobs/uploads/` — the monolithic or session-opening
     /// upload endpoint.
-    BlobUpload,
+    BlobUpload {
+        repository: String,
+    },
     /// `PUT .../blobs/uploads/{session}` — the commit of an upload a `202`
     /// opened.
-    BlobUploadSession,
+    BlobUploadSession {
+        repository: String,
+    },
+}
+
+impl RegistryAsset {
+    /// The repository path the request addressed — what the 401 challenge
+    /// scope names.
+    fn repository(&self) -> &str {
+        match self {
+            Self::Manifest { repository, .. }
+            | Self::Blob { repository, .. }
+            | Self::TagsList { repository }
+            | Self::BlobUpload { repository }
+            | Self::BlobUploadSession { repository } => repository,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2100,13 +2155,15 @@ mod tests {
     use stow_types::bundle::{
         ArtifactBundleFile, STOW_BUNDLE_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, sigstore_signature_tag,
     };
-    use stow_types::identity::{CMetadata, CrateName, DependencyCMetadataJson, FeaturesJson};
+    use stow_types::identity::{
+        CMetadata, CrateName, DependencyCMetadataJson, FeaturesJson, WireRustcVersion,
+    };
     use stow_types::index::{
         ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
         STOW_INDEX_MEDIA_TYPE, encode, index_tag,
     };
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
-    use stow_types::registry::{GHCR_BASE, GHCR_REPOSITORY, sha256_digest};
+    use stow_types::registry::{CacheRepository, cache_repository, sha256_digest};
     use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
     use tower::ServiceExt as _;
 
@@ -2117,7 +2174,7 @@ mod tests {
         write_public_key,
     };
 
-    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-2/manifests/latest";
+    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-1.98.0/manifests/latest";
 
     fn manifest_request() -> Request<Body> {
         Request::builder()
@@ -2131,38 +2188,44 @@ mod tests {
     #[tokio::test]
     async fn challenge_exchange_then_served() {
         let root = tempfile::tempdir().expect("registry root");
-        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache-2"))
+        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache-1.98.0"))
             .expect("manifest dir");
         std::fs::write(
-            root.path().join("manifests/water-rs/stow-cache-2/latest"),
+            root.path()
+                .join("manifests/water-rs/stow-cache-1.98.0/latest"),
             b"{\"schemaVersion\":2}",
         )
         .expect("manifest file");
         let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
 
-        // 1. Unauthenticated asset request → 401 + Bearer challenge. The
-        // version ping carries the same challenge — that is how the
-        // registry client discovers the realm before its first asset pull.
-        for request in [
-            manifest_request(),
-            Request::builder()
-                .uri("/v2/")
-                .body(Body::empty())
-                .expect("ping request builds"),
+        // 1. Unauthenticated asset request → 401 + Bearer challenge
+        // scoped to the request's repository. The version ping names no
+        // repository, so its challenge carries none — that is still how
+        // the registry client discovers the realm before its first asset
+        // pull.
+        for (request, challenge) in [
+            (
+                manifest_request(),
+                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache-1.98.0:pull\"",
+            ),
+            (
+                Request::builder()
+                    .uri("/v2/")
+                    .body(Body::empty())
+                    .expect("ping request builds"),
+                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\"",
+            ),
         ] {
             let response = app.clone().oneshot(request).await.expect("401 response");
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            let challenge = response
+            let header = response
                 .headers()
                 .get(header::WWW_AUTHENTICATE)
                 .expect("challenge header")
                 .to_str()
                 .expect("challenge is a string")
                 .to_owned();
-            assert_eq!(
-                challenge,
-                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache-2:pull\""
-            );
+            assert_eq!(header, challenge);
         }
 
         // 2. The realm mints a bearer anonymously.
@@ -2170,7 +2233,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-2:pull")
+                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-1.98.0:pull")
                     .body(Body::empty())
                     .expect("token request builds"),
             )
@@ -2218,7 +2281,16 @@ mod tests {
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.98.0";
+    /// The GHCR package `RUSTC` derives: `water-rs/stow-cache-<rustc>`.
+    const REPOSITORY: &str = "water-rs/stow-cache-1.98.0";
+    /// `ghcr.io/<repository>` — the base signed references are built on.
+    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-1.98.0";
     const C_METADATA: &str = "aabbccddeeff0011";
+
+    /// `RUSTC`'s package as the session APIs want it.
+    fn test_cache_repository() -> CacheRepository {
+        cache_repository(&WireRustcVersion::parse(RUSTC).expect("rustc version"))
+    }
 
     /// Publish one index slice pinning one bundle blob into `root`, the
     /// way `index-from-records` and `populate` lay them out.
@@ -2276,23 +2348,24 @@ mod tests {
             "layers": [{ "mediaType": STOW_INDEX_MEDIA_TYPE, "digest": layer_digest, "size": index_bytes.len() }],
         }))
         .expect("manifest json");
-        write_manifest(root, GHCR_REPOSITORY, &index_tag(TARGET, RUSTC), &manifest)
+        write_manifest(root, REPOSITORY, &index_tag(TARGET, RUSTC), &manifest)
             .await
             .expect("index manifest");
     }
 
-    /// The edge byte-path stand-in serves blobs by digest — the same
-    /// contract the worker answers in front of the registry: the blob for
-    /// a digest it holds, 404 for a well-formed digest that names none,
-    /// 400 for a malformed digest, and HEAD carries the length without the
-    /// body.
+    /// The edge byte-path stand-in serves blobs by digest under the
+    /// bundle's rustc — the same contract the worker answers in front of
+    /// the registry: the blob for a digest it holds, 404 for a
+    /// well-formed digest that names none, 400 for a malformed rustc or
+    /// digest, and HEAD carries the length without the body.
     #[tokio::test]
     async fn byte_path_serves_bundles_by_digest() {
         let root = tempfile::tempdir().expect("registry root");
         let bundle = b"not really a tar, but the bytes the index pins".to_vec();
         publish_slice(root.path(), &bundle).await;
         let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
-        let uri = format!("/api/v1/bundles/{}", sha256_digest(&bundle));
+        let digest = sha256_digest(&bundle);
+        let uri = format!("/api/v1/bundles/{RUSTC}/{digest}");
 
         let response = app
             .clone()
@@ -2340,7 +2413,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v1/bundles/sha256:{}", "1".repeat(64)))
+                    .uri(format!("/api/v1/bundles/{RUSTC}/sha256:{}", "1".repeat(64)))
                     .body(Body::empty())
                     .expect("miss request builds"),
             )
@@ -2358,7 +2431,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!("/api/v1/bundles/{malformed}"))
+                        .uri(format!("/api/v1/bundles/{RUSTC}/{malformed}"))
                         .body(Body::empty())
                         .expect("malformed request builds"),
                 )
@@ -2366,6 +2439,19 @@ mod tests {
                 .expect("malformed response");
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{malformed}");
         }
+
+        // A rustc segment outside the wire-version alphabet is rejected
+        // the same way.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/bundles/not~a~rustc/{digest}"))
+                    .body(Body::empty())
+                    .expect("malformed rustc request builds"),
+            )
+            .await
+            .expect("malformed rustc response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Bind an ephemeral loopback port, serve the probe-instrumented
@@ -2422,7 +2508,7 @@ mod tests {
             },
             emit: vec!["link".to_owned()],
             oci_reference: format!(
-                "{GHCR_BASE}:serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-{C_METADATA}"
+                "{REFERENCE_BASE}:serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-{C_METADATA}"
             ),
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
@@ -2443,13 +2529,13 @@ mod tests {
 
     /// A credentialed `pull,push` session on the served mock.
     fn push_session(listen: &str, http: &stow_oci::RegistryHttp) -> stow_oci::RegistrySession {
-        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{}", GHCR_REPOSITORY))
-            .expect("registry base");
+        let base =
+            stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
         let credentials = stow_oci::RegistryCredentials {
             username: "mock".to_owned(),
             password: "mock".to_owned(),
         };
-        base.push_session(&credentials, http)
+        base.push_session(&test_cache_repository(), &credentials, http)
     }
 
     /// The in-process signer the push tests inject: writes the signature
@@ -2704,15 +2790,15 @@ mod tests {
         let forged =
             br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
         let real_digest = sha256_digest(real);
-        probe.forge_manifest("forged-tag", forged, &real_digest);
-        probe.forge_manifest(&real_digest, forged, &real_digest);
+        probe.forge_manifest(&format!("{REPOSITORY}:forged-tag"), forged, &real_digest);
+        probe.forge_manifest(&format!("{REPOSITORY}@{real_digest}"), forged, &real_digest);
 
-        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
-            .expect("registry base");
+        let base =
+            stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
         let http = stow_oci::RegistryHttp::new().await.expect("registry http");
-        let session = base.session(&http);
+        let session = base.session(&test_cache_repository(), &http);
 
-        let tag_reference = base.reference("forged-tag").expect("tag reference");
+        let tag_reference = session.reference("forged-tag").expect("tag reference");
         let error = session
             .pull_manifest(&tag_reference)
             .await
@@ -2722,7 +2808,7 @@ mod tests {
             "a forged body is a refusal, not an absence: {error}"
         );
 
-        let digest_reference = base
+        let digest_reference = session
             .digest_reference(&real_digest)
             .expect("digest reference");
         let error = session
@@ -2761,17 +2847,22 @@ mod tests {
         let tag_a = "folded.aarch64-apple-darwin.1.98.1";
         let tag_b = "folded.x86_64-pc-windows-msvc.1.98.1";
         for tag in [tag_a, tag_b, tag_a] {
-            write_mock_signature(root.path(), &signer, &format!("{GHCR_BASE}:{tag}"), digest)
-                .await
-                .expect("sign");
+            write_mock_signature(
+                root.path(),
+                &signer,
+                &format!("{REFERENCE_BASE}:{tag}"),
+                digest,
+            )
+            .await
+            .expect("sign");
         }
 
         let (listen, _probe) = serve_probe_registry(root.path()).await;
-        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
-            .expect("registry base");
+        let base =
+            stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
         let http = stow_oci::RegistryHttp::new().await.expect("registry http");
-        let session = base.session(&http);
-        let reference = base.reference(tag_a).expect("reference");
+        let session = base.session(&test_cache_repository(), &http);
+        let reference = session.reference(tag_a).expect("reference");
         let materials = stow_oci::pull_signature_materials(&session, &reference, digest)
             .await
             .expect("signature materials");
@@ -2785,7 +2876,7 @@ mod tests {
         for tag in [tag_a, tag_b] {
             stow_oci::verify::verify_materials(
                 &trust,
-                &format!("{GHCR_BASE}:{tag}"),
+                &format!("{REFERENCE_BASE}:{tag}"),
                 digest,
                 &materials,
                 "",
@@ -2799,7 +2890,7 @@ mod tests {
     /// How many `GET /manifests/{signature_tag}` requests the served
     /// registry saw — the pulls a signature read made.
     fn signature_manifest_pulls(probe: &RegistryProbe, signature_tag: &str) -> usize {
-        let path = format!("/v2/{GHCR_REPOSITORY}/manifests/{signature_tag}");
+        let path = format!("/v2/{REPOSITORY}/manifests/{signature_tag}");
         probe
             .request_log()
             .iter()
@@ -2819,18 +2910,21 @@ mod tests {
             .expect("mock signer");
         let digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
-        write_mock_signature(root.path(), &signer, &format!("{GHCR_BASE}:{tag}"), digest)
-            .await
-            .expect("mock signature");
+        write_mock_signature(
+            root.path(),
+            &signer,
+            &format!("{REFERENCE_BASE}:{tag}"),
+            digest,
+        )
+        .await
+        .expect("mock signature");
         let (listen, probe) = serve_probe_registry(root.path()).await;
         let signature_tag = sigstore_signature_tag(digest);
         probe.manifest_unknown(Method::GET, &format!("/manifests/{signature_tag}"), 1);
 
-        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
-            .expect("registry base");
         let http = stow_oci::RegistryHttp::new().await.expect("registry http");
         let session = push_session(&listen, &http);
-        let reference = base.reference(tag).expect("reference");
+        let reference = session.reference(tag).expect("reference");
         let materials = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
             .await
             .expect("the registry catches up within the bound");
@@ -2859,12 +2953,10 @@ mod tests {
             usize::MAX,
         );
 
-        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
-            .expect("registry base");
         let http = stow_oci::RegistryHttp::new().await.expect("registry http");
         let session = push_session(&listen, &http);
         let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
-        let reference = base.reference(tag).expect("reference");
+        let reference = session.reference(tag).expect("reference");
         let error = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
             .await
             .expect_err("a signature that never lands fails at the bound");
@@ -2876,7 +2968,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(&format!("{GHCR_REPOSITORY}:{signature_tag}")),
+                .contains(&format!("{REPOSITORY}:{signature_tag}")),
             "the error names the signature reference: {error}"
         );
     }
@@ -2896,12 +2988,12 @@ mod tests {
             usize::MAX,
         );
 
-        let base = stow_oci::RegistryBase::parse(&format!("http://{listen}/{GHCR_REPOSITORY}"))
-            .expect("registry base");
+        let base =
+            stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
         let http = stow_oci::RegistryHttp::new().await.expect("registry http");
-        let session = base.session(&http);
+        let session = base.session(&test_cache_repository(), &http);
         let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
-        let reference = base.reference(tag).expect("reference");
+        let reference = session.reference(tag).expect("reference");
         let error = stow_oci::pull_signature_materials(&session, &reference, digest)
             .await
             .expect_err("an absent signature is the answer, not a retry");
@@ -2913,7 +3005,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(&format!("{GHCR_REPOSITORY}:{signature_tag}")),
+                .contains(&format!("{REPOSITORY}:{signature_tag}")),
             "the error names the signature reference: {error}"
         );
     }

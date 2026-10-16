@@ -34,6 +34,7 @@ use askama::Template;
 use clap::{Args, Subcommand};
 use stow_types::analytics::{self, Envelope};
 use stow_types::api::{AdminStatus, DispatchFreeze};
+use stow_types::identity::WireRustcVersion;
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
 
@@ -839,11 +840,11 @@ impl Watcher<'_> {
         // HEAD: the route registers no HEAD handler, and the probe's job
         // is the real user fetch anyway.
         match self.pick_bundle_digest().await {
-            Ok(Some(digest)) => {
+            Ok(Some((rustc_version, digest))) => {
                 readings.push(
                     self.probe(
                         "endpoint.artifact",
-                        &format!("/api/v1/bundles/{digest}"),
+                        &format!("/api/v1/bundles/{rustc_version}/{digest}"),
                         zenwave::Method::GET,
                     )
                     .await,
@@ -899,31 +900,35 @@ impl Watcher<'_> {
     }
 
     /// One `bundle_digest` out of a published index slice of the current
-    /// stable toolchain, or `None` when none of its slices carries rows.
+    /// stable toolchain — returned with the rustc the byte path names —
+    /// or `None` when none of its slices carries rows.
     /// The slice is pulled and verified off GHCR — the same signed source
     /// `index export` and `preheat manual` pull — so the probe depends on
     /// the store the CLI itself reads, not the D1 mirror. Only the current
     /// stable rustc's `index.<target>.<rustc>` tags answer: another
     /// toolchain's slice proves nothing about what users are served.
-    async fn pick_bundle_digest(&self) -> stow_types::error::Result<Option<String>> {
+    async fn pick_bundle_digest(
+        &self,
+    ) -> stow_types::error::Result<Option<(WireRustcVersion, String)>> {
         let rustc_version = crate::rust_channel::stable_rustc_version().await?;
         let base = crate::index_cmd::registry_base()?;
         let http = stow_oci::RegistryHttp::new().await?;
-        let session = base.session(&http);
+        let repository = stow_types::registry::cache_repository(&rustc_version);
+        let session = base.session(&repository, &http);
         let trust = crate::index_cmd::records_trust().await?;
         for target in stow_types::api::CI_TARGET_TRIPLES {
             let tag = stow_types::index::index_tag(target, rustc_version.as_str());
             let Some(pulled) =
-                stow_oci::pull_index(&session, &base, target, rustc_version.as_str()).await?
+                stow_oci::pull_index(&session, target, rustc_version.as_str()).await?
             else {
                 continue;
             };
-            let reference = base.reference(&tag)?;
+            let reference = session.reference(&tag)?;
             crate::index_cmd::verify_artifact(
                 &session,
                 &trust,
                 &reference,
-                &format!("{}:{tag}", stow_types::registry::GHCR_BASE),
+                &repository.reference(&tag),
                 &pulled.manifest_digest,
                 crate::index_cmd::INDEX_CERT_URL,
             )
@@ -934,7 +939,7 @@ impl Watcher<'_> {
                 &pulled.bytes,
             )?;
             if let Some(row) = index.rows.first() {
-                return Ok(Some(row.bundle_digest.clone()));
+                return Ok(Some((rustc_version, row.bundle_digest.clone())));
             }
         }
         Ok(None)

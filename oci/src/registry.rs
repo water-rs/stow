@@ -1,7 +1,7 @@
 use oci_client::Reference;
 use oci_client::manifest::{OciDescriptor, OciImageManifest};
 use stow_types::error::Context;
-use stow_types::registry::{GHCR_V2_BASE_URL, verify_oci_digest};
+use stow_types::registry::{CacheRepository, GHCR_REGISTRY_URL, verify_oci_digest};
 
 use crate::client::{RegistryHttp, RegistrySession};
 
@@ -32,15 +32,19 @@ impl RegistryCredentials {
         })
     }
 
-    /// The credentialed publish session on the production registry — the one
-    /// every stow push path shares.
+    /// The credentialed publish session on the production registry — the
+    /// one every stow push path shares.
     ///
     /// # Errors
     ///
-    /// Returns an error if [`GHCR_V2_BASE_URL`] is malformed — a bug, not a
-    /// runtime condition.
-    pub fn session(&self, http: &RegistryHttp) -> stow_types::error::Result<RegistrySession> {
-        Ok(RegistryBase::production()?.push_session(self, http))
+    /// Returns an error if [`GHCR_REGISTRY_URL`] is malformed — a bug, not
+    /// a runtime condition.
+    pub fn session(
+        &self,
+        repository: &CacheRepository,
+        http: &RegistryHttp,
+    ) -> stow_types::error::Result<RegistrySession> {
+        Ok(RegistryBase::production()?.push_session(repository, self, http))
     }
 }
 
@@ -61,27 +65,29 @@ pub fn env_required(name: &str) -> stow_types::error::Result<String> {
         .map_err(|_| stow_types::stow_error!("missing required environment variable {name}"))
 }
 
-/// A `scheme://host/v2/repository` registry API base.
+/// A `scheme://host[:port]` registry root — the OCI API base every
+/// per-repository session hangs its `/v2/<repository>/…` URLs off.
 ///
-/// Production is [`GHCR_V2_BASE_URL`]; the mock registry serves the same
+/// Production is [`GHCR_REGISTRY_URL`]; the mock registry serves the same
 /// paths over plain HTTP, so the URL scheme selects the client protocol.
 /// `STOW_REGISTRY_BASE_URL` on the CLI redirects every pull through this
-/// type.
+/// type. The repository is never part of the configured root: each pull or
+/// push names the package its rustc derives.
 #[derive(Debug, Clone)]
 pub struct RegistryBase {
     scheme: String,
     registry: String,
-    repository: String,
 }
 
 impl RegistryBase {
-    /// Parse `<scheme>://<host>/v2/<repository>`; `http` stays plaintext
-    /// for the mock registry, `https` is the production TLS path.
+    /// Parse `<scheme>://<host>[:<port>]` — the registry root. `http` stays
+    /// plaintext for the mock registry, `https` is the production TLS path.
     ///
     /// # Errors
     ///
     /// Returns an error when the URL has no scheme, an unsupported scheme,
-    /// or no repository path after `/v2/`.
+    /// an empty host, or a path — the per-rustc repository is appended by
+    /// code, never configured.
     pub fn parse(base_url: &str) -> stow_types::error::Result<Self> {
         let (scheme, rest) = base_url.split_once("://").ok_or_else(|| {
             stow_types::stow_error!("registry base URL {base_url:?} has no scheme")
@@ -91,22 +97,15 @@ impl RegistryBase {
                 "registry base URL {base_url:?} uses unsupported scheme {scheme:?}"
             ));
         }
-        let (registry, path) = rest.split_once('/').ok_or_else(|| {
-            stow_types::stow_error!("registry base URL {base_url:?} has no repository path")
-        })?;
-        let repository = path
-            .strip_prefix("v2/")
-            .unwrap_or(path)
-            .trim_end_matches('/');
-        if repository.is_empty() {
+        let registry = rest.trim_end_matches('/');
+        if registry.is_empty() || registry.contains('/') {
             return Err(stow_types::stow_error!(
-                "registry base URL {base_url:?} has an empty repository path"
+                "registry base URL {base_url:?} must be the registry root —                  scheme://host[:port] with no repository path"
             ));
         }
         Ok(Self {
             scheme: scheme.to_owned(),
             registry: registry.to_owned(),
-            repository: repository.to_owned(),
         })
     }
 
@@ -114,10 +113,10 @@ impl RegistryBase {
     ///
     /// # Errors
     ///
-    /// Returns an error if [`GHCR_V2_BASE_URL`] is malformed — a bug, not a
-    /// runtime condition.
+    /// Returns an error if [`GHCR_REGISTRY_URL`] is malformed — a bug, not
+    /// a runtime condition.
     pub fn production() -> stow_types::error::Result<Self> {
-        Self::parse(GHCR_V2_BASE_URL)
+        Self::parse(GHCR_REGISTRY_URL)
     }
 
     /// The URL scheme the base declared (`http` or `https`) — the session
@@ -129,35 +128,6 @@ impl RegistryBase {
     /// The `host[:port]` segment asset URLs hang off.
     pub(crate) fn registry(&self) -> &str {
         &self.registry
-    }
-
-    /// The repository path every request addresses.
-    pub(crate) fn repository(&self) -> &str {
-        &self.repository
-    }
-
-    /// `<registry>/<repository>:<tag>` as a pull reference.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `tag` cannot form a valid OCI reference.
-    pub fn reference(&self, tag: &str) -> stow_types::error::Result<Reference> {
-        format!("{}/{}:{tag}", self.registry, self.repository)
-            .parse()
-            .wrap_err_with(|| format!("build OCI reference for tag {tag:?}"))
-    }
-
-    /// `<registry>/<repository>@<digest>` as a pull reference — the form a
-    /// blob-by-digest download needs (the descriptor carries the digest; the
-    /// reference carries the repository).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `digest` cannot form a valid OCI reference.
-    pub fn digest_reference(&self, digest: &str) -> stow_types::error::Result<Reference> {
-        format!("{}/{}@{digest}", self.registry, self.repository)
-            .parse()
-            .wrap_err_with(|| format!("build OCI reference for digest {digest:?}"))
     }
 }
 

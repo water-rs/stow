@@ -17,11 +17,12 @@ file values. Keys the file does not model are ignored, not rejected.
 # mock or staging runs. May also be set via $STOW_EDGE_URL.
 edge_url = "https://stow.waterui.dev"
 
-# OCI base URL (scheme://host/v2/repository) the signed index slices are
-# pulled from (bundles stream through the edge). Defaults to the
-# production GHCR repository; set it for mock runs.
+# OCI registry root (scheme://host[:port]) the signed index slices are
+# pulled from — the pull appends /v2/water-rs/stow-cache-<rustc> for the
+# rustc's package (bundles stream through the edge). Defaults to the
+# production GHCR root; set it for mock runs.
 # May also be set via $STOW_REGISTRY_BASE_URL.
-# registry_base_url = "https://ghcr.io/v2/water-rs/stow-cache-2"
+# registry_base_url = "https://ghcr.io"
 
 # Seconds a cached index slice may sit before `stow check`/`build`
 # revalidates its manifest digest against the registry. Default 600.

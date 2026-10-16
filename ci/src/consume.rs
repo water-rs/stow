@@ -162,7 +162,10 @@ async fn stage_candidates(
     let registry =
         stow_oci::RegistryBase::parse(config.registry_base_url()).map_err(unavailable)?;
     let http = config.registry_http().await.map_err(unavailable)?;
-    let session = registry.session(&http);
+    let session = registry.session(
+        &stow_types::registry::cache_repository(&task.rustc_version),
+        &http,
+    );
 
     let mut seen_compile_keys = BTreeSet::new();
     let mut distinct = Vec::new();

@@ -62,7 +62,7 @@ fn a_served_build_prints_cargo_output_and_the_summary_only() {
     write_fixture(dir.path(), cargo_home.path(), FIXTURE_DEPENDENCIES);
     stow_setup_in(dir.path(), cargo_home.path());
     let edge_url = refused_url();
-    let registry_url = format!("{}/v2/water-rs/stow-cache-2", refused_url());
+    let registry_url = refused_url();
     let cache = tempfile::tempdir().expect("cache dir");
 
     // First build: all misses, every unit stored locally.

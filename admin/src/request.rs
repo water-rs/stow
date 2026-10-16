@@ -190,11 +190,12 @@ async fn plan_request(
     // pruned dep is one the serving path can actually hand out.
     let base = crate::index_cmd::registry_base()?;
     let http = stow_oci::RegistryHttp::new().await?;
-    let session = base.session(&http);
+    let repository = stow_types::registry::cache_repository(&rustc_version);
+    let session = base.session(&repository, &http);
     let trust = crate::index_cmd::records_trust().await?;
     let catalog = crate::manual::Index {
         session: &session,
-        base: &base,
+        repository: &repository,
         trust: &trust,
     };
     // The flag each resolved node carries decides the shapes its

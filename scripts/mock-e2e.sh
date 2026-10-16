@@ -215,7 +215,7 @@ isolated_env() {
 stow_cli() {
     isolated_env \
         STOW_EDGE_URL="$EDGE_URL" \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
@@ -944,7 +944,7 @@ fi
     # isolated stow cache, never GHCR or the developer's ~/.stow.
     [ -z "$SYSROOT" ] || eval "$("$REPO_ROOT/ci/glibc-sysroot/env.sh" "$SYSROOT")"
     exec env "${ISOLATED_ENV[@]}" \
-        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
         STOW_VERIFY_MODE="mock-key" \
         STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
         SCHEDULER_URL="$SCHEDULER_URL" \
@@ -1006,7 +1006,7 @@ done
 # delegates each slice's signed push to `stow-mock-registry
 # publish-index`, which writes the same layout the GHCR path produces.
 isolated_env \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     "$BIN/stow-admin" index export \
     --out-dir "$WORK_DIR/index-export" \
@@ -1068,7 +1068,7 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # (same-file), so the wave lands in two layers.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
 isolated_env \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2" \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
@@ -1087,11 +1087,11 @@ isolated_env \
 # The mock registry, like GHCR, serves /v2 only to an anonymous bearer
 # minted by its token endpoint.
 registry_token="$(curl -fsS --max-time 10 \
-    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache-2:pull" \
+    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache-${RUSTC_VERSION}:pull" \
     | jq -er .token)" \
     || die "mock registry token exchange failed"
 curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
-    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-2/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
+    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-${RUSTC_VERSION}/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
     -o /dev/null \
     || die "index slice index.${HOST_TARGET}.${RUSTC_VERSION} missing after the manual wave"
 
@@ -1150,7 +1150,7 @@ echo "[mock-e2e] $TASK_CRATE cache stats: hits=$hits errors=$errors"
 # --- byte path: bundles served by digest, Workers Cache in front of GHCR ---
 #
 # `stow check` already fetched itoa's bundle through
-# GET /api/v1/bundles/{digest}; the assertions below pin the route's
+# GET /api/v1/bundles/{rustc_version}/{digest}; the assertions below pin the route's
 # contract directly. The index layer blob lives in the same registry
 # repository but the CLI pulled it straight from the registry, so the
 # edge has never served it. The route's whole caching contract is the
@@ -1167,7 +1167,7 @@ INDEX_DIGEST="sha256:$(sha256sum "$INDEX_SLICE" | awk '{print $1}')"
     || die "index blob not in the mock registry: $INDEX_DIGEST"
 
 headers="$(curl -fsS -D - -o "$WORK_DIR/bundle.bin" \
-    "$EDGE_URL/api/v1/bundles/$INDEX_DIGEST")"
+    "$EDGE_URL/api/v1/bundles/$RUSTC_VERSION/$INDEX_DIGEST")"
 grep -qi '^cache-control: *public, max-age=31536000, immutable' <<<"$headers" \
     || die "digest fetch did not emit the immutable cache contract: $headers"
 cmp -s "$WORK_DIR/bundle.bin" "$INDEX_SLICE" \
@@ -1175,9 +1175,9 @@ cmp -s "$WORK_DIR/bundle.bin" "$INDEX_SLICE" \
 echo "[mock-e2e] digest fetch: bytes plus immutable cache contract (expected)"
 
 code="$(curl -s -o /dev/null -w '%{http_code}' \
-    "$EDGE_URL/api/v1/bundles/sha256:0000000000000000000000000000000000000000000000000000000000000000")"
+    "$EDGE_URL/api/v1/bundles/$RUSTC_VERSION/sha256:0000000000000000000000000000000000000000000000000000000000000000")"
 [ "$code" = "404" ] || die "unknown bundle digest returned $code, expected 404"
-code="$(curl -s -o /dev/null -w '%{http_code}' "$EDGE_URL/api/v1/bundles/sha256:nothex")"
+code="$(curl -s -o /dev/null -w '%{http_code}' "$EDGE_URL/api/v1/bundles/$RUSTC_VERSION/sha256:nothex")"
 [ "$code" = "400" ] || die "malformed bundle digest returned $code, expected 400"
 code="$(curl -s -o /dev/null -w '%{http_code}' \
     "$EDGE_URL/api/v1/artifacts/$HOST_TARGET/$RUSTC_VERSION/0000000000000000")"

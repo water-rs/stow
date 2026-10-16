@@ -116,10 +116,11 @@ enum Fire {
     /// `GET /api/v1/index/{target}/{rustc}` then the digest-addressed
     /// slice when a pointer answers — the pull's two requests.
     IndexPull { target: String, rustc: String },
-    /// `GET /api/v1/bundles/sha256:{counter}` — rotating synthetic
-    /// digests; the 404 is the miss the launch fleet sees on an
-    /// uncovered unit, and it still costs the full route.
-    BundleFetch,
+    /// `GET /api/v1/bundles/{rustc}/sha256:{counter}` — rotating
+    /// synthetic digests under the run's rustc; the 404 is the miss the
+    /// launch fleet sees on an uncovered unit, and it still costs the
+    /// full route.
+    BundleFetch { rustc: String },
     /// `GET /api/v1/requests/{request_id}` over the seeded request
     /// records — alternates the `enqueued` record (whose read re-probes
     /// its stored roots into live queue rows) with the `failed` record.
@@ -504,10 +505,10 @@ async fn plan(
             })
         }
         Fire::IndexPull { target, rustc } => plan_index_pull(base, target, rustc, client).await,
-        Fire::BundleFetch => {
+        Fire::BundleFetch { rustc } => {
             let digest = format!("{:064x}", counter.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             Ok(Plan::Get {
-                url: format!("{base}/api/v1/bundles/sha256:{digest}"),
+                url: format!("{base}/api/v1/bundles/{rustc}/sha256:{digest}"),
                 bearer: None,
             })
         }
@@ -819,7 +820,9 @@ fn build_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
         Lane {
             name: "bundle-fetch",
             eps: eps(EventKind::CliBytePathFetch),
-            fire: Fire::BundleFetch,
+            fire: Fire::BundleFetch {
+                rustc: args.rustc.clone(),
+            },
             expected: ok_or_404,
         },
         Lane {

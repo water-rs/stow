@@ -1201,7 +1201,7 @@ mod tests {
     fn test_config(cache_dir: &Path) -> StowConfig {
         StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
-            registry_base_url: "http://127.0.0.1:9/v2/stow".to_owned(),
+            registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
             request_timeout: std::time::Duration::from_millis(200),
             negative_cache_ttl: std::time::Duration::ZERO,
