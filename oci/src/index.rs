@@ -4,14 +4,15 @@ use oci_client::Reference;
 use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::{OciImageManifest, OciManifest};
 use stow_types::bundle::sigstore_signature_tag;
+use stow_types::identity::WireRustcVersion;
 use stow_types::index::{
     STOW_FOLDED_CONFIG_MEDIA_TYPE, STOW_FOLDED_MEDIA_TYPE, STOW_INDEX_CONFIG_MEDIA_TYPE,
     STOW_INDEX_MEDIA_TYPE, folded_tag, index_tag,
 };
-use stow_types::registry::{GHCR_BASE, sha256_digest};
+use stow_types::registry::{cache_repository, sha256_digest};
 
 use crate::client::{RegistryHttp, RegistrySession, canonical_manifest_bytes};
-use crate::registry::{RegistryBase, RegistryCredentials, pull_blob_verified};
+use crate::registry::{RegistryCredentials, pull_blob_verified};
 use crate::sign;
 
 /// Manifest annotation carrying the index's content digest — the
@@ -143,9 +144,10 @@ pub async fn published_index_content_sha256(
 pub async fn pull_published_index(
     session: &RegistrySession,
     target: &str,
-    rustc_version: &str,
+    rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<Option<Vec<u8>>> {
-    let reference = format!("{GHCR_BASE}:{}", index_tag(target, rustc_version));
+    let reference =
+        cache_repository(rustc_version).reference(&index_tag(target, rustc_version.as_str()));
     let parsed_reference: Reference = reference
         .parse()
         .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
@@ -195,11 +197,12 @@ pub async fn publish_index(
     http: &RegistryHttp,
     index_bytes: &[u8],
     target: &str,
-    rustc_version: &str,
+    rustc_version: &WireRustcVersion,
     content_sha256: &str,
 ) -> stow_types::error::Result<IndexPublishOutcome> {
-    let session = credentials.session(http)?;
-    let reference = format!("{GHCR_BASE}:{}", index_tag(target, rustc_version));
+    let repository = cache_repository(rustc_version);
+    let session = credentials.session(&repository, http)?;
+    let reference = repository.reference(&index_tag(target, rustc_version.as_str()));
     let parsed_reference: Reference = reference
         .parse()
         .map_err(|error| stow_types::stow_error!("parse index reference {reference}: {error}"))?;
@@ -285,12 +288,11 @@ pub struct PulledIndex {
 /// index artifact, or the layer fails its digest check.
 pub async fn pull_index(
     session: &RegistrySession,
-    base: &RegistryBase,
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<Option<PulledIndex>> {
     let tag = index_tag(target, rustc_version);
-    let reference = base.reference(&tag)?;
+    let reference = session.reference(&tag)?;
     let (bytes, manifest_digest) = match session.pull_manifest(&reference).await {
         Ok(pulled) => pulled,
         Err(error) if error.is_not_found() => return Ok(None),
@@ -338,12 +340,11 @@ pub struct PulledFolded {
 /// Returns an error when the pull fails or the artifact is malformed.
 pub async fn pull_folded(
     session: &RegistrySession,
-    base: &RegistryBase,
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<Option<PulledFolded>> {
     let tag = folded_tag(target, rustc_version);
-    let reference = base.reference(&tag)?;
+    let reference = session.reference(&tag)?;
     let (bytes, manifest_digest) = match session.pull_manifest(&reference).await {
         Ok(pulled) => pulled,
         Err(error) if error.is_not_found() => return Ok(None),
@@ -389,10 +390,11 @@ pub async fn publish_folded(
     http: &RegistryHttp,
     folded_bytes: &[u8],
     target: &str,
-    rustc_version: &str,
+    rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<IndexPublishOutcome> {
-    let session = credentials.session(http)?;
-    let reference = format!("{GHCR_BASE}:{}", folded_tag(target, rustc_version));
+    let repository = cache_repository(rustc_version);
+    let session = credentials.session(&repository, http)?;
+    let reference = repository.reference(&folded_tag(target, rustc_version.as_str()));
     let parsed_reference: Reference = reference
         .parse()
         .map_err(|error| stow_types::stow_error!("parse folded reference {reference}: {error}"))?;

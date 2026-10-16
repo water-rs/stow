@@ -40,10 +40,11 @@ const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
     pub edge_url: String,
-    /// OCI registry API base every index/artifact pull hits, in
-    /// `scheme://host/v2/repository` form. `STOW_REGISTRY_BASE_URL` or
+    /// OCI registry root every index/artifact pull hits, in
+    /// `scheme://host[:port]` form — the pull appends `/v2/<repository>`
+    /// for the rustc's own package. `STOW_REGISTRY_BASE_URL` or
     /// `registry_base_url` redirect it — the mock e2e serves the same
-    /// paths over plain HTTP; production is the GHCR package.
+    /// paths over plain HTTP; production is GHCR.
     pub registry_base_url: String,
     pub cache_dir: PathBuf,
     pub request_timeout: Duration,
@@ -440,7 +441,7 @@ fn resolve_registry_base_url(file_config: Option<&StowUserConfig>) -> String {
     std::env::var(STOW_REGISTRY_BASE_URL_ENV)
         .ok()
         .or_else(|| file_config.and_then(|config| config.registry_base_url.clone()))
-        .unwrap_or_else(|| stow_types::registry::GHCR_V2_BASE_URL.to_owned())
+        .unwrap_or_else(|| stow_types::registry::GHCR_REGISTRY_URL.to_owned())
 }
 
 fn load_index_refresh_interval(

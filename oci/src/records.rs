@@ -12,11 +12,12 @@ use std::collections::BTreeMap;
 use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::OciImageManifest;
 use stow_types::api::ArtifactRecord;
+use stow_types::identity::WireRustcVersion;
 use stow_types::records::{
     BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
     is_records_tag, records_tag,
 };
-use stow_types::registry::sha256_digest;
+use stow_types::registry::{cache_repository, sha256_digest};
 
 use crate::client::{RegistryHttp, RegistrySession, canonical_manifest_bytes};
 use crate::registry::{
@@ -62,14 +63,15 @@ pub struct PulledRecords {
 pub async fn push_records(
     credentials: &RegistryCredentials,
     http: &RegistryHttp,
-    rustc_version: &str,
+    rustc_version: &WireRustcVersion,
     task_id: &str,
     build: BuildRun,
     records: &[ArtifactRecord],
 ) -> stow_types::error::Result<RecordsPublishOutcome> {
+    let repository = cache_repository(rustc_version);
     let base = RegistryBase::production()?;
-    let session = base.push_session(credentials, http);
-    push_records_with(&session, &base, rustc_version, task_id, build, records, |reference, digest| async move {
+    let session = base.push_session(&repository, credentials, http);
+    push_records_with(&session, rustc_version, task_id, build, records, |reference, digest| async move {
         sign::sign_artifact(&reference, &digest, credentials).await
     })
     .await
@@ -84,8 +86,7 @@ pub async fn push_records(
 /// Same as [`push_records`].
 pub async fn push_records_with<S, Fut>(
     session: &RegistrySession,
-    base: &RegistryBase,
-    rustc_version: &str,
+    rustc_version: &WireRustcVersion,
     task_id: &str,
     build: BuildRun,
     records: &[ArtifactRecord],
@@ -95,8 +96,8 @@ where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<()>> + Send,
 {
-    let tag = records_tag(rustc_version, task_id, build);
-    let reference = base.reference(&tag)?;
+    let tag = records_tag(rustc_version.as_str(), task_id, build);
+    let reference = session.reference(&tag)?;
     let body = serde_json::to_vec(records)
         .map_err(|error| stow_types::stow_error!("encode records for {task_id}: {error}"))?;
     let layer = ImageLayer::new(body, RECORDS_ARTIFACT_TYPE.to_owned(), None);
@@ -153,13 +154,11 @@ where
 /// artifact, or the layer fails its digest check or decodes wrong.
 pub async fn pull_records(
     session: &RegistrySession,
-    base: &RegistryBase,
     rustc_version: &str,
     task_id: &str,
     build: BuildRun,
 ) -> stow_types::error::Result<PulledRecords> {
-    let pulled =
-        pull_records_by_tag(session, base, &records_tag(rustc_version, task_id, build)).await?;
+    let pulled = pull_records_by_tag(session, &records_tag(rustc_version, task_id, build)).await?;
     if pulled.task_id != task_id {
         return Err(stow_types::stow_error!(
             "{} carries no {RECORDS_TASK_ID_ANNOTATION} annotation naming {task_id}",
@@ -180,10 +179,9 @@ pub async fn pull_records(
 /// Same as [`pull_records`].
 pub async fn pull_records_by_tag(
     session: &RegistrySession,
-    base: &RegistryBase,
     tag: &str,
 ) -> stow_types::error::Result<PulledRecords> {
-    let reference = base.reference(tag)?;
+    let reference = session.reference(tag)?;
     let (manifest_digest, manifest) = pull_tagged_manifest(session, &reference).await?;
     if manifest.artifact_type.as_deref() != Some(RECORDS_ARTIFACT_TYPE) {
         return Err(stow_types::stow_error!(

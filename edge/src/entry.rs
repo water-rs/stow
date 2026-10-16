@@ -224,7 +224,7 @@ fn anonymous_nodes() -> Vec<RouteNode> {
         "/install.ps1".at(site::install_ps1),
         "/stats".at(site::stats_page),
         lanes::REQUEST_PAGE.at(site::request_status),
-        "/api/v1/bundles/{digest}".at(api::get_bundle),
+        "/api/v1/bundles/{rustc_version}/{digest}".at(api::get_bundle),
         "/api/v1/crates".route((
             "/search".at(api::search_crates),
             "/{crate_name}/versions".at(api::crate_versions),

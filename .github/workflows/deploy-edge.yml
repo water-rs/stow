@@ -263,7 +263,7 @@ jobs:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
         run: |
           set -euo pipefail
-          bundle_probe="/api/v1/bundles/sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          bundle_probe="/api/v1/bundles/1.99.0/sha256:0000000000000000000000000000000000000000000000000000000000000000"
           cand="stow-edge=\"$CANDIDATE_VERSION\""
           base="stow-edge=\"$BASELINE_VERSION\""
           probes=$((SUITE_REQUESTS / 5))

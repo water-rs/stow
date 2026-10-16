@@ -11,8 +11,8 @@ default, and the purpose.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | `https://stow.waterui.dev` | HTTPS URL of the edge worker — the CLI streams bundles from `/api/v1/bundles/{digest}` (the byte path) and posts `/api/v1/admissions` (miss minting) and `/api/v1/enqueue` (PoW redemption) to it. Falls back to `edge_url` in `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux), then to the production edge. |
-| `STOW_REGISTRY_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache-2` | OCI base URL (`scheme://host/v2/repository`) the CLI pulls signed index slices from (bundle bytes stream through the edge). Override for mock-registry runs; `registry_base_url` in the config file does the same. |
+| `STOW_EDGE_URL` | `https://stow.waterui.dev` | HTTPS URL of the edge worker — the CLI streams bundles from `/api/v1/bundles/{rustc_version}/{digest}` (the byte path) and posts `/api/v1/admissions` (miss minting) and `/api/v1/enqueue` (PoW redemption) to it. Falls back to `edge_url` in `~/Library/Application Support/stow/config.toml` (macOS) or `~/.config/stow/config.toml` (Linux), then to the production edge. |
+| `STOW_REGISTRY_BASE_URL` | `https://ghcr.io` | OCI registry root (`scheme://host[:port]`) the CLI pulls signed index slices from — the pull appends `/v2/water-rs/stow-cache-<rustc>` for the rustc's package (bundle bytes stream through the edge). Override for mock-registry runs; `registry_base_url` in the config file does the same. |
 | `STOW_INDEX_REFRESH_SECS` | `600` | Seconds a cached index slice may sit before the driver revalidates its manifest digest against the registry. `index_refresh_secs` in the config file. |
 | `STOW_CACHE_BUDGET_SECS` | `150ms x covered units, capped at 30` | Seconds the pre-cargo work budget lasts — the graph analysis and blocking prefetch a `stow check`/`build`/`test` pays before handing off to cargo; what is not prefetched is fetched on demand by the wrapper. `0` disables the pre-build phase entirely, the cheapest way to measure stow's overhead against a plain cargo run. |
 | `STOW_VERIFY_MODE` | `github-ci` | `github-ci` enforces fulcio-rooted cosign verification; `mock-key` accepts a single PEM public key for local mock and exists only in a `stow-cli` built with the `mock-verify` cargo feature (release binaries reject it). |
@@ -153,7 +153,7 @@ The mock registry is a one-shot CLI; everything else is positional args.
 | `SCHEDULER` | _required_ (Durable Object binding) | Build scheduler queue. |
 | `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim and the push-permission check), and the repository the scheduler triggers `workflow_dispatch` of `build-crate.yml` on. |
 | `STOW_OIDC_AUDIENCE` | _required_ (var) | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests. |
-| `GHCR_BASE_URL` | `https://ghcr.io/v2/water-rs/stow-cache-2` | OCI base URL (`scheme://host/v2/repository`) the edge's bundle byte path pulls from; a mock deploy points it at `stow-mock-registry serve`. |
+| `GHCR_BASE_URL` | `https://ghcr.io` | OCI registry root (`scheme://host[:port]`) the edge's bundle byte path pulls from — the request's rustc names the `water-rs/stow-cache-<rustc>` package appended under `/v2/`; a mock deploy points it at `stow-mock-registry serve`. |
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |
 | `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `workflow_dispatch`. Used by mock fixtures. |
 | `STOW_SCHEDULER_BUDGET` | unset | **Mock-only.** When `"1"`, the Durable Object answers the `/budget` and `/budget/seed` probe routes the workerd cost gate (`scripts/scheduler-budget.sh`) drives. Set only by `edge/Skyzen.mock.toml`; a test asserts it never appears in `edge/Skyzen.toml`, so the probe cannot reach production. |

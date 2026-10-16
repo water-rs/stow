@@ -14,8 +14,10 @@ use crate::registry_auth::{
     parse_bearer_challenge, pull_scope,
 };
 
+/// The production registry root — `scheme://host`; every request path
+/// appends `/v2/<repository>` for the rustc's own package.
 pub const fn default_base_url() -> &'static str {
-    stow_types::registry::GHCR_V2_BASE_URL
+    stow_types::registry::GHCR_REGISTRY_URL
 }
 
 /// `GET blobs/<digest>` as a streaming response. GHCR answers a blob GET
@@ -29,7 +31,10 @@ pub async fn open_blob(
     tokens: &RegistryTokens,
     pool: &OutboundPool,
 ) -> Result<worker::Response, FetchError> {
-    let url = format!("{}/blobs/{digest}", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/v2/{repo}/blobs/{digest}",
+        base_url.trim_end_matches('/')
+    );
     send_request(&url, tokens, &pull_scope(repo), None, pool).await
 }
 
@@ -44,7 +49,10 @@ pub async fn open_manifest(
     tokens: &RegistryTokens,
     pool: &OutboundPool,
 ) -> Result<worker::Response, FetchError> {
-    let url = format!("{}/manifests/{reference}", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/v2/{repo}/manifests/{reference}",
+        base_url.trim_end_matches('/')
+    );
     send_request(
         &url,
         tokens,
@@ -56,7 +64,7 @@ pub async fn open_manifest(
 }
 
 /// Accept header for the manifest GET — the OCI image manifest media type
-/// every stow-cache-2 tag resolves to.
+/// every `stow-cache-<rustc>` tag resolves to.
 const OCI_MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// `GET url` through the registry token exchange.

@@ -501,7 +501,7 @@ mod tests {
     fn test_config(cache_dir: PathBuf) -> StowConfig {
         StowConfig {
             edge_url: "https://stow.waterui.dev".to_owned(),
-            registry_base_url: stow_types::registry::GHCR_V2_BASE_URL.to_owned(),
+            registry_base_url: stow_types::registry::GHCR_REGISTRY_URL.to_owned(),
             cache_dir,
             request_timeout: Duration::from_mins(5),
             negative_cache_ttl: Duration::from_mins(5),

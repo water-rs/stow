@@ -13,7 +13,8 @@ use stow_types::bundle::{
     STOW_BUNDLE_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
 };
 use stow_types::bundle_schema::validate_bundle_schema;
-use stow_types::registry::{bundle_oci_reference, sha256_digest};
+use stow_types::identity::WireRustcVersion;
+use stow_types::registry::{bundle_oci_reference, cache_repository, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput, PublishedArtifact};
 
 use crate::client::{RegistryError, RegistryHttp, RegistrySession, canonical_manifest_bytes};
@@ -42,10 +43,11 @@ pub struct UploadOutcome {
 /// fails; the registry round-trip error names the plan's OCI reference.
 pub async fn push_artifacts(
     plans: &[PlannedArtifact],
+    rustc_version: &WireRustcVersion,
     credentials: &RegistryCredentials,
     http: &RegistryHttp,
 ) -> stow_types::error::Result<UploadOutcome> {
-    let session = credentials.session(http)?;
+    let session = credentials.session(&cache_repository(rustc_version), http)?;
     push_artifacts_with(&session, plans, |reference, digest| async move {
         sign::sign_artifact(&reference, &digest, credentials).await
     })

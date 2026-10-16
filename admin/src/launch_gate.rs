@@ -128,7 +128,7 @@ struct EventCost {
 const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::CliBytePathFetch,
-        route: "GET /api/v1/bundles/{digest}",
+        route: "GET /api/v1/bundles/{rustc_version}/{digest}",
         drives: &[],
         do_requests: 0.0,
         claims: 0.0,

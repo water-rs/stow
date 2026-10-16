@@ -184,7 +184,8 @@ async fn publish(
     // One client for the whole publish: the artifact push and the
     // records push share the trust-store load (stow#624).
     let http = stow_oci::RegistryHttp::new().await?;
-    let upload_outcome = stow_oci::push_artifacts(&output.plan, &credentials, &http).await?;
+    let upload_outcome =
+        stow_oci::push_artifacts(&output.plan, &task.rustc_version, &credentials, &http).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
         &upload_outcome.published_by_reference,
@@ -199,7 +200,7 @@ async fn publish(
     let records = stow_oci::push_records(
         &credentials,
         &http,
-        task.rustc_version.as_str(),
+        &task.rustc_version,
         &task.task_id,
         build_run_from_env()?,
         &artifact_records,
