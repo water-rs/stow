@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use stow_types::stow_error;
-use stow_types::transient::{Backoff, is_transient_status, retry_after_hint};
+use stow_types::transient::{
+    Backoff, RateLimit, is_transient_status, rate_limit, retry_after_hint,
+};
 use zenwave::{Client, ResponseExt};
 
 /// The repository every request below addresses — `build-crate.yml` runs
@@ -145,19 +147,39 @@ pub async fn get_url_json<T: serde::de::DeserializeOwned>(
         .map_err(|error| stow_error!("read {url}: {error}"))
 }
 
+/// The wall clock in epoch seconds — read at the call site so
+/// [`rate_limit`] itself stays clock-free, and a test scripts its own
+/// reset instead of the suite waiting a wall-clock hour.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Warn once per rate-limit wait: the URL, the wait, and the
+/// `x-ratelimit-reset` epoch the answer carried, when it carried one.
+fn warn_rate_limit(url: &str, wait: Duration, reset: Option<i64>) {
+    tracing::warn!(url, wait = ?wait, reset = ?reset, "rate-limited; waiting for the reset");
+}
+
 /// `GET` `url`, retried on transport errors and transient statuses by
 /// the caller's [`Backoff`]; `Authorization` rides the request only
 /// when `token` is `Some`. zenwave delivers an error status as `Err`,
 /// the response inside it — a terminal status is its error without
 /// another attempt, a transient one carries its `Retry-After` hint into
 /// the wait, and a failure that outlives the budget returns as its
-/// final error. The retried unit is the whole read — request, status
+/// final error. A rate-limited answer is neither: it is GitHub naming
+/// when to come back, so its wait — `Retry-After`, or until
+/// `x-ratelimit-reset` — is slept in full and the attempt never spends
+/// the budget. The retried unit is the whole read — request, status
 /// and body: the body is read to completion inside the loop, so a
 /// connection cut mid-body retries like any other transport failure,
 /// and what leaves the loop is a response whose body is already in
 /// memory — a complete body that does not parse is terminal, never a
 /// retry.
-async fn send_get(
+pub async fn send_get(
     token: Option<&str>,
     url: &str,
     accept: Option<&str>,
@@ -179,31 +201,48 @@ async fn send_get(
             None => request,
         };
         let (error, retry_after) = match request.await {
-            Ok(response) if !is_transient_status(response.status().as_u16()) => {
-                // A response cut while its body streams is the same
-                // transport failure a cut request is — buffer the body
-                // inside the loop so the retry covers it, and rebuild
-                // the response over the complete bytes so nothing the
-                // caller reads can still meet the wire.
-                let (parts, body) = response.into_parts();
-                match body.into_bytes().await {
-                    Ok(bytes) => {
-                        return Ok(zenwave::Response::from_parts(
-                            parts,
-                            zenwave::Body::from(bytes),
-                        ));
-                    }
-                    Err(error) => (zenwave::Error::BodyParse(error), None),
-                }
-            }
             Ok(response) => {
-                let retry_after = retry_after_hint(response.headers());
-                match response.error_for_status().await {
-                    Ok(response) => return Ok(response),
-                    Err(error) => (error, retry_after),
+                if let Some(RateLimit::Wait { wait, reset }) =
+                    rate_limit(response.status().as_u16(), response.headers(), unix_now())
+                {
+                    warn_rate_limit(url, wait, reset);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                if is_transient_status(response.status().as_u16()) {
+                    let retry_after = retry_after_hint(response.headers());
+                    match response.error_for_status().await {
+                        Ok(response) => return Ok(response),
+                        Err(error) => (error, retry_after),
+                    }
+                } else {
+                    // A response cut while its body streams is the same
+                    // transport failure a cut request is — buffer the body
+                    // inside the loop so the retry covers it, and rebuild
+                    // the response over the complete bytes so nothing the
+                    // caller reads can still meet the wire.
+                    let (parts, body) = response.into_parts();
+                    match body.into_bytes().await {
+                        Ok(bytes) => {
+                            return Ok(zenwave::Response::from_parts(
+                                parts,
+                                zenwave::Body::from(bytes),
+                            ));
+                        }
+                        Err(error) => (zenwave::Error::BodyParse(error), None),
+                    }
                 }
             }
             Err(error) => {
+                if let Some(RateLimit::Wait { wait, reset }) =
+                    error.response().and_then(|response| {
+                        rate_limit(response.status().as_u16(), response.headers(), unix_now())
+                    })
+                {
+                    warn_rate_limit(url, wait, reset);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 let http = error.response().map(|response| {
                     (
                         response.status().as_u16(),
@@ -256,12 +295,15 @@ pub enum WriteFailure {
     /// GitHub answered with a status that is neither a rate limit nor
     /// 5xx — the write did not happen and repeating it is pointless.
     Refused(String),
-    /// A 429, or a 403 carrying `Retry-After`: the write did not
-    /// happen, and the hint is the answer's own wait.
+    /// A rate-limit answer per [`rate_limit`] — a 429, a 403 carrying
+    /// `Retry-After`, or a 403/429 whose `x-ratelimit-remaining` is `0`:
+    /// the write did not happen, and the hint is the wait the answer
+    /// named, when it named one.
     RateLimited {
         /// The rendered failure, context included.
         message: String,
-        /// The answer's `Retry-After` hint, when it carried one.
+        /// The answer's own wait — `Retry-After`, or until
+        /// `x-ratelimit-reset` — when it carried one.
         hint: Option<Duration>,
     },
     /// A 5xx, or a transport failure from the send or the response-body
@@ -270,8 +312,9 @@ pub enum WriteFailure {
 }
 
 impl WriteFailure {
-    /// The `Retry-After` hint a rate-limited answer carried — `None`
-    /// for every other kind and for a hintless 429.
+    /// The wait a rate-limited answer named — `Retry-After`, or the
+    /// reset-derived wait — `None` for every other kind and for a
+    /// hintless 429.
     #[must_use]
     pub const fn hint(&self) -> Option<Duration> {
         match self {
@@ -294,35 +337,29 @@ impl std::fmt::Display for WriteFailure {
 
 impl std::error::Error for WriteFailure {}
 
-/// Whether an answered status is GitHub's rate limit rather than the
-/// request's own verdict: a 429 outright, or a 403 carrying
-/// `Retry-After` — what GitHub's secondary rate limits send on writes,
-/// and the same answer [`send_get`] waits out under its hint.
-fn rate_limited_answer(response: &zenwave::Response) -> bool {
-    let status = response.status().as_u16();
-    status == 429 || (status == 403 && retry_after_hint(response.headers()).is_some())
-}
-
 /// Classify a write's failure answer for the caller's
 /// resolve-then-resend decision — `pub` for the local dispatch arm in
 /// `manual`, which speaks to the mock server over the same zenwave
 /// path. `context` is the `"{method} {url}"` prefix the message
-/// renders with.
+/// renders with. Rate-limit answers classify through [`rate_limit`],
+/// the same decision [`send_get`] waits out on reads.
 pub fn classify_write(context: &str, error: &zenwave::Error) -> WriteFailure {
     let message = format!("{context}: {error}");
     let Some(response) = error.response() else {
         return WriteFailure::Ambiguous(message);
     };
     let status = response.status().as_u16();
-    if rate_limited_answer(response) {
-        WriteFailure::RateLimited {
+    match rate_limit(status, response.headers(), unix_now()) {
+        Some(RateLimit::Wait { wait, .. }) => WriteFailure::RateLimited {
             message,
-            hint: retry_after_hint(response.headers()),
-        }
-    } else if status >= 500 {
-        WriteFailure::Ambiguous(message)
-    } else {
-        WriteFailure::Refused(message)
+            hint: Some(wait),
+        },
+        Some(RateLimit::Unstated) => WriteFailure::RateLimited {
+            message,
+            hint: None,
+        },
+        None if status >= 500 => WriteFailure::Ambiguous(message),
+        None => WriteFailure::Refused(message),
     }
 }
 
@@ -443,31 +480,42 @@ pub async fn delete(token: &str, path: &str) -> stow_types::error::Result<()> {
 }
 
 /// `delete` at a resolved URL — production passes an
-/// [`API_BASE`]-rooted path, tests an owned loopback URL.
+/// [`API_BASE`]-rooted path, tests an owned loopback URL. A rate-limited
+/// answer is a settled "not yet" — the delete provably did not happen,
+/// so the wait the answer named is slept and the ask resent, the same
+/// classification the reads wait out.
 async fn delete_url(token: &str, url: &str) -> stow_types::error::Result<()> {
-    let mut client = zenwave::client();
-    let result = client
-        .delete(url)
-        .map_err(|error| stow_error!("build DELETE {url}: {error}"))?
-        .header("Authorization", format!("Bearer {token}"))
-        .and_then(|request| request.header("User-Agent", USER_AGENT))
-        .and_then(|request| request.header("Accept", "application/vnd.github+json"))
-        .map_err(|error| stow_error!("build DELETE {url}: {error}"))?
-        .await;
-    // zenwave lifts 4xx/5xx into `Err(Error::Http)` at `.await` — the
-    // 404 the doc promises lands there, not in a response branch.
-    let error = match result {
-        Ok(response) => match response.error_for_status().await {
-            Ok(_) => return Ok(()),
+    loop {
+        let mut client = zenwave::client();
+        let result = client
+            .delete(url)
+            .map_err(|error| stow_error!("build DELETE {url}: {error}"))?
+            .header("Authorization", format!("Bearer {token}"))
+            .and_then(|request| request.header("User-Agent", USER_AGENT))
+            .and_then(|request| request.header("Accept", "application/vnd.github+json"))
+            .map_err(|error| stow_error!("build DELETE {url}: {error}"))?
+            .await;
+        // zenwave lifts 4xx/5xx into `Err(Error::Http)` at `.await` —
+        // the 404 the doc promises lands there, not in a response branch.
+        let error = match result {
+            Ok(response) => match response.error_for_status().await {
+                Ok(_) => return Ok(()),
+                Err(error) => error,
+            },
             Err(error) => error,
-        },
-        Err(error) => error,
-    };
-    if matches!(error, zenwave::Error::Http { status, .. } if status == zenwave::StatusCode::NOT_FOUND)
-    {
-        Ok(())
-    } else {
-        Err(stow_error!("DELETE {url}: {error}"))
+        };
+        if matches!(error, zenwave::Error::Http { status, .. } if status == zenwave::StatusCode::NOT_FOUND)
+        {
+            return Ok(());
+        }
+        if let Some(RateLimit::Wait { wait, reset }) = error.response().and_then(|response| {
+            rate_limit(response.status().as_u16(), response.headers(), unix_now())
+        }) {
+            warn_rate_limit(url, wait, reset);
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        return Err(classify_write(&format!("DELETE {url}"), &error).into());
     }
 }
 
@@ -1126,6 +1174,75 @@ mod url_json_tests {
         assert_eq!(heads.len(), 1);
     }
 
+    /// A 403 without rate-limit markers is the answer, not the limit —
+    /// terminal, never retried.
+    #[tokio::test]
+    async fn get_url_json_does_not_retry_a_plain_403() {
+        let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+            status: 403,
+            retry_after: None,
+            body: r#"{"message":"forbidden"}"#,
+        }])
+        .await;
+        let result: stow_types::error::Result<serde_json::Value> =
+            get_url_json(&server.url, None, Backoff::new()).await;
+        assert!(result.is_err());
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
+    }
+
+    /// GitHub's primary rate limit — a 403 with `x-ratelimit-remaining: 0`
+    /// and a near `x-ratelimit-reset` — is the server naming when to come
+    /// back, not the request's failure: the read waits out the reset and
+    /// retries, and the wait never spends the attempt budget — three
+    /// 503s after it still fit inside `Backoff::new`'s three retries.
+    #[tokio::test]
+    async fn get_url_json_waits_out_the_primary_limit_without_spending_budget() {
+        let server = test_server::Loopback::start(vec![
+            test_server::Step::RateLimited {
+                status: 403,
+                reset_in: 1,
+                body: "{}",
+            },
+            test_server::Step::Respond {
+                status: 503,
+                retry_after: None,
+                body: "{}",
+            },
+            test_server::Step::Respond {
+                status: 503,
+                retry_after: None,
+                body: "{}",
+            },
+            test_server::Step::Respond {
+                status: 503,
+                retry_after: None,
+                body: "{}",
+            },
+            test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            },
+        ])
+        .await;
+        let started = std::time::Instant::now();
+        let body: serde_json::Value = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            get_url_json(&server.url, None, Backoff::new()),
+        )
+        .await
+        .expect("the limited read completes inside the bound")
+        .expect("the reset is waited out and the read retries");
+        assert_eq!(body["ok"], true);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "the reset wait was honored"
+        );
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 5);
+    }
+
     /// A `200` whose body the connection cuts mid-read is the same
     /// transport failure a dropped request is — the retried unit is the
     /// whole read, so the second attempt answers the parsed value.
@@ -1381,6 +1498,53 @@ mod write_tests {
             let heads = server.join().await;
             assert_eq!(heads.len(), 1);
         }
+    }
+
+    /// GitHub's primary limit on a write — a 403 with
+    /// `x-ratelimit-remaining: 0` and a `x-ratelimit-reset` — is
+    /// `RateLimited` whose hint is the reset-derived wait, so the
+    /// wave's write gate pauses sends for the answer's own duration.
+    #[tokio::test]
+    async fn a_primary_limit_answer_is_rate_limited_with_the_reset_hint() {
+        let server = test_server::Loopback::start(vec![test_server::Step::RateLimited {
+            status: 403,
+            reset_in: 30,
+            body: "{}",
+        }])
+        .await;
+        let result = write(&server.url).await;
+        match result {
+            Err(WriteFailure::RateLimited {
+                hint: Some(hint), ..
+            }) => {
+                assert!(
+                    (28..=33).contains(&hint.as_secs()),
+                    "the hint is the reset-derived wait, got {hint:?}"
+                );
+            }
+            other => panic!("a primary-limit 403 must classify rate-limited, got {other:?}"),
+        }
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
+    }
+
+    /// A bare 429 stays rate-limited but names no wait — the hint is
+    /// `None` and the caller's own budget paces the resend.
+    #[tokio::test]
+    async fn a_bare_429_is_rate_limited_without_a_hint() {
+        let server = test_server::Loopback::start(vec![test_server::Step::Respond {
+            status: 429,
+            retry_after: None,
+            body: "{}",
+        }])
+        .await;
+        let result = write(&server.url).await;
+        match result {
+            Err(WriteFailure::RateLimited { hint: None, .. }) => {}
+            other => panic!("a bare 429 must classify rate-limited hintless, got {other:?}"),
+        }
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 1);
     }
 
     /// A connection closed before any answer is the ambiguous case the

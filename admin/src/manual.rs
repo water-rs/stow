@@ -200,6 +200,20 @@ struct WriteGate {
     next_at: Option<tokio::time::Instant>,
 }
 
+/// The wait a failed write asks for: a rate limit's own stated wait is
+/// honored in full — the write provably did not happen, and a rate
+/// limit is not an unanswered write that spends the outage budget —
+/// while every other unsettled answer asks the budget for its next
+/// wait.
+fn write_hold(backoff: &mut Backoff, failure: &WriteFailure) -> Option<std::time::Duration> {
+    match failure {
+        WriteFailure::RateLimited {
+            hint: Some(wait), ..
+        } => Some(*wait),
+        _ => backoff.next_wait(failure.hint()),
+    }
+}
+
 impl WriteGate {
     const fn new() -> Self {
         Self {
@@ -219,12 +233,12 @@ impl WriteGate {
         *self = Self::new();
     }
 
-    /// A write whose answer settled nothing asks the budget for the
-    /// next wait: `Some` pauses sends until it elapses, `None` is the
+    /// A write whose answer settled nothing takes [`write_hold`]'s
+    /// wait: `Some` pauses sends until it elapses, `None` is the
     /// wave's error — GitHub writes stayed unanswerable past the
     /// outage bound.
     fn hold(&mut self, failure: &WriteFailure) -> stow_types::error::Result<()> {
-        match self.backoff.next_wait(failure.hint()) {
+        match write_hold(&mut self.backoff, failure) {
             Some(wait) => {
                 self.next_at = Some(tokio::time::Instant::now() + wait);
                 tracing::warn!(%failure, wait = ?wait, "GitHub write unanswered; writes paused");
@@ -1999,7 +2013,7 @@ async fn publish_and_wait(
                     Ok(()) => break,
                     Err(failure @ WriteFailure::Refused(_)) => return Err(failure.into()),
                     Err(failure) => {
-                        let Some(wait) = backoff.next_wait(failure.hint()) else {
+                        let Some(wait) = write_hold(&mut backoff, &failure) else {
                             return Err(stow_error!(
                                 "index-publish dispatch stayed unanswerable for the outage bound: {failure}"
                             ));
@@ -2701,6 +2715,37 @@ mod tests {
 
     /// `main`'s sha in the test fixtures.
     const MAIN_HEAD: &str = "1111111111111111111111111111111111111111";
+
+    /// A rate limit's own stated wait closes the write gate for exactly
+    /// that duration — past the retry-after ceiling and outside the
+    /// outage budget, so an ambiguous answer right after it still gets
+    /// the budget's first wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limit_hold_keeps_its_stated_wait_outside_the_budget() {
+        let mut gate = WriteGate::new();
+        let wait = std::time::Duration::from_mins(40);
+        gate.hold(&WriteFailure::RateLimited {
+            message: "limited".to_owned(),
+            hint: Some(wait),
+        })
+        .expect("a stated wait always holds");
+        assert!(!gate.open());
+        tokio::time::advance(
+            wait.checked_sub(std::time::Duration::from_secs(1))
+                .expect("the hold is longer than a second"),
+        )
+        .await;
+        assert!(!gate.open(), "the gate holds the whole stated wait");
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert!(gate.open());
+        // The outage budget never saw the hold: the next unsettled
+        // answer still gets the first doubling wait.
+        gate.hold(&WriteFailure::Ambiguous("unknown".to_owned()))
+            .expect("the budget is intact");
+        assert!(!gate.open());
+        tokio::time::advance(std::time::Duration::from_millis(600)).await;
+        assert!(gate.open(), "the ambiguous hold was the first-budget wait");
+    }
 
     /// stow#558: `preheat manual --projects` accepts `--source-trees`;
     /// without `--projects` it is a clap error before any file is read.
