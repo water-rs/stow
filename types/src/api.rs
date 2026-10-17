@@ -789,6 +789,19 @@ pub struct AdmissionRequest {
     pub expanded_entries: Vec<ResolvedDependencyGraphEntry>,
 }
 
+/// How `-` is spelled inside a record id's segment: `_`.
+///
+/// `-` is the segment separator, so a value's own dashes are written
+/// `_`. Task ids ([`task_id_prefix`]) spell target and rustc this way,
+/// request ids ([`request_id`]) spell rustc this way; the segment
+/// cannot be decoded by reversing the spelling because a value may
+/// itself carry `_` (`x86_64`), so readers match a known set against
+/// this encoding.
+#[must_use]
+pub fn task_id_segment(value: &str) -> String {
+    value.replace('-', "_")
+}
+
 /// The `<crate>-<version>-<features hash>-<target>-<rustc>` prefix every
 /// task id shares — [`crate::task_graph::TaskNodeIdentity::task_id`]
 /// inserts the `-d<dependency digest>` segment and appends `-host` —
@@ -806,8 +819,8 @@ pub(crate) fn task_id_prefix(
         crate_name,
         version,
         features_hash,
-        target.replace('-', "_"),
-        rustc_version.replace('-', "_")
+        task_id_segment(target),
+        task_id_segment(rustc_version)
     )
 }
 
@@ -1396,7 +1409,7 @@ pub fn request_id(
         crate_name,
         version,
         features_hash,
-        rustc_version.replace('-', "_")
+        task_id_segment(rustc_version)
     )
 }
 

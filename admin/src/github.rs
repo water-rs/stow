@@ -17,6 +17,15 @@ use zenwave::{Client, ResponseExt};
 pub const REPO: &str = "water-rs/stow";
 
 pub const API_BASE: &str = "https://api.github.com";
+/// The clock allowance between this machine and GitHub: a dispatch's
+/// wall time minus this is both a run-listing `created` window start and
+/// the floor a candidate run's own `created_at` must clear — GitHub's
+/// clock may trail ours by this much before a run the dispatch created
+/// reads as older than its own attempt. The jobs-page settle comparison
+/// in `runs::classify_failure` grants it toward the deferral so
+/// local-versus-GitHub skew can never read a just-completed job as a
+/// lost runner.
+pub const GITHUB_CLOCK_ALLOWANCE: time::Duration = time::Duration::seconds(60);
 pub const USER_AGENT: &str = "stow-admin";
 /// Workflow file whose runs `runs failures` inspects.
 pub const BUILD_WORKFLOW: &str = "build-crate.yml";
