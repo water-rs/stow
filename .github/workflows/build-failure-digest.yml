@@ -1,0 +1,78 @@
+name: Build failure digest
+
+# The daily digest of failed `build-crate.yml` runs (stow#778): every
+# day at 13:00 UTC it lists the runs that completed `failure` in the
+# previous 24 hours, classifies each by the step it failed in (the
+# manual driver's verdict/infrastructure classes), and posts one
+# comment on the `Daily failed builds` incident issue. A clean window
+# sends nothing and closes that issue when it is open. Unlike the
+# watchdog's alerts it keeps only the issue channel — no mail
+# (AGENTS.md's exception).
+#
+# The job fails only when the issue channel failed; a window full of
+# failed builds is a normal exit.
+on:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the digest; read and write no issue.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  # Read the build-crate runs, their jobs and job logs.
+  actions: read
+  # Open, comment and close the `Daily failed builds` incident issue.
+  issues: write
+  contents: read
+  # Pull the signed toolchain artifact from ghcr.io/water-rs/stow-toolchain.
+  packages: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # stow-admin is the toolchain artifact toolchain-publish.yml
+      # builds and cosign-signs once per platform on main's merge queue
+      # (stow#431) — a cron cannot afford a Rust build. The workflow
+      # runs from the default branch, whose own sha has no toolchain:
+      # main's head does, so resolve it and pull that sha's artifact.
+      # The action fails the step if the artifact is absent or the
+      # signature does not verify; there is no compile fallback.
+      - name: Resolve main's head
+        id: main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" \
+            >> "$GITHUB_OUTPUT"
+      # A local action resolves from the workspace, so its directory has
+      # to be checked out; nothing else in the tree is needed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - name: stow-admin from the signed toolchain
+        uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ steps.main.outputs.sha }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          stow-admin builds digest "${args[@]}"

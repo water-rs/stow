@@ -9,6 +9,7 @@
 //! stdout writers are the final renderers in `render.rs`.
 
 mod artifacts;
+mod builds;
 mod cache;
 mod cloudflare;
 mod coverage;
@@ -101,6 +102,8 @@ enum Command {
     Preheat(preheat::PreheatArgs),
     /// Inspect GitHub Actions build runs.
     Runs(runs::RunsArgs),
+    /// The daily failed-build digest (stow#778).
+    Builds(builds::BuildsArgs),
     /// Inspect and prune the artifact catalog.
     Artifacts(artifacts::ArtifactsArgs),
     /// GitHub Actions cache usage and eviction.
@@ -233,6 +236,7 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         Command::Coverage(args) => coverage::run(&Edge::connect().await?, args, output).await,
         Command::Preheat(args) => preheat::run(args, output).await,
         Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
+        Command::Builds(args) => builds::run(&github_token().await?, args, output).await,
         Command::Artifacts(args) => artifacts::run(&Edge::connect().await?, args, output).await,
         Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
         Command::Maintenance(args) => maintenance::run(args, output).await,
@@ -356,17 +360,26 @@ impl Edge {
 
     /// `POST` a JSON body to an edge path — the one transport every
     /// JSON/unit/stream caller shares: bearer + version header +
-    /// timeout + status guard. The caller owns the 2xx response's
-    /// decode, drain, or unbuffered stream.
-    async fn post_response<B: serde::Serialize + Sync>(
+    /// timeout. The nested result keeps the send's typed outcome
+    /// intact — the backend lifts a non-2xx into
+    /// `Err(zenwave::Error::Http)` — so a caller can match a refusal's
+    /// status itself; the outer `Err` covers build/auth failures.
+    async fn post_send<B: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &B,
         timeout: Duration,
-    ) -> stow_types::error::Result<zenwave::Response> {
+    ) -> stow_types::error::Result<std::result::Result<zenwave::Response, zenwave::Error>> {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
-        let mut client = zenwave::client().timeout(timeout);
+        // The timeout middleware is stacked by hand — `Client::timeout`
+        // hides it behind `impl Client`'s associated `Error`, and the
+        // send's `MiddlewareError` must stay matchable for the typed
+        // outcome this function returns.
+        let mut client = zenwave::endpoint::WithMiddleware::new(
+            zenwave::client(),
+            zenwave::Timeout::new(timeout),
+        );
         let request = client
             .post(&url)
             .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
@@ -376,13 +389,46 @@ impl Edge {
             })
             .and_then(|request| request.json_body(body))
             .map_err(|error| stow_error!("POST {url}: {error}"))?;
-        let response = request
-            .await
-            .map_err(|error| stow_error!("POST {url}: {error}"))?;
-        response
+        // The timeout middleware wraps the endpoint's `zenwave::Error`
+        // in `MiddlewareError`; the send's outcome stays typed either
+        // way — the endpoint half verbatim, the timeout as
+        // `Error::Timeout`, the same variant zenwave maps it to.
+        Ok(request.await.map_err(|error| match error {
+            zenwave::middleware::MiddlewareError::Endpoint(error) => error,
+            zenwave::middleware::MiddlewareError::Middleware(error) => error.into(),
+        }))
+    }
+
+    /// [`post_send`](Self::post_send) plus the 2xx status guard most
+    /// callers want. The caller owns the 2xx response's decode, drain,
+    /// or unbuffered stream.
+    async fn post_response<B: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> stow_types::error::Result<zenwave::Response> {
+        let url = format!("{}{path}", self.base);
+        self.post_send(path, body, timeout)
+            .await?
+            .map_err(|error| stow_error!("POST {url}: {error}"))?
             .error_for_status()
             .await
             .map_err(|error| stow_error!("POST {url}: {error}"))
+    }
+
+    /// `POST` a JSON body and answer the send's own result — no status
+    /// guard, so `index report`'s 409 → full-report resync matches the
+    /// refusal's typed code instead of a flattened error. The outer
+    /// `Err` covers build/auth failures; an `Err` inside is the
+    /// backend's `zenwave::Error::Http` carrying the response's status
+    /// and body.
+    pub(crate) async fn post_unchecked<B: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> stow_types::error::Result<std::result::Result<zenwave::Response, zenwave::Error>> {
+        self.post_send(path, body, REQUEST_TIMEOUT).await
     }
 
     /// [`post_json`](Self::post_json) at an explicit bound — for the

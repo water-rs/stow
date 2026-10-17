@@ -38,8 +38,9 @@ use stow_types::trusted_builder::{
 };
 use zenwave::{Client, ResponseExt};
 
-use crate::github::{WriteFailure, classify_write};
+use crate::github::{GITHUB_CLOCK_ALLOWANCE, WriteFailure, classify_write};
 use crate::render::{self, Output};
+use crate::runs::{RunFailure, RunJobsPage, classify_failure};
 
 /// The build-crate runs poll cadence.
 const RUN_POLL_SECONDS: u64 = 30;
@@ -51,12 +52,6 @@ const PUBLISH_TIMEOUT_MINUTES: u64 = 120;
 /// GitHub may take a few seconds to materialize a dispatched run — a
 /// task whose run does not appear inside this window is a real error.
 const RUN_GRACE_MINUTES: u64 = 10;
-/// The clock allowance between this machine and GitHub: a dispatch's
-/// wall time minus this is both the resolution listing's `created`
-/// window start and the floor a candidate run's own `created_at` must
-/// clear — GitHub's clock may trail ours by this much before a run the
-/// dispatch created reads as older than its own attempt.
-const GITHUB_CLOCK_ALLOWANCE: time::Duration = time::Duration::seconds(60);
 /// The index slices ride this workflow's dispatch.
 const INDEX_PUBLISH_WORKFLOW: &str = "index-publish.yml";
 /// Concurrent slice pulls while reading coverage — `CI_TARGET_TRIPLES`
@@ -72,26 +67,6 @@ const ADOPT_SINCE_DEFAULT_HOURS: i64 = 24;
 /// observed at this count is the node's verdict even when its step
 /// is infrastructure.
 const MAX_RUN_ATTEMPTS: u64 = 3;
-/// The `build-crate.yml` step names whose failure is the crate's
-/// verdict — the steps that run the crate or judge its outputs; every
-/// other step is runner setup, toolchain install or artifact transfer.
-/// Step names are the contract: keep them in sync with
-/// `.github/workflows/build-crate.yml`.
-const VERDICT_STEPS: &[&str] = &[
-    "Run the untrusted build stage",
-    "Report the built outputs' glibc floor",
-    "Run the trusted publish stage",
-];
-/// How long a completed failed job's step rows may take to finish
-/// writing before the page stops being mid-settle and becomes the
-/// lost-runner shape: a run reaching `completed` writes its step rows
-/// within seconds of the job's own `completed_at`, while a runner that
-/// drops communication leaves `in_progress`/`pending` step rows behind
-/// forever (runs 38919684562 and 38410583752 — "The hosted runner lost
-/// communication with the server"). Two minutes is far past every
-/// observed settle, so after the window an unsettled failed job is the
-/// lost-runner case and classifies `Infrastructure`.
-const STEP_SETTLE_WINDOW: time::Duration = time::Duration::minutes(2);
 
 /// `stow-admin preheat manual` arguments.
 #[derive(Debug, Args)]
@@ -1395,105 +1370,6 @@ fn bind_node(node: &mut NodeRun, state: &RunState) {
     node.latest = Some(state.clone());
 }
 
-/// A completed run's non-success conclusion, classified by which step
-/// failed: `Verdict` is the crate's own outcome and the node fails as
-/// always; `Infrastructure` names the failed job and step — runner
-/// setup, toolchain install or artifact transfer — and earns a rerun
-/// of the run's failed jobs instead of the node's verdict. A jobs
-/// page read mid-settle is not a class at all — `classify_failure`
-/// holds it unsettled until the failed job's step rows finish writing
-/// or outlive [`STEP_SETTLE_WINDOW`], past which they name where the
-/// runner was lost.
-enum FailureClass {
-    Verdict,
-    Infrastructure {
-        /// The failed job's name — for the warn log and the report.
-        job: String,
-        /// Its first failed step — `None` when the runner was lost
-        /// before any step ran (a cancelled setup, a dropped runner).
-        step: Option<String>,
-    },
-}
-
-/// A job or step row has settled once GitHub reports it `completed` —
-/// a run's own `completed` arrives while its job rows still read
-/// `queued`/`in_progress`/`waiting` and the failed job's steps the
-/// same, so every other value is a page still being written.
-fn row_completed(status: &str) -> bool {
-    status == "completed"
-}
-
-/// Classify a completed failed run by its jobs as of `now`: the first
-/// failed job's first failed step decides — a `VERDICT_STEPS` step is
-/// the crate's verdict and anything else is infrastructure. A failed
-/// job with no failed step (the runner died mid-job) and a failed run
-/// with no failed job at all (`startup_failure` — no runner ever took
-/// it) are infrastructure too.
-///
-/// `None` is "no answer yet", not a class: GitHub lets a run reach
-/// `completed` before its job and step rows do, and a page read
-/// mid-settle shows the failed job without its failed step — the
-/// lost-runner shape — so a verdict would misclassify as
-/// infrastructure and earn a rerun GitHub then refuses (stow#765). A
-/// job still not `completed` defers unconditionally; a failed job
-/// whose step rows are unsettled defers only inside
-/// [`STEP_SETTLE_WINDOW`] of its own `completed_at` — past the window
-/// the first unsettled step is where the runner was lost, and the
-/// class is `Infrastructure` naming it. `now` is the caller's clock:
-/// the comparison grants [`GITHUB_CLOCK_ALLOWANCE`] toward the
-/// deferral so local-versus-GitHub skew can never read a
-/// just-completed job as a lost runner.
-fn classify_failure(
-    jobs: &[RunJobRow],
-    now: time::OffsetDateTime,
-) -> stow_types::error::Result<Option<FailureClass>> {
-    if jobs.iter().any(|job| !row_completed(&job.status)) {
-        return Ok(None);
-    }
-    let Some(job) = jobs
-        .iter()
-        .find(|job| job.conclusion.as_deref() == Some("failure"))
-    else {
-        return Ok(Some(FailureClass::Infrastructure {
-            job: "-".to_owned(),
-            step: None,
-        }));
-    };
-    if let Some(step) = job.steps.iter().find(|step| !row_completed(&step.status)) {
-        let Some(completed_at) = job.completed_at else {
-            return Err(stow_error!(
-                "jobs page: completed job {:?} carries no completed_at",
-                job.name
-            ));
-        };
-        if now - completed_at < STEP_SETTLE_WINDOW + GITHUB_CLOCK_ALLOWANCE {
-            return Ok(None);
-        }
-        return Ok(Some(FailureClass::Infrastructure {
-            job: job.name.clone(),
-            step: Some(step.name.clone()),
-        }));
-    }
-    let Some(step) = job
-        .steps
-        .iter()
-        .find(|step| step.conclusion.as_deref() == Some("failure"))
-    else {
-        return Ok(Some(FailureClass::Infrastructure {
-            job: job.name.clone(),
-            step: None,
-        }));
-    };
-    if VERDICT_STEPS.contains(&step.name.as_str()) {
-        Ok(Some(FailureClass::Verdict))
-    } else {
-        Ok(Some(FailureClass::Infrastructure {
-            job: job.name.clone(),
-            step: Some(step.name.clone()),
-        }))
-    }
-}
-
 /// One infrastructure rerun for the finish report: the run, the job
 /// and step it failed in, and the attempt the rerun runs as — the
 /// failed attempt's `run_attempt` + 1.
@@ -2275,7 +2151,7 @@ impl Dispatch {
         let Some(class) = classify_failure(&page.jobs, time::OffsetDateTime::now_utc())? else {
             return Ok(Classified::Unsettled);
         };
-        let FailureClass::Infrastructure { job, step } = class else {
+        let RunFailure::Infrastructure { job, step } = class else {
             return Ok(Classified::Verdict);
         };
         match crate::github::post_empty(
@@ -2617,39 +2493,6 @@ struct WorkflowRunRow {
     created_at: time::OffsetDateTime,
 }
 
-/// `GET actions/runs/{id}/jobs` — the fields failure classification
-/// needs: each job's status and conclusion and its steps'. The
-/// endpoint serves the latest attempt's jobs by default, exactly the
-/// attempt the run's `run_attempt` names.
-#[derive(serde::Deserialize)]
-struct RunJobsPage {
-    jobs: Vec<RunJobRow>,
-}
-
-#[derive(serde::Deserialize)]
-struct RunJobRow {
-    name: String,
-    /// `queued`/`in_progress`/`completed`/`waiting`/`pending` as
-    /// GitHub serves it — a run's `completed` arrives while its job
-    /// rows are still settling, so classification reads it.
-    status: String,
-    conclusion: Option<String>,
-    /// GitHub's completion time — null until the job finishes. The
-    /// lost-runner rule measures the failed job's unsettled step rows
-    /// as [`STEP_SETTLE_WINDOW`] past it.
-    #[serde(with = "time::serde::rfc3339::option")]
-    completed_at: Option<time::OffsetDateTime>,
-    steps: Vec<RunStepRow>,
-}
-
-#[derive(serde::Deserialize)]
-struct RunStepRow {
-    name: String,
-    /// The same settle contract the job row's `status` carries.
-    status: String,
-    conclusion: Option<String>,
-}
-
 impl crate::github::RunRow for WorkflowRunRow {
     fn run_id(&self) -> u64 {
         self.id
@@ -2690,6 +2533,7 @@ struct LocalTaskRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runs::{RunJobRow, RunStepRow, VERDICT_STEPS};
     use clap::Parser;
 
     /// Fold one already-classified run state: a `Some` record means the
@@ -3501,6 +3345,7 @@ mod tests {
         steps: &[(&str, &str, Option<&str>)],
     ) -> RunJobRow {
         RunJobRow {
+            id: 0,
             name: name.to_owned(),
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
@@ -3531,7 +3376,7 @@ mod tests {
             assert!(
                 matches!(
                     classify_failure(&jobs, at(1_000_100)),
-                    Ok(Some(FailureClass::Verdict))
+                    Ok(Some(RunFailure::Verdict { .. }))
                 ),
                 "{step} is the crate's verdict"
             );
@@ -3551,7 +3396,7 @@ mod tests {
             Some(1_000_000),
             &[(TOOLCHAIN_STEP, "completed", Some("failure"))],
         )];
-        let Ok(Some(FailureClass::Infrastructure { job, step })) =
+        let Ok(Some(RunFailure::Infrastructure { job, step })) =
             classify_failure(&jobs, at(1_000_100))
         else {
             panic!("a toolchain-install failure is infrastructure");
@@ -3575,11 +3420,11 @@ mod tests {
         )];
         assert!(matches!(
             classify_failure(&jobs, at(1_000_100)),
-            Ok(Some(FailureClass::Infrastructure { step: None, .. }))
+            Ok(Some(RunFailure::Infrastructure { step: None, .. }))
         ));
         assert!(matches!(
             classify_failure(&[], at(1_000_100)),
-            Ok(Some(FailureClass::Infrastructure { step: None, .. }))
+            Ok(Some(RunFailure::Infrastructure { step: None, .. }))
         ));
     }
 
@@ -3604,7 +3449,7 @@ mod tests {
         )];
         assert!(matches!(
             classify_failure(&jobs, at(1_000_100)),
-            Ok(Some(FailureClass::Verdict))
+            Ok(Some(RunFailure::Verdict { .. }))
         ));
     }
 
@@ -3658,7 +3503,7 @@ mod tests {
                 ],
             ),
         ];
-        let Ok(Some(FailureClass::Infrastructure { job, step })) =
+        let Ok(Some(RunFailure::Infrastructure { job, step })) =
             classify_failure(&jobs, at(1_000_000))
         else {
             panic!("a lost runner is infrastructure");
@@ -3899,11 +3744,14 @@ mod tests {
         assert_eq!(runs[0].workflow_run_id, 7);
         let heads = server.join().await;
         assert_eq!(heads.len(), 2);
-        for head in &heads {
+        for request in &heads {
             assert!(
-                !head.headers.contains_key(http::header::AUTHORIZATION),
+                !request
+                    .head
+                    .headers
+                    .contains_key(http::header::AUTHORIZATION),
                 "the local read must not send an Authorization header: {:?}",
-                head.headers
+                request.head.headers
             );
         }
     }

@@ -17,6 +17,15 @@ use zenwave::{Client, ResponseExt};
 pub const REPO: &str = "water-rs/stow";
 
 pub const API_BASE: &str = "https://api.github.com";
+/// The clock allowance between this machine and GitHub: a dispatch's
+/// wall time minus this is both a run-listing `created` window start and
+/// the floor a candidate run's own `created_at` must clear — GitHub's
+/// clock may trail ours by this much before a run the dispatch created
+/// reads as older than its own attempt. The jobs-page settle comparison
+/// in `runs::classify_failure` grants it toward the deferral so
+/// local-versus-GitHub skew can never read a just-completed job as a
+/// lost runner.
+pub const GITHUB_CLOCK_ALLOWANCE: time::Duration = time::Duration::seconds(60);
 pub const USER_AGENT: &str = "stow-admin";
 /// Workflow file whose runs `runs failures` inspects.
 pub const BUILD_WORKFLOW: &str = "build-crate.yml";
@@ -1395,9 +1404,10 @@ mod send_get_tests {
         let heads = server.join().await;
         let response = result.expect("a 304 without Location is a response, not a redirect error");
         assert_eq!(heads.len(), 1);
-        assert_eq!(heads[0].method, http::Method::GET);
+        assert_eq!(heads[0].head.method, http::Method::GET);
         assert_eq!(
             heads[0]
+                .head
                 .headers
                 .get(http::header::IF_NONE_MATCH)
                 .expect("the validator rides the request"),
@@ -1560,7 +1570,7 @@ mod write_tests {
         );
         let heads = server.join().await;
         assert_eq!(heads.len(), 1);
-        assert_eq!(heads[0].method, http::Method::POST);
+        assert_eq!(heads[0].head.method, http::Method::POST);
     }
 
     /// A 2xx answer is the confirmed write — no failure kind at all.
