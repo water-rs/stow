@@ -7,11 +7,14 @@ use stow_types::api::{
     CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueRequest, EnqueueSource,
     QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
 };
-use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
+use stow_types::identity::{
+    CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
+};
 use stow_types::public_cache::{
     ExplicitSpelling, UnitInvocation, UnitShape, required_unit_shapes,
     stable_c_metadata_for_compile_key,
 };
+use stow_types::task_graph::{DigestEntry, TaskNodeIdentity, shared_dependency_identities};
 
 use crate::errors::ResolverError;
 use crate::sql_batch;
@@ -206,6 +209,9 @@ struct CachedArtifactRow {
     features_json: String,
     c_metadata: String,
     dependency_c_metadata_json: String,
+    /// The Merkle dependency digest the row was built under — the
+    /// context a node must match for the row to cover it (stow#790).
+    dependency_identity: String,
     /// The builder-recorded unit shape.
     unit_side: i64,
     unit_invocation: i64,
@@ -238,37 +244,6 @@ pub async fn expand_scheduler_requests(
     let rustc_version_typed =
         WireRustcVersion::parse(rustc_version).map_err(|error| error.to_string())?;
     let exact_graph = exact_graph_from_request(roots, expanded_entries)?;
-    // Every entry's dependency subgraph is client-supplied — minted
-    // off the build's own `cargo --unit-graph` — so a dep the coverage
-    // prune drops still carries its real context (stow#588). The
-    // explicit-spelling flag travels the same way: the caller derived
-    // it from its unit graph, and the edge answers it for coverage,
-    // the queue row and the dispatched payload (stow#736).
-    let mut context_by_key = BTreeMap::<ExpandedNodeKey, ExpandedNodeContext>::new();
-    for entry in expanded_entries {
-        let key = ExpandedNodeKey {
-            package: PackageKey {
-                crate_name: entry.crate_name.clone(),
-                version: entry.version.clone(),
-            },
-            host_side: entry.host_side,
-        };
-        if context_by_key
-            .insert(
-                key,
-                ExpandedNodeContext {
-                    subgraph: entry.dependency_subgraph.clone(),
-                    explicit_spelling: entry.explicit_spelling,
-                },
-            )
-            .is_some()
-        {
-            return Err(ResolverError::Invariant(format!(
-                "duplicate expanded dependency graph entry for {} {}",
-                entry.crate_name, entry.version
-            )));
-        }
-    }
     // A consumer target outside `CI_TARGET_TRIPLES` has no runner
     // family, so its host units have no host triple to mint on —
     // refuse rather than mint nodes that block their dependents.
@@ -282,6 +257,26 @@ pub async fn expand_scheduler_requests(
             "`{target}` is not a CI target; host units cannot be minted for it"
         )));
     }
+    // Every entry's dependency subgraph is client-supplied — minted
+    // off the build's own `cargo --unit-graph` — so a dep the coverage
+    // prune drops still carries its real context (stow#588). The
+    // explicit-spelling flag travels the same way: the caller derived
+    // it from its unit graph, and the edge answers it for coverage,
+    // the queue row and the dispatched payload (stow#736). One shared
+    // bottom-up pass over the subgraphs' union yields each node's
+    // Merkle dependency digest — the context an artifact must have
+    // been published under to cover it (stow#790) — and is the wire's
+    // resolve check: a subgraph that does not resolve, or two
+    // declarations of one node that disagree, is refused rather than
+    // minted (stow#588). The declared-id check still rides the ticket
+    // path — `/api/v1/enqueue` already refuses
+    // `ticket.task_id != request.task_id()`.
+    let context_by_key = node_contexts(
+        &exact_graph,
+        expanded_entries,
+        &target_typed,
+        &rustc_version_typed,
+    )?;
     let semantic_keys = load_cached_artifacts(
         db,
         target,
@@ -303,6 +298,85 @@ pub async fn expand_scheduler_requests(
     Ok(ExpandedSchedulerPlan {
         enqueue_requests: requests,
     })
+}
+
+/// The per-node context map for `expanded_entries`: each entry's
+/// carried subgraph, its explicit-spelling flag, and its Merkle
+/// dependency digest. The digests come from one shared bottom-up pass
+/// over the subgraphs' union — a node's digest derives from its own
+/// identity and its dependencies' digests, so each distinct node is
+/// computed once (stow#790) — and the same pass is the wire's resolve
+/// check: a subgraph that does not resolve, or two declarations of one
+/// node that disagree, is refused rather than minted (stow#588).
+fn node_contexts(
+    exact_graph: &ExactExpandedGraph,
+    expanded_entries: &[ResolvedDependencyGraphEntry],
+    target_typed: &TargetTriple,
+    rustc_version_typed: &WireRustcVersion,
+) -> Result<BTreeMap<ExpandedNodeKey, ExpandedNodeContext>, ResolverError> {
+    let mut identities = Vec::with_capacity(expanded_entries.len());
+    for entry in expanded_entries {
+        let key = ExpandedNodeKey {
+            package: PackageKey {
+                crate_name: entry.crate_name.clone(),
+                version: entry.version.clone(),
+            },
+            host_side: entry.host_side,
+        };
+        let features_json = exact_graph.feature_json_by_key.get(&key).ok_or_else(|| {
+            ResolverError::Invariant(format!(
+                "missing serialized feature set for {} {}",
+                key.package.crate_name, key.package.version
+            ))
+        })?;
+        identities.push(TaskNodeIdentity {
+            crate_name: entry.crate_name.clone(),
+            version: CrateVersion::new(entry.version.clone()),
+            features_json: parse_canonical_features_json(features_json)?,
+            target: node_target(&key, target_typed),
+            rustc_version: rustc_version_typed.clone(),
+            host_side: entry.host_side,
+        });
+    }
+    let digest_entries = expanded_entries
+        .iter()
+        .zip(&identities)
+        .map(|(entry, identity)| DigestEntry {
+            identity,
+            root_spelling: entry.explicit_spelling,
+            subgraph: &entry.dependency_subgraph,
+        })
+        .collect::<Vec<_>>();
+    let digests = shared_dependency_identities(&digest_entries).map_err(|error| {
+        ResolverError::BadRequest(format!("dependency subgraphs do not resolve: {error}"))
+    })?;
+    let mut context_by_key = BTreeMap::new();
+    for (entry, dependency_identity) in expanded_entries.iter().zip(digests) {
+        let key = ExpandedNodeKey {
+            package: PackageKey {
+                crate_name: entry.crate_name.clone(),
+                version: entry.version.clone(),
+            },
+            host_side: entry.host_side,
+        };
+        if context_by_key
+            .insert(
+                key,
+                ExpandedNodeContext {
+                    subgraph: entry.dependency_subgraph.clone(),
+                    explicit_spelling: entry.explicit_spelling,
+                    dependency_identity,
+                },
+            )
+            .is_some()
+        {
+            return Err(ResolverError::Invariant(format!(
+                "duplicate expanded dependency graph entry for {} {}",
+                entry.crate_name, entry.version
+            )));
+        }
+    }
+    Ok(context_by_key)
 }
 
 /// The platform a node's task keys on: the consumer's target for
@@ -365,16 +439,10 @@ fn build_enqueue_requests(
             host_side: node_key.host_side,
             explicit_spelling: context.explicit_spelling,
         };
-        // Re-derive every id the subgraph yields: a wire that does not
-        // resolve is refused rather than minted (stow#588). The
-        // declared-id check rides the ticket path — `/api/v1/enqueue`
-        // already refuses `ticket.task_id != request.task_id()`.
-        request.resolved_dependency_graph().map_err(|error| {
-            ResolverError::BadRequest(format!(
-                "dependency subgraph for {} {} does not resolve: {error}",
-                node_key.package.crate_name, node_key.package.version
-            ))
-        })?;
+        // The subgraph already resolved when the node's context was
+        // built — a wire that does not resolve never mints a context
+        // (stow#588), and its digest is what the coverage prune keyed
+        // on (stow#790).
         requests.push(request);
     }
     Ok(requests)
@@ -481,11 +549,14 @@ struct ExactExpandedGraph {
 }
 
 /// What one expanded-graph entry carries per node: the client-minted
-/// dependency subgraph and the explicit-spelling flag the caller
-/// derived from its unit graph (stow#736).
+/// dependency subgraph, the explicit-spelling flag the caller derived
+/// from its unit graph (stow#736), and the node's Merkle dependency
+/// digest resolved out of that subgraph — the context an artifact must
+/// have been published under to count as covering the node (stow#790).
 struct ExpandedNodeContext {
     subgraph: stow_types::api::TaskSubgraph,
     explicit_spelling: ExplicitSpelling,
+    dependency_identity: DependencyIdentity,
 }
 
 fn exact_graph_from_request(
@@ -591,30 +662,46 @@ async fn load_cached_artifacts(
     // same triple — so coverage is asked per (platform, side): each side
     // requires the unit shapes its consumers' builds look up.
     for (platform, host_side) in [(target, false), (host_triple, true)] {
-        let key_pairs = feature_json_by_key
+        let mut nodes = BTreeMap::<(PackageKey, String), NodeCoverageContext>::new();
+        for (key, features_json) in feature_json_by_key
             .iter()
             .filter(|(key, _)| key.host_side == host_side)
-            .map(|(key, features_json)| (key.package.clone(), features_json.clone()))
-            .collect::<BTreeSet<_>>();
-        let spellings = context_by_key
-            .iter()
-            .filter(|(key, _)| key.host_side == host_side)
-            .map(|(key, context)| (key.package.clone(), context.explicit_spelling))
-            .collect::<BTreeMap<_, _>>();
-        for (package, features_json) in load_cached_artifacts_for_keys(
-            db,
-            platform,
-            rustc_version,
-            &key_pairs,
-            host_side,
-            &spellings,
-        )
-        .await?
+        {
+            let context = context_by_key.get(key).ok_or_else(|| {
+                format!(
+                    "missing node context for {} {}",
+                    key.package.crate_name, key.package.version
+                )
+            })?;
+            nodes.insert(
+                (key.package.clone(), features_json.clone()),
+                NodeCoverageContext {
+                    explicit_spelling: context.explicit_spelling,
+                    dependency_identity: context.dependency_identity.clone(),
+                },
+            );
+        }
+        for (package, features_json) in
+            load_cached_artifacts_for_keys(db, platform, rustc_version, &nodes, host_side).await?
         {
             cached.insert((ExpandedNodeKey { package, host_side }, features_json));
         }
     }
     Ok(cached)
+}
+
+/// What coverage needs from one node beyond its semantic key: the
+/// invocation spelling its required unit shapes derive from, and the
+/// node's own Merkle dependency digest — an artifact published under
+/// any other dependency context does not cover it, because the
+/// dependents' edges name this digest, never the bare tuple
+/// (stow#790).
+pub struct NodeCoverageContext {
+    /// The node's explicit-`--target` spelling flag (stow#736).
+    pub explicit_spelling: ExplicitSpelling,
+    /// The node's dependency-context digest, derived from its resolved
+    /// subgraph.
+    pub dependency_identity: DependencyIdentity,
 }
 
 /// [`load_cached_artifacts`] over a set of `(key, features)` pairs —
@@ -625,16 +712,15 @@ pub async fn load_cached_artifacts_for_keys(
     db: &Db,
     target: &str,
     rustc_version: &str,
-    key_pairs: &BTreeSet<(PackageKey, String)>,
+    nodes: &BTreeMap<(PackageKey, String), NodeCoverageContext>,
     host_side: bool,
-    spellings: &BTreeMap<PackageKey, ExplicitSpelling>,
 ) -> Result<BTreeSet<(PackageKey, String)>, ResolverError> {
-    if key_pairs.is_empty() {
+    if nodes.is_empty() {
         return Ok(BTreeSet::new());
     }
 
-    let crate_names = key_pairs
-        .iter()
+    let crate_names = nodes
+        .keys()
         .map(|(key, _)| key.crate_name.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -642,7 +728,7 @@ pub async fn load_cached_artifacts_for_keys(
     let mut cached_rows = Vec::<CachedArtifactRow>::new();
     for batch in crate_names.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
         let sql = format!(
-            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, unit_side, unit_invocation, unit_linked \
+            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_identity, unit_side, unit_invocation, unit_linked \
              FROM artifacts \
              WHERE target = ? AND rustc_version = ? AND crate_name IN ({})",
             sql_batch::placeholders(batch.len())
@@ -667,7 +753,7 @@ pub async fn load_cached_artifacts_for_keys(
     // "closed within D1", not "closed within this request's candidates".
     let cached_rows = complete_chain_rows(db, target, rustc_version, cached_rows).await?;
 
-    let candidates = resolve_reachable_cached_rows(key_pairs, cached_rows)?;
+    let candidates = resolve_reachable_cached_rows(nodes, cached_rows)?;
     // Coverage is per unit shape, not per semantic row: the consumer's
     // build looks up each unit at the shape its invocation computes, so
     // a key is covered only when reachable candidates carry every shape
@@ -677,16 +763,10 @@ pub async fn load_cached_artifacts_for_keys(
         UnitInvocation::for_task(target, family.host_triple())
     });
     let mut required_by_key = BTreeMap::<&(PackageKey, String), Vec<UnitShape>>::new();
-    for key_pair in key_pairs {
-        let spelling = spellings.get(&key_pair.0).copied().ok_or_else(|| {
-            format!(
-                "missing explicit-spelling flag for {} {}",
-                key_pair.0.crate_name, key_pair.0.version
-            )
-        })?;
+    for (key_pair, context) in nodes {
         required_by_key.insert(
             key_pair,
-            required_unit_shapes(host_side, invocation, spelling),
+            required_unit_shapes(host_side, invocation, context.explicit_spelling),
         );
     }
     let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<UnitShape>>::new();
@@ -708,7 +788,7 @@ pub async fn load_cached_artifacts_for_keys(
 }
 
 fn resolve_reachable_cached_rows(
-    key_pairs: &BTreeSet<(PackageKey, String)>,
+    nodes: &BTreeMap<(PackageKey, String), NodeCoverageContext>,
     rows: Vec<CachedArtifactRow>,
 ) -> Result<Vec<ReachableCandidateRow>, ResolverError> {
     let IndexedRows {
@@ -716,7 +796,7 @@ fn resolve_reachable_cached_rows(
         candidate_index,
         chain_rows,
         chain_index,
-    } = partition_cached_rows(key_pairs, rows)?;
+    } = partition_cached_rows(nodes, rows)?;
 
     // Reachability fixpoint over the union of candidates and chain rows:
     // a node is reachable when every dependency identity it references is a
@@ -726,7 +806,7 @@ fn resolve_reachable_cached_rows(
     let mut progressed = true;
     while progressed {
         progressed = false;
-        let reach_check = |identity: &DependencyIdentity,
+        let reach_check = |identity: &DepChainIdentity,
                            reachable_candidates: &BTreeSet<usize>,
                            reachable_chain: &BTreeSet<usize>| {
             let key = (
@@ -777,11 +857,14 @@ fn resolve_reachable_cached_rows(
 }
 
 /// Partition cached rows by request match: rows whose (package, features)
-/// pair is in `key_pairs` become candidates; every other canonical row is a
-/// chain row another candidate's closure may reference. Rows failing the
+/// pair is in `nodes` *and* whose recorded dependency digest equals the
+/// node's own become candidates (stow#790 — a tuple published under a
+/// different dependency context covers nothing, because dependents' edges
+/// name the node's own digest); every other canonical row is a chain row
+/// another candidate's closure may reference. Rows failing the
 /// canonical-metadata check are dropped.
 fn partition_cached_rows(
-    key_pairs: &BTreeSet<(PackageKey, String)>,
+    nodes: &BTreeMap<(PackageKey, String), NodeCoverageContext>,
     rows: Vec<CachedArtifactRow>,
 ) -> Result<IndexedRows, ResolverError> {
     let mut candidates = Vec::<ReachableCandidateRow>::new();
@@ -794,7 +877,7 @@ fn partition_cached_rows(
             continue;
         }
         let dependency_identities =
-            serde_json::from_str::<Vec<DependencyIdentity>>(&row.dependency_c_metadata_json)
+            serde_json::from_str::<Vec<DepChainIdentity>>(&row.dependency_c_metadata_json)
                 .map_err(|error| {
                     format!(
                         "parse cached dependency_c_metadata_json for {} {} {}: {error}",
@@ -815,7 +898,10 @@ fn partition_cached_rows(
             version,
         };
         let semantic_key = (package_key, row.features_json.clone());
-        if key_pairs.contains(&semantic_key) {
+        if nodes
+            .get(&semantic_key)
+            .is_some_and(|context| context.dependency_identity.as_str() == row.dependency_identity)
+        {
             if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
                 if !deduplicate_cached_candidate(
                     &candidates[existing_index],
@@ -879,7 +965,7 @@ async fn complete_chain_rows(
     for _ in 0..MAX_CHAIN_DEPTH {
         let mut wanted = BTreeSet::<String>::new();
         for index in std::mem::take(&mut frontier) {
-            let identities = serde_json::from_str::<Vec<DependencyIdentity>>(
+            let identities = serde_json::from_str::<Vec<DepChainIdentity>>(
                 &rows[index].dependency_c_metadata_json,
             )
             .map_err(|error| {
@@ -900,7 +986,7 @@ async fn complete_chain_rows(
         let wanted = wanted.into_iter().collect::<Vec<_>>();
         for batch in wanted.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
             let sql = format!(
-                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, unit_side, unit_invocation, unit_linked \
+                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_identity, unit_side, unit_invocation, unit_linked \
                  FROM artifacts \
                  WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
                 sql_batch::placeholders(batch.len())
@@ -947,8 +1033,8 @@ fn cached_row_has_canonical_metadata(row: &CachedArtifactRow) -> Result<bool, Re
 }
 
 fn canonicalize_dependency_identities(
-    mut dependency_identities: Vec<DependencyIdentity>,
-) -> Vec<DependencyIdentity> {
+    mut dependency_identities: Vec<DepChainIdentity>,
+) -> Vec<DepChainIdentity> {
     dependency_identities.sort_by(|left, right| {
         canonical_crate_name(&left.crate_name)
             .cmp(&canonical_crate_name(&right.crate_name))
@@ -961,7 +1047,7 @@ fn deduplicate_cached_candidate(
     existing: &ReachableCandidateRow,
     semantic_key: &SemanticKey,
     row: &CachedArtifactRow,
-    dependency_identities: &[DependencyIdentity],
+    dependency_identities: &[DepChainIdentity],
 ) -> bool {
     if existing.semantic_key != *semantic_key
         || existing.dependency_identities != dependency_identities
@@ -975,7 +1061,7 @@ fn deduplicate_cached_candidate(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-struct DependencyIdentity {
+struct DepChainIdentity {
     crate_name: String,
     c_metadata: String,
 }
@@ -987,14 +1073,14 @@ struct ReachableCandidateRow {
     shape: UnitShape,
     semantic_key: (PackageKey, String),
     row: CachedArtifactRow,
-    dependency_identities: Vec<DependencyIdentity>,
+    dependency_identities: Vec<DepChainIdentity>,
 }
 
 /// A canonical row that is not a semantic match for the current request but
 /// participates in candidates' dependency closures.
 #[derive(Debug)]
 struct ChainRow {
-    dependency_identities: Vec<DependencyIdentity>,
+    dependency_identities: Vec<DepChainIdentity>,
 }
 
 /// Cached rows partitioned by request match — semantic candidates and
@@ -1474,6 +1560,7 @@ mod tests {
                 version: "1.0.6".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "72e2ded9fa67e0a1".to_owned(),
+                dependency_identity: leaf_dependency_identity().to_string(),
                 unit_side: 0,
                 unit_invocation: 1,
                 unit_linked: 1,
@@ -1485,6 +1572,7 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
+                dependency_identity: leaf_dependency_identity().to_string(),
                 unit_side: 0,
                 unit_invocation: 1,
                 unit_linked: 1,
@@ -1493,7 +1581,7 @@ mod tests {
             },
         ];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
+        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
 
         assert_eq!(reachable.len(), 2);
         assert_eq!(reachable[0].row.crate_name, "same-file");
@@ -1510,6 +1598,7 @@ mod tests {
             version: "2.5.0".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "1c0d7420b566b7a2".to_owned(),
+            dependency_identity: leaf_dependency_identity().to_string(),
             unit_side: 0,
             unit_invocation: 1,
             unit_linked: 1,
@@ -1517,7 +1606,7 @@ mod tests {
                 r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
         }];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
+        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
 
         assert!(reachable.is_empty());
     }
@@ -1537,6 +1626,7 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "1c0d7420b566b7a2".to_owned(),
+                dependency_identity: leaf_dependency_identity().to_string(),
                 unit_side: 0,
                 unit_invocation: 1,
                 unit_linked: 1,
@@ -1549,6 +1639,7 @@ mod tests {
                 version: "1.0.6".to_owned(),
                 features_json: r#"["unstable"]"#.to_owned(),
                 c_metadata: "72e2ded9fa67e0a1".to_owned(),
+                dependency_identity: leaf_dependency_identity().to_string(),
                 unit_side: 0,
                 unit_invocation: 1,
                 unit_linked: 1,
@@ -1556,7 +1647,7 @@ mod tests {
             },
         ];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
+        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
 
         assert_eq!(reachable.len(), 1);
         assert_eq!(reachable[0].row.crate_name, "walkdir");
@@ -1576,13 +1667,14 @@ mod tests {
             version: "2.11.0".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
+            dependency_identity: leaf_dependency_identity().to_string(),
             unit_side: 0,
             unit_invocation: 1,
             unit_linked: 1,
             dependency_c_metadata_json: "[]".to_owned(),
         }];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
+        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
 
         assert_eq!(reachable.len(), 1);
     }
@@ -1602,6 +1694,7 @@ mod tests {
             version: "0.4.25".to_owned(),
             features_json: "[]".to_owned(),
             c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
+            dependency_identity: leaf_dependency_identity().to_string(),
             unit_side: 0,
             unit_invocation: 1,
             unit_linked: 1,
@@ -1613,6 +1706,7 @@ mod tests {
             // stable prefix: filtered by the canonical-metadata check.
             CachedArtifactRow {
                 c_metadata: "bbbbbbbbbbbbbbbb".to_owned(),
+                dependency_identity: leaf_dependency_identity().to_string(),
                 unit_side: 0,
                 unit_invocation: 1,
                 unit_linked: 1,
@@ -1627,6 +1721,7 @@ mod tests {
                 version: "2.5.0".to_owned(),
                 features_json: "[]".to_owned(),
                 c_metadata: "9999999999999999".to_owned(),
+                dependency_identity: leaf_dependency_identity().to_string(),
                 unit_side: 0,
                 unit_invocation: 1,
                 unit_linked: 1,
@@ -1634,7 +1729,7 @@ mod tests {
             },
         ];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, rows).unwrap();
+        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
 
         assert_eq!(reachable.len(), 2);
         assert_eq!(reachable[0].row.crate_name, "ignore");
@@ -1763,23 +1858,72 @@ mod tests {
 
     /// Subgraphs minted off the exact graph the same way the wire
     /// carries them — each node's closure, covered nodes with their own
-    /// feature set (stow#588).
+    /// feature set (stow#588) — with the dependency digest each
+    /// subgraph resolves to, the same derivation `expand_scheduler_requests`
+    /// runs (stow#790).
     fn contexts(
         graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
         features: &BTreeMap<ExpandedNodeKey, String>,
+        target: &str,
+        rustc_version: &str,
     ) -> BTreeMap<ExpandedNodeKey, super::ExpandedNodeContext> {
+        let target_typed = super::TargetTriple::parse(target).expect("target");
+        let rustc_typed = super::WireRustcVersion::parse(rustc_version).expect("rustc");
         graph
             .keys()
             .map(|key| {
+                let subgraph = subgraph_for(key, graph, features);
+                let identity = stow_types::task_graph::TaskNodeIdentity {
+                    crate_name: key.package.crate_name.clone(),
+                    version: stow_types::identity::CrateVersion::new(key.package.version.clone()),
+                    features_json: super::parse_canonical_features_json(
+                        features.get(key).expect("node features"),
+                    )
+                    .expect("features parse"),
+                    target: super::node_target(key, &target_typed),
+                    rustc_version: rustc_typed.clone(),
+                    host_side: key.host_side,
+                };
+                let dependency_identity = subgraph
+                    .resolve(&identity, super::ExplicitSpelling::KeysAsNative)
+                    .expect("subgraph resolves")
+                    .dependency_identity(0)
+                    .expect("root digest")
+                    .clone();
                 (
                     key.clone(),
                     super::ExpandedNodeContext {
-                        subgraph: subgraph_for(key, graph, features),
+                        subgraph,
                         explicit_spelling: super::ExplicitSpelling::KeysAsNative,
+                        dependency_identity,
                     },
                 )
             })
             .collect()
+    }
+
+    /// The coverage probe `load_cached_artifacts_for_keys` consumes for
+    /// the same nodes `contexts` produces — `KeysAsNative` and the
+    /// leaf digest every default subgraph resolves to.
+    fn probes(
+        key_pairs: &BTreeSet<(PackageKey, String)>,
+    ) -> BTreeMap<(PackageKey, String), super::NodeCoverageContext> {
+        key_pairs
+            .iter()
+            .map(|key_pair| {
+                (
+                    key_pair.clone(),
+                    super::NodeCoverageContext {
+                        explicit_spelling: super::ExplicitSpelling::KeysAsNative,
+                        dependency_identity: leaf_dependency_identity(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn leaf_dependency_identity() -> stow_types::identity::DependencyIdentity {
+        stow_types::identity::DependencyIdentity::leaf().expect("leaf identity")
     }
 
     fn subgraph_for(
@@ -1888,7 +2032,12 @@ mod tests {
         let requests = build_enqueue_requests(
             &features(&graph),
             &graph,
-            &contexts(&graph, &features(&graph)),
+            &contexts(
+                &graph,
+                &features(&graph),
+                "x86_64-unknown-linux-gnu",
+                "1.98.0",
+            ),
             &covered(&["b"]),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1932,7 +2081,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
-            &contexts(&graph, &features),
+            &contexts(&graph, &features, "wasm32-unknown-unknown", "1.98.0"),
             &BTreeSet::new(),
             &"wasm32-unknown-unknown".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -1981,7 +2130,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
-            &contexts(&graph, &features),
+            &contexts(&graph, &features, "aarch64-apple-ios", "1.98.0"),
             &BTreeSet::new(),
             &"aarch64-apple-ios".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
@@ -2016,14 +2165,25 @@ mod sqlite_tests {
     use super::expand_scheduler_requests;
     use super::tests::StubCratesIo;
 
-    use stow_types::api::{CrateRequestState, QueueTaskStatus, RequestStatus, TaskLane};
-    use stow_types::identity::{
-        CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
+    use stow_types::api::{
+        ArtifactRecord, CrateRequestState, DependencyGraphEntry, QueueTaskStatus, RequestStatus,
+        ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry, TaskLane,
     };
+    use stow_types::artifact::{ArtifactKind, RustCrateType};
+    use stow_types::identity::{
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
+        DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
+    };
+    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
+    use stow_types::task_graph::TaskNodeIdentity;
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
     const RUSTC: &str = "1.85.0";
+
+    fn wasm_target() -> TargetTriple {
+        TargetTriple::parse("wasm32-unknown-unknown").expect("wasm triple")
+    }
 
     fn linux_target() -> TargetTriple {
         TargetTriple::parse(TARGET).expect("target")
@@ -2440,5 +2600,359 @@ mod sqlite_tests {
             .await
             .expect("cache row count");
         assert_eq!(cached, 0, "the aborted write must leave no row");
+    }
+
+    fn artifact_record(
+        crate_name: &str,
+        version: &str,
+        c_metadata: &str,
+        dependency_c_metadata_json: DependencyCMetadataJson,
+        dependency_identity: DependencyIdentity,
+        kind: stow_types::public_cache::UnitKind,
+    ) -> ArtifactRecord {
+        ArtifactRecord {
+            compile_key: format!("{c_metadata}{c_metadata}"),
+            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
+            extra_filename: format!("-{c_metadata}"),
+            target: linux_target(),
+            rustc_version: rustc(),
+            unit_shape: stow_types::public_cache::UnitShape {
+                side: stow_types::public_cache::UnitSide::Target,
+                invocation: stow_types::public_cache::UnitInvocation::Native,
+                kind,
+            },
+            profile: Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 0,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: PanicStrategy::Unwind,
+                strip: StripLevel::None,
+            },
+            emit: match kind {
+                stow_types::public_cache::UnitKind::Linked => vec!["link".to_owned()],
+                stow_types::public_cache::UnitKind::Unlinked => {
+                    vec!["dep-info".to_owned(), "metadata".to_owned()]
+                }
+            },
+            crate_name: CrateName::parse(crate_name).expect("name"),
+            version: CrateVersion::new(semver::Version::parse(version).expect("version")),
+            features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+            dependency_c_metadata_json,
+            dependency_identity,
+            oci_reference: format!(
+                "ghcr.io/water-rs/stow-cache-{RUSTC}:{crate_name}.{version}-x86_64-linux-{RUSTC}-abcdef012345-{c_metadata}"
+            ),
+            oci_digest: format!("sha256:{}", "0".repeat(64)),
+            has_native: false,
+            artifact_kind: ArtifactKind::Rlib,
+            crate_types: vec![RustCrateType::Rlib],
+            artifact_size: 1,
+            bundle_digest: format!("sha256:{}", "0".repeat(64)),
+            bundle_size: 1,
+            compile_millis: 1_234,
+            min_glibc: None,
+        }
+    }
+
+    /// Both unit shapes a target-side node owes at the native
+    /// invocation — the check-only and the linked row a published
+    /// context carries, each its own `c_metadata` since the artifacts
+    /// table keys rows on it.
+    fn context_records(
+        crate_name: &str,
+        version: &str,
+        c_metadata_unlinked: &str,
+        c_metadata_linked: &str,
+        dependency_c_metadata_json: &DependencyCMetadataJson,
+        dependency_identity: &DependencyIdentity,
+    ) -> Vec<ArtifactRecord> {
+        [
+            (
+                c_metadata_unlinked,
+                stow_types::public_cache::UnitKind::Unlinked,
+            ),
+            (
+                c_metadata_linked,
+                stow_types::public_cache::UnitKind::Linked,
+            ),
+        ]
+        .into_iter()
+        .map(|(c_metadata, kind)| {
+            artifact_record(
+                crate_name,
+                version,
+                c_metadata,
+                dependency_c_metadata_json.clone(),
+                dependency_identity.clone(),
+                kind,
+            )
+        })
+        .collect()
+    }
+
+    /// The request's graph for the two-context coverage test: `dep` sits
+    /// over `dep-child` — a non-leaf context the wrong-context
+    /// publication does not match — and the dependency digest the
+    /// request path derives for `dep`.
+    fn dep_over_child_fixture() -> (
+        Vec<ResolvedDependencyGraphEntry>,
+        Vec<DependencyGraphEntry>,
+        DependencyIdentity,
+    ) {
+        let one_zero = || semver::Version::parse("1.0.0").expect("version");
+        let leaf_entry = |crate_name: &str| ResolvedDependencyGraphEntry {
+            crate_name: CrateName::parse(crate_name).expect("name"),
+            version: one_zero(),
+            features: Vec::new(),
+            host_side: false,
+            dependencies: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        };
+        let dep_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: CrateName::parse("dep-child").expect("name"),
+                version: CrateVersion::new(one_zero()),
+                features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+                host_side: false,
+                keys_apart: false,
+                deps: Vec::new(),
+            }],
+        };
+        let mut dep_entry = leaf_entry("dep");
+        dep_entry.dependencies = vec![ResolvedDependencyGraphDependency {
+            crate_name: CrateName::parse("dep-child").expect("name"),
+            version: one_zero(),
+            host_side: false,
+        }];
+        dep_entry.dependency_subgraph = dep_subgraph.clone();
+        let entries = vec![DependencyGraphEntry {
+            crate_name: CrateName::parse("dep").expect("name"),
+            version: one_zero(),
+            features: Vec::new(),
+        }];
+        let dep_digest = dep_subgraph
+            .resolve(
+                &TaskNodeIdentity {
+                    crate_name: CrateName::parse("dep").expect("name"),
+                    version: CrateVersion::new(one_zero()),
+                    features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+                    target: linux_target(),
+                    rustc_version: rustc(),
+                    host_side: false,
+                },
+                stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            )
+            .expect("subgraph resolves")
+            .dependency_identity(0)
+            .expect("root digest")
+            .clone();
+        (
+            vec![dep_entry, leaf_entry("dep-child")],
+            entries,
+            dep_digest,
+        )
+    }
+
+    /// stow#790: the miss-admission prune keys a node on its own
+    /// dependency context, the defect #787 fixed in the claim pass.
+    /// `dep` 1.0.0 `[]` is published twice: once under another context's
+    /// digest — reachable, its chain closed — and once under the digest
+    /// the request's own subgraph resolves to. Only the same-context
+    /// publication may drop the node from the miss plan; without it the
+    /// dependents' digest-named edges could never be served.
+    #[tokio::test]
+    async fn coverage_prune_requires_the_nodes_own_dependency_context() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        crate::db::apply_schema(&db).await;
+
+        let (expanded, entries, dep_digest) = dep_over_child_fixture();
+
+        // dep-child is covered as a leaf. `dep` is published under an
+        // unrelated context: its chain closes (it names dep-child's
+        // artifact), so reachability alone would call it covered — only
+        // the digest must separate the contexts.
+        let other_context = DependencyIdentity::parse("f".repeat(64)).expect("digest");
+        let dep_chain = DependencyCMetadataJson::canonicalize(vec![DependencyCMetadataIdentity {
+            crate_name: CrateName::parse("dep-child").expect("name"),
+            c_metadata: CMetadata::parse("bbbbbbbbbbbbbbbb").expect("c_metadata"),
+        }])
+        .expect("chain");
+        let mut records = context_records(
+            "dep-child",
+            "1.0.0",
+            "bbbbbbbbbbbbbbbb",
+            "6666666666666666",
+            &DependencyCMetadataJson::default(),
+            &DependencyIdentity::leaf().expect("leaf"),
+        );
+        records.extend(context_records(
+            "dep",
+            "1.0.0",
+            "7777777777777777",
+            "aaaaaaaaaaaaaaaa",
+            &dep_chain,
+            &other_context,
+        ));
+        crate::db::insert_artifact_records(&db, &records)
+            .await
+            .expect("insert");
+
+        let outcome = expand_scheduler_requests(&db, TARGET, RUSTC, &entries, &expanded)
+            .await
+            .expect("expansion");
+        let enqueued = outcome
+            .enqueue_requests
+            .iter()
+            .map(|request| request.crate_name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            enqueued,
+            vec!["dep".to_owned()],
+            "a tuple published under another dependency context covers nothing: \
+             dep must still be minted while dep-child's leaf context is served"
+        );
+
+        // Publishing dep under its own dependency digest closes the
+        // miss: the same tuple now carries the request's context.
+        crate::db::insert_artifact_records(
+            &db,
+            &context_records(
+                "dep",
+                "1.0.0",
+                "8888888888888888",
+                "cccccccccccccccc",
+                &dep_chain,
+                &dep_digest,
+            ),
+        )
+        .await
+        .expect("insert own-context rows");
+        let outcome = expand_scheduler_requests(&db, TARGET, RUSTC, &entries, &expanded)
+            .await
+            .expect("expansion");
+        assert!(
+            outcome.enqueue_requests.is_empty(),
+            "the same-context publication covers the node"
+        );
+    }
+    /// A zed-shaped admissions request at the route's
+    /// `MAX_EXPANDED_TASKS` cap: mostly leaves, a band of mid-size
+    /// nodes, and a few broad hubs on both sides — so most entries
+    /// carry small subgraphs and a minority carry real closures.
+    /// Review measurement for stow#790: `node_contexts` derives every
+    /// entry's dependency digest in one shared pass; the second timing
+    /// re-runs the per-entry `TaskSubgraph::resolve` loop it replaced.
+    /// Host CPU is an upper-bound proxy for the worker's budget — the
+    /// admission route's `WORKER_CPU_BUDGETS` is 5 ms.
+    #[test]
+    fn context_construction_at_max_admission_size() {
+        const N: usize = super::MAX_EXPANDED_TASKS;
+        let one_zero = || semver::Version::parse("1.0.0").expect("version");
+        let identity = |index: usize, host_side: bool| TaskNodeIdentity {
+            crate_name: CrateName::parse(format!("dep-{index}")).expect("name"),
+            version: CrateVersion::new(one_zero()),
+            features_json: FeaturesJson::canonicalize(
+                index
+                    .is_multiple_of(16)
+                    .then(|| "std".to_owned())
+                    .into_iter()
+                    .collect(),
+            )
+            .expect("features"),
+            target: if host_side {
+                linux_target()
+            } else {
+                wasm_target()
+            },
+            rustc_version: rustc(),
+            host_side,
+        };
+        // Deterministic zed-shaped out-degrees: ~60% leaves, ~30% light
+        // (1-3 deps), ~8% mid (4-8), ~2% hubs (9-24). A tenth of nodes
+        // compile host-side; every dep points strictly backward.
+        let mut resolved_nodes = Vec::with_capacity(N);
+        for index in 0..N {
+            let width = match index % 50 {
+                0..=29 => 0,
+                30..=44 => 1 + index % 3,
+                45..=48 => 4 + index % 5,
+                _ => 9 + index % 16,
+            };
+            let deps = (0..width.min(index))
+                .map(|d| index - 1 - (index + d) % index)
+                .collect::<Vec<_>>();
+            resolved_nodes.push(stow_types::task_graph::ResolvedTaskNode {
+                identity: identity(index, index.is_multiple_of(10)),
+                explicit_spelling: super::ExplicitSpelling::KeysAsNative,
+                dependencies: deps,
+            });
+        }
+        let resolved = stow_types::task_graph::ResolvedTaskGraph::resolve(resolved_nodes)
+            .expect("fixture graph resolves");
+        let entries = resolved
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(index, node)| ResolvedDependencyGraphEntry {
+                crate_name: node.identity.crate_name.clone(),
+                version: node.identity.version.as_semver().clone(),
+                features: node.identity.features_json.features().to_vec(),
+                host_side: node.identity.host_side,
+                dependencies: node
+                    .dependencies
+                    .iter()
+                    .map(|&dep| ResolvedDependencyGraphDependency {
+                        crate_name: resolved.nodes()[dep].identity.crate_name.clone(),
+                        version: resolved.nodes()[dep].identity.version.as_semver().clone(),
+                        host_side: resolved.nodes()[dep].identity.host_side,
+                    })
+                    .collect(),
+                dependency_subgraph: stow_types::api::TaskSubgraph::from_resolved(&resolved, index)
+                    .expect("subgraph"),
+                explicit_spelling: super::ExplicitSpelling::KeysAsNative,
+            })
+            .collect::<Vec<_>>();
+        let wire_nodes = entries
+            .iter()
+            .map(|entry| entry.dependency_subgraph.nodes.len())
+            .sum::<usize>();
+        let roots = vec![DependencyGraphEntry {
+            crate_name: CrateName::parse(format!("dep-{}", N - 1)).expect("name"),
+            version: one_zero(),
+            features: Vec::new(),
+        }];
+        let exact_graph = super::exact_graph_from_request(&roots, &entries).expect("exact graph");
+
+        let start = std::time::Instant::now();
+        let contexts = super::node_contexts(&exact_graph, &entries, &wasm_target(), &rustc())
+            .expect("contexts");
+        let shared = start.elapsed();
+        assert_eq!(contexts.len(), N, "every expanded node gets a context");
+
+        // The per-entry `TaskSubgraph::resolve` loop the shared pass
+        // replaced — kept here so the review's cost comparison rides
+        // the same fixture.
+        let identities = (0..N)
+            .map(|index| identity(index, index.is_multiple_of(10)))
+            .collect::<Vec<_>>();
+        let start = std::time::Instant::now();
+        for (entry, node_identity) in entries.iter().zip(&identities) {
+            std::hint::black_box(
+                entry
+                    .dependency_subgraph
+                    .resolve(node_identity, entry.explicit_spelling)
+                    .expect("resolve"),
+            );
+        }
+        eprintln!(
+            "admission context construction at {N} entries / {wire_nodes} wire nodes: \
+             shared pass {shared:?}; per-entry resolve {:?} (route budget 5ms)",
+            start.elapsed()
+        );
     }
 }
