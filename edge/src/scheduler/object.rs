@@ -1060,14 +1060,18 @@ async fn record_published_index(
     alarm: Alarm,
     Json(slice): Json<stow_types::api::PublishedSlice>,
 ) -> Result<Json<OkResponse>> {
+    let settings = scheduler_settings(&env)?;
     match queue::record_published_slice(
         &db,
+        &settings,
         slice.target.as_str(),
         slice.rustc_version.as_str(),
-        slice.base_generation,
-        slice.generation,
-        &slice.added,
-        &slice.retired,
+        &stow_types::api::PublishedSliceReport {
+            base_generation: slice.base_generation,
+            generation: slice.generation,
+            added: slice.added,
+            retired: slice.retired,
+        },
     )
     .await
     {
