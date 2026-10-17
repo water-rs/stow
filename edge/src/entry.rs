@@ -19,6 +19,7 @@ const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 const STOW_OIDC_AUDIENCE_BINDING: &str = "STOW_OIDC_AUDIENCE";
 const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
+const STOW_GITHUB_API_URL_BINDING: &str = "STOW_GITHUB_API_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -84,11 +85,29 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
     // dispatch pass; probing them here fails worker startup on a missing
     // App credential instead of surfacing it as a burned dispatch
     // attempt. Local-CI dispatch needs none of them.
-    if env_binding::optional_string(env, STOW_LOCAL_CI_URL_BINDING).is_none() {
+    let local_ci_url = env_binding::optional_string(env, STOW_LOCAL_CI_URL_BINDING);
+    if local_ci_url.is_none() {
         env_binding::required_string(env, GITHUB_APP_ID_BINDING);
         env_binding::required_string(env, GITHUB_APP_INSTALLATION_ID_BINDING);
         env_binding::required_string(env, GITHUB_APP_PRIVATE_KEY_BINDING);
     }
+    // The bearer check's GitHub probes: `STOW_LOCAL_CI_URL` marks the
+    // mock stack, where they must resolve inside it — a mock manifest
+    // that forgets `STOW_GITHUB_API_URL` fails startup rather than
+    // letting the trusted lanes reach the real API (stow#793). A set
+    // value pins to loopback like `STOW_STATS_SQL_URL`, because the
+    // caller's credential rides in `Authorization`.
+    let probe_base_url = match env_binding::optional_string(env, STOW_GITHUB_API_URL_BINDING) {
+        Some(url) => Some(
+            crate::scheduler::object::loopback_url(STOW_GITHUB_API_URL_BINDING, &url)
+                .unwrap_or_else(|error| panic!("{error}")),
+        ),
+        None if local_ci_url.is_some() => panic!(
+            "{STOW_GITHUB_API_URL_BINDING} is required when {STOW_LOCAL_CI_URL_BINDING} is set: \
+             the mock stack's bearer check must stay inside it"
+        ),
+        None => None,
+    };
     let ghcr = GhcrConfig {
         base_url: env_binding::optional_string(env, GHCR_BASE_URL_BINDING)
             .unwrap_or_else(|| ghcr::default_base_url().to_owned()),
@@ -136,6 +155,7 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
         .with(State(github_auth::GitHubTrustConfig {
             repo: env_binding::required_string(env, GITHUB_REPO_BINDING),
             oidc_audience: env_binding::required_string(env, STOW_OIDC_AUDIENCE_BINDING),
+            probe_base_url,
         }))
         .with(State(github_auth::Jwks::default()))
         .with(State(github_auth::PushVerdicts::default()))
