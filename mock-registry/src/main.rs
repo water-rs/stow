@@ -79,6 +79,7 @@ async fn async_main() -> stow_types::error::Result<()> {
         Command::PublishIndex(request) => publish_index(request).await,
         Command::IndexFromRecords(request) => index_from_records(request).await,
         Command::PushRecords(request) => push_records(request).await,
+        Command::PutBlob(request) => put_blob(request).await,
         Command::Serve(request) => serve_registry(request).await,
     }
 }
@@ -236,6 +237,24 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
 /// shape `stow_oci::push_records` pushes to GHCR: the JSON layer under
 /// `application/vnd.stow.records.v1+json`, a `{}` config, the task-id
 /// annotation on the manifest, and the mock signature image.
+/// The blob's bytes are blake3's extendable output over a fixed seed, so
+/// every run stores the same digest and the content does not compress
+/// away to nothing on any path that would encode it.
+async fn put_blob(request: PutBlobArgs) -> stow_types::error::Result<()> {
+    let mut bytes = vec![0u8; request.size];
+    blake3::Hasher::new()
+        .update(b"stow traffic-cost bundle")
+        .finalize_xof()
+        .fill(&mut bytes);
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)));
+    write_blob(&request.registry_root, &digest, &bytes).await?;
+    println!(
+        "{}",
+        serde_json::json!({ "digest": digest, "size": request.size })
+    );
+    Ok(())
+}
+
 async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()> {
     let bytes = read(&request.records).await.map_err(|error| {
         stow_types::stow_error!("read records {}: {error}", request.records.display())
@@ -1200,7 +1219,20 @@ enum Command {
     /// mock signature — the write the production publish stage performs
     /// on GHCR once a build's records live there (stow#455).
     PushRecords(PushRecordsArgs),
+    /// Store one deterministic blob of `--size` bytes and print its
+    /// digest — a bundle-sized body the edge's byte path can stream,
+    /// for the traffic-cost CPU measurement (`scripts/traffic-cost.sh`).
+    PutBlob(PutBlobArgs),
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct PutBlobArgs {
+    /// Blob length in bytes.
+    #[arg(long)]
+    size: usize,
+    #[arg(long = "registry-root")]
+    registry_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]

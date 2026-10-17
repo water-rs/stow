@@ -1,8 +1,8 @@
 name: Test
 
 # The checks every merge waits on: nextest on the three platforms, lint and
-# the `CI gate` job the rulesets require. The slow lanes — `Mock end-to-end`,
-# `Scheduler budget (workerd)` and `Launch load (workerd)` — live in
+# the `CI gate` job the rulesets require. The slow lanes — `Mock end-to-end`
+# and `Traffic cost` — live in
 # release-gate.yml, which runs them on demand, nightly on dev and as the
 # release gate for main. A push to dev runs nothing: the dev merge queue
 # already tested the tree that lands. A nightly run on dev keeps the rust

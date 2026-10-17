@@ -2,8 +2,8 @@
 //! `cargo test -p stow-edge`. It is *not* the number Cloudflare bills:
 //! the host backend exposes no scan-step counters, so `rows_read` here
 //! is the statements' result cardinality and `rows_written` their
-//! `changes()`. The merge gate is the workerd harness
-//! (`budget.rs` + `scripts/scheduler-budget.sh`), which replays the
+//! `changes()`. The billed gate is the workerd harness
+//! (`budget.rs` + `scripts/traffic-cost.sh`), which replays the
 //! same [`drives`] list on the 100k fixture inside the Durable Object
 //! and reports the real cursor counters. This test keeps the host
 //! proxies honest on a small fixture — a regression that goes

@@ -48,7 +48,7 @@ use crate::errors::QueueError;
 
 /// The host-gate shape — 10k rows — small enough that `cargo test`
 /// stays fast. Only the host pre-check uses it; the workerd harness
-/// seeds `PRODUCTION` and the 1M shape `STOW_BUDGET_SIZES` carries.
+/// seeds `PRODUCTION` and the 1M shape `STOW_TRAFFIC_SIZES` carries.
 #[cfg(test)]
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
 
@@ -1533,6 +1533,15 @@ const SEED_TABLES: &[&str] = &[
     // that are pending in the new shape, a chain whose depth grows
     // with the size delta (stow#588).
     "task_nodes",
+    // The feed tables are fixture state the same way: the feed phases
+    // write them `INSERT OR IGNORE` with ids that roll from 1, so the
+    // previous size's rows survive the wipe untouched — a larger
+    // fixture's retained pages and staged bulk persist into the
+    // smaller shape, and the feed drives measure a live window sized
+    // for the old fixture (stow#772 — the `cleanup disturbed live
+    // bulk` breach, same defect class as `task_nodes`).
+    "demand_feed_pages",
+    "demand_feed_hours",
 ];
 
 /// `POST /budget/seed` — load the fixture through the operator path,
@@ -1924,6 +1933,86 @@ mod tests {
         assert!(
             reset_ns.len() > 5 && reset_ns.windows(2).all(|pair| pair[1] > pair[0]),
             "reset's n is rows wiped so far — strictly increasing across calls: {reset_ns:?}"
+        );
+    }
+
+    /// The reset wipe's table list is the seed's whole write set: a
+    /// reset seed at a smaller size must leave the feed tables holding
+    /// exactly the new shape's rows. The feed phases insert `OR
+    /// IGNORE` with ids that roll from 1, so anything the smaller seed
+    /// does not write is stale bulk surviving the wipe (stow#772 — the
+    /// 1M fixture's staged pages persisted into the 100k shape and the
+    /// cleanup drive read them as live bulk).
+    #[tokio::test]
+    async fn reset_seed_clears_the_feed_tables_the_seed_writes() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        let run = |reset, queue_rows| {
+            let db = &db;
+            let settings = &settings;
+            async move {
+                let mut first = true;
+                loop {
+                    let report = seed(
+                        db,
+                        &SchedulerSeedRequest {
+                            queue_rows: Some(queue_rows),
+                            reset: Some(reset && first),
+                            batch: Some(50),
+                        },
+                        settings,
+                    )
+                    .await
+                    .expect("seed call");
+                    first = false;
+                    if report.done {
+                        return;
+                    }
+                }
+            }
+        };
+
+        run(false, 800).await;
+        // Both shapes clamp to the same hour count at these sizes, so
+        // a stale header — and a stale page under it — is planted to
+        // stand in for history a larger fixture leaves.
+        db.query(
+            "INSERT INTO demand_feed_hours (hour, generation, state) \
+             VALUES ('1900-01-01T00', 1, 'delivered')",
+        )
+        .execute()
+        .await
+        .expect("plant stale hour");
+        db.query(
+            "INSERT INTO demand_feed_pages \
+             (hour, generation, page_no, entry_count, page_hash, chain_hash, payload) \
+             VALUES ('1900-01-01T00', 1, 0, 1, 'x', 'x', 'x')",
+        )
+        .execute()
+        .await
+        .expect("plant stale page");
+        run(true, 200).await;
+
+        let small = FixtureShape { queue_rows: 200 };
+        let hours = db
+            .query("SELECT COUNT(*) FROM demand_feed_hours")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count hours");
+        assert_eq!(
+            hours,
+            i64::from(feed_hist_hours(small)) + 1,
+            "seeded history headers plus the staging hour — no stale rows"
+        );
+        let pages = db
+            .query("SELECT COUNT(*) FROM demand_feed_pages")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count pages");
+        assert_eq!(
+            pages,
+            i64::from(feed_hist_pages(small) + feed_staged_pages(small) + FEED_OBSOLETE_TAIL),
+            "retained pages plus staging bulk and its obsolete tail — no stale rows"
         );
     }
 

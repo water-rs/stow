@@ -1,27 +1,20 @@
-//! `stow-admin launch-load` — the stow#452 mock-stack load test driver.
+//! The traffic lanes the Traffic cost test fires — one lane per kind
+//! of user or operator request the launch model counts. The peak drive
+//! (`peak.rs`) paces every lane at the model's peak rate; the Worker CPU
+//! measurement (`cpu.rs`) fires each lane alone under the isolate's CPU
+//! profiler. Both build their lanes here, so the request a CPU number
+//! prices is the request the peak drive sends.
 //!
-//! The driver reads `launch-model.toml` and fires each lane at its
-//! peak-hour rate for `--duration-secs` (the issue's thirty minutes by
-//! default). The public lanes need no credential; `--scheduler` adds
-//! the trusted lanes on the operator bearer, `--webhook-secret` adds
-//! the `workflow_run` callback lane signed under the mock's
+//! The public lanes need no credential; `--scheduler` adds the trusted
+//! lanes on the operator bearer, `--webhook-secret` adds the
+//! `workflow_run` callback lane signed under the mock's
 //! `STOW_GITHUB_WEBHOOK_SECRET`, and `--pow-secret` adds the untrusted
 //! miss lanes — real `POST /api/v1/admissions` calls, and `POST
-//! /api/v1/enqueue` redemptions on tickets the driver mints itself
-//! under the mock's `STOW_POW_CHALLENGE_SECRET`. Alarm passes are
-//! never fired directly — the submits, mutations and completions the
-//! lanes drive arm the dispatch alarm, which is exactly how production
-//! earns them.
-//!
-//! Per lane it reports request count, the effective rate, p50/p99
-//! latency and the status mix, and the run exits nonzero on a breach:
-//! any `overload` signal (a 429/503 or an `overload` marker in the
-//! body), a lane's error share over 1%, or a lane p99 over its bound.
-//! The per-route row counts under load come from the
-//! `scheduler-budget` probe — `scripts/launch-load.sh` runs it before
-//! and after the driver and gates on both reports.
+//! /api/v1/enqueue` redemptions on tickets minted under the mock's
+//! `STOW_POW_CHALLENGE_SECRET`. Alarm passes are never fired directly —
+//! the submits, mutations and completions the lanes drive arm the
+//! dispatch alarm, which is exactly how production earns them.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,26 +32,18 @@ use stow_types::fixture::{
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::pow::enqueue_pow_zero_bits;
-use stow_types::stow_error;
 
 use zenwave::Client;
 
 use crate::Edge;
-use crate::render::{Output, Table, emit};
 
-/// The load driver — `stow-admin launch-load`.
+/// Which lanes run and what they name — shared by the peak drive and
+/// the CPU measurement.
 #[derive(Debug, Args)]
-pub struct LaunchLoadArgs {
+pub struct LaneArgs {
     /// The checked-in launch model.
     #[arg(long, default_value = "launch-model.toml")]
     pub model: PathBuf,
-    /// Seconds the run lasts — stow#452's thirty minutes by default.
-    #[arg(long, default_value_t = 1800)]
-    pub duration_secs: u64,
-    /// Multiplier over the model's peak-hour rate — `--rate-scale 0.1`
-    /// for a smoke run, `1.0` for the launch rate.
-    #[arg(long, default_value_t = 1.0)]
-    pub rate_scale: f64,
     /// Also drive the trusted scheduler lanes (`/api/v1/admin/*`,
     /// `/api/v1/scheduler/tasks/submit`) on the operator bearer —
     /// requires the push-capable credential CI carries.
@@ -70,35 +55,33 @@ pub struct LaunchLoadArgs {
     #[arg(long)]
     pub webhook_secret: Option<String>,
     /// Queue rows the seeded fixture holds — picks the task ids the
-    /// mutation and callback lanes name. The harness seeds 100k.
+    /// mutation and callback lanes name.
     #[arg(long, default_value_t = 100_000)]
     pub queue_rows: u64,
     /// The rustc the seeded rows and synthetic tasks name.
     #[arg(long, default_value = "1.85.0")]
     pub rustc: String,
-    /// Per-lane p99 bound in milliseconds — the serialization sanity
-    /// check, not a latency SLO.
-    #[arg(long, default_value_t = 10_000.0)]
-    pub p99_bound_ms: f64,
     /// Comma-separated lane names to run instead of the full set — a
-    /// debugging aid; the harness runs them all.
+    /// debugging aid; the test runs them all.
     #[arg(long, value_delimiter = ',')]
     pub lanes: Vec<String>,
     /// Mint the redemption lane's tickets under this challenge secret —
     /// the mock manifest's `STOW_POW_CHALLENGE_SECRET`
-    /// (`mock-pow-challenge-secret`). With it the driver fires the
-    /// untrusted `admissions` and `enqueue` lanes; without it they stay
-    /// off.
+    /// (`mock-pow-challenge-secret`). With it the `admissions` and
+    /// `enqueue` lanes run; without it they stay off.
     #[arg(long)]
     pub pow_secret: Option<String>,
     /// Leading-zero bits the redemption lane's tickets solve to — the
     /// mock manifest's `STOW_POW_MIN_BITS` (default 12).
     #[arg(long, default_value_t = DEFAULT_POW_MIN_BITS)]
     pub pow_min_bits: u32,
+    /// A bundle digest the mock registry holds (`stow-mock-registry
+    /// put-blob`): the bundle lane streams it instead of asking for
+    /// rotating absent digests, so it pays the covered-fetch path a
+    /// CLI byte-path fetch pays.
+    #[arg(long)]
+    pub bundle_digest: Option<String>,
 }
-
-/// Lane error share the run tolerates before it fails — one percent.
-const ERROR_RATE_BOUND: f64 = 0.01;
 
 /// A response that takes this long under the mock stack is a stall,
 /// not slowness: an unanswered request would otherwise freeze its lane
@@ -106,21 +89,24 @@ const ERROR_RATE_BOUND: f64 = 0.01;
 /// `join_all` would sit until the CI job's timeout kills the whole
 /// load run. The lane scores a stall as a transport error, the same
 /// signal any other failed request leaves.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What one lane event is.
 #[derive(Debug)]
-enum Fire {
+pub enum Fire {
     /// Round-robin `GET`s over public paths.
     PublicGet(Vec<String>),
     /// `GET /api/v1/index/{target}/{rustc}` then the digest-addressed
     /// slice when a pointer answers — the pull's two requests.
     IndexPull { target: String, rustc: String },
-    /// `GET /api/v1/bundles/{rustc}/sha256:{counter}` — rotating
-    /// synthetic digests under the run's rustc; the 404 is the miss the
-    /// launch fleet sees on an uncovered unit, and it still costs the
-    /// full route.
-    BundleFetch { rustc: String },
+    /// `GET /api/v1/bundles/{rustc}/{digest}` — the stored `digest`
+    /// when one is given (the covered fetch), else rotating synthetic
+    /// digests under the run's rustc, whose 404 is the miss the launch
+    /// fleet sees on an uncovered unit and still costs the full route.
+    BundleFetch {
+        rustc: String,
+        digest: Option<String>,
+    },
     /// `GET /api/v1/requests/{request_id}` over the seeded request
     /// records — alternates the `enqueued` record (whose read re-probes
     /// its stored roots into live queue rows) with the `failed` record.
@@ -154,64 +140,24 @@ enum Fire {
 
 /// One lane: what to fire, at what peak rate, and which statuses are
 /// the route working as designed (a bundle 404 is the miss path).
-struct Lane {
-    /// Report label.
-    name: &'static str,
+pub struct Lane {
+    /// Report label — also the key of the lane's Worker CPU budget.
+    pub name: &'static str,
     /// Events per second at the peak rate the run drives.
-    eps: f64,
+    pub eps: f64,
     /// What one event does.
-    fire: Fire,
+    pub fire: Fire,
     /// Statuses the lane accepts as designed work.
-    expected: fn(u16) -> bool,
-}
-
-/// Per-lane measurements over the run.
-#[derive(Debug, Default, serde::Serialize)]
-struct LaneStats {
-    /// Requests the lane fired.
-    requests: u64,
-    /// The rate it actually drove.
-    effective_eps: f64,
-    /// Median latency in milliseconds.
-    p50_ms: f64,
-    /// 99th-percentile latency.
-    p99_ms: f64,
-    /// Transport failures (connect, timeout, stream).
-    transport_errors: u64,
-    /// 5xx responses.
-    server_errors: u64,
-    /// Responses outside the lane's expected status set.
-    unexpected_statuses: u64,
-    /// `overload` signals — a 429/503 or the marker string in a body.
-    overloaded: u64,
-    /// Status histogram.
-    statuses: BTreeMap<u16, u64>,
-    /// Raw per-request latencies — the percentiles summarize it; kept
-    /// out of the emitted JSON.
-    #[serde(skip)]
-    latencies_ms: Vec<f64>,
+    pub expected: fn(u16) -> bool,
 }
 
 /// One fired request's outcome.
-enum Outcome {
+pub enum Outcome {
     /// A response arrived: its status and whether the body or the
     /// status itself signalled overload.
     Response { status: u16, overloaded: bool },
     /// The request never completed — connect, timeout, stream error.
     Transport(String),
-}
-
-/// The driver's report — one entry per lane plus the verdict.
-#[derive(Debug, serde::Serialize)]
-struct LoadReport {
-    /// Seconds the run lasted.
-    duration_secs: u64,
-    /// `rate_scale` the lanes ran at.
-    rate_scale: f64,
-    /// Per-lane stats keyed by lane name.
-    lanes: BTreeMap<&'static str, LaneStats>,
-    /// Every breach the verdict names; empty on a pass.
-    breaches: Vec<String>,
 }
 
 /// The queue-order shape the seeded ids come from —
@@ -248,9 +194,6 @@ fn failed_task_id(k: u64, queue_rows: u64) -> String {
 /// the same eight task ids — the lane exercises the resubmit path;
 /// the fresh-row inserts come from the miss lanes' per-counter
 /// features.
-/// the same eight task ids — the lane exercises the resubmit path;
-/// the fresh-row inserts come from the miss lanes' per-counter
-/// features.
 const SUBMIT_POOL: &[(&str, &str)] = &[
     ("cfg-if", "1.0.0"),
     ("scopeguard", "1.2.0"),
@@ -276,7 +219,7 @@ fn sign_body(secret: &str, body: &[u8]) -> String {
 /// build workflow's path, `main`, `workflow_dispatch`, and a
 /// `<rustc>-<task_id>` title. The `id`/`run_attempt` pair names the
 /// build whose records tag the edge looks up, so it is the fixture
-/// row's own index — the value `launch-load.sh` pushes each dispatched
+/// row's own index — the value `traffic-cost.sh` pushes each dispatched
 /// row's records artifact under.
 fn workflow_run_body(task_id: &str, rustc: &str, run_id: u64) -> String {
     serde_json::json!({
@@ -505,10 +448,15 @@ async fn plan(
             })
         }
         Fire::IndexPull { target, rustc } => plan_index_pull(base, target, rustc, client).await,
-        Fire::BundleFetch { rustc } => {
-            let digest = format!("{:064x}", counter.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        Fire::BundleFetch { rustc, digest } => {
+            let digest = digest.clone().unwrap_or_else(|| {
+                format!(
+                    "sha256:{:064x}",
+                    counter.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                )
+            });
             Ok(Plan::Get {
-                url: format!("{base}/api/v1/bundles/{rustc}/sha256:{digest}"),
+                url: format!("{base}/api/v1/bundles/{rustc}/{digest}"),
                 bearer: None,
             })
         }
@@ -552,7 +500,7 @@ async fn plan(
             queue_rows,
         } => {
             // The run id is the fixture row's own index, not the lane
-            // counter: `launch-load.sh` pushes each dispatched row's
+            // counter: `traffic-cost.sh` pushes each dispatched row's
             // records artifact under run id k, and the records tag's
             // per-build suffix is what the edge's existence check
             // resolves the delivery to.
@@ -591,7 +539,7 @@ async fn plan(
 }
 
 /// Fire one lane event; returns the response outcome.
-async fn fire_once(
+pub async fn fire_once(
     fire: &Fire,
     edge: &Edge,
     client: &mut zenwave::DefaultClient,
@@ -680,115 +628,11 @@ fn ok_or_404(status: u16) -> bool {
     ok2xx(status) || status == 404
 }
 
-/// Fire `fire` every `interval` until `duration` elapses — the pacing
-/// loop every lane runs. Beats are anchored to each event's start (a
-/// response slower than the interval waits nothing), but the tail
-/// sleep wakes AT the deadline rather than running on to the next
-/// beat: under the launch model's slowest lanes the rate floor
-/// (0.005eps) makes the interval 200s, so a lane that fired at 0/200/400
-/// in a 450s segment used to sleep from 400s to 600s — every segment
-/// in queue run 36945779831 read 600s for that reason. An event still
-/// in flight at the deadline completes on its own [`REQUEST_TIMEOUT`]:
-/// it was scheduled inside the segment, so its latency counts, and
-/// cancelling it would report a fake transport error into the
-/// error-share gate. The clock is `tokio::time`'s so the boundary
-/// cases run under a paused clock.
-async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncFnMut(u64)) {
-    let deadline = tokio::time::Instant::now() + duration;
-    let mut counter = 0u64;
-    loop {
-        let fired = tokio::time::Instant::now();
-        fire(counter).await;
-        counter += 1;
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let wake = (fired + interval).min(deadline);
-        if now < wake {
-            tokio::time::sleep_until(wake).await;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-    }
-}
-
-/// Run one lane to the deadline, pacing at `eps`.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "request counts and percentile indices are tiny"
-)]
-async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
-    let mut client = zenwave::client();
-    let mut stats = LaneStats::default();
-    let interval = Duration::from_secs_f64(1.0 / lane.eps.max(1e-4));
-    let fire = async |counter: u64| {
-        let fired = tokio::time::Instant::now();
-        // A response the edge never sends cannot stall the run: the
-        // deadline check happens between fires, so bound each one.
-        let outcome = tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            fire_once(&lane.fire, edge, &mut client, counter),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Ok(Outcome::Transport(format!(
-                "lane request exceeded {}s",
-                REQUEST_TIMEOUT.as_secs()
-            )))
-        });
-        match outcome {
-            Ok(Outcome::Response { status, overloaded }) => {
-                *stats.statuses.entry(status).or_default() += 1;
-                if (500..600).contains(&status) {
-                    stats.server_errors += 1;
-                }
-                if !(lane.expected)(status) {
-                    stats.unexpected_statuses += 1;
-                }
-                if overloaded {
-                    stats.overloaded += 1;
-                }
-            }
-            Ok(Outcome::Transport(error)) => {
-                stats.transport_errors += 1;
-                tracing::debug!(lane = lane.name, %error, "request failed");
-            }
-            Err(error) => {
-                stats.transport_errors += 1;
-                tracing::warn!(lane = lane.name, %error, "lane request build failed");
-            }
-        }
-        stats
-            .latencies_ms
-            .push(fired.elapsed().as_secs_f64() * 1000.0);
-        stats.requests += 1;
-    };
-    run_paced(interval, duration, fire).await;
-    let mut sorted = std::mem::take(&mut stats.latencies_ms);
-    sorted.sort_by(f64::total_cmp);
-    let percentile = |p: f64| -> f64 {
-        if sorted.is_empty() {
-            return 0.0;
-        }
-        let index = (((sorted.len() - 1) as f64) * p).round() as usize;
-        sorted[index.min(sorted.len() - 1)]
-    };
-    stats.p50_ms = percentile(0.5);
-    stats.p99_ms = percentile(0.99);
-    stats.latencies_ms = sorted;
-    stats.effective_eps = stats.requests as f64 / duration.as_secs_f64();
-    stats
-}
-
 /// Build this run's lane set — the public lanes always, the trusted
 /// scheduler lanes behind `--scheduler`, the signed callback lane
-/// behind `--webhook-secret`.
-fn build_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
-    let scale = args.rate_scale;
+/// behind `--webhook-secret` — each at `scale` × the model's peak rate,
+/// narrowed to `--lanes` when given.
+pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<Vec<Lane>, String> {
     let eps = |kind: EventKind| model.peak_events_per_second(kind) * scale;
 
     let mut lanes = vec![
@@ -822,6 +666,7 @@ fn build_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
             eps: eps(EventKind::CliBytePathFetch),
             fire: Fire::BundleFetch {
                 rustc: args.rustc.clone(),
+                digest: args.bundle_digest.clone(),
             },
             expected: ok_or_404,
         },
@@ -833,7 +678,7 @@ fn build_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
         },
     ];
     if args.scheduler {
-        lanes.extend(scheduler_lanes(args, model));
+        lanes.extend(scheduler_lanes(args, model, scale));
     }
     if let Some(secret) = &args.pow_secret {
         lanes.extend([
@@ -870,16 +715,20 @@ fn build_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
             expected: ok2xx,
         });
     }
-
-    lanes
+    if !args.lanes.is_empty() {
+        lanes.retain(|lane| args.lanes.iter().any(|name| name == lane.name));
+        if lanes.is_empty() {
+            return Err(format!("no lane matches --lanes {}", args.lanes.join(",")));
+        }
+    }
+    Ok(lanes)
 }
 
 /// The `--scheduler` lanes — the trusted surface's admin reads, a queue
 /// mutation, and the human-lane submits (the miss lanes' enqueues fire
 /// on their own routes, so `trusted-submit` carries only the model's
 /// human traffic).
-fn scheduler_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
-    let scale = args.rate_scale;
+fn scheduler_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Vec<Lane> {
     let eps = |kind: EventKind| model.peak_events_per_second(kind) * scale;
     vec![
         Lane {
@@ -914,233 +763,42 @@ fn scheduler_lanes(args: &LaunchLoadArgs, model: &LaunchModel) -> Vec<Lane> {
     ]
 }
 
-/// `stow-admin launch-load` — fire the lanes, then emit the report and
-/// exit nonzero on a breach.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "request counts are tiny next to f64's mantissa"
-)]
-pub async fn run(
-    edge: &Edge,
-    args: &LaunchLoadArgs,
-    output: Output,
-) -> stow_types::error::Result<()> {
-    let model_text = tokio::fs::read_to_string(&args.model)
-        .await
-        .map_err(|error| stow_error!("read launch model {}: {error}", args.model.display()))?;
-    let model = LaunchModel::from_toml(&model_text)
-        .map_err(|error| stow_error!("load launch model {}: {error}", args.model.display()))?;
-    let mut lanes = build_lanes(args, &model);
-    if !args.lanes.is_empty() {
-        lanes.retain(|lane| args.lanes.iter().any(|name| name == lane.name));
-        if lanes.is_empty() {
-            return Err(stow_error!(
-                "no launch-load lane matches --lanes {}",
-                args.lanes.join(",")
-            ));
-        }
-    }
-
-    let duration = Duration::from_secs(args.duration_secs);
-    let results =
-        futures_util::future::join_all(lanes.iter().map(|lane| run_lane(lane, edge, duration)))
-            .await;
-
-    let mut lanes_map = BTreeMap::new();
-    let mut breaches = Vec::new();
-    for (lane, stats) in lanes.iter().zip(results) {
-        let total = stats.requests.max(1) as f64;
-        let error_share = (stats.transport_errors + stats.server_errors) as f64 / total;
-        if error_share > ERROR_RATE_BOUND {
-            breaches.push(format!(
-                "{}: error share {:.1}% over {:.0}%",
-                lane.name,
-                error_share * 100.0,
-                ERROR_RATE_BOUND * 100.0
-            ));
-        }
-        if stats.unexpected_statuses > 0 {
-            breaches.push(format!(
-                "{}: {} unexpected statuses",
-                lane.name, stats.unexpected_statuses
-            ));
-        }
-        if stats.overloaded > 0 {
-            breaches.push(format!(
-                "{}: {} overload signal(s) — the DO serialization bound",
-                lane.name, stats.overloaded
-            ));
-        }
-        if stats.p99_ms > args.p99_bound_ms {
-            breaches.push(format!(
-                "{}: p99 {:.0}ms over the {:.0}ms bound",
-                lane.name, stats.p99_ms, args.p99_bound_ms
-            ));
-        }
-        lanes_map.insert(lane.name, stats);
-    }
-    let report = LoadReport {
-        duration_secs: args.duration_secs,
-        rate_scale: args.rate_scale,
-        lanes: lanes_map,
-        breaches,
-    };
-    emit(output, &report, render_report)?;
-    if report.breaches.is_empty() {
-        Ok(())
-    } else {
-        Err(stow_error!(
-            "launch-load: {} breach(es)",
-            report.breaches.len()
-        ))
-    }
-}
-
-/// Human rendering — per-lane rate/latency/status table plus the
-/// verdict lines.
-fn render_report(report: &LoadReport) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let mut table = Table::new(&[
-        "lane",
-        "reqs",
-        "eff eps",
-        "p50 ms",
-        "p99 ms",
-        "errs",
-        "unexpected",
-        "overload",
-        "statuses",
-    ]);
-    for (name, stats) in &report.lanes {
-        let statuses = stats
-            .statuses
-            .iter()
-            .map(|(status, count)| format!("{status}×{count}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        table.push([
-            (*name).to_owned(),
-            stats.requests.to_string(),
-            format!("{:.3}", stats.effective_eps),
-            format!("{:.0}", stats.p50_ms),
-            format!("{:.0}", stats.p99_ms),
-            (stats.transport_errors + stats.server_errors).to_string(),
-            stats.unexpected_statuses.to_string(),
-            stats.overloaded.to_string(),
-            statuses,
-        ]);
-    }
-    let _ = writeln!(out, "{}", table.render());
-    if report.breaches.is_empty() {
-        let _ = writeln!(out, "\nlaunch-load: PASS");
-    } else {
-        let _ = writeln!(out, "\nlaunch-load: FAIL");
-        for breach in &report.breaches {
-            let _ = writeln!(out, "  {breach}");
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Duration, run_paced};
-    use tokio::time::Instant;
+    use stow_types::do_budgets::WORKER_CPU_BUDGETS;
+    use stow_types::launch_model::LaunchModel;
 
-    /// Run `run_paced` under the paused clock and return every event's
-    /// virtual fire instant plus the virtual instant the run returned —
-    /// each event spends `work` in flight before its call completes.
-    /// `run_paced` awaits `fire` sequentially, so the closure holds the
-    /// recording vec by `&mut` alone.
-    async fn run_recording(
-        interval: Duration,
-        duration: Duration,
-        work: Duration,
-    ) -> (Vec<Duration>, Duration) {
-        let start = Instant::now();
-        let mut seen = Vec::new();
-        run_paced(interval, duration, async |_counter: u64| {
-            seen.push(Instant::now() - start);
-            tokio::time::sleep(work).await;
-        })
-        .await;
-        (seen, Instant::now() - start)
-    }
+    use super::{LaneArgs, build_lanes};
 
-    /// The defect this fixes: a 0.005eps lane (200s interval) in a 450s
-    /// segment fires at 0/200/400 and must end AT the 450s deadline —
-    /// the old pacing slept the tail to the 600s beat.
-    #[tokio::test(start_paused = true)]
-    async fn run_ends_at_deadline_not_next_beat() {
-        let (fires, elapsed) = run_recording(
-            Duration::from_secs(200),
-            Duration::from_secs(450),
-            Duration::ZERO,
-        )
-        .await;
-        assert_eq!(
-            fires,
-            [0, 200, 400].map(Duration::from_secs),
-            "fires only land inside the segment",
-        );
-        assert_eq!(
-            elapsed,
-            Duration::from_secs(450),
-            "run ends at the deadline"
-        );
-    }
-
-    /// A run shorter than its lane's interval still ends at its
-    /// deadline, not at the first beat.
-    #[tokio::test(start_paused = true)]
-    async fn short_run_ends_at_deadline() {
-        let (fires, elapsed) = run_recording(
-            Duration::from_secs(200),
-            Duration::from_secs(45),
-            Duration::ZERO,
-        )
-        .await;
-        assert_eq!(fires, [Duration::ZERO]);
-        assert_eq!(elapsed, Duration::from_secs(45));
-    }
-
-    /// An event landing exactly on the deadline is not fired — the
-    /// segment is `[start, deadline)`. With a 10s interval and 30s run
-    /// the beats are 0/10/20 and the run still returns at 30s.
-    #[tokio::test(start_paused = true)]
-    async fn beat_on_deadline_is_not_fired() {
-        let (fires, elapsed) = run_recording(
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::ZERO,
-        )
-        .await;
-        assert_eq!(fires, [0, 10, 20].map(Duration::from_secs));
-        assert_eq!(elapsed, Duration::from_secs(30));
-    }
-
-    /// An event slower than the interval waits nothing before the next
-    /// fire — pacing anchors to the fire's start — and an in-flight
-    /// event at the deadline completes instead of being cut (cancelling
-    /// would report a fake transport error).
-    #[tokio::test(start_paused = true)]
-    async fn slow_events_wait_nothing_and_complete() {
-        let (fires, elapsed) = run_recording(
-            Duration::from_secs(1),
-            Duration::from_secs(4),
-            Duration::from_millis(1500),
-        )
-        .await;
-        assert_eq!(
-            fires,
-            [0, 1500, 3000].map(Duration::from_millis),
-            "back-to-back fires when the event outlasts the interval",
-        );
-        assert_eq!(
-            elapsed,
-            Duration::from_millis(4500),
-            "the in-flight event completes past the deadline",
-        );
+    /// The full lane set and the Worker CPU budget table name the same
+    /// lanes: a lane without a budget would be measured and never gated,
+    /// a budget without a lane would gate nothing.
+    #[test]
+    fn every_lane_has_a_cpu_budget_and_every_budget_a_lane() {
+        let model =
+            LaunchModel::from_toml(include_str!("../../../launch-model.toml")).expect("model");
+        let args = LaneArgs {
+            model: "launch-model.toml".into(),
+            scheduler: true,
+            webhook_secret: Some("secret".to_owned()),
+            queue_rows: 100_000,
+            rustc: "1.85.0".to_owned(),
+            lanes: Vec::new(),
+            pow_secret: Some("secret".to_owned()),
+            pow_min_bits: 12,
+            bundle_digest: None,
+        };
+        let mut lanes: Vec<&str> = build_lanes(&args, &model, 1.0)
+            .expect("lanes")
+            .iter()
+            .map(|lane| lane.name)
+            .collect();
+        let mut budgets: Vec<&str> = WORKER_CPU_BUDGETS
+            .iter()
+            .map(|budget| budget.lane)
+            .collect();
+        lanes.sort_unstable();
+        budgets.sort_unstable();
+        assert_eq!(lanes, budgets);
     }
 }
