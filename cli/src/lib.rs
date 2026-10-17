@@ -715,11 +715,12 @@ pub(crate) struct BuildContext {
     pub(crate) analysis: std::sync::Arc<std::sync::OnceLock<AnalysisFacts>>,
     /// The "the serve map is final" signal `AwaitServeMap` frames wait
     /// on — and the "the build's slice fetch has settled" signal the
-    /// slice memo's missing-slice read waits on (stow#735): `run_cargo`
-    /// shares the enrichment's with the supervisor and completes it
-    /// itself when no fetch is in flight; the standalone wrapper's
-    /// settles by construction — a driver with no pending map answers
-    /// at once (stow#347).
+    /// slice memo's missing-slice read (stow#735) and pending-slice
+    /// miss retry (stow#797) wait on: `run_cargo` shares the
+    /// enrichment's with the supervisor and completes it itself when no
+    /// fetch is in flight; the standalone wrapper's settles by
+    /// construction — a driver with no pending map answers at once
+    /// (stow#347).
     pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
     /// The "the cache policy's allow set is committed" signal the plan
     /// path waits on when an invocation's marker is absent
@@ -1563,9 +1564,11 @@ pub(crate) struct WrapperEnvCache {
     path: OsString,
     /// The verified index slices this build's lookups read — the driver's
     /// fetch can still be in flight when cargo starts, so a miss waits
-    /// on `serve_map_ready` before its answer is memoized (stow#735);
-    /// each slice is decoded and keyed once per `(target, rustc)`
-    /// instead of once per rustc invocation (stow#347).
+    /// on `serve_map_ready` before its answer is memoized (stow#735),
+    /// and a stale-but-readable slice memoizes with a `fetch_pending`
+    /// flag that lets a later miss wait, refresh, and retry once
+    /// (stow#797); each slice is decoded and keyed once per
+    /// `(target, rustc)` instead of once per rustc invocation (stow#347).
     slices: MemoizedSliceMap,
     /// The circuit's tripped state, read once for the build and kept in
     /// step by the build's own recordings.
@@ -1590,9 +1593,81 @@ type MemoizedBaseMap = std::sync::Mutex<
 type MemoizedSliceMap = std::sync::Mutex<
     std::collections::HashMap<
         (String, String),
-        std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<SliceIndex>>>>,
+        std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<SliceMemo>>>,
     >,
 >;
+
+/// One build's memoized answer for an index slice: the freshest decoded
+/// slice the cache has handed it plus whether the build's own fetch
+/// could still replace it — `slice_fetch_pending` decided once, when
+/// the memo is filled, so no invocation pays a pointer read (stow#797).
+/// A lookup that misses on a pending slice waits out `serve_map_ready`,
+/// [`SliceMemo::refresh`] swaps in what the fetch landed — every later
+/// invocation sees it — and the serves retry once; a hit never waits,
+/// and a miss on a settled slice never does either.
+#[derive(Debug)]
+struct SliceMemo {
+    inner: std::sync::Mutex<SliceMemoState>,
+}
+
+#[derive(Debug)]
+struct SliceMemoState {
+    /// The freshest decoded slice this build has read; `refresh`
+    /// replaces it with what the settled fetch landed.
+    slice: Option<std::sync::Arc<SliceIndex>>,
+    /// `slice_fetch_pending` at fill: `true` while the build's fetch may
+    /// still land rows this slice lacks. `false` once the memo was
+    /// filled from the settled answer or a miss's `refresh` took it — a
+    /// fetch that has already landed cannot be waited out twice.
+    fetch_pending: bool,
+}
+
+impl SliceMemo {
+    fn new(slice: Option<SliceIndex>, fetch_pending: bool) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(SliceMemoState {
+                slice: slice.map(std::sync::Arc::new),
+                fetch_pending,
+            }),
+        }
+    }
+
+    /// The memo's answer as one pair under one lock — the slice and its
+    /// pending flag can never describe different generations, which is
+    /// what a racing `refresh` would otherwise allow (stow#797).
+    fn read(&self) -> (Option<std::sync::Arc<SliceIndex>>, bool) {
+        let state = self.inner.lock().expect("slice memo mutex");
+        (state.slice.clone(), state.fetch_pending)
+    }
+
+    /// A pending miss's second answer: the fetch `serve_map_ready`
+    /// gated has settled, so read the cache once more and make its
+    /// answer the build's — every later lookup sees this slice. The
+    /// flag clears with the swap: a settled fetch cannot be waited out
+    /// again, and a sibling that already refreshed short-circuits the
+    /// re-read.
+    async fn refresh(
+        &self,
+        config: &StowConfig,
+        target: &str,
+        rustc_version: &str,
+    ) -> stow_types::error::Result<Option<std::sync::Arc<SliceIndex>>> {
+        {
+            let state = self.inner.lock().expect("slice memo mutex");
+            if !state.fetch_pending {
+                return Ok(state.slice.clone());
+            }
+        }
+        let slice = match index::cached_slice(config, target, rustc_version).await? {
+            Some(slice) => Some(smol::unblock(move || SliceIndex::new(slice)).await),
+            None => None,
+        };
+        let mut state = self.inner.lock().expect("slice memo mutex");
+        state.slice = slice.map(std::sync::Arc::new);
+        state.fetch_pending = false;
+        Ok(state.slice.clone())
+    }
+}
 
 /// Whether the facade's `spelling` and the seeded base's `target` rustc
 /// are the same file — bare names resolved through `path`, the
@@ -1692,15 +1767,18 @@ impl WrapperEnvCache {
     /// invocation. A missing slice may still be in flight — the driver's
     /// fetch runs beside cargo's build, not before it — so absence is
     /// memoized only after `serve_map_ready` says the build's fetch has
-    /// settled (stow#735); an error is not — it keeps today's
-    /// retry-and-warn semantics for a transient read failure.
+    /// settled (stow#735); a stale-but-readable slice memoizes at once
+    /// but flagged `fetch_pending`, so a lookup that misses on it waits
+    /// the fetch out and retries once against what it landed (stow#797).
+    /// An error is not memoized — it keeps today's retry-and-warn
+    /// semantics for a transient read failure.
     async fn slice(
         &self,
         config: &StowConfig,
         target: &str,
         rustc_version: &str,
         serve_map_ready: &crate::facade::ServeMapSignal,
-    ) -> stow_types::error::Result<Option<std::sync::Arc<SliceIndex>>> {
+    ) -> stow_types::error::Result<std::sync::Arc<SliceMemo>> {
         let key = (target.to_owned(), rustc_version.to_owned());
         let cell = self
             .slices
@@ -1710,33 +1788,40 @@ impl WrapperEnvCache {
             .or_default()
             .clone();
         cell.get_or_try_init(|| async {
-            let slice = if let Some(slice) =
-                index::cached_slice(config, target, rustc_version).await?
-            {
-                slice
-            } else {
-                // The fetch can still be in flight when cargo starts:
-                // wait out the build's `serve_map_ready`, then let the
-                // cache's second answer be the memoized one — only then
-                // is absence final for this build (stow#735).
-                let waited = std::time::Instant::now();
-                serve_map_ready.wait().await;
-                tracing::debug!(
-                    target = %target,
-                    rustc_version = %rustc_version,
-                    waited_ms = waited.elapsed().as_millis(),
-                    "index slice lookup waited for the build's fetch to settle"
-                );
-                let Some(slice) = index::cached_slice(config, target, rustc_version).await? else {
-                    return Ok(None);
-                };
-                slice
+            // Pending is decided once, here, and read *before* the
+            // slice: a fetch landing between the two answers then flags
+            // a fresh memo pending — one redundant retry a miss pays —
+            // where the other order can flag a stale memo settled,
+            // which is the stow#797 miss this flag exists to catch.
+            let fetch_pending = index::slice_fetch_pending(config, target, rustc_version).await;
+            if let Some(slice) = index::cached_slice(config, target, rustc_version).await? {
+                let index = smol::unblock(move || SliceIndex::new(slice)).await;
+                return Ok(std::sync::Arc::new(SliceMemo::new(
+                    Some(index),
+                    fetch_pending,
+                )));
+            }
+            // The fetch can still be in flight when cargo starts: wait
+            // out the build's `serve_map_ready`, then let the cache's
+            // second answer be the memoized one — only then is absence
+            // final for this build (stow#735). Its flag is settled: the
+            // fetch this signal gated has already been waited out.
+            let waited = std::time::Instant::now();
+            serve_map_ready.wait().await;
+            tracing::debug!(
+                target = %target,
+                rustc_version = %rustc_version,
+                waited_ms = waited.elapsed().as_millis(),
+                "index slice lookup waited for the build's fetch to settle"
+            );
+            let index = match index::cached_slice(config, target, rustc_version).await? {
+                // The lookup table is one entry per row the slice
+                // publishes, so it is built on a blocking thread like
+                // the decode behind it (stow#624).
+                Some(slice) => Some(smol::unblock(move || SliceIndex::new(slice)).await),
+                None => None,
             };
-            // The lookup table is one entry per row the slice publishes,
-            // so it is built on a blocking thread like the decode behind
-            // it (stow#624).
-            let index = smol::unblock(move || SliceIndex::new(slice)).await;
-            Ok::<_, stow_types::error::Error>(Some(std::sync::Arc::new(index)))
+            Ok::<_, stow_types::error::Error>(std::sync::Arc::new(SliceMemo::new(index, false)))
         })
         .await
         .cloned()
@@ -2009,8 +2094,9 @@ async fn try_remote_serves(
     // freshness, and a registry round trip on every rustc invocation is
     // exactly the cost the local index exists to remove. Absence is a
     // miss — but only once `serve_map_ready` says the build's fetch has
-    // settled (stow#735); an in-flight one is waited out first.
-    let slice = match env
+    // settled (stow#735); a readable-but-stale slice whose fetch is
+    // still in flight serves at once, flagged pending.
+    let memo = match env
         .env_cache
         .slice(
             &env.env_base.config,
@@ -2020,15 +2106,7 @@ async fn try_remote_serves(
         )
         .await
     {
-        Ok(Some(slice)) => slice,
-        Ok(None) => {
-            tracing::debug!(
-                target = %env.target,
-                rustc_version = %env.rustc_version,
-                "no cached index slice, skipping registry serves"
-            );
-            return RemoteServe::Miss;
-        }
+        Ok(memo) => memo,
         Err(error) => {
             tracing::debug!(
                 error = %error,
@@ -2039,13 +2117,91 @@ async fn try_remote_serves(
             return RemoteServe::Miss;
         }
     };
+    let (slice, fetch_pending) = memo.read();
+    let Some(slice) = slice else {
+        tracing::debug!(
+            target = %env.target,
+            rustc_version = %env.rustc_version,
+            "no cached index slice, skipping registry serves"
+        );
+        return RemoteServe::Miss;
+    };
+    let outcome = serves_against_slice(
+        env,
+        parsed,
+        request,
+        &slice,
+        exact_public_cache_allowed,
+        fetch_pending,
+        tally,
+    )
+    .await;
+    // A miss on a pending slice is provisional: the fetch the memo's
+    // flag saw still in flight can carry the row this lookup lacked.
+    // Wait it out, make its answer the build's memo — every later
+    // invocation reads it — and retry once. A hit never waits, and a
+    // miss on a settled slice never does either (stow#797).
+    if !matches!(outcome, RemoteServe::Miss) || !fetch_pending {
+        return outcome;
+    }
+    let waited = std::time::Instant::now();
+    ctx.serve_map_ready.wait().await;
+    tracing::debug!(
+        target = %env.target,
+        rustc_version = %env.rustc_version,
+        waited_ms = waited.elapsed().as_millis(),
+        "index slice miss waited for the build's fetch, retrying on its answer"
+    );
+    match memo
+        .refresh(&env.env_base.config, &env.target, &env.rustc_version)
+        .await
+    {
+        Ok(Some(slice)) => {
+            serves_against_slice(
+                env,
+                parsed,
+                request,
+                &slice,
+                exact_public_cache_allowed,
+                false,
+                tally,
+            )
+            .await
+        }
+        Ok(None) => RemoteServe::Miss,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                "failed to re-read the index slice after the fetch settled"
+            );
+            RemoteServe::Miss
+        }
+    }
+}
+
+/// The two registry serves over one decoded slice: exact first, then
+/// the semantic fallback when it is enabled and the exact path did not
+/// serve or disqualify the cache outright. `fetch_pending` marks the
+/// slice provisional — a miss on it records no negative-cache entry,
+/// the settled retry's does (stow#797).
+async fn serves_against_slice(
+    env: &WrapperEnvironment<'_>,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    slice: &SliceIndex,
+    exact_public_cache_allowed: bool,
+    fetch_pending: bool,
+    tally: &mut LookupTally,
+) -> RemoteServe {
     // A refusal does not end the lookup: the exact row may be unservable
     // while a differently-shaped semantic candidate still loads. Either
     // way, one refusal anywhere means no build should be enqueued —
     // `Refused` outranks `Miss` in the merge.
     let mut refused = false;
     if exact_public_cache_allowed {
-        match try_remote_exact_serve(env, parsed, request, &slice, tally).await {
+        match try_remote_exact_serve(env, parsed, request, slice, fetch_pending, tally).await {
             RemoteServe::Miss => {}
             RemoteServe::Refused => refused = true,
             outcome => return outcome,
@@ -2069,12 +2225,15 @@ async fn try_remote_serves(
 /// Resolve the exact artifact identity against the index slice, stream its
 /// bundle through the edge byte path, and serve it. `Miss` means the index
 /// carries no such artifact (or the negative cache already says so);
-/// `Bypass` means the artifact arrived but could not be used.
+/// `Bypass` means the artifact arrived but could not be used. While
+/// `fetch_pending` marks the slice provisional the miss records nothing:
+/// the negative cache asserts a settled absence (stow#797).
 async fn try_remote_exact_serve(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     slice: &SliceIndex,
+    fetch_pending: bool,
     tally: &mut LookupTally,
 ) -> RemoteServe {
     let negative_cache_hit = match circuit::negative_cache_contains(
@@ -2094,10 +2253,15 @@ async fn try_remote_exact_serve(
         return RemoteServe::Miss;
     }
     let Some(row) = slice.exact_row(request.c_metadata) else {
-        log_nonfatal_result(
-            "failed to record stow negative cache entry",
-            circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
-        );
+        // While the slice's fetch is in flight this absence is
+        // provisional — the fetched slice can carry the row — so the
+        // negative-cache write waits for the settled retry (stow#797).
+        if !fetch_pending {
+            log_nonfatal_result(
+                "failed to record stow negative cache entry",
+                circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
+            );
+        }
         return RemoteServe::Miss;
     };
     if !resolve::row_servable_on_host(row, env.host_glibc) {
@@ -2119,10 +2283,12 @@ async fn try_remote_exact_serve(
         // stale registry blob) after the slice was published. Remember the
         // miss locally until the next slice; the circuit stays closed.
         Err(fetch::FetchError::NotFound) => {
-            log_nonfatal_result(
-                "failed to record stow negative cache entry",
-                circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
-            );
+            if !fetch_pending {
+                log_nonfatal_result(
+                    "failed to record stow negative cache entry",
+                    circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
+                );
+            }
             RemoteServe::Miss
         }
         Err(error) => {
@@ -5146,11 +5312,19 @@ mod tests {
         .await
         .expect("write the slice the fetch landed");
         signal.complete();
-        let slice = lookup
-            .await
-            .expect("read the cached slice")
-            .expect("the slice the fetch landed is served");
-        assert_eq!(slice.slice.manifest_digest, digest);
+        let memo = lookup.await.expect("read the cached slice");
+        let (slice, fetch_pending) = memo.read();
+        assert_eq!(
+            slice
+                .expect("the slice the fetch landed is served")
+                .slice
+                .manifest_digest,
+            digest
+        );
+        assert!(
+            !fetch_pending,
+            "the fetch the fill-time wait covered has settled"
+        );
     }
 
     /// stow#735: once the build's fetch has settled, absence is final —
@@ -5170,6 +5344,8 @@ mod tests {
                 .slice(&config, TARGET, RUSTC, &signal)
                 .await
                 .expect("read the cached slice")
+                .read()
+                .0
                 .is_none(),
             "no slice once the fetch has settled reads as absent"
         );
@@ -5186,8 +5362,268 @@ mod tests {
                 .slice(&config, TARGET, RUSTC, &signal)
                 .await
                 .expect("read the cached slice")
+                .read()
+                .0
                 .is_none(),
             "the settled absence is memoized for the rest of the build"
+        );
+    }
+
+    /// stow#797: a stale-but-readable slice memoizes at once — a hit on
+    /// it never waits for the in-flight fetch — and the memo carries the
+    /// pending flag the miss path reads.
+    #[tokio::test]
+    async fn a_pending_slice_memoizes_at_once_flagged() {
+        const TARGET: &str = "x86_64-unknown-linux-gnu";
+        const RUSTC: &str = "1.91.1";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = env_base_test_config(&dir);
+        // A zero interval keeps every cached slice's fetch pending —
+        // the rule `fetch_slice` itself applies (stow#788).
+        config.index_refresh_interval = std::time::Duration::ZERO;
+        let digest = crate::index::write_cached_test_slice(
+            &config,
+            TARGET,
+            RUSTC,
+            &empty_test_index(TARGET, RUSTC),
+        )
+        .await
+        .expect("write the stale slice");
+        let cache = test_cache(std::ffi::OsStr::new(""));
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
+
+        // The signal stays pending for the whole test: if the fill
+        // waited on it, this read could never answer.
+        let memo = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cache.slice(&config, TARGET, RUSTC, &signal),
+        )
+        .await
+        .expect("a readable slice answers without waiting on the fetch")
+        .expect("read the cached slice");
+        let (slice, fetch_pending) = memo.read();
+        assert_eq!(
+            slice.expect("the stale slice serves").slice.manifest_digest,
+            digest
+        );
+        assert!(
+            fetch_pending,
+            "a slice whose fetch is in flight memoizes flagged pending"
+        );
+    }
+
+    /// The wrapper environment a remote-serve test needs: a real env
+    /// base over `config`, the build's `env_cache`, and an exact-only
+    /// request keyed by `c_metadata` — the dead test registry stands in
+    /// for the edge (stow#797).
+    async fn serve_env<'a>(
+        config: &crate::config::StowConfig,
+        env_cache: &'a super::WrapperEnvCache,
+        target: &str,
+        rustc_version: &str,
+        c_metadata: &str,
+    ) -> super::WrapperEnvironment<'a> {
+        config.ensure_dirs().await.expect("ensure cache dirs");
+        let env_base = std::sync::Arc::new(super::WrapperEnvBase {
+            rustc: OsString::from("rustc"),
+            config: config.clone(),
+            host_target: target.to_owned(),
+            rustc_version: rustc_version.to_owned(),
+            _version_lease: crate::prepare_local_cache(config, rustc_version)
+                .await
+                .expect("prepare local cache"),
+        });
+        super::WrapperEnvironment {
+            env_base,
+            env_cache,
+            circuit_tripped: false,
+            target: target.to_owned(),
+            rustc_version: rustc_version.to_owned(),
+            cache_key: format!("{target}/{rustc_version}/{c_metadata}"),
+            request_c_metadata: c_metadata.to_owned(),
+            semantic_request: None,
+            host_glibc: None,
+        }
+    }
+
+    /// The `BuildContext` the serve tests drive — no policy, no
+    /// analysis facts, `serve_map_ready` under the test's control.
+    fn serve_ctx(
+        serve_map_ready: &std::sync::Arc<crate::facade::ServeMapSignal>,
+    ) -> super::BuildContext {
+        super::BuildContext {
+            policy_dir: None,
+            public_cache_target: None,
+            public_cache_disabled: false,
+            analysis: std::sync::Arc::new(std::sync::OnceLock::from(super::AnalysisFacts {
+                semantic_fallback_enabled: false,
+                unit_nodes: None,
+                prefetch_candidates: std::collections::BTreeMap::new(),
+            })),
+            serve_map_ready: std::sync::Arc::clone(serve_map_ready),
+            policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+            in_flight: crate::supervisor::server::InFlightUnits::default(),
+        }
+    }
+
+    /// The argv of one registry lib unit — enough for the parser; the
+    /// serves themselves key on `request.c_metadata`.
+    fn serve_args(target: &str, c_metadata: &str) -> Vec<OsString> {
+        vec![
+            OsString::from("--crate-name"),
+            OsString::from("demo"),
+            OsString::from("--crate-type"),
+            OsString::from("lib"),
+            OsString::from("--emit"),
+            OsString::from("dep-info,metadata,link"),
+            OsString::from("-C"),
+            OsString::from(format!("metadata={c_metadata}")),
+            OsString::from("--target"),
+            OsString::from(target),
+            OsString::from("lib.rs"),
+        ]
+    }
+
+    /// stow#797: a lookup that misses on a stale slice whose fetch is
+    /// still in flight parks on `serve_map_ready`, writes no
+    /// negative-cache entry while parked, and retries once on the
+    /// fetched slice. Here the retry reaches the row's bundle fetch —
+    /// which the dead test registry refuses (`tally.failed`) — and the
+    /// memo serves the fresh row to every later invocation.
+    #[tokio::test]
+    async fn a_miss_on_a_pending_slice_retries_the_fetched_answer() {
+        const TARGET: &str = "x86_64-unknown-linux-gnu";
+        const RUSTC: &str = "1.91.1";
+        const C_METADATA: &str = "cd800a14379e5df9";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = env_base_test_config(&dir);
+        // A zero interval keeps the cached slice's fetch pending — the
+        // stale-slice miss this test drives (stow#788).
+        config.index_refresh_interval = std::time::Duration::ZERO;
+        crate::index::write_cached_test_slice(
+            &config,
+            TARGET,
+            RUSTC,
+            &empty_test_index(TARGET, RUSTC),
+        )
+        .await
+        .expect("write the stale slice the build starts with");
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
+        let env_cache = test_cache(std::ffi::OsStr::new(""));
+        let env = serve_env(&config, &env_cache, TARGET, RUSTC, C_METADATA).await;
+        let ctx = serve_ctx(&signal);
+        let parsed =
+            ParsedRustcArgs::parse(&serve_args(TARGET, C_METADATA)).expect("parse the unit args");
+        let request = crate::fetch::FetchRequest {
+            target: TARGET,
+            rustc_version: RUSTC,
+            c_metadata: C_METADATA,
+        };
+        let mut tally = super::LookupTally::default();
+
+        // The stale slice lacks the row, but its fetch is still in
+        // flight — the miss must wait for it, not answer. The block
+        // scopes the pinned future so its `tally` borrow ends before
+        // the tally is checked.
+        let outcome = {
+            let mut serve = std::pin::pin!(super::try_remote_serves(
+                &env, &parsed, &request, &ctx, true, &mut tally,
+            ));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(500), &mut serve)
+                    .await
+                    .is_err(),
+                "the lookup missed on a pending slice without waiting for the fetch"
+            );
+            assert!(
+                !crate::circuit::negative_cache_contains(&config, &env.cache_key)
+                    .await
+                    .expect("read the negative cache"),
+                "a pending miss wrote a negative-cache entry"
+            );
+
+            // The fetch lands the row the stale slice lacked, then the
+            // map settles — the order the enrichment writes it.
+            let mut index = empty_test_index(TARGET, RUSTC);
+            index.rows.push(crate::index::index_test_row(C_METADATA));
+            index.header.row_count = 1;
+            crate::index::write_cached_test_slice(&config, TARGET, RUSTC, &index)
+                .await
+                .expect("write the slice the fetch landed");
+            signal.complete();
+            serve.await
+        };
+
+        // The retry finds the row: the bundle fetch it then pays fails
+        // on the dead test registry, which `tally.failed` records.
+        assert!(matches!(outcome, super::RemoteServe::Miss));
+        assert!(
+            tally.failed,
+            "the retry must reach the fetched row's bundle fetch"
+        );
+
+        // And the memo now serves the fetched slice to the whole build.
+        let (slice, fetch_pending) = env_cache
+            .slice(&config, TARGET, RUSTC, &signal)
+            .await
+            .expect("read the memoized slice")
+            .read();
+        assert!(!fetch_pending, "the settled fetch is no longer pending");
+        assert!(
+            slice
+                .expect("the fetched slice")
+                .exact_row(C_METADATA)
+                .is_some(),
+            "later invocations see the row the fetch landed"
+        );
+    }
+
+    /// stow#797: a miss on a slice whose fetch is not pending is the old
+    /// answer — immediate, `serve_map_ready` never awaited, and the
+    /// negative cache records it as it always has.
+    #[tokio::test]
+    async fn a_miss_on_a_settled_slice_never_waits() {
+        const TARGET: &str = "x86_64-unknown-linux-gnu";
+        const RUSTC: &str = "1.91.1";
+        const C_METADATA: &str = "cd800a14379e5df9";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = env_base_test_config(&dir);
+        crate::index::write_cached_test_slice(
+            &config,
+            TARGET,
+            RUSTC,
+            &empty_test_index(TARGET, RUSTC),
+        )
+        .await
+        .expect("write the fresh slice");
+        // The signal stays pending for the whole test — a wait on it
+        // would hang, so the timeout *is* the assertion.
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
+        let env_cache = test_cache(std::ffi::OsStr::new(""));
+        let env = serve_env(&config, &env_cache, TARGET, RUSTC, C_METADATA).await;
+        let ctx = serve_ctx(&signal);
+        let parsed =
+            ParsedRustcArgs::parse(&serve_args(TARGET, C_METADATA)).expect("parse the unit args");
+        let request = crate::fetch::FetchRequest {
+            target: TARGET,
+            rustc_version: RUSTC,
+            c_metadata: C_METADATA,
+        };
+        let mut tally = super::LookupTally::default();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::try_remote_serves(&env, &parsed, &request, &ctx, true, &mut tally),
+        )
+        .await
+        .expect("a miss on a settled slice must not wait on serve_map_ready");
+        assert!(matches!(outcome, super::RemoteServe::Miss));
+        assert!(!tally.failed);
+        assert!(
+            crate::circuit::negative_cache_contains(&config, &env.cache_key)
+                .await
+                .expect("read the negative cache"),
+            "a settled miss records its negative-cache entry"
         );
     }
 
