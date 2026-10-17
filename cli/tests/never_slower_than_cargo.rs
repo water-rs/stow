@@ -16,7 +16,7 @@ use stow_cli::protocol::{Answer, Request};
 
 mod support;
 
-use support::hermetic_stow_env;
+use support::{hermetic_stow_env, sealed_home_env};
 
 /// An edge that answers the miss-admissions mint with an empty list and
 /// then fails every other call with a 500.
@@ -141,12 +141,13 @@ fn write_probe_crate(dir: &Path, cargo_home: &Path, dependencies: &str) {
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
     // The fetch must share the isolated CARGO_HOME the builds use.
-    let fetched = Command::new("cargo")
+    let mut fetch = Command::new("cargo");
+    fetch
         .arg("fetch")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &dir.join("stow-home"));
+    let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
         "cargo fetch failed:\n{}",
@@ -210,7 +211,7 @@ fn stow_setup_in(dir: &Path, edge_url: &str, cache_dir: &Path, cargo_home: &Path
         .arg("setup")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut setup, edge_url, cache_dir);
+    hermetic_stow_env(&mut setup, edge_url, cache_dir, &dir.join("stow-home"));
     let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
@@ -255,7 +256,7 @@ fn stow_build(
         .arg("build")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
     command
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
@@ -556,7 +557,7 @@ fn cargo_build_in(
         .env("CARGO_HOME", cargo_home);
     // The wrapper shim is `stow-cli rustc` under cargo: same hermetic
     // environment as a driver invocation.
-    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
     command
         .env("RUSTC_WRAPPER", wrapper)
         .env("CARGO_TARGET_DIR", target_dir)
@@ -1108,6 +1109,7 @@ fn write_empty_crate(dir: &Path) {
 /// gates compare stow against.
 fn cargo_baseline(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Command {
     let mut command = Command::new("cargo");
+    sealed_home_env(&mut command, &dir.join("stow-home"));
     command
         .arg("build")
         .current_dir(dir)
@@ -1138,7 +1140,7 @@ fn stow_candidate(
         .arg("build")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
     command
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
@@ -1244,12 +1246,13 @@ fn write_multi_crate(dir: &Path, cargo_home: &Path) {
     std::fs::create_dir_all(dir.join("src")).expect("create src");
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
-    let fetched = Command::new("cargo")
+    let mut fetch = Command::new("cargo");
+    fetch
         .arg("fetch")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &dir.join("stow-home"));
+    let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
         "cargo fetch failed:\n{}",

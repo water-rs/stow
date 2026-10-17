@@ -5899,10 +5899,10 @@ mod tests {
             .expect("write rmeta");
         }
 
-        /// A `BuildSupervisor` whose local base for the `rustc` spelling
-        /// the fixture's frames carry is already memoized with a temp-dir
-        /// config — the cell is set, so `observed` never touches the
-        /// process environment or probes a toolchain.
+        /// A `BuildSupervisor` whose bases for the `rustc` spelling the
+        /// fixture's frames carry are already memoized with a temp-dir
+        /// config — the cells are set, so `observed` and `plan` never
+        /// touch the process environment or probe a toolchain.
         async fn fixture(
             root: &Path,
         ) -> (
@@ -5950,14 +5950,17 @@ mod tests {
             });
             let in_flight = server::InFlightUnits::default();
             let env_cache = crate::WrapperEnvCache::new(config.state_db.clone());
-            env_cache
-                .local_bases
-                .lock()
-                .expect("env base map mutex")
-                .insert(
-                    OsString::from("rustc"),
-                    Arc::new(tokio::sync::OnceCell::from(Some(base))),
-                );
+            // Both base maps get the fixture's cell: an unset cell loads
+            // through `StowConfig::load`, which reads the developer's
+            // `~/.stow` — a real index slice for the host there would
+            // serve the fixture's units from state the test never wrote
+            // (stow#800).
+            let cell = Arc::new(tokio::sync::OnceCell::from(Some(base)));
+            for map in [&env_cache.local_bases, &env_cache.env_bases] {
+                map.lock()
+                    .expect("env base map mutex")
+                    .insert(OsString::from("rustc"), Arc::clone(&cell));
+            }
             let handler = Arc::new(BuildSupervisor {
                 env_cache,
                 ctx: ctx(&in_flight),

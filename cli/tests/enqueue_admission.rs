@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
 
-use support::hermetic_stow_env;
+use support::{hermetic_stow_env, sealed_home_env};
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const RUSTC_VERSION: &str = "1.85.0";
@@ -187,12 +187,13 @@ fn write_crate(dir: &Path, cargo_home: &Path) {
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
     // The fetch must share the isolated CARGO_HOME the build uses.
-    let fetched = Command::new("cargo")
+    let mut fetch = Command::new("cargo");
+    fetch
         .arg("fetch")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &dir.join("stow-home"));
+    let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
         "cargo fetch failed:\n{}",
@@ -218,7 +219,12 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         .arg("setup")
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path());
-    hermetic_stow_env(&mut setup, &edge_url, cache.path());
+    hermetic_stow_env(
+        &mut setup,
+        &edge_url,
+        cache.path(),
+        &dir.path().join("stow-home"),
+    );
     let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
@@ -230,7 +236,12 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         .arg("build")
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path());
-    hermetic_stow_env(&mut build, &edge_url, cache.path());
+    hermetic_stow_env(
+        &mut build,
+        &edge_url,
+        cache.path(),
+        &dir.path().join("stow-home"),
+    );
     let output = build
         // The public cache only serves recent stable toolchains; pin the
         // probed identity so the analysis runs even when the host rustc is
@@ -327,7 +338,12 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
         .arg("build")
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path());
-    hermetic_stow_env(&mut build, &dead_edge, cache.path());
+    hermetic_stow_env(
+        &mut build,
+        &dead_edge,
+        cache.path(),
+        &dir.path().join("stow-home"),
+    );
     let output = build
         .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
@@ -462,9 +478,16 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         command
             .arg("build")
             .current_dir(dir)
-            .env("CARGO_HOME", cargo_home.path())
-            .env("RUSTC_WRAPPER", &shim);
-        hermetic_stow_env(&mut command, &edge_url, cache.path());
+            .env("CARGO_HOME", cargo_home.path());
+        hermetic_stow_env(
+            &mut command,
+            &edge_url,
+            cache.path(),
+            &dir.join("stow-home"),
+        );
+        // After the seal — it clears an ambient `RUSTC_WRAPPER`, and the
+        // shim is the wiring under test.
+        command.env("RUSTC_WRAPPER", &shim);
         let output = command
             .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
             .env("STOW_PUBLIC_CACHE_TARGET", TARGET)

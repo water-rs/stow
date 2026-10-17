@@ -766,6 +766,7 @@ pub async fn phase_unit_graphs(
                 workspace.workspace_root(),
                 runner_host_triple(task)?,
                 &task.rustc_version,
+                None,
             )
             .await?;
             graphs.push(PhaseUnitGraph {

@@ -1090,6 +1090,7 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
             manifest.parent().unwrap(),
             host.as_str(),
             rustc,
+            None,
         )
         .await
         .expect("native unit graph");
@@ -1109,6 +1110,7 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
             manifest.parent().unwrap(),
             host.as_str(),
             rustc,
+            None,
         )
         .await
         .expect("explicit-target unit graph");
@@ -1539,6 +1541,7 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
                 manifest.parent().unwrap(),
                 host.as_str(),
                 rustc,
+                None,
             )
             .await
             .unwrap_or_else(|error| panic!("{target} cargo --unit-graph: {error}"));

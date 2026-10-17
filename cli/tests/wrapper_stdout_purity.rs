@@ -9,6 +9,15 @@
 
 use std::process::Command;
 
+// The shared fixture carries helpers this test does not call; each
+// integration binary lints them per target.
+#[allow(dead_code)]
+mod build_fixture;
+mod support;
+
+use build_fixture::refused_url;
+use support::hermetic_stow_env;
+
 fn rustc_path() -> String {
     std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned())
 }
@@ -25,6 +34,16 @@ fn plain_version_output() -> Vec<u8> {
 fn wrapper_version_output(env: &[(&str, &str)]) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     command.arg("rustc").arg(rustc_path()).arg("-vV");
+    // A wrapper invocation reads the stow config and the ambient
+    // supervisor variables — the sealed home and cleared `STOW_*` keep
+    // the developer's `~/.stow` and shell exports out of it (stow#800).
+    let home = tempfile::tempdir().expect("home");
+    hermetic_stow_env(
+        &mut command,
+        &refused_url(),
+        &home.path().join("stow-cache"),
+        home.path(),
+    );
     command.env_remove("RUST_LOG");
     for (key, value) in env {
         command.env(key, value);
@@ -46,10 +65,16 @@ fn wrapper_version_output(env: &[(&str, &str)]) -> Vec<u8> {
 /// the refusal text proves the order.
 #[test]
 fn a_foreign_supervisor_is_refused_before_any_connection() {
-    let output = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
-        .arg("rustc")
-        .arg(rustc_path())
-        .arg("-vV")
+    let home = tempfile::tempdir().expect("home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    command.arg("rustc").arg(rustc_path()).arg("-vV");
+    hermetic_stow_env(
+        &mut command,
+        &refused_url(),
+        &home.path().join("stow-cache"),
+        home.path(),
+    );
+    let output = command
         .env("STOW_SUPERVISOR_ENDPOINT", supervisor_endpoint())
         .env("STOW_SUPERVISOR_TOKEN", "a-token")
         .env("STOW_SUPERVISOR_BINARY", "1:1")

@@ -596,9 +596,12 @@ mod tests {
         );
     }
 
+    /// The tools dir's contract, exercised against an injected data dir —
+    /// calling `tools_dir` itself would resolve through the developer's
+    /// home (stow#800).
     #[test]
     fn tools_dir_is_absolute_and_outside_the_system_temp_dir() {
-        let dir = super::tools_dir().expect("resolve tools dir");
+        let dir = crate::wrapper_shim::tools_dir_in(Path::new("/nonexistent/data-local"));
         assert!(
             dir.is_absolute(),
             "tools dir {} is not absolute",
