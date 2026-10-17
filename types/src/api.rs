@@ -1648,13 +1648,14 @@ pub struct ArtifactIndexPage {
 ///
 /// - **Delta** — `base_generation` is the index generation the report's
 ///   base was taken from; `added`/`retired` carry only what moved. The
-///   scheduler 409s when its live generation moved past the base — the
-///   reporter must then resync with a full report, never retry a stale
-///   delta.
+///   scheduler 409s when its live generation moved past the base —
+///   `index report` then resyncs once with a full report; a stale
+///   delta is never retried.
 /// - **Full** — `base_generation` is `None`, `added` carries the slice's
 ///   whole membership and `retired` is empty; the scheduler computes the
-///   delta itself. This is the first-publish path and the
-///   `stow-admin index report --full` resync.
+///   delta itself. This is the first-publish path, the
+///   `stow-admin index report --full` resync, and the resync a refused
+///   delta triggers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedSliceReport {
     /// The index generation this report's delta is based on — `None`

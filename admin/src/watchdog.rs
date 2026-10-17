@@ -3300,12 +3300,15 @@ mod tests {
     // `Err(Error::Http)` at `.await`, so the scripted steps below feed
     // the real default client through the pinned Hyper error path — no
     // mock, no other backend. Each server is owned by its test, joined
-    // for the captured request heads, and bounded by `test_server`'s
+    // for the captured requests, and bounded by `test_server`'s
     // own connection/join timeouts.
 
     /// The captured request at `index` — method and path, in order.
-    fn request_at(heads: &[http::request::Parts], index: usize) -> (&http::Method, &str) {
-        let head = &heads[index];
+    fn request_at(
+        heads: &[crate::test_server::CapturedRequest],
+        index: usize,
+    ) -> (&http::Method, &str) {
+        let head = &heads[index].head;
         (&head.method, head.uri.path())
     }
 

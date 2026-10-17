@@ -1395,9 +1395,10 @@ mod send_get_tests {
         let heads = server.join().await;
         let response = result.expect("a 304 without Location is a response, not a redirect error");
         assert_eq!(heads.len(), 1);
-        assert_eq!(heads[0].method, http::Method::GET);
+        assert_eq!(heads[0].head.method, http::Method::GET);
         assert_eq!(
             heads[0]
+                .head
                 .headers
                 .get(http::header::IF_NONE_MATCH)
                 .expect("the validator rides the request"),
@@ -1560,7 +1561,7 @@ mod write_tests {
         );
         let heads = server.join().await;
         assert_eq!(heads.len(), 1);
-        assert_eq!(heads[0].method, http::Method::POST);
+        assert_eq!(heads[0].head.method, http::Method::POST);
     }
 
     /// A 2xx answer is the confirmed write — no failure kind at all.

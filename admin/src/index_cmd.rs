@@ -39,6 +39,7 @@ use stow_types::stow_error;
 
 use crate::Edge;
 use crate::render;
+use zenwave::ResponseExt as _;
 
 /// Records artifacts pulled in flight per export — the shared
 /// anonymous session already honors the registry's rate limit, so this
@@ -187,6 +188,10 @@ struct IndexPublishSummary {
 /// report sends `base_generation` plus only the rows that moved. `--full`
 /// sends the explicit full report the scheduler diffs itself; so does a
 /// first publish (`generation == 1`), the only slice with no `.prev`.
+/// A delta the edge refuses with 409 — its live generation moved past
+/// `base_generation`, or the slice was never reported — is resent once
+/// as the full report for the same file, which is the resync the
+/// conflict asks for.
 #[derive(Args)]
 pub struct IndexReportArgs {
     /// The encoded index file (`index export --out-dir` wrote it).
@@ -207,8 +212,9 @@ struct IndexReportSummary {
     added: usize,
     /// Rows the report retired — `0` on a full report.
     retired: usize,
-    /// `true` when the report took the explicit full path (`--full` or
-    /// a first publish with no `.prev` sidecar).
+    /// `true` when the report took the explicit full path (`--full`, a
+    /// first publish with no `.prev` sidecar, or the resync a 409'd
+    /// delta triggers).
     full: bool,
     tag: String,
 }
@@ -986,10 +992,12 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
     // The delta base is the `.prev` sidecar `index export` captured
     // while the tag still named the previous index — resolved exactly,
     // never silently: `--full` or a first publish takes the explicit
-    // full path, and neither the caller nor the DO retries a bad
-    // `base_generation` (a mismatch answers 409).
+    // full path. A delta the DO refuses on a stale `base_generation`
+    // (409 — its live generation moved, or was never reported) resyncs
+    // below with the full report, once; nothing retries a refused
+    // delta, and a refused full report is an error.
     let (base_generation, added, retired) = if args.full {
-        (None, rows, Vec::new())
+        (None, rows.clone(), Vec::new())
     } else if let Some(prev) = read_prev_sidecar(&args.file, index.header.generation).await? {
         let prev_rows = semantic_rows(&prev);
         let current: std::collections::BTreeSet<_> = rows.iter().map(row_key).collect();
@@ -1005,20 +1013,45 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
             .collect();
         (Some(prev.header.generation), added, retired)
     } else {
-        (None, rows, Vec::new())
+        (None, rows.clone(), Vec::new())
     };
-    let report = PublishedSliceReport {
+    let mut report = PublishedSliceReport {
         base_generation,
         generation: Some(index.header.generation),
         added,
         retired,
     };
-    edge.post_json::<_, serde_json::Value>(
-        &format!("/api/v1/admin/index/{target}/{rustc_version}"),
-        &report,
-    )
-    .await?;
+    let path = format!("/api/v1/admin/index/{target}/{rustc_version}");
+    let url = format!("{}{path}", edge.base());
     let tag = index_tag(target.as_str(), rustc_version.as_str());
+    match edge.post_unchecked(&path, &report).await? {
+        Ok(response) => {
+            response
+                .into_json::<serde_json::Value>()
+                .await
+                .map_err(|error| stow_error!("decode {url}: {error}"))?;
+        }
+        Err(zenwave::Error::Http {
+            status, message, ..
+        }) if status == zenwave::StatusCode::CONFLICT && base_generation.is_some() => {
+            tracing::warn!(
+                %tag,
+                base_generation = base_generation.expect("a conflicted report is a delta"),
+                answer = %message,
+                "delta slice report refused — resyncing with a full report"
+            );
+            report = PublishedSliceReport {
+                base_generation: None,
+                generation: Some(index.header.generation),
+                added: rows,
+                retired: Vec::new(),
+            };
+            edge.post_json::<_, serde_json::Value>(&path, &report)
+                .await
+                .map_err(|error| error.wrap_err("full slice report"))?;
+        }
+        Err(error) => return Err(stow_error!("POST {url}: {error}")),
+    }
     let summary = IndexReportSummary {
         added: report.added.len(),
         retired: report.retired.len(),
@@ -1871,5 +1904,128 @@ mod tests {
         // through — the value verification compared before the fix.
         let transport = format!("127.0.0.1:28123/water-rs/stow-cache-1.88.0:{tag}");
         assert!(stow_oci::verify::verify_payload_identity(&payload, &transport, digest).is_err());
+    }
+
+    /// The file pair a delta report reads: the emitted slice at
+    /// generation 3 and its `.prev` sidecar at generation 2. The
+    /// `dep-right` row is the delta's only addition — the two rows
+    /// share a unit and differ in dependency context (stow#657), so the
+    /// semantic report keeps both.
+    fn report_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("report fixture dir");
+        let file = dir.path().join(index_tag(TARGET, RUSTC));
+        let left = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let right = record_to_index_row(&shared_unit_record(&["dep-right"]));
+        std::fs::write(
+            &file,
+            encode(&prev_index(vec![left.clone(), right], 3)).expect("encode index"),
+        )
+        .expect("write index file");
+        std::fs::write(
+            prev_path(&file),
+            encode(&prev_index(vec![left], 2)).expect("encode prev"),
+        )
+        .expect("write prev sidecar");
+        (dir, file)
+    }
+
+    /// The report body one captured request carried.
+    fn posted_report(request: &crate::test_server::CapturedRequest) -> serde_json::Value {
+        serde_json::from_slice(&request.body).expect("the report posts JSON")
+    }
+
+    /// stow#780: a delta report refused with the scheduler's 409 —
+    /// the edge's live generation moved past `base_generation` —
+    /// resyncs once as the full report for the same file: no
+    /// `base_generation`, the slice's whole membership, and no
+    /// `retired`.
+    #[tokio::test]
+    async fn a_conflicted_delta_resyncs_with_the_full_report() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::Respond {
+                status: 409,
+                retry_after: None,
+                body: r#"{"error":"slice report base generation 2 conflicts with the live generation 1"}"#,
+            },
+            crate::test_server::Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: r#"{"ok":true}"#,
+            },
+        ])
+        .await;
+        let (_dir, file) = report_fixture();
+        index_report(
+            &Edge::for_test(server.url.clone()),
+            IndexReportArgs { file, full: false },
+        )
+        .await
+        .expect("the resynced report succeeds");
+        let requests = server.join().await;
+        assert_eq!(requests.len(), 2, "the delta, then exactly one full report");
+        let delta = posted_report(&requests[0]);
+        assert_eq!(delta["base_generation"], 2);
+        assert_eq!(
+            delta["added"].as_array().expect("added rows").len(),
+            1,
+            "the delta carries only the moved row"
+        );
+        let full = posted_report(&requests[1]);
+        assert!(full.get("base_generation").is_none());
+        assert_eq!(full["generation"], 3);
+        assert_eq!(full["added"].as_array().expect("added rows").len(), 2);
+        assert!(
+            full.get("retired").is_none(),
+            "a full report carries no retired rows"
+        );
+    }
+
+    /// A full report refused the same way stays an error — the resync
+    /// itself failed, and no third request goes out.
+    #[tokio::test]
+    async fn a_conflicted_full_report_is_an_error() {
+        let server = crate::test_server::Loopback::start(vec![
+            crate::test_server::Step::Respond {
+                status: 409,
+                retry_after: None,
+                body: r#"{"error":"slice report base generation 2 conflicts with the live generation 1"}"#,
+            },
+            crate::test_server::Step::Respond {
+                status: 409,
+                retry_after: None,
+                body: r#"{"error":"slice report still conflicts"}"#,
+            },
+        ])
+        .await;
+        let (_dir, file) = report_fixture();
+        index_report(
+            &Edge::for_test(server.url.clone()),
+            IndexReportArgs { file, full: false },
+        )
+        .await
+        .expect_err("a refused resync is an error");
+        let requests = server.join().await;
+        assert_eq!(requests.len(), 2, "the delta plus exactly one resync");
+    }
+
+    /// A delta refused with anything but the generation conflict —
+    /// here a plain 400 — is an error with no resync at all.
+    #[tokio::test]
+    async fn a_delta_refused_without_conflict_is_an_error() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 400,
+            retry_after: None,
+            body: r#"{"error":"malformed report"}"#,
+        }])
+        .await;
+        let (_dir, file) = report_fixture();
+        index_report(
+            &Edge::for_test(server.url.clone()),
+            IndexReportArgs { file, full: false },
+        )
+        .await
+        .expect_err("a non-conflict refusal is an error");
+        let requests = server.join().await;
+        assert_eq!(requests.len(), 1, "no resync follows a non-409 refusal");
     }
 }
