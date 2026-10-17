@@ -4351,17 +4351,22 @@ struct CargoRunPlan<'a> {
 /// status, success or not — the status travels up to the caller that
 /// owns what the build leaves behind, and only the top of the command
 /// turns it into the process's exit (stow#652).
-async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitStatus> {
-    let CargoRunPlan {
-        project,
-        config,
-        state_db,
-        action,
-        cache_policy_entries,
-        public_cache_mode,
-        covered_units,
-        ..
-    } = *plan;
+/// The build's pre-cargo state — everything `run_cargo` lays out before
+/// the supervisor and cargo spawn: the scratch directory every generated
+/// file lives under (stow#630), the wrapper shims, the argv and `STOW_*`
+/// environment cargo reads, the seeded policy dir and the serve map
+/// whose `pending` signal holds the facades it cannot yet cover.
+struct CargoRunSetup {
+    scratch: tempfile::TempDir,
+    wrappers: crate::commands::WrapperCommands,
+    launch: CargoLaunch,
+    cache_policy_path: Option<PathBuf>,
+    serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
+    serve_map_path: Option<PathBuf>,
+    serve_waiters: Option<crate::facade::ServeMapWaiters>,
+}
+
+async fn prepare_cargo_run(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<CargoRunSetup> {
     // Every file this build generates — the serve map, the graph
     // tables, the extra-args list, the cache-policy markers — lives in
     // one directory the build owns, beside the supervisor's socket
@@ -4375,7 +4380,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         tracing::debug_span!("stow.precargo.detect_wrappers").in_scope(detect_wrapper_commands)?;
     let argv = cargo_argv(plan).await?;
 
-    let cache_policy_path = seed_cache_policy(scratch.path(), cache_policy_entries)
+    let cache_policy_path = seed_cache_policy(scratch.path(), plan.cache_policy_entries)
         .instrument(tracing::debug_span!("stow.precargo.policy_dir"))
         .await;
 
@@ -4391,7 +4396,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         write_initial_serve_map(scratch.path(), plan.servable_units, &serve_map_ready)
             .instrument(tracing::debug_span!("stow.precargo.serve_map_write"))
             .await?;
-    arm_or_settle_serve_map_ready(plan, config, &serve_map_ready, &mut serve_waiters);
+    arm_or_settle_serve_map_ready(plan, plan.config, &serve_map_ready, &mut serve_waiters);
     let envs = collect_wrapper_env(
         plan,
         &wrappers,
@@ -4401,6 +4406,36 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     )
     .instrument(tracing::debug_span!("stow.precargo.export_env"))
     .await?;
+    Ok(CargoRunSetup {
+        scratch,
+        wrappers,
+        launch: CargoLaunch { argv, envs },
+        cache_policy_path,
+        serve_map_ready,
+        serve_map_path,
+        serve_waiters,
+    })
+}
+
+async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitStatus> {
+    let CargoRunPlan {
+        project,
+        config,
+        state_db,
+        action,
+        public_cache_mode,
+        covered_units,
+        ..
+    } = *plan;
+    let CargoRunSetup {
+        scratch,
+        wrappers,
+        launch,
+        cache_policy_path,
+        serve_map_ready,
+        serve_map_path,
+        serve_waiters,
+    } = prepare_cargo_run(plan).await?;
 
     // Every rustc invocation this cargo run spawns is a facade that asks
     // this process what to do, so the whole build shares one transport —
@@ -4432,15 +4467,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         resolution_done.clone(),
         state_db.clone(),
     ));
-    let (mut cargo_run, mut supervisor) = spawn_cargo_run(
-        plan,
-        &handler,
-        in_flight,
-        &wrappers,
-        CargoLaunch { argv, envs },
-        scratch.path(),
-    )
-    .await?;
+    let (mut cargo_run, mut supervisor) =
+        spawn_cargo_run(plan, &handler, in_flight, &wrappers, launch, scratch.path()).await?;
 
     let before = coverage_snapshot(config).await;
 
