@@ -13,7 +13,12 @@ key pair, starts all three services, submits one `itoa` task through
 `stow-admin`, waits out the scheduler, exports and publishes the signed
 index slice, refreshes it into the CLI's local index, and `stow check`s a
 throwaway consumer crate in mock-key mode until the artifact is served
-from the cache. For the edge it runs `skyzen build` once and supervises
+from the cache. It then exercises the host-side node pipeline:
+`snafu-derive`'s proc-macro tree submits as host-side tasks gated on
+published slices, builds wave by wave with an export → publish → report →
+sync pass between layers, and serves a second consumer both natively and
+under `--target wasm32-unknown-unknown`. For the edge it runs
+`skyzen build` once and supervises
 `wrangler dev` itself, because `skyzen dev`'s file watcher rebuilds in
 a loop on Linux — inotify reports opens of the watched manifest and
 sources as changes, so every rebuild re-triggers itself. Everything
