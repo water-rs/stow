@@ -22,9 +22,7 @@ pub mod os_bytes;
 pub mod protocol;
 pub mod server;
 
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
 

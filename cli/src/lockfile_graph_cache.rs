@@ -310,6 +310,7 @@ mod tests {
             metadata_args: MetadataArgs::default(),
             target: "x86_64-unknown-linux-gnu".to_owned(),
             target_given: false,
+            host_target: "x86_64-unknown-linux-gnu".to_owned(),
             rustc_version: "1.99.0".to_owned(),
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,

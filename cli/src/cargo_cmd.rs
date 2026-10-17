@@ -729,6 +729,7 @@ fn build_mirror_project_context(
         metadata_args,
         target: project.target.clone(),
         target_given: project.target_given,
+        host_target: project.host_target.clone(),
         rustc_version: project.rustc_version.clone(),
         mold: project.mold.clone(),
         env_base: project.env_base.clone(),
@@ -865,6 +866,10 @@ pub struct ProjectContext {
     /// Cargo was given a target — `--target`, `CARGO_BUILD_TARGET`, or
     /// `build.target` — so its unit graph splits host and target units.
     pub target_given: bool,
+    /// The compiling rustc's real `host:` triple — where build scripts
+    /// and proc macros compile, which is not the consumer target under
+    /// a `--target` build (stow#317) and not a target-to-runner mapping.
+    pub host_target: String,
     pub rustc_version: String,
     /// The cargo `--config` values this build needs so its Linux units
     /// link with mold — empty on non-Linux, and empty when the cargo
@@ -1111,12 +1116,18 @@ impl PendingProjectContext {
             Output = stow_types::error::Result<crate::derive_gate::ForegroundHold>,
         >,
     ) -> stow_types::error::Result<ProjectContext> {
-        let (target, rustc_version, foreground) =
-            tokio::join!(self.target, self.rustc_version, foreground);
+        let (target, rustc_version, host_vv, foreground) =
+            tokio::join!(self.target, self.rustc_version, self.rustc_vv, foreground);
         let target =
             target.map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
         let rustc_version = rustc_version
             .map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
+        // The compiling rustc's own `host:` — build scripts and proc
+        // macros compile for it — out of the shared `-vV` the build's
+        // other facts already came from (stow#317).
+        let host_target = host_vv
+            .and_then(|vv| crate::rustc_args::vv_host(&vv))
+            .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
         let foreground = foreground?;
         Ok(ProjectContext {
             action: self.action,
@@ -1128,6 +1139,7 @@ impl PendingProjectContext {
             metadata_args: self.metadata_args,
             target,
             target_given: self.resolved_target.is_some(),
+            host_target,
             rustc_version,
             mold,
             env_base: None,
@@ -4218,6 +4230,9 @@ async fn run_cargo_passthrough_sandboxed(
         shims_dir: None,
         runtime_executable: &runtime,
         rustc_executable: Path::new(project.build_rustc.executable()),
+        host_target: project.host_target.as_str(),
+        cargo_dir: current_dir,
+        cargo_args,
         ipc: None,
     };
     let sandbox = crate::sandbox::BuildSandbox::create(request).await?;
@@ -4715,6 +4730,9 @@ async fn sandboxed_cargo_run(
         shims_dir: Some(shims_dir),
         runtime_executable: &wrappers.runtime_executable,
         rustc_executable: Path::new(plan.project.build_rustc.executable()),
+        host_target: plan.project.host_target.as_str(),
+        cargo_dir: plan.current_dir,
+        cargo_args: plan.cargo_args,
         ipc: Some(router),
     };
     let sandbox = crate::sandbox::BuildSandbox::create(request).await?;
@@ -5726,6 +5744,7 @@ mod tests {
             metadata_args: MetadataArgs::default(),
             target: "aarch64-apple-darwin".to_owned(),
             target_given: false,
+            host_target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
@@ -6078,6 +6097,7 @@ mod tests {
             metadata_args: MetadataArgs::default(),
             target: "aarch64-apple-darwin".to_owned(),
             target_given: false,
+            host_target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,

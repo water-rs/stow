@@ -22,6 +22,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+use futures_util::StreamExt;
 use heel::{Access, IpcRouter, Sandbox, SandboxConfigBuilder, SecurityConfig};
 use stow_types::error::Context;
 
@@ -94,6 +95,17 @@ pub struct SandboxRequest<'a> {
     /// The rustc the build's probes resolved — its directory and sysroot
     /// are the toolchain the sandboxed cargo invokes.
     pub rustc_executable: &'a Path,
+    /// The triple build scripts and proc macros compile for — the
+    /// rustc's real `host:`, already resolved by the driver's shared
+    /// probes rather than re-asked here.
+    pub host_target: &'a str,
+    /// The directory the sandboxed cargo runs in — where its cargo
+    /// configuration chain, and so its `[env]` and `target.*.linker`
+    /// tables, is read from.
+    pub cargo_dir: &'a Path,
+    /// The build's own arguments after the action — a `--target` among
+    /// them widens the toolchain discovery to that target's linker.
+    pub cargo_args: &'a [OsString],
     /// The supervisor's IPC router when the build is supervised; a
     /// passthrough cargo registers none and gets no IPC socket.
     pub ipc: Option<IpcRouter>,
@@ -188,7 +200,7 @@ impl BuildSandbox {
         if let Some(router) = request.ipc.take() {
             builder = builder.ipc(router);
         }
-        for (path, access, reason) in sandbox_grants(&request)? {
+        for (path, access, reason) in sandbox_grants(&request).await? {
             // The kernel resolves paths through `/var` → `/private/var`
             // and friends; a grant spelled through a symlink does not
             // cover the resolved path, so every grant is canonicalized
@@ -266,7 +278,7 @@ async fn run<N: heel::NetworkPolicy>(
 /// files are deliberately absent: heel's strict protections deny cargo's
 /// `credentials`/`credentials.toml`, and the per-file grants below keep
 /// it that way — a whole-home grant would silently reopen them.
-fn sandbox_grants(
+async fn sandbox_grants(
     request: &SandboxRequest<'_>,
 ) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
     let cargo_home = crate::config::require_cargo_home()?;
@@ -312,6 +324,23 @@ fn sandbox_grants(
     conditional_grants(&cargo_home, rustup_home.as_deref(), &mut grants);
     grants.extend(compiler_search_grants(request.rustc_executable));
     grants.extend(toolchain_grant_dirs());
+    // The process-spawning halves — rustc's sysroot probe and the
+    // driver/linker discovery — are independent of each other and of
+    // the sync grants, so they run in one join; the probes inside the
+    // discovery are themselves bounded by `PROBE_CONCURRENCY`.
+    let (sysroot, toolchain) = futures_util::future::join(
+        rustc_sysroot(request.rustc_executable),
+        discovered_toolchain_grants(request),
+    )
+    .await;
+    if let Some(sysroot) = sysroot {
+        grants.push((
+            sysroot,
+            Access::READ | Access::EXEC,
+            "the rustc sysroot — std rlibs and the toolchain's helper binaries",
+        ));
+    }
+    grants.extend(toolchain?);
 
     Ok(grants)
 }
@@ -420,37 +449,51 @@ fn compiler_search_grants(rustc_executable: &Path) -> Vec<(PathBuf, Access, &'st
             "the directory the build's rustc lives in",
         ));
     }
-    if let Some(sysroot) = rustc_sysroot(rustc_executable) {
-        grants.push((
-            sysroot,
-            Access::READ | Access::EXEC,
-            "the rustc sysroot — std rlibs and the toolchain's helper binaries",
-        ));
-    }
     grants
 }
 
 /// The directory an executable named `tool` resolves to on `PATH`.
 fn resolve_on_path(tool: &str) -> Option<PathBuf> {
+    resolve_executable(OsStr::new(tool)).and_then(|found| found.parent().map(Path::to_path_buf))
+}
+
+/// The executable a tool spelling resolves to: a spelling that carries
+/// a path separator must exist as given; a bare name is searched on
+/// `PATH`, with the platform's executable suffix tried beside it —
+/// `cargo` resolves `cargo.exe` on Windows.
+fn resolve_executable(tool: &OsStr) -> Option<PathBuf> {
+    let tool_path = Path::new(tool);
+    if tool_path.components().count() > 1 {
+        return tool_path.is_file().then(|| tool_path.to_path_buf());
+    }
     let path = std::env::var_os("PATH")?;
+    let mut suffixed = tool.to_os_string();
+    suffixed.push(std::env::consts::EXE_SUFFIX);
     std::env::split_paths(&path)
-        .map(|dir| dir.join(tool))
+        .flat_map(|dir| [dir.join(tool), dir.join(&suffixed)])
         .find(|candidate| candidate.is_file())
-        .and_then(|found| found.parent().map(Path::to_path_buf))
 }
 
 /// `rustc --print sysroot`, for a toolchain whose support files do not
 /// live under `RUSTUP_HOME` — a Nix store rustc, a vendor toolchain.
-fn rustc_sysroot(rustc_executable: &Path) -> Option<PathBuf> {
-    let output = std::process::Command::new(rustc_executable)
+async fn rustc_sysroot(rustc_executable: &Path) -> Option<PathBuf> {
+    let output = match async_process::Command::new(rustc_executable)
         .args(["--print", "sysroot"])
         .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
-        .filter(|path| path.is_dir())
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(rustc = %rustc_executable.display(), %error, "rustc sysroot probe could not spawn");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::debug!(rustc = %rustc_executable.display(), status = %output.status, "rustc sysroot probe refused");
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    path.is_dir().then_some(path)
 }
 
 /// Directories a toolchain lives under, named by toolchain environment
@@ -523,6 +566,364 @@ const ANDROID_ROOT_VARS: &[&str] = &[
     "ANDROID_NDK_LATEST_HOME",
 ];
 
+/// The helpers a gcc- or clang-shaped driver execs outside `PATH`:
+/// `collect2` runs the link, `as` the assembly, and the `ld.*` names are
+/// what `-fuse-ld=` selects — `ld.mold` is stow's Linux selection
+/// (stow#779), `ld.lld` rustc's default where it applies.
+const DRIVER_SUBPROGRAMS: &[&str] = &[
+    "collect2", "as", "ld", "ld.bfd", "ld.gold", "ld.lld", "ld.mold", "lld", "mold",
+];
+
+/// The toolchain a build's compiler drivers and linkers reach,
+/// discovered by asking the tools themselves rather than naming a
+/// distro layout (stow#779): each driver's `-print-search-dirs`
+/// reports the `programs:` trees holding the helpers it execs —
+/// `collect2`, `cc1`, `as` and the `ld.*` a `-fuse-ld=` selects, which
+/// live outside `PATH` and outside heel's system rules wherever a
+/// toolchain does not install under `/usr` — and `-print-prog-name`
+/// resolves each helper the way the link does, `ld.mold` in the
+/// `COMPILER_PATH` `stow setup` writes included.
+async fn discovered_toolchain_grants(
+    request: &SandboxRequest<'_>,
+) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
+    let cargo_home = crate::config::cargo_home();
+    // A cargo config cargo itself would refuse is a load error, not a
+    // skip: the build fails here the way it would inside the sandbox.
+    let config =
+        crate::mold::cargo_config(request.cargo_dir, cargo_home.as_deref()).map_err(|error| {
+            stow_types::stow_error!("load the cargo config for toolchain discovery: {error}")
+        })?;
+    let compiler_path = crate::mold::effective_compiler_path(&config, &crate::mold::process_env);
+    let mut grants: Vec<(PathBuf, Access, &'static str)> = Vec::new();
+    if let Some(compiler_path) = compiler_path.as_deref() {
+        for dir in std::env::split_paths(compiler_path) {
+            if dir.is_dir() {
+                grants.push((
+                    dir,
+                    Access::READ | Access::EXEC,
+                    "a COMPILER_PATH directory — the driver's subprogram search path, where `stow setup` installs `ld.mold`",
+                ));
+            }
+        }
+    }
+    let targets = build_targets(request);
+    let b_dirs = rustflag_b_dirs(&targets, Some(&config));
+    for dir in &b_dirs {
+        if dir.is_dir() {
+            grants.push((
+                dir.clone(),
+                Access::READ | Access::EXEC,
+                "a `-B` prefix the rustflags hand the driver — a subprogram search directory",
+            ));
+        }
+    }
+    let drivers = toolchain_drivers(&targets, Some(&config));
+    // Every (driver, question) pair is independent — the driver's own
+    // directory grant is free — so all of them run in one bounded
+    // stream: the cost is the slowest probe, not the sum.
+    let mut probes = Vec::new();
+    for driver in &drivers {
+        probes.push((driver.clone(), "-print-search-dirs".to_owned()));
+        for tool in DRIVER_SUBPROGRAMS {
+            probes.push((driver.clone(), format!("-print-prog-name={tool}")));
+        }
+    }
+    let results: Vec<(PathBuf, String, Option<String>)> =
+        futures_util::stream::iter(probes.into_iter().map(|(driver, flag)| {
+            let b_dirs = b_dirs.clone();
+            let compiler_path = compiler_path.clone();
+            async move {
+                let output = driver_probe(&driver, &b_dirs, compiler_path.as_deref(), &flag).await;
+                (driver, flag, output)
+            }
+        }))
+        .buffer_unordered(PROBE_CONCURRENCY)
+        .collect()
+        .await;
+    grants.extend(driver_probe_grants(&drivers, &results));
+    #[cfg(windows)]
+    grants.extend(msvc_toolchain_grants(&targets));
+    Ok(grants)
+}
+
+/// The grants a finished driver-probe set implies: each driver's own
+/// directory, its `-print-search-dirs` program and library trees, and
+/// the directories its `-print-prog-name` answers name.
+fn driver_probe_grants(
+    drivers: &[PathBuf],
+    results: &[(PathBuf, String, Option<String>)],
+) -> Vec<(PathBuf, Access, &'static str)> {
+    let mut grants = Vec::new();
+    for driver in drivers {
+        if let Some(dir) = driver.parent() {
+            grants.push((
+                dir.to_path_buf(),
+                Access::READ | Access::EXEC,
+                "the compiler driver's own directory",
+            ));
+        }
+    }
+    for (_driver, flag, output) in results {
+        let Some(output) = output.as_deref() else {
+            continue;
+        };
+        if flag == "-print-search-dirs" {
+            let (exec_dirs, read_dirs) = parse_search_dirs(output);
+            for dir in exec_dirs {
+                if dir.is_dir() {
+                    grants.push((
+                        dir,
+                        Access::READ | Access::EXEC,
+                        "a driver's program search directory — collect2, cc1, as and the lto helpers it execs",
+                    ));
+                }
+            }
+            for dir in read_dirs {
+                if dir.is_dir() {
+                    grants.push((
+                        dir,
+                        Access::READ,
+                        "a driver's library search directory — the objects and shared libraries it links",
+                    ));
+                }
+            }
+            continue;
+        }
+        let resolved = PathBuf::from(output.trim());
+        // A name the driver cannot resolve echoes back unchanged;
+        // only a real path carries a grant.
+        if !resolved.is_file() {
+            continue;
+        }
+        if let Some(dir) = resolved.parent() {
+            grants.push((
+                dir.to_path_buf(),
+                Access::READ | Access::EXEC,
+                "the directory the driver resolves a subprogram to",
+            ));
+        }
+    }
+    grants
+}
+
+/// `-print-*` probes spawn per (driver, question) — a handful of
+/// milliseconds each. Eight keeps a build naming several toolchains
+/// inside a bounded burst while still finishing the usual one-driver
+/// set in a single wave.
+const PROBE_CONCURRENCY: usize = 8;
+
+/// The triples the build compiles for: an explicit `--target` or
+/// `CARGO_BUILD_TARGET`, plus the rustc host — build scripts and proc
+/// macros always compile for it.
+fn build_targets(request: &SandboxRequest<'_>) -> Vec<String> {
+    let mut targets: Vec<String> = explicit_build_target(request.cargo_args)
+        .or_else(|| std::env::var("CARGO_BUILD_TARGET").ok())
+        .into_iter()
+        .collect();
+    if !targets.iter().any(|target| target == request.host_target) {
+        targets.push(request.host_target.to_owned());
+    }
+    targets
+}
+
+/// The `--target` the user spelled, or `None` for a host build.
+fn explicit_build_target(cargo_args: &[OsString]) -> Option<String> {
+    let mut iter = cargo_args.iter();
+    while let Some(arg) = iter.next() {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if arg == "--target" {
+            return iter
+                .next()
+                .and_then(|value| value.to_str().map(str::to_owned));
+        }
+        if let Some(value) = arg.strip_prefix("--target=") {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+/// Ask a driver one of its `-print-*` introspection questions under
+/// the search environment the build's link runs in — the `-B`
+/// prefixes first, then `COMPILER_PATH` — so the probe answers the
+/// question the sandboxed driver itself would ask.
+async fn driver_probe(
+    driver: &Path,
+    b_dirs: &[PathBuf],
+    compiler_path: Option<&OsStr>,
+    flag: &str,
+) -> Option<String> {
+    let mut command = async_process::Command::new(driver);
+    for dir in b_dirs {
+        command.arg(format!("-B{}", dir.display()));
+    }
+    command.arg(flag);
+    if let Some(compiler_path) = compiler_path {
+        command.env("COMPILER_PATH", compiler_path);
+    }
+    let output = match command.output().await {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(driver = %driver.display(), flag, %error, "toolchain probe could not spawn");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::debug!(driver = %driver.display(), flag, status = %output.status, "toolchain probe refused");
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The `-B` prefixes the build's effective rustflags hand the driver,
+/// for each target the build compiles — searched ahead of the driver's
+/// own directories for every subprogram.
+fn rustflag_b_dirs(targets: &[String], config: Option<&cargo_config2::Config>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(config) = config {
+        for target in targets {
+            if let Ok(Some(flags)) = config.rustflags(target.as_str()) {
+                dirs.extend(crate::mold::b_dirs(&flags.flags));
+            }
+        }
+    }
+    dirs
+}
+
+/// The compiler drivers and linkers the build can invoke, resolved to
+/// real executables: the `cc`/`c++` rustc and the `cc` crate fall back
+/// to, the executables the toolchain environment names (`CC`,
+/// `CC_<target>`, `CARGO_TARGET_<triple>_LINKER`, `LD`, …), and the
+/// linker the cargo configuration selects for each build target.
+fn toolchain_drivers(targets: &[String], config: Option<&cargo_config2::Config>) -> Vec<PathBuf> {
+    let mut spellings: Vec<OsString> = vec![OsString::from("cc"), OsString::from("c++")];
+    for (name, value) in std::env::vars_os() {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let toolchain_exe = matches!(name, "CC" | "CXX" | "LD")
+            || name.starts_with("CC_")
+            || name.starts_with("CXX_")
+            || name.starts_with("LD_")
+            || (name.starts_with("CARGO_TARGET_") && name.ends_with("_LINKER"));
+        if toolchain_exe {
+            spellings.push(value);
+        }
+    }
+    if let Some(config) = config {
+        for target in targets {
+            if let Ok(Some(linker)) = config.linker(target.as_str()) {
+                spellings.push(linker.into_os_string());
+            }
+            if let Ok(Some(flags)) = config.rustflags(target.as_str())
+                && let Some(linker) = crate::mold::rustflags_linker(&flags.flags)
+            {
+                spellings.push(OsString::from(linker));
+            }
+        }
+    }
+    let mut drivers: Vec<PathBuf> = Vec::new();
+    for spelling in spellings {
+        if let Some(exe) = resolve_executable(&spelling)
+            && !drivers.contains(&exe)
+        {
+            drivers.push(exe);
+        }
+    }
+    drivers
+}
+
+/// The directory lists a gcc- or clang-shaped driver reports for
+/// `-print-search-dirs`: `install:`/`programs:`/`installedDir:` hold
+/// the executables it runs — read-and-execute — while `libraries:` is
+/// the object and shared-library search path — read only. Values are
+/// `key: =dir:dir:…` — the `=` is the driver's list marker, not a path
+/// byte.
+fn parse_search_dirs(output: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut exec_dirs = Vec::new();
+    let mut read_dirs = Vec::new();
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let dirs = value
+            .trim()
+            .trim_start_matches('=')
+            .split(':')
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from);
+        match key.trim() {
+            "install" | "programs" | "installedDir" => exec_dirs.extend(dirs),
+            "libraries" => read_dirs.extend(dirs),
+            _ => {}
+        }
+    }
+    (exec_dirs, read_dirs)
+}
+
+/// The MSVC toolchain and Windows SDK a `*-msvc` build's `cl.exe` and
+/// `link.exe` live in — located the way rustc and the `cc` crate
+/// locate them, so the usual Visual Studio install that is not on
+/// `PATH` is still found. `find_tool` answers `None` for non-msvc
+/// targets, so each build target is simply asked.
+#[cfg(windows)]
+fn msvc_toolchain_grants(targets: &[String]) -> Vec<(PathBuf, Access, &'static str)> {
+    let mut grants = Vec::new();
+    for target in targets {
+        for name in ["cl.exe", "link.exe"] {
+            let Some(tool) = find_msvc_tools::find_tool(target.as_str(), name) else {
+                continue;
+            };
+            if let Some(dir) = tool.path().parent() {
+                grants.push((
+                    dir.to_path_buf(),
+                    Access::READ | Access::EXEC,
+                    "the MSVC tool's own directory",
+                ));
+            }
+            for (key, value) in tool.env() {
+                let access = if key.as_os_str() == "PATH" {
+                    Access::READ | Access::EXEC
+                } else {
+                    Access::READ
+                };
+                for dir in std::env::split_paths(value) {
+                    if dir.is_dir() {
+                        grants.push((
+                            dir,
+                            access,
+                            "a directory the MSVC toolchain's environment names",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(sdk) = find_msvc_tools::find_windows_sdk(std::env::consts::ARCH) {
+        for dir in sdk.path() {
+            if dir.is_dir() {
+                grants.push((
+                    dir.to_path_buf(),
+                    Access::READ | Access::EXEC,
+                    "a Windows SDK binary directory",
+                ));
+            }
+        }
+        for dir in sdk.libs().chain(sdk.include()) {
+            if dir.is_dir() {
+                grants.push((
+                    dir.to_path_buf(),
+                    Access::READ,
+                    "a Windows SDK library or include directory",
+                ));
+            }
+        }
+    }
+    grants
+}
+
 /// The environment allowlist: the names a build legitimately reads —
 /// cargo's own configuration, rustc and rustup settings, the compiler
 /// toolchain's variables, locale and terminal information — and nothing
@@ -560,6 +961,7 @@ fn sandbox_env_names(names: impl Iterator<Item = String>) -> Vec<String> {
         "AR",
         "RANLIB",
         "LD",
+        "COMPILER_PATH",
         "CFLAGS",
         "CXXFLAGS",
         "CPPFLAGS",
@@ -776,6 +1178,108 @@ mod tests {
                 OsString::from("--locked"),
                 OsString::from("--frozen"),
                 OsString::from("--offline"),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_dirs_parse_gccs_install_programs_and_libraries() {
+        // gcc 13 on Ubuntu: `install` and `programs` carry the helpers
+        // the driver execs, `libraries` the objects it links.
+        let output = "install: /usr/lib/gcc/x86_64-linux-gnu/13/\n\
+             programs: =/usr/lib/gcc/x86_64-linux-gnu/13/:/usr/lib/gcc/x86_64-linux-gnu/13/../../../../x86_64-linux-gnu/bin/x86_64-linux-gnu/13/:/usr/bin/x86_64-linux-gnu/\n\
+             libraries: =/usr/lib/gcc/x86_64-linux-gnu/13/:/usr/lib/gcc/x86_64-linux-gnu/13/../../../../x86_64-linux-gnu/lib/x86_64-linux-gnu/13/:/lib/x86_64-linux-gnu/\n";
+        let (exec_dirs, read_dirs) = parse_search_dirs(output);
+        assert_eq!(
+            exec_dirs,
+            vec![
+                PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/13/"),
+                PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/13/"),
+                PathBuf::from(
+                    "/usr/lib/gcc/x86_64-linux-gnu/13/../../../../x86_64-linux-gnu/bin/x86_64-linux-gnu/13/"
+                ),
+                PathBuf::from("/usr/bin/x86_64-linux-gnu/"),
+            ]
+        );
+        assert_eq!(
+            read_dirs,
+            vec![
+                PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/13/"),
+                PathBuf::from(
+                    "/usr/lib/gcc/x86_64-linux-gnu/13/../../../../x86_64-linux-gnu/lib/x86_64-linux-gnu/13/"
+                ),
+                PathBuf::from("/lib/x86_64-linux-gnu/"),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_dirs_parse_clangs_layout() {
+        let output = "programs: =/usr/lib/llvm-18/bin\n\
+             libraries: =/usr/lib/llvm-18/lib/clang/18\n";
+        let (exec_dirs, read_dirs) = parse_search_dirs(output);
+        assert_eq!(exec_dirs, vec![PathBuf::from("/usr/lib/llvm-18/bin")]);
+        assert_eq!(
+            read_dirs,
+            vec![PathBuf::from("/usr/lib/llvm-18/lib/clang/18")]
+        );
+    }
+
+    #[test]
+    fn search_dirs_ignore_unrelated_lines() {
+        let (exec_dirs, read_dirs) = parse_search_dirs("gcc version 13.2.0\nno colon here\n");
+        assert_eq!(exec_dirs.len(), 0);
+        assert_eq!(read_dirs.len(), 0);
+    }
+
+    #[test]
+    fn an_explicit_target_is_read_from_cargo_args() {
+        for args in [
+            vec![
+                OsString::from("--target"),
+                OsString::from("aarch64-unknown-linux-gnu"),
+            ],
+            vec![OsString::from("--target=aarch64-unknown-linux-gnu")],
+        ] {
+            assert_eq!(
+                explicit_build_target(&args).as_deref(),
+                Some("aarch64-unknown-linux-gnu")
+            );
+        }
+        assert_eq!(explicit_build_target(&[OsString::from("--release")]), None);
+    }
+
+    #[test]
+    fn a_cross_target_keeps_the_real_host_for_the_build_scripts() {
+        // A wasm32 consumer build names a target outside every CI
+        // family, but its build scripts and proc macros still compile
+        // for the rustc's real host — so `build_targets` carries the
+        // spelled target AND the host the driver resolved, not a
+        // runner-family mapping of the consumer target.
+        let dummy = PathBuf::from("/usr/bin/true");
+        let args = vec![
+            OsString::from("--target"),
+            OsString::from("wasm32-unknown-unknown"),
+        ];
+        let request = SandboxRequest {
+            network: SandboxNetwork::Deny,
+            source_roots: &[],
+            target_dir: Path::new("/tmp"),
+            scratch_dir: None,
+            shims_dir: None,
+            runtime_executable: &dummy,
+            rustc_executable: &dummy,
+            host_target: "aarch64-apple-darwin",
+            cargo_dir: Path::new("/tmp"),
+            cargo_args: &args,
+            ipc: None,
+        };
+        let targets = build_targets(&request);
+        assert_eq!(
+            targets,
+            vec![
+                "wasm32-unknown-unknown".to_owned(),
+                "aarch64-apple-darwin".to_owned(),
             ]
         );
     }
