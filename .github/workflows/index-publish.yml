@@ -161,6 +161,10 @@ jobs:
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # When the export ran `--full` the report does too: its slices
+          # carry no `.prev` base, and the explicit full shape is also
+          # the resync a stale-base 409 asks for.
+          INPUT_FULL: ${{ inputs.full }}
         # A slice whose publish fails must not cost every later slice its
         # update: slices are independent, and a stale slice is what every
         # CLI on that target resolves against until the next run.
@@ -178,7 +182,10 @@ jobs:
               steps = [["stow-admin", "index", "publish",
                         "--file", file, "--folded", folded]]
               if os.environ.get("STOW_EDGE_URL"):
-                  steps.append(["stow-admin", "index", "report", "--file", file])
+                  report = ["stow-admin", "index", "report", "--file", file]
+                  if os.environ.get("INPUT_FULL") == "true":
+                      report.append("--full")
+                  steps.append(report)
               ok = all(subprocess.run(step).returncode == 0 for step in steps)
               print("::endgroup::", flush=True)
               if not ok:

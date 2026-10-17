@@ -1393,18 +1393,21 @@ struct GhJob {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct GhIssue {
-    number: u64,
-    title: String,
-    html_url: String,
+pub struct GhIssue {
+    /// The issue number.
+    pub number: u64,
+    /// The issue title.
+    pub title: String,
+    /// Browser URL.
+    pub html_url: String,
     /// The issue body — the disabled-workflow record (the
     /// `stow-watchdog:disabled` marker) lives here (stow#744).
     #[serde(default)]
-    body: Option<String>,
+    pub body: Option<String>,
     /// Present on pull requests — `…/issues` returns both; PRs are not
     /// incidents.
     #[serde(default)]
-    pull_request: Option<serde_json::Value>,
+    pub pull_request: Option<serde_json::Value>,
 }
 
 /// `GET /actions/workflows/{file}`'s answer — `state` is the only field
@@ -1591,7 +1594,7 @@ async fn apply_clear(
 
 // ===== The incident issue =====
 
-const INCIDENT_LABEL: &str = "incident";
+pub const INCIDENT_LABEL: &str = "incident";
 /// Stable title prefix — dedup keys on it together with the label.
 const INCIDENT_TITLE_PREFIX: &str = "stow incident:";
 /// HTML marker stamped on digest comments so cadence is derivable.
@@ -1749,7 +1752,7 @@ fn is_duplicate_label_conflict(error: &zenwave::Error) -> bool {
 /// propagates. `request_timeout` bounds each whole read — send, status,
 /// body decode, and any rate-limit wait — so a stalled body or a far
 /// reset cannot outlive it.
-async fn ensure_label(
+pub async fn ensure_label(
     api_base: &str,
     gh_token: &str,
     request_timeout: std::time::Duration,
@@ -2703,10 +2706,13 @@ struct IssuePatch<'a> {
 
 /// `POST /issues` — a fresh incident.
 #[derive(serde::Serialize)]
-struct IssueNew<'a> {
-    title: &'a str,
-    body: &'a str,
-    labels: [&'a str; 1],
+pub struct IssueNew<'a> {
+    /// Issue title.
+    pub title: &'a str,
+    /// Issue body.
+    pub body: &'a str,
+    /// Labels to apply.
+    pub labels: [&'a str; 1],
 }
 
 /// `PATCH /issues/{n}` close marker.
@@ -2721,7 +2727,7 @@ struct IssueComment<'a> {
     body: &'a str,
 }
 
-async fn post_comment(gh_token: &str, issue: u64, body: &str) -> Result<(), String> {
+pub async fn post_comment(gh_token: &str, issue: u64, body: &str) -> Result<(), String> {
     let _: serde_json::Value = github::post(
         gh_token,
         &format!("issues/{issue}/comments"),
@@ -2733,7 +2739,7 @@ async fn post_comment(gh_token: &str, issue: u64, body: &str) -> Result<(), Stri
 }
 
 /// Comment and close — `clear` and the auto-clear path share it.
-async fn close_incident(gh_token: &str, issue: u64, comment: &str) -> Result<(), String> {
+pub async fn close_incident(gh_token: &str, issue: u64, comment: &str) -> Result<(), String> {
     post_comment(gh_token, issue, comment).await?;
     let _: GhIssue = github::patch(
         gh_token,
@@ -3300,12 +3306,15 @@ mod tests {
     // `Err(Error::Http)` at `.await`, so the scripted steps below feed
     // the real default client through the pinned Hyper error path — no
     // mock, no other backend. Each server is owned by its test, joined
-    // for the captured request heads, and bounded by `test_server`'s
+    // for the captured requests, and bounded by `test_server`'s
     // own connection/join timeouts.
 
     /// The captured request at `index` — method and path, in order.
-    fn request_at(heads: &[http::request::Parts], index: usize) -> (&http::Method, &str) {
-        let head = &heads[index];
+    fn request_at(
+        heads: &[crate::test_server::CapturedRequest],
+        index: usize,
+    ) -> (&http::Method, &str) {
+        let head = &heads[index].head;
         (&head.method, head.uri.path())
     }
 

@@ -923,6 +923,16 @@ edge-health signals (request error rate, exceeded CPU/memory, usage
 percentages) are the watchdog's too — the GraphQL Analytics API is only
 read from Actions, never from the edge.
 
+Which builds failed is a third channel neither of those owns: the
+failure *rate* alerts, an alert per build would be noise. Once a day
+`build-failure-digest.yml` runs `stow-admin builds digest` — it lists
+the `build-crate.yml` runs that failed in the previous 24 hours,
+classifies each by the step it died in (the manual driver's
+verdict/infrastructure classes), and posts one comment on the single
+open `incident`-labelled issue `Daily failed builds` — opened on the
+first failing day, closed by a clean day. It is the one alert that
+sends no mail: the issue is the whole record (AGENTS.md).
+
 ## Tunables (Cloudflare bindings)
 
 The edge worker reads runtime knobs from `vars` bindings via
