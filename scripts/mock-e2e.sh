@@ -159,6 +159,31 @@ cleanup() {
             tail -n 80 "$log" >>"$dump" 2>/dev/null || true
         done
         cat "$dump" >&2
+        # stow#774 diagnostics: the heck host task's builder evidence.
+        # The build stage's stdout/stderr already landed in local-ci.log;
+        # what only persists in the per-run dispatch tree
+        # (.tmp/local-ci-dispatch/<task_id>) is the generated wrapper
+        # manifest, the capture-dir identity files the wrapper computed
+        # each unit's stable key under, the upload plan carrying every
+        # compile-key input, and the pushed records. Small files only —
+        # the phase target dirs stay behind.
+        local dispatch_root="$WORK_DIR/local-ci/.tmp/local-ci-dispatch"
+        local task_dir
+        for task_dir in "$dispatch_root"/*/; do
+            local plan="$task_dir/output/upload-plan.json"
+            [ -f "$plan" ] || continue
+            jq -e 'any(.[]; .crate_name == "heck")' "$plan" >/dev/null 2>&1 \
+                || continue
+            local evidence="$LOG_DIR/local-ci-heck-task"
+            mkdir -p "$evidence"
+            cp "$plan" "$evidence/" 2>/dev/null || true
+            cp "$task_dir/records.json" "$evidence/" 2>/dev/null || true
+            cp -R "$task_dir/workspace/wrapper" "$evidence/wrapper" \
+                2>/dev/null || true
+            cp -R "$task_dir/workspace/.stow-rustc-capture/output-identities" \
+                "$evidence/output-identities" 2>/dev/null || true
+            echo "[mock-e2e] heck task evidence copied to $evidence"
+        done
     fi
     echo "[mock-e2e] logs: $LOG_DIR"
     exit "$status"
@@ -1432,6 +1457,18 @@ echo "[mock-e2e] all $task_count host-deps tasks completed — the own-node chec
 # target-side node ever ran.
 publish_slices "host-deps-final"
 
+# stow#774 diagnostics: the published host slice's rows for the three
+# leaf units the consumer's lookups miss — every compile-key input the
+# publish recorded (compile_key, c_metadata, features, dep identities,
+# profile, emit, crate types, unit shape). Read back from the D1 catalog
+# the final `index sync` just folded — the same rows the consumer's
+# index lookups match against.
+d1 "SELECT * FROM artifacts \
+    WHERE crate_name IN ('heck', 'unicode-ident', 'proc-macro2') \
+      AND target = '$HOST_TARGET' AND rustc_version = '$RUSTC_VERSION'" \
+    | jq '.[0].results' >"$LOG_DIR/host-slice-rows.json" \
+    || echo "[mock-e2e] warning: could not dump host-slice rows for diagnostics" >&2
+
 # --- catalog assertions --------------------------------------------------
 #
 # The catalog's artifacts table must register every host-side unit under
@@ -1518,9 +1555,19 @@ prepare_consumer "$CONSUMER" snafu
 # consumer checks revalidate the tag's digest so they see the slices the
 # host-deps waves just published. They still fetch the slices themselves.
 # Native consumer: host units at the native invocation spelling.
+# Diagnostics (stow#774): `-v` hands cargo the verbose flag so the exact
+# rustc argv of every unit lands in the log; RUST_LOG scoped to stow's
+# own crates raises the wrapper's miss/lookup lines to debug; the
+# identity trace writes one JSON per invocation with every compile-key
+# input and the computed key itself — the evidence a published row is
+# diffed against when the lookups miss.
 (
     cd "$CONSUMER"
-    STOW_INDEX_REFRESH_SECS=0 stow_cli check
+    STOW_INDEX_REFRESH_SECS=0 \
+    STOW_TRACE_WRAPPED_COMPILERS=1 \
+    STOW_IDENTITY_TRACE="$LOG_DIR/identity-trace-native" \
+    RUST_LOG='stow_cli=debug,stow_types=debug' \
+        stow_cli check -v
 ) >"$LOG_DIR/stow-check-native.log" 2>&1 \
     || die "native stow check failed — see $LOG_DIR/stow-check-native.log"
 assert_served 1 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
@@ -1530,7 +1577,11 @@ assert_served 1 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
 # target dir, so the second check re-serves them, not re-compiles.
 (
     cd "$CONSUMER"
-    STOW_INDEX_REFRESH_SECS=0 stow_cli check --target "$CONSUMER_TARGET"
+    STOW_INDEX_REFRESH_SECS=0 \
+    STOW_TRACE_WRAPPED_COMPILERS=1 \
+    STOW_IDENTITY_TRACE="$LOG_DIR/identity-trace-wasm32" \
+    RUST_LOG='stow_cli=debug,stow_types=debug' \
+        stow_cli check -v --target "$CONSUMER_TARGET"
 ) >"$LOG_DIR/stow-check-wasm32.log" 2>&1 \
     || die "wasm32 stow check failed — see $LOG_DIR/stow-check-wasm32.log"
 assert_served 2 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
