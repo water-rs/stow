@@ -7923,6 +7923,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "glob",
+ "heel",
  "hex",
  "libc",
  "oci-client 0.16.1",

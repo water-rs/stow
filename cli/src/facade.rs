@@ -25,6 +25,7 @@ use stow_types::public_cache::{canonical_crate_name, detect_registry_crate_versi
 use stow_types::rustc::ParsedRustcArgs;
 
 use crate::rustc_args;
+use crate::supervisor::ipc::{IPC_METHOD, IpcCall, IpcCallBody, mint_connection_id};
 use crate::supervisor::protocol::{Answer, AwaitServeMap, Observed, Request};
 use crate::supervisor::{self, Endpoint};
 
@@ -234,15 +235,32 @@ fn run_uncovered(
     // before the frame that could consult it. (stow's own identity is
     // insensitive to provenance; an artifact compiled against CI's copy of
     // a locally-built crate links against the wrong copy.)
-    write_observed(&mut wire, token, executable, wrapped_args, None)
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    send(
+        &mut wire,
+        &Request::Observed(Observed::new(
+            token.to_owned(),
+            executable,
+            wrapped_args,
+            None,
+        )),
+    )
+    .map_err(|error| stow_types::stow_error!("{error}"))?;
     let status = std::process::Command::new(executable)
         .args(wrapped_args)
         .status()
         .wrap_err("failed to spawn wrapped compiler")?;
     let success = status.success();
-    write_observed(&mut wire, token, executable, wrapped_args, Some(success))
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    send(
+        &mut wire,
+        &Request::Observed(Observed::new(
+            token.to_owned(),
+            executable,
+            wrapped_args,
+            Some(success),
+        )),
+    )
+    .map_err(|error| stow_types::stow_error!("{error}"))?;
+    close_wire(&mut wire).map_err(|error| stow_types::stow_error!("{error}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -280,12 +298,9 @@ fn await_serve_map_within(
     let request = Request::AwaitServeMap(AwaitServeMap {
         token: token.to_owned(),
     });
-    write_request(&mut wire, &request).map_err(|error| {
-        stow_types::stow_error!(
-            "the serve-map wait could not ask the supervisor at {endpoint:?}: {error}"
-        )
-    })?;
-    match read_answer(&mut wire) {
+    let answer = send(&mut wire, &request);
+    let _ = close_wire(&mut wire);
+    match answer {
         Ok(Some(Answer::ServeMapReady)) => Ok(()),
         Ok(None) => Err(stow_types::stow_error!(
             "the supervisor at {endpoint:?} closed the serve-map wait unanswered"
@@ -385,22 +400,31 @@ impl Drop for ServeMapWaiters {
 }
 
 /// The stream a facade opens to its supervisor — unix socket on unix,
-/// loopback TCP elsewhere: the transport the Windows build's facades
-/// already speak (stow#347).
+/// loopback TCP elsewhere, or heel's IPC socket when the build is
+/// sandboxed: the transports every platform speaks (stow#347, stow#779).
 enum FacadeStream {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
     Tcp(std::net::TcpStream),
+    /// A conversation on heel's IPC socket: the only outbound channel a
+    /// `deny network*` profile leaves a sandboxed process (stow#779).
+    Ipc {
+        client: heel::IpcClient,
+        connection: u64,
+    },
 }
 
 impl FacadeStream {
     /// Bound the wait's read: the `ServeMapReady` answer cannot stall a
-    /// unit queue past it.
+    /// unit queue past it. heel's `IpcClient` exposes no read deadline,
+    /// so the IPC transport relies on the supervisor's own lifetime —
+    /// its death closes the socket and fails the call.
     fn set_read_timeout(&self, duration: Option<std::time::Duration>) -> std::io::Result<()> {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => stream.set_read_timeout(duration),
             Self::Tcp(stream) => stream.set_read_timeout(duration),
+            Self::Ipc { .. } => Ok(()),
         }
     }
 }
@@ -411,6 +435,7 @@ impl Read for FacadeStream {
             #[cfg(unix)]
             Self::Unix(stream) => stream.read(buffer),
             Self::Tcp(stream) => stream.read(buffer),
+            Self::Ipc { .. } => unreachable!("the IPC transport answers through its own call"),
         }
     }
 }
@@ -421,6 +446,7 @@ impl Write for FacadeStream {
             #[cfg(unix)]
             Self::Unix(stream) => stream.write(buffer),
             Self::Tcp(stream) => stream.write(buffer),
+            Self::Ipc { .. } => unreachable!("the IPC transport writes through its own call"),
         }
     }
 
@@ -429,6 +455,7 @@ impl Write for FacadeStream {
             #[cfg(unix)]
             Self::Unix(stream) => stream.flush(),
             Self::Tcp(stream) => stream.flush(),
+            Self::Ipc { .. } => unreachable!("the IPC transport writes through its own call"),
         }
     }
 }
@@ -444,7 +471,58 @@ fn connect(endpoint: &Endpoint) -> std::io::Result<FacadeStream> {
         Endpoint::Loopback(port) => {
             std::net::TcpStream::connect(("127.0.0.1", *port)).map(FacadeStream::Tcp)
         }
+        Endpoint::Ipc(path) => heel::IpcClient::connect(path)
+            .map(|client| FacadeStream::Ipc {
+                client,
+                connection: mint_connection_id(),
+            })
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("connect to supervisor over heel IPC: {error}"),
+                )
+            }),
     }
+}
+
+/// Send one `Request` and collect its `Answer` — over the socket that is
+/// a frame write plus a frame read, over IPC one call; `Observed`, the
+/// protocol's one-way frame, carries `Ok(None)` on either.
+fn send(wire: &mut FacadeStream, request: &Request) -> Result<Option<Answer>, FrameError> {
+    if let FacadeStream::Ipc { client, connection } = wire {
+        return client
+            .call::<_, Option<Answer>>(
+                IPC_METHOD,
+                &IpcCall {
+                    connection: *connection,
+                    body: IpcCallBody::Request(request.clone()),
+                },
+            )
+            .map_err(|error| FrameError::Io(std::io::Error::other(error.to_string())));
+    }
+    write_request(wire, request).map_err(FrameError::Io)?;
+    match request {
+        Request::Observed(_) => Ok(None),
+        _ => read_answer(wire),
+    }
+}
+
+/// End the conversation: the IPC server drops the marks it held — the
+/// teardown a socket close performs — then the transport drops.
+fn close_wire(wire: &mut FacadeStream) -> std::io::Result<()> {
+    let FacadeStream::Ipc { client, connection } = wire else {
+        return Ok(());
+    };
+    client
+        .call::<_, Option<Answer>>(
+            IPC_METHOD,
+            &IpcCall {
+                connection: *connection,
+                body: IpcCallBody::Close,
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 /// One length-prefixed request frame: the same wire
@@ -471,6 +549,15 @@ enum FrameError {
     Malformed(String),
 }
 
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Malformed(message) => write!(f, "{message}"),
+        }
+    }
+}
+
 /// Read one answer frame, blocking. `Ok(None)` is a clean end of
 /// stream — the driver closed between frames — the same semantic the
 /// async `read_frame` gives the supervisor.
@@ -492,24 +579,6 @@ fn read_answer(wire: &mut FacadeStream) -> Result<Option<Answer>, FrameError> {
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(|error| FrameError::Malformed(format!("decode frame: {error}")))
-}
-
-/// One one-way `Observed` frame: mark or report, on the same wire
-/// `client::Connection` speaks.
-fn write_observed(
-    wire: &mut FacadeStream,
-    token: &str,
-    executable: &OsString,
-    wrapped_args: &[OsString],
-    success: Option<bool>,
-) -> std::io::Result<()> {
-    let request = Request::Observed(Observed::new(
-        token.to_owned(),
-        executable,
-        wrapped_args,
-        success,
-    ));
-    write_request(wire, &request)
 }
 
 #[cfg(test)]

@@ -61,6 +61,8 @@ pub struct CargoCommandArgs {
     /// entirely.
     #[arg(long)]
     pub no_stow_resolver: bool,
+    #[command(flatten)]
+    pub sandbox: SandboxArgs,
     #[arg(
         value_name = "CARGO_ARGS",
         num_args = 0..,
@@ -68,6 +70,26 @@ pub struct CargoCommandArgs {
         allow_hyphen_values = true
     )]
     pub cargo_args: Vec<OsString>,
+}
+
+/// The experimental heel-sandbox switches, flattened into the commands
+/// that run cargo (stow#779). Both default off.
+#[derive(Debug, Clone, Args)]
+pub struct SandboxArgs {
+    /// Run the cargo build inside a heel sandbox: build scripts, proc
+    /// macros and the linkers build scripts select are cut off from the
+    /// home directory's credentials and every write outside the target
+    /// directory, while dependencies are fetched before the sandboxed
+    /// cargo runs offline. Experimental; also enabled by
+    /// `experimental.sandbox = true` in the stow config.
+    #[arg(long)]
+    pub sandbox: bool,
+    /// Like `--sandbox`, but additionally deny the build all network
+    /// access: the only channel out of the sandbox is the socket the
+    /// rustc wrapper uses to reach this stow process. Also enabled by
+    /// `experimental.sandbox_deny_network = true` in the stow config.
+    #[arg(long)]
+    pub sandbox_deny_network: bool,
 }
 
 #[derive(Debug, Clone, Args)]
