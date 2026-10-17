@@ -608,7 +608,10 @@ fn resolve_link_from(
 /// The `COMPILER_PATH` a build at this config would run under, per
 /// cargo's `env` precedence: `force` entries beat the ambient variable,
 /// plain entries lose to it and apply only when it is unset.
-fn effective_compiler_path(config: &cargo_config2::Config, env: EnvLookup<'_>) -> Option<OsString> {
+pub fn effective_compiler_path(
+    config: &cargo_config2::Config,
+    env: EnvLookup<'_>,
+) -> Option<OsString> {
     let ambient = env("COMPILER_PATH");
     // `CARGO_ENV_<name>` overrides a `[env]` file entry the way cargo
     // applies it — below `force` and the ambient variable, above the
@@ -1177,7 +1180,7 @@ fn codegen_options(rustflags: &[String]) -> Vec<&str> {
 
 /// The last `-C linker=` among `rustflags` — the codegen option that
 /// overrides a configured `linker` key.
-fn rustflags_linker(rustflags: &[String]) -> Option<String> {
+pub fn rustflags_linker(rustflags: &[String]) -> Option<String> {
     codegen_options(rustflags)
         .into_iter()
         .filter_map(|option| option.strip_prefix("linker="))
@@ -1187,7 +1190,7 @@ fn rustflags_linker(rustflags: &[String]) -> Option<String> {
 
 /// Every `-B` directory among `rustflags`' `link-arg`/`link-args` values,
 /// in the order they reach the driver.
-fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
+pub fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for option in codegen_options(rustflags) {
         let Some((key, value)) = option.split_once('=') else {
