@@ -527,65 +527,70 @@ impl WorkerCpuBudget {
 /// passes half of the Worker CPU allowance (`cpu_ms_at_budget`), and
 /// prints each route's share of the allowance at its measured figure
 /// and at its budget.
-///
-/// The values below are provisional until the first Traffic cost run
-/// on CI reports measured figures; that run replaces them by the rule
-/// above.
 pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
     WorkerCpuBudget {
+        // Run 39009034210: 0.38 ms.
         lane: "site",
         cpu_ms: 5.0,
     },
     WorkerCpuBudget {
+        // Run 39009034210: 2.165 ms.
         lane: "stats",
-        cpu_ms: 10.0,
+        cpu_ms: 5.0,
     },
     WorkerCpuBudget {
         // The pointer GET plus the digest-addressed slice GET.
+        // Run 39009034210: 2.1 ms.
         lane: "index-pull",
-        cpu_ms: 10.0,
+        cpu_ms: 5.0,
     },
     WorkerCpuBudget {
         // A covered bundle streamed through the byte path — the
-        // dominant CPU line at 9e5 events/mo, so its budget is what the
-        // allowance leaves it. stow#738 measured 11–24 ms mean on the
-        // deployed Worker; if the local measurement lands in that
-        // range the gate fails on the projection, which is the finding
-        // the test exists to report.
+        // dominant CPU line at 9e5 events/mo. stow#738 measured 11–24 ms
+        // mean on the deployed Worker, far above this local figure.
+        // Run 39009034210: 0.595 ms.
         lane: "bundle-fetch",
-        cpu_ms: 10.0,
+        cpu_ms: 5.0,
     },
     WorkerCpuBudget {
+        // Run 39009034210: 1.38 ms.
         lane: "status-read",
-        cpu_ms: 10.0,
+        cpu_ms: 5.0,
     },
     WorkerCpuBudget {
+        // Run 39009034210: 3.06 ms.
         lane: "admin-status",
         cpu_ms: 10.0,
     },
     WorkerCpuBudget {
+        // Run 39009034210: 5.475 ms.
         lane: "queue-read",
         cpu_ms: 15.0,
     },
     WorkerCpuBudget {
+        // Run 39009034210: 5.395 ms.
         lane: "queue-mutate",
         cpu_ms: 15.0,
     },
     WorkerCpuBudget {
+        // Run 39009034210: 4.345 ms.
         lane: "trusted-submit",
-        cpu_ms: 15.0,
-    },
-    WorkerCpuBudget {
-        lane: "admission",
-        cpu_ms: 15.0,
-    },
-    WorkerCpuBudget {
-        lane: "enqueue-redeem",
         cpu_ms: 10.0,
+    },
+    WorkerCpuBudget {
+        // Run 39009034210: 1.64 ms.
+        lane: "admission",
+        cpu_ms: 5.0,
+    },
+    WorkerCpuBudget {
+        // Run 39009034210: 5.915 ms.
+        lane: "enqueue-redeem",
+        cpu_ms: 15.0,
     },
     WorkerCpuBudget {
         // The signed `workflow_run` callback: HMAC check, the records
         // artifact's cosign verification, and the completion.
+        // Run 39009034210: 3.185 ms.
         lane: "workflow-callback",
         cpu_ms: 10.0,
     },
