@@ -1513,10 +1513,14 @@ printf 'snafu-derive = "=%s"\n\n[build-dependencies]\nheck = "=%s"\n' "$HOST_DEP
 printf 'fn main() {}\n' >"$CONSUMER/build.rs"
 prepare_consumer "$CONSUMER" snafu
 
+# The host slice this run already cached for itoa is still inside the
+# CLI's refresh interval, and it predates every host-deps record: both
+# consumer checks revalidate the tag's digest so they see the slices the
+# host-deps waves just published. They still fetch the slices themselves.
 # Native consumer: host units at the native invocation spelling.
 (
     cd "$CONSUMER"
-    stow_cli check
+    STOW_INDEX_REFRESH_SECS=0 stow_cli check
 ) >"$LOG_DIR/stow-check-native.log" 2>&1 \
     || die "native stow check failed — see $LOG_DIR/stow-check-native.log"
 assert_served 1 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
@@ -1526,7 +1530,7 @@ assert_served 1 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
 # target dir, so the second check re-serves them, not re-compiles.
 (
     cd "$CONSUMER"
-    stow_cli check --target "$CONSUMER_TARGET"
+    STOW_INDEX_REFRESH_SECS=0 stow_cli check --target "$CONSUMER_TARGET"
 ) >"$LOG_DIR/stow-check-wasm32.log" 2>&1 \
     || die "wasm32 stow check failed — see $LOG_DIR/stow-check-wasm32.log"
 assert_served 2 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
