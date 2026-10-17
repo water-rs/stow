@@ -18,8 +18,6 @@ mod demand_feed;
 mod deploy;
 mod github;
 mod index_cmd;
-mod launch_gate;
-mod launch_load;
 mod launch_model;
 mod maintenance;
 mod manual;
@@ -35,6 +33,7 @@ mod scheduler;
 mod source_trees;
 #[cfg(test)]
 mod test_server;
+mod traffic_cost;
 mod watchdog;
 
 use std::fmt::Write as _;
@@ -123,14 +122,10 @@ enum Command {
     /// Regenerate the checked-in launch traffic model from production
     /// analytics (stow#452).
     LaunchModel(launch_model::LaunchModelArgs),
-    /// The launch-cost gate: project the measured scheduler-budget
-    /// report against the launch model and fail on an over-allowance
-    /// dimension (stow#452).
-    LaunchGate(launch_gate::LaunchGateArgs),
-    /// The stow#452 mock-stack load test: drive a running edge at the
-    /// launch model's peak rates and report per-lane p50/p99, error
-    /// and overload signals.
-    LaunchLoad(launch_load::LaunchLoadArgs),
+    /// The Traffic cost test's pieces: Worker CPU per lane, the
+    /// peak-concurrency drive, and the projection against the
+    /// allowance (`scripts/traffic-cost.sh`).
+    TrafficCost(traffic_cost::TrafficCostArgs),
     /// The human request lane's Actions leg: `request resolve` turns an
     /// admitted request's dispatch input into its outcome report.
     Request(request::RequestArgs),
@@ -246,8 +241,7 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         }
         Command::Index(args) => index_cmd::run(args).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
-        Command::LaunchGate(args) => launch_gate::run(&args, output).await,
-        Command::LaunchLoad(args) => launch_load::run(&Edge::connect().await?, &args, output).await,
+        Command::TrafficCost(args) => traffic_cost::run(args, output).await,
         Command::Request(args) => request::run(args, output).await,
         Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
         Command::Deploy(args) => deploy::run(args, output).await,

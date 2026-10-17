@@ -4,8 +4,8 @@
 //! here is the *shape* — which queue-order `n` is pending, completed,
 //! failed or in-flight, and the `%064x` task id it carries — so every
 //! consumer computes the same row: the edge's seeders and drives, the
-//! host drift gate, and `stow-admin launch-load`'s lanes (which name
-//! seeded ids directly). A shape that exists in two places drifts —
+//! host drift gate, and `stow-admin traffic-cost`'s lanes (which
+//! name seeded ids directly). A shape that exists in two places drifts —
 //! the reason `DO_BUDGETS` moved here too.
 
 use crate::api::CI_TARGET_TRIPLES;
@@ -25,8 +25,8 @@ pub struct FixtureShape {
 
 impl FixtureShape {
     /// The production shape — 100k rows — the workerd harness seeds by
-    /// default (`STOW_BUDGET_SIZES` in `scripts/scheduler-budget.sh`
-    /// adds the 20k shape to the pair).
+    /// default (`STOW_TRAFFIC_SIZES` in `scripts/traffic-cost.sh`
+    /// pairs it with the 1M shape).
     pub const PRODUCTION: Self = Self {
         queue_rows: 100_000,
     };

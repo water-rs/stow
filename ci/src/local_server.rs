@@ -55,6 +55,10 @@ pub struct MockTaskRun {
     pub conclusion: Option<&'static str>,
     /// Where a human would look — the failure list prints it.
     pub html_url: String,
+    /// The workflow file the run belongs to, as GitHub's run `path`
+    /// spells it (`.github/workflows/<file>`) — what tells a build run
+    /// from a resolve run.
+    pub path: String,
 }
 
 /// Per-process state injected into every `/dispatch` invocation.
@@ -126,6 +130,7 @@ impl LocalServerState {
     fn mark_run(
         &self,
         workflow_run_id: u64,
+        workflow_file: &str,
         display_title: &str,
         status: &'static str,
         conclusion: Option<&'static str>,
@@ -136,6 +141,7 @@ impl LocalServerState {
             status,
             conclusion,
             html_url: format!("http://{}/tasks/{workflow_run_id}", self.listen),
+            path: format!(".github/workflows/{workflow_file}"),
         };
         self.runs
             .lock()
@@ -160,6 +166,7 @@ impl LocalServerState {
     ) {
         self.mark_run(
             workflow_run_id,
+            stow_types::trusted_builder::WORKFLOW_FILE,
             &Self::build_run_title(task),
             status,
             conclusion,
@@ -285,15 +292,18 @@ fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
             run_dispatched_task(state_for_task.clone(), task.clone(), workflow_run_id).await
         {
             tracing::error!(task_id = %task.task_id, %error, "local CI dispatched task failed");
-            state_for_task.mark_build_run(&task, workflow_run_id, "completed", Some("failure"));
-            if let Err(report_error) = report_failed_task(
+            // The run reads `completed` only once its webhook has
+            // been answered — `GET /tasks` is how a harness knows every
+            // callback a pass caused has landed (scripts/traffic-cost.sh).
+            let reported = report_failed_task(
                 &state_for_task,
                 &task,
                 workflow_run_id,
                 format!("local CI dispatch failed: {error}"),
             )
-            .await
-            {
+            .await;
+            state_for_task.mark_build_run(&task, workflow_run_id, "completed", Some("failure"));
+            if let Err(report_error) = reported {
                 tracing::error!(
                     task_id = %task.task_id,
                     %report_error,
@@ -317,7 +327,13 @@ fn dispatch_resolve(state: LocalServerState, dispatch: RequestDispatch) -> Respo
     let display_title =
         stow_types::records::resolve_run_title(dispatch.attempt, &dispatch.request_id);
     let run_key = resolve_run_key(&dispatch);
-    state.mark_run(workflow_run_id, &display_title, "in_progress", None);
+    state.mark_run(
+        workflow_run_id,
+        stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE,
+        &display_title,
+        "in_progress",
+        None,
+    );
     let report = WorkflowRunReport {
         workflow_run_id,
         run_key,
@@ -452,12 +468,7 @@ async fn run_dispatched_task(
             &std::env::current_exe()?,
         )
         .await?;
-        state.mark_build_run(&task, workflow_run_id, "completed", Some("success"));
-        return post_workflow_run(
-            &state,
-            &task_workflow_run(&state, &task, workflow_run_id, Some("success"), None),
-        )
-        .await;
+        return complete_build_run(&state, &task, workflow_run_id).await;
     }
     let task_json = serde_json::to_string(&task)?;
     let exe = std::env::current_exe()?;
@@ -468,7 +479,6 @@ async fn run_dispatched_task(
     let status = run_build_stage(&exe, &task_json, &layout).await?;
     if !status.success() {
         let error = format!("stow-build exited with status {status}");
-        state.mark_build_run(&task, workflow_run_id, "completed", Some("failure"));
         post_workflow_run(
             &state,
             &task_workflow_run(
@@ -497,12 +507,7 @@ async fn run_dispatched_task(
             exe.as_path(),
         )
         .await?;
-        state.mark_build_run(&task, workflow_run_id, "completed", Some("success"));
-        return post_workflow_run(
-            &state,
-            &task_workflow_run(&state, &task, workflow_run_id, Some("success"), None),
-        )
-        .await;
+        return complete_build_run(&state, &task, workflow_run_id).await;
     }
 
     populate_mock_registry(&exe, &state, &task, workflow_run_id, &layout).await?;
@@ -514,12 +519,25 @@ async fn run_dispatched_task(
         exe.as_path(),
     )
     .await?;
-    state.mark_build_run(&task, workflow_run_id, "completed", Some("success"));
+    complete_build_run(&state, &task, workflow_run_id).await
+}
+
+/// Deliver a successful run's `workflow_run` webhook, then mark the run
+/// `completed`: `GET /tasks` reports a run finished only once the edge
+/// has answered its callback, so a caller that sees no build run in
+/// progress knows no callback is still in flight.
+async fn complete_build_run(
+    state: &LocalServerState,
+    task: &BuildTaskPayload,
+    workflow_run_id: u64,
+) -> stow_types::error::Result<()> {
     post_workflow_run(
-        &state,
-        &task_workflow_run(&state, &task, workflow_run_id, Some("success"), None),
+        state,
+        &task_workflow_run(state, task, workflow_run_id, Some("success"), None),
     )
-    .await
+    .await?;
+    state.mark_build_run(task, workflow_run_id, "completed", Some("success"));
+    Ok(())
 }
 
 /// Spawn the untrusted `stow-build build` stage. It receives only the task
@@ -602,7 +620,6 @@ async fn populate_mock_registry(
         return Ok(());
     }
     let error = format!("mock registry populate exited with status {populate_status}");
-    state.mark_build_run(task, workflow_run_id, "completed", Some("failure"));
     post_workflow_run(
         state,
         &task_workflow_run(
@@ -823,6 +840,7 @@ mod tests {
         let first_response = dispatch_response(&first);
         state.mark_run(
             first.workflow_run_id,
+            first.workflow_file,
             &first.display_title,
             "in_progress",
             None,
@@ -841,6 +859,7 @@ mod tests {
         let second_response = dispatch_response(&second);
         state.mark_run(
             second.workflow_run_id,
+            second.workflow_file,
             &second.display_title,
             "in_progress",
             None,

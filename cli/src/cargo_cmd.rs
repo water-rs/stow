@@ -1850,10 +1850,20 @@ async fn cached_consumer_slices(
         }
     };
     let slice = slice?;
-    // A slice the cache does not hold is one the enrichment's fetch will
-    // land mid-build: the map the lite pass writes stays provisional
-    // until that answer replaces it (stow#347).
-    let pending = slice.is_none() || (host_slice_expected && host_slice.is_none());
+    // "Pending" is a fetch fact, not an absence fact: the enrichment's
+    // `ensure_slice` consults the registry whenever the pointer is
+    // missing, stale past `index_refresh_interval`, or the interval is
+    // 0 — the same rule `fetch_slice` itself applies (stow#788). A
+    // stale-but-readable generation is provisional too: the map the
+    // lite pass writes from it stays provisional until the fetched
+    // answer replaces it.
+    let pending = index::slice_fetch_pending(config, &project.target, &project.rustc_version).await
+        || match host_target.as_deref() {
+            Some(target) if host_slice_expected => {
+                index::slice_fetch_pending(config, target, &project.rustc_version).await
+            }
+            _ => false,
+        };
     Ok((slice, host_slice, pending))
 }
 
@@ -2356,11 +2366,13 @@ async fn synthesize_lockfile(
 ) -> stow_types::error::Result<Option<String>> {
     // The resolver needs a cached slice to pin against — read it first,
     // so a cold cache skips the manifest walk entirely (stow#608).
-    let Some(slice) = cached_consumer_slices(config, project)
-        .instrument(tracing::debug_span!("stow.precargo.cached_slices"))
-        .await?
-        .0
-    else {
+    let (slice, host_slice) = {
+        let (slice, host_slice, _) = cached_consumer_slices(config, project)
+            .instrument(tracing::debug_span!("stow.precargo.cached_slices"))
+            .await?;
+        (slice, host_slice)
+    };
+    let Some(slice) = slice else {
         tracing::info!("no cached index slice; nothing for the resolver to pin to");
         return Ok(None);
     };
@@ -2374,7 +2386,13 @@ async fn synthesize_lockfile(
         return Ok(None);
     }
     let outcome = {
-        let rows = slice.index.rows;
+        // Host-side rows pin host-only subtrees the same way: on a
+        // `--target` build a direct dep can exist only in the host
+        // slice (stow#788).
+        let mut rows = slice.index.rows;
+        if let Some(host_slice) = host_slice {
+            rows.extend(host_slice.index.rows);
+        }
         tokio::task::spawn_blocking(move || lockfile_resolver::resolve_lockfile(&rows, &direct))
             .await
             .wrap_err("join lockfile resolver")??
@@ -4390,21 +4408,12 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     // on cargo's environment, so the deciding process holds the resolved
     // values itself (stow#347).
     let analysis_cell = analysis_cell(plan);
+    let policy_ready = policy_ready_signal(cache_policy_path.is_some() && plan.deferred_analysis);
     // The driver-built wrapper base lands here: the task spawned in
     // `run_inner` has been running beside mold's provisioning and the
     // analysis, so this await is almost always an immediate take (stow#608).
     let env_base = join_env_base(project.env_base.as_ref()).await?;
-    // The supervisor completes this on the first facade frame that
-    // describes a real compile unit — the moment cargo's resolution is
-    // over — so the package-cache lock always goes to the real build
-    // first (stow#608).
-    let resolution_done = crate::ResolutionDone::pending();
-    // The foreground hold's release task: `ResolutionDone` is the
-    // moment cargo holds the package-cache lock only shared, so a
-    // drain's cargo can no longer make this build wait — and a `stow
-    // run` that stays up for hours must not keep every drain shut
-    // (stow#667). It is stopped with cargo below.
-    let release_hold = spawn_hold_release(resolution_done.clone(), project.foreground.clone());
+    let (resolution_done, release_hold) = spawn_resolution_lease(project);
     // The supervisor and the handler share the build's in-flight unit
     // registry: the server marks and completes flights, the post-compiles
     // wait on them before resolving dependency identities (stow#618).
@@ -4416,6 +4425,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             public_cache_disabled: public_cache_mode.disable_reason().is_some(),
             analysis: std::sync::Arc::clone(&analysis_cell),
             serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
+            policy_ready: std::sync::Arc::clone(&policy_ready),
             in_flight: in_flight.clone(),
         },
         env_base,
@@ -4432,9 +4442,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     )
     .await?;
 
-    let before = CoverageSnapshot::capture(config)
-        .instrument(tracing::debug_span!("stow.precargo.coverage_snapshot"))
-        .await;
+    let before = coverage_snapshot(config).await;
 
     // The full graph analysis — the verified index fetch and the live
     // `--unit-graph` resolve — runs while cargo builds rather than in
@@ -4456,6 +4464,8 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             map_path: serve_map_path.clone(),
             policy_dir: cache_policy_path.clone(),
             readiness: serve_waiters,
+            policy_ready: (!policy_ready.has_completed())
+                .then(|| crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(&policy_ready))),
             resolution_done,
         }))
     } else {
@@ -4825,6 +4835,29 @@ async fn seed_cache_policy(
     }
 }
 
+/// The build's pre-cargo coverage snapshot, instrumented as its own
+/// span.
+async fn coverage_snapshot(config: Option<&StowConfig>) -> CoverageSnapshot {
+    CoverageSnapshot::capture(config)
+        .instrument(tracing::debug_span!("stow.precargo.coverage_snapshot"))
+        .await
+}
+
+/// The supervisor completes the latch on the first facade frame that
+/// describes a real compile unit — the moment cargo's resolution is
+/// over — so the package-cache lock always goes to the real build first
+/// (stow#608). The release task rides it: once cargo holds the
+/// package-cache lock only shared, a drain's cargo can no longer make
+/// this build wait — and a `stow run` that stays up for hours must not
+/// keep every drain shut (stow#667). The task is stopped with cargo.
+fn spawn_resolution_lease(
+    project: &ProjectContext,
+) -> (crate::ResolutionDone, tokio::task::JoinHandle<()>) {
+    let resolution_done = crate::ResolutionDone::pending();
+    let release_hold = spawn_hold_release(resolution_done.clone(), project.foreground.clone());
+    (resolution_done, release_hold)
+}
+
 /// The task `run_cargo` stops with cargo: release the foreground hold
 /// the moment `resolution_done` fires (stow#667).
 fn spawn_hold_release(
@@ -5040,7 +5073,10 @@ fn arm_or_settle_serve_map_ready(
     if serve_waiters.is_some() {
         return;
     }
-    if plan.deferred_analysis && config.is_some() && plan.servable_units.is_none() {
+    if plan.deferred_analysis
+        && config.is_some()
+        && plan.servable_units.as_ref().is_none_or(|map| map.pending)
+    {
         *serve_waiters = Some(crate::facade::ServeMapWaiters::new(std::sync::Arc::clone(
             serve_map_ready,
         )));
@@ -5136,12 +5172,111 @@ struct BuildEnrichment {
     /// `AwaitServeMap` and the slice memo's lookups, whichever way the
     /// analysis ends (stow#347, stow#735).
     readiness: Option<crate::facade::ServeMapWaiters>,
+    /// The policy gate's completion guard: dropped right after the
+    /// coarse allow commit lands the fetched slices' markers — or by an
+    /// early return — so a denied unit waits out the commit once, never
+    /// the task's whole lifetime (stow#788).
+    policy_ready: Option<crate::facade::ServeMapWaiters>,
     /// Held until the supervisor's first compile-unit frame says
     /// cargo's resolution is over: only then may this task's own
     /// `--unit-graph` cargo take the package-cache lock — before that
     /// it would queue the user's real build behind a whole second
     /// resolve (stow#608).
     resolution_done: crate::ResolutionDone,
+}
+
+/// The policy gate's readiness latch for this build: pending only while
+/// a deferred build's enrichment still owes the seeded directory its
+/// coarse commit — released by the commit or by the guard dropping with
+/// the task; every other build answers a missing marker at once
+/// (stow#788).
+fn policy_ready_signal(commit_pending: bool) -> std::sync::Arc<crate::facade::ServeMapSignal> {
+    std::sync::Arc::new(if commit_pending {
+        crate::facade::ServeMapSignal::pending()
+    } else {
+        crate::facade::ServeMapSignal::settled()
+    })
+}
+
+/// The policy gate's first commit — every crate the fetched slices
+/// name that this build compiles. The marker is name-keyed, so the set
+/// is a superset of every marker the full analysis could add, and a
+/// crate absent from it can never gain one: that is what makes the
+/// commit's `policy_ready` release the final deny answer (stow#788).
+/// An over-broad allow costs the plan path one indexed lookup, never a
+/// wrong serve. When the compiled-name set is not on disk yet — no
+/// lockfile, no cached graph — the commit falls back to every row name
+/// rather than wait on the resolve it exists to outrun.
+async fn coarse_cache_policy_entries(
+    config: &StowConfig,
+    project: &ProjectContext,
+    slice: &index::IndexSlice,
+    host_slice: Option<&index::IndexSlice>,
+) -> stow_types::error::Result<(Vec<cache_policy::CachePolicyEntry>, bool)> {
+    let row_names: std::collections::BTreeSet<&str> = slice
+        .index
+        .rows
+        .iter()
+        .chain(host_slice.iter().flat_map(|slice| slice.index.rows.iter()))
+        .map(|row| row.crate_name.as_str())
+        .collect();
+    let compiled: Option<std::collections::BTreeSet<String>> =
+        if let Some(graph) = expanded_graph_cached(config, project).await? {
+            Some(
+                graph
+                    .entries
+                    .iter()
+                    .map(|entry| entry.crate_name.as_str().to_owned())
+                    .collect(),
+            )
+        } else {
+            let workspace_root = project.workspace_root.clone();
+            tokio::task::spawn_blocking(move || {
+                workspace_deps::lockfile_registry_packages(&workspace_root)
+            })
+            .await
+            .wrap_err("join lockfile registry package read")??
+            .map(|packages| packages.into_iter().map(|(name, _)| name).collect())
+        };
+    // With neither graph nor lockfile on disk the compiled set is not yet
+    // written — cargo creates the lockfile during this build's own
+    // resolution — so bound the commit to the manifest's direct deps, the
+    // lockfile-free answer the build already has (never the whole slice),
+    // and report the commit incomplete: the latch stays pending until the
+    // analysis writes the exact set.
+    let names: Vec<String> = if let Some(compiled) = &compiled {
+        row_names
+            .into_iter()
+            .filter(|name| compiled.contains(*name))
+            .map(str::to_owned)
+            .collect()
+    } else {
+        let direct = collect_user_direct_dependencies(
+            &project.manifest_path,
+            &project.workspace_root,
+            &project.metadata_args,
+        )
+        .await?;
+        let direct: std::collections::BTreeSet<String> = direct
+            .into_iter()
+            .map(|dep| dep.crate_name.as_str().to_owned())
+            .collect();
+        row_names
+            .into_iter()
+            .filter(|name| direct.contains(*name))
+            .map(str::to_owned)
+            .collect()
+    };
+    Ok((
+        names
+            .into_iter()
+            .map(|crate_name| cache_policy::CachePolicyEntry {
+                target: project.target.clone(),
+                crate_name,
+            })
+            .collect(),
+        compiled.is_some(),
+    ))
 }
 
 /// Run the full graph analysis while cargo builds and commit what it
@@ -5160,6 +5295,29 @@ fn spawn_build_enrichment(work: BuildEnrichment) -> tokio::task::JoinHandle<()> 
 }
 
 async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::Result<()> {
+    // Everything the build consults downstream reads the fetched
+    // generation, so the consumer slices are fetched first — the coarse
+    // allow commit and the serve map's final write both follow it
+    // (stow#788). `ensure_slice` memoizes, so the analysis below reuses
+    // this pair.
+    let (slice, host_slice) = ensure_consumer_slices(&work.config, &work.project).await?;
+    // The policy gate commits as soon as the rows exist — before the
+    // `resolution_done` gate and the second resolve. The marker is
+    // name-keyed, so "the crate has any row the fetched slices carry"
+    // is already the final allow answer; the guard's drop releases the
+    // plan path's waiters, and an early return releases them the same
+    // way (stow#788).
+    if let Some(policy_dir) = &work.policy_dir {
+        let (entries, complete) =
+            coarse_cache_policy_entries(&work.config, &work.project, &slice, host_slice.as_ref())
+                .await?;
+        cache_policy::write_policy_entries(policy_dir, &entries).await?;
+        if complete {
+            drop(work.policy_ready.take());
+        }
+    } else {
+        drop(work.policy_ready.take());
+    }
     // The build's slice waiters — a `pending` map's facades, and the
     // slice memo's lookups (stow#735) — hold until coverage is knowable:
     // the fresh slices landed, the filesystem pass rebuilt the map with
@@ -5168,7 +5326,6 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // (the cached slices now exist) and the guard's drop releases the
     // waiters; an early return releases them the same way (stow#347).
     if work.readiness.is_some() {
-        ensure_consumer_slices(&work.config, &work.project).await?;
         if let Some(map_path) = &work.map_path {
             let lite = analyze_workspace_prediction_lite(&work.project, &work.config).await?;
             write_build_json_file(map_path, lite.servable_units.unwrap_or_default()).await?;
@@ -5187,9 +5344,15 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
         let map = analysis.servable_units.clone().unwrap_or_default();
         write_build_json_file(map_path, map).await?;
     }
-    if let Some(policy_dir) = &work.policy_dir {
+    // The coarse commit stayed incomplete — no lockfile and no cached
+    // graph to bound it — so the analysis's exact allow set is the
+    // release-worthy commit for the units still parked on the latch.
+    if work.policy_ready.is_some()
+        && let Some(policy_dir) = &work.policy_dir
+    {
         cache_policy::write_policy_entries(policy_dir, &analysis.cache_policy_entries).await?;
     }
+    drop(work.policy_ready.take());
     work.cell
         .set(crate::AnalysisFacts {
             semantic_fallback_enabled: analysis

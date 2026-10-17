@@ -209,7 +209,7 @@ async fn fetch_slice(
     let pointer = read_pointer(&dir).await;
     if !force
         && let Some(pointer) = &pointer
-        && now_secs().saturating_sub(pointer.fetched_at) < config.index_refresh_interval.as_secs()
+        && pointer_is_fresh(pointer, config.index_refresh_interval)
         && let Some(slice) = load_cached(&dir, pointer).await?
     {
         return Ok(slice);
@@ -448,6 +448,26 @@ fn slice_dir(config: &StowConfig, target: &str, rustc_version: &str) -> PathBuf 
         .join("index")
         .join(target)
         .join(rustc_version)
+}
+
+/// The one freshness rule for a cached slice pointer: inside
+/// `index_refresh_interval` it serves as-is (an interval of 0
+/// revalidates every call); absent or past it, `fetch_slice` will
+/// consult the registry. Readers that must know whether the in-build
+/// fetch can still change their answer share this rule (stow#788).
+fn pointer_is_fresh(pointer: &SlicePointer, interval: std::time::Duration) -> bool {
+    now_secs().saturating_sub(pointer.fetched_at) < interval.as_secs()
+}
+
+/// Whether the next `fetch_slice` for this `(target, rustc)` will
+/// consult the registry — no usable pointer, or one that aged out.
+/// `cached_slice`'s "absent" is not the same question: a readable stale
+/// slice still exists, but the fetch it precedes can change every
+/// answer derived from it.
+pub async fn slice_fetch_pending(config: &StowConfig, target: &str, rustc_version: &str) -> bool {
+    read_pointer(&slice_dir(config, target, rustc_version))
+        .await
+        .is_none_or(|pointer| !pointer_is_fresh(&pointer, config.index_refresh_interval))
 }
 
 fn now_secs() -> u64 {
@@ -734,6 +754,54 @@ mod tests {
                 .await
                 .expect("cached slices")
                 .is_empty()
+        );
+    }
+
+    /// stow#788: "will the enrichment fetch" is `fetch_slice`'s own
+    /// freshness rule — an absent pointer, one older than the refresh
+    /// interval, and a zero interval all mean the next fetch consults
+    /// the registry; a pointer inside the interval is final.
+    #[tokio::test]
+    async fn slice_fetch_pending_is_the_fetchs_freshness_rule() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        assert!(
+            slice_fetch_pending(&config, TARGET, RUSTC).await,
+            "no pointer: the fetch runs"
+        );
+
+        let dir = slice_dir(&config, TARGET, RUSTC);
+        std::fs::create_dir_all(&dir).expect("create slice dir");
+        let pointer = SlicePointer {
+            manifest_digest: "sha256:aaaa".to_owned(),
+            fetched_at: now_secs(),
+            row_count: 1,
+        };
+        write_pointer(&dir, &pointer).await.expect("write pointer");
+        assert!(
+            !slice_fetch_pending(&config, TARGET, RUSTC).await,
+            "a pointer inside the interval serves as-is"
+        );
+
+        write_pointer(
+            &dir,
+            &SlicePointer {
+                fetched_at: 0,
+                ..pointer
+            },
+        )
+        .await
+        .expect("write stale pointer");
+        assert!(
+            slice_fetch_pending(&config, TARGET, RUSTC).await,
+            "a pointer older than the interval revalidates"
+        );
+
+        let mut eager = test_config(tempdir.path());
+        eager.index_refresh_interval = std::time::Duration::ZERO;
+        assert!(
+            slice_fetch_pending(&eager, TARGET, RUSTC).await,
+            "a zero interval revalidates every call"
         );
     }
 }

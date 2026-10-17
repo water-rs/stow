@@ -84,7 +84,7 @@ async fn extract_trusted_caller(
         })?;
     github_auth::authenticate(
         &config,
-        &github_auth::CfGitHubTrust::new(OutboundPool::new()),
+        &github_auth::CfGitHubTrust::new(OutboundPool::new(), config.probe_base_url.clone()),
         &jwks,
         &push_verdicts,
         &bearer,
