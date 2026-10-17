@@ -17,11 +17,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
-use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry};
+use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry, runner_family};
 use stow_types::glibc::GlibcVersion;
-use stow_types::identity::{CMetadata, CrateName};
+use stow_types::identity::{
+    CMetadata, CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple,
+    WireRustcVersion,
+};
 use stow_types::index::ArtifactIndexRow;
 use stow_types::public_cache::stable_c_metadata_for_compile_key;
+use stow_types::task_graph::{DigestEntry, TaskNodeIdentity, shared_dependency_identities};
 use stow_types::versioning::is_semver_compatible_upgrade;
 
 use crate::fetch::SemanticFetchRequest;
@@ -168,15 +172,23 @@ pub const fn host_glibc() -> Option<GlibcVersion> {
 /// leaves the prefetch set, because downloading a bundle rustc cannot
 /// `dlopen` is a wasted round trip.
 ///
+/// `target`/`rustc_version` are the build's own toolchain coordinates —
+/// each expanded node's dependency digest resolves against them, and
+/// coverage counts a node only when the slice carries an artifact
+/// published under that node's own context (stow#790).
+///
 /// # Errors
 ///
 /// Returns an error when `expanded_entries` is missing or malformed
-/// (duplicate node, dangling edge, missing root), or when an index row
-/// carries a `compile_key` the canonical-metadata check cannot read.
+/// (duplicate node, dangling edge, missing root, an unresolvable
+/// dependency subgraph), or when an index row carries a `compile_key`
+/// the canonical-metadata check cannot read.
 pub fn analyze_dependency_graph(
     rows: &[ArtifactIndexRow],
     entries: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
+    target: &str,
+    rustc_version: &str,
     host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<GraphAnalysis> {
     if entries.is_empty() {
@@ -188,7 +200,7 @@ pub fn analyze_dependency_graph(
         });
     }
 
-    let exact_graph = exact_graph_from_request(entries, expanded_entries)?;
+    let exact_graph = exact_graph_from_request(entries, expanded_entries, target, rustc_version)?;
 
     // The analysis entries' feature key is cargo's recorded feature
     // set — the same identity the expanded entries carry — while
@@ -260,6 +272,7 @@ fn expanded_scheduler_plan(
     let cached = cached_artifacts(
         rows,
         &exact_graph.feature_json_by_key,
+        &exact_graph.dependency_identity_by_key,
         &exact_graph.root_keys,
         host_glibc,
     )?;
@@ -290,11 +303,20 @@ struct ExpandedSchedulerPlan {
 struct ExactExpandedGraph {
     feature_json_by_key: BTreeMap<PackageKey, String>,
     root_keys: BTreeSet<PackageKey>,
+    /// Each node's own Merkle dependency digest, resolved out of the
+    /// entry's carried subgraph — the context an artifact must have
+    /// been published under to cover the node (stow#790). Empty on a
+    /// consumer target with no runner family: no CI slice can serve
+    /// such a build anyway, so coverage stays vacuous rather than
+    /// failing on the family's missing host triple.
+    dependency_identity_by_key: BTreeMap<PackageKey, DependencyIdentity>,
 }
 
 fn exact_graph_from_request(
     roots: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
+    target: &str,
+    rustc_version: &str,
 ) -> stow_types::error::Result<ExactExpandedGraph> {
     if expanded_entries.is_empty() {
         return Err(stow_types::stow_error!(
@@ -310,6 +332,9 @@ fn exact_graph_from_request(
 
     let mut feature_json_by_key = BTreeMap::<PackageKey, String>::new();
     let mut dependency_keys_by_key = BTreeMap::<PackageKey, BTreeSet<PackageKey>>::new();
+    let host_triple = runner_family(target).map(stow_types::api::RunnerFamily::host_triple);
+    let rustc_version_typed = WireRustcVersion::parse(rustc_version)
+        .map_err(|error| stow_types::stow_error!("parse rustc version {rustc_version}: {error}"))?;
 
     for entry in expanded_entries {
         let key = PackageKey {
@@ -336,11 +361,30 @@ fn exact_graph_from_request(
                 .get_mut(&key)
                 .expect("feature and dependency maps are built together")
                 .extend(dependency_keys);
-            continue;
+        } else {
+            feature_json_by_key.insert(key.clone(), features_json.clone());
+            dependency_keys_by_key.insert(key.clone(), dependency_keys);
         }
-        feature_json_by_key.insert(key.clone(), features_json);
-        dependency_keys_by_key.insert(key.clone(), dependency_keys);
     }
+
+    // Every node's own Merkle dependency digest resolves in one shared
+    // bottom-up pass over the carried subgraphs' union — a node's
+    // digest derives from its own identity and its dependencies'
+    // digests, so each distinct node is computed once (stow#790). The
+    // merged node's coverage probe is its target-side context — the
+    // only side this slice can serve — so a target-side entry's digest
+    // wins over a host-side one; a host-only node keeps its host
+    // context, which no consumer-slice row can match anyway. Digests
+    // are derived only when the target maps to a runner family: a
+    // non-CI target has no slice that could serve the build, so
+    // coverage stays vacuous rather than failing on the family's
+    // missing host triple.
+    let dependency_identity_by_key = expanded_dependency_identities(
+        expanded_entries,
+        target,
+        host_triple,
+        &rustc_version_typed,
+    )?;
 
     for (package_key, dependency_keys) in &dependency_keys_by_key {
         for dependency_key in dependency_keys {
@@ -378,7 +422,69 @@ fn exact_graph_from_request(
     Ok(ExactExpandedGraph {
         feature_json_by_key,
         root_keys,
+        dependency_identity_by_key,
     })
+}
+
+/// Every entry's own Merkle dependency digest, derived in one shared
+/// bottom-up pass over the carried subgraphs — a node's digest derives
+/// from its own identity and its dependencies' digests, so each
+/// distinct node is computed once (stow#790). The merged node's
+/// coverage probe is its target-side context — the only side this
+/// slice can serve — so a target-side entry's digest wins over a
+/// host-side one; a host-only node keeps its host context, which no
+/// consumer-slice row can match anyway. Empty when `target` maps to no
+/// runner family: a non-CI target has no slice that could serve the
+/// build, so coverage stays vacuous rather than failing on the
+/// family's missing host triple.
+fn expanded_dependency_identities(
+    expanded_entries: &[ResolvedDependencyGraphEntry],
+    target: &str,
+    host_triple: Option<&str>,
+    rustc_version_typed: &WireRustcVersion,
+) -> stow_types::error::Result<BTreeMap<PackageKey, DependencyIdentity>> {
+    let mut dependency_identity_by_key = BTreeMap::<PackageKey, DependencyIdentity>::new();
+    let Some(host_triple) = host_triple else {
+        return Ok(dependency_identity_by_key);
+    };
+    let identities = expanded_entries
+        .iter()
+        .map(|entry| {
+            Ok(TaskNodeIdentity {
+                crate_name: entry.crate_name.clone(),
+                version: CrateVersion::new(entry.version.clone()),
+                features_json: FeaturesJson::from_sorted(
+                    normalize_feature_set(entry.features.clone())?
+                        .into_iter()
+                        .collect(),
+                )?,
+                target: TargetTriple::parse(if entry.host_side { host_triple } else { target })?,
+                rustc_version: rustc_version_typed.clone(),
+                host_side: entry.host_side,
+            })
+        })
+        .collect::<stow_types::error::Result<Vec<_>>>()?;
+    let digest_entries = expanded_entries
+        .iter()
+        .zip(&identities)
+        .map(|(entry, identity)| DigestEntry {
+            identity,
+            root_spelling: entry.explicit_spelling,
+            subgraph: &entry.dependency_subgraph,
+        })
+        .collect::<Vec<_>>();
+    let digests = shared_dependency_identities(&digest_entries)
+        .map_err(|error| stow_types::stow_error!("dependency subgraphs do not resolve: {error}"))?;
+    for (entry, digest) in expanded_entries.iter().zip(digests) {
+        let key = PackageKey {
+            crate_name: entry.crate_name.clone(),
+            version: entry.version.clone(),
+        };
+        if !entry.host_side || !dependency_identity_by_key.contains_key(&key) {
+            dependency_identity_by_key.insert(key, digest);
+        }
+    }
+    Ok(dependency_identity_by_key)
 }
 
 struct CachedArtifacts {
@@ -393,6 +499,7 @@ struct CachedArtifacts {
 fn cached_artifacts(
     rows: &[ArtifactIndexRow],
     feature_json_by_key: &BTreeMap<PackageKey, String>,
+    dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
     root_keys: &BTreeSet<PackageKey>,
     host_glibc: Option<GlibcVersion>,
 ) -> stow_types::error::Result<CachedArtifacts> {
@@ -407,7 +514,7 @@ fn cached_artifacts(
         });
     }
 
-    let reachable = resolve_reachable_cached_rows(&key_pairs, rows)?;
+    let reachable = resolve_reachable_cached_rows(&key_pairs, dependency_identity_by_key, rows)?;
     let semantic_keys = reachable
         .candidates
         .iter()
@@ -424,7 +531,8 @@ fn cached_artifacts(
         .filter(|row| row_servable_on_host(row, host_glibc))
         .cloned()
         .collect::<Vec<_>>();
-    let servable_reachable = resolve_reachable_cached_rows(&key_pairs, &servable_rows)?;
+    let servable_reachable =
+        resolve_reachable_cached_rows(&key_pairs, dependency_identity_by_key, &servable_rows)?;
     let selected_prefetch_rows =
         select_prefetch_candidates(feature_json_by_key, root_keys, &servable_reachable)?;
     // Prefetch the full closure of every selected candidate: the CLI's
@@ -439,12 +547,13 @@ fn cached_artifacts(
 
 fn resolve_reachable_cached_rows<'a>(
     key_pairs: &BTreeSet<(PackageKey, String)>,
+    dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
     rows: &'a [ArtifactIndexRow],
 ) -> stow_types::error::Result<ReachableRows<'a>> {
     let IndexedRows {
         candidates,
         chain_rows,
-    } = partition_cached_rows(key_pairs, rows)?;
+    } = partition_cached_rows(key_pairs, dependency_identity_by_key, rows)?;
 
     let (reachable_candidates, reachable_chain) = reachable_indices(&candidates, &chain_rows);
 
@@ -505,7 +614,7 @@ fn reachable_indices<'a>(
 ) -> (BTreeSet<usize>, BTreeSet<usize>) {
     let candidate_by_c_metadata = by_c_metadata(candidates, |candidate| candidate.row);
     let chain_by_c_metadata = by_c_metadata(chain_rows, |chain_row| chain_row.row);
-    let edge_reachable = |identity: &DependencyIdentity,
+    let edge_reachable = |identity: &DepChainIdentity,
                           reachable_candidates: &BTreeSet<usize>,
                           reachable_chain: &BTreeSet<usize>| {
         candidate_by_c_metadata
@@ -525,7 +634,7 @@ fn reachable_indices<'a>(
     let mut progressed = true;
     while progressed {
         progressed = false;
-        let reach_check = |identity: &DependencyIdentity,
+        let reach_check = |identity: &DepChainIdentity,
                            reachable_candidates: &BTreeSet<usize>,
                            reachable_chain: &BTreeSet<usize>| {
             edge_reachable(identity, reachable_candidates, reachable_chain)
@@ -561,11 +670,14 @@ fn reachable_indices<'a>(
 }
 
 /// Partition index rows by request match: rows whose (package, features)
-/// pair is in `key_pairs` become candidates; every other canonical row is a
-/// chain row another candidate's closure may reference. Rows failing the
-/// canonical-metadata check are dropped.
+/// pair is in `key_pairs` *and* whose recorded dependency digest equals
+/// the node's own become candidates (stow#790 — a tuple published under
+/// a different dependency context covers nothing); every other canonical
+/// row is a chain row another candidate's closure may reference. Rows
+/// failing the canonical-metadata check are dropped.
 fn partition_cached_rows<'a>(
     key_pairs: &BTreeSet<(PackageKey, String)>,
+    dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
     rows: &'a [ArtifactIndexRow],
 ) -> stow_types::error::Result<IndexedRows<'a>> {
     let mut candidates = Vec::<ReachableCandidateRow<'a>>::new();
@@ -581,7 +693,7 @@ fn partition_cached_rows<'a>(
             row.dependency_c_metadata_json
                 .entries()
                 .iter()
-                .map(|entry| DependencyIdentity {
+                .map(|entry| DepChainIdentity {
                     crate_name: entry.crate_name.as_str().to_owned(),
                     c_metadata: entry.c_metadata.as_str().to_owned(),
                 })
@@ -597,7 +709,11 @@ fn partition_cached_rows<'a>(
             version: row.version.as_semver().clone(),
         };
         let semantic_key = (package_key, row.features_json.raw());
-        if key_pairs.contains(&semantic_key) {
+        if key_pairs.contains(&semantic_key)
+            && dependency_identity_by_key
+                .get(&semantic_key.0)
+                .is_some_and(|digest| *digest == row.dependency_identity)
+        {
             if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
                 if !deduplicate_cached_candidate(
                     &candidates[existing_index],
@@ -654,8 +770,8 @@ fn cached_row_has_canonical_metadata(row: &ArtifactIndexRow) -> stow_types::erro
 }
 
 fn canonicalize_dependency_identities(
-    mut dependency_identities: Vec<DependencyIdentity>,
-) -> Vec<DependencyIdentity> {
+    mut dependency_identities: Vec<DepChainIdentity>,
+) -> Vec<DepChainIdentity> {
     dependency_identities.sort_by(|left, right| {
         canonical_crate_name(&left.crate_name)
             .cmp(&canonical_crate_name(&right.crate_name))
@@ -668,7 +784,7 @@ fn deduplicate_cached_candidate(
     existing: &ReachableCandidateRow<'_>,
     semantic_key: &SemanticKey,
     row: &ArtifactIndexRow,
-    dependency_identities: &[DependencyIdentity],
+    dependency_identities: &[DepChainIdentity],
 ) -> bool {
     if existing.semantic_key != *semantic_key
         || existing.dependency_identities != dependency_identities
@@ -679,7 +795,7 @@ fn deduplicate_cached_candidate(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DependencyIdentity {
+struct DepChainIdentity {
     crate_name: String,
     c_metadata: String,
 }
@@ -688,7 +804,7 @@ struct DependencyIdentity {
 struct ReachableCandidateRow<'a> {
     semantic_key: (PackageKey, String),
     row: &'a ArtifactIndexRow,
-    dependency_identities: Vec<DependencyIdentity>,
+    dependency_identities: Vec<DepChainIdentity>,
 }
 
 /// A canonical row that is not a semantic match for the current request but
@@ -696,7 +812,7 @@ struct ReachableCandidateRow<'a> {
 #[derive(Debug)]
 struct ChainRow<'a> {
     row: &'a ArtifactIndexRow,
-    dependency_identities: Vec<DependencyIdentity>,
+    dependency_identities: Vec<DepChainIdentity>,
 }
 
 /// Index rows partitioned by request match — semantic candidates and
@@ -1152,7 +1268,7 @@ fn emit_covers_request(candidate_emit: &[String], requested_emit: &[String]) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use semver::Version;
     use stow_types::api::{
@@ -1182,6 +1298,23 @@ mod tests {
             crate_name: CrateName::parse(name).unwrap(),
             version: Version::parse(version).unwrap(),
         }
+    }
+
+    /// Every key pair at the leaf dependency digest — the digest a
+    /// `TaskSubgraph::default()` entry resolves to, which is what the
+    /// `row()` helper's `dependency_identity` field carries.
+    fn leaf_digests(
+        key_pairs: &BTreeSet<(PackageKey, String)>,
+    ) -> BTreeMap<PackageKey, stow_types::identity::DependencyIdentity> {
+        key_pairs
+            .iter()
+            .map(|(package, _)| {
+                (
+                    package.clone(),
+                    stow_types::identity::DependencyIdentity::leaf().expect("leaf identity"),
+                )
+            })
+            .collect()
     }
 
     /// An index row whose `compile_key[..16]` equals `c_metadata` — the
@@ -1292,6 +1425,8 @@ mod tests {
                     explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 },
             ],
+            TARGET,
+            RUSTC,
         )
         .unwrap();
 
@@ -1327,7 +1462,8 @@ mod tests {
             ),
         ];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
 
         assert_eq!(reachable.candidates.len(), 2);
         assert_eq!(reachable.candidates[0].row.crate_name.as_str(), "same-file");
@@ -1347,7 +1483,8 @@ mod tests {
             &[("same_file", "72e2ded9fa67e0a1")],
         )];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
 
         assert!(reachable.candidates.is_empty());
     }
@@ -1382,7 +1519,8 @@ mod tests {
             ),
         ];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
 
         assert_eq!(reachable.candidates.len(), 2);
         let consumer_index = reachable
@@ -1427,7 +1565,8 @@ mod tests {
             unlinked,
         ];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
 
         assert_eq!(reachable.candidates.len(), 1);
         assert_eq!(reachable.chain_rows.len(), 2);
@@ -1461,7 +1600,8 @@ mod tests {
             row("same-file", "1.0.6", "72e2ded9fa67e0a1", &["unstable"], &[]),
         ];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
 
         assert_eq!(reachable.candidates.len(), 1);
         assert_eq!(reachable.candidates[0].row.crate_name.as_str(), "walkdir");
@@ -1512,7 +1652,8 @@ mod tests {
             row("walkdir", "2.5.0", "9999999999999999", &[], &[]),
         ];
 
-        let reachable = resolve_reachable_cached_rows(&key_pairs, &rows).unwrap();
+        let reachable =
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
 
         assert_eq!(reachable.candidates.len(), 2);
         assert_eq!(reachable.candidates[0].row.crate_name.as_str(), "ignore");
@@ -1626,7 +1767,8 @@ mod tests {
             },
         ];
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, None).expect("analyze");
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None)
+                .expect("analyze");
 
         assert_eq!(analysis.expanded_total, 3);
         assert_eq!(analysis.expanded_cached, 2);
@@ -1815,7 +1957,8 @@ mod tests {
         });
 
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, host).expect("analyze");
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, host)
+                .expect("analyze");
 
         // Both nodes stay covered — dep-b's row exists, it simply cannot
         // be served here — so nothing turns into an enqueue miss.
@@ -1825,5 +1968,115 @@ mod tests {
         // needed it: dep-b is never fetched, and dep-a — which cannot be
         // injected without its dep chain — goes unfetched too.
         assert!(analysis.prefetch_artifacts.is_empty());
+    }
+
+    /// stow#790: two contexts of one `(package, features)` where only one
+    /// is published. `dep-a` sits over `dep-child` — a non-leaf context —
+    /// while the slice carries `dep-a`'s tuple published under another
+    /// context's digest (reachable, chain closed). The wrong-context
+    /// publication must count neither as coverage nor as a prefetch
+    /// candidate; the same-context one must do both.
+    #[test]
+    fn coverage_requires_the_nodes_own_dependency_context() {
+        let dep_a = key("dep-a", "1.0.0");
+        let dep_b = key("dep-b", "1.0.0");
+        let leaf_entry = |package: &PackageKey| ResolvedDependencyGraphEntry {
+            crate_name: package.crate_name.clone(),
+            version: package.version.clone(),
+            features: Vec::new(),
+            host_side: false,
+            dependencies: Vec::new(),
+            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        };
+        let dep_subgraph = stow_types::api::TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![stow_types::api::SubgraphNode {
+                crate_name: dep_b.crate_name.clone(),
+                version: CrateVersion::new(dep_b.version.clone()),
+                features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+                host_side: false,
+                keys_apart: false,
+                deps: Vec::new(),
+            }],
+        };
+        let entries = vec![DependencyGraphEntry {
+            crate_name: dep_a.crate_name.clone(),
+            version: dep_a.version.clone(),
+            features: Vec::new(),
+        }];
+        let mut dep_a_entry = leaf_entry(&dep_a);
+        dep_a_entry.dependencies = vec![ResolvedDependencyGraphDependency {
+            crate_name: dep_b.crate_name.clone(),
+            version: dep_b.version.clone(),
+            host_side: false,
+        }];
+        dep_a_entry.dependency_subgraph = dep_subgraph.clone();
+        let expanded_entries = vec![dep_a_entry, leaf_entry(&dep_b)];
+        // dep-a's own digest — the same resolve the analysis runs.
+        let dep_digest = dep_subgraph
+            .resolve(
+                &stow_types::task_graph::TaskNodeIdentity {
+                    crate_name: dep_a.crate_name.clone(),
+                    version: CrateVersion::new(dep_a.version),
+                    features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+                    target: stow_types::identity::TargetTriple::parse(TARGET).expect("target"),
+                    rustc_version: stow_types::identity::WireRustcVersion::parse(RUSTC)
+                        .expect("rustc"),
+                    host_side: false,
+                },
+                stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            )
+            .expect("subgraph resolves")
+            .dependency_identity(0)
+            .expect("root digest")
+            .clone();
+
+        let mut dep_a_row = row(
+            "dep-a",
+            "1.0.0",
+            "aaaaaaaaaaaaaaaa",
+            &[],
+            &[("dep-b", "bbbbbbbbbbbbbbbb")],
+        );
+        dep_a_row.dependency_identity =
+            stow_types::identity::DependencyIdentity::parse("f".repeat(64)).expect("digest");
+        let rows = vec![
+            dep_a_row.clone(),
+            row("dep-b", "1.0.0", "bbbbbbbbbbbbbbbb", &[], &[]),
+        ];
+
+        let analysis =
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None)
+                .expect("analyze");
+        assert_eq!(analysis.expanded_total, 2);
+        assert_eq!(
+            analysis.expanded_cached, 1,
+            "a tuple published under another dependency context covers nothing"
+        );
+        assert!(
+            analysis.prefetch_artifacts.is_empty(),
+            "the wrong-context row never joins the prefetch set"
+        );
+
+        dep_a_row.dependency_identity = dep_digest;
+        let rows = vec![
+            dep_a_row,
+            row("dep-b", "1.0.0", "bbbbbbbbbbbbbbbb", &[], &[]),
+        ];
+        let analysis =
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None)
+                .expect("analyze");
+        assert_eq!(
+            analysis.expanded_cached, 2,
+            "the same-context publication covers the node"
+        );
+        assert!(
+            analysis
+                .prefetch_artifacts
+                .iter()
+                .any(|artifact| artifact.c_metadata.as_str() == "aaaaaaaaaaaaaaaa"),
+            "the own-context root row is prefetched"
+        );
     }
 }
