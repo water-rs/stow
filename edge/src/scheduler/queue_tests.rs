@@ -160,6 +160,7 @@ fn semantic_identity(crate_name: &str) -> SemanticTaskIdentity {
         target: TARGET.to_owned(),
         rustc_version: RUSTC.to_owned(),
         host_side: false,
+        dependency_identity: dep_identity(crate_name).to_string(),
         explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     }
 }
@@ -3426,6 +3427,60 @@ async fn claim_retires_tasks_the_catalog_already_covers() {
 
 fn crate_task_id(crate_name: &str) -> String {
     task_id_on(crate_name, TARGET)
+}
+
+/// stow#787: two resolutions mint the same semantic tuple at two
+/// different dependency closures — "dep" as a leaf in one lane's graph,
+/// "dep" over "dep-child" in another's. When the first variant's build
+/// publishes, the catalog serves the tuple; the claim-time coverage
+/// oracle matches that bare tuple and retires the second variant's row
+/// without a build — but its dependents' edges gate on
+/// `dependency_identity`-exact slice rows that can now never exist.
+/// Coverage must be contextual: a different-context publication does
+/// not retire the pending node.
+#[tokio::test]
+async fn coverage_retirement_requires_the_same_dependency_context() {
+    let db = memory_db().await.expect("memory db");
+    // dep's second context: the same tuple, a subgraph with a child.
+    let dep_other_context = request("dep", &[dependency("dep-child")]);
+    let dep_other_context_id = dep_other_context.task_id().expect("dep task id");
+    enqueue(
+        &db,
+        &[
+            dependency("dep-child"),
+            dep_other_context.clone(),
+            request("owner", std::slice::from_ref(&dep_other_context)),
+        ],
+    )
+    .await
+    .expect("enqueue");
+
+    // dep-child's publication releases dep's second-context node; the
+    // catalog covering dep's *tuple* (the first context's artifacts)
+    // is what production's `covered_semantic_identities` answers —
+    // FixedCoverage replays that answer.
+    publish(&db, "dep-child").await;
+    let oracle = FixedCoverage {
+        covered: BTreeSet::from([semantic_identity("dep")]),
+        asked: std::sync::Mutex::new(Vec::new()),
+    };
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(10),
+        dispatch_min_age_minutes: 0,
+        ..settings()
+    };
+
+    let claimed = super::claim_dispatchable_tasks(&db, &settings, &oracle)
+        .await
+        .expect("claim");
+
+    assert!(
+        claimed
+            .iter()
+            .any(|task| task.task_id == dep_other_context_id),
+        "a tuple-covered but context-unpublished node must still build: \
+         the edges naming its digest can never otherwise be served"
+    );
 }
 
 /// Both rows are eligible to claim here: the miss row is aged past the

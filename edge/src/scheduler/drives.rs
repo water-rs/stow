@@ -1397,6 +1397,7 @@ pub const DRIVES: &[Drive] = &[
                         target: String,
                         rustc_version: String,
                         host_side: i64,
+                        dependency_identity: String,
                     }
                     let d1 = ctx
                         .d1
@@ -1407,7 +1408,7 @@ pub const DRIVES: &[Drive] = &[
                         identities.extend(
                             db.query(
                                 "SELECT crate_name, version, features_json, target, \
-                                        rustc_version, host_side FROM queue \
+                                        rustc_version, host_side, dependency_identity FROM queue \
                                  WHERE task_id IN (SELECT value FROM json_each(?))",
                             )
                             .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
@@ -1422,6 +1423,7 @@ pub const DRIVES: &[Drive] = &[
                                 target: row.target,
                                 rustc_version: row.rustc_version,
                                 host_side: row.host_side != 0,
+                                dependency_identity: row.dependency_identity,
                                 explicit_spelling:
                                     stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                             }),
