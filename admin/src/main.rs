@@ -22,6 +22,7 @@ mod launch_model;
 mod maintenance;
 mod manual;
 mod preheat;
+mod preheat_cost;
 mod projects;
 mod queue;
 mod render;

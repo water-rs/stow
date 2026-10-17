@@ -1256,6 +1256,12 @@ pub async fn run_sandboxed_phase(
     // in, but it is never a publishable artifact.
     command = command.env(STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME);
     command = command.env(STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT);
+    // The sandbox starts with no environment: a mock-compile run's switch
+    // reaches the capture wrapper only through this grant.
+    #[cfg(feature = "mock-compile")]
+    if crate::mock_compile::enabled() {
+        command = command.env(crate::mock_compile::STOW_BUILD_MOCK_COMPILE_ENV, "1");
+    }
     // A linux-gnu task's units link with mold, and the pin is part of what
     // the compile key records, so it is a choice the builder makes — the
     // workflow installs mold — not an observation of whatever linker the
