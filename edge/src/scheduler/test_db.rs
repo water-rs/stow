@@ -427,10 +427,20 @@ fn check_do_statements(sql: &str, ddl_permitted: bool) -> Result<(), DurableDbEr
 impl DurableDbBackend for SqliteBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
+        // `fetch_all` hands back rows but no `changes()` — yet a write
+        // issued through the read path (an `INSERT … RETURNING`, the
+        // budget upsert) writes all the same, and the Durable Object
+        // cursor bills it. Bracket the statement with `total_changes()`
+        // on one held connection so the reported `rows_written` is what
+        // the statement actually moved — the same count `execute`'s
+        // `rows_affected` already carries (stow#796).
+        let mut conn = self.pool.acquire().await.map_err(backend_error)?;
+        let before = total_changes(&mut conn).await?;
         let rows = bind_params(sqlx::query(sqlx::AssertSqlSafe(query)), params)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(backend_error)?;
+        let after = total_changes(&mut conn).await?;
         let rows = rows
             .iter()
             .map(row_to_json)
@@ -438,7 +448,7 @@ impl DurableDbBackend for SqliteBackend {
         Ok(DbExecResult {
             rows_read: u64::try_from(rows.len()).map_err(backend_error)?,
             rows,
-            rows_written: 0,
+            rows_written: u64::try_from(after.saturating_sub(before)).map_err(backend_error)?,
         })
     }
 
@@ -482,6 +492,15 @@ fn backend_error(error: impl std::fmt::Display) -> DurableDbError {
         message: error.to_string(),
         source: None,
     }
+}
+
+/// The connection-wide change counter — its delta across one
+/// statement is the write count `changes()` would report for it.
+async fn total_changes(conn: &mut sqlx::SqliteConnection) -> Result<i64, DurableDbError> {
+    sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(backend_error)
 }
 
 async fn pragma_i64(pool: &sqlx::SqlitePool, sql: &str) -> Result<u64, DurableDbError> {

@@ -1021,6 +1021,23 @@ async fn enqueue_inner(
     // priority that cannot exceed `compute_priority`'s own bound, so
     // only the update set needs the probe.
     check_update_band_bound(db, &plan.updates).await?;
+    // The human lane spends from a per-UTC-day budget — a mutating
+    // charge, so it runs only after every read-only preflight above
+    // has passed, and before the write phase below so a refused batch
+    // leaves no trace. The plan counts what the batch actually moves
+    // (stow#796): only requests that insert a human-lane row, promote
+    // an existing row to the human lane or resurrect a completed row
+    // pay — a resubmit of an already-queued human task issues no
+    // statement at all.
+    if plan.human_charges > 0
+        && !charge_human_daily_budget(db, plan.human_charges, settings.human_daily_task_budget)
+            .await?
+    {
+        return Err(QueueError::HumanDailyBudgetExhausted {
+            attempted: u64::from(plan.human_charges),
+            budget: u64::from(settings.human_daily_task_budget),
+        });
+    }
     // The content-addressed node store: every submit upserts every
     // node of each request's resolved subgraph, root included, so a
     // claimed task's `dependency_subgraph` can later be rebuilt by
@@ -1031,30 +1048,6 @@ async fn enqueue_inner(
         .flat_map(|entry| entry.nodes.iter().cloned())
         .collect();
     upsert_task_nodes(db, &node_rows).await?;
-    // The human lane spends from a per-UTC-day budget — a mutating
-    // charge, so it runs only after every read-only preflight above
-    // has passed; a refused resubmit must not consume budget.
-    let human_tasks = u32::try_from(
-        requests
-            .iter()
-            .filter(|request| {
-                request_lane(request.source) == TaskLane::Human
-                    && stow_types::api::is_ci_target(request.target.as_str())
-            })
-            .count(),
-    )
-    .map_err(|_| QueueError::Overflow {
-        field: "human-lane task count",
-        value: requests.len() as u64,
-    })?;
-    if human_tasks > 0
-        && !charge_human_daily_budget(db, human_tasks, settings.human_daily_task_budget).await?
-    {
-        return Err(QueueError::HumanDailyBudgetExhausted {
-            attempted: u64::from(human_tasks),
-            budget: u64::from(settings.human_daily_task_budget),
-        });
-    }
     let edge_owner_ids: Vec<String> = plan.edge_inserts.keys().cloned().collect();
     let edges: Vec<BatchedDepEdge> = plan.edge_inserts.into_values().flatten().collect();
     insert_dep_edges(db, &edges).await?;
@@ -1247,6 +1240,14 @@ struct EnqueuePlan {
     /// dependency subgraph, so an existing id's stored edges are already
     /// exactly these (stow#588).
     edge_inserts: BTreeMap<String, Vec<BatchedDepEdge>>,
+    /// The human-lane requests this plan moves stored state for — the
+    /// count `charge_human_daily_budget` spends (stow#796): a fresh
+    /// human-lane insert, a re-request that promotes an existing row
+    /// to the human lane, or a human-lane resurrect of a completed
+    /// row — each creates or speeds up a build. A resubmit of an
+    /// already-queued human task plans none of them, so it charges
+    /// nothing.
+    human_charges: u32,
 }
 
 /// One existence probe's answer for a chunk task id: the row's status
@@ -1363,6 +1364,7 @@ fn plan_enqueue(
         updates: Vec::new(),
         inserts: Vec::new(),
         edge_inserts: BTreeMap::new(),
+        human_charges: 0,
     };
     for entry in prepared {
         let lane = request_lane(entry.request.source);
@@ -1410,35 +1412,34 @@ fn plan_enqueue(
                 update.human |= u8::from(lane == TaskLane::Human);
                 update.explicit |= request_explicit;
             }
-            if redispatch {
-                statuses.insert(
-                    entry.task_id.clone(),
-                    TaskStatusProbe {
-                        status: "pending".to_owned(),
-                        explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
-                        lane: if lane == TaskLane::Human {
-                            "human".to_owned()
-                        } else {
-                            probe.lane.clone()
-                        },
-                        downloads: probe.downloads.max(downloads),
-                    },
-                );
-            } else {
-                statuses.insert(
-                    entry.task_id.clone(),
-                    TaskStatusProbe {
-                        status: probe.status.clone(),
-                        explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
-                        lane: if lane == TaskLane::Human {
-                            "human".to_owned()
-                        } else {
-                            probe.lane.clone()
-                        },
-                        downloads: probe.downloads.max(downloads),
-                    },
-                );
+            // The stored-state moves the budget pays for (stow#796):
+            // the lane promotion, or a human request putting a
+            // completed row back to `pending` — the budget prices
+            // human-triggered builds, and a resurrect creates one
+            // whether or not the lane moves. A later occurrence of
+            // this task in the same batch already reads lane 'human'
+            // and status 'pending' from `statuses`, so it cannot
+            // double-charge.
+            if lane_move || (redispatch && lane == TaskLane::Human) {
+                plan.human_charges += 1;
             }
+            statuses.insert(
+                entry.task_id.clone(),
+                TaskStatusProbe {
+                    status: if redispatch {
+                        "pending".to_owned()
+                    } else {
+                        probe.status.clone()
+                    },
+                    explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
+                    lane: if lane == TaskLane::Human {
+                        "human".to_owned()
+                    } else {
+                        probe.lane.clone()
+                    },
+                    downloads: probe.downloads.max(downloads),
+                },
+            );
         } else {
             plan.inserts.push(BatchedInsert {
                 task_id: entry.task_id.clone(),
@@ -1464,6 +1465,11 @@ fn plan_enqueue(
                     downloads,
                 },
             );
+            // A fresh human-lane row is the other move the budget pays
+            // for (stow#796).
+            if lane == TaskLane::Human {
+                plan.human_charges += 1;
+            }
             // A task id commits to its whole dependency subgraph, so a
             // task's edge set is a function of the id (stow#588): edges
             // are written only for the row this request inserts — a

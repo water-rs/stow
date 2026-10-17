@@ -169,20 +169,25 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
     },
     RouteBudget {
+        // Measured 4/4/8 once the host backend counts `RETURNING`
+        // writes (stow#796): the two retried rows, their status-count
+        // trigger rows and the keyed follow-up writes.
         name: "POST /tasks/retry",
         statements: 4,
         rows_read: 10,
-        rows_written: 4,
+        rows_written: 16,
         scan_allowlist: &[],
     },
     RouteBudget {
-        // Row 5 is a dependent's `blocked` flip: failing a task that
-        // other pending rows depend on must wake-block them in the same
-        // request, not on the next pass.
+        // Measured 3/2/9 once `RETURNING` writes count (stow#796): the
+        // cancelled rows, their status-count trigger rows, and the
+        // dependents' `blocked` flips — failing a task that pending
+        // rows depend on must wake-block them in the same request, not
+        // on the next pass.
         name: "POST /tasks/cancel",
         statements: 3,
         rows_read: 10,
-        rows_written: 5,
+        rows_written: 20,
         scan_allowlist: &[],
     },
     RouteBudget {
@@ -278,10 +283,13 @@ const BUDGETS: &[RouteBudget] = &[
     // The same batch submitted again, fully deduplicated (stow#784):
     // `plan_enqueue` emits an update only when a request moves stored
     // state, so the whole resubmit is the status probe plus the
-    // task_nodes upsert conflicts — zero rows written.
+    // task_nodes upsert conflicts — two statements, zero rows written.
+    // The human-lane request in the batch charges nothing either
+    // (stow#796): `rows_written` would catch the spend now that the
+    // host backend counts `RETURNING` writes.
     RouteBudget {
         name: "POST /admin/enqueue (resubmit)",
-        statements: 4,
+        statements: 3,
         rows_read: 20,
         rows_written: 0,
         scan_allowlist: &[],
