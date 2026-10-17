@@ -496,13 +496,6 @@ pub struct GateEvaluation {
     pub breaches: Vec<Breach>,
 }
 
-impl GateEvaluation {
-    /// Whether the projection stays inside every bound.
-    const fn passes(&self) -> bool {
-        self.breaches.is_empty()
-    }
-}
-
 /// Σ over every event kind: projected monthly usage per product
 /// dimension, the DO wall seconds that price duration, and the
 /// peak-hour serialized wall — plus the per-route shares for the
@@ -556,23 +549,14 @@ fn lane_budget_ms(lane: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("lane `{lane}` has no WORKER_CPU_BUDGETS row"))
 }
 
-/// Fold one event kind's monthly and peak counts into the projection.
-fn fold_kind(
-    model: &LaunchModel,
+/// Fold the event kind's Worker CPU price into the projection and
+/// return the CPU milliseconds one event costs across its lanes.
+fn fold_cpu(
     cost: &EventCost,
-    drive: &dyn Fn(&'static str) -> Result<DriveCost, String>,
-    claim_marginal: &DriveCost,
     cpu: &WorkerCpuReport,
+    monthly: f64,
     projection: &mut Projection,
-) -> Result<(), String> {
-    let monthly = model.monthly_events(cost.kind);
-    let peak_per_s = model.peak_events_per_second(cost.kind);
-    projection.worker_requests = monthly.mul_add(cost.worker_requests, projection.worker_requests);
-    projection.do_requests = monthly.mul_add(cost.do_requests, projection.do_requests);
-    projection.diag_subrequests = monthly.mul_add(cost.subrequests, projection.diag_subrequests);
-    projection.diag_d1_read = monthly.mul_add(cost.d1_rows_read, projection.diag_d1_read);
-    projection.diag_d1_written = monthly.mul_add(cost.d1_rows_written, projection.diag_d1_written);
-    projection.diag_r2_ops = monthly.mul_add(cost.r2_ops, projection.diag_r2_ops);
+) -> Result<f64, String> {
     let mut kind_cpu_ms = 0.0;
     match cost.cpu {
         CpuPricing::Lanes(lanes) => {
@@ -607,6 +591,27 @@ fn fold_kind(
             reason,
         }),
     }
+    Ok(kind_cpu_ms)
+}
+
+/// Fold one event kind's monthly and peak counts into the projection.
+fn fold_kind(
+    model: &LaunchModel,
+    cost: &EventCost,
+    drive: &dyn Fn(&'static str) -> Result<DriveCost, String>,
+    claim_marginal: &DriveCost,
+    cpu: &WorkerCpuReport,
+    projection: &mut Projection,
+) -> Result<(), String> {
+    let monthly = model.monthly_events(cost.kind);
+    let peak_per_s = model.peak_events_per_second(cost.kind);
+    projection.worker_requests = monthly.mul_add(cost.worker_requests, projection.worker_requests);
+    projection.do_requests = monthly.mul_add(cost.do_requests, projection.do_requests);
+    projection.diag_subrequests = monthly.mul_add(cost.subrequests, projection.diag_subrequests);
+    projection.diag_d1_read = monthly.mul_add(cost.d1_rows_read, projection.diag_d1_read);
+    projection.diag_d1_written = monthly.mul_add(cost.d1_rows_written, projection.diag_d1_written);
+    projection.diag_r2_ops = monthly.mul_add(cost.r2_ops, projection.diag_r2_ops);
+    let kind_cpu_ms = fold_cpu(cost, cpu, monthly, projection)?;
     projection.worker_cpu_ms = monthly.mul_add(kind_cpu_ms, projection.worker_cpu_ms);
     let mut kind_read = 0.0;
     let mut kind_written = 0.0;
@@ -772,6 +777,38 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
     ]
 }
 
+/// Turn each usage line over `ALLOWANCE_FRACTION` of its allowance
+/// into a breach, attributed to the route that dominates the breached
+/// dimension.
+fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach> {
+    let mut breaches = Vec::new();
+    for line in usage {
+        let bound = line.allowance * ALLOWANCE_FRACTION;
+        if line.projected > bound {
+            // `RouteShare::dimension` keys the share dimension by
+            // product prefix — `do_`, `d1_`, `worker_`.
+            let prefix = match line.product {
+                "workers" => "worker",
+                "durable_objects" => "do",
+                other => other,
+            };
+            let share_key = format!("{prefix}_{}", line.dimension);
+            let top_route = top_routes
+                .iter()
+                .find(|r| r.dimension == share_key)
+                .map_or("n/a", |r| r.route);
+            breaches.push(Breach {
+                product: line.product,
+                dimension: line.dimension,
+                projected: line.projected,
+                bound,
+                top_route,
+            });
+        }
+    }
+    breaches
+}
+
 /// Project the launch model's monthly events against one report's
 /// measured rows, the measured Worker CPU and the watchdog allowance
 /// table.
@@ -844,31 +881,7 @@ fn evaluate(
     top_routes.sort_by(|a, b| b.share.total_cmp(&a.share));
     top_routes.truncate(5);
 
-    let mut breaches = Vec::new();
-    for line in &usage {
-        let bound = line.allowance * ALLOWANCE_FRACTION;
-        if line.projected > bound {
-            // `RouteShare::dimension` keys the share dimension by
-            // product prefix — `do_`, `d1_`, `worker_`.
-            let prefix = match line.product {
-                "workers" => "worker",
-                "durable_objects" => "do",
-                other => other,
-            };
-            let share_key = format!("{prefix}_{}", line.dimension);
-            let top_route = top_routes
-                .iter()
-                .find(|r| r.dimension == share_key)
-                .map_or("n/a", |r| r.route);
-            breaches.push(Breach {
-                product: line.product,
-                dimension: line.dimension,
-                projected: line.projected,
-                bound,
-                top_route,
-            });
-        }
-    }
+    let mut breaches = usage_breaches(&usage, &top_routes);
     // The budgets themselves must fit the allowance: a route may spend
     // its whole budget and the month must still stay inside the bound,
     // so a budget raised past what the allowance carries fails here
@@ -1350,7 +1363,7 @@ mod tests {
             |name| if name == "alarm pass" { 15.0 } else { 0.5 },
         );
         let evaluation = evaluate(&model(), &report, &fixture_cpu(|_| 0.5)).expect("evaluate");
-        assert!(!evaluation.passes());
+        assert!(!evaluation.breaches.is_empty());
         assert!(
             evaluation
                 .breaches
@@ -1425,12 +1438,12 @@ mod tests {
             .expect("row");
         row.rows_read *= 10;
         let rows = growth(&small, &grown).expect("growth");
-        let grows: Vec<&str> = rows
+        let rising: Vec<&str> = rows
             .iter()
             .filter(|row| row.grows)
             .map(|row| row.name.as_str())
             .collect();
-        assert_eq!(grows, ["GET /tasks"]);
+        assert_eq!(rising, ["GET /tasks"]);
     }
 
     /// An over-budget row in the post-load report fails the verdict.

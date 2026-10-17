@@ -15,7 +15,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use clap::Args;
-use stow_types::launch_model::LaunchModel;
 use stow_types::stow_error;
 
 use super::lanes::{self, Lane, LaneArgs, Outcome, REQUEST_TIMEOUT};

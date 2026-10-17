@@ -33,7 +33,7 @@ pub struct TrafficCostArgs {
 
 #[derive(Debug, Subcommand)]
 enum TrafficCostCommand {
-    /// Measure Worker CPU per traffic lane through the edge's DevTools
+    /// Measure Worker CPU per traffic lane through the edge's `DevTools`
     /// inspector and fail on a lane over its budget.
     Cpu(cpu::CpuArgs),
     /// Drive every traffic lane at the launch model's peak rate and fail

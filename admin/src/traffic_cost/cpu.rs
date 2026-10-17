@@ -5,7 +5,7 @@
 //! event's `cpuTime` is hard-coded to zero in open-source workerd, and
 //! `Date.now()` inside the isolate only advances on I/O. The measurement
 //! Cloudflare documents for local CPU work is the V8 CPU profiler behind
-//! `wrangler dev`'s DevTools inspector, so that is what this pass drives:
+//! `wrangler dev`'s `DevTools` inspector, so that is what this pass drives:
 //! `Profiler.start`, one lane's events fired back to back, then
 //! `Profiler.stop` and the sample count.
 //!
@@ -50,7 +50,7 @@ use crate::render::{Output, Table, emit};
 pub struct CpuArgs {
     #[command(flatten)]
     pub lanes: LaneArgs,
-    /// The edge's DevTools inspector — `wrangler dev --inspector-port`'s
+    /// The edge's `DevTools` inspector — `wrangler dev --inspector-port`'s
     /// `ws://127.0.0.1:<port>/ws`.
     #[arg(long)]
     pub inspector_url: String,
@@ -122,7 +122,7 @@ impl WorkerCpuReport {
     }
 }
 
-/// A DevTools protocol session on the inspector socket.
+/// A `DevTools` protocol session on the inspector socket.
 struct Inspector {
     socket: WebSocket,
     next_id: AtomicU64,
@@ -281,10 +281,6 @@ async fn fire_events(
 }
 
 /// Measure one lane: warm it, then [`ROUNDS`] profiled rounds.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "event counts are tiny next to f64's mantissa"
-)]
 async fn measure_lane(
     lane: &Lane,
     edge: &Edge,

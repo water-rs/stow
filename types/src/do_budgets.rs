@@ -534,55 +534,59 @@ impl WorkerCpuBudget {
 pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
     WorkerCpuBudget {
         lane: "site",
-        cpu_ms: 20.0,
+        cpu_ms: 5.0,
     },
     WorkerCpuBudget {
         lane: "stats",
-        cpu_ms: 30.0,
+        cpu_ms: 10.0,
     },
     WorkerCpuBudget {
         // The pointer GET plus the digest-addressed slice GET.
         lane: "index-pull",
-        cpu_ms: 40.0,
+        cpu_ms: 10.0,
     },
     WorkerCpuBudget {
-        // A covered bundle streamed through the byte path — stow#738
-        // measured 11–24 ms mean on the deployed Worker.
+        // A covered bundle streamed through the byte path — the
+        // dominant CPU line at 9e5 events/mo, so its budget is what the
+        // allowance leaves it. stow#738 measured 11–24 ms mean on the
+        // deployed Worker; if the local measurement lands in that
+        // range the gate fails on the projection, which is the finding
+        // the test exists to report.
         lane: "bundle-fetch",
-        cpu_ms: 50.0,
+        cpu_ms: 10.0,
     },
     WorkerCpuBudget {
         lane: "status-read",
-        cpu_ms: 30.0,
+        cpu_ms: 10.0,
     },
     WorkerCpuBudget {
         lane: "admin-status",
-        cpu_ms: 30.0,
+        cpu_ms: 10.0,
     },
     WorkerCpuBudget {
         lane: "queue-read",
-        cpu_ms: 40.0,
+        cpu_ms: 15.0,
     },
     WorkerCpuBudget {
         lane: "queue-mutate",
-        cpu_ms: 40.0,
+        cpu_ms: 15.0,
     },
     WorkerCpuBudget {
         lane: "trusted-submit",
-        cpu_ms: 60.0,
+        cpu_ms: 15.0,
     },
     WorkerCpuBudget {
         lane: "admission",
-        cpu_ms: 80.0,
+        cpu_ms: 15.0,
     },
     WorkerCpuBudget {
         lane: "enqueue-redeem",
-        cpu_ms: 60.0,
+        cpu_ms: 10.0,
     },
     WorkerCpuBudget {
         // The signed `workflow_run` callback: HMAC check, the records
         // artifact's cosign verification, and the completion.
         lane: "workflow-callback",
-        cpu_ms: 80.0,
+        cpu_ms: 10.0,
     },
 ];
