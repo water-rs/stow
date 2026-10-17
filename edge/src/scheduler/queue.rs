@@ -4114,11 +4114,6 @@ pub async fn claim_dispatchable_tasks(
     // Stale recovery runs ahead of the pause check: a paused scheduler
     // owes its in-flight builds the same lease-expiry reclaim.
     recover_stale_active_tasks(db, settings).await?;
-    // A completed dependency whose published rows do not cover the
-    // shapes a dependent's edge requires is not done — re-queue it once
-    // so it rebuilds and republishes rather than gating dependents
-    // forever. Repair, not dispatch: it runs paused or not.
-    requeue_incomplete_shape_deps(db, settings).await?;
     // The dispatch freeze is the gate, and it lives here — the enqueue
     // side of the queue never consults it, so misses keep arriving and
     // stay pending for the first pass after a human lifts the freeze.
@@ -4130,6 +4125,10 @@ pub async fn claim_dispatchable_tasks(
         tracing::info!("scheduler dispatch paused — claiming nothing");
         return Ok(Vec::new());
     };
+    // The shape-coverage repair lives in `record_published_slice`
+    // (stow#785): whether a completed dep's published rows cover a
+    // dependent's edge is decidable only at the report that publishes
+    // them — an alarm pass precedes that data and cannot know.
     let active = count_active_by_family(db).await?;
     let mut total_slots = limit.get().saturating_sub(active.total);
     let mut macos_slots = settings
@@ -6167,13 +6166,17 @@ fn normalized_gate_json(
 
 pub async fn record_published_slice(
     db: &DurableDb,
+    settings: &SchedulerSettings,
     target: &str,
     rustc_version: &str,
-    base_generation: Option<i64>,
-    generation: Option<i64>,
-    added: &[PublishedSliceRow],
-    retired: &[PublishedSliceRow],
+    report: &stow_types::api::PublishedSliceReport,
 ) -> Result<(), QueueError> {
+    let (base_generation, generation, added, retired) = (
+        report.base_generation,
+        report.generation,
+        report.added.as_slice(),
+        report.retired.as_slice(),
+    );
     // The live generation is edited in place: delete the rows the new
     // report drops, insert the rows it adds, then refresh `published_at`.
     // The ordering is delete-first so a dependent's gate never sees a
@@ -6280,14 +6283,30 @@ pub async fn record_published_slice(
     let marker_generation = live.as_ref().map_or(1, |row| row.generation);
     commit_published_slice(
         db,
+        settings,
         target,
         rustc_version,
         marker_generation,
-        gate_changes,
-        run_stale_cleanup,
-        next_applied,
+        SliceCommit {
+            gate_changes,
+            run_stale_cleanup,
+            next_applied,
+        },
     )
     .await
+}
+
+/// The tail of a slice commit — everything past the marker row itself:
+/// the gate work the delta implies, whether the stale-generation sweep
+/// runs, and the applied-generation the marker records.
+struct SliceCommit {
+    /// Edge-flip payload `apply_slice_gate_delta` runs, when the report
+    /// changed live rows.
+    gate_changes: Option<GateChangeSet>,
+    /// Whether this commit runs the full-report stale-generation sweep.
+    run_stale_cleanup: bool,
+    /// The report generation the marker adopts, when it moves.
+    next_applied: Option<i64>,
 }
 
 /// The live marker row of one slice — its membership epoch and the last
@@ -6495,13 +6514,17 @@ async fn apply_slice_row_delta(
 /// the queue or the edge graph.
 async fn commit_published_slice(
     db: &DurableDb,
+    settings: &SchedulerSettings,
     target: &str,
     rustc_version: &str,
     live_generation: i64,
-    gate_changes: Option<GateChangeSet>,
-    run_stale_cleanup: bool,
-    next_applied: Option<i64>,
+    commit: SliceCommit,
 ) -> Result<(), QueueError> {
+    let SliceCommit {
+        gate_changes,
+        run_stale_cleanup,
+        next_applied,
+    } = commit;
     if let Some(next_applied) = next_applied {
         db.query(
             "INSERT INTO published_slices \
@@ -6563,11 +6586,16 @@ async fn commit_published_slice(
         db,
         target,
         rustc_version,
-        gate_changes.json,
+        gate_changes.json.clone(),
         live_generation,
         gate_changes.directional,
     )
-    .await
+    .await?;
+    // The shape-coverage repair (stow#785): only now is it decidable
+    // whether the deps this report touched cover their dependents'
+    // edges — before this commit a completed dep always looked
+    // uncovered, so no earlier event could judge it.
+    requeue_incomplete_shape_deps(db, settings, &gate_changes.json, target, rustc_version).await
 }
 
 /// Build the direct-dependent join, optionally restricting explicit delta
@@ -6880,29 +6908,61 @@ async fn recover_stale_active_tasks(
 }
 
 /// A `completed` dependency is not done until its published slice rows
-/// cover every unit shape a dependent's edge requires. `completed`
-/// here means "reported done without covering": re-queue the row once,
-/// behind the same backoff the failed-dependency requeue applies, and
-/// let the rebuild republish real shapes; `shape_requeue` latches the
+/// cover every unit shape a dependent's edge requires — a verdict that
+/// is decidable only at the report publishing the dep's own rows
+/// (stow#785: at claim time a freshly built dep always looks
+/// uncovered). The slice commit drives it from `changed_json`, the
+/// report's own changed rows: each matches its queue row through the
+/// unique queue identity in one probe, and `idx_queue_dependencies_dep`
+/// answers whether a dependent edge still stands `dep_met = 0`. Cost is
+/// the changed-row count times their direct dependents — event-sized,
+/// never the stored queue. Re-queue once behind the same backoff the
+/// failed-dependency requeue applies; `shape_requeue` latches the
 /// repair so it runs at most once.
 async fn requeue_incomplete_shape_deps(
     db: &DurableDb,
     settings: &SchedulerSettings,
+    changed_json: &str,
+    target: &str,
+    rustc_version: &str,
 ) -> Result<(), QueueError> {
-    // Driven from the completed rows not yet repaired — a set the
-    // `idx_queue_shape_requeue` partial index makes ~0 entries — with
-    // the per-candidate dependent probe answered through
-    // `idx_queue_dependencies_dep`. The reverse direction the old
-    // statement took (every edge's slice check per claim) read the
-    // whole edge table. The candidate set is an `IN` subquery pinned
-    // `INDEXED BY` the partial index: left as a flat `status =
-    // 'completed'` predicate, the planner prefers the plain status index
-    // and walks every completed row each pass.
     // Rows re-enter `pending`: `deps_met` re-derives from the live
     // counter, and `blocked` — maintained for pending rows only — is
     // stale on a completed row; both recompute in the same statement,
     // alongside the `not_before` bump's `wake_at`.
     let next_not_before = "MAX(not_before, datetime('now', '+' || MIN(1 << MIN(dispatch_attempts, 6), 60) || ' minutes'))";
+    // The candidates first, payload-driven: each changed row probes the
+    // queue's unique identity index once and `idx_queue_dependencies_dep`
+    // answers whether a dependent edge still stands unmet — the read set
+    // is the changed-row count plus their matched rows, never a queue
+    // range (an UPDATE-side `status` predicate scanned the completed
+    // band, ~350k billed reads at 1M rows).
+    let candidates = db
+        .query(
+            "SELECT q.task_id FROM (SELECT value AS c FROM json_each(?)) AS j \
+             CROSS JOIN queue q \
+                 ON q.crate_name = j.c ->> 'crate_name' \
+                AND q.version = j.c ->> 'version' \
+                AND q.features_json = j.c ->> 'features_json' \
+                AND q.host_side = j.c ->> 'unit_side' \
+                AND q.dependency_identity = j.c ->> 'dependency_identity' \
+             WHERE q.target = ? AND q.rustc_version = ? \
+               AND q.status = 'completed' AND q.shape_requeue = 0 \
+               AND EXISTS ( \
+                   SELECT 1 FROM queue_dependencies d \
+                   WHERE d.depends_on_task_id = q.task_id \
+                     AND d.dep_met = 0 \
+               )",
+        )
+        .bind(changed_json.to_owned())
+        .bind(target.to_owned())
+        .bind(rustc_version.to_owned())
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("find shape-incomplete dependencies: {error}"))?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
     let requeued = db
         .query(&format!(
             "UPDATE queue \
@@ -6915,14 +6975,7 @@ async fn requeue_incomplete_shape_deps(
              wake_at = {wake}, \
              updated_at = datetime('now'), \
              shape_requeue = 1 \
-         WHERE task_id IN ( \
-             SELECT c.task_id FROM queue c INDEXED BY idx_queue_shape_requeue \
-             WHERE c.status = 'completed' AND c.shape_requeue = 0) \
-           AND EXISTS ( \
-               SELECT 1 FROM queue_dependencies d \
-               WHERE d.depends_on_task_id = queue.task_id \
-                 AND d.dep_met = 0 \
-           ) \
+         WHERE task_id IN (SELECT value FROM json_each(?)) \
          RETURNING task_id",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
@@ -6933,6 +6986,7 @@ async fn requeue_incomplete_shape_deps(
                 settings.dispatch_min_age_minutes,
             ),
         ))
+        .bind(enqueue_json(&candidates).map_err(|error| error.to_string())?)
         .fetch_scalars::<String>()
         .await
         .map_err(|error| format!("requeue shape-incomplete dependencies: {error}"))?;
