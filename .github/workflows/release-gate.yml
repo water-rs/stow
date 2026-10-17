@@ -1,0 +1,292 @@
+name: Release gate
+
+# The checks a release must pass but a routine merge must not wait on: the
+# mock end-to-end and the workerd cost lanes. They run three ways —
+# `workflow_dispatch` on any ref, nightly on dev's head (03:00 ET), and on
+# pull requests and merge groups into main, where the `main` ruleset
+# requires this workflow's `Release gate` check.
+#
+# The `merge_group` trigger carries no branch filter because dev's queue
+# fires it as well as main's: every leg below skips itself when the group's
+# base ref is not main (`github.event.merge_group.base_ref` is the group's
+# target branch), so a dev merge pays only the gate job's seconds while the
+# required check still reports.
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:00 America/New_York; scheduled runs land on the default branch,
+    # which is dev.
+    - cron: "0 7 * * *"
+  pull_request:
+    branches: [main]
+  merge_group:
+
+# Same contract as test.yml: a pull request pushed several times in a row
+# only needs its newest run; scheduled and merge-group runs are records and
+# never cancel one another.
+concurrency:
+  group: release-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # No debuginfo in CI builds. A failing test reports its file and line
+  # without it, and it was most of every cached target directory: a
+  # workspace `cargo test --no-run` is 11 GB with it and 3.4 GB without,
+  # and compiles in 128 s instead of 174 s. The per-job caches held the full
+  # size, filled the repository's 10 GB cache allowance and evicted each
+  # other.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  # Every leg skips itself in a dev merge group — see the header. On any
+  # other trigger it runs unconditionally: a release gate or a nightly tick
+  # has no "changed paths" to scope to, and the nightly exists to catch a
+  # drift no change drove.
+  mock-e2e:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    name: Mock end-to-end
+    runs-on: ubuntu-latest
+    permissions:
+      # The local edge authenticates its write endpoints against the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`) to pass. Fork pull requests still receive a
+      # read-only token regardless of this block.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          # Pull requests restore the `dev` cache and never save their own:
+          # a per-PR copy of every job's cache duplicated the whole set
+          # under the PR ref and evicted the build-crate caches (#177).
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # skyzen-cli ships cargo-dist binaries; install-action does not know
+      # the tool and its cargo-binstall fallback compiles it from source
+      # (about eight minutes), so the pinned, digest-checked archive is used.
+      # The workspace build and the consumer projects the e2e script drives
+      # link with mold too.
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      # The mock's dispatched builds link the buster glibc-2.28 sysroot
+      # the way production builds do (stow#336) — same manifest hash key
+      # as the build-crate job's cache; the extracted tree is large
+      # enough to keep between runs.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: glibc-sysroot
+        with:
+          path: ~/.cache/stow
+          key: glibc-sysroot-${{ hashFiles('ci/glibc-sysroot-debs.txt') }}
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.glibc-sysroot.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/stow
+          key: ${{ steps.glibc-sysroot.outputs.cache-primary-key }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # The mock manifest runs on the Cloudflare provider, so `skyzen dev`
+      # supervises `wrangler dev --local` (workerd).
+      - run: bun install -g wrangler@4
+      # Both binaries take the mock trust root: the build job now consumes
+      # the cache through the same verified-download chain the CLI uses, and
+      # a builder that cannot verify the mock key would quietly skip it.
+      - run: cargo build --features stow-cli/mock-verify,stow-build/mock-verify -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+      - run: scripts/mock-e2e.sh
+        env:
+          STOW_E2E_WORK_DIR: ${{ runner.temp }}/stow-mock-e2e
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: mock-e2e-logs
+          path: ${{ runner.temp }}/stow-mock-e2e/logs
+          if-no-files-found: ignore
+
+  # The scheduler-cost gate (stow#433): the host test is the
+  # fast pre-check, but the numbers Cloudflare bills — the cursor's
+  # `rowsRead`/`rowsWritten` — only exist under workerd. This job seeds
+  # the production-shaped fixture through the Durable Object's probe
+  # route and fails when any route or the alarm pass exceeds its
+  # in-code budget.
+  scheduler-budget:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    name: Scheduler budget (workerd)
+    runs-on: ubuntu-latest
+    permissions:
+      # Same operator auth as mock-e2e: the budget probe rides the
+      # trusted admin endpoints, which authenticate the credential's own
+      # repo permissions — GITHUB_TOKEN needs push (`contents: write`).
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      # The same stow-admin and edge bundle build as mock-e2e, so it
+      # restores that job's cache instead of saving a second copy of it.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: cargo build -p stow-admin
+      - run: scripts/scheduler-budget.sh
+        env:
+          STOW_BUDGET_WORK_DIR: ${{ runner.temp }}/stow-budget
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # stow#452's launch-cost gate: the production-shape report the
+      # harness just measured is the per-event cost vector, and the
+      # checked-in `launch-model.toml` supplies the event counts. The
+      # step fails the job when a projected monthly usage crosses half
+      # the product's included allowance, and prints the per-route
+      # projection table either way.
+      - name: Launch-cost gate
+        run: ./target/debug/stow-admin launch-gate --report "${{ runner.temp }}/stow-budget/budget-report-100000.json" --model launch-model.toml
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: scheduler-budget-logs
+          path: |
+            ${{ runner.temp }}/stow-budget/logs
+            ${{ runner.temp }}/stow-budget/budget-report*.json
+          if-no-files-found: ignore
+
+
+  # stow#452's load test: the mock stack on the 100k fixture, driven at
+  # the launch model's peak rates for thirty minutes between two budget
+  # probes — the after report doubles as the launch-cost gate's input,
+  # and `scripts/launch-load.sh` fails on any overload signal, error
+  # share or row-count regression.
+  #
+  # The lane runs unconditionally on every trigger of this workflow: a
+  # release gate cannot be path-scoped, and the nightly tick holds the
+  # cadence the deleted launch-load-scheduled.yml carried — a run on
+  # dev's head catches a drift that no change drove.
+  launch-load:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    name: Launch load (workerd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      # Same operator auth as scheduler-budget: the load's scheduler
+      # lanes ride the trusted endpoints, which authenticate the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`).
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: cargo build -p stow-admin
+      - run: scripts/launch-load.sh
+        env:
+          STOW_LOAD_WORK_DIR: ${{ runner.temp }}/stow-load
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: launch-load-logs
+          path: |
+            ${{ runner.temp }}/stow-load/logs
+            ${{ runner.temp }}/stow-load/budget-report-*.json
+            ${{ runner.temp }}/stow-load/launch-load-report-seg*.json
+          if-no-files-found: ignore
+
+
+  # One check to require — the `main` ruleset names `Release gate` — built
+  # like test.yml's `CI gate`: it needs every leg, `if: always()` runs it
+  # past a failed or cancelled need, and the verdict reads
+  # `needs.*.result` so such a leg turns the gate red. `skipped` passes,
+  # which is what every leg reports in a dev merge group.
+  gate:
+    needs:
+      - mock-e2e
+      - scheduler-budget
+      - launch-load
+    if: always()
+    name: Release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The gate covers every job only because it needs every job; a new
+      # job that forgets to join `needs:` would ship ungated. Read the
+      # workflow itself and fail if any job other than this one and the
+      # schedule-only reporter — which needs the gate, so the gate cannot
+      # need it — is absent from the list.
+      - name: Needs covers every job
+        run: |
+          needed=$(yq '.jobs.gate.needs.[]' .github/workflows/release-gate.yml | sort)
+          declared=$(yq '.jobs | keys.[]' .github/workflows/release-gate.yml | sort | grep -vx -e gate -e nightly-report)
+          if [ "$needed" != "$declared" ]; then
+            diff <(echo "$declared") <(echo "$needed") || true
+            echo "Release gate needs: must name every other job in release-gate.yml" >&2
+            exit 1
+          fi
+      - name: Every leg succeeded or skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e '[.[].result] | all(. == "success" or . == "skipped")' > /dev/null
+
+  # Schedule ticks alone, after the gate: a failure comments on the open
+  # `nightly` issue — filing one when none is open — and a pass closes
+  # every open one. It needs the legs and the gate so `needs` carries
+  # their results; `if: always()` because a failed leg must not silence
+  # it. The gate's needs-cover check exempts this job.
+  nightly-report:
+    needs:
+      - mock-e2e
+      - scheduler-budget
+      - launch-load
+      - gate
+    if: always() && github.event_name == 'schedule'
+    name: Nightly report
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Report the nightly result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NEEDS: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          failed=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key] | join(", ")')
+          open_issues=$(gh issue list --label nightly --state open --json number --jq '.[].number')
+          if [ -n "$failed" ]; then
+            body=$(printf 'Nightly release gate failed on commit %s.\n\nFailed jobs: %s\nRun: %s\n' "$GITHUB_SHA" "$failed" "$RUN_URL")
+            if [ -n "$open_issues" ]; then
+              gh issue comment "$(echo "$open_issues" | head -n 1)" --body "$body"
+            else
+              gh issue create --title "Nightly release gate failed" --label nightly --body "$body"
+            fi
+          elif [ -n "$open_issues" ]; then
+            body=$(printf 'Nightly release gate passed on commit %s.\n\nRun: %s\n' "$GITHUB_SHA" "$RUN_URL")
+            while read -r issue; do
+              gh issue comment "$issue" --body "$body"
+              gh issue close "$issue"
+            done <<< "$open_issues"
+          fi

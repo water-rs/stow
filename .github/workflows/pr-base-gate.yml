@@ -13,8 +13,9 @@ on:
 permissions: {}
 
 # The source check is all this workflow does. The checks a release must
-# pass are required by the `main` ruleset itself (`CI gate`, `installable
-# release`, `toolchain gate`), so no job holds a runner polling the others.
+# pass are required by the `main` ruleset itself (`CI gate`, `Release
+# gate`, `installable release`, `toolchain gate`), so no job holds a
+# runner polling the others.
 jobs:
   verify-source:
     name: PR source gate

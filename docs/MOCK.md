@@ -26,10 +26,11 @@ scripts/mock-e2e.sh
 ```
 
 The script prints its log directory at the end and dumps every log on
-failure. CI runs it on every PR and push (`mock-e2e` in
-`.github/workflows/test.yml`), which is what keeps the trusted build
-path — dispatch → build → publish → CLI cache hit — continuously
-tested on a clean runner.
+failure. CI runs it in the release gate (`mock-e2e` in
+`.github/workflows/release-gate.yml`) — on demand, nightly on `dev`,
+and on every pull request and merge group into `main` — which is what
+keeps the trusted build path — dispatch → build → publish → CLI cache
+hit — continuously tested on a clean runner.
 
 The rest of this doc is the manual recipe the script automates, with
 the topology and verification details behind it. Follow it when you
